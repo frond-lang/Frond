@@ -501,7 +501,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                // Integer divide-by-zero returns 0 (checked semantics, implemented by `arith_div_$ty`).
+                // Integer divide-by-zero panics (implemented by `arith_div_$ty`).
                 Value::$ctor(crate::value::[<arith_div_$ty>](a, b))
             }
             pub fn [<compute_mod_$ty>](frame: &mut Frame, node: NodeId) -> Value {

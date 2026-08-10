@@ -7,7 +7,7 @@ use crate::value::{Value, ValueArena};
 use std::cell::{RefCell, RefMut};
 use std::ops::DerefMut;
 use parking_lot::{Condvar, Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
 use std::sync::Arc;
 
@@ -91,6 +91,8 @@ impl Engine<Single> {
             event_waiters: RefCell::new(Vec::new()),
             pending_completions: RefCell::new(HashMap::new()),
             pending_events: RefCell::new(HashMap::new()),
+            defer_frames: RefCell::new(HashSet::new()),
+            defer_waiters: RefCell::new(HashMap::new()),
             result: RefCell::new(None),
             frame_pool: RefCell::new(Vec::new()),
             ready_frames: Some(RefCell::new(std::collections::VecDeque::new())),
@@ -187,6 +189,8 @@ impl Engine<Multi> {
             event_waiters: ParkingMutex::new(Vec::new()),
             pending_completions: ParkingMutex::new(HashMap::new()),
             pending_events: ParkingMutex::new(HashMap::new()),
+            defer_frames: ParkingMutex::new(HashSet::new()),
+            defer_waiters: ParkingMutex::new(HashMap::new()),
             result: ParkingMutex::new(None),
             frame_pool: ParkingMutex::new(Vec::new()),
             ready_frames: None,

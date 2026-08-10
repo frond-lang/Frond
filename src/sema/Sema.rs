@@ -533,6 +533,8 @@ pub struct SemaResult {
     pub expr_types: FxHashMap<u64, ExprInfo>,
     /// Compile-time errors.
     pub errors: Vec<SemaError>,
+    /// Compile-time warnings (do not stop compilation).
+    pub warnings: Vec<SemaError>,
     /// Whether any error occurred.
     pub has_error: bool,
     /// Type definition table (replaces IRBuilder's type_table + ctor_table).
@@ -640,6 +642,7 @@ impl SemaResult {
         SemaResult {
             expr_types: FxHashMap::default(),
             errors: Vec::new(),
+            warnings: Vec::new(),
             has_error: false,
             type_defs: Vec::new(),
             type_def_index: FxHashMap::default(),
@@ -700,6 +703,11 @@ impl SemaResult {
     pub fn add_error(&mut self, err: SemaError) {
         self.has_error = true;
         self.errors.push(err);
+    }
+
+    /// Record a warning (does not set has_error).
+    pub fn add_warning(&mut self, err: SemaError) {
+        self.warnings.push(err);
     }
 
     // ── Type definitions ──

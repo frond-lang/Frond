@@ -632,14 +632,34 @@ where
 #[inline]
 fn binop_scalar_t<T: Num + BitOps>(a: T, b: T, op: BinOp) -> T {
     match op {
-        BinOp::Add => a.wrapping_add(b),
-        BinOp::Sub => a.wrapping_sub(b),
-        BinOp::Mul => a.wrapping_mul(b),
+        // Bug #75: debug mode panics on integer overflow; release mode wraps.
+        // Float checked_* always returns Some, so expect never panics for floats.
+        BinOp::Add => {
+            if cfg!(debug_assertions) {
+                a.checked_add(b).expect("integer overflow in addition")
+            } else {
+                a.wrapping_add(b)
+            }
+        }
+        BinOp::Sub => {
+            if cfg!(debug_assertions) {
+                a.checked_sub(b).expect("integer overflow in subtraction")
+            } else {
+                a.wrapping_sub(b)
+            }
+        }
+        BinOp::Mul => {
+            if cfg!(debug_assertions) {
+                a.checked_mul(b).expect("integer overflow in multiplication")
+            } else {
+                a.wrapping_mul(b)
+            }
+        }
         // Division-by-zero semantics match scalar arith_div/arith_mod:
-        //   - Integer checked_div/checked_rem return None on divide-by-zero → unwrap_or(zero) yields 0
-        //   - Float checked_div/checked_rem always return Some (divide-by-zero yields inf/nan) → unwrap_or never fires
-        BinOp::Div => a.checked_div(b).unwrap_or(T::zero()),
-        BinOp::Mod => a.checked_rem(b).unwrap_or(T::zero()),
+        //   - Integer checked_div/checked_rem return None on divide-by-zero → expect panics
+        //   - Float checked_div/checked_rem always return Some (Kuzo Num impl delegates to native /, yielding inf/nan) → expect never panics
+        BinOp::Div => a.checked_div(b).expect("integer divide by zero"),
+        BinOp::Mod => a.checked_rem(b).expect("integer modulo by zero"),
         BinOp::Band => a.bit_and(b),
         BinOp::Bor => a.bit_or(b),
         BinOp::Bxor => a.bit_xor(b),
@@ -654,7 +674,13 @@ where T: Num + BitOps {
     let n = dst.len().min(a.len());
     for i in 0..n {
         dst[i] = match op {
-            UnaryOp::Neg => a[i].wrapping_neg(),
+            UnaryOp::Neg => {
+                if cfg!(debug_assertions) {
+                    a[i].neg().expect("integer overflow in negation")
+                } else {
+                    a[i].wrapping_neg()
+                }
+            }
             UnaryOp::Abs => a[i].abs(),
             UnaryOp::Bnot => a[i].bit_not(),
         };
@@ -1380,8 +1406,8 @@ impl_simd_unsigned_cmp!(u64, u64x4, 4);
 // =========================================================================
 //
 // Generates pure arithmetic functions for all integer/float types. Semantics strictly match the compute_fn macro in Engine.rs:
-//   - Integer add/sub/mul: wrapping semantics
-//   - Integer div/mod: checked; divide-by-zero returns 0
+//   - Integer add/sub/mul/neg: debug mode panics on overflow; release mode wraps (Bug #75)
+//   - Integer div/mod: divide-by-zero panics (no silent fallback)
 //   - Integer shl/shr: shift amount is i32 (matching Engine.rs reading as_i32), cast to u32 then wrapping
 //   - Float div: native division (divide-by-zero yields inf/nan)
 // runtime compute_fn calls these pure functions (reuse); compile-time ConstFold also calls the same arithmetic (decoupled from Frame).
@@ -1391,17 +1417,25 @@ impl_simd_unsigned_cmp!(u64, u64x4, 4);
 macro_rules! impl_arith_int {
     ($ty:ident, $rust:ty) => {
         paste! {
-            #[inline] pub fn [<arith_add_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_add(b) }
-            #[inline] pub fn [<arith_sub_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_sub(b) }
-            #[inline] pub fn [<arith_mul_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_mul(b) }
-            #[inline] pub fn [<arith_div_$ty>](a: $rust, b: $rust) -> $rust { if b == 0 { 0 } else { a.wrapping_div(b) } }
-            #[inline] pub fn [<arith_mod_$ty>](a: $rust, b: $rust) -> $rust { if b == 0 { 0 } else { a.wrapping_rem(b) } }
+            #[inline] pub fn [<arith_add_$ty>](a: $rust, b: $rust) -> $rust {
+                if cfg!(debug_assertions) { a.checked_add(b).expect("integer overflow in addition") } else { a.wrapping_add(b) }
+            }
+            #[inline] pub fn [<arith_sub_$ty>](a: $rust, b: $rust) -> $rust {
+                if cfg!(debug_assertions) { a.checked_sub(b).expect("integer overflow in subtraction") } else { a.wrapping_sub(b) }
+            }
+            #[inline] pub fn [<arith_mul_$ty>](a: $rust, b: $rust) -> $rust {
+                if cfg!(debug_assertions) { a.checked_mul(b).expect("integer overflow in multiplication") } else { a.wrapping_mul(b) }
+            }
+            #[inline] pub fn [<arith_div_$ty>](a: $rust, b: $rust) -> $rust { if b == 0 { panic!("integer divide by zero") } else { a.wrapping_div(b) } }
+            #[inline] pub fn [<arith_mod_$ty>](a: $rust, b: $rust) -> $rust { if b == 0 { panic!("integer modulo by zero") } else { a.wrapping_rem(b) } }
             #[inline] pub fn [<arith_bitand_$ty>](a: $rust, b: $rust) -> $rust { a & b }
             #[inline] pub fn [<arith_bitor_$ty>](a: $rust, b: $rust) -> $rust { a | b }
             #[inline] pub fn [<arith_bitxor_$ty>](a: $rust, b: $rust) -> $rust { a ^ b }
             #[inline] pub fn [<arith_shl_$ty>](a: $rust, shift: i32) -> $rust { a.wrapping_shl(shift as u32) }
             #[inline] pub fn [<arith_shr_$ty>](a: $rust, shift: i32) -> $rust { a.wrapping_shr(shift as u32) }
-            #[inline] pub fn [<arith_neg_$ty>](a: $rust) -> $rust { a.wrapping_neg() }
+            #[inline] pub fn [<arith_neg_$ty>](a: $rust) -> $rust {
+                if cfg!(debug_assertions) { a.checked_neg().expect("integer overflow in negation") } else { a.wrapping_neg() }
+            }
             #[inline] pub fn [<arith_bitnot_$ty>](a: $rust) -> $rust { !a }
         }
     };

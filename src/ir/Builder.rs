@@ -1556,7 +1556,7 @@ impl<'a> IrBuilder<'a> {
         // (the lambda is not in the call_graph, so `lookup_memo_strategy` returns None -> the
         // default `compile_expr` path is taken).
         let lambda_name = fn_name.unwrap_or("");
-        let return_node = self.compile_function_body(lambda_name, None, body_expr, params, false);
+        let return_node = self.compile_function_body(lambda_name, None, body_expr, params, false, is_async);
 
         self.current_sg_start = prev_sg_start;
         self.current_effect = prev_effect;
@@ -2501,6 +2501,12 @@ impl<'a> IrBuilder<'a> {
     /// mangled name for the `FuncId` lookup.
     /// Precondition: the caller has set `current_sg_start = node_start` (`compile_memoize`
     /// relies on this value to compute parameter node ids = `current_sg_start + param_index`).
+    ///
+    /// `is_async`: whether the enclosing function is declared `async`. When true and the body
+    /// expression's inferred type is `Async<T>` (Bug #79), an implicit await node is inserted so
+    /// the function returns the resolved `T` rather than the raw async handle. This implements
+    /// transparent async forwarding — `async fun f(): Async<T> { g() }` where `g(): Async<T>`
+    /// automatically awaits `g()` and returns its result.
     fn compile_function_body(
         &mut self,
         name: &str,
@@ -2508,6 +2514,7 @@ impl<'a> IrBuilder<'a> {
         body_expr: crate::ast::Ast::ExprId,
         params: &[crate::ast::Ast::Param<'_>],
         is_void_fn: bool,
+        is_async: bool,
     ) -> NodeId {
         let prev_tail = self.in_tail_position;
         self.in_tail_position = !is_void_fn;
@@ -2524,7 +2531,20 @@ impl<'a> IrBuilder<'a> {
             Some(crate::pass::Analyzer::MemoStrategy::Memoize { cache_key, .. }) => {
                 self.compile_memoize(name, body_expr, params, &cache_key)
             }
-            _ => self.compile_expr(body_expr),
+            _ => {
+                let node = self.compile_expr(body_expr);
+                // Bug #79: Auto-await forwarding. If this is an async function and the body
+                // expression's inferred type is Async<T>, the body produces an async handle (a
+                // raw i32 async_id) rather than the resolved value T. Insert an implicit await
+                // node to resolve it, so the function returns T (which the runtime wraps back
+                // into Async<T> for the caller). Sema already validates type compatibility
+                // (unify_return_type handles Async<X> vs Async<Y> by unifying inner types).
+                if is_async && self.expr_type_is_async(body_expr) {
+                    self.build_await_node(body_expr, node)
+                } else {
+                    node
+                }
+            }
         };
         self.in_tail_position = prev_tail;
         r
@@ -5723,6 +5743,21 @@ impl<'a> IrBuilder<'a> {
         EventSourceKind::AsyncJoin
     }
 
+    /// Check if an expression's inferred type is `Async<T>` (Bug #79: auto-await forwarding).
+    /// Returns false when the type is unknown or not Async, unlike `infer_event_source_kind`
+    /// which defaults to AsyncJoin.
+    fn expr_type_is_async(&self, expr_id: crate::ast::Ast::ExprId) -> bool {
+        let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr_id.0 as u64);
+        if let Some(info) = self.sema.expr_types.get(&key) {
+            if let Some(ref tn) = info.type_name {
+                if let Some(ty) = crate::types::Ty::from_type_name(tn.as_ref()) {
+                    return ty.family() == crate::types::TypeFamily::Async;
+                }
+            }
+        }
+        false
+    }
+
     /// Compile a field access.
     ///
     /// Binds compute_record_field_get, storing only the field name as the runtime by-name lookup key.
@@ -6459,7 +6494,11 @@ impl<'a> IrBuilder<'a> {
                     matches!(module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
                 }
             });
-        let return_node = self.compile_function_body(name, None, body_expr, &params, is_void_fn);
+        // Compute is_async before compile_function_body so it can auto-await Async<T> bodies (Bug #79).
+        let fn_is_async = self.sema.get_func_sig(name)
+            .map(|sig| sig.is_async)
+            .unwrap_or(is_async);
+        let return_node = self.compile_function_body(name, None, body_expr, &params, is_void_fn, fn_is_async);
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
@@ -6472,9 +6511,7 @@ impl<'a> IrBuilder<'a> {
         sg.entry_node = NodeId(node_start);
         sg.return_node = return_node;
         // Consumes sema's FuncSigInfo.is_async (builtin modules fall back to AST is_async)
-        sg.has_suspend = self.sema.get_func_sig(name)
-            .map(|sig| sig.is_async)
-            .unwrap_or(is_async);
+        sg.has_suspend = fn_is_async;
         sg.function_id = sg_id.0;
 
         self.func_subgraphs.insert(name.to_string(), sg_id);
@@ -6587,7 +6624,11 @@ impl<'a> IrBuilder<'a> {
                     matches!(module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
                 }
             });
-        let return_node = self.compile_function_body(func_name, None, body_expr, &params, is_void_fn);
+        // Compute is_async before compile_function_body so it can auto-await Async<T> bodies (Bug #79).
+        let fn_is_async = self.sema.get_func_sig(func_name)
+            .map(|sig| sig.is_async)
+            .unwrap_or(is_async);
+        let return_node = self.compile_function_body(func_name, None, body_expr, &params, is_void_fn, fn_is_async);
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
@@ -6600,9 +6641,7 @@ impl<'a> IrBuilder<'a> {
         sg.entry_node = NodeId(node_start);
         sg.return_node = return_node;
         // Consumes sema's FuncSigInfo.is_async (builtin modules fall back to AST is_async)
-        sg.has_suspend = self.sema.get_func_sig(func_name)
-            .map(|sig| sig.is_async)
-            .unwrap_or(is_async);
+        sg.has_suspend = fn_is_async;
         sg.function_id = sg_id.0;
 
         // Restore the outer type_args context
@@ -6683,7 +6722,7 @@ impl<'a> IrBuilder<'a> {
                 matches!(m.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
             }
         };
-        let return_node = self.compile_function_body(method_name, Some(type_name), body_expr, &params, is_void_fn);
+        let return_node = self.compile_function_body(method_name, Some(type_name), body_expr, &params, is_void_fn, is_async);
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
@@ -6765,7 +6804,7 @@ impl<'a> IrBuilder<'a> {
                 matches!(self.module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
             }
         };
-        let return_node = self.compile_function_body(method_name, Some(type_name), body_expr, &params, is_void_fn);
+        let return_node = self.compile_function_body(method_name, Some(type_name), body_expr, &params, is_void_fn, is_async);
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;

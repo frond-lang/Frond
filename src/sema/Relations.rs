@@ -764,10 +764,15 @@ pub fn peer_type(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
         .copied()
         .collect();
     if non_trivial.is_empty() {
-        // All Never/Void → return the first original type (preserving Never priority)
+        // All branches are Never/Void. Only when EVERY branch is Never (every
+        // path diverges) is the result Never. If any Void is present, there is
+        // a non-diverging fall-through path (e.g. `if c { return }` without an
+        // else — the implicit else falls through), so the result is Void, not
+        // Never. This prevents false "unreachable" warnings for code after a
+        // single-sided diverging if.
         if types
             .iter()
-            .any(|&t| matches!(arena.get(arena.resolve(t)), Ty::Never))
+            .all(|&t| matches!(arena.get(arena.resolve(t)), Ty::Never))
         {
             return arena.make(Ty::Never);
         }

@@ -229,14 +229,14 @@ fun exp_f64_impl(x: f64): f64 {
     ldexp_f64_impl(sum, k)
 }
 fun exp_f32_impl(x: f32): f32 {
-    val ln2 = 0x1.62e42fefa39efp-1
+    val ln2: f32 = 0x1.62e42fefa39efp-1
     if x == 0.0 { return 1.0 }
     if x > 88.722839052 { return 1.0 / 0.0 }
     if x < -103.972085 { return 0.0 }
     val k = cast(floor_f32_impl(x / ln2 + 0.5)).to(i32)
     val r = x - cast(k).to(f32) * ln2
-    var term = 1.0
-    var sum = 1.0
+    var term: f32 = 1.0
+    var sum: f32 = 1.0
     var i = 1
     while i < 10 {
         term = term * r / cast(i).to(f32)
@@ -252,8 +252,8 @@ fun exp_f16_impl(x: f16): f16 {
     if x < -17.32 { return 0.0 }
     val k = cast(floor_f16_impl(x / ln2 + 0.5)).to(i32)
     val r = x - cast(k).to(f16) * ln2
-    var term = 1.0
-    var sum = 1.0
+    var term: f16 = 1.0
+    var sum: f16 = 1.0
     var i = 1
     while i < 5 {
         term = term * r / cast(i).to(f16)
@@ -469,7 +469,7 @@ fun exp2_f64_impl(x: f64): f64 {
     exp_f64_impl(x * ln2)
 }
 fun exp2_f32_impl(x: f32): f32 {
-    val ln2 = 0x1.62e42fefa39efp-1
+    val ln2: f32 = 0x1.62e42fefa39efp-1
     exp_f32_impl(x * ln2)
 }
 fun exp2_f16_impl(x: f16): f16 {
@@ -496,7 +496,7 @@ fun exp10_f64_impl(x: f64): f64 {
     exp_f64_impl(x * ln10)
 }
 fun exp10_f32_impl(x: f32): f32 {
-    val ln10 = 0x1.26bb1bbb55516p+1
+    val ln10: f32 = 0x1.26bb1bbb55516p+1
     exp_f32_impl(x * ln10)
 }
 fun exp10_f16_impl(x: f16): f16 {

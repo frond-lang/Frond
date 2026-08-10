@@ -32,6 +32,55 @@ macro_rules! numeric_lit {
     }};
 }
 
+/// Range-check an integer literal's raw text against the target scalar type's range.
+/// Returns `Some(error message)` when out of range or unparseable; `None` when in range.
+/// Mirrors `ir::Builder::check_int_range` so sema and IR report consistently (Bug #72: stage consistency).
+fn check_int_literal_range(raw: &str, tag: crate::types::ValueTag) -> Option<String> {
+    let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
+    let (digits, radix) = cleaned
+        .strip_prefix("0x").map(|s| (s, 16u32))
+        .or_else(|| cleaned.strip_prefix("0o").map(|s| (s, 8)))
+        .or_else(|| cleaned.strip_prefix("0b").map(|s| (s, 2)))
+        .unwrap_or((cleaned.as_str(), 10));
+    // i128/u128 literals cannot overflow their own parse; only syntax errors are possible.
+    match tag {
+        crate::types::ValueTag::I128 => {
+            return match i128::from_str_radix(digits, radix) {
+                Ok(_) => None,
+                Err(_) => Some(format!("invalid integer literal '{}'", raw)),
+            };
+        }
+        crate::types::ValueTag::U128 => {
+            return match u128::from_str_radix(digits, radix) {
+                Ok(_) => None,
+                Err(_) => Some(format!("invalid integer literal '{}'", raw)),
+            };
+        }
+        _ => {}
+    }
+    let (min, max, name): (i128, i128, &str) = match tag {
+        crate::types::ValueTag::I8    => (i8::MIN    as i128, i8::MAX    as i128, "i8"),
+        crate::types::ValueTag::I16   => (i16::MIN   as i128, i16::MAX   as i128, "i16"),
+        crate::types::ValueTag::I32   => (i32::MIN   as i128, i32::MAX   as i128, "i32"),
+        crate::types::ValueTag::I64   => (i64::MIN   as i128, i64::MAX   as i128, "i64"),
+        crate::types::ValueTag::U8    => (0,                   u8::MAX    as i128, "u8"),
+        crate::types::ValueTag::U16   => (0,                   u16::MAX   as i128, "u16"),
+        crate::types::ValueTag::U32   => (0,                   u32::MAX   as i128, "u32"),
+        crate::types::ValueTag::U64   => (0,                   u64::MAX   as i128, "u64"),
+        crate::types::ValueTag::Isize => (isize::MIN as i128, isize::MAX as i128, "isize"),
+        crate::types::ValueTag::Usize => (0,                   usize::MAX as i128, "usize"),
+        _ => return None,
+    };
+    match i128::from_str_radix(digits, radix) {
+        Ok(v) if v < min || v > max => Some(format!(
+            "integer literal '{}' is out of range for {} (valid range: {}..={})",
+            raw, name, min, max
+        )),
+        Ok(_) => None,
+        Err(_) => Some(format!("invalid integer literal '{}'", raw)),
+    }
+}
+
 /// Inference context: encapsulates all state needed for type inference.
 ///
 /// Lifetime: a single TypeArena is shared across the whole module's sema stage; InferContext holds a `&mut` reference to it.
@@ -112,6 +161,9 @@ pub struct InferContext<'a> {
     /// Instantiation-mode context: None = HM mode, Some = instantiation mode.
     /// Set to Some when resolving types in a monomorphized function body; None during HM type checking.
     pub instantiation_ctx: Option<InstantiationCtx>,
+    /// Tracks local binding mutability per environment scope: (env_id, name) → is_mutable.
+    /// Used to detect val→var / var→val mutability-changing shadowing (Bug #76).
+    pub local_mutability: FxHashMap<(u32, String), bool>,
 }
 
 /// Checks whether a type references any unresolved TypeVar (in unresolved_set).
@@ -189,6 +241,7 @@ impl<'a> InferContext<'a> {
             type_trace: Vec::new(),
             ctor_module_envs: FxHashMap::default(),
             instantiation_ctx: None,
+            local_mutability: FxHashMap::default(),
         }
     }
 
@@ -310,6 +363,11 @@ impl<'a> InferContext<'a> {
     /// Adds an error with location info (for call sites that have AST span context).
     pub fn add_error_at(&mut self, message: &str, line: u32, column: u32) {
         self.sema_result.add_error(SemaError::new(message, line, column));
+    }
+
+    /// Adds a warning with location info (does not set has_error; does not stop compilation).
+    pub fn add_warning_at(&mut self, message: &str, line: u32, column: u32) {
+        self.sema_result.add_warning(SemaError::new(message, line, column));
     }
 
     // ── self parameter resolution (phase3b) ──
@@ -1082,8 +1140,15 @@ impl<'a> InferContext<'a> {
         if self.instantiation_ctx.is_some() {
             return;
         }
-        if self.arena.unify(t1, t2).is_err() {
-            self.solver.add_equality(t1, t2);
+        // Record candidate before unify so finalize_solution can detect ambiguity when
+        // the same TypeVar is required to bind to multiple distinct concrete types
+        // (Bug #83: `pair(1i32, 2i64)` silently bound T to i32). Without this, only
+        // failed unifies recorded candidates, so a TypeVar bound by the first
+        // successful unify + a conflicting failed unify would show a single candidate.
+        let InferContext { arena, solver, .. } = self;
+        solver.record_candidate(arena, t1, t2);
+        if arena.unify(t1, t2).is_err() {
+            solver.add_equality(t1, t2);
         }
     }
 
@@ -1351,6 +1416,80 @@ impl<'a> InferContext<'a> {
         )
     }
 
+    /// Returns true if the expression has an explicitly declared numeric type
+    /// that cannot be silently promoted. This includes:
+    /// - Suffixed numeric literals (e.g. `1i32`, `2.0f64`)
+    /// - Identifier references (variables with declared types)
+    /// Computed expressions (binary ops, calls, etc.) are NOT "explicitly typed"
+    /// because their type may result from bare-literal promotion internally.
+    fn expr_is_explicitly_typed_numeric(ast: &AstArena<'_>, expr: ExprId) -> bool {
+        match ast.expr(expr).node {
+            Expr::IntLit { suffix: Some(_), .. }
+            | Expr::FloatLit { suffix: Some(_), .. } => true,
+            Expr::Ident(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Check numeric binary operation type compatibility (Bug #73, #74).
+    ///
+    /// Rules (consistent with user preference: Rust-style strict typing,
+    /// bare literals promotable, explicitly typed operands require cast):
+    /// 1. Types already equal → OK
+    /// 2. Cross-category (int vs float): always error (no implicit int↔float conversion)
+    /// 3. Same category different bit width: error only if both sides are
+    ///    explicitly typed (suffixed literal or variable identifier)
+    fn check_numeric_binop_compat(
+        &mut self,
+        ast: &AstArena<'_>,
+        lhs: ExprId,
+        rhs: ExprId,
+        left_ty: TypeHandle,
+        right_ty: TypeHandle,
+        span: crate::ast::Ast::Span,
+    ) {
+        // If types are already equal, no issue.
+        if types_equal(self.arena, left_ty, right_ty) {
+            return;
+        }
+
+        let lc = self.arena.get(left_ty);
+        let rc = self.arena.get(right_ty);
+
+        let left_str = format!("{}", self.arena.display(left_ty));
+        let right_str = format!("{}", self.arena.display(right_ty));
+
+        // Cross-category (int vs float): always error — no implicit int↔float conversion.
+        if (lc.is_int() && rc.is_float()) || (lc.is_float() && rc.is_int()) {
+            self.add_error_at(
+                &format!(
+                    "type mismatch: cannot operate on '{}' and '{}' without explicit cast (int/float category mismatch)",
+                    left_str, right_str
+                ),
+                span.line,
+                span.column,
+            );
+            return;
+        }
+
+        // Same category, different bit widths: error only if both sides are
+        // explicitly typed (suffixed literal or variable identifier).
+        // Computed expressions (e.g. `1.0 / 0.0`) may derive their type from
+        // bare-literal promotion, so they are not treated as "explicitly typed".
+        let left_explicit = Self::expr_is_explicitly_typed_numeric(ast, lhs);
+        let right_explicit = Self::expr_is_explicitly_typed_numeric(ast, rhs);
+        if left_explicit && right_explicit {
+            self.add_error_at(
+                &format!(
+                    "type mismatch: cannot operate on '{}' and '{}' without explicit cast (different bit widths)",
+                    left_str, right_str
+                ),
+                span.line,
+                span.column,
+            );
+        }
+    }
+
     /// Dereferences a ref/nullable type, returning the inner type; for non-ref/nullable types returns the original type.
     /// SafeAccess `?.` on a Nullable needs to unwrap the inner type to look up fields, matching how method calls unwrap Nullable.
     fn unwrap_ref(&self, ty: TypeHandle) -> TypeHandle {
@@ -1473,7 +1612,17 @@ impl<'a> InferContext<'a> {
         let node = &ast.expr(expr).node;
         match node {
             // ── Literals ──
-            Expr::IntLit { suffix, .. } => numeric_lit!(self, suffix, expected, int_suffix_to_type, is_int, I32),
+            Expr::IntLit { raw, suffix } => {
+                // Range-check suffixed integer literals at sema time (Bug #72: stage consistency with IR Builder).
+                if let Some(suf) = suffix {
+                    if let Some(tag) = crate::types::ValueTag::from_name(suf) {
+                        if let Some(err) = check_int_literal_range(raw, tag) {
+                            self.add_error(&err);
+                        }
+                    }
+                }
+                numeric_lit!(self, suffix, expected, int_suffix_to_type, is_int, I32)
+            }
             Expr::FloatLit { suffix, .. } => numeric_lit!(self, suffix, expected, float_suffix_to_type, is_float, F64),
             Expr::BoolLit(_) => self.make_builtin(Ty::Bool),
             Expr::CharLit(_) => self.make_builtin(Ty::Char),
@@ -1549,11 +1698,17 @@ impl<'a> InferContext<'a> {
                 let right_ty = self.infer_expr(*rhs, ast, env, None);
                 let left_is_lit = Self::expr_is_literal(ast, *lhs);
                 let right_is_lit = Self::expr_is_literal(ast, *rhs);
+                let bin_span = ast.expr(expr).span;
                 match op {
                     BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
                         let rl = self.arena.resolve(left_ty);
                         let rr = self.arena.resolve(right_ty);
                         if self.arena.get(rl).is_numeric() && self.arena.get(rr).is_numeric() {
+                            // Bug #73/#74: strict numeric type checking.
+                            // - Bare literals (no suffix) can be promoted freely.
+                            // - Explicitly typed operands (suffixed literals or variables)
+                            //   require explicit cast for different bit widths or int/float crossing.
+                            self.check_numeric_binop_compat(ast, *lhs, *rhs, rl, rr, bin_span);
                             // v2 convergence: peer_type_binary replaces literal_promotion;
                             // literal promotion rules are inlined into peer_type_binary.
                             return peer_type_binary(
@@ -1572,6 +1727,8 @@ impl<'a> InferContext<'a> {
                         let rl = self.arena.resolve(left_ty);
                         let rr = self.arena.resolve(right_ty);
                         if self.arena.get(rl).is_numeric() && self.arena.get(rr).is_numeric() {
+                            // Bug #73/#74: same strict checking for comparison ops.
+                            self.check_numeric_binop_compat(ast, *lhs, *rhs, rl, rr, bin_span);
                             // v2 convergence: comparison ops use peer_type_binary to unify operand types.
                             let _ = peer_type_binary(
                                 self.arena,
@@ -2233,7 +2390,12 @@ impl<'a> InferContext<'a> {
                     // peer_type already inlines Never/Void filtering, numeric widening, and nullable/throw propagation.
                     peer_type(self.arena, &[then_ty, else_ty])
                 } else {
-                    then_ty
+                    // No else branch: the implicit else falls through as Void.
+                    // peer_type(then, Void) ensures a diverging then (Never) does
+                    // not make the whole if diverge — the fall-through path is
+                    // reachable. Only an explicit `else { diverge }` yields Never.
+                    let void_ty = self.make_builtin(Ty::Void);
+                    peer_type(self.arena, &[then_ty, void_ty])
                 }
             }
 
@@ -2242,14 +2404,43 @@ impl<'a> InferContext<'a> {
                 let child_env = self.env.child(env);
                 let mut diverges = false;
                 for &stmt in stmts.iter() {
-                    let _ = self.infer_stmt(stmt, ast, child_env);
-                    match &ast.stmt(stmt).node {
-                        Stmt::Return { .. } | Stmt::Throw { .. } => diverges = true,
-                        _ => {}
+                    if diverges {
+                        // Bug #84: code after a diverging statement is unreachable.
+                        // Report a warning but continue inferring so the IR builder has
+                        // ExprInfo for all expressions (it processes all statements
+                        // independently of sema's divergence analysis).
+                        let span = ast.stmt(stmt).span;
+                        self.add_warning_at("unreachable code after throw/return/break/continue", span.line, span.column);
+                    }
+                    let stmt_ty = self.infer_stmt(stmt, ast, child_env);
+                    // Detect divergence: direct control-flow exits (return/throw/break/
+                    // continue) or statements whose inferred type is Never (e.g. an
+                    // if/match/block expression where all branches diverge).
+                    let is_direct_exit = matches!(
+                        &ast.stmt(stmt).node,
+                        Stmt::Return { .. } | Stmt::Throw { .. } | Stmt::Break | Stmt::Continue
+                    );
+                    let is_never = stmt_ty
+                        .map(|t| matches!(self.arena.get(self.arena.resolve(t)), Ty::Never))
+                        .unwrap_or(false);
+                    if !diverges && (is_direct_exit || is_never) {
+                        diverges = true;
                     }
                 }
                 if let Some(te) = trailing {
-                    self.infer_expr(*te, ast, child_env, expected)
+                    if diverges {
+                        // Trailing expression after a diverging statement is unreachable.
+                        let span = ast.expr(*te).span;
+                        self.add_warning_at("unreachable code after throw/return/break/continue", span.line, span.column);
+                        // Still infer the trailing expression so the IR builder has
+                        // ExprInfo for it (it processes all expressions independently
+                        // of sema's divergence analysis). The block's type is Never
+                        // regardless of the trailing expression's type.
+                        let _ = self.infer_expr(*te, ast, child_env, expected);
+                        self.make_builtin(Ty::Never)
+                    } else {
+                        self.infer_expr(*te, ast, child_env, expected)
+                    }
                 } else if diverges {
                     self.make_builtin(Ty::Never)
                 } else {
@@ -2966,6 +3157,82 @@ impl<'a> InferContext<'a> {
 
     // ── infer_stmt ──
 
+    /// Shared logic for ValDecl and VarDecl: type-check the annotation and value,
+    /// detect mutability-changing shadowing (Bug #76), and define the binding.
+    fn check_local_decl(
+        &mut self,
+        name: &str,
+        type_annotation: Option<crate::ast::Ast::TypeRef>,
+        value: crate::ast::Ast::ExprRef,
+        is_mutable: bool,
+        ast: &AstArena<'_>,
+        env: EnvId,
+        stmt: StmtId,
+    ) -> TypeHandle {
+        // kind_check the type annotation.
+        if let Some(ta) = type_annotation {
+            let mut errors = Vec::new();
+            check_type_node(self.sema_result, ast, ta, &[], &mut errors);
+            for e in errors {
+                self.sema_result.add_error(e);
+            }
+        }
+        let expected_ty = type_annotation.map(|ta| self.type_from_ast(ta, ast));
+        let val_ty = self.infer_expr(value, ast, env, expected_ty);
+        let bind_ty = if let Some(ta) = type_annotation {
+            let annot_ty = self.type_from_ast(ta, ast);
+            if self.try_widen_unify(annot_ty, val_ty).is_err() {
+                let annot_str = format!("{}", self.arena.display(annot_ty));
+                let val_str = format!("{}", self.arena.display(val_ty));
+                let span = ast.ty(ta).span;
+                self.add_error_at(
+                    &format!(
+                        "type annotation mismatch: expected '{}', found '{}'",
+                        annot_str, val_str
+                    ),
+                    span.line,
+                    span.column,
+                );
+            }
+            annot_ty
+        } else {
+            val_ty
+        };
+
+        // Bug #76: detect mutability-changing shadowing (val→var or var→val).
+        // Same-mutability shadowing (val→val, var→var) is allowed.
+        let key = (env.0, name.to_string());
+        if let Some(&prev_mutable) = self.local_mutability.get(&key) {
+            if prev_mutable != is_mutable {
+                let prev_kw = if prev_mutable { "var" } else { "val" };
+                let new_kw = if is_mutable { "var" } else { "val" };
+                let span = ast.stmt(stmt).span;
+                self.add_error_at(
+                    &format!(
+                        "cannot shadow {} '{}' with {} {}: mutability mismatch",
+                        prev_kw, name, new_kw, name
+                    ),
+                    span.line,
+                    span.column,
+                );
+            }
+        }
+        // Record mutability for this scope.
+        self.local_mutability.insert(key, is_mutable);
+
+        // Define the binding. Use redefine to allow same-mutability shadowing
+        // (define returns false without updating when the name already exists).
+        if self.env.define(env, name, bind_ty) {
+            // New binding — already inserted.
+        } else {
+            // Name already exists — shadowing. Use redefine to update the binding.
+            self.env.redefine(env, name, bind_ty);
+        }
+        // Return the value's inferred type so callers (e.g. Block divergence
+        // analysis) can detect `val/var x = <never>` as a diverging statement.
+        val_ty
+    }
+
     /// Infers a statement's type. Returns `Some(ty)` when the statement produces a value (expression statements).
     pub fn infer_stmt(
         &mut self,
@@ -2975,38 +3242,24 @@ impl<'a> InferContext<'a> {
     ) -> Option<TypeHandle> {
         let node = &ast.stmt(stmt).node;
         match node {
-            Stmt::ValDecl { name, type_annotation, value, .. } | Stmt::VarDecl { name, type_annotation, value, .. } => {
-                // kind_check the type annotation.
-                if let Some(ta) = type_annotation {
-                    let mut errors = Vec::new();
-                    check_type_node(self.sema_result, ast, *ta, &[], &mut errors);
-                    for e in errors {
-                        self.sema_result.add_error(e);
-                    }
-                }
-                let expected_ty = type_annotation.map(|ta| self.type_from_ast(ta, ast));
-                let val_ty = self.infer_expr(*value, ast, env, expected_ty);
-                let bind_ty = if let Some(ta) = type_annotation {
-                    let annot_ty = self.type_from_ast(*ta, ast);
-                    if self.try_widen_unify(annot_ty, val_ty).is_err() {
-                        let annot_str = format!("{}", self.arena.display(annot_ty));
-                        let val_str = format!("{}", self.arena.display(val_ty));
-                        let span = ast.ty(*ta).span;
-                        self.add_error_at(
-                            &format!(
-                                "type annotation mismatch: expected '{}', found '{}'",
-                                annot_str, val_str
-                            ),
-                            span.line,
-                            span.column,
-                        );
-                    }
-                    annot_ty
+            Stmt::ValDecl { name, type_annotation, value, .. } => {
+                let val_ty = self.check_local_decl(name, *type_annotation, *value, false, ast, env, stmt);
+                // Propagate Never so Block-level divergence analysis detects
+                // `val x = <never>` (e.g. a val bound to an if/match/block that
+                // always diverges) as a diverging statement. Bug #84 generality.
+                if matches!(self.arena.get(self.arena.resolve(val_ty)), Ty::Never) {
+                    Some(val_ty)
                 } else {
-                    val_ty
-                };
-                self.env.define(env, name, bind_ty);
-                None
+                    None
+                }
+            }
+            Stmt::VarDecl { name, type_annotation, value, .. } => {
+                let val_ty = self.check_local_decl(name, *type_annotation, *value, true, ast, env, stmt);
+                if matches!(self.arena.get(self.arena.resolve(val_ty)), Ty::Never) {
+                    Some(val_ty)
+                } else {
+                    None
+                }
             }
             Stmt::Assignment { target, value } => {
                 let target_ty = self.infer_expr(*target, ast, env, None);
@@ -3451,6 +3704,15 @@ impl<'a> InferContext<'a> {
         // 1. Populate the definition tables (if not already populated).
         populate_module(self.arena, self.sema_result, module);
 
+        // 1b. Check for cyclic type aliases (Bug #80).
+        self.check_alias_cycles();
+
+        // 1c. Check for duplicate constructor names across types (Bug #81).
+        self.check_duplicate_constructors();
+
+        // 1d. Check for duplicate named fields within a constructor (Bug #82).
+        self.check_duplicate_ctor_fields();
+
         // 2. Reset state (do not reset env; preserve the shared root_env).
         self.reset_state();
         // Snapshot current type_vars/types length: arena is shared across modules and not reset;
@@ -3489,6 +3751,37 @@ impl<'a> InferContext<'a> {
         // Split borrows of self's different fields: arena as mutable borrow, witness_table as shared borrow.
         let InferContext { arena, solver, witness_table, type_trace, .. } = self;
         solver.solve_with_witness(arena, Some(witness_table));
+
+        // 9.1 Report solver ambiguity errors (Bug #83: generic parameter type
+        // unification failures were silently dropped — solver.errors() was never
+        // consulted, so e.g. `pair(1i32, 2i64)` silently bound T to i32 and accepted
+        // the i64 argument).
+        // Only report ambiguity errors (from finalize_solution: a TypeVar was required
+        // to bind to multiple distinct concrete types). "type mismatch" errors from
+        // the fixpoint loop are NOT reported — they are often false positives because
+        // `unify_or_constrain` does strict unify only, while other paths use
+        // `try_widen_unify` (widening/nullable/async unfolding) which accepts those
+        // same type pairs.
+        {
+            let solver_errors: Vec<ConstraintError> = solver.errors().to_vec();
+            for ce in solver_errors {
+                if !ce.reason.as_ref().contains("ambiguous") {
+                    continue;
+                }
+                let (t1, t2) = match &ce.constraint {
+                    Constraint::Equality(t1, t2) => (*t1, *t2),
+                    _ => continue,
+                };
+                let r1 = arena.resolve(t1);
+                let r2 = arena.resolve(t2);
+                let s1 = arena.display(r1);
+                let s2 = arena.display(r2);
+                self.sema_result.add_error(crate::sema::Sema::SemaError::new(
+                    &format!("type mismatch: {} does not unify with {} ({})", s1, s2, ce.reason),
+                    ce.line, ce.column,
+                ));
+            }
+        }
 
         // 9.4 Default unbound non-rigid TypeVars to void (root cause F).
         //
@@ -3858,6 +4151,166 @@ impl<'a> InferContext<'a> {
             return ret_ty;
         }
         self.arena.make_fn(param_types.into_boxed_slice(), ret_ty)
+    }
+
+    /// Check for cyclic type aliases (Bug #80).
+    ///
+    /// Iterates through all type definitions; for each alias, follows the `target_type_name`
+    /// chain to detect cycles. The existing `visiting`-based cycle detection in
+    /// `resolve_name_to_type` / `resolve_named_type_resolved` is ineffective because the
+    /// `target_type` short-circuit (returning the pre-resolved TypeHandle directly) bypasses
+    /// the recursive `target_type_name` path where cycle detection lives.
+    ///
+    /// This function reports a `cyclic type alias` error for each cycle found, e.g.:
+    /// `type A = B` + `type B = A` → `cyclic type alias: A -> B -> A`.
+    fn check_alias_cycles(&mut self) {
+        use std::collections::HashSet;
+        // Collect already-reported cycle messages to avoid duplicates across modules
+        // (sema_result.type_defs is cumulative across all modules).
+        let existing: HashSet<String> = self.sema_result.errors.iter()
+            .filter_map(|e| {
+                e.message.as_ref().strip_prefix("cyclic type alias: ").map(String::from)
+            })
+            .collect();
+        let mut reported: HashSet<String> = existing;
+        for i in 0..self.sema_result.type_defs.len() {
+            let td = &self.sema_result.type_defs[i];
+            if td.kind != crate::sema::Sema::TypeDefKind::Alias {
+                continue;
+            }
+            let mut chain: Vec<String> = Vec::new();
+            let mut visiting: HashSet<String> = HashSet::new();
+            let start_name = td.name.to_string();
+            chain.push(start_name.clone());
+            visiting.insert(start_name.clone());
+            let mut current = td.target_type_name.as_deref().map(String::from);
+            loop {
+                match current {
+                    None => break, // No target_name: not a cycle (or target is a non-named type).
+                    Some(ref target_name) => {
+                        if visiting.contains(target_name) {
+                            // Cycle detected: build the cycle path for the error message.
+                            chain.push(target_name.clone());
+                            let cycle_start = chain.iter().position(|n| n == target_name)
+                                .unwrap_or(0);
+                            let cycle_path = chain[cycle_start..].join(" -> ");
+                            if reported.insert(cycle_path.clone()) {
+                                self.sema_result.add_error(crate::sema::Sema::SemaError::new(
+                                    &format!("cyclic type alias: {}", cycle_path),
+                                    0, 0,
+                                ));
+                            }
+                            break;
+                        }
+                        // Look up the target's type def to continue the chain.
+                        let target_td = self.sema_result.get_type_def(target_name);
+                        match target_td {
+                            Some(t) if t.kind == crate::sema::Sema::TypeDefKind::Alias => {
+                                visiting.insert(target_name.clone());
+                                chain.push(target_name.clone());
+                                current = t.target_type_name.as_deref().map(String::from);
+                            }
+                            _ => break, // Target is not an alias: no cycle.
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check for duplicate constructor names across different types (Bug #81).
+    ///
+    /// Constructor names are globally registered in root_env via `redefine`, so a
+    /// later type defining the same constructor name silently overwrites the earlier
+    /// binding. This check reports the conflict at definition time rather than
+    /// leaving the user to discover it as a confusing "type annotation mismatch"
+    /// when using the shadowed constructor.
+    fn check_duplicate_constructors(&mut self) {
+        use std::collections::{HashMap, HashSet};
+        // Map from constructor name → first type_name that defined it.
+        let mut first_def: HashMap<String, String> = HashMap::new();
+        // Set of constructor names already reported (avoids duplicate errors across
+        // modules, since type_defs is cumulative).
+        let mut reported: HashSet<String> = self.sema_result.errors.iter()
+            .filter_map(|e| {
+                e.message.as_ref().strip_prefix("duplicate constructor: ").and_then(|s| {
+                    s.split(" already defined").next().map(String::from)
+                })
+            })
+            .collect();
+        // Collect errors first to avoid borrow conflict (iterating type_defs is
+        // an immutable borrow; add_error is mutable).
+        let mut new_errors: Vec<String> = Vec::new();
+        for i in 0..self.sema_result.type_defs.len() {
+            let td = &self.sema_result.type_defs[i];
+            for ctor in td.constructors.iter() {
+                let ctor_name = ctor.name.to_string();
+                if reported.contains(&ctor_name) {
+                    continue;
+                }
+                if let Some(prev_type) = first_def.get(&ctor_name) {
+                    if prev_type.as_str() != td.name.as_ref() {
+                        new_errors.push(format!(
+                            "duplicate constructor: {} already defined for type {}",
+                            ctor_name, prev_type
+                        ));
+                        reported.insert(ctor_name);
+                    }
+                } else {
+                    first_def.insert(ctor_name, td.name.to_string());
+                }
+            }
+        }
+        for msg in new_errors {
+            self.sema_result.add_error(crate::sema::Sema::SemaError::new(&msg, 0, 0));
+        }
+    }
+
+    /// Check for duplicate named fields within a single constructor (Bug #82).
+    ///
+    /// ADT/record constructors may have positional (unnamed) fields, which are
+    /// allowed to repeat; only named fields must be unique. Pattern matching and
+    /// field access rely on unique names to disambiguate.
+    fn check_duplicate_ctor_fields(&mut self) {
+        use std::collections::HashSet;
+        // Collect (ctor_name, field_name) pairs already reported, to dedupe across
+        // modules (type_defs is cumulative).
+        let mut reported: HashSet<(String, String)> = self.sema_result.errors.iter()
+            .filter_map(|e| {
+                e.message.as_ref().strip_prefix("duplicate field '").and_then(|s| {
+                    let mut it = s.split("' in constructor ");
+                    let field = it.next()?.to_string();
+                    let ctor = it.next()?.to_string();
+                    Some((field, ctor))
+                })
+            })
+            .collect();
+        let mut new_errors: Vec<String> = Vec::new();
+        for i in 0..self.sema_result.type_defs.len() {
+            let td = &self.sema_result.type_defs[i];
+            for ctor in td.constructors.iter() {
+                let mut seen: HashSet<String> = HashSet::new();
+                for fname_opt in ctor.field_names.iter() {
+                    if let Some(fname) = fname_opt {
+                        let fname_s = fname.to_string();
+                        let key = (fname_s.clone(), ctor.name.to_string());
+                        if reported.contains(&key) {
+                            continue;
+                        }
+                        if !seen.insert(fname_s.clone()) {
+                            new_errors.push(format!(
+                                "duplicate field '{}' in constructor {}",
+                                fname_s, ctor.name
+                            ));
+                            reported.insert(key);
+                        }
+                    }
+                }
+            }
+        }
+        for msg in new_errors {
+            self.sema_result.add_error(crate::sema::Sema::SemaError::new(&msg, 0, 0));
+        }
     }
 
     /// Checks a single declaration (infers function body / expression).
@@ -4636,7 +5089,7 @@ impl ConstraintSolver {
     /// - If t1 is a TypeVar and t2 is not → candidates[t1.idx].push(t2).
     /// - If t2 is a TypeVar and t1 is not → candidates[t2.idx].push(t1).
     /// - Both sides TypeVars → do not record (var-var bindings are handled directly by unify).
-    fn record_candidate(&mut self, arena: &TypeArena, t1: TypeHandle, t2: TypeHandle) {
+    pub fn record_candidate(&mut self, arena: &TypeArena, t1: TypeHandle, t2: TypeHandle) {
         match (arena.get(t1), arena.get(t2)) {
             (Ty::TypeVar(_), Ty::TypeVar(_)) => {
                 // Both sides are TypeVars: var-var binding is handled by unify; do not record
@@ -4656,18 +5109,22 @@ impl ConstraintSolver {
     /// ambiguity.
     ///
     /// For each TypeVar's candidate set:
-    /// 1. Deduplicate based on resolved TypeHandle equality.
+    /// 1. Deduplicate based on structural equality (handles are not interned).
     /// 2. Unique candidate → write into subst.
     /// 3. Multiple distinct candidates → flag an ambiguity error; still write the arena's
     ///    actual solution into subst (to avoid cascading false positives).
     fn finalize_solution(&mut self, arena: &mut TypeArena) {
         let candidates = std::mem::take(&mut self.candidates);
         for (idx, cands) in candidates {
-            // Deduplicate based on resolved TypeHandle equality.
+            // Deduplicate based on structural equality (not TypeHandle identity).
+            // `make()` does not intern types, so two `Ty::Bool` from different call
+            // sites have different TypeHandles; comparing by handle would wrongly
+            // flag them as distinct candidates and emit a false "ambiguous
+            // inference" error (e.g. `identity(true) == true`).
             let mut unique: Vec<TypeHandle> = Vec::new();
             for c in &cands {
                 let r = arena.resolve(*c);
-                if !unique.iter().any(|&u| arena.resolve(u) == r) {
+                if !unique.iter().any(|&u| types_equal(arena, u, r)) {
                     unique.push(r);
                 }
             }

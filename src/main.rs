@@ -539,6 +539,7 @@ fn run_sema_pipeline(
     }
 
     let mut prev_err_len = 0usize;
+    let mut prev_warn_len = 0usize;
 
     // populate: fill in the definition tables (type method signatures, etc.) for all modules before checking,
     // to resolve cross-module method lookup failures caused by module check ordering.
@@ -581,7 +582,11 @@ fn run_sema_pipeline(
         for err in &ctx.sema_result.errors[prev_err_len..] {
             eprintln!("{}:{}:{}: {}", path, err.line, err.column, err.message);
         }
+        for warn in &ctx.sema_result.warnings[prev_warn_len..] {
+            eprintln!("{}:{}:{}: warning: {}", path, warn.line, warn.column, warn.message);
+        }
         prev_err_len = ctx.sema_result.errors.len();
+        prev_warn_len = ctx.sema_result.warnings.len();
     }
     for key in std_keys {
         if let Some(m) = loader.get_module_by_key(key) {
@@ -589,7 +594,11 @@ fn run_sema_pipeline(
             for err in &ctx.sema_result.errors[prev_err_len..] {
                 eprintln!("{}:{}:{}: {}", key, err.line, err.column, err.message);
             }
+            for warn in &ctx.sema_result.warnings[prev_warn_len..] {
+                eprintln!("{}:{}:{}: warning: {}", key, warn.line, warn.column, warn.message);
+            }
             prev_err_len = ctx.sema_result.errors.len();
+            prev_warn_len = ctx.sema_result.warnings.len();
         }
     }
     for k in dep_keys {
@@ -598,12 +607,19 @@ fn run_sema_pipeline(
             for err in &ctx.sema_result.errors[prev_err_len..] {
                 eprintln!("{}:{}:{}: {}", k, err.line, err.column, err.message);
             }
+            for warn in &ctx.sema_result.warnings[prev_warn_len..] {
+                eprintln!("{}:{}:{}: warning: {}", k, warn.line, warn.column, warn.message);
+            }
             prev_err_len = ctx.sema_result.errors.len();
+            prev_warn_len = ctx.sema_result.warnings.len();
         }
     }
     ctx.check_module_with_env(entry_module, root_env, &all_modules);
     for err in &ctx.sema_result.errors[prev_err_len..] {
         eprintln!("{}:{}:{}: {}", entry_filename, err.line, err.column, err.message);
+    }
+    for warn in &ctx.sema_result.warnings[prev_warn_len..] {
+        eprintln!("{}:{}:{}: warning: {}", entry_filename, warn.line, warn.column, warn.message);
     }
 
     if !ctx.sema_result.errors.is_empty() {

@@ -145,7 +145,16 @@ impl<S: LockStrategy> Engine<S> {
         frame.parent_frame_ptr = parent_ptr;
         frame.root_frame_ptr = parent_root;
 
+        // Bug #77: set caller to the parent frame so that when this defer frame completes (in
+        // process_frame's Completed/Failed branch) the parent frame can be woken. The call_node
+        // value is unused for defer frames (defer frames are identified via `defer_frames`), so
+        // NodeId(0) is a safe placeholder.
+        frame.caller = Some((parent_frame.id, crate::ir::Ir::NodeId(0)));
+
         self.frames.lock().insert(fid, frame);
+        // Bug #77: register this frame as a defer frame so process_frame can distinguish it from
+        // ordinary child frames and route its completion to defer_waiter wakeup.
+        self.defer_frames.lock().insert(fid);
         fid
     }
 
