@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::sema::Sema::*;
 use crate::ast::Ast::{
     AstArena, Decl, Expr, ExprId, InterpolationPart, LambdaBody, Module,
@@ -8,25 +6,33 @@ use crate::ast::Ast::{
 };
 use rustc_hash::FxHashMap;
 
-/// 单态化递归深度上限：防止极深泛型调用链导致栈溢出。
-/// in_progress.len() 即当前递归深度，达到上限时停止递归。
+/// Maximum recursion depth for monomorphization: prevents stack overflow from
+/// extremely deep generic call chains.
+/// `in_progress.len()` is the current recursion depth; recursion stops when the
+/// limit is reached.
 const MAX_MONOMORPH_DEPTH: usize = 256;
 
-// ====== 以下是从 Inference.rs（原 SemaInfer.rs）740-2408 行原样迁移的代码 ======
+// ====== The code below was migrated verbatim from Inference.rs (formerly
+//         SemaInfer.rs), lines 740-2408. ======
 // =========================================================================
-// monomorph — 单态化实例化
+// monomorph — monomorphization instantiation.
 //
-// v3 spec §5.2: 迁自 src/sema/monomorph.zig。
-// 职责：识别所有泛型调用点 → 推导 type_args → 去重 → 确定实例集合。
+// v3 spec §5.2: migrated from src/sema/monomorph.zig.
+// Responsibility: identify all generic call sites → infer type_args →
+// deduplicate → determine the instance set.
 //
-// 适配 Rust：
-// - 表达式 key 由裸指针 `@intFromPtr` 改为 `ExprId.0 as u64`（AstArena 索引）
-// - 类型解析委托 `resolve_type_node_resolved`（接收 `Option<AstTypeRef>` 而非 `*TypeNode`）
-// - 借用分离：`WalkCtx` 不持有 `sema_result`，通过独立字段参数传递，避免
-//   `&mut SemaResult` 与 `&mut WalkCtx` 循环借用；`instance` 作为栈上局部变量
-//   在 `push` 前完成体解析，与 `sema_result` 无别名
-// - `field_access` 元信息按 `TypeDefKind` 区分 Record（field_id 从 0）与
-//   ADT/Newtype（field_id 从 1，`__tag=0`），修正 Zig 版 Record 索引偏移
+// Rust adaptations:
+// - Expression keys changed from raw-pointer `@intFromPtr` to
+//   `ExprId.0 as u64` (AstArena index).
+// - Type resolution delegates to `resolve_type_node_resolved` (which takes
+//   `Option<AstTypeRef>` rather than `*TypeNode`).
+// - Borrow separation: `WalkCtx` does not hold `sema_result`; it is passed as a
+//   separate parameter to avoid a circular borrow between `&mut SemaResult` and
+//   `&mut WalkCtx`. `instance` is a stack-local that finishes body resolution
+//   before `push`, so it has no alias with `sema_result`.
+// - `field_access` metadata distinguishes Record (field_id starts at 0) from
+//   ADT/Newtype (field_id starts at 1, `__tag=0`) per `TypeDefKind`, fixing the
+//   Record index offset bug in the Zig version.
 // =========================================================================
 
 /// Compute a stable identity hash for a TypeHandle (for monomorph cache keys).
@@ -54,8 +60,9 @@ fn type_identity_hash(arena: &TypeArena, h: TypeHandle) -> u64 {
     hash
 }
 
-/// FNV-1a 64-bit 哈希（迁自 monomorph.zig:hashTypeArgs）。
-/// 输入为 `TypeHandle` 列表，通过 `type_identity_hash` 派生稳定标识。
+/// FNV-1a 64-bit hash (migrated from monomorph.zig:hashTypeArgs).
+/// Takes a list of `TypeHandle`s and derives a stable identity via
+/// `type_identity_hash`.
 pub fn hash_type_args(arena: &TypeArena, type_args: &[TypeHandle]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &ta in type_args {
@@ -65,7 +72,8 @@ pub fn hash_type_args(arena: &TypeArena, type_args: &[TypeHandle]) -> u64 {
     h
 }
 
-/// 构造单态化缓存键：func_name 与 type_args 的 FNV-1a 组合 u64 哈希（无 String 分配）。
+/// Build a monomorphization cache key: an FNV-1a combined u64 hash of
+/// `func_name` and `type_args` (no String allocation).
 pub fn build_cache_key(func_name: &str, arena: &TypeArena, type_args: &[TypeHandle]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in func_name.as_bytes() {
@@ -76,7 +84,8 @@ pub fn build_cache_key(func_name: &str, arena: &TypeArena, type_args: &[TypeHand
     h.wrapping_mul(0x100000001b3)
 }
 
-/// 查找已有单态化实例（仅查询缓存，不创建）。
+/// Find an existing monomorphization instance (cache lookup only; does not
+/// create).
 pub fn find_instance(
     arena: &TypeArena,
     sema_result: &SemaResult,
@@ -87,55 +96,51 @@ pub fn find_instance(
     sema_result.monomorph_index.get(&cache_key).copied()
 }
 
-/// Compute whether a TypeHandle corresponds to a reference type (str or user-defined).
-/// Mirrors `Ty::is_ref()` semantics: str or dynamic type, excluding nullable.
-fn is_ref_type(arena: &TypeArena, h: TypeHandle) -> bool {
-    let ty = arena.get(h);
-    !matches!(ty, Ty::Nullable(_))
-        && matches!(
-            ty,
-            Ty::Str
-                | Ty::Adt(_)
-                | Ty::Generic(_)
-                | Ty::Trait(_)
-                | Ty::TraitObject(_)
-                | Ty::Record(_)
-                | Ty::ModuleRef(_)
-        )
-}
+// ── AST traversal context ──
 
-// ── AST 遍历上下文 ──
-
-/// AST 遍历上下文：携带函数名 → 声明映射与循环检测表。
+/// AST traversal context: carries the function-name → declaration mapping and
+/// the cycle-detection table.
 ///
-/// 刻意不持有 `sema_result`：所有需要 `&mut SemaResult` 的函数将其作为独立参数
-/// 接收，使 `&mut ctx.in_progress` 与 `&mut sema_result` 可同时存活（split borrow）。
+/// Deliberately does not hold `sema_result`: all functions needing
+/// `&mut SemaResult` take it as a separate parameter, so `&mut ctx.in_progress`
+/// and `&mut sema_result` can coexist (split borrow).
 struct WalkCtx<'a> {
     ast: &'a AstArena<'a>,
-    /// 函数名 → FunDecl 引用，用于推导 type_args 时查询参数类型注解与返回类型
+    /// Function name → `FunDecl` reference, used to look up parameter type
+    /// annotations and return types while inferring type_args.
     func_decls: FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
-    /// 函数名 → 所在模块 arena（跨模块单态化时，get_or_create_instance 需用被调函数
-    /// 所在模块的 arena 解引用 body ExprId / 参数类型注解，而非调用点模块 arena）
+    /// Function name → owning module arena (for cross-module monomorphization,
+    /// `get_or_create_instance` must use the callee's module arena to
+    /// dereference body ExprIds / parameter type annotations, not the call-site
+    /// module arena).
     func_arenas: FxHashMap<&'a str, &'a AstArena<'a>>,
-    /// 函数名 → 所在模块名（跨模块单态化时，expr_types 的 key 必须用被调函数所在模块名，
-    /// 而非调用点模块名，确保 IR Builder 查找时 key 一致）
+    /// Function name → owning module name (for cross-module monomorphization,
+    /// the `expr_types` key must use the callee's module name, not the call-site
+    /// module name, so the IR Builder lookup keys match).
     func_module_names: FxHashMap<&'a str, &'a str>,
-    /// 循环检测：正在实例化的 cache_key → instance_id（前向引用支持）
+    /// Cycle detection: cache_key currently being instantiated → instance_id
+    /// (forward-reference support).
     in_progress: FxHashMap<u64, u32>,
-    /// 当前模块名（用于实参 expr_types 查询，实参属于调用点模块）
+    /// Current module name (used for argument `expr_types` lookup; arguments
+    /// belong to the call-site module).
     module_name: &'a str,
 }
 
-/// 推导泛型调用的 type_args
+/// Infer the type_args of a generic call.
 ///
-/// 优先级：
-/// 1. 显式类型实参（call expr 的 type_args 字段，如 `foo<i32>(x)`）
-/// 2. 隐式推断：
-///    a. `.named` 类型注解（如 `init: A`）→ 实参 `ExprInfo` 的 `TypeHandle`
-///    b. `.function` 类型注解（如 `f: (A, T) -> A`）→ lambda 实参的参数类型注解
-///    c. `.function` 返回类型注解 → lambda 实参的返回类型（注解或 body 推断）
+/// Priority:
+/// 1. Explicit type arguments (the `type_args` field of the call expr, e.g.
+///    `foo<i32>(x)`).
+/// 2. Implicit inference:
+///    a. `.named` type annotation (e.g. `init: A`) → the argument's `ExprInfo`
+///       `TypeHandle`.
+///    b. `.function` type annotation (e.g. `f: (A, T) -> A`) → the lambda
+///       argument's parameter type annotations.
+///    c. `.function` return-type annotation → the lambda argument's return type
+///       (annotation or body inference).
 ///
-/// 未匹配的类型参数用 `arena.make_adt` 创建占位 Adt（name = 参数名）。
+/// Unmatched type parameters get a placeholder Adt via `arena.make_adt` (name =
+/// parameter name).
 fn infer_type_args<'a>(
     func_name: &str,
     arguments: &[ExprId],
@@ -148,7 +153,7 @@ fn infer_type_args<'a>(
     sema_result: &mut SemaResult,
     arena: &mut TypeArena,
 ) -> Vec<TypeHandle> {
-    // 1. 显式类型实参：直接解析每个 TypeNode
+    // 1. Explicit type arguments: resolve each TypeNode directly.
     if let Some(hints) = type_args_hint {
         if !hints.is_empty() {
             let mut args = Vec::with_capacity(hints.len());
@@ -167,11 +172,12 @@ fn infer_type_args<'a>(
         }
     }
 
-    // 2. 隐式推断
+    // 2. Implicit inference.
     let fd_decl = match func_decls.get(func_name).copied() {
         Some(d) => d,
         None => {
-            // AST 不可达（可能是方法或内建函数）：为每个类型参数创建具名 Adt 占位
+            // AST-unreachable (likely a method or built-in): create a named Adt
+            // placeholder for each type parameter.
             return sig
                 .type_params
                 .iter()
@@ -179,8 +185,10 @@ fn infer_type_args<'a>(
                 .collect();
         }
     };
-    // 被调函数所在模块的 arena：跨模块时类型注解 TypeId 属于被调模块 arena，
-    // 必须用 fd_ast（而非 ctx.ast）访问，否则越界。
+    // The callee's owning module arena: for cross-module calls the type
+    // annotation TypeIds belong to the callee's module arena, so they must be
+    // accessed via `fd_ast` (not `ctx.ast`), otherwise indexing goes out of
+    // bounds.
     let fd_ast = func_arenas.get(func_name).copied().unwrap_or(ast);
     let fd = match &fd_decl.node {
         Decl::FunDecl {
@@ -206,7 +214,7 @@ fn infer_type_args<'a>(
 
     let param_count = fd.params.len().min(arguments.len());
 
-    // Pass 1: 匹配 .named 类型注解（如 `init: A` → 实参类型）
+    // Pass 1: match `.named` type annotations (e.g. `init: A` → argument type).
     for (i, arg) in arguments.iter().enumerate().take(param_count) {
         let param_type = match fd.params[i].type_annotation {
             Some(t) => t,
@@ -225,7 +233,8 @@ fn infer_type_args<'a>(
         }
     }
 
-    // Pass 2: 匹配 .function 类型注解（如 `f: (A, T) -> A`）against lambda 实参
+    // Pass 2: match `.function` type annotations (e.g. `f: (A, T) -> A`)
+    // against lambda arguments.
     for (i, arg) in arguments.iter().enumerate().take(param_count) {
         let param_type = match fd.params[i].type_annotation {
             Some(t) => t,
@@ -248,7 +257,7 @@ fn infer_type_args<'a>(
             _ => continue,
         };
 
-        // 匹配函数类型参数与 lambda 参数
+        // Match function-type parameters against lambda parameters.
         let (fn_params, fn_ret) = fn_type;
         let (lambda_params, lambda_rt, _lambda_body) = lambda;
         let match_count = fn_params.len().min(lambda_params.len());
@@ -269,7 +278,7 @@ fn infer_type_args<'a>(
             }
         }
 
-        // 匹配函数返回类型注解 → lambda 返回类型
+        // Match function return-type annotation → lambda return type.
         let ret_name = match &fd_ast.ty(fn_ret).node {
             TypeNode::Named { name } => Some(*name),
             _ => None,
@@ -289,10 +298,13 @@ fn infer_type_args<'a>(
         }
     }
 
-    // Pass 3: .generic 类型注解（如 `l: Lst<T>`）— 目前无法从 ref 通道提取元素类型，
-    // 仅记录未绑定的类型参数名，依赖 Pass 1/2 已绑定的类型参数（跳过未绑定）
+    // Pass 3: `.generic` type annotations (e.g. `l: Lst<T>`) — currently cannot
+    // extract the element type from the ref channel; only records unbound type
+    // parameter names and relies on type parameters already bound in Pass 1/2
+    // (skipping unbound ones).
 
-    // 输出 type_args：以类型参数名构造占位 Adt，使 resolve_type_node_resolved 按名匹配
+    // Emit type_args: build a placeholder Adt from the type parameter name so
+    // `resolve_type_node_resolved` can match by name.
     let mut args = Vec::with_capacity(sig.type_params.len());
     for tp_name in sig.type_params.iter() {
         let h = if let Some(&h) = name_to_handle.get(tp_name.as_ref()) {
@@ -305,8 +317,9 @@ fn infer_type_args<'a>(
     args
 }
 
-/// 从 lambda body 推断返回类型。
-/// 优先：显式返回类型注解 → body expression 的 ExprInfo → block trailing_expr 的 ExprInfo。
+/// Infer the return type from a lambda body.
+/// Priority: explicit return-type annotation → body expression's `ExprInfo` →
+/// block `trailing_expr`'s `ExprInfo`.
 fn infer_lambda_return_type<'a>(
     lambda: (&'a [Param<'a>], Option<AstTypeRef>, &'a LambdaBody),
     ast: &'a AstArena<'a>,
@@ -333,12 +346,15 @@ fn infer_lambda_return_type<'a>(
     }
 }
 
-/// 查找或创建 `MonomorphInstance`
+/// Find or create a `MonomorphInstance`.
 ///
-/// 1. 查 `monomorph_index` 缓存命中 → 返回 instance_id
-/// 2. 未命中：创建栈上局部实例、注册 `in_progress`（前向引用支持）
-/// 3. 用具体 type_args 解析函数体内所有表达式类型（可能触发前向引用）
-/// 4. 解析完成后 `push` 到 `monomorph_instances`、写入缓存
+/// 1. Check `monomorph_index` cache; on hit, return the instance_id.
+/// 2. On miss: create a stack-local instance, register it in `in_progress`
+///    (forward-reference support).
+/// 3. Resolve all expression types in the function body using the concrete
+///    type_args (may trigger forward references).
+/// 4. After resolution completes, `push` to `monomorph_instances` and write the
+///    cache.
 fn get_or_create_instance<'a>(
     func_name: &str,
     type_args: &[TypeHandle],
@@ -354,21 +370,22 @@ fn get_or_create_instance<'a>(
 ) -> u32 {
     let cache_key = build_cache_key(func_name, arena, type_args);
 
-    // 1. 查缓存
+    // 1. Check the cache.
     if let Some(&idx) = sema_result.monomorph_index.get(&cache_key) {
         return idx;
     }
 
-    // 2. 循环检测：前向引用支持
+    // 2. Cycle detection: forward-reference support.
     if let Some(&existing_id) = in_progress.get(&cache_key) {
         return existing_id;
     }
-    // 递归深度上限：in_progress.len() 即当前递归深度，超限停止递归防止栈溢出
+    // Recursion-depth limit: `in_progress.len()` is the current depth; stop
+    // recursing past the limit to prevent stack overflow.
     if in_progress.len() >= MAX_MONOMORPH_DEPTH {
         panic!("monomorph recursion depth exceeded {} for function {}", MAX_MONOMORPH_DEPTH, func_name);
     }
 
-    // 3. 新建栈上实例
+    // 3. Create a stack-local instance.
     let fd = match &fd_decl.node {
         Decl::FunDecl {
             type_params,
@@ -410,11 +427,13 @@ fn get_or_create_instance<'a>(
         field_accesses: FxHashMap::default(),
     };
 
-    // 4. 标记为正在实例化（前向引用支持）
+    // 4. Mark as in-progress (forward-reference support).
     in_progress.insert(cache_key, instance_id);
 
-    // 5. 递归解析函数体类型（instance 是栈上局部，与 sema_result 无别名）
-    // module_name 是被调函数所在模块名，确保 expr_types key 与 IR Builder 查找一致
+    // 5. Recursively resolve body types (`instance` is stack-local, with no
+    //    alias with `sema_result`).
+    // `module_name` is the callee's module name, ensuring the `expr_types` key
+    // matches the IR Builder lookup.
     resolve_instance_body_types(
         &mut instance,
         &fd,
@@ -429,13 +448,14 @@ fn get_or_create_instance<'a>(
         arena,
     );
 
-    // 6. 写入实例表与缓存
+    // 6. Write to the instance table and cache.
     sema_result.monomorph_instances.push(instance);
     sema_result.monomorph_index.insert(cache_key, instance_id);
     instance_id
 }
 
-/// FunDecl 字段视图（从 `Decl::FunDecl` 提取，便于跨函数传递）。
+/// Field view of `FunDecl` (extracted from `Decl::FunDecl` for easy cross-
+/// function passing).
 struct FunDeclView<'a> {
     type_params: &'a [TypeParam<'a>],
     params: &'a [Param<'a>],
@@ -444,12 +464,13 @@ struct FunDeclView<'a> {
     is_async: bool,
 }
 
-// ── AST 递归遍历：收集泛型调用点 ──
+// ── AST recursive traversal: collect generic call sites ──
 
-/// 处理直接调用表达式（callee 为标识符）。
+/// Process a direct call expression (callee is an identifier).
 ///
-/// 仅处理 callee 是 identifier 的直接函数调用。方法调用、闭包调用等由
-/// `process_method_call` 处理或跳过（递归遍历仍会进入 recv/arguments）。
+/// Only handles direct function calls where the callee is an identifier. Method
+/// calls, closure calls, etc. are handled by `process_method_call` or skipped
+/// (recursive traversal still descends into recv/arguments).
 #[allow(clippy::too_many_arguments)]
 fn process_call<'a>(
     callee: ExprId,
@@ -465,12 +486,13 @@ fn process_call<'a>(
     module_name: &'a str,
     arena: &mut TypeArena,
 ) {
-    // 仅处理直接标识符调用：foo(args) 或 foo<T>(args)
+    // Only handle direct identifier calls: `foo(args)` or `foo<T>(args)`.
     let func_name = match &ast.expr(callee).node {
         Expr::Ident(name) => *name,
         _ => return,
     };
-    // 查函数签名：跳过未注册函数与非泛型函数
+    // Look up the function signature: skip unregistered and non-generic
+    // functions.
     let sig_owned: Option<FuncSigInfo> = sema_result
         .get_func_sig(func_name).cloned();
     let sig = match sig_owned {
@@ -478,16 +500,17 @@ fn process_call<'a>(
         _ => return,
     };
 
-    // 查函数 AST（用于参数类型注解与返回类型）
+    // Look up the function AST (for parameter type annotations and return type).
     let fd_decl = match func_decls.get(func_name).copied() {
         Some(d) => d,
         None => return,
     };
 
-    // 推导 type_args（显式或隐式）
-    // module_name 必须用调用点所在模块：实参表达式的类型信息以
-    // module_expr_key(调用点模块, expr_id) 为 key 存入 expr_types，
-    // 若用空串将导致 infer_type_args 查不到实参类型，T 无法绑定。
+    // Infer type_args (explicit or implicit).
+    // `module_name` must be the call-site module: argument expression type info
+    // is stored in `expr_types` under the key
+    // `module_expr_key(call_site_module, expr_id)`; using an empty string would
+    // cause `infer_type_args` to miss the argument types and leave T unbound.
     let type_args = infer_type_args(
         func_name,
         arguments,
@@ -501,11 +524,13 @@ fn process_call<'a>(
         arena,
     );
 
-    // 查找或创建实例
-    // ast 用被调函数所在模块 arena（跨模块时 body ExprId 属于被调模块 arena），
-    // 回退调用点 arena（同模块调用场景）
+    // Find or create the instance.
+    // `ast` uses the callee's module arena (for cross-module calls the body
+    // ExprIds belong to the callee's arena), falling back to the call-site arena
+    // (same-module call case).
     let callee_ast = func_arenas.get(func_name).copied().unwrap_or(ast);
-    // module_name 用被调函数所在模块名（跨模块时 expr_types key 必须与 IR Builder 查找一致）
+    // `module_name` uses the callee's module name (for cross-module calls the
+    // `expr_types` key must match the IR Builder lookup).
     let callee_module_name = func_module_names.get(func_name).copied().unwrap_or(module_name);
     let instance_id = get_or_create_instance(
         func_name,
@@ -521,18 +546,21 @@ fn process_call<'a>(
         arena,
     );
 
-    // 记录调用点 → 实例映射（用 module_expr_key 避免跨模块 ExprId 碰撞）
+    // Record the call-site → instance mapping (uses `module_expr_key` to avoid
+    // cross-module ExprId collisions).
     let call_key = crate::sema::Sema::module_expr_key(module_name, call_expr.0 as u64);
     sema_result
         .call_instantiations
         .insert(call_key, instance_id);
 }
 
-/// 处理方法调用表达式。
+/// Process a method-call expression.
 ///
-/// 方法调用通过 trait 分派，完整解析需要对象类型构造 mangled 名。此处采用最佳努力
-/// 策略：直接以方法名查 `func_sig`，命中则处理；未命中则跳过。递归遍历仍会进入
-/// recv/arguments，保证嵌套调用被收集。
+/// Method calls go through trait dispatch, and full resolution requires the
+/// object type to construct the mangled name. A best-effort strategy is used
+/// here: look up `func_sig` directly by method name and process on hit, skip
+/// otherwise. Recursive traversal still descends into recv/arguments, ensuring
+/// nested calls are collected.
 #[allow(clippy::too_many_arguments)]
 fn process_method_call<'a>(
     method: &str,
@@ -548,7 +576,8 @@ fn process_method_call<'a>(
     module_name: &'a str,
     arena: &mut TypeArena,
 ) {
-    // 直接以方法名查 func_sig（覆盖同名顶层函数的罕见场景）
+    // Look up `func_sig` directly by method name (covers the rare case of a
+    // same-named top-level function).
     let sig_owned: Option<FuncSigInfo> = sema_result.get_func_sig(method).cloned();
     let sig = match sig_owned {
         Some(s) if !s.type_params.is_empty() => s,
@@ -574,9 +603,11 @@ fn process_method_call<'a>(
         arena,
     );
 
-    // ast 用被调函数所在模块 arena（跨模块 Module.fun() 调用时 body 属于被调模块）
+    // `ast` uses the callee's module arena (for cross-module `Module.fun()`
+    // calls the body belongs to the callee's module).
     let callee_ast = func_arenas.get(method).copied().unwrap_or(ast);
-    // module_name 用被调函数所在模块名（跨模块时 expr_types key 必须与 IR Builder 查找一致）
+    // `module_name` uses the callee's module name (for cross-module calls the
+    // `expr_types` key must match the IR Builder lookup).
     let callee_module_name = func_module_names.get(method).copied().unwrap_or(module_name);
     let instance_id = get_or_create_instance(
         method,
@@ -596,8 +627,10 @@ fn process_method_call<'a>(
         .call_instantiations
         .insert(call_key, instance_id);
 
-    // v3 阶段 1：记录方法分派元信息（最佳努力匹配，完整 trait 解析留待后续阶段）
-    // 键使用 module_expr_key（与 call_instantiations 一致），供 IR 查询 intrinsic
+    // v3 phase 1: record method-dispatch metadata (best-effort match; full
+    // trait resolution is deferred to a later phase).
+    // The key uses `module_expr_key` (consistent with `call_instantiations`) so
+    // the IR can query the intrinsic.
     let dispatch_key = crate::sema::Sema::module_expr_key(module_name, call_expr.0 as u64);
     sema_result.method_dispatches.insert(
         dispatch_key,
@@ -611,7 +644,7 @@ fn process_method_call<'a>(
     );
 }
 
-/// 递归遍历 Stmt，收集所有嵌套的泛型调用点。
+/// Recursively walk a `Stmt`, collecting all nested generic call sites.
 fn walk_stmt<'a>(
     stmt: StmtId,
     ctx: &mut WalkCtx<'a>,
@@ -663,24 +696,26 @@ fn walk_stmt<'a>(
     }
 }
 
-/// 递归遍历 Expr，收集所有嵌套的泛型调用点。
+/// Recursively walk an `Expr`, collecting all nested generic call sites.
 ///
-/// 对 `call`/`method_call`/`safe_method_call` 三种调用表达式，提取调用元信息并
-/// 推导 type_args。同时递归进入所有子表达式，确保嵌套调用被完整收集。
+/// For the three call-expression kinds (`call`/`method_call`/`safe_method_call`),
+/// extracts the call metadata and infers type_args. Also recurses into all
+/// sub-expressions to ensure nested calls are fully collected.
 fn walk_expr<'a>(
     expr: ExprId,
     ctx: &mut WalkCtx<'a>,
     sema_result: &mut SemaResult,
     arena: &mut TypeArena,
 ) {
-    // 先复制不可变引用字段，再用 &mut ctx.in_progress（split borrow）
+    // Copy the immutable-reference fields first, then use
+    // `&mut ctx.in_progress` (split borrow).
     let ast = ctx.ast;
     let func_decls = &ctx.func_decls;
     let func_arenas = &ctx.func_arenas;
     let func_module_names = &ctx.func_module_names;
     let node = &ast.expr(expr).node;
     match node {
-        // ── 调用表达式：核心收集目标 ──
+        // ── Call expressions: primary collection target ──
         Expr::Call {
             callee,
             args,
@@ -759,7 +794,7 @@ fn walk_expr<'a>(
             }
         }
 
-        // ── 一元/二元/赋值 ──
+        // ── Unary/binary/assignment ──
         Expr::Binary { op: _, lhs, rhs } => {
             walk_expr(*lhs, ctx, sema_result, arena);
             walk_expr(*rhs, ctx, sema_result, arena);
@@ -782,7 +817,7 @@ fn walk_expr<'a>(
             walk_expr(*rhs, ctx, sema_result, arena);
         }
 
-        // ── 字段访问与索引 ──
+        // ── Field access and indexing ──
         Expr::FieldAccess { recv, .. } => walk_expr(*recv, ctx, sema_result, arena),
         Expr::SafeAccess { recv, .. } => walk_expr(*recv, ctx, sema_result, arena),
         Expr::Index { recv, index } => {
@@ -795,7 +830,7 @@ fn walk_expr<'a>(
             walk_expr(*end, ctx, sema_result, arena);
         }
 
-        // ── 容器字面量 ──
+        // ── Container literals ──
         Expr::ArrayLit { elements, fill } => {
             for &e in elements {
                 walk_expr(e, ctx, sema_result, arena);
@@ -817,7 +852,7 @@ fn walk_expr<'a>(
             }
         }
 
-        // ── 控制流 ──
+        // ── Control flow ──
         Expr::Lambda { body, .. } => match body {
             LambdaBody::Block(b) => walk_expr(*b, ctx, sema_result, arena),
             LambdaBody::Expression(e) => walk_expr(*e, ctx, sema_result, arena),
@@ -851,7 +886,7 @@ fn walk_expr<'a>(
             }
         }
 
-        // ── 并发/异步 ──
+        // ── Concurrency/async ──
         Expr::Atomic(e) => walk_expr(*e, ctx, sema_result, arena),
         Expr::Lazy(e) => walk_expr(*e, ctx, sema_result, arena),
         Expr::Select(arms) => {
@@ -871,7 +906,7 @@ fn walk_expr<'a>(
             }
         }
 
-        // ── 字符串插值 ──
+        // ── String interpolation ──
         Expr::StrInterp(parts) => {
             for part in parts {
                 if let InterpolationPart::Expression(e) = part {
@@ -880,7 +915,7 @@ fn walk_expr<'a>(
             }
         }
 
-        // ── inline trait value：方法体可能含泛型调用 ──
+        // ── Inline trait value: method bodies may contain generic calls ──
         Expr::InlineTrait(methods) => {
             for method in methods {
                 if let Some(body) = method.body {
@@ -889,7 +924,7 @@ fn walk_expr<'a>(
             }
         }
 
-        // ── 终端节点：无需递归 ──
+        // ── Terminal nodes: no recursion needed ──
         Expr::IntLit { .. }
         | Expr::FloatLit { .. }
         | Expr::BoolLit(_)
@@ -901,26 +936,33 @@ fn walk_expr<'a>(
     }
 }
 
-// ── 主入口：collect_monomorph_instances ──
+// ── Main entry point: collect_monomorph_instances ──
 
-/// 收集模块中所有泛型调用点，产出单态化实例集合
+/// Collect all generic call sites in a module, producing the monomorphization
+/// instance set.
 ///
-/// v3 spec §5.2 `collectMonomorphInstances` 算法：
-/// 1. 构建 `func_name → fun_decl` 映射，供推导 type_args 时查询参数类型注解
-/// 2. 遍历所有顶层声明：
-///    a. 非泛型 `fun_decl` → 创建空 type_args 实例
-///    b. 所有 `fun_decl` 体 / `type_decl` 方法体 / `expr_decl` → 递归遍历
-/// 3. 对每个泛型调用点：推导 type_args → 去重 → 创建实例 → 记录调用点映射
+/// v3 spec §5.2 `collectMonomorphInstances` algorithm:
+/// 1. Build the `func_name → fun_decl` mapping, used to look up parameter type
+///    annotations while inferring type_args.
+/// 2. Walk all top-level declarations:
+///    a. Non-generic `fun_decl` → create an empty-type_args instance.
+///    b. All `fun_decl` bodies / `type_decl` method bodies / `expr_decl` →
+///       recursive traversal.
+/// 3. For each generic call site: infer type_args → deduplicate → create the
+///    instance → record the call-site mapping.
 ///
-/// 泛型函数本身不创建空实例（其具体实例由调用点驱动生成）。
-/// 方法调用的完整 trait 分派解析留待后续阶段，当前仅做最佳努力匹配。
+/// Generic functions themselves do not create empty instances (their concrete
+/// instances are driven by call sites). Full trait-dispatch resolution for
+/// method calls is deferred to a later phase; only best-effort matching is
+/// done here.
 pub fn collect_monomorph_instances<'a>(
     module: &'a Module<'a>,
     all_modules: &[&'a Module<'a>],
     sema_result: &mut SemaResult,
     arena: &mut TypeArena,
 ) {
-    // 注册内置类型方法签名（合成 TypeDefInfo），使方法查找走统一 (type_id, method_idx) 路径
+    // Register built-in type method signatures (synthetic TypeDefInfo) so
+    // method lookup goes through the unified (type_id, method_idx) path.
     register_builtin_method_sigs(sema_result);
 
     let mut ctx = WalkCtx {
@@ -932,10 +974,13 @@ pub fn collect_monomorph_instances<'a>(
         module_name: module.name,
     };
 
-    // 1. 构建 func_name → &Spanned<Decl> + 所在模块 arena + 所在模块名 映射（跨模块收集顶层 fun_decl）
-    // 跨模块单态化：调用 std.math.Math.abs<T>(x) 时，func_decls 需能命中 abs（定义在 Math 模块），
-    // func_arenas 提供 abs 所在模块 arena，供 get_or_create_instance 解引用 body ExprId，
-    // func_module_names 提供 abs 所在模块名，确保 expr_types 的 key 与 IR Builder 查找一致。
+    // 1. Build func_name → &Spanned<Decl> + owning module arena + owning module
+    //    name mappings (collect top-level fun_decls across modules).
+    // Cross-module monomorphization: when calling `std.math.Math.abs<T>(x)`,
+    // `func_decls` must find `abs` (defined in the Math module), `func_arenas`
+    // provides the arena of abs's module so `get_or_create_instance` can
+    // dereference body ExprIds, and `func_module_names` provides abs's module
+    // name so the `expr_types` key matches the IR Builder lookup.
     for m in all_modules {
         for decl in &m.declarations {
             if let Decl::FunDecl { name, .. } = &decl.node {
@@ -946,7 +991,7 @@ pub fn collect_monomorph_instances<'a>(
         }
     }
 
-    // 2. 遍历所有顶层声明
+    // 2. Walk all top-level declarations.
     let declarations: Vec<&Spanned<Decl<'a>>> = module.declarations.iter().collect();
     for decl in declarations {
         match &decl.node {
@@ -959,8 +1004,9 @@ pub fn collect_monomorph_instances<'a>(
                 is_async,
                 ..
             } => {
-                // 非泛型函数：创建空 type_args 实例
-                // （泛型函数不创建空实例，由调用点驱动）
+                // Non-generic function: create an empty-type_args instance.
+                // (Generic functions do not create empty instances; they are
+                // driven by call sites.)
                 if type_params.is_empty() {
                     let empty_type_args: Vec<TypeHandle> = Vec::new();
                     let return_handle = resolve_type_node_resolved(
@@ -991,17 +1037,22 @@ pub fn collect_monomorph_instances<'a>(
                     };
                     sema_result.monomorph_instances.push(instance);
 
-                    // 非泛型函数：遍历函数体收集泛型调用点
-                    // （泛型函数体的调用点在 resolveInstanceBodyTypes 中发现，
-                    //  因为它们依赖当前实例的 type_args 上下文才能正确推断类型实参）
+                    // Non-generic function: walk the function body to collect
+                    // generic call sites.
+                    // (Call sites inside a generic function body are discovered
+                    // in `resolveInstanceBodyTypes`, since they depend on the
+                    // current instance's type_args context to correctly infer
+                    // type arguments.)
                     walk_expr(*body, &mut ctx, sema_result, arena);
                 }
-                let _ = params; // params 未在非泛型分支使用
+                let _ = params; // params unused in the non-generic branch
             }
 
-            // 类型声明：遍历非泛型方法体（泛型方法体在实例化时发现）
+            // Type declaration: walk non-generic method bodies (generic method
+            // bodies are discovered during instantiation).
             Decl::TypeDecl { methods, .. } => {
-                // 收集需遍历的方法体，避免在借用 methods 时 &mut sema_result
+                // Collect the method bodies to walk, avoiding `&mut sema_result`
+                // while borrowing `methods`.
                 let bodies: Vec<ExprId> = methods
                     .iter()
                     .filter(|m| m.type_params.is_empty())
@@ -1012,7 +1063,7 @@ pub fn collect_monomorph_instances<'a>(
                 }
             }
 
-            // 顶层表达式声明：遍历表达式
+            // Top-level expression declaration: walk the expression.
             Decl::ExprDecl { expr, stmt } => {
                 walk_expr(*expr, &mut ctx, sema_result, arena);
                 if let Some(s) = stmt {
@@ -1020,19 +1071,21 @@ pub fn collect_monomorph_instances<'a>(
                 }
             }
 
-            // import / pack：无需遍历
+            // import / pack: no traversal needed.
             _ => {}
         }
     }
 }
 
-// ── 实例体类型解析 ──
+// ── Instance body type resolution ──
 
-/// 用具体 type_args 解析函数体内所有表达式类型
+/// Resolve all expression types in the function body using the concrete
+/// type_args.
 ///
-/// 递归遍历函数体 AST，对每个表达式计算其类型并存入 `instance.expr_types`。
-/// 对 `field_access` 表达式额外存入 `instance.field_accesses`。
-/// 替代 IRBuilder 的 `infer*` 系列函数。
+/// Recursively walks the function body AST, computing the type of each
+/// expression and storing it in `instance.expr_types`. For `field_access`
+/// expressions, additionally stores info in `instance.field_accesses`.
+/// Replaces the IRBuilder `infer*` family of functions.
 fn resolve_instance_body_types<'a>(
     instance: &mut MonomorphInstance,
     fd: &FunDeclView<'a>,
@@ -1048,21 +1101,23 @@ fn resolve_instance_body_types<'a>(
 ) {
     use crate::sema::Inference::InferContext;
 
-    // ── 步骤 1：用 InferContext 实例化模式解析函数体类型 ──
-    // 创建临时 InferContext，用具体 type_args 替换 rigid TypeVar，
-    // 跑一遍 infer_expr 将所有表达式类型写入 local_expr_types。
+    // ── Step 1: resolve body types using InferContext instantiation mode ──
+    // Create a temporary InferContext, replace the rigid TypeVars with the
+    // concrete type_args, and run `infer_expr` once to write all expression
+    // types into `local_expr_types`.
     let local_expr_types: FxHashMap<u64, ExprInfo>;
     {
         let mut infer_ctx = InferContext::new(arena, sema_result);
         infer_ctx.current_module_name = module_name.to_string();
 
-        // push type bindings（先放 rigid var，enter_instantiation_mode 会替换为具体 type_args）
+        // Push type bindings (place rigid vars first; `enter_instantiation_mode`
+        // will replace them with the concrete type_args).
         let type_param_names: Vec<&str> = fd.type_params.iter().map(|tp| tp.name).collect();
         infer_ctx.push_type_bindings(
             &type_param_names.iter().map(|&name| (name, None)).collect::<Vec<_>>(),
         );
 
-        // 进入实例化模式：rigid var → 具体 type_args
+        // Enter instantiation mode: rigid var → concrete type_args.
         infer_ctx.enter_instantiation_mode(
             instance.func_name.clone(),
             type_args.to_vec().into_boxed_slice(),
@@ -1071,7 +1126,7 @@ fn resolve_instance_body_types<'a>(
             in_progress.clone(),
         );
 
-        // 创建环境并注册函数参数
+        // Create the environment and register the function parameters.
         let fn_env = infer_ctx.env.root();
         for param in fd.params {
             let h = if let Some(ta) = param.type_annotation {
@@ -1082,7 +1137,7 @@ fn resolve_instance_body_types<'a>(
             infer_ctx.env.define(fn_env, param.name, h);
         }
 
-        // 设置返回类型
+        // Set the return type.
         let ret_ty = if let Some(rt) = fd.return_type {
             infer_ctx.type_from_ast(rt, ast)
         } else {
@@ -1090,10 +1145,11 @@ fn resolve_instance_body_types<'a>(
         };
         infer_ctx.expected_return = Some(ret_ty);
 
-        // 推断函数体（实例化模式下 unify_or_constrain 跳过，store_expr_info 写入 local_expr_types）
+        // Infer the function body (in instantiation mode `unify_or_constrain`
+        // is skipped; `store_expr_info` writes to `local_expr_types`).
         let _ = infer_ctx.infer_expr(fd.body, ast, fn_env, infer_ctx.expected_return);
 
-        // 离开实例化模式，取出暂存类型
+        // Leave instantiation mode and retrieve the stashed types.
         if let Some((let_local, _field_accesses, let_in_progress)) =
             infer_ctx.leave_instantiation_mode()
         {
@@ -1104,11 +1160,13 @@ fn resolve_instance_body_types<'a>(
         }
 
         infer_ctx.pop_type_bindings();
-    } // infer_ctx dropped，释放 &mut arena 和 &mut sema_result
+    } // infer_ctx dropped, releasing &mut arena and &mut sema_result
 
-    // 合并 local_expr_types 到 instance.expr_types + sema_result.expr_types
-    // instance.expr_types：实例本地查询（IR Builder 用）
-    // sema_result.expr_types：全局查询（process_call → infer_type_args 用）
+    // Merge `local_expr_types` into `instance.expr_types` +
+    // `sema_result.expr_types`.
+    // `instance.expr_types`: instance-local lookup (used by the IR Builder).
+    // `sema_result.expr_types`: global lookup (used by `process_call` →
+    // `infer_type_args`).
     for (key, info) in &local_expr_types {
         instance.expr_types.insert(*key, info.clone());
     }
@@ -1116,9 +1174,12 @@ fn resolve_instance_body_types<'a>(
         sema_result.put_expr(key, info);
     }
 
-    // ── 步骤 2：用 walk_expr + process_call 触发嵌套调用的单态化 ──
-    // 复用顶层路径：walk_expr 遍历函数体，遇到 Call/MethodCall 时 process_call
-    // 从 sema_result.expr_types 查询实参类型（步骤 1 已写入），推断 type_args 并创建嵌套实例
+    // ── Step 2: use `walk_expr` + `process_call` to trigger monomorphization of
+    //    nested calls ──
+    // Reuse the top-level path: `walk_expr` walks the function body; on
+    // Call/MethodCall it calls `process_call`, which looks up argument types
+    // from `sema_result.expr_types` (written in step 1), infers type_args, and
+    // creates nested instances.
     let mut walk_ctx = WalkCtx {
         ast,
         func_decls: func_decls.clone(),
@@ -1131,12 +1192,14 @@ fn resolve_instance_body_types<'a>(
     *in_progress = walk_ctx.in_progress;
 }
 
-// ====== 以下是新增的 trait 默认方法单态化逻辑 ======
+// ====== New trait-default-method monomorphization logic below ======
 
-/// 判断类型是否在 AST 层显式实现了某方法（有 body）。
+/// Whether a type explicitly implements a method at the AST level (has a body).
 ///
-/// 用于跳过 trait 默认方法特化：类型已显式覆写该方法时不需要生成特化子图。
-/// 与 Ir.rs 步骤 0 注册 method_subgraphs 的条件一致（method.body.is_some()）。
+/// Used to skip trait-default-method specialization: when the type already
+/// explicitly overrides the method, no specialized subgraph is needed.
+/// Matches the condition used in Ir.rs step 0 for registering `method_subgraphs`
+/// (`method.body.is_some()`).
 fn type_has_explicit_method<'a>(module: &'a Module<'a>, type_name: &str, method_name: &str) -> bool {
     for decl in &module.declarations {
         if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &decl.node {
@@ -1148,16 +1211,20 @@ fn type_has_explicit_method<'a>(module: &'a Module<'a>, type_name: &str, method_
     false
 }
 
-/// 收集 trait 默认方法单态化实例。
+/// Collect trait-default-method monomorphization instances.
 ///
-/// 为每个实现 trait 但未显式覆写该方法的类型生成一个 TraitDefaultInstance 条目。
-/// IR 层（IrBuilder）消费此表预注册并编译特化子图。
+/// Generates a `TraitDefaultInstance` entry for each type that implements a
+/// trait but does not explicitly override the method. The IR layer (IrBuilder)
+/// consumes this table to pre-register and compile specialized subgraphs.
 ///
-/// 算法：
-/// 1. 遍历模块中的 TraitDecl，获取 trait_idx
-/// 2. 从 witness_table 收集所有实现该 trait 的类型 (type_id, type_name)
-/// 3. 对每个有 body 的默认方法，为每个实现类型生成特化实例
-/// 4. 跳过类型已显式覆写该方法的情况（AST 层判断 type_has_explicit_method）
+/// Algorithm:
+/// 1. Walk the module's `TraitDecl`s and obtain the `trait_idx`.
+/// 2. Collect all types implementing the trait (type_id, type_name) from the
+///    `witness_table`.
+/// 3. For each default method with a body, generate a specialized instance
+///    for each implementing type.
+/// 4. Skip types that explicitly override the method (checked at the AST level
+///    via `type_has_explicit_method`).
 pub fn collect_trait_default_instances<'a>(
     module: &'a Module<'a>,
     sema_result: &mut SemaResult,
@@ -1168,14 +1235,15 @@ pub fn collect_trait_default_instances<'a>(
                 Some(idx) => idx,
                 None => continue,
             };
-            // 收集所有实现该 trait 的类型（从 witness_table）
+            // Collect all types implementing this trait (from the
+            // witness_table).
             let impl_entries: Vec<(u16, String)> = sema_result
                 .witness_table
                 .entries()
                 .iter()
                 .filter(|e| e.trait_name.as_ref() == *name)
                 .filter_map(|e| {
-                    // type_id → type_name（反查 type_defs）
+                    // type_id → type_name (reverse-lookup in type_defs).
                     sema_result.type_defs.iter().enumerate()
                         .find(|(i, _)| crate::types::dynamic_type_id(*i as u16) == e.type_id)
                         .map(|(_, td)| (e.type_id, td.name.to_string()))
@@ -1188,7 +1256,7 @@ pub fn collect_trait_default_instances<'a>(
                 }
                 let method_name: &str = method.name.as_ref();
                 for (type_id, type_name) in &impl_entries {
-                    // 跳过类型已显式覆写该方法的情况
+                    // Skip types that explicitly override this method.
                     if type_has_explicit_method(module, type_name, method_name) {
                         continue;
                     }
@@ -1205,14 +1273,18 @@ pub fn collect_trait_default_instances<'a>(
     }
 }
 
-/// Sema 后单态化统一入口。
+/// Unified post-sema monomorphization entry point.
 ///
-/// 在 Sema 阶段完成后调用，执行两类单态化实例收集：
-/// 1. `collect_monomorph_instances`：泛型函数调用点驱动的单态化
-/// 2. `collect_trait_default_instances`：trait 默认方法按实现类型特化
+/// Called after the Sema phase completes; runs two kinds of monomorphization
+/// instance collection:
+/// 1. `collect_monomorph_instances`: call-site-driven monomorphization of
+///    generic functions.
+/// 2. `collect_trait_default_instances`: specialization of trait default
+///    methods per implementing type.
 ///
-/// IR 层（IrBuilder）消费 SemaResult 中的 monomorph_instances 和 trait_default_instances
-/// 生成对应的特化子图。
+/// The IR layer (IrBuilder) consumes `monomorph_instances` and
+/// `trait_default_instances` in `SemaResult` to generate the corresponding
+/// specialized subgraphs.
 pub fn run_monomorphization<'a>(
     module: &'a Module<'a>,
     all_modules: &[&'a Module<'a>],

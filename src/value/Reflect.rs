@@ -1,13 +1,14 @@
-//! Reflect.rs — 反射原语 extern "C" fn 实现
+//! Reflect.rs — reflection primitive `extern "C" fn` implementations.
 //!
-//! 所有原语接收 ValueHandle (u32)，内部查全局 ValueArena 拿 HeapObj，
-//! 直接 match 读取已携带的类型信息。无 type_table、无 type_id 注入、无查表。
+//! All primitives receive a `ValueHandle` (`u32`); internally they look up the `HeapObj` from the global
+//! `ValueArena` and directly match on the type information it already carries. No `type_table`,
+//! no `type_id` injection, no table lookup.
 //!
-//! 职责边界：
-//! - Value.rs：Value 系统自描述（RecordValue.type_name 等字段已自带类型信息）
-//! - Reflect.rs：extern "C" 原语，match HeapObj 返回反射信息
-//! - Raw.kz：@extern("C") 声明，C ABI 调用约定
-//! - Reflect.kz：Reflect 内建类型 + wrapper 函数
+//! Responsibility boundaries:
+//! - Value.rs: the Value system is self-describing (fields like `RecordValue.type_name` carry their own type info)
+//! - Reflect.rs: `extern "C"` primitives that match on `HeapObj` to return reflection information
+//! - Raw.kz: `@extern("C")` declarations, C ABI calling convention
+//! - Reflect.kz: `Reflect` built-in type + wrapper functions
 
 use std::ffi::CString;
 
@@ -15,7 +16,7 @@ use super::arena::ValueArena;
 use super::value::{F16, F128, HeapObj, RefKind, ValueTag, Value, ValueHandle};
 
 // =========================================================================
-// TypeKind 枚举（与 Kuzo 侧 kind 值一致，供用户判断类型分类）
+// TypeKind enum (values match the Kuzo-side kind constants; lets users classify types)
 // =========================================================================
 
 pub const KIND_NULL: u8 = 0;
@@ -45,7 +46,7 @@ pub const KIND_ADT: u8 = 23;
 pub const KIND_NEWTYPE: u8 = 24;
 pub const KIND_ARRAY: u8 = 25;
 
-/// ValueTag → TypeKind 映射（标量直接映射，堆对象走 ref_kind）
+/// ValueTag → TypeKind mapping (scalars map directly; heap objects go through ref_kind).
 fn tag_to_kind(tag: ValueTag) -> u8 {
     match tag {
         ValueTag::Null => KIND_NULL,
@@ -72,7 +73,7 @@ fn tag_to_kind(tag: ValueTag) -> u8 {
     }
 }
 
-/// ref_kind → TypeKind
+/// ref_kind → TypeKind.
 fn ref_kind_to_kind(rk: RefKind) -> u8 {
     match rk {
         RefKind::Str => KIND_STR,
@@ -85,11 +86,12 @@ fn ref_kind_to_kind(rk: RefKind) -> u8 {
 }
 
 // =========================================================================
-// str 返回辅助：thread_local 缓冲避免悬垂指针
+// str return helpers: thread_local buffers avoid dangling pointers.
 //
-// [R-1 契约] write_str_out / write_slice_out 写入 *out_data 的指针仅保证有效
-// 到「同一线程下一次调用任意 reflect 原语之前」。C 侧必须立即消费（memcpy），
-// 不得跨 reflect 调用持有。原因：缓冲为 thread_local 单槽，下次调用即替换。
+// [R-1 contract] The pointer written to *out_data by write_str_out / write_slice_out is only valid
+// until "the next call to any reflect primitive on the same thread". The C side must consume it
+// immediately (memcpy) and must not retain it across reflect calls. Reason: the buffer is a
+// thread_local single-slot; the next call replaces it.
 // =========================================================================
 
 thread_local! {
@@ -99,7 +101,7 @@ thread_local! {
 fn write_str_out(s: &str, out_data: *mut *const u8, out_len: *mut usize) {
     NAME_BUF.with(|buf| {
         let mut b = buf.borrow_mut();
-        // [R-4] 含 NUL 的字符串视为非法（类型名不应含 NUL），显式标记而非静默空串
+        // [R-4] Strings containing NUL are treated as illegal (type names must not contain NUL); mark explicitly rather than silently producing an empty string
         *b = CString::new(s).unwrap_or_else(|_| CString::new("<invalid-name>").unwrap());
         unsafe {
             *out_data = b.as_ptr() as *const u8;
@@ -108,8 +110,8 @@ fn write_str_out(s: &str, out_data: *mut *const u8, out_len: *mut usize) {
     });
 }
 
-/// 写入静态/借用字节切片指针到 out 参数（不经过 CString，零拷贝）。
-/// 调用方须保证 `data` 在指针被消费前存活（静态切片或 thread_local 缓冲）。
+/// Writes a static/borrowed byte-slice pointer to the out parameters (no CString involved; zero-copy).
+/// The caller must ensure `data` outlives consumption of the pointer (static slice or thread_local buffer).
 fn write_slice_out(data: &[u8], out_data: *mut *const u8, out_len: *mut usize) {
     unsafe {
         *out_data = data.as_ptr();
@@ -122,10 +124,10 @@ thread_local! {
 }
 
 // =========================================================================
-// 反射原语 — 全部 #[no_mangle] extern "C" fn，接收 u32 (ValueHandle raw)
+// Reflection primitives — all `#[no_mangle] extern "C" fn`; receive `u32` (ValueHandle raw).
 // =========================================================================
 
-/// 返回值的 TypeKind（标量直接映射，堆对象查 arena 取 ref_kind）
+/// Returns the value's TypeKind (scalars map directly; heap objects look up ref_kind via the arena).
 #[no_mangle]
 pub extern "C" fn __reflect_kind(handle: u32) -> u8 {
     let h = ValueHandle::from_raw(handle);
@@ -140,12 +142,13 @@ pub extern "C" fn __reflect_kind(handle: u32) -> u8 {
     }
 }
 
-/// 返回类型名（标量返回静态字符串，堆对象查 arena 读 type_name 字段）
+/// Returns the type name (scalars return a static string; heap objects read the type_name field via the arena).
 ///
-/// 标量分支派生自 `Type::BUILTIN_TABLE`（单一真相源）：通过 `builtin_info_by_tag`
-/// 查表获取 `&'static str` 类型名，消除原 21 个硬编码 `b"..."` 分支。
-/// 不变量：外层 `tag != ValueTag::Ref` 保证 tag 必在 BUILTIN_TABLE 中（20 个非 Ref
-/// tag 全部登记），`.expect` 为不变量违反时的 fail-fast，非回退。
+/// The scalar branch is derived from `Type::BUILTIN_TABLE` (single source of truth): it looks up
+/// the `&'static str` type name via `builtin_info_by_tag`, eliminating the original 21 hardcoded
+/// `b"..."` branches.
+/// Invariant: the outer `tag != ValueTag::Ref` guard ensures the tag is always in BUILTIN_TABLE (all
+/// 20 non-Ref tags are registered); the `.expect` is a fail-fast on invariant violation, not a fallback.
 #[no_mangle]
 pub extern "C" fn __reflect_type_name(handle: u32, out_data: *mut *const u8, out_len: *mut usize) {
     let h = ValueHandle::from_raw(handle);
@@ -153,11 +156,11 @@ pub extern "C" fn __reflect_type_name(handle: u32, out_data: *mut *const u8, out
     if tag != ValueTag::Ref {
         let info = crate::types::builtin_info_by_tag(tag)
             .expect("non-Ref ValueTag must be in BUILTIN_TABLE");
-        // info.name 是 &'static str，指针 'static 有效，无悬垂风险
+        // info.name is &'static str; the pointer is 'static and has no dangling risk
         write_slice_out(info.name.as_bytes(), out_data, out_len);
         return;
     }
-    // 堆对象：查 arena 读用户类型名
+    // Heap object: look up the user type name via the arena
     let name = if let Some(obj) = ValueArena::get_global_obj(h) {
         match &*obj {
             HeapObj::Record(r) => r.type_name.clone(),
@@ -173,16 +176,16 @@ pub extern "C" fn __reflect_type_name(handle: u32, out_data: *mut *const u8, out
     write_str_out(&name, out_data, out_len);
 }
 
-/// 返回值的字节大小（标量委托 `ValueTag::byte_width`，堆对象按 ref_kind 估算）
+/// Returns the value's byte size (scalars delegate to `ValueTag::byte_width`; heap objects are estimated by ref_kind).
 #[no_mangle]
 pub extern "C" fn __reflect_size(handle: u32) -> u8 {
     let h = ValueHandle::from_raw(handle);
     let tag = h.tag();
     if tag != ValueTag::Ref {
-        // 标量/Null/Void 统一委托 byte_width（与 Value.rs 单点同步）
+        // Scalars/Null/Void uniformly delegate to byte_width (single source of truth in Value.rs)
         return tag.byte_width() as u8;
     }
-    // 堆对象：str/array 估算为 16（data+len），其余无固定尺寸
+    // Heap object: str/array estimated as 16 (data+len); others have no fixed size
     if let Some(obj) = ValueArena::get_global_obj(h) {
         match obj.ref_kind() {
             RefKind::Str => 16,
@@ -193,7 +196,7 @@ pub extern "C" fn __reflect_size(handle: u32) -> u8 {
     } else { 0 }
 }
 
-/// 返回字段数（Record/Adt/Newtype/Array 的字段/元素数）
+/// Returns the field count (number of fields/elements of Record/Adt/Newtype/Array).
 #[no_mangle]
 pub extern "C" fn __reflect_field_count(handle: u32) -> u16 {
     let h = ValueHandle::from_raw(handle);
@@ -202,7 +205,7 @@ pub extern "C" fn __reflect_field_count(handle: u32) -> u16 {
     }
     if let Some(obj) = ValueArena::get_global_obj(h) {
         match &*obj {
-            // [R-2] clamp 到 u16::MAX 而非 as 截断回绕，避免 >65535 字段静默变成错误小值
+            // [R-2] Clamp to u16::MAX instead of `as` truncation wraparound, preventing >65535 fields from silently becoming a small wrong value
             HeapObj::Record(r) => r.fields.len().min(u16::MAX as usize) as u16,
             HeapObj::Adt(a) => a.fields.len().min(u16::MAX as usize) as u16,
             HeapObj::Newtype(_) => 1,
@@ -214,7 +217,7 @@ pub extern "C" fn __reflect_field_count(handle: u32) -> u16 {
     }
 }
 
-/// 返回字段名（Record/Adt 的字段名，数组/元组返回空字符串）
+/// Returns the field name (field names of Record/Adt; arrays/tuples return an empty string).
 #[no_mangle]
 pub extern "C" fn __reflect_field_name(handle: u32, index: u16, out_data: *mut *const u8, out_len: *mut usize) {
     let h = ValueHandle::from_raw(handle);
@@ -242,8 +245,8 @@ pub extern "C" fn __reflect_field_name(handle: u32, index: u16, out_data: *mut *
     write_str_out(&name, out_data, out_len);
 }
 
-/// 返回字段值（子 ValueHandle，用于递归反射）。
-/// HeapObj 字段已迁移为 Value，需通过 alloc_value 转回 ValueHandle 供 FFI 返回。
+/// Returns the field value (a child ValueHandle for recursive reflection).
+/// HeapObj fields have been migrated to Value; `alloc_value` converts them back to ValueHandle for FFI return.
 #[no_mangle]
 pub extern "C" fn __reflect_field_value(handle: u32, index: u16) -> u32 {
     let h = ValueHandle::from_raw(handle);
@@ -252,14 +255,14 @@ pub extern "C" fn __reflect_field_value(handle: u32, index: u16) -> u32 {
     }
     if let Some(obj) = ValueArena::get_global_obj(h) {
         match &*obj {
-            // Record/Adt/Array 字段为 Value：alloc_value 转回 ValueHandle
+            // Record/Adt/Array fields are Values: alloc_value converts them back to ValueHandle
             HeapObj::Record(r) => r.fields.get(index as usize)
                 .map(|f| ValueArena::with_global_mut(|a| a.alloc_value(f)).to_raw())
                 .unwrap_or(ValueHandle::NULL.to_raw()),
             HeapObj::Adt(a) => a.fields.get(index as usize)
                 .map(|f| ValueArena::with_global_mut(|a| a.alloc_value(&f.value)).to_raw())
                 .unwrap_or(ValueHandle::NULL.to_raw()),
-            // Newtype.inner 仍为 ValueHandle，直接返回
+            // Newtype.inner is still a ValueHandle; return directly
             HeapObj::Newtype(n) => if index == 0 { n.inner.to_raw() } else { ValueHandle::NULL.to_raw() },
             HeapObj::Array(a) => a.elements.get(index as usize)
                 .map(|f| ValueArena::with_global_mut(|arena| arena.alloc_value(f)).to_raw())
@@ -271,7 +274,7 @@ pub extern "C" fn __reflect_field_value(handle: u32, index: u16) -> u32 {
     }
 }
 
-/// 返回数组长度
+/// Returns the array length.
 #[no_mangle]
 pub extern "C" fn __reflect_array_len(handle: u32) -> usize {
     let h = ValueHandle::from_raw(handle);
@@ -286,7 +289,7 @@ pub extern "C" fn __reflect_array_len(handle: u32) -> usize {
     0
 }
 
-/// 返回 ADT 构造器名
+/// Returns the ADT constructor name.
 #[no_mangle]
 pub extern "C" fn __reflect_adt_constructor(handle: u32, out_data: *mut *const u8, out_len: *mut usize) {
     let h = ValueHandle::from_raw(handle);
@@ -302,7 +305,7 @@ pub extern "C" fn __reflect_adt_constructor(handle: u32, out_data: *mut *const u
     write_str_out(&ctor, out_data, out_len);
 }
 
-/// 标量转字符串（按 ValueTag 分派格式化）
+/// Converts a scalar to string (formats by ValueTag dispatch).
 #[no_mangle]
 pub extern "C" fn __reflect_scalar_to_str(handle: u32, out_data: *mut *const u8, out_len: *mut usize) {
     let h = ValueHandle::from_raw(handle);
@@ -321,7 +324,7 @@ pub extern "C" fn __reflect_scalar_to_str(handle: u32, out_data: *mut *const u8,
             }
         } else {
             ValueArena::with_global(|a| {
-                // [V-2] FFI 边界防御：脏 handle 的 index 可能越界，校验后再取值
+                // [V-2] FFI boundary defense: a dirty handle's index may be out of bounds; validate before reading
                 if !a.is_valid_handle_inner(h) {
                     s.push_str("<invalid>");
                     return;
@@ -332,7 +335,7 @@ pub extern "C" fn __reflect_scalar_to_str(handle: u32, out_data: *mut *const u8,
                     ValueTag::Bool => s.push_str(if h == ValueHandle::TRUE { "true" } else { "false" }),
                     ValueTag::Char => {
                         let c = a.get_char(h);
-                        // 码点 → Unicode 标量值 → 字符（覆盖所有合法码点，包括非 ASCII）
+                        // Code point → Unicode scalar value → char (covers all valid code points, including non-ASCII)
                         if let Some(ch) = char::from_u32(c) {
                             s.push(ch);
                         } else {
@@ -359,26 +362,26 @@ pub extern "C" fn __reflect_scalar_to_str(handle: u32, out_data: *mut *const u8,
                 }
             });
         }
-        // s 借用 FORMAT_BUF，指针有效至下次 reflect 调用（见 [R-1 契约]）
+        // s borrows FORMAT_BUF; the pointer is valid until the next reflect call (see [R-1 contract])
         write_slice_out(s.as_bytes(), out_data, out_len);
     });
 }
 
-/// 顶层格式化入口：递归 match HeapObj 生成字符串
+/// Top-level formatting entry point: recursively matches on HeapObj to produce a string.
 #[no_mangle]
 pub extern "C" fn __reflect_format(handle: u32, out_data: *mut *const u8, out_len: *mut usize) {
-    // 入口 handle → Value，后续递归全部走 Value 路径
+    // Entry handle → Value; subsequent recursion takes the Value path throughout.
     let h = ValueHandle::from_raw(handle);
     let v = ValueArena::with_global(|arena| arena.get_value(h));
     let result = format_value(&v, 0);
     write_str_out(&result, out_data, out_len);
 }
 
-/// 递归格式化 Value 为 String（内部函数，非 extern "C"）。
-/// [R-3] depth 限制递归深度，防止环引用或极深嵌套导致栈溢出。
+/// Recursively formats a Value into a String (internal function, not `extern "C"`).
+/// [R-3] `depth` limits recursion depth, preventing stack overflow from reference cycles or deeply nested structures.
 const FORMAT_MAX_DEPTH: u32 = 64;
 pub fn format_value(v: &Value, depth: u32) -> String {
-    // 深度超限：截断为省略号，避免栈溢出（环/极深嵌套防御）
+    // Depth exceeded: truncate to ellipsis to avoid stack overflow (defense against cycles/deep nesting)
     if depth > FORMAT_MAX_DEPTH {
         return "...".to_string();
     }
@@ -386,13 +389,13 @@ pub fn format_value(v: &Value, depth: u32) -> String {
         Value::Null => "null".to_string(),
         Value::Void => "void".to_string(),
         Value::Scalar(sv, tag) => {
-            // 标量格式化：直接从 ScalarValue 读取，不经 ValueArena
+            // Scalar formatting: read directly from ScalarValue, without going through ValueArena
             unsafe {
                 match tag {
                     ValueTag::Bool => (if sv.bool_val { "true" } else { "false" }).to_string(),
                     ValueTag::Char => {
                         let c = sv.char_val;
-                        // 码点 → Unicode 标量值 → 字符（覆盖所有合法码点，包括非 ASCII）
+                        // Code point → Unicode scalar value → char (covers all valid code points, including non-ASCII)
                         char::from_u32(c).map(|ch| ch.to_string()).unwrap_or_else(|| format!("U+{:04X}", c))
                     }
                     ValueTag::I8 => sv.i8_val.to_string(),
@@ -416,7 +419,7 @@ pub fn format_value(v: &Value, depth: u32) -> String {
             }
         }
         Value::Ref(r) => {
-            // 堆对象：match HeapObj
+            // Heap object: match on HeapObj
             match &**r {
                 HeapObj::Record(rec) => {
                     let mut out = format!("{}(", rec.type_name);
@@ -449,7 +452,7 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                     }
                 }
                 HeapObj::Newtype(n) => {
-                    // Newtype.inner 仍为 ValueHandle：转 Value 后递归
+                    // Newtype.inner is still a ValueHandle: convert to Value then recurse
                     let inner_val = ValueArena::with_global(|arena| arena.get_value(n.inner));
                     format!("{}({})", n.type_name, format_value(&inner_val, depth + 1))
                 }
@@ -464,9 +467,9 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                 }
                 HeapObj::Str(kuzo_str) => kuzo_str.bytes().to_string(),
                 HeapObj::LazyVal(lazy) => {
-                    // 已 forced 的 LazyValue：格式化缓存值
-                    // 未 forced 的 LazyValue：由 Engine 的 force_lazy_value_sync 预先处理，
-                    // 此处仅处理嵌套结构中残留的未 forced LazyValue（防御性兜底）
+                    // Forced LazyValue: format the cached value
+                    // Unforced LazyValue: normally pre-processed by Engine's force_lazy_value_sync;
+                    // here we only handle residual unforced LazyValues in nested structures (defensive fallback)
                     if lazy.forced.load(std::sync::atomic::Ordering::Relaxed) {
                         match &*lazy.cached.lock().unwrap() {
                             Some(v) => format_value(v, depth + 1),
@@ -477,7 +480,7 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                     }
                 }
                 _ => {
-                    // 其他堆对象：用 ref_kind 名兜底
+                    // Other heap objects: fall back to the ref_kind name
                     "<non-scalar>".to_string()
                 }
             }
@@ -485,7 +488,7 @@ pub fn format_value(v: &Value, depth: u32) -> String {
     }
 }
 
-/// 返回类型种类字符串（"Primitive"/"Record"/"Adt"/"Newtype"/"Str"/"Array"/"Nullable"/"Ref"）
+/// Returns the type kind string ("Primitive"/"Record"/"Adt"/"Newtype"/"Str"/"Array"/"Nullable"/"Ref").
 #[no_mangle]
 pub extern "C" fn __reflect_kind_str(handle: u32, out_data: *mut *const u8, out_len: *mut usize) {
     let h = ValueHandle::from_raw(handle);
@@ -513,7 +516,7 @@ pub extern "C" fn __reflect_kind_str(handle: u32, out_data: *mut *const u8, out_
     write_slice_out(kind, out_data, out_len);
 }
 
-/// 返回值的布局大小（标量按 tag，堆对象按 ref_kind 估算字段总大小）
+/// Returns the value's layout size (scalars by tag; heap objects estimate total field size by ref_kind).
 #[no_mangle]
 pub extern "C" fn __reflect_layout_size(handle: u32) -> u32 {
     let h = ValueHandle::from_raw(handle);
@@ -532,19 +535,19 @@ pub extern "C" fn __reflect_layout_size(handle: u32) -> u32 {
                 match &*obj {
                     HeapObj::Str(_) => 16,
                     HeapObj::Array(_) => {
-                        // 16B fat pointer + 元素大小 * len（估算）
+                        // 16B fat pointer + element_size * len (estimated)
                         16
                     }
                     HeapObj::Record(r) => {
-                        // 字段大小总和（粗略估算，不含 padding）
+                        // Sum of field sizes (rough estimate, excluding padding)
                         r.fields.iter().map(value_size).sum::<u32>()
                     }
                     HeapObj::Adt(a) => {
-                        // 字段大小总和（当前构造器的字段，不含 tag）
+                        // Sum of field sizes (current constructor's fields, excluding tag)
                         a.fields.iter().map(|f| value_size(&f.value)).sum::<u32>()
                     }
                     HeapObj::Newtype(n) => {
-                        // inner 值大小
+                        // inner value size
                         ValueArena::with_global(|arena| value_size(&arena.get_value(n.inner)))
                     }
                     _ => 0,
@@ -554,7 +557,7 @@ pub extern "C" fn __reflect_layout_size(handle: u32) -> u32 {
     }
 }
 
-/// 返回值的对齐（标量按大小，堆对象按最大字段对齐）
+/// Returns the value's alignment (scalars by size; heap objects by maximum field alignment).
 #[no_mangle]
 pub extern "C" fn __reflect_layout_alignment(handle: u32) -> u32 {
     let h = ValueHandle::from_raw(handle);
@@ -573,11 +576,11 @@ pub extern "C" fn __reflect_layout_alignment(handle: u32) -> u32 {
                     HeapObj::Str(_) => 8,
                     HeapObj::Array(_) => 8,
                     HeapObj::Record(r) => {
-                        // 最大字段对齐
+                        // Maximum field alignment
                         r.fields.iter().map(value_alignment).max().unwrap_or(1)
                     }
                     HeapObj::Adt(a) => {
-                        // tag(1) 和最大字段对齐取最大
+                        // Maximum of tag(1) and maximum field alignment
                         a.fields.iter().map(|f| value_alignment(&f.value)).max().unwrap_or(1).max(1)
                     }
                     HeapObj::Newtype(n) => {
@@ -590,7 +593,7 @@ pub extern "C" fn __reflect_layout_alignment(handle: u32) -> u32 {
     }
 }
 
-/// 估算 Value 的字节大小（用于 Record/Adt/Newtype layout 估算）
+/// Estimates the byte size of a Value (used for Record/Adt/Newtype layout estimation).
 fn value_size(v: &Value) -> u32 {
     match v {
         Value::Null | Value::Void => 0,
@@ -611,9 +614,9 @@ fn value_size(v: &Value) -> u32 {
                 HeapObj::Str(_) => 16,
                 HeapObj::Array(_) => 16,
                 HeapObj::Record(rec) => rec.fields.iter().map(value_size).sum(),
-                // ADT：字段大小总和（当前构造器的字段，不含 tag）
+                // ADT: sum of field sizes (current constructor's fields, excluding tag)
                 HeapObj::Adt(a) => a.fields.iter().map(|f| value_size(&f.value)).sum(),
-                // Newtype：从全局 arena 查找 inner 值的大小
+                // Newtype: look up the inner value's size from the global arena
                 HeapObj::Newtype(n) => {
                     ValueArena::with_global(|arena| value_size(&arena.get_value(n.inner)))
                 }
@@ -623,7 +626,7 @@ fn value_size(v: &Value) -> u32 {
     }
 }
 
-/// 估算 Value 的对齐
+/// Estimates the alignment of a Value.
 fn value_alignment(v: &Value) -> u32 {
     match v {
         Value::Null | Value::Void => 1,
@@ -644,7 +647,7 @@ fn value_alignment(v: &Value) -> u32 {
                 HeapObj::Str(_) | HeapObj::Array(_) => 8,
                 HeapObj::Record(rec) => rec.fields.iter().map(value_alignment).max().unwrap_or(1),
                 HeapObj::Adt(a) => a.fields.iter().map(|f| value_alignment(&f.value)).max().unwrap_or(1).max(1),
-                // Newtype：从全局 arena 查找 inner 值的对齐
+                // Newtype: look up the inner value's alignment from the global arena
                 HeapObj::Newtype(n) => {
                     ValueArena::with_global(|arena| value_alignment(&arena.get_value(n.inner)))
                 }
@@ -654,18 +657,18 @@ fn value_alignment(v: &Value) -> u32 {
     }
 }
 
-/// 公共 API：从 &Value 估算布局大小（供 Engine FFI 调用）
+/// Public API: estimates layout size from a &Value (for Engine FFI calls).
 pub fn reflect_layout_size(v: &Value) -> u32 {
     value_size(v)
 }
 
-/// 公共 API：从 &Value 估算对齐（供 Engine FFI 调用）
+/// Public API: estimates alignment from a &Value (for Engine FFI calls).
 pub fn reflect_layout_alignment(v: &Value) -> u32 {
     value_alignment(v)
 }
 
 // =========================================================================
-// RefKind::as_str 辅助（用于 type_name 兜底）
+// RefKind::as_str helper (used as a type_name fallback)
 // =========================================================================
 
 impl RefKind {

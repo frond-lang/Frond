@@ -1,55 +1,58 @@
 // =========================================================================
-// Ops — TypeOps trait + 标量/引用 ops 实现 + ops 查找表 + DynamicOpsRegistry
+// Ops — TypeOps trait + scalar/reference ops implementations + DynamicOpsRegistry.
 // =========================================================================
 //
-// TypeOps trait 与 Ty 分离：Ty 是类型身份（Copy 数据），TypeOps 是运行时值操作。
-// ops 查找表（ops_of/ops_by_type_id）在下方提供。
-// TypeDescriptor 结构体已删除，静态 DESC 常量不再生成。
+// The TypeOps trait is kept separate from Ty: Ty is type identity (Copy data), while
+// TypeOps covers runtime value operations. The TypeDescriptor struct has been removed;
+// static DESC constants are no longer generated.
 
 use super::Tag::*;
-use super::ty::*;
 use crate::value::{Char, F128, F16, ValueArena, ValueHandle};
-use rustc_hash::FxHashMap;
 
-/// 类型操作 trait：描述某种类型在原始字节缓冲区与 `ValueArena` 句柄之间的
-/// 转换语义。所有方法均为热路径，实现应保持 `#[inline]`。
+/// Type operations trait: describes the conversion semantics between a raw byte buffer
+/// and a `ValueArena` handle for a given type. All methods are hot paths and
+/// implementations should keep `#[inline]`.
 ///
-/// 实现者要求 `Send + Sync + 'static`，以便 ops 可被静态构造并跨线程共享。
+/// Implementors require `Send + Sync + 'static` so that ops can be constructed
+/// statically and shared across threads.
 pub trait TypeOps: Send + Sync + 'static {
-    /// 从 `ptr` 读取一个值，分配到 `arena` 并返回句柄。
+    /// Read a value from `ptr`, allocate it into `arena`, and return the handle.
     fn read(&self, ptr: *const u8, arena: &mut ValueArena) -> ValueHandle;
-    /// 将句柄 `v` 对应的值写入 `ptr`。
+    /// Write the value corresponding to handle `v` into `ptr`.
     fn write(&self, ptr: *mut u8, v: ValueHandle, arena: &ValueArena);
-    /// 将任意句柄 `v` 强制转换为本类型句柄。
+    /// Coerce an arbitrary handle `v` into a handle of this type.
     fn coerce(&self, v: ValueHandle, arena: &mut ValueArena) -> ValueHandle;
-    /// 比较两块内存中的值是否相等。
+    /// Compare two in-memory values for equality.
     fn equal(&self, a: *const u8, b: *const u8) -> bool;
-    /// 将 `ptr` 处的值格式化写入 `buf`，返回写入部分的 `&str` 切片。
+    /// Format the value at `ptr` into `buf`, returning the written `&str` slice.
     fn format<'a>(&self, ptr: *const u8, buf: &'a mut [u8]) -> &'a str;
-    /// 计算值的哈希。
+    /// Compute the hash of the value.
     fn hash_val(&self, ptr: *const u8) -> u64;
-    /// 克隆值（标量为值语义，等价于 read）。
+    /// Clone the value (scalars are value-semantic, so this is equivalent to `read`).
     fn clone_val(&self, ptr: *const u8, arena: &mut ValueArena) -> ValueHandle;
 }
 
 // =========================================================================
-// 标量 ops 宏生成（14 种小尺寸标量）
+// Scalar ops macro generation (14 small-size scalars).
 // =========================================================================
 //
-// 宏参数：ops 名, Rust 原生类型, alloc 方法名, get 方法名, fmt 表达式, coerce 种类。
+// Macro parameters: ops name, Rust native type, alloc method name, get method name,
+// fmt expression, coerce kind.
 //
-// 该宏生成 ZST ops 结构体与 `TypeOps` 实现。i128 / u128 / f128 / bool 因特殊语义
-// 手动实现。TypeDescriptor 静态常量不再生成（TypeDescriptor 已删除）。
+// This macro generates a ZST ops struct and its `TypeOps` implementation. i128 / u128 /
+// f128 / bool are manually implemented due to special semantics. TypeDescriptor static
+// constants are no longer generated (TypeDescriptor has been removed).
 
 macro_rules! impl_scalar_ops {
-    // 内部分支：生成 read/write/format/hash_val/clone_val 五个方法（不含 equal）。
-    // 这些方法的职责就是操作裸指针指向的类型化内存，clippy 的
-    // `not_unsafe_ptr_arg_deref` 在此为误报，统一 allow。
+    // Internal arm: generates read/write/format/hash_val/clone_val (excludes equal).
+    // The responsibility of these methods is to operate on typed memory behind raw
+    // pointers; clippy's `not_unsafe_ptr_arg_deref` is a false positive here, so we
+    // allow it uniformly.
     (@fns_core $ty:ty, $alloc:ident, $get:ident, [$v:ident => $fmt:expr]) => {
         #[inline]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
         fn read(&self, ptr: *const u8, arena: &mut ValueArena) -> ValueHandle {
-            // SAFETY: ptr 指向合法的 $ty 值内存，按非对齐方式读取。
+            // SAFETY: ptr points to valid $ty memory; read unaligned.
             let $v: $ty = unsafe { std::ptr::read_unaligned(ptr as *const $ty) };
             arena.$alloc($v)
         }
@@ -57,28 +60,28 @@ macro_rules! impl_scalar_ops {
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
         fn write(&self, ptr: *mut u8, h: ValueHandle, arena: &ValueArena) {
             let $v: $ty = arena.$get(h);
-            // SAFETY: ptr 指向可写的 $ty 内存，按非对齐方式写入。
+            // SAFETY: ptr points to writable $ty memory; write unaligned.
             unsafe { std::ptr::write_unaligned(ptr as *mut $ty, $v) }
         }
         #[inline]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
         fn format<'a>(&self, ptr: *const u8, buf: &'a mut [u8]) -> &'a str {
-            // SAFETY: ptr 指向合法的 $ty 值。
+            // SAFETY: ptr points to a valid $ty value.
             let $v: $ty = unsafe { std::ptr::read_unaligned(ptr as *const $ty) };
             use std::io::Write;
             let mut cursor = std::io::Cursor::new(buf);
             let _ = write!(cursor, "{}", $fmt);
             let written = cursor.position() as usize;
             let buf_ref: &mut [u8] = cursor.into_inner();
-            // SAFETY: 原生数值/字符的 Display 输出为 ASCII 或合法 UTF-8。
+            // SAFETY: Display output of native numeric/char types is ASCII or valid UTF-8.
             unsafe { std::str::from_utf8_unchecked(&buf_ref[..written]) }
         }
         #[inline]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
         fn hash_val(&self, ptr: *const u8) -> u64 {
             use std::hash::{Hash, Hasher};
-            // SAFETY: ptr 指向合法的 $ty 值；按其字节表示哈希（对 f32/f64
-            // 等未实现 Hash 的类型，统一按 bit pattern 哈希）。
+            // SAFETY: ptr points to a valid $ty value; hash by its byte representation
+            // (for types like f32/f64 that do not implement Hash, hash by bit pattern).
             let bytes: &[u8] =
                 unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<$ty>()) };
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -88,21 +91,22 @@ macro_rules! impl_scalar_ops {
         #[inline]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
         fn clone_val(&self, ptr: *const u8, arena: &mut ValueArena) -> ValueHandle {
-            // SAFETY: 标量为值语义，clone 等价于 read。
+            // SAFETY: scalars are value-semantic; clone is equivalent to read.
             let $v: $ty = unsafe { std::ptr::read_unaligned(ptr as *const $ty) };
             arena.$alloc($v)
         }
     };
 
-    // 完整 @fns = @fns_core + 默认 equal（bit-pattern 比较）。
-    // f32/f64 的原生 == 已实现 IEEE 语义（NaN≠NaN，-0==+0）；
-    // 整数/bool/char 的 == 即值相等。f16 存储为 u16，需 IEEE 语义时走 coerce=f16 分支。
+    // Full @fns = @fns_core + default equal (bit-pattern comparison).
+    // The native == for f32/f64 already implements IEEE semantics (NaN != NaN, -0 == +0);
+    // == for integers/bool/char is value equality. f16 is stored as u16; for IEEE
+    // semantics, use the coerce=f16 branch.
     (@fns $ty:ty, $alloc:ident, $get:ident, [$v:ident => $fmt:expr]) => {
         impl_scalar_ops!(@fns_core $ty, $alloc, $get, [$v => $fmt]);
         #[inline]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
         fn equal(&self, a: *const u8, b: *const u8) -> bool {
-            // SAFETY: 两个指针均指向合法的 $ty 值。
+            // SAFETY: both pointers point to valid $ty values.
             unsafe {
                 std::ptr::read_unaligned(a as *const $ty)
                     == std::ptr::read_unaligned(b as *const $ty)
@@ -110,7 +114,7 @@ macro_rules! impl_scalar_ops {
         }
     };
 
-    // 整数目标类型
+    // Integer target type
     (
         $ops:ident, $ty:ty,
         alloc=$alloc:ident, get=$get:ident, fmt($v:ident) => $fmt:expr, coerce=int
@@ -146,7 +150,7 @@ macro_rules! impl_scalar_ops {
         }
     };
 
-    // 浮点目标类型（f32 / f64）
+    // Float target type (f32 / f64)
     (
         $ops:ident, $ty:ty,
         alloc=$alloc:ident, get=$get:ident, fmt($v:ident) => $fmt:expr, coerce=float
@@ -182,7 +186,7 @@ macro_rules! impl_scalar_ops {
         }
     };
 
-    // f16 目标类型
+    // f16 target type
     (
         $ops:ident, $ty:ty,
         alloc=$alloc:ident, get=$get:ident, fmt($v:ident) => $fmt:expr, coerce=f16
@@ -193,18 +197,19 @@ macro_rules! impl_scalar_ops {
             #[inline]
             #[allow(clippy::not_unsafe_ptr_arg_deref)]
             fn equal(&self, a: *const u8, b: *const u8) -> bool {
-                // IEEE 754 语义：NaN≠NaN，-0==+0（与 f32/f64/f128 的 equal 一致）。
-                // F16 存储为 u16 bit pattern，不能用 u16 == u16（会得到 NaN==NaN、-0≠+0）。
+                // IEEE 754 semantics: NaN != NaN, -0 == +0 (consistent with f32/f64/f128 equal).
+                // F16 is stored as a u16 bit pattern; using u16 == u16 directly would give
+                // NaN == NaN and -0 != +0.
                 unsafe {
                     let x = std::ptr::read_unaligned(a as *const u16);
                     let y = std::ptr::read_unaligned(b as *const u16);
-                    // NaN 判定：exponent 全 1 (0x7C00) 且 mantissa 非零 (0x03FF)
+                    // NaN check: exponent all 1s (0x7C00) and mantissa nonzero (0x03FF).
                     let x_nan = (x & 0x7C00) == 0x7C00 && (x & 0x03FF) != 0;
                     let y_nan = (y & 0x7C00) == 0x7C00 && (y & 0x03FF) != 0;
                     if x_nan || y_nan {
                         return false;
                     }
-                    // -0 == +0：两者 exponent 与 mantissa 均为零时视为相等
+                    // -0 == +0: when both exponent and mantissa are zero, treat as equal.
                     x == y || (x | y) & 0x7FFF == 0
                 }
             }
@@ -236,7 +241,7 @@ macro_rules! impl_scalar_ops {
         }
     };
 
-    // f128 目标类型
+    // f128 target type
     (
         $ops:ident, $ty:ty,
         alloc=$alloc:ident, get=$get:ident, fmt($v:ident) => $fmt:expr, coerce=f128
@@ -246,8 +251,9 @@ macro_rules! impl_scalar_ops {
             impl_scalar_ops!(@fns $ty, $alloc, $get, [$v => $fmt]);
             #[inline]
             fn coerce(&self, v: ValueHandle, arena: &mut ValueArena) -> ValueHandle {
-                // i128/u128 精度超出 f64（53 位），用 F128::from_i128/from_u128 精确构造；
-                // F128 源恒等返回，无精度损失；其余经 f64（值在 f64 精度内，无损）。
+                // i128/u128 precision exceeds f64 (53 bits); use F128::from_i128/from_u128 for
+                // exact construction. F128 sources are returned as-is (no loss); all others
+                // go through f64 (values are within f64 precision, lossless).
                 match v.tag() {
                     ValueTag::I128 => return arena.$alloc(F128::from_i128(arena.get_i128(v))),
                     ValueTag::U128 => return arena.$alloc(F128::from_u128(arena.get_u128(v))),
@@ -271,7 +277,7 @@ macro_rules! impl_scalar_ops {
                     ValueTag::F32 => arena.get_f32(v) as f64,
                     ValueTag::F64 => arena.get_f64(v),
                     ValueTag::Null | ValueTag::Void | ValueTag::Ref => 0.0,
-                    // I128/U128/F128 已在上方 early return，不会到达
+                    // I128/U128/F128 were early-returned above and never reach here.
                     ValueTag::I128 | ValueTag::U128 | ValueTag::F128 => unreachable!(),
                 };
                 arena.$alloc(F128::from_f64(f))
@@ -279,7 +285,7 @@ macro_rules! impl_scalar_ops {
         }
     };
 
-    // bool 目标类型
+    // bool target type
     (
         $ops:ident, $ty:ty,
         alloc=$alloc:ident, get=$get:ident, fmt($v:ident) => $fmt:expr, coerce=bool
@@ -315,7 +321,7 @@ macro_rules! impl_scalar_ops {
         }
     };
 
-    // char 目标类型
+    // char target type
     (
         $ops:ident, $ty:ty,
         alloc=$alloc:ident, get=$get:ident, fmt($v:ident) => $fmt:expr, coerce=char
@@ -352,7 +358,7 @@ macro_rules! impl_scalar_ops {
     };
 }
 
-// 14 种小尺寸标量的宏实例化（生成 ops 结构体与 TypeOps 实现）。
+// Macro instantiation for the 14 small-size scalars (generates ops structs and TypeOps impls).
 impl_scalar_ops!(I8Ops, i8, alloc=alloc_i8, get=get_i8, fmt(v) => v, coerce=int);
 impl_scalar_ops!(I16Ops, i16, alloc=alloc_i16, get=get_i16, fmt(v) => v, coerce=int);
 impl_scalar_ops!(I32Ops, i32, alloc=alloc_i32, get=get_i32, fmt(v) => v, coerce=int);
@@ -369,22 +375,22 @@ impl_scalar_ops!(F64Ops, f64, alloc=alloc_f64, get=get_f64, fmt(v) => v, coerce=
 impl_scalar_ops!(CharOps, u32, alloc=alloc_char, get=get_char, fmt(v) => Char::from_codepoint_unchecked(v), coerce=char);
 
 // =========================================================================
-// 手动实现：i128 / u128 / f128 / bool
+// Manual implementations: i128 / u128 / f128 / bool.
 // =========================================================================
 
-/// `TypeOps` 实现：i128（16 字节，`ValueArena` 返回 i128）。
+/// `TypeOps` implementation for i128 (16 bytes; `ValueArena` returns i128).
 pub struct I128Ops;
 impl TypeOps for I128Ops {
     #[inline]
     fn read(&self, ptr: *const u8, arena: &mut ValueArena) -> ValueHandle {
-        // SAFETY: ptr 指向 16 字节合法 i128。
+        // SAFETY: ptr points to a valid 16-byte i128.
         let v: i128 = unsafe { std::ptr::read_unaligned(ptr as *const i128) };
         arena.alloc_i128(v)
     }
     #[inline]
     fn write(&self, ptr: *mut u8, h: ValueHandle, arena: &ValueArena) {
         let v: i128 = arena.get_i128(h);
-        // SAFETY: ptr 指向可写 16 字节 i128。
+        // SAFETY: ptr points to writable 16-byte i128 memory.
         unsafe { std::ptr::write_unaligned(ptr as *mut i128, v) }
     }
     #[inline]
@@ -414,7 +420,7 @@ impl TypeOps for I128Ops {
     }
     #[inline]
     fn equal(&self, a: *const u8, b: *const u8) -> bool {
-        // SAFETY: 两指针均指向合法 i128。
+        // SAFETY: both pointers point to valid i128 values.
         unsafe {
             std::ptr::read_unaligned(a as *const i128)
                 == std::ptr::read_unaligned(b as *const i128)
@@ -422,20 +428,20 @@ impl TypeOps for I128Ops {
     }
     #[inline]
     fn format<'a>(&self, ptr: *const u8, buf: &'a mut [u8]) -> &'a str {
-        // SAFETY: ptr 指向合法 i128。
+        // SAFETY: ptr points to a valid i128.
         let v: i128 = unsafe { std::ptr::read_unaligned(ptr as *const i128) };
         use std::io::Write;
         let mut cursor = std::io::Cursor::new(buf);
         let _ = write!(cursor, "{}", v);
         let written = cursor.position() as usize;
         let buf_ref: &mut [u8] = cursor.into_inner();
-        // SAFETY: i128 Display 输出为 ASCII 十进制。
+        // SAFETY: i128 Display output is ASCII decimal.
         unsafe { std::str::from_utf8_unchecked(&buf_ref[..written]) }
     }
     #[inline]
     fn hash_val(&self, ptr: *const u8) -> u64 {
         use std::hash::{Hash, Hasher};
-        // SAFETY: ptr 指向合法 i128。
+        // SAFETY: ptr points to a valid i128.
         let v: i128 = unsafe { std::ptr::read_unaligned(ptr as *const i128) };
         let mut h = std::collections::hash_map::DefaultHasher::new();
         v.hash(&mut h);
@@ -443,25 +449,25 @@ impl TypeOps for I128Ops {
     }
     #[inline]
     fn clone_val(&self, ptr: *const u8, arena: &mut ValueArena) -> ValueHandle {
-        // SAFETY: 标量值语义，clone 等价于 read。
+        // SAFETY: scalars are value-semantic; clone is equivalent to read.
         let v: i128 = unsafe { std::ptr::read_unaligned(ptr as *const i128) };
         arena.alloc_i128(v)
     }
 }
 
-/// `TypeOps` 实现：u128（16 字节，`ValueArena` 返回 u128）。
+/// `TypeOps` implementation for u128 (16 bytes; `ValueArena` returns u128).
 pub struct U128Ops;
 impl TypeOps for U128Ops {
     #[inline]
     fn read(&self, ptr: *const u8, arena: &mut ValueArena) -> ValueHandle {
-        // SAFETY: ptr 指向 16 字节合法 u128。
+        // SAFETY: ptr points to a valid 16-byte u128.
         let v: u128 = unsafe { std::ptr::read_unaligned(ptr as *const u128) };
         arena.alloc_u128(v)
     }
     #[inline]
     fn write(&self, ptr: *mut u8, h: ValueHandle, arena: &ValueArena) {
         let v: u128 = arena.get_u128(h);
-        // SAFETY: ptr 指向可写 16 字节 u128。
+        // SAFETY: ptr points to writable 16-byte u128 memory.
         unsafe { std::ptr::write_unaligned(ptr as *mut u128, v) }
     }
     #[inline]
@@ -491,7 +497,7 @@ impl TypeOps for U128Ops {
     }
     #[inline]
     fn equal(&self, a: *const u8, b: *const u8) -> bool {
-        // SAFETY: 两指针均指向合法 u128。
+        // SAFETY: both pointers point to valid u128 values.
         unsafe {
             std::ptr::read_unaligned(a as *const u128)
                 == std::ptr::read_unaligned(b as *const u128)
@@ -499,20 +505,20 @@ impl TypeOps for U128Ops {
     }
     #[inline]
     fn format<'a>(&self, ptr: *const u8, buf: &'a mut [u8]) -> &'a str {
-        // SAFETY: ptr 指向合法 u128。
+        // SAFETY: ptr points to a valid u128.
         let v: u128 = unsafe { std::ptr::read_unaligned(ptr as *const u128) };
         use std::io::Write;
         let mut cursor = std::io::Cursor::new(buf);
         let _ = write!(cursor, "{}", v);
         let written = cursor.position() as usize;
         let buf_ref: &mut [u8] = cursor.into_inner();
-        // SAFETY: u128 Display 输出为 ASCII 十进制。
+        // SAFETY: u128 Display output is ASCII decimal.
         unsafe { std::str::from_utf8_unchecked(&buf_ref[..written]) }
     }
     #[inline]
     fn hash_val(&self, ptr: *const u8) -> u64 {
         use std::hash::{Hash, Hasher};
-        // SAFETY: ptr 指向合法 u128。
+        // SAFETY: ptr points to a valid u128.
         let v: u128 = unsafe { std::ptr::read_unaligned(ptr as *const u128) };
         let mut h = std::collections::hash_map::DefaultHasher::new();
         v.hash(&mut h);
@@ -520,30 +526,31 @@ impl TypeOps for U128Ops {
     }
     #[inline]
     fn clone_val(&self, ptr: *const u8, arena: &mut ValueArena) -> ValueHandle {
-        // SAFETY: 标量值语义，clone 等价于 read。
+        // SAFETY: scalars are value-semantic; clone is equivalent to read.
         let v: u128 = unsafe { std::ptr::read_unaligned(ptr as *const u128) };
         arena.alloc_u128(v)
     }
 }
 
-/// `TypeOps` 实现：f128（16 字节，`ValueArena` 返回 `F128`）。
+/// `TypeOps` implementation for f128 (16 bytes; `ValueArena` returns `F128`).
 pub struct F128Ops;
 impl TypeOps for F128Ops {
     #[inline]
     fn read(&self, ptr: *const u8, arena: &mut ValueArena) -> ValueHandle {
-        // SAFETY: ptr 指向 16 字节合法 F128（Copy）。
+        // SAFETY: ptr points to a valid 16-byte F128 (Copy).
         let v: F128 = unsafe { std::ptr::read_unaligned(ptr as *const F128) };
         arena.alloc_f128(v)
     }
     #[inline]
     fn write(&self, ptr: *mut u8, h: ValueHandle, arena: &ValueArena) {
         let v: F128 = arena.get_f128(h);
-        // SAFETY: ptr 指向可写 16 字节 F128。
+        // SAFETY: ptr points to writable 16-byte F128 memory.
         unsafe { std::ptr::write_unaligned(ptr as *mut F128, v) }
     }
     #[inline]
     fn coerce(&self, v: ValueHandle, arena: &mut ValueArena) -> ValueHandle {
-        // i128/u128 经 as f64 会丢精度，用 from_i128/from_u128 精确构造；F128 源恒等返回
+        // i128/u128 would lose precision via `as f64`; use from_i128/from_u128 for exact
+        // construction. F128 sources are returned as-is.
         match v.tag() {
             ValueTag::I128 => return arena.alloc_f128(F128::from_i128(arena.get_i128(v))),
             ValueTag::U128 => return arena.alloc_f128(F128::from_u128(arena.get_u128(v))),
@@ -573,14 +580,14 @@ impl TypeOps for F128Ops {
     }
     #[inline]
     fn equal(&self, a: *const u8, b: *const u8) -> bool {
-        // IEEE 754 语义：NaN≠NaN，-0==+0（与 f32/f64 的 equal 一致）
+        // IEEE 754 semantics: NaN != NaN, -0 == +0 (consistent with f32/f64 equal).
         unsafe {
             let x = std::ptr::read_unaligned(a as *const F128);
             let y = std::ptr::read_unaligned(b as *const F128);
             if x.is_nan() || y.is_nan() {
                 return false;
             }
-            // -0 == +0：bit pattern 仅符号位不同时视为相等
+            // -0 == +0: treat as equal when bit patterns differ only in the sign bit.
             let xb = u128::from_le_bytes(x.0);
             let yb = u128::from_le_bytes(y.0);
             xb == yb || (xb | yb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0
@@ -588,20 +595,20 @@ impl TypeOps for F128Ops {
     }
     #[inline]
     fn format<'a>(&self, ptr: *const u8, buf: &'a mut [u8]) -> &'a str {
-        // SAFETY: ptr 指向合法 F128。
+        // SAFETY: ptr points to a valid F128.
         let v: F128 = unsafe { std::ptr::read_unaligned(ptr as *const F128) };
         use std::io::Write;
         let mut cursor = std::io::Cursor::new(buf);
         let _ = write!(cursor, "{}", v);
         let written = cursor.position() as usize;
         let buf_ref: &mut [u8] = cursor.into_inner();
-        // SAFETY: F128 Display 输出为 ASCII。
+        // SAFETY: F128 Display output is ASCII.
         unsafe { std::str::from_utf8_unchecked(&buf_ref[..written]) }
     }
     #[inline]
     fn hash_val(&self, ptr: *const u8) -> u64 {
         use std::hash::{Hash, Hasher};
-        // SAFETY: ptr 指向合法 F128。
+        // SAFETY: ptr points to a valid F128.
         let v: F128 = unsafe { std::ptr::read_unaligned(ptr as *const F128) };
         let mut h = std::collections::hash_map::DefaultHasher::new();
         v.hash(&mut h);
@@ -609,25 +616,26 @@ impl TypeOps for F128Ops {
     }
     #[inline]
     fn clone_val(&self, ptr: *const u8, arena: &mut ValueArena) -> ValueHandle {
-        // SAFETY: 标量值语义，clone 等价于 read。
+        // SAFETY: scalars are value-semantic; clone is equivalent to read.
         let v: F128 = unsafe { std::ptr::read_unaligned(ptr as *const F128) };
         arena.alloc_f128(v)
     }
 }
 
-/// `TypeOps` 实现：bool（`ValueArena::bool` 与 `get_bool` 均为 `&self` 单例语义）。
+/// `TypeOps` implementation for bool (`ValueArena::bool` and `get_bool` both have
+/// `&self` singleton semantics).
 pub struct BoolOps;
 impl TypeOps for BoolOps {
     #[inline]
     fn read(&self, ptr: *const u8, arena: &mut ValueArena) -> ValueHandle {
-        // SAFETY: ptr 指向 1 字节合法 bool。
+        // SAFETY: ptr points to a valid 1-byte bool.
         let v: bool = unsafe { std::ptr::read_unaligned(ptr as *const bool) };
         arena.bool(v)
     }
     #[inline]
     fn write(&self, ptr: *mut u8, h: ValueHandle, arena: &ValueArena) {
         let v: bool = arena.get_bool(h);
-        // SAFETY: ptr 指向可写 1 字节 bool。
+        // SAFETY: ptr points to writable 1-byte bool memory.
         unsafe { std::ptr::write_unaligned(ptr as *mut bool, v) }
     }
     #[inline]
@@ -657,7 +665,7 @@ impl TypeOps for BoolOps {
     }
     #[inline]
     fn equal(&self, a: *const u8, b: *const u8) -> bool {
-        // SAFETY: 两指针均指向合法 bool。
+        // SAFETY: both pointers point to valid bool values.
         unsafe {
             std::ptr::read_unaligned(a as *const bool)
                 == std::ptr::read_unaligned(b as *const bool)
@@ -665,20 +673,20 @@ impl TypeOps for BoolOps {
     }
     #[inline]
     fn format<'a>(&self, ptr: *const u8, buf: &'a mut [u8]) -> &'a str {
-        // SAFETY: ptr 指向合法 bool。
+        // SAFETY: ptr points to a valid bool.
         let v: bool = unsafe { std::ptr::read_unaligned(ptr as *const bool) };
         use std::io::Write;
         let mut cursor = std::io::Cursor::new(buf);
         let _ = write!(cursor, "{}", v);
         let written = cursor.position() as usize;
         let buf_ref: &mut [u8] = cursor.into_inner();
-        // SAFETY: bool Display 输出为 ASCII（"true"/"false"）。
+        // SAFETY: bool Display output is ASCII ("true"/"false").
         unsafe { std::str::from_utf8_unchecked(&buf_ref[..written]) }
     }
     #[inline]
     fn hash_val(&self, ptr: *const u8) -> u64 {
         use std::hash::{Hash, Hasher};
-        // SAFETY: ptr 指向合法 bool。
+        // SAFETY: ptr points to a valid bool.
         let v: bool = unsafe { std::ptr::read_unaligned(ptr as *const bool) };
         let mut h = std::collections::hash_map::DefaultHasher::new();
         v.hash(&mut h);
@@ -686,17 +694,17 @@ impl TypeOps for BoolOps {
     }
     #[inline]
     fn clone_val(&self, ptr: *const u8, arena: &mut ValueArena) -> ValueHandle {
-        // SAFETY: 标量值语义，clone 等价于 read。
+        // SAFETY: scalars are value-semantic; clone is equivalent to read.
         let v: bool = unsafe { std::ptr::read_unaligned(ptr as *const bool) };
         arena.bool(v)
     }
 }
 
 // =========================================================================
-// Null / Void ops（简化实现）
+// Null / Void ops (simplified implementations).
 // =========================================================================
 
-/// `TypeOps` 实现：null 类型（无数据，单例语义）。
+/// `TypeOps` implementation for the null type (no data, singleton semantics).
 pub struct NullOps;
 impl TypeOps for NullOps {
     #[inline]
@@ -711,7 +719,7 @@ impl TypeOps for NullOps {
     }
     #[inline]
     fn equal(&self, _a: *const u8, _b: *const u8) -> bool {
-        // null 为单例，所有实例相等（同 type_id）。
+        // null is a singleton; all instances are equal (same type_id).
         true
     }
     #[inline]
@@ -719,7 +727,7 @@ impl TypeOps for NullOps {
         if buf.len() < 4 {
             return "";
         }
-        // SAFETY: "null" 为合法 ASCII。
+        // SAFETY: "null" is valid ASCII.
         buf[..4].copy_from_slice(b"null");
         unsafe { std::str::from_utf8_unchecked(&buf[..4]) }
     }
@@ -733,7 +741,7 @@ impl TypeOps for NullOps {
     }
 }
 
-/// `TypeOps` 实现：void 类型（无数据，单例语义）。
+/// `TypeOps` implementation for the void type (no data, singleton semantics).
 pub struct VoidOps;
 impl TypeOps for VoidOps {
     #[inline]
@@ -748,7 +756,7 @@ impl TypeOps for VoidOps {
     }
     #[inline]
     fn equal(&self, _a: *const u8, _b: *const u8) -> bool {
-        // void 为单例，所有实例相等（同 type_id）。
+        // void is a singleton; all instances are equal (same type_id).
         true
     }
     #[inline]
@@ -756,7 +764,7 @@ impl TypeOps for VoidOps {
         if buf.len() < 4 {
             return "";
         }
-        // SAFETY: "void" 为合法 ASCII。
+        // SAFETY: "void" is valid ASCII.
         buf[..4].copy_from_slice(b"void");
         unsafe { std::str::from_utf8_unchecked(&buf[..4]) }
     }
@@ -771,12 +779,14 @@ impl TypeOps for VoidOps {
 }
 
 // =========================================================================
-// ref_ops / heap_ref_ops（引用类型 ops，简化实现）
+// ref_ops / heap_ref_ops (reference type ops, simplified implementations).
 // =========================================================================
 //
-// 完整的 ref 实现（msync 检查、ObjHeader 验证、堆对象物化）属于 engine 层职责。
-// 共享层仅提供 8 字节指针槽的读写骨架：0 表示 null，非零地址在 read 时返回 null
-// （保持无配语义），write 将句柄索引写入槽位作为占位。
+// The full ref implementation (msync checks, ObjHeader validation, heap object
+// materialization) is the responsibility of the engine layer. The shared layer only
+// provides a read/write skeleton for the 8-byte pointer slot: 0 denotes null, and a
+// nonzero address returns null on read (preserving null-paired semantics); write
+// stores the handle index into the slot as a placeholder.
 
 macro_rules! impl_ref_ops {
     ($ops:ident) => {
@@ -784,19 +794,21 @@ macro_rules! impl_ref_ops {
         impl TypeOps for $ops {
             #[inline]
             fn read(&self, ptr: *const u8, arena: &mut ValueArena) -> ValueHandle {
-                // SAFETY: ptr 指向 8 字节地址槽（0 表示 null）。
+                // SAFETY: ptr points to an 8-byte address slot (0 denotes null).
                 let addr: usize = unsafe { std::ptr::read_unaligned(ptr as *const usize) };
                 if addr == 0 {
                     arena.null()
                 } else {
-                    // 完整 ref 物化需要 engine 层（ObjHeader / msync 校验），
-                    // 共享层保持无配语义，非零地址返回 null。
+                    // Full ref materialization requires the engine layer (ObjHeader /
+                    // msync validation); the shared layer preserves null-paired
+                    // semantics and returns null for nonzero addresses.
                     arena.null()
                 }
             }
             #[inline]
             fn write(&self, ptr: *mut u8, h: ValueHandle, _arena: &ValueArena) {
-                // SAFETY: ptr 指向可写 8 字节地址槽；存储句柄索引作为占位。
+                // SAFETY: ptr points to a writable 8-byte address slot; store the handle
+                // index as a placeholder.
                 let raw: usize = h.index();
                 unsafe { std::ptr::write_unaligned(ptr as *mut usize, raw) }
             }
@@ -806,7 +818,7 @@ macro_rules! impl_ref_ops {
             }
             #[inline]
             fn equal(&self, a: *const u8, b: *const u8) -> bool {
-                // SAFETY: 两指针均指向 8 字节地址槽。
+                // SAFETY: both pointers point to 8-byte address slots.
                 unsafe {
                     std::ptr::read_unaligned(a as *const usize)
                         == std::ptr::read_unaligned(b as *const usize)
@@ -814,19 +826,19 @@ macro_rules! impl_ref_ops {
             }
             #[inline]
             fn format<'a>(&self, ptr: *const u8, buf: &'a mut [u8]) -> &'a str {
-                // SAFETY: ptr 指向 8 字节地址。
+                // SAFETY: ptr points to an 8-byte address.
                 let addr: usize = unsafe { std::ptr::read_unaligned(ptr as *const usize) };
                 use std::io::Write;
                 let mut cursor = std::io::Cursor::new(buf);
                 let _ = write!(cursor, "ref:0x{:x}", addr);
                 let written = cursor.position() as usize;
                 let buf_ref: &mut [u8] = cursor.into_inner();
-                // SAFETY: 格式化文本为 ASCII。
+                // SAFETY: the formatted text is ASCII.
                 unsafe { std::str::from_utf8_unchecked(&buf_ref[..written]) }
             }
             #[inline]
             fn hash_val(&self, ptr: *const u8) -> u64 {
-                // SAFETY: ptr 指向 8 字节地址，按 u64 重解释。
+                // SAFETY: ptr points to an 8-byte address; reinterpret as u64.
                 unsafe { std::ptr::read_unaligned(ptr as *const u64) }
             }
             #[inline]
@@ -841,179 +853,57 @@ impl_ref_ops!(RefOps);
 impl_ref_ops!(HeapRefOps);
 
 // =========================================================================
-// type_id 常量（从 TypeDesc.rs 迁移，权威源）
+// type_id constants (migrated from TypeDesc.rs, authoritative source).
 // =========================================================================
 
-/// 内置标量类型 ID 范围：1..=21（共 21 种）。
-/// type_id 0 保留给 "unknown"；22+ 为用户/动态类型（type_def_index 偏移）。
+/// Builtin scalar type ID range: 1..=21 (21 types in total).
+/// type_id 0 is reserved for "unknown"; 22+ are user/dynamic types (type_def_index offset).
 pub const FIRST_DYNAMIC_TYPE_ID: u16 = 22;
-pub const MAX_BUILTIN_TYPE_ID: u16 = 21;
 
-/// str/null/void 的 type_id（与 BUILTIN_TABLE 一致）。
+/// type_id for str/null/void (consistent with BUILTIN_TABLE).
 pub const STR_TYPE_ID: u16 = 19;
 pub const NULL_TYPE_ID: u16 = 20;
 pub const VOID_TYPE_ID: u16 = 21;
 
-/// 整数类型 type_id 范围：1..=12。
+/// Integer type type_id range: 1..=12.
 pub const FIRST_INT_TYPE_ID: u16 = 1;
 pub const LAST_INT_TYPE_ID: u16 = 12;
-/// 浮点类型 type_id 范围：13..=16。
+/// Float type type_id range: 13..=16.
 pub const FIRST_FLOAT_TYPE_ID: u16 = 13;
 pub const LAST_FLOAT_TYPE_ID: u16 = 16;
 
-/// 将 type_def_index 转为动态 type_id。
+/// Convert a `type_def_index` to a dynamic `type_id`.
 #[inline]
 pub const fn dynamic_type_id(type_def_index: u16) -> u16 {
     FIRST_DYNAMIC_TYPE_ID + type_def_index
 }
 
-/// 将动态 type_id 还原为 type_def_index。
-/// 仅对 type_id >= FIRST_DYNAMIC_TYPE_ID 有效。
+/// Convert a dynamic `type_id` back to a `type_def_index`.
+/// Only valid for type_id >= FIRST_DYNAMIC_TYPE_ID.
 #[inline]
 pub const fn type_def_index_of(type_id: u16) -> u16 {
     type_id - FIRST_DYNAMIC_TYPE_ID
 }
 
 // =========================================================================
-// ops 查找表（ops_of / ops_by_type_id）
+// DynamicOpsRegistry (replaces TypeDescriptorPool).
 // =========================================================================
 //
-// 从 Ty / type_id 派生 &'static dyn TypeOps，替代原 TypeDesc.rs 的
-// scalar_tag_to_desc / lookup_by_type_id / lookup_by_int_kind / lookup_by_float_kind。
-// TypeDescriptor 结构体已删除，不再有静态 DESC 常量中间层。
+// Manages ops for user-defined types (type_id starts at FIRST_DYNAMIC_TYPE_ID=22).
+// The TypeDescriptor struct has been removed; user type ops are registered directly as
+// `&'static dyn TypeOps`.
 
-/// 按 Ty 查找内置类型的 ops。
+/// Dynamic type ops entry: stores the ops + size + name + type_id for a user-defined type.
 ///
-/// 21 种内置类型（18 标量 + str/null/void）返回对应 ops；
-/// 复合类型（Array/Ref/Fn/Nullable 等）和用户类型（Adt/Record 等）返回 None，
-/// 需通过 DynamicOpsRegistry 查找。
-#[inline]
-pub fn ops_of(ty: &Ty) -> Option<&'static dyn TypeOps> {
-    match ty {
-        Ty::I8 => Some(&I8Ops),
-        Ty::I16 => Some(&I16Ops),
-        Ty::I32 => Some(&I32Ops),
-        Ty::I64 => Some(&I64Ops),
-        Ty::I128 => Some(&I128Ops),
-        Ty::U8 => Some(&U8Ops),
-        Ty::U16 => Some(&U16Ops),
-        Ty::U32 => Some(&U32Ops),
-        Ty::U64 => Some(&U64Ops),
-        Ty::U128 => Some(&U128Ops),
-        Ty::Isize => Some(&IsizeOps),
-        Ty::Usize => Some(&UsizeOps),
-        Ty::F16 => Some(&F16Ops),
-        Ty::F32 => Some(&F32Ops),
-        Ty::F64 => Some(&F64Ops),
-        Ty::F128 => Some(&F128Ops),
-        Ty::Bool => Some(&BoolOps),
-        Ty::Char => Some(&CharOps),
-        Ty::Str => Some(&HeapRefOps),
-        Ty::Null => Some(&NullOps),
-        Ty::Void => Some(&VoidOps),
-        _ => None,
-    }
-}
-
-/// 按 type_id 查找内置类型的 ops（1..=21）。
-///
-/// 派生自 BUILTIN_TABLE：type_id → ValueTag → Ty → ops_of。
-/// 动态 type_id（>= 22）返回 None，需通过 DynamicOpsRegistry 查找。
-#[inline]
-pub fn ops_by_type_id(type_id: u16) -> Option<&'static dyn TypeOps> {
-    let info = builtin_info_by_type_id(type_id)?;
-    ops_of(&Ty::from(info.value_tag))
-}
-
-// =========================================================================
-// DynamicOpsRegistry（替代 TypeDescriptorPool）
-// =========================================================================
-//
-// 管理用户自定义类型的 ops（type_id 从 FIRST_DYNAMIC_TYPE_ID=22 开始）。
-// TypeDescriptor 结构体已删除，用户类型 ops 直接注册为 &'static dyn TypeOps。
-
-/// 动态类型 ops 条目：存储用户自定义类型的 ops + size + name + type_id。
-///
-/// 替代原 TypeDescriptor 的角色，但不聚合为结构体常量——
-/// 仅在 DynamicOpsRegistry 中按 type_id 索引存储。
-pub struct DynamicOpsEntry {
-    pub ops: &'static dyn TypeOps,
-    pub size: u8,
-    pub type_id: u16,
-    pub type_name: &'static str,
-}
-
-/// 动态类型 ops 注册表：管理用户自定义类型（type_id 从 FIRST_DYNAMIC_TYPE_ID 开始）。
-///
-/// 替代 TypeDescriptorPool。TypeDescriptor 结构体已删除，
-/// 用户类型 ops 直接注册为 &'static dyn TypeOps。
-///
-/// `register` 会将类型名与条目泄漏为 &'static 以获得静态生命周期，
-/// 适用于进程级类型注册（与 Sema/Ir 的类型表语义一致）。
-pub struct DynamicOpsRegistry {
-    entries: Vec<DynamicOpsEntry>,
-    name_to_id: FxHashMap<String, u16>,
-}
+/// Dynamic type ops registry: placeholder for user-defined type ops registration.
+/// Currently no dynamic types are registered; methods will be added when user-defined
+/// type registration is wired into sema.
+pub struct DynamicOpsRegistry;
 
 impl DynamicOpsRegistry {
     #[inline]
     pub fn new() -> Self {
-        DynamicOpsRegistry {
-            entries: Vec::new(),
-            name_to_id: FxHashMap::default(),
-        }
-    }
-
-    /// 注册一个用户类型，返回分配的 `type_id`（从 FIRST_DYNAMIC_TYPE_ID 开始递增）。
-    pub fn register(&mut self, name: &str, size: u8, ops: &'static dyn TypeOps) -> u16 {
-        let len = self.entries.len();
-        assert!(
-            FIRST_DYNAMIC_TYPE_ID as usize + len <= u16::MAX as usize,
-            "type_id overflow: too many dynamic type descriptors"
-        );
-        let type_id = FIRST_DYNAMIC_TYPE_ID + len as u16;
-        let name_static: &'static str = Box::leak(name.to_string().into_boxed_str());
-        self.entries.push(DynamicOpsEntry {
-            ops,
-            size,
-            type_id,
-            type_name: name_static,
-        });
-        self.name_to_id.insert(name.to_string(), type_id);
-        type_id
-    }
-
-    /// 按 `type_id` 查找 ops。
-    ///
-    /// type_id 1..=MAX_BUILTIN_TYPE_ID 委托给 ops_by_type_id（内置静态表）；
-    /// type_id >= FIRST_DYNAMIC_TYPE_ID 查询动态池。
-    #[inline]
-    pub fn get_ops(&self, type_id: u16) -> Option<&'static dyn TypeOps> {
-        if type_id <= MAX_BUILTIN_TYPE_ID {
-            return ops_by_type_id(type_id);
-        }
-        let idx = type_def_index_of(type_id) as usize;
-        self.entries.get(idx).map(|e| e.ops)
-    }
-
-    /// 按 `type_id` 查找完整条目（含 size / type_name）。
-    ///
-    /// 仅对动态 type_id（>= FIRST_DYNAMIC_TYPE_ID）有效；内置 type_id 返回 None
-    /// （内置类型的 size/name 可从 Ty 派生：Ty::byte_width() / Ty::name()）。
-    #[inline]
-    pub fn get_entry(&self, type_id: u16) -> Option<&DynamicOpsEntry> {
-        if type_id < FIRST_DYNAMIC_TYPE_ID {
-            return None;
-        }
-        let idx = type_def_index_of(type_id) as usize;
-        self.entries.get(idx)
-    }
-
-    /// 按类型名查找完整条目。
-    #[inline]
-    pub fn get_by_name(&self, name: &str) -> Option<&DynamicOpsEntry> {
-        let id = *self.name_to_id.get(name)?;
-        self.get_entry(id)
+        DynamicOpsRegistry
     }
 }
 

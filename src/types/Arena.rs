@@ -1,24 +1,26 @@
 // =========================================================================
-// Arena — 类型分配器 + unify/occurs/resolve
+// Arena — type allocator + unify/occurs/resolve.
 // =========================================================================
 
 use super::Tag::*;
 use super::ty::*;
 use super::Display::TypeDisplay;
 
-/// Ty 分配器：arena-based，管理类型槽、结构详情、类型变量与 kind 变量。
+/// Arena-based `Ty` allocator: manages type slots, structural details, type variables,
+/// and kind variables.
 ///
-/// 所有 Ty 通过 `make()` 分配返回 `TypeHandle`；复合类型通过 `make_*` 方法
-/// 分配 `DetailId` 并存结构数据到 `details` 表。`unify`/`occurs`/`resolve`/
-/// `kind_of` 等方法需访问 `details`，故为 `TypeArena` 方法。
+/// Every `Ty` is allocated via `make()` and returns a `TypeHandle`; composite types are
+/// allocated a `DetailId` via the `make_*` methods, which store their structural data in
+/// the `details` table. Methods such as `unify`/`occurs`/`resolve`/`kind_of` need to
+/// access `details`, so they are methods on `TypeArena`.
 pub struct TypeArena {
-    /// 类型槽：Ty 枚举（Copy）按 TypeHandle 索引。
+    /// Type slots: the `Ty` enum (`Copy`), indexed by `TypeHandle`.
     pub types: Vec<Ty>,
-    /// 结构详情表：复合类型的结构数据按 DetailId 索引。
+    /// Structural detail table: structural data for composite types, indexed by `DetailId`.
     pub details: Vec<TypeDetail>,
-    /// 类型变量表：TypeVar(u32) 载荷索引此表。
+    /// Type variable table: indexed by the `TypeVar(u32)` payload.
     pub type_vars: Vec<TypeVar>,
-    /// kind 变量绑定表：SemKind::Var(idx) 索引此表。
+    /// Kind variable binding table: indexed by `SemKind::Var(idx)`.
     kind_vars: Vec<Option<SemKind>>,
 }
 
@@ -38,7 +40,7 @@ impl TypeArena {
         }
     }
 
-    // ── 基础访问 ──
+    // -- Basic access --
 
     #[inline]
     pub fn len(&self) -> usize {
@@ -57,27 +59,27 @@ impl TypeArena {
         self.types[h.0 as usize]
     }
 
-    /// 分配一个 Ty，返回句柄。
+    /// Allocate a `Ty` and return its handle.
     pub fn make(&mut self, ty: Ty) -> TypeHandle {
         let h = TypeHandle(self.types.len() as u32);
         self.types.push(ty);
         h
     }
 
-    /// 分配一个 TypeDetail，返回 DetailId。
+    /// Allocate a `TypeDetail` and return its `DetailId`.
     fn make_detail(&mut self, detail: TypeDetail) -> DetailId {
         let id = DetailId(self.details.len() as u32);
         self.details.push(detail);
         id
     }
 
-    /// 获取 detail 引用（has_detail() 为 false 的变体调用会 panic）。
+    /// Get a reference to a detail (panics for variants where `has_detail()` is false).
     #[inline]
     pub fn detail(&self, id: DetailId) -> &TypeDetail {
         &self.details[id.0 as usize]
     }
 
-    // ── 复合类型构造器（分配 detail + make Ty）──
+    // -- Composite type constructors (allocate detail + make Ty) --
 
     pub fn make_throw(&mut self, value: TypeHandle, error: TypeHandle) -> TypeHandle {
         let id = self.make_detail(TypeDetail::Throw {
@@ -178,9 +180,9 @@ impl TypeArena {
         self.make(Ty::Generic(id))
     }
 
-    // ── 结构化访问器（替代 ConcreteType::Fn{params, return_type} 内联访问）──
+    // -- Structural accessors (replace inline access like ConcreteType::Fn{params, return_type}) --
 
-    /// 从 Ty 取出 DetailId（has_detail 为 false 时 panic）。
+    /// Extract the `DetailId` from a `Ty` (panics when `has_detail` is false).
     #[inline]
     pub fn detail_id_of(&self, ty: Ty) -> DetailId {
         match ty {
@@ -205,7 +207,7 @@ impl TypeArena {
         }
     }
 
-    /// Throw 的 (value_type, error_type)。
+    /// The `(value_type, error_type)` of a `Throw`.
     #[inline]
     pub fn throw_parts(&self, h: TypeHandle) -> (TypeHandle, TypeHandle) {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -216,7 +218,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Channel 元素类型。
+    /// The element type of a `Channel`.
     #[inline]
     pub fn channel_elem(&self, h: TypeHandle) -> TypeHandle {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -224,7 +226,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Async 的值类型。
+    /// The value type of an `Async`.
     #[inline]
     pub fn async_value(&self, h: TypeHandle) -> TypeHandle {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -232,7 +234,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Lazy 的值类型。
+    /// The value type of a `Lazy`.
     #[inline]
     pub fn lazy_value(&self, h: TypeHandle) -> TypeHandle {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -240,7 +242,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Atomic 元素类型。
+    /// The element type of an `Atomic`.
     #[inline]
     pub fn atomic_elem(&self, h: TypeHandle) -> TypeHandle {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -248,7 +250,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Sender 元素类型。
+    /// The element type of a `Sender`.
     #[inline]
     pub fn sender_elem(&self, h: TypeHandle) -> TypeHandle {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -256,7 +258,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Receiver 元素类型。
+    /// The element type of a `Receiver`.
     #[inline]
     pub fn receiver_elem(&self, h: TypeHandle) -> TypeHandle {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -264,7 +266,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Array 的 (elem, size)。
+    /// The `(elem, size)` of an `Array`.
     #[inline]
     pub fn array_parts(&self, h: TypeHandle) -> (TypeHandle, Option<u64>) {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -272,7 +274,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Ref 的 (inner, is_raw)。
+    /// The `(inner, is_raw)` of a `Ref`.
     #[inline]
     pub fn ref_parts(&self, h: TypeHandle) -> (TypeHandle, bool) {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -280,7 +282,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Fn 的参数切片与返回类型。
+    /// The parameter slice and return type of an `Fn`.
     #[inline]
     pub fn fn_parts(&self, h: TypeHandle) -> (&[TypeHandle], TypeHandle) {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -288,7 +290,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Nullable 的内部类型。
+    /// The inner type of a `Nullable`.
     #[inline]
     pub fn nullable_inner(&self, h: TypeHandle) -> TypeHandle {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -296,7 +298,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Adt 的 (name, type_args)。
+    /// The `(name, type_args)` of an `Adt`.
     #[inline]
     pub fn adt_parts(&self, h: TypeHandle) -> (&str, &[TypeHandle]) {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -304,7 +306,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Record 的 fields 切片。
+    /// The `fields` slice of a `Record`.
     #[inline]
     pub fn record_fields(&self, h: TypeHandle) -> &[FieldType] {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -312,7 +314,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Record 的 name。
+    /// The `name` of a `Record`.
     #[inline]
     pub fn record_name(&self, h: TypeHandle) -> Option<&str> {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -320,7 +322,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Trait 的 (name, type_args)。
+    /// The `(name, type_args)` of a `Trait`.
     #[inline]
     pub fn trait_parts(&self, h: TypeHandle) -> (&str, &[TypeHandle]) {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -328,7 +330,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// TraitObject 的 (trait_name, method_sigs)。
+    /// The `(trait_name, method_sigs)` of a `TraitObject`.
     #[inline]
     pub fn trait_object_parts(&self, h: TypeHandle) -> (&str, &[TraitMethodSig]) {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -339,7 +341,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// ModuleRef 的 (path, env)。
+    /// The `(path, env)` of a `ModuleRef`.
     #[inline]
     pub fn module_ref_parts(&self, h: TypeHandle) -> (&str, EnvId) {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -347,7 +349,7 @@ impl TypeArena {
             _ => unreachable!(),
         }
     }
-    /// Generic 的 (name, args)。
+    /// The `(name, args)` of a `Generic`.
     #[inline]
     pub fn generic_parts(&self, h: TypeHandle) -> (&str, &[TypeHandle]) {
         match self.detail(self.detail_id_of(self.get(h))) {
@@ -356,7 +358,7 @@ impl TypeArena {
         }
     }
 
-    // ── 类型变量构造 ──
+    // -- Type variable construction --
 
     pub fn fresh_type_var(&mut self) -> TypeHandle {
         let idx = self.type_vars.len() as u32;
@@ -389,7 +391,7 @@ impl TypeArena {
         &self.type_vars[idx as usize].kind
     }
 
-    /// 计算任意 TypeHandle 的 kind。
+    /// Compute the kind of an arbitrary `TypeHandle`.
     pub fn kind_of(&self, ty: TypeHandle) -> SemKind {
         match self.get(ty) {
             Ty::TypeVar(idx) => self.type_vars[idx as usize].kind.clone(),
@@ -397,10 +399,11 @@ impl TypeArena {
         }
     }
 
-    // ── resolve / occurs / unify / kind 统一 ──
-    //（原 sema/Sema.rs 实现整体迁移，ConcreteType → Ty，结构访问改为访问器 API）
+    // -- resolve / occurs / unify / kind unification --
+    // (The original sema/Sema.rs implementation was migrated wholesale;
+    // ConcreteType -> Ty, and structural access now uses accessor APIs.)
 
-    /// 解析 kind 变量到其绑定值（类似 type resolve）。
+    /// Resolve a kind variable to its binding (analogous to type resolution).
     pub fn resolve_kind(&self, mut kind: SemKind) -> SemKind {
         while let SemKind::Var(idx) = &kind {
             if let Some(Some(bound)) = self.kind_vars.get(*idx as usize) {
@@ -412,7 +415,7 @@ impl TypeArena {
         kind
     }
 
-    /// kind 统一：尝试统一两个 kind，成功则绑定 kind 变量。
+    /// Kind unification: attempt to unify two kinds; on success, binds the kind variable.
     pub fn unify_kind(&mut self, k1: &SemKind, k2: &SemKind) -> Result<(), ()> {
         let r1 = self.resolve_kind(k1.clone());
         let r2 = self.resolve_kind(k2.clone());
@@ -441,7 +444,7 @@ impl TypeArena {
         }
     }
 
-    /// 检查类型应用（type application）的 kind 一致性。
+    /// Check kind consistency of a type application.
     pub fn check_kind_application(
         &mut self,
         constructor_kind: &SemKind,
@@ -491,13 +494,13 @@ impl TypeArena {
         }
     }
 
-    /// 获取类型变量引用。
+    /// Get a reference to a type variable.
     #[inline]
     pub fn type_var(&self, idx: u32) -> &TypeVar {
         &self.type_vars[idx as usize]
     }
 
-    /// 解析 TypeHandle 到非 TypeVar 或已绑定的目标。
+    /// Resolve a `TypeHandle` to a non-`TypeVar` or its bound target.
     pub fn resolve(&self, h: TypeHandle) -> TypeHandle {
         let mut cur = h;
         loop {
@@ -516,7 +519,7 @@ impl TypeArena {
         }
     }
 
-    /// occurs check：类型变量 `var_idx` 是否出现在 `ty` 中（防止无限类型）。
+    /// Occurs check: whether type variable `var_idx` occurs within `ty` (prevents infinite types).
     pub fn occurs(&self, var_idx: u32, ty: TypeHandle) -> bool {
         let t = self.get(ty);
         match t {
@@ -560,7 +563,7 @@ impl TypeArena {
         }
     }
 
-    /// 统一两个类型（就地修改 `type_var.bound` 或覆写 `never`/`unknown` 槽位）。
+    /// Unify two types (in-place mutation of `type_var.bound` or overwriting `never`/`unknown` slots).
     pub fn unify(&mut self, t1: TypeHandle, t2: TypeHandle) -> Result<(), UnifyError> {
         let a = self.resolve(t1);
         let b = self.resolve(t2);
@@ -571,7 +574,7 @@ impl TypeArena {
         let a_ty = self.get(a);
         let b_ty = self.get(b);
 
-        // ── type_var 绑定（a 侧）──
+        // -- type_var binding (a side) --
         if let Ty::TypeVar(idx) = a_ty {
             let is_rigid = self.type_vars[idx as usize].is_rigid;
             if is_rigid {
@@ -579,7 +582,7 @@ impl TypeArena {
                     if bidx == idx {
                         return Ok(());
                     }
-                    // b 侧是非 rigid var：把 b 绑定到 rigid a
+                    // b side is a non-rigid var: bind b to rigid a
                     if !self.type_vars[bidx as usize].is_rigid {
                         if self.occurs(bidx, a) {
                             return Err(UnifyError::OccursCheckFailed);
@@ -607,7 +610,7 @@ impl TypeArena {
             return Ok(());
         }
 
-        // ── type_var 绑定（b 侧）──
+        // -- type_var binding (b side) --
         if let Ty::TypeVar(idx) = b_ty {
             let is_rigid = self.type_vars[idx as usize].is_rigid;
             if is_rigid {
@@ -625,7 +628,7 @@ impl TypeArena {
             return Ok(());
         }
 
-        // ── never / unknown 与任意类型统一为对方（就地覆写原槽位）──
+        // -- never / unknown unify with any type as the other side (in-place overwrite of the original slot) --
         match a_ty {
             Ty::Never | Ty::Unknown => {
                 self.types[t1.0 as usize] = b_ty;
@@ -641,9 +644,10 @@ impl TypeArena {
             _ => {}
         }
 
-        // ── 结构化统一 ──
-        // Ty is Copy，无需 clone；复合类型字段通过访问器获取。
-        // 对于需要递归 unify 的字段，先收集 TypeHandle 对到 Vec 以避免借用冲突。
+        // -- Structural unification --
+        // Ty is Copy, so no clone is needed; composite type fields are obtained via accessors.
+        // For fields requiring recursive unify, TypeHandle pairs are first collected into a
+        // Vec to avoid borrow conflicts.
         match (a_ty, b_ty) {
             (Ty::I8, Ty::I8)
             | (Ty::I16, Ty::I16)
@@ -764,7 +768,7 @@ impl TypeArena {
                 Ok(())
             }
 
-            // Trait 类型与 TraitObject（同名）可统一
+            // A Trait type and a TraitObject with the same name can unify.
             (Ty::Trait(_), Ty::TraitObject(_)) => {
                 let na = self.trait_parts(a).0;
                 let nb = self.trait_object_parts(b).0;
@@ -797,7 +801,7 @@ impl TypeArena {
                 self.unify(ea, eb)
             }
 
-            // 单参数内置泛型：递归统一元素/值类型
+            // Single-parameter builtin generics: recursively unify the element/value type.
             (Ty::Channel(_), Ty::Channel(_)) => {
                 self.unify(self.channel_elem(a), self.channel_elem(b))
             }
@@ -821,12 +825,13 @@ impl TypeArena {
         }
     }
 
-    /// 提取类型名（用于 `ExprInfo.type_name`）。
-    /// 标量返回静态名；adt/generic/trait 返回其名；ref/nullable 递归取 inner 名；
-    /// 其余返回 `None`。递归场景需 arena 访问子节点。
+    /// Extract the type name (used for `ExprInfo.type_name`).
+    /// Scalars return their static name; adt/generic/trait return their name;
+    /// ref/nullable recursively take the inner name; all others return `None`.
+    /// Recursive cases require arena access to child nodes.
     pub fn type_name(&self, ty: TypeHandle) -> Option<&str> {
         let t = self.get(ty);
-        // 内置标量 + Str/Null/Void + 内置泛型名：返回静态名
+        // Builtin scalars + Str/Null/Void + builtin generic names: return the static name.
         if t.is_scalar()
             || matches!(
                 t,
@@ -848,15 +853,15 @@ impl TypeArena {
         }
     }
 
-    /// 构造一个 `TypeDisplay` 包装器，可用于 `format!("{}", arena.display(h))`。
+    /// Construct a `TypeDisplay` wrapper, usable as `format!("{}", arena.display(h))`.
     #[inline]
     pub fn display(&self, ty: TypeHandle) -> TypeDisplay<'_> {
         TypeDisplay { arena: self, ty }
     }
 
-    // ── 内置标量名查找（原 from_scalar_name）──
+    // -- Builtin scalar name lookup (formerly from_scalar_name) --
 
-    /// 从标量类型名反向构造 Ty（内置类型），未知名返回 Unknown。
+    /// Construct a `Ty` (builtin type) from a scalar type name; unknown names return `Unknown`.
     pub fn from_scalar_name(&mut self, name: &str) -> TypeHandle {
         match Ty::from_type_name(name) {
             Some(ty) => self.make(ty),

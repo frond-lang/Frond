@@ -1,43 +1,33 @@
-//! 模块加载的缓存条目与错误类型。
+//! Cache entries and error types for module loading.
 
 use rustc_hash::FxHashSet;
 
 use crate::ast::Ast::Module;
 
-/// 已加载的模块条目
+/// A loaded module entry.
 pub struct LoadedModule {
-    /// parse 产出的 AST 模块（'static 生命周期，可安全缓存）
+    /// The parsed AST module (`'static` lifetime, safe to cache).
     pub module: Module<'static>,
-    /// 模块导出的公开符号（pub fun / pub type / pub val 的名称）
+    /// Public symbols exported by the module (names of `pub fun` / `pub type` / `pub val`).
     pub exports: FxHashSet<String>,
 }
 
-/// 模块加载失败的原因
+/// Reasons for module loading failures.
 ///
-/// 所有加载失败（模块未找到 / 解析失败）均结构化记录到 `ModuleLoader::load_errors`，
-/// 由调用方统一报告，避免错误被静默吞掉后引发 sema 级联误报。
+/// All loading failures (module not found / parse failed) are recorded structurally
+/// in `ModuleLoader::load_errors` and reported by the caller, preventing silent error
+/// swallowing that would trigger cascading sema false positives.
 #[derive(Debug, Clone)]
 pub enum LoadError {
-    /// 模块路径未找到（stdlib 嵌入表和文件系统搜索路径均未命中）
+    /// Module path not found (neither the stdlib embed table nor filesystem search paths matched).
     ModuleNotFound { path: String },
-    /// 模块源码解析失败（致命 parse 错误，AST 不可用）
+    /// Module source parsing failed (fatal parse error, AST unavailable).
     ParseFailed {
         path: String,
         line: u32,
         column: u32,
         message: String,
     },
-    /// 循环导入检测到（A 导入 B，B 导入 A）
+    /// Circular import detected (A imports B, B imports A).
     CircularImport { path: String },
-}
-
-impl LoadError {
-    /// 返回失败模块的路径
-    pub fn path(&self) -> &str {
-        match self {
-            LoadError::ModuleNotFound { path } => path,
-            LoadError::ParseFailed { path, .. } => path,
-            LoadError::CircularImport { path } => path,
-        }
-    }
 }

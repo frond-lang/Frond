@@ -1,12 +1,12 @@
-//! Engine 核心类型定义：Engine<S> 结构体、EngineRef 工厂、Send/Sync 实现、
-//! 调度器常量与 env_flag 辅助。
+//! Engine core type definitions: the `Engine<S>` struct, the `EngineRef` factory, Send/Sync
+//! implementations, scheduler constants, and the `env_flag` helper.
 //!
-//! 业务方法（impl<S: LockStrategy> Engine<S>）分散在子模块中：
-//! - [`crate::engine::Frame`]: Frame 生命周期
-//! - [`crate::engine::Subgraph`]: 子图调用与返回
-//! - [`crate::engine::Schedule`]: 就绪调度核心
-//! - [`crate::engine::AsyncRt`]: 事件处理
-//! - [`crate::engine::Strategy`]: 单/多线程入口（new_single / new_multi / run_single / run_multi）
+//! Business methods (`impl<S: LockStrategy> Engine<S>`) are spread across submodules:
+//! - [`crate::engine::Frame`]: frame lifecycle
+//! - [`crate::engine::Subgraph`]: subgraph invocation and return
+//! - [`crate::engine::Schedule`]: readiness scheduling core
+//! - [`crate::engine::AsyncRt`]: event handling
+//! - [`crate::engine::Strategy`]: single-/multi-threaded entry points (new_single / new_multi / run_single / run_multi)
 
 use super::*;
 use crate::ir::Ir::*;
@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 use crossbeam_deque::Injector;
 use std::sync::Arc;
 
-/// 缓存环境变量布尔标志，避免热路径每次调用 std::env::var。
+/// Caches a boolean environment-variable flag to avoid calling `std::env::var` on every hot-path invocation.
 #[inline]
 pub(super) fn env_flag(name: &str) -> bool {
     static FLAG_STALL: OnceLock<bool> = OnceLock::new();
@@ -29,19 +29,20 @@ pub(super) fn env_flag(name: &str) -> bool {
 }
 
 // =========================================================================
-// 哨兵常量 — 调度器使用
+// Sentinel constants — used by the scheduler
 // =========================================================================
 
-/// `pending_inputs` 槽位哨兵：标记"永不就绪/外部源"（实际入度必须 < 65535）。
+/// Sentinel for a `pending_inputs` slot marking it as "never ready / external source" (the actual
+/// in-degree must stay below 65535).
 pub(super) const PENDING_EXTERNAL: u16 = u16::MAX;
-/// splitmix64 黄金比例散列常量（确保各 worker 的 steal 顺序互异）。
+/// splitmix64 golden-ratio hash constant (ensures each worker steals in a distinct order).
 pub(super) const GOLDEN_RATIO_64: u64 = 0x9E3779B97F4A7C15;
 
 // =========================================================================
-// Engine<S> — 统一执行引擎（泛型锁策略）
+// Engine<S> — unified execution engine (generic over lock strategy)
 // =========================================================================
 
-/// 统一引擎：字段类型由 S 决定，业务逻辑只写一份
+/// Unified engine: field types are determined by `S`, while the business logic is written once.
 pub struct Engine<S: LockStrategy> {
     pub graph: Arc<DataFlowGraph>,
     pub frames: S::Mutex<HashMap<FrameId, Box<crate::ir::Ir::Frame>>>,
@@ -52,48 +53,52 @@ pub struct Engine<S: LockStrategy> {
     pub event_waiters: S::Mutex<Vec<(crate::ir::Ir::RuntimeEvent, FrameId)>>,
     pub pending_completions:
         S::Mutex<HashMap<FrameId, Vec<(crate::ir::Ir::NodeId, Value, crate::ir::Ir::ControlSignal)>>>,
-    /// 事件投递竞态兜底：事件到达时帧正被 process_frame 处理（不在 HashMap），
-    /// 将事件暂存，process_frame insert 帧后消费（与 pending_completions 对称）
+    /// Fallback for event-delivery races: when an event arrives while a frame is being processed by
+    /// process_frame (and is therefore absent from the HashMap), the event is stashed here and
+    /// consumed once process_frame inserts the frame (symmetric to pending_completions).
     pub pending_events: S::Mutex<HashMap<FrameId, (crate::ir::Ir::RuntimeEvent, Value)>>,
     pub result: S::Mutex<Option<Value>>,
-    /// 帧池：回收已完成帧的 Box<Frame> 供复用，消除频繁 Vec 分配/释放
+    /// Frame pool: reclaims completed `Box<Frame>` for reuse, eliminating frequent Vec
+    /// allocation/deallocation.
     pub frame_pool: S::Mutex<Vec<Box<crate::ir::Ir::Frame>>>,
-    /// 单线程队列（Multi 模式为 None）
+    /// Single-threaded queue (None in Multi mode).
     pub ready_frames: Option<RefCell<std::collections::VecDeque<FrameId>>>,
-    /// 多线程调度（Single 模式为 None）
+    /// Multi-threaded scheduling (None in Single mode).
     pub global_queue: Option<Injector<FrameId>>,
     pub wakeup: Option<(ParkingMutex<()>, Condvar)>,
     pub active_count: Option<ParkingMutex<usize>>,
-    // pub(super)：结构体定义于 engine::EngineCore，需允许 engine 子树（Strategy 等 sibling）
-    // 在构造 Engine { ... } 时写入此字段。
+    // pub(super): the struct is defined in engine::EngineCore; sibling submodules (Strategy, etc.)
+    // must be allowed to write this field when constructing `Engine { ... }`.
     pub(super) _strategy: std::marker::PhantomData<S>,
 }
 
-// Safety: Frame 含裸指针（root_frame_ptr/parent_frame_ptr），但所有可变字段都在
-// ParkingMutex 保护下，同一时刻只有一个线程访问每个字段。
+// Safety: Frame contains raw pointers (root_frame_ptr/parent_frame_ptr), but every mutable field
+// is guarded by a ParkingMutex, so only one thread accesses each field at a time.
 unsafe impl Send for Engine<Multi> {}
 unsafe impl Sync for Engine<Multi> {}
 
 // =========================================================================
-// EngineRef — 统一工厂（根据 workers 数决定编译期策略）
+// EngineRef — unified factory (picks a compile-time strategy based on the worker count)
 // =========================================================================
 
-/// 统一工厂：根据 workers 数决定编译期策略
+/// Unified factory: picks a compile-time strategy based on the worker count.
 pub enum EngineRef {
     Single(Engine<Single>),
     Multi(Arc<Engine<Multi>>),
 }
 
 impl EngineRef {
-    /// 创建引擎：自动判断 worker 数。
+    /// Creates the engine, automatically deciding the worker count.
     ///
-    /// 策略：从 entry_subgraph 可达的子图中，任一 `has_suspend = true`
-    /// （含 async/timer/channel 挂起点）时用多 worker（= available_parallelism），
-    /// 否则单线程。
-    /// 关键：可达性分析只看从 entry 出发能调用到的子图，避免被"已编译但未调用"
-    /// 的 stdlib async 函数（如 open/read_file/sleep）误判为需要多 worker。
-    /// 纯同步程序无挂起点，单线程数据流调度最高效（无 work-stealing 开销）；
-    /// 含 async 的程序有挂起/唤醒，多 worker 并发推进多帧更高效。
+    /// Strategy: among the subgraphs reachable from `entry_subgraph`, if any has
+    /// `has_suspend = true` (i.e. contains an async/timer/channel suspension point), use multiple
+    /// workers (= `available_parallelism`); otherwise use a single thread.
+    /// Key point: the reachability analysis only considers subgraphs callable from the entry, so
+    /// "compiled-but-uncalled" stdlib async functions (such as open/read_file/sleep) are not
+    /// mistaken as requiring multiple workers.
+    /// A purely synchronous program has no suspension points, so single-threaded dataflow
+    /// scheduling is most efficient (no work-stealing overhead); a program containing async has
+    /// suspend/wake behavior, so multiple workers advancing frames concurrently is more efficient.
     pub fn new(graph: DataFlowGraph) -> Self {
         let has_async = Self::entry_reaches_suspend(&graph);
         if has_async {
@@ -106,8 +111,9 @@ impl EngineRef {
         }
     }
 
-    /// 从 entry_subgraph 出发做可达性分析，判断是否有可达子图含挂起点。
-    /// 遍历每个可达子图节点范围内的 Call 节点的 call_targets，BFS 扩展。
+    /// Performs a reachability analysis starting from `entry_subgraph` to determine whether any
+    /// reachable subgraph contains a suspension point. Traverses the `call_targets` of every Call
+    /// node within each reachable subgraph's node range, expanding via BFS.
     fn entry_reaches_suspend(graph: &DataFlowGraph) -> bool {
         let entry = match graph.entry_subgraph {
             Some(sg) => sg,
@@ -124,7 +130,7 @@ impl EngineRef {
             if sg.has_suspend {
                 return true;
             }
-            // 扫描该子图节点范围内的 Call 节点，收集 call_targets
+            // Scan the Call nodes within this subgraph's node range and collect call_targets.
             let (start, end) = sg.node_range;
             let start = start.0 as usize;
             let end = end.0 as usize;
@@ -132,7 +138,7 @@ impl EngineRef {
                 if nid >= graph.node_count() {
                     break;
                 }
-                // call_targets 是 per-Node 表，Call 节点才有 Some(target)
+                // call_targets is a per-Node table; only Call nodes have Some(target).
                 if let Some(target_sg) = graph.call_target(nid) {
                     let t = target_sg.0 as usize;
                     if t < visited.len() && !visited[t] {
@@ -145,7 +151,7 @@ impl EngineRef {
         false
     }
 
-    /// 运行引擎，返回结果值
+    /// Runs the engine and returns the result value.
     pub fn run(self) -> Value {
         match self {
             Self::Single(e) => e.run_single(),

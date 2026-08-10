@@ -1,9 +1,8 @@
 // =========================================================================
-// Ops — Num/BitOps trait + cast + batch/SIMD + allocator + 纯算术核心
+// Ops — Num/BitOps trait + cast + batch/SIMD + allocator + pure arithmetic core
 // =========================================================================
 
 use std::hash::Hash;
-use std::sync::Arc;
 
 use rayon::prelude::*;
 use pastey::paste;
@@ -14,10 +13,10 @@ pub use crate::types::ValueTag;
 use super::value::*;
 
 // =========================================================================
-// 第十一部分：ops.rs（Num trait + BitOps trait + impl）
+// Part 11: ops.rs (Num trait + BitOps trait + impl)
 // =========================================================================
 
-/// 数值运算 trait：支持溢出检测的算术运算
+/// Numeric operation trait: arithmetic operations with overflow detection.
 pub trait Num: Sized + Copy {
     fn checked_add(self, other: Self) -> Option<Self>;
     fn checked_sub(self, other: Self) -> Option<Self>;
@@ -113,7 +112,7 @@ impl Num for f64 {
     fn to_u32(self) -> u32 { self as u32 }
 }
 
-// F16 实现 Num：委托到精确 IEEE 754 binary16 运算（不经 f64 中转）
+// F16 Num impl: delegates to exact IEEE 754 binary16 arithmetic (no f64 intermediate)
 impl Num for F16 {
     fn checked_add(self, other: Self) -> Option<Self> { Some(self + other) }
     fn checked_sub(self, other: Self) -> Option<Self> { Some(self - other) }
@@ -127,13 +126,13 @@ impl Num for F16 {
     fn wrapping_mul(self, other: Self) -> Self { self * other }
     fn wrapping_neg(self) -> Self { -self }
     fn abs(self) -> Self {
-        // 清除符号位
+        // Clear the sign bit
         F16(self.0 & 0x7FFF)
     }
     fn to_u32(self) -> u32 { self.to_f32() as u32 }
 }
 
-// F128 实现 Num：委托到精确 IEEE 754 binary128 运算（不经 f64 中转）
+// F128 Num impl: delegates to exact IEEE 754 binary128 arithmetic (no f64 intermediate)
 impl Num for F128 {
     fn checked_add(self, other: Self) -> Option<Self> { Some(self + other) }
     fn checked_sub(self, other: Self) -> Option<Self> { Some(self - other) }
@@ -147,14 +146,14 @@ impl Num for F128 {
     fn wrapping_mul(self, other: Self) -> Self { self * other }
     fn wrapping_neg(self) -> Self { -self }
     fn abs(self) -> Self {
-        // 清除符号位（bit 127）
+        // Clear the sign bit (bit 127)
         let bits = u128::from_le_bytes(self.0) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
         F128(bits.to_le_bytes())
     }
     fn to_u32(self) -> u32 { self.to_f64() as u32 }
 }
 
-/// 位运算 trait
+/// Bitwise operation trait.
 pub trait BitOps: Sized + Copy {
     fn bit_and(self, other: Self) -> Self;
     fn bit_or(self, other: Self) -> Self;
@@ -182,21 +181,8 @@ macro_rules! impl_bitops {
 impl_bitops!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
 
 // =========================================================================
-// 第十二部分：cast.rs（CastError, ParseError, cast_value, try_cast_value, parse_str）
+// Part 12: cast.rs (cast_value)
 // =========================================================================
-
-/// 转换错误
-#[derive(Debug, Clone, PartialEq)]
-pub enum CastError {
-    Overflow,
-    InvalidCodepoint,
-}
-
-/// 解析错误
-#[derive(Debug, Clone, PartialEq)]
-pub enum ParseError {
-    ParseFailed(String),
-}
 
 pub fn cast_value(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag) -> Vec<u8> {
     let dst_width = dst_tag.byte_width();
@@ -243,138 +229,7 @@ pub fn cast_value(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag) -> Vec
     result
 }
 
-pub fn try_cast_value(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag) -> Result<Vec<u8>, CastError> {
-    if src_tag == dst_tag {
-        return Ok(cast_value(src_tag, src_bytes, dst_tag));
-    }
-
-    if src_tag.is_int() && dst_tag == ValueTag::Char {
-        let cp = cast_to_u32(src_tag, src_bytes);
-        if cp > 0x10FFFF || (0xD800..=0xDFFF).contains(&cp) {
-            return Err(CastError::InvalidCodepoint);
-        }
-        let mut result = vec![0u8; 4];
-        write_u32_le(cp, &mut result);
-        return Ok(result);
-    }
-
-    if src_tag.is_int() && dst_tag.is_int() && src_tag.byte_width() > dst_tag.byte_width() {
-        return try_cast_int_narrow(src_tag, src_bytes, dst_tag);
-    }
-
-    if src_tag.is_float() && dst_tag.is_int() {
-        return try_cast_float_to_int(src_tag, src_bytes, dst_tag);
-    }
-
-    Ok(cast_value(src_tag, src_bytes, dst_tag))
-}
-
-pub fn parse_str(s: &str, dst_tag: ValueTag) -> Result<Vec<u8>, ParseError> {
-    let trimmed = s.trim();
-    let result = vec![0u8; dst_tag.byte_width()];
-
-    if trimmed.is_empty() {
-        return Err(ParseError::ParseFailed("empty string".to_string()));
-    }
-
-    let mut result = result;
-
-    match dst_tag {
-        ValueTag::Bool => {
-            let b = match trimmed.to_ascii_lowercase().as_str() {
-                "true" => true,
-                "false" => false,
-                _ => return Err(ParseError::ParseFailed(format!("invalid bool: {}", s))),
-            };
-            write_bool(b, &mut result);
-        }
-        ValueTag::Char => {
-            let mut chars = trimmed.chars();
-            let c = chars.next().ok_or_else(|| ParseError::ParseFailed("empty char".to_string()))?;
-            if chars.next().is_some() {
-                return Err(ParseError::ParseFailed("char must be single character".to_string()));
-            }
-            write_u32_le(c as u32, &mut result);
-        }
-        ValueTag::I8 => {
-            let v: i8 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
-            write_i8(v, &mut result);
-        }
-        ValueTag::I16 => {
-            let v: i16 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
-            write_i16_le(v, &mut result);
-        }
-        ValueTag::I32 => {
-            let v: i32 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
-            write_i32_le(v, &mut result);
-        }
-        ValueTag::I64 => {
-            let v: i64 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
-            write_i64_le(v, &mut result);
-        }
-        ValueTag::I128 => {
-            let v: i128 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
-            write_i128_le(v, &mut result);
-        }
-        ValueTag::U8 => {
-            let v: u8 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
-            write_u8(v, &mut result);
-        }
-        ValueTag::U16 => {
-            let v: u16 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
-            write_u16_le(v, &mut result);
-        }
-        ValueTag::U32 => {
-            let v: u32 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
-            write_u32_le(v, &mut result);
-        }
-        ValueTag::U64 => {
-            let v: u64 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
-            write_u64_le(v, &mut result);
-        }
-        ValueTag::U128 => {
-            let v: u128 = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
-            write_u128_le(v, &mut result);
-        }
-        ValueTag::Isize => {
-            let v: isize = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
-            write_i64_le(v as i64, &mut result);
-        }
-        ValueTag::Usize => {
-            let v: usize = trimmed.parse().map_err(|e: std::num::ParseIntError| ParseError::ParseFailed(e.to_string()))?;
-            write_u64_le(v as u64, &mut result);
-        }
-        ValueTag::F32 => {
-            let v: f32 = trimmed.parse().map_err(|e: std::num::ParseFloatError| ParseError::ParseFailed(e.to_string()))?;
-            write_f32_le(v, &mut result);
-        }
-        ValueTag::F64 => {
-            let v: f64 = trimmed.parse().map_err(|e: std::num::ParseFloatError| ParseError::ParseFailed(e.to_string()))?;
-            write_f64_le(v, &mut result);
-        }
-        ValueTag::F16 => {
-            let v: f32 = trimmed.parse().map_err(|e: std::num::ParseFloatError| ParseError::ParseFailed(e.to_string()))?;
-            let f16 = F16::from_f32(v);
-            write_u16_le(f16.0, &mut result);
-        }
-        ValueTag::F128 => {
-            // 运行时字符串→f128：不经 f64 中转，直接解析为 binary128（与编译期字面量一致）
-            // 优先用精确十进制解析；失败时（如 "inf"/"nan"）回退 f64 路径
-            if let Some(bits) = crate::ir::Builder::parse_decimal_f128(trimmed) {
-                result.copy_from_slice(&bits);
-            } else {
-                let v: f64 = trimmed.parse().map_err(|e: std::num::ParseFloatError| ParseError::ParseFailed(e.to_string()))?;
-                let f128 = F128::from_f64(v);
-                result.copy_from_slice(&f128.0);
-            }
-        }
-        _ => return Err(ParseError::ParseFailed(format!("unsupported tag: {:?}", dst_tag))),
-    }
-
-    Ok(result)
-}
-
-// ---- cast 内部辅助 ----
+// ---- cast internal helpers ----
 
 fn read_bool(bytes: &[u8]) -> bool {
     bytes.first().copied().unwrap_or(0) != 0
@@ -658,7 +513,7 @@ fn cast_int_to_int(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst: 
 }
 
 fn cast_int_to_float(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst: &mut [u8]) {
-    // F128 目标：整数经 as f64 对 >2^53 的值会丢精度，改用 from_i128/from_u128 精确构造
+    // F128 target: integers via `as f64` lose precision for values >2^53, so use from_i128/from_u128 for exact construction
     if dst_tag == ValueTag::F128 {
         let f = if src_tag.is_signed() {
             F128::from_i128(read_int_as_i128(src_tag, src_bytes))
@@ -700,124 +555,53 @@ fn cast_float_to_float(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, d
     cast_from_f64(f, dst_tag, dst);
 }
 
-fn try_cast_int_narrow(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag) -> Result<Vec<u8>, CastError> {
-    let sval = read_int_as_i128(src_tag, src_bytes);
-    let uval = read_int_as_u128(src_tag, src_bytes);
-
-    let in_range = if dst_tag.is_signed() {
-        match dst_tag {
-            ValueTag::I8 => (i8::MIN as i128..=i8::MAX as i128).contains(&sval),
-            ValueTag::I16 => (i16::MIN as i128..=i16::MAX as i128).contains(&sval),
-            ValueTag::I32 => (i32::MIN as i128..=i32::MAX as i128).contains(&sval),
-            ValueTag::I64 => (i64::MIN as i128..=i64::MAX as i128).contains(&sval),
-            ValueTag::Isize => (isize::MIN as i128..=isize::MAX as i128).contains(&sval),
-            _ => true,
-        }
-    } else {
-        if src_tag.is_signed() && sval < 0 {
-            false
-        } else {
-            match dst_tag {
-                ValueTag::U8 => uval <= u8::MAX as u128,
-                ValueTag::U16 => uval <= u16::MAX as u128,
-                ValueTag::U32 => uval <= u32::MAX as u128,
-                ValueTag::U64 => uval <= u64::MAX as u128,
-                ValueTag::Usize => uval <= usize::MAX as u128,
-                _ => true,
-            }
-        }
-    };
-
-    if !in_range {
-        return Err(CastError::Overflow);
-    }
-
-    Ok(cast_value(src_tag, src_bytes, dst_tag))
-}
-
-fn try_cast_float_to_int(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag) -> Result<Vec<u8>, CastError> {
-    let f = read_float_as_f64(src_tag, src_bytes);
-
-    if f.is_nan() || f.is_infinite() {
-        return Err(CastError::Overflow);
-    }
-
-    let in_range = if dst_tag.is_signed() {
-        match dst_tag {
-            ValueTag::I8 => f >= i8::MIN as f64 && f <= i8::MAX as f64,
-            ValueTag::I16 => f >= i16::MIN as f64 && f <= i16::MAX as f64,
-            ValueTag::I32 => f >= i32::MIN as f64 && f <= i32::MAX as f64,
-            ValueTag::I64 => f >= i64::MIN as f64 && f <= i64::MAX as f64,
-            ValueTag::I128 => f >= i128::MIN as f64 && f <= i128::MAX as f64,
-            ValueTag::Isize => f >= isize::MIN as f64 && f <= isize::MAX as f64,
-            _ => true,
-        }
-    } else {
-        match dst_tag {
-            ValueTag::U8 => f >= 0.0 && f <= u8::MAX as f64,
-            ValueTag::U16 => f >= 0.0 && f <= u16::MAX as f64,
-            ValueTag::U32 => f >= 0.0 && f <= u32::MAX as f64,
-            ValueTag::U64 => f >= 0.0 && f <= u64::MAX as f64,
-            ValueTag::U128 => f >= 0.0 && f <= u128::MAX as f64,
-            ValueTag::Usize => f >= 0.0 && f <= usize::MAX as f64,
-            _ => true,
-        }
-    };
-
-    if !in_range {
-        return Err(CastError::Overflow);
-    }
-
-    Ok(cast_value(src_tag, src_bytes, dst_tag))
-}
-
 // =========================================================================
-// 第十三部分：batch.rs（精简）
+// Part 13: batch.rs (slimmed)
 // =========================================================================
 
-/// 二元运算
+/// Binary operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, num_enum::TryFromPrimitive)]
 #[repr(u8)]
 pub enum BinOp {
     Add = 0, Sub = 1, Mul = 2, Div = 3, Mod = 4, Band = 5, Bor = 6, Bxor = 7, Shl = 8, Shr = 9,
 }
 
-/// 一元运算
+/// Unary operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, num_enum::TryFromPrimitive)]
 #[repr(u8)]
 pub enum UnaryOp {
     Neg = 0, Abs = 1, Bnot = 2,
 }
 
-/// 比较运算
+/// Comparison operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, num_enum::TryFromPrimitive)]
 #[repr(u8)]
 pub enum CmpOp {
     Lt = 0, Gt = 1, Eq = 2, Ne = 3, Le = 4, Ge = 5,
 }
 
-/// 归约运算
+/// Reduction operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReduceOp {
     Add, Mul, Band, Bor, Bxor,
 }
 
-/// 大数组并行阈值：超过该长度时启用 rayon 并行分块。
+/// Large-array parallel threshold: arrays longer than this use rayon parallel chunking.
 pub const PARALLEL_THRESHOLD: usize = 4096;
 
-/// 计算并行分块大小：将数组切成约 (线程数 × 4) 块，并对齐到 4 lane
-/// 以便 SIMD kernel 每个 chunk 都能尽量走满整 lane。
+/// Computes the parallel chunk size: slices the array into roughly (thread_count × 4) chunks,
+/// aligned to 4 lanes so each SIMD kernel chunk can fill whole lanes.
 #[inline]
 pub fn par_chunk_size(n: usize) -> usize {
     let pieces = rayon::current_num_threads().max(1) * 4;
     let chunk = n.div_ceil(pieces);
-    // 向上对齐到 4 的倍数
+    // Round up to a multiple of 4
     let chunk = (chunk + 3) & !3;
     chunk.max(4)
 }
 
-/// 通用二元运算分派（标量路径）。大数组（> PARALLEL_THRESHOLD）走 rayon 并行，
-/// 小数组走单线程标量以避免线程调度开销。
+/// Generic binary operation dispatch (scalar path). Large arrays (> PARALLEL_THRESHOLD) use rayon parallelism;
+/// small arrays use single-threaded scalar code to avoid thread-scheduling overhead.
 pub fn batch_binop<T>(dst: &mut [T], a: &[T], b: &[T], op: BinOp)
 where
     T: Num + BitOps + Send + Sync,
@@ -844,16 +628,16 @@ where
     }
 }
 
-/// 标量二元运算（泛型后备，与原始 for 循环语义完全一致）。
+/// Scalar binary operation (generic fallback; semantically identical to the original for loop).
 #[inline]
 fn binop_scalar_t<T: Num + BitOps>(a: T, b: T, op: BinOp) -> T {
     match op {
         BinOp::Add => a.wrapping_add(b),
         BinOp::Sub => a.wrapping_sub(b),
         BinOp::Mul => a.wrapping_mul(b),
-        // 除零语义与标量 arith_div/arith_mod 一致：
-        //   - 整数 checked_div/checked_rem 在除零时返回 None → unwrap_or(zero) 返回 0
-        //   - 浮点 checked_div/checked_rem 恒返回 Some（除零产生 inf/nan）→ unwrap_or 不触发
+        // Division-by-zero semantics match scalar arith_div/arith_mod:
+        //   - Integer checked_div/checked_rem return None on divide-by-zero → unwrap_or(zero) yields 0
+        //   - Float checked_div/checked_rem always return Some (divide-by-zero yields inf/nan) → unwrap_or never fires
         BinOp::Div => a.checked_div(b).unwrap_or(T::zero()),
         BinOp::Mod => a.checked_rem(b).unwrap_or(T::zero()),
         BinOp::Band => a.bit_and(b),
@@ -864,7 +648,7 @@ fn binop_scalar_t<T: Num + BitOps>(a: T, b: T, op: BinOp) -> T {
     }
 }
 
-/// 通用一元运算分派
+/// Generic unary operation dispatch.
 pub fn batch_unaryop<T>(dst: &mut [T], a: &[T], op: UnaryOp)
 where T: Num + BitOps {
     let n = dst.len().min(a.len());
@@ -877,7 +661,7 @@ where T: Num + BitOps {
     }
 }
 
-/// 批量比较运算：输出 `u8` 掩码（0/1）。大数组走 rayon 并行，小数组走标量。
+/// Batch comparison operation: outputs a `u8` mask (0/1). Large arrays use rayon parallelism; small arrays use scalar code.
 pub fn batch_cmp<T>(dst: &mut [u8], a: &[T], b: &[T], op: CmpOp)
 where
     T: PartialOrd + Sync,
@@ -904,7 +688,7 @@ where
     }
 }
 
-/// 标量比较（泛型后备，按引用比较，因此不要求 T: Copy）。
+/// Scalar comparison (generic fallback; compares by reference, so it does not require `T: Copy`).
 #[inline]
 fn cmp_scalar_t<T: PartialOrd + ?Sized>(a: &T, b: &T, op: CmpOp) -> bool {
     match op {
@@ -917,87 +701,17 @@ fn cmp_scalar_t<T: PartialOrd + ?Sized>(a: &T, b: &T, op: CmpOp) -> bool {
     }
 }
 
-/// 批量归约运算。大数组走 rayon 并行归约（各分块局部归约后再合并，
-/// wrapping add/mul 与位运算均满足结合律，结果与顺序归约一致）。
-pub fn batch_reduce<T>(a: &[T], op: ReduceOp) -> T
-where
-    T: Num + BitOps + Send + Sync,
-{
-    if a.is_empty() {
-        return T::zero();
-    }
-    if a.len() > PARALLEL_THRESHOLD {
-        let chunk = par_chunk_size(a.len());
-        let partials: Vec<T> = a.par_chunks(chunk).map(|c| reduce_seq(c, op)).collect();
-        let mut acc = partials[0];
-        for &p in &partials[1..] {
-            acc = reduce_combine(acc, p, op);
-        }
-        acc
-    } else {
-        reduce_seq(a, op)
-    }
-}
-
-/// 顺序归约（从 a[0] 起累加，与原始实现语义一致）。
-#[inline]
-fn reduce_seq<T: Num + BitOps>(a: &[T], op: ReduceOp) -> T {
-    if a.is_empty() {
-        return T::zero();
-    }
-    let mut acc = a[0];
-    for &v in &a[1..] {
-        acc = match op {
-            ReduceOp::Add => acc.wrapping_add(v),
-            ReduceOp::Mul => acc.wrapping_mul(v),
-            ReduceOp::Band => acc.bit_and(v),
-            ReduceOp::Bor => acc.bit_or(v),
-            ReduceOp::Bxor => acc.bit_xor(v),
-        };
-    }
-    acc
-}
-
-/// 合并两个归约部分结果。
-#[inline]
-fn reduce_combine<T: Num + BitOps>(a: T, b: T, op: ReduceOp) -> T {
-    match op {
-        ReduceOp::Add => a.wrapping_add(b),
-        ReduceOp::Mul => a.wrapping_mul(b),
-        ReduceOp::Band => a.bit_and(b),
-        ReduceOp::Bor => a.bit_or(b),
-        ReduceOp::Bxor => a.bit_xor(b),
-    }
-}
-
-/// 掩码选择
-pub fn batch_select<T>(dst: &mut [T], mask: &[u8], t: &[T], f: &[T])
-where T: Copy {
-    let n = dst.len().min(mask.len()).min(t.len()).min(f.len());
-    for i in 0..n {
-        dst[i] = if mask[i] != 0 { t[i] } else { f[i] };
-    }
-}
-
-/// 广播
-pub fn broadcast<T>(dst: &mut [T], val: T)
-where T: Copy {
-    for slot in dst.iter_mut() {
-        *slot = val;
-    }
-}
-
 // =========================================================================
-// 第十三部分补充：SIMD 加速特化（wide crate + rayon）
+// Part 13 supplement: SIMD acceleration specializations (wide crate + rayon)
 //
-// 对 f32/f64/i32/i64 提供独立的 SIMD 特化函数（4-wide）。
-// - 算术/位运算走 SIMD lane，无法向量化的运算（整数 Div/Mod/Shl/Shr、
-//   浮点 Mod）回退到标量；
-// - 大数组（> PARALLEL_THRESHOLD）走 rayon 并行分块，每块由 SIMD kernel 处理；
-// - 这些是 *额外* 的 pub fn，泛型版本（batch_binop 等）保持不变。
+// Provides standalone SIMD-specialized functions (4-wide) for f32/f64/i32/i64.
+// - Arithmetic/bitwise ops run on SIMD lanes; operations that cannot be vectorized
+//   (integer Div/Mod/Shl/Shr, float Mod) fall back to scalar;
+// - Large arrays (> PARALLEL_THRESHOLD) use rayon parallel chunking; each chunk is handled by a SIMD kernel;
+// - These are *additional* pub fns; the generic versions (batch_binop, etc.) remain unchanged.
 // =========================================================================
 
-/// SIMD lane 宽度。
+/// SIMD lane width.
 pub const SIMD_LANES: usize = 4;
 
 // -------------------- f32 --------------------
@@ -1010,7 +724,7 @@ fn binop_f32_scalar(a: f32, b: f32, op: BinOp) -> f32 {
         BinOp::Mul => a * b,
         BinOp::Div => a / b,
         BinOp::Mod => a % b,
-        // f32 不支持位运算/移位，保持原值
+        // f32 does not support bitwise/shift ops; keep the original value
         _ => a,
     }
 }
@@ -1047,7 +761,7 @@ fn binop_f32_kernel(dst: &mut [f32], a: &[f32], b: &[f32], op: BinOp) {
     }
 }
 
-/// f32 SIMD + rayon 并行二元运算。
+/// f32 SIMD + rayon parallel binary operation.
 pub fn batch_binop_f32(dst: &mut [f32], a: &[f32], b: &[f32], op: BinOp) {
     let n = dst.len().min(a.len()).min(b.len());
     if n == 0 {
@@ -1110,7 +824,7 @@ fn binop_f64_kernel(dst: &mut [f64], a: &[f64], b: &[f64], op: BinOp) {
     }
 }
 
-/// f64 SIMD + rayon 并行二元运算。
+/// f64 SIMD + rayon parallel binary operation.
 pub fn batch_binop_f64(dst: &mut [f64], a: &[f64], b: &[f64], op: BinOp) {
     let n = dst.len().min(a.len()).min(b.len());
     if n == 0 {
@@ -1135,7 +849,7 @@ fn binop_i32_scalar(a: i32, b: i32, op: BinOp) -> i32 {
         BinOp::Add => a.wrapping_add(b),
         BinOp::Sub => a.wrapping_sub(b),
         BinOp::Mul => a.wrapping_mul(b),
-        // 整数除零直接 panic（不回退）
+        // Integer divide-by-zero panics directly (no fallback)
         BinOp::Div => a / b,
         BinOp::Mod => a % b,
         BinOp::Band => a & b,
@@ -1149,9 +863,9 @@ fn binop_i32_scalar(a: i32, b: i32, op: BinOp) -> i32 {
 fn binop_i32_kernel(dst: &mut [i32], a: &[i32], b: &[i32], op: BinOp) {
     let n = dst.len().min(a.len()).min(b.len());
     let blocks = n / SIMD_LANES;
-    // i32x4 支持算术 + 位运算（均 wrapping，与泛型语义一致）；
-    // Div/Mod（无 SIMD 整数除法、且需除零保护）与 Shl/Shr（逐 lane 变长移位
-    // 不支持）回退标量。
+    // i32x4 supports arithmetic + bitwise ops (all wrapping, consistent with the generic semantics);
+    // Div/Mod (no SIMD integer division, and divide-by-zero protection needed) and Shl/Shr
+    // (per-lane variable-length shifts are unsupported) fall back to scalar.
     let use_simd = matches!(
         op,
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Band | BinOp::Bor | BinOp::Bxor
@@ -1186,7 +900,7 @@ fn binop_i32_kernel(dst: &mut [i32], a: &[i32], b: &[i32], op: BinOp) {
     }
 }
 
-/// i32 SIMD + rayon 并行二元运算。
+/// i32 SIMD + rayon parallel binary operation.
 pub fn batch_binop_i32(dst: &mut [i32], a: &[i32], b: &[i32], op: BinOp) {
     let n = dst.len().min(a.len()).min(b.len());
     if n == 0 {
@@ -1258,7 +972,7 @@ fn binop_i64_kernel(dst: &mut [i64], a: &[i64], b: &[i64], op: BinOp) {
     }
 }
 
-/// i64 SIMD + rayon 并行二元运算。
+/// i64 SIMD + rayon parallel binary operation.
 pub fn batch_binop_i64(dst: &mut [i64], a: &[i64], b: &[i64], op: BinOp) {
     let n = dst.len().min(a.len()).min(b.len());
     if n == 0 {
@@ -1275,7 +989,7 @@ pub fn batch_binop_i64(dst: &mut [i64], a: &[i64], b: &[i64], op: BinOp) {
     }
 }
 
-// -------------------- 比较 f32 / f64 --------------------
+// -------------------- Compare f32 / f64 --------------------
 
 fn cmp_f32_kernel(dst: &mut [u8], a: &[f32], b: &[f32], op: CmpOp) {
     let n = dst.len().min(a.len()).min(b.len());
@@ -1284,8 +998,8 @@ fn cmp_f32_kernel(dst: &mut [u8], a: &[f32], b: &[f32], op: CmpOp) {
         let i = blk * SIMD_LANES;
         let va = f32x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
         let vb = f32x4::new(b[i..i + SIMD_LANES].try_into().unwrap());
-        // wide 浮点比较返回 mask：true 为全 1 位（f32 表现为 NaN），
-        // false 为 0.0。用 to_bits() != 0 判定。
+        // wide float comparison returns a mask: true is all-1 bits (f32 appears as NaN),
+        // false is 0.0. Use to_bits() != 0 to test.
         let m = match op {
             CmpOp::Lt => va.cmp_lt(vb),
             CmpOp::Gt => va.cmp_gt(vb),
@@ -1305,7 +1019,7 @@ fn cmp_f32_kernel(dst: &mut [u8], a: &[f32], b: &[f32], op: CmpOp) {
     }
 }
 
-/// f32 SIMD + rayon 并行比较（输出 u8 掩码）。
+/// f32 SIMD + rayon parallel comparison (outputs a u8 mask).
 pub fn batch_cmp_f32(dst: &mut [u8], a: &[f32], b: &[f32], op: CmpOp) {
     let n = dst.len().min(a.len()).min(b.len());
     if n == 0 {
@@ -1348,7 +1062,7 @@ fn cmp_f64_kernel(dst: &mut [u8], a: &[f64], b: &[f64], op: CmpOp) {
     }
 }
 
-/// f64 SIMD + rayon 并行比较（输出 u8 掩码）。
+/// f64 SIMD + rayon parallel comparison (outputs a u8 mask).
 pub fn batch_cmp_f64(dst: &mut [u8], a: &[f64], b: &[f64], op: CmpOp) {
     let n = dst.len().min(a.len()).min(b.len());
     if n == 0 {
@@ -1366,13 +1080,13 @@ pub fn batch_cmp_f64(dst: &mut [u8], a: &[f64], b: &[f64], op: CmpOp) {
 }
 
 // =========================================================================
-// SIMD 补全：i8/i16/u8/u16/u32/u64 binop + cmp，以及 i32/i64 cmp
-// 每类型用 wide 原生 lane 数（i8x16=16, i16x8=8, i32x4=4, i64x4=4,
-// u8x16=16, u16x8=8, u32x4=4, u64x4=4），最大化 SIMD 利用率。
+// SIMD completion: i8/i16/u8/u16/u32/u64 binop + cmp, plus i32/i64 cmp
+// Each type uses the wide crate's native lane count (i8x16=16, i16x8=8, i32x4=4, i64x4=4,
+// u8x16=16, u16x8=8, u32x4=4, u64x4=4) to maximize SIMD utilization.
 // =========================================================================
 
-/// 通用整数 SIMD binop kernel 生成宏（含乘法）
-/// 支持 add/sub/mul/and/or/xor 的 SIMD 加速；div/mod/shl/shr 回退标量。
+/// Generic integer SIMD binop kernel generation macro (including multiplication).
+/// Accelerates add/sub/mul/and/or/xor via SIMD; div/mod/shl/shr fall back to scalar.
 macro_rules! impl_simd_int_binop {
     ($ty:ty, $vec:ty, $lanes:expr, $scalar_fn:ident) => {
         #[inline]
@@ -1447,7 +1161,7 @@ macro_rules! impl_simd_int_binop {
     };
 }
 
-/// i8/u8 专用宏：无 SIMD 乘法（8 位乘法无硬件支持），其余运算同上
+/// i8/u8-specific macro: no SIMD multiplication (8-bit multiplication has no hardware support); other operations as above.
 macro_rules! impl_simd_int_binop_no_mul {
     ($ty:ty, $vec:ty, $lanes:expr, $scalar_fn:ident) => {
         #[inline]
@@ -1521,7 +1235,7 @@ macro_rules! impl_simd_int_binop_no_mul {
     };
 }
 
-// i8/u8 无 SIMD 乘法（8 位乘法无硬件支持），其余整数类型有
+// i8/u8 have no SIMD multiplication (8-bit multiplication has no hardware support); other integer types do
 impl_simd_int_binop_no_mul!(i8, i8x16, 16, binop_i8_scalar);
 impl_simd_int_binop!(i16, i16x8, 8, binop_i16_scalar);
 impl_simd_int_binop_no_mul!(u8, u8x16, 16, binop_u8_scalar);
@@ -1529,10 +1243,10 @@ impl_simd_int_binop!(u16, u16x8, 8, binop_u16_scalar);
 impl_simd_int_binop!(u32, u32x4, 4, binop_u32_scalar);
 impl_simd_int_binop!(u64, u64x4, 4, binop_u64_scalar);
 
-// -------------------- 有符号整数 SIMD cmp（i8/i16/i32/i64）--------------------
-// wide 对有符号整数提供 CmpEq/CmpLt/CmpGt，其余组合：Ne=!Eq, Le=Lt|Eq, Ge=Gt|Eq
+// -------------------- Signed integer SIMD cmp (i8/i16/i32/i64) --------------------
+// wide provides CmpEq/CmpLt/CmpGt for signed integers; other combinations: Ne=!Eq, Le=Lt|Eq, Ge=Gt|Eq
 
-/// 有符号整数 SIMD cmp kernel 生成宏
+/// Signed integer SIMD cmp kernel generation macro.
 macro_rules! impl_simd_signed_cmp {
     ($ty:ty, $vec:ty, $lanes:expr) => {
         paste! {
@@ -1544,7 +1258,7 @@ macro_rules! impl_simd_signed_cmp {
                     let i = blk * $lanes;
                     let va = <$vec>::new(a[i..i + $lanes].try_into().unwrap());
                     let vb = <$vec>::new(b[i..i + $lanes].try_into().unwrap());
-                    // wide 有符号整数比较返回同类型 mask（全 1/0），转 bool
+                    // wide signed integer comparison returns a same-type mask (all 1/0); convert to bool
                     let arr = match op {
                         CmpOp::Eq => CmpEq::cmp_eq(va, vb).to_array(),
                         CmpOp::Ne => {
@@ -1596,10 +1310,10 @@ impl_simd_signed_cmp!(i16, i16x8, 8);
 impl_simd_signed_cmp!(i32, i32x4, 4);
 impl_simd_signed_cmp!(i64, i64x4, 4);
 
-// -------------------- 无符号整数 SIMD cmp（u8/u16/u32/u64）--------------------
-// wide 对无符号整数仅提供 CmpEq，其余比较回退标量（无 SIMD 无符号比较指令）
+// -------------------- Unsigned integer SIMD cmp (u8/u16/u32/u64) --------------------
+// wide provides only CmpEq for unsigned integers; other comparisons fall back to scalar (no SIMD unsigned comparison instructions)
 
-/// 无符号整数 SIMD cmp kernel 生成宏：仅 Eq/Ne 走 SIMD，其余标量
+/// Unsigned integer SIMD cmp kernel generation macro: only Eq/Ne use SIMD; others use scalar.
 macro_rules! impl_simd_unsigned_cmp {
     ($ty:ty, $vec:ty, $lanes:expr) => {
         paste! {
@@ -1661,147 +1375,19 @@ impl_simd_unsigned_cmp!(u16, u16x8, 8);
 impl_simd_unsigned_cmp!(u32, u32x4, 4);
 impl_simd_unsigned_cmp!(u64, u64x4, 4);
 
-// -------------------- 归约 f32 / f64 --------------------
-
-fn reduce_add_f32_seq(a: &[f32]) -> f32 {
-    let n = a.len();
-    if n == 0 {
-        return 0.0;
-    }
-    let blocks = n / SIMD_LANES;
-    let mut acc = f32x4::splat(0.0);
-    for blk in 0..blocks {
-        let i = blk * SIMD_LANES;
-        acc += f32x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
-    }
-    let mut sum = acc.reduce_add();
-    for &v in a.iter().skip(blocks * SIMD_LANES) {
-        sum += v;
-    }
-    sum
-}
-
-/// f32 归约：Add 走 SIMD（+ rayon 并行），Mul 走标量，位运算对 f32 无意义。
-pub fn batch_reduce_f32(a: &[f32], op: ReduceOp) -> f32 {
-    if a.is_empty() {
-        return 0.0;
-    }
-    match op {
-        ReduceOp::Add => {
-            let n = a.len();
-            if n > PARALLEL_THRESHOLD {
-                let chunk = par_chunk_size(n);
-                let partials: Vec<f32> =
-                    a.par_chunks(chunk).map(reduce_add_f32_seq).collect();
-                partials.iter().copied().fold(0.0, |x, y| x + y)
-            } else {
-                reduce_add_f32_seq(a)
-            }
-        }
-        _ => {
-            let mut acc = a[0];
-            for &v in &a[1..] {
-                acc = match op {
-                    ReduceOp::Mul => acc * v,
-                    _ => acc,
-                };
-            }
-            acc
-        }
-    }
-}
-
-fn reduce_add_f64_seq(a: &[f64]) -> f64 {
-    let n = a.len();
-    if n == 0 {
-        return 0.0;
-    }
-    let blocks = n / SIMD_LANES;
-    let mut acc = f64x4::splat(0.0);
-    for blk in 0..blocks {
-        let i = blk * SIMD_LANES;
-        acc += f64x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
-    }
-    let mut sum = acc.reduce_add();
-    for &v in a.iter().skip(blocks * SIMD_LANES) {
-        sum += v;
-    }
-    sum
-}
-
-/// f64 归约：Add 走 SIMD（+ rayon 并行），Mul 走标量。
-pub fn batch_reduce_f64(a: &[f64], op: ReduceOp) -> f64 {
-    if a.is_empty() {
-        return 0.0;
-    }
-    match op {
-        ReduceOp::Add => {
-            let n = a.len();
-            if n > PARALLEL_THRESHOLD {
-                let chunk = par_chunk_size(n);
-                let partials: Vec<f64> =
-                    a.par_chunks(chunk).map(reduce_add_f64_seq).collect();
-                partials.iter().copied().fold(0.0, |x, y| x + y)
-            } else {
-                reduce_add_f64_seq(a)
-            }
-        }
-        _ => {
-            let mut acc = a[0];
-            for &v in &a[1..] {
-                acc = match op {
-                    ReduceOp::Mul => acc * v,
-                    _ => acc,
-                };
-            }
-            acc
-        }
-    }
-}
-
 // =========================================================================
-// 第十四部分：allocator.rs
-// =========================================================================
-
-/// 内存分配器 trait
-pub trait Allocator: Clone {
-    fn alloc_str(&self, s: &str) -> Arc<str>;
-    fn alloc_array(&self, vals: Vec<ValueHandle>) -> Arc<Vec<ValueHandle>>;
-    fn alloc_value(&self, val: ValueHandle) -> ValueHandle {
-        val
-    }
-}
-
-/// 默认分配器
-#[derive(Debug, Clone, Default)]
-pub struct DefaultAllocator;
-
-impl Allocator for DefaultAllocator {
-    fn alloc_str(&self, s: &str) -> Arc<str> {
-        Arc::from(s)
-    }
-    fn alloc_array(&self, vals: Vec<ValueHandle>) -> Arc<Vec<ValueHandle>> {
-        Arc::new(vals)
-    }
-}
-
-pub fn default_allocator() -> DefaultAllocator {
-    DefaultAllocator
-}
-
-// =========================================================================
-// 第十五部分：纯算术核心 — 无 Frame 依赖，runtime compute_fn 与编译期 ConstFold 共用
+// Part 15: Pure arithmetic core — no Frame dependency; shared by runtime compute_fn and compile-time ConstFold
 // =========================================================================
 //
-// 为所有整数/浮点类型生成纯算术函数，语义与 Engine.rs 的 compute_fn 宏严格一致：
-//   - 整数 add/sub/mul: wrapping 语义
-//   - 整数 div/mod: checked，除零返回 0
-//   - 整数 shl/shr: 移位量为 i32（与 Engine.rs 读取 as_i32 一致），cast u32 后 wrapping
-//   - 浮点 div: 原生除法（除零产生 inf/nan）
-// runtime compute_fn 调用这些纯函数（复用），编译期 ConstFold 也调用同一份算术（解耦 Frame）。
+// Generates pure arithmetic functions for all integer/float types. Semantics strictly match the compute_fn macro in Engine.rs:
+//   - Integer add/sub/mul: wrapping semantics
+//   - Integer div/mod: checked; divide-by-zero returns 0
+//   - Integer shl/shr: shift amount is i32 (matching Engine.rs reading as_i32), cast to u32 then wrapping
+//   - Float div: native division (divide-by-zero yields inf/nan)
+// runtime compute_fn calls these pure functions (reuse); compile-time ConstFold also calls the same arithmetic (decoupled from Frame).
 
-/// 为指定整数类型生成全套纯算术函数（add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot）。
-/// shl/shr 的移位量参数为 i32（与 Engine.rs compute_shl_*/compute_shr_* 读取 as_i32 一致）。
+/// Generates a full set of pure arithmetic functions for the specified integer type (add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot).
+/// The shl/shr shift amount parameter is i32 (matching Engine.rs compute_shl_*/compute_shr_* reading as_i32).
 macro_rules! impl_arith_int {
     ($ty:ident, $rust:ty) => {
         paste! {
@@ -1821,7 +1407,7 @@ macro_rules! impl_arith_int {
     };
 }
 
-/// 为指定浮点类型生成全套纯算术函数（add/sub/mul/div/mod/neg）。
+/// Generates a full set of pure arithmetic functions for the specified float type (add/sub/mul/div/mod/neg).
 macro_rules! impl_arith_float {
     ($ty:ident, $rust:ty) => {
         paste! {
@@ -1835,7 +1421,7 @@ macro_rules! impl_arith_float {
     };
 }
 
-// 整数类型展开（12 类型 × 12 运算）
+// Integer type expansion (12 types × 12 operations)
 impl_arith_int!(i8,    i8);
 impl_arith_int!(i16,   i16);
 impl_arith_int!(i32,   i32);
@@ -1849,14 +1435,14 @@ impl_arith_int!(u128,  u128);
 impl_arith_int!(isize, isize);
 impl_arith_int!(usize, usize);
 
-// 浮点类型展开（4 类型 × 6 运算）
+// Float type expansion (4 types × 6 operations)
 impl_arith_float!(f16, F16);
 impl_arith_float!(f32, f32);
 impl_arith_float!(f64, f64);
 impl_arith_float!(f128, F128);
 
 // =========================================================================
-// 布尔纯算术 — 与 Engine.rs compute_and_bool/or/not 语义一致
+// Boolean pure arithmetic — semantically consistent with Engine.rs compute_and_bool/or/not
 // =========================================================================
 
 #[inline] pub fn arith_and_bool(a: bool, b: bool) -> bool { a && b }

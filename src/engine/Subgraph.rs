@@ -1,16 +1,17 @@
-//! 子图调用与返回：switch_subgraph + start_subgraph + complete_and_wake_caller。
+//! Subgraph invocation and return: switch_subgraph + start_subgraph + complete_and_wake_caller.
 
 use super::*;
 use crate::ir::Ir::*;
 use crate::ir::Ir::Frame;
 use crate::value::Value;
 
-/// 尾调用图跳转：复用当前帧执行目标子图（帧池零分配）。
+/// Tail-call graph jump: reuses the current frame to execute the target subgraph (zero pool
+/// allocation).
 pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubGraphId, args: &[Value]) {
     let (node_start, node_end) = graph.subgraphs[target_sg.0 as usize].node_range;
     let node_count = (node_end.0 - node_start.0) as usize;
 
-    // 更新 subgraph_id + 调整数组尺寸
+    // Update subgraph_id + resize the arrays.
     frame.subgraph_id = target_sg;
     if frame.value_table.len() != node_count {
         frame.value_table.resize(node_count);
@@ -19,7 +20,7 @@ pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubG
         frame.pending_inputs.resize(node_count, 0);
     }
 
-    // 清空 value_table（prepare_frame_nodes 不做此操作）
+    // Clear value_table (prepare_frame_nodes does not do this).
     frame.value_table.reset_all();
     frame.ready_queue.clear();
     frame.control_signal = ControlSignal::None;
@@ -31,12 +32,12 @@ pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubG
     frame.state = FrameState::Ready;
     frame.suspend_state = SuspendState::NotSuspended;
     frame.suspend_event = None;
-    // caller 保持不变：返回值直达原始调用方的 call 节点
+    // caller is unchanged: the return value goes straight to the original caller's call node.
 
-    // prepare_frame_nodes：设置 node_offset + pending_inputs + Const 预填充
+    // prepare_frame_nodes: set node_offset + pending_inputs + Const prefill.
     prepare_frame_nodes(frame, graph);
 
-    // 参数注入
+    // Argument injection.
     let offset = node_start.0 as usize;
     let param_count = graph.subgraphs[target_sg.0 as usize].param_count as usize;
     for (i, arg) in args.iter().enumerate().take(param_count) {
@@ -44,20 +45,22 @@ pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubG
         let global_id = NodeId((offset + i) as u32);
         let consumer_count = graph.downstream_slice(offset + i).len() as u16;
         frame.set_value(local_id, arg.clone(), consumer_count);
-        // 不 push_ready：参数值已由 set_value 设置，notify_downstream 传播给下游即可。
-        // 若 push_ready，compute_const 会被调用并返回 VOID 覆盖参数值。
+        // Do not push_ready: the parameter value is already set by set_value; notify_downstream
+        // propagates it to downstream. If we did push_ready, compute_const would be invoked and
+        // return VOID, overwriting the parameter value.
         notify_downstream(frame, graph, local_id, global_id, NodeId(node_start.0));
     }
 }
 
 // =========================================================================
-// impl<S: LockStrategy> Engine<S> — 子图方法
+// impl<S: LockStrategy> Engine<S> — subgraph methods
 // =========================================================================
 
 impl<S: LockStrategy> Engine<S> {
-    /// 启动子图：创建子帧 + 参数注入 + 绑定 caller。
-    /// 同函数分支子图（if-else/match arm）：值表扩展到父函数大小，复制父帧值，
-    /// 使分支节点可直接通过 get_value_by_global 访问外层变量（无需帧链指针）。
+    /// Starts a subgraph: creates a child frame + injects arguments + binds the caller.
+    /// For same-function branch subgraphs (if-else/match arm): the value table is sized to the
+    /// parent function and parent-frame values are copied, so branch nodes can directly access
+    /// outer variables via get_value_by_global (no frame-chain pointers needed).
     pub(super) fn start_subgraph(
         &self,
         caller_fid: FrameId,
@@ -70,10 +73,11 @@ impl<S: LockStrategy> Engine<S> {
         let child_fid = self.alloc_frame_id();
         let parent_sg = &self.graph.subgraphs[parent_frame.subgraph_id.0 as usize];
         let child_sg = &self.graph.subgraphs[subgraph_id.0 as usize];
-        // same_function 路径用于同函数内分支子图（if-else/match arm），这些子图
-        // 的 node_range 严格包含在父函数 node_range 内，需要复制父帧值。
-        // 递归调用自身（child_sg.id == parent subgraph_id）不应走此路径——
-        // 它需要全新的调用帧，而非父帧值复制。直接递归走跨函数路径。
+        // The same_function path is used for in-function branch subgraphs (if-else/match arm),
+        // whose node_range is strictly contained within the parent function's node_range and which
+        // need parent-frame values copied. Direct self-recursion (child_sg.id == parent
+        // subgraph_id) must not take this path — it needs a fresh call frame, not a parent-value
+        // copy. Direct recursion takes the cross-function path.
         let same_function = parent_sg.function_id == child_sg.function_id
             && subgraph_id != parent_frame.subgraph_id;
 
@@ -96,11 +100,13 @@ impl<S: LockStrategy> Engine<S> {
         }
 
         if same_function {
-            // 同函数分支：值表扩展到父帧大小，复制父帧值。
-            // 使用父帧的 node_offset/value_table.len() 而非 parent_sg.node_range，
-            // 因为嵌套闭包帧的布局由祖父帧决定（如 outer 帧的 node_offset 是 main 的
-            // node_start，而非 outer 子图的 node_range.0），使用 subgraph.node_range
-            // 会导致值表索引错位、节点被误标记为 ready 从而跳过 compute_fn。
+            // Same-function branch: value table is sized to the parent frame and parent-frame
+            // values are copied.
+            // Use the parent frame's node_offset/value_table.len() rather than parent_sg.node_range,
+            // because a nested closure frame's layout is determined by the grandparent frame (e.g.
+            // outer's node_offset is main's node_start, not outer's own node_range.0). Using
+            // subgraph.node_range would misalign value-table indices and cause nodes to be
+            // mistakenly marked ready, skipping compute_fn.
             let parent_start = parent_frame.node_offset;
             let parent_node_count = parent_frame.value_table.len();
             let (branch_start, _branch_end) = child_sg.node_range;
@@ -109,10 +115,12 @@ impl<S: LockStrategy> Engine<S> {
             let mut child = self.acquire_frame(child_fid, subgraph_id, parent_node_count);
             child.node_offset = parent_start;
 
-            // 复制父帧已就绪的值（refcount 设 0 = 永不回收，帧结束时统一释放）
-            // 跳过 child_sg 范围内的节点：递归调用时 child_sg 是函数体子图，
-            // 分支内节点（如 n-1）的旧计算结果不能复制，否则子帧不会重新计算，
-            // 导致递归参数不递减（fact(n-1) 反复传入相同的旧 n-1 值）。
+            // Copy the parent frame's ready values (refcount set to 0 = never reclaimed; released
+            // all at once when the frame ends).
+            // Skip nodes inside the child_sg range: on recursive calls child_sg is the function
+            // body subgraph, and stale results of in-branch nodes (e.g. n-1) must not be copied,
+            // otherwise the child frame would not recompute them and the recursive argument would
+            // not decrement (fact(n-1) repeatedly receives the same stale n-1 value).
             for i in 0..parent_node_count {
                 let gid = (parent_start as usize + i) as u32;
                 let in_child = gid >= branch_start.0 && gid < child_sg.node_range.1 .0;
@@ -127,11 +135,13 @@ impl<S: LockStrategy> Engine<S> {
 
             }
 
-            // 使用预计算的 nested_ranges（构建期填充），避免运行时全图扫描
+            // Use the precomputed nested_ranges (filled at build time) to avoid a runtime
+            // full-graph scan.
             let nested_ranges: &[(u32, u32)] = self.graph.sg_nested_ranges(subgraph_id.0 as usize);
             let is_nested = |gid: u32| nested_ranges.iter().any(|&(s, e)| gid >= s && gid < e);
 
-            // 设置 pending_inputs：分支节点按实际未就绪输入计数，非分支节点标记 EXTERNAL
+            // Set pending_inputs: in-branch nodes count actually-unready inputs; non-branch nodes
+            // are marked EXTERNAL.
             for i in 0..parent_node_count {
                 let gid = (parent_start as usize + i) as u32;
                 let in_branch = gid >= branch_start.0 && gid < child_sg.node_range.1 .0;
@@ -145,8 +155,10 @@ impl<S: LockStrategy> Engine<S> {
                 } else if node.kind == NodeKind::Gate && self.graph.has_select_info(gid as usize) {
                     child.pending_inputs[i] = 0;
                 } else {
-                    // Gate（非 select）和普通节点统一：按实际 in-frame 未就绪输入计数
-                    // 帧范围外的输入（effect 链、外层变量）通过帧链穿透访问，不计为 pending
+                    // Gate (non-select) and ordinary nodes are unified: count actually-unready
+                    // in-frame inputs. Inputs outside the frame range (effect chains, outer
+                    // variables) are accessed via frame-chain penetration and are not counted as
+                    // pending.
                     let inputs = self.graph.inputs(node.inputs_offset, node.input_count);
                     let mut pending = 0u16;
                     for &inp in inputs {
@@ -154,25 +166,30 @@ impl<S: LockStrategy> Engine<S> {
                         if il < parent_node_count {
                             let inp_gid = (parent_start as usize + il) as u32;
                             let inp_in_branch = inp_gid >= branch_start.0 && inp_gid < child_sg.node_range.1 .0;
-                            // 分支内节点：未就绪则计入 pending
-                            // 外层变量/effect（!in_branch）：通过帧链穿透访问，不计 pending
+                            // In-branch node: count toward pending when not ready.
+                            // Outer variable/effect (!in_branch): accessed via frame-chain
+                            // penetration, not counted.
                             if inp_in_branch && !child.value_table.is_ready(il) {
                                 pending += 1;
                             }
                         }
-                        // 帧范围外（il >= parent_node_count 或下溢）→ 帧链穿透，不计 pending
+                        // Outside the frame range (il >= parent_node_count or underflow) ->
+                        // frame-chain penetration, not counted.
                     }
                     child.pending_inputs[i] = pending;
                 }
             }
 
-            // 分支内 0-input 非 Param 节点入队（必须在参数注入之前！）
-            // 顺序原因：若参数注入在前，notify_downstream 会使下游节点 pending 归零并入队；
-            // 随后 0-input 入队又检查到 pending==0 && !ready 再次入队，导致节点被执行两次
-            // （如 for-in 的 next_call 被执行两次，消耗两个迭代器元素，跳过首个元素）。
-            // 将 0-input 入队放在参数注入之前：此时下游节点 pending 仍 >0 不会被入队，
-            // 仅 0-input 常量节点入队；参数注入的 notify_downstream 随后将下游入队一次。
-            // 此顺序与跨函数路径（prepare_frame_nodes 先于参数注入）一致。
+            // Enqueue in-branch 0-input non-Param nodes (must precede argument injection!).
+            // Ordering rationale: if argument injection ran first, notify_downstream would zero
+            // pending for downstream nodes and enqueue them; the subsequent 0-input enqueue would
+            // then see pending==0 && !ready and enqueue them again, causing nodes to execute twice
+            // (e.g. for-in's next_call runs twice, consuming two iterator elements and skipping the
+            // first element).
+            // Putting 0-input enqueue before argument injection means downstream nodes still have
+            // pending > 0 and are not enqueued; only 0-input constant nodes are enqueued. Argument
+            // injection's notify_downstream then enqueues downstream once.
+            // This matches the cross-function path (prepare_frame_nodes before argument injection).
             for i in 0..parent_node_count {
                 let gid = (parent_start as usize + i) as u32;
                 let in_branch = gid >= branch_start.0 && gid < child_sg.node_range.1 .0;
@@ -184,27 +201,31 @@ impl<S: LockStrategy> Engine<S> {
                 }
             }
 
-            // 参数注入（local 索引 = branch_start - parent_start + i）
-            // 实际参数注入调用方传入的 arg 值；
-            // upvalue 参数注入当前父帧值（引用捕获语义），使 same_function 调用
-            // 能看到外层变量的最新值（而非闭包构造时的快照）。
+            // Argument injection (local index = branch_start - parent_start + i).
+            // Actual arguments inject the arg values supplied by the caller.
+            // Upvalue arguments inject the current parent-frame value (capture-by-reference
+            // semantics), so the same_function call sees the latest outer-variable values (rather
+            // than the snapshot taken at closure construction).
             let param_local_offset = branch_start.0.wrapping_sub(parent_start) as usize;
             let actual_param_count = branch_param_count
                 .saturating_sub(child_sg.upvalue_count as usize);
-            // 实际参数
+            // Actual arguments.
             for (i, arg) in args.iter().enumerate().take(actual_param_count) {
                 let lid = NodeId((param_local_offset + i) as u32);
                 let gid = branch_start.0 as usize + i;
                 let global_id = NodeId(gid as u32);
                 let cc = self.graph.downstream_slice(gid).len() as u16;
                 child.set_value(lid, arg.clone(), cc);
-                // 不 push_ready：参数值已设置，notify_downstream 传播给下游
+                // Do not push_ready: the parameter value is already set; notify_downstream
+                // propagates it downstream.
                 notify_downstream(&mut child, &self.graph, lid, global_id, NodeId(parent_start));
             }
-            // upvalue 参数注入：从父帧读取最新值（引用捕获语义），使 same_function
-            // 调用能看到外层变量的最新值（而非闭包构造时的快照）。
-            // 递归闭包例外：self_upvalue_idx 对应的 slot 注入闭包自身引用，
-            // 而非父帧值（父帧中 self slot 是 void_const 占位）。
+            // Upvalue argument injection: read the latest value from the parent frame
+            // (capture-by-reference semantics), so the same_function call sees the latest
+            // outer-variable values (rather than the snapshot taken at closure construction).
+            // Recursive-closure exception: the slot at self_upvalue_idx is injected with the
+            // closure's own self reference, not a parent-frame value (the self slot in the parent
+            // frame is a void_const placeholder).
             let self_upvalue_idx = closure_val.as_ref()
                 .and_then(|v| v.heap_obj())
                 .and_then(|h| match h {
@@ -226,13 +247,14 @@ impl<S: LockStrategy> Engine<S> {
                     parent_frame.get_value_by_global(outer_node)
                 };
                 child.set_value(lid, val, cc);
-                // 不 push_ready：参数值已设置，notify_downstream 传播给下游
+                // Do not push_ready: the parameter value is already set; notify_downstream
+                // propagates it downstream.
                 notify_downstream(&mut child, &self.graph, lid, global_id, NodeId(parent_start));
             }
 
             child.caller = Some((caller_fid, call_node));
 
-            // 帧链指针在 process_frame 的 setup_frame_chain 中设置
+            // Frame-chain pointers are set later by setup_frame_chain in process_frame.
             child.root_frame_ptr = std::ptr::null_mut();
             child.parent_frame_ptr = std::ptr::null_mut();
             child.closure_val = closure_val;
@@ -257,7 +279,7 @@ impl<S: LockStrategy> Engine<S> {
             self.frames.lock().insert(child_fid, child);
             child_fid
         } else {
-            // 跨函数调用：原有逻辑
+            // Cross-function call: original logic.
             let (node_start, node_end) = child_sg.node_range;
             let node_count = (node_end.0 - node_start.0) as usize;
             let offset = node_start.0 as usize;
@@ -271,7 +293,8 @@ impl<S: LockStrategy> Engine<S> {
                 let global_id = NodeId((offset + i) as u32);
                 let consumer_count = self.graph.downstream_slice(offset + i).len() as u16;
                 child.set_value(local_id, arg.clone(), consumer_count);
-                // 不 push_ready：参数值已设置，notify_downstream 传播给下游
+                // Do not push_ready: the parameter value is already set; notify_downstream
+                // propagates it downstream.
                 notify_downstream(&mut *child, &self.graph, local_id, global_id, NodeId(node_start.0));
             }
 
@@ -285,16 +308,16 @@ impl<S: LockStrategy> Engine<S> {
         }
     }
 
-    /// 子图完成后：回写返回值到调用方 + 唤醒调用方。
-    /// 含 LoopBody 完成检测 + pending_completions 竞态处理。
-    /// 使用迭代式处理 LoopBody break/return 传播，避免深度嵌套循环的栈溢出。
+    /// After a subgraph completes: write the return value back to the caller and wake the caller.
+    /// Handles LoopBody completion detection and the pending_completions race. Uses iterative
+    /// propagation of LoopBody break/return to avoid stack overflow on deeply nested loops.
     pub(super) fn complete_and_wake_caller(&self, mut child_frame: Frame, queue: &QueueHandle<'_>) {
-        // LoopBody break/return 传播循环（迭代式，替代递归）
+        // LoopBody break/return propagation loop (iterative, replacing recursion).
         loop {
             let child_sg_id = child_frame.subgraph_id;
             let child_loop_kind = self.graph.subgraphs[child_sg_id.0 as usize].loop_kind;
             if child_loop_kind != crate::ir::Ir::LoopKind::LoopBody {
-                break; // 非 LoopBody，进入正常完成路径
+                break; // Not a LoopBody; enter the normal completion path.
             }
             let child_signal = child_frame.control_signal.clone();
             let (loop_fid, _call_node) = child_frame
@@ -302,34 +325,35 @@ impl<S: LockStrategy> Engine<S> {
                 .expect("LoopBody frame missing caller");
             match child_signal {
                 ControlSignal::Break | ControlSignal::Return(_) => {
-                    // break/return → 循环退出
+                    // break/return -> loop exits.
                     let mut loop_frame = self.frames.lock().remove(&loop_fid);
                     if let Some(lf) = loop_frame.as_deref_mut() {
                         lf.cached_child_frame = None;
                         lf.control_signal = child_signal;
                     }
-                    // 迭代处理 loop_frame（loop_kind 通常是 While/Loop/For，非 LoopBody，
-                    // 但若为嵌套 LoopBody 则继续迭代传播，避免递归栈溢出）
+                    // Iterate on loop_frame (loop_kind is usually While/Loop/For, not LoopBody,
+                    // but if it is a nested LoopBody we keep propagating iteratively to avoid
+                    // recursive stack overflow).
                     match loop_frame {
                         Some(lf) => {
-                            child_frame = *lf; // 迭代而非递归
+                            child_frame = *lf; // Iterate instead of recursing.
                             continue;
                         }
                         None => panic!(
-                            "complete_and_wake_caller: LoopBody break/return 但 loop_frame {:?} 不在 frames（不变量违反：body 帧的 caller 引用的 loop 帧必须存在）",
+                            "complete_and_wake_caller: LoopBody break/return but loop_frame {:?} is not in frames (invariant violation: the loop frame referenced by the body frame's caller must exist)",
                             loop_fid
                         ),
                     }
                 }
                 ControlSignal::Continue => {
-                    // continue → 循环重置（帧复用）
+                    // continue -> loop reset (frame reuse).
                     let mut loop_frame = self.frames.lock().remove(&loop_fid).unwrap_or_else(|| {
                         panic!(
-                            "complete_and_wake_caller: LoopBody continue 但 loop_frame {:?} 不在 frames（不变量违反：body 帧的 caller 引用的 loop 帧必须存在）",
+                            "complete_and_wake_caller: LoopBody continue but loop_frame {:?} is not in frames (invariant violation: the loop frame referenced by the body frame's caller must exist)",
                             loop_fid
                         )
                     });
-                    let mut child = child_frame; // 取得所有权以便修改
+                    let mut child = child_frame; // Take ownership to modify.
                     self.reset_loop_iteration(&mut *loop_frame, loop_fid, &mut child);
                     self.frames.lock().insert(loop_fid, loop_frame);
                     queue.push(loop_fid);
@@ -338,7 +362,7 @@ impl<S: LockStrategy> Engine<S> {
                     return;
                 }
                 ControlSignal::None => {
-                    // 正常完成：检查 caller 循环类型
+                    // Normal completion: check the caller's loop kind.
                     if std::env::var("KUZO_DEBUG_FORIN").is_ok() {
                         let bsg = &self.graph.subgraphs[child_frame.subgraph_id.0 as usize];
                         let rq_len = child_frame.ready_queue.len();
@@ -355,21 +379,23 @@ impl<S: LockStrategy> Engine<S> {
                     }
                     let mut loop_frame = self.frames.lock().remove(&loop_fid).unwrap_or_else(|| {
                         panic!(
-                            "complete_and_wake_caller: LoopBody none 但 loop_frame {:?} 不在 frames（不变量违反：body 帧的 caller 引用的 loop 帧必须存在）",
+                            "complete_and_wake_caller: LoopBody none but loop_frame {:?} is not in frames (invariant violation: the loop frame referenced by the body frame's caller must exist)",
                             loop_fid
                         )
                     });
                     let loop_kind = self.graph.subgraphs[loop_frame.subgraph_id.0 as usize].loop_kind;
                     if loop_kind == crate::ir::Ir::LoopKind::TailRec {
-                        // TailRec 循环：body_sg 无信号完成 = base case 命中。
-                        // 提取 body_sg 返回值，转换为 Return 信号让循环退出。
+                        // TailRec loop: body_sg completes with no signal = base case hit.
+                        // Extract body_sg's return value and convert it to a Return signal to exit
+                        // the loop.
                         let return_value = super::Schedule::extract_child_return(&child_frame, &self.graph);
                         loop_frame.cached_child_frame = None;
                         loop_frame.control_signal = ControlSignal::Return(return_value);
                         child_frame = *loop_frame;
                         continue;
                     } else {
-                        // 普通循环（While/Loop/For）：正常完成 → 循环重置（帧复用）
+                        // Ordinary loop (While/Loop/For): normal completion -> loop reset (frame
+                        // reuse).
                         let mut child = child_frame;
                         self.reset_loop_iteration(&mut *loop_frame, loop_fid, &mut child);
                         self.frames.lock().insert(loop_fid, loop_frame);
@@ -382,19 +408,22 @@ impl<S: LockStrategy> Engine<S> {
             }
         }
 
-        // 非 LoopBody：回写返回值 + 唵醒 caller（含 pending_completions 竞态处理）
+        // Not a LoopBody: write back the return value + wake the caller (with pending_completions
+        // race handling).
         let child_sg_id = child_frame.subgraph_id;
         let return_value = super::Schedule::extract_child_return(&child_frame, &self.graph);
         let child_signal = child_frame.control_signal.clone();
         let caller = child_frame.caller;
-        // 回收子帧到池（Vec 容量保留供复用）
+        // Return the child frame to the pool (Vec capacity is retained for reuse).
         self.release_frame(Box::new(child_frame));
 
         if let Some((caller_fid, call_node)) = caller {
             let mut caller_frame_opt = self.frames.lock().remove(&caller_fid);
             if caller_frame_opt.is_none() {
-                // 父帧尚未 insert 回 HashMap，存储完成信息等待重试。
-                // 使用 Vec 避免同一 caller 多个子帧并发完成时互相覆盖。
+                // The parent frame has not yet been inserted back into the HashMap; store the
+                // completion info for a later retry.
+                // Use a Vec to avoid concurrent completions of multiple child frames for the same
+                // caller overwriting each other.
                 self.pending_completions
                     .lock()
                     .entry(caller_fid)
@@ -403,11 +432,12 @@ impl<S: LockStrategy> Engine<S> {
                 return;
             }
             if let Some(caller_frame) = caller_frame_opt.as_deref_mut() {
-                // 使用 caller_frame.node_offset 而非 subgraph.node_range.0：
-                // 同函数分支帧的 node_offset 是父函数的 node_start，
-                // 而 subgraph.node_range.0 是分支子图的 node_start，两者不同。
-                // 用错会导致 call_graph_id 偏移错误 → notify_downstream 找不到下游
-                // → 下游节点 ready 标记永远不被设置 → 帧挂起。
+                // Use caller_frame.node_offset rather than subgraph.node_range.0:
+                // a same-function branch frame's node_offset is the parent function's node_start,
+                // whereas subgraph.node_range.0 is the branch subgraph's node_start — the two
+                // differ. Using the wrong one yields an incorrect call_graph_id offset ->
+                // notify_downstream finds no downstream -> the downstream node's ready flag is
+                // never set -> the frame hangs.
                 let caller_offset = NodeId(caller_frame.node_offset);
                 let call_graph_id = NodeId(call_node.0 + caller_offset.0);
                 let consumer_count =
@@ -425,29 +455,37 @@ impl<S: LockStrategy> Engine<S> {
                 caller_frame.suspend_state = SuspendState::NotSuspended;
                 caller_frame.suspend_event = None;
 
-                // 控制信号传播：子帧的 throw/return/break/continue 信号传播给调用方帧。
-                // 仅在同函数内传播（Gate 分支子图、循环子图）：
-                // - if-else/match arm（Gate 节点）内 throw/return/break/continue → 传播给父帧
-                //   （break/continue 需穿透到 LoopBody 帧，否则循环体内的 if-break 无效）
-                // - while/loop/for（循环帧）内 throw/return → 传播给函数帧
-                // 不传播的情况：
-                // - 跨函数调用：函数帧的 Return 信号是函数级返回，返回值已通过
-                //   extract_child_return 提取，传播会导致调用方帧错误提前退出
-                // - Lambda/嵌套函数调用（Call 节点 + loop_kind==None + 同 function_id）：
-                //   虽然与调用方共享 function_id（为帧链穿透），但它是独立函数调用，
-                //   返回值已提取，传播 Return 会导致调用方帧错误退出（静默退出 bug）
-                // - 循环帧的 Break/Continue：已被循环消费，传播会导致函数错误退出
+                // Control-signal propagation: the child frame's throw/return/break/continue signal
+                // propagates to the caller frame. Propagation is in-function only (Gate branch
+                // subgraphs, loop subgraphs):
+                // - if-else/match arm (Gate node) throw/return/break/continue -> propagate to the
+                //   parent frame (break/continue must penetrate to the LoopBody frame, otherwise an
+                //   if-break inside a loop body has no effect).
+                // - while/loop/for (loop frame) throw/return -> propagate to the function frame.
+                // Cases that do NOT propagate:
+                // - Cross-function calls: a function frame's Return signal is a function-level
+                //   return; the return value has already been extracted via extract_child_return,
+                //   so propagating it would make the caller frame exit prematurely.
+                // - Lambda/nested-function calls (Call node + loop_kind==None + same function_id):
+                //   although it shares the caller's function_id (for frame-chain penetration), it is
+                //   an independent function call whose return value is already extracted;
+                //   propagating Return would make the caller frame exit incorrectly (silent-exit
+                //   bug).
+                // - Loop frame's Break/Continue: already consumed by the loop; propagating would
+                //   cause the function to exit incorrectly.
                 let child_loop_kind = self.graph.subgraphs[child_sg_id.0 as usize].loop_kind;
                 let is_gate = self.graph.node(call_graph_id.0 as usize).kind
                     == crate::ir::Ir::NodeKind::Gate;
                 let should_propagate = match child_signal {
                     ControlSignal::Return(_) => {
-                        // Return：Gate 分支 + 循环帧传播；Lambda/函数调用不传播
+                        // Return: propagate from Gate branches + loop frames; not from
+                        // Lambda/function calls.
                         is_gate || child_loop_kind != crate::ir::Ir::LoopKind::None
                     }
                     ControlSignal::Break | ControlSignal::Continue => {
-                        // Break/Continue：仅 Gate 分支传播（穿透到 LoopBody）
-                        // 循环帧的 Break/Continue 已被循环消费
+                        // Break/Continue: propagate from Gate branches only (penetrate to
+                        // LoopBody). A loop frame's Break/Continue has already been consumed by the
+                        // loop.
                         is_gate
                     }
                     ControlSignal::None => false,
@@ -474,6 +512,7 @@ impl<S: LockStrategy> Engine<S> {
                 queue.push(caller_fid);
             }
         }
-        // 子帧已完成，由调用方负责 drop（不放回 frames）
+        // The child frame has completed; the caller is responsible for dropping it (it is not put
+        // back into frames).
     }
 }

@@ -1,21 +1,23 @@
-//! DataFlowGraph zerocopy 访问层
+//! DataFlowGraph zerocopy accessor layer.
 //!
-//! 当 `DataFlowGraph.mem = Some(GraphMemory)` 时（.resin 加载路径），
-//! 24 个 per-Node 标量表 + nodes + inputs 通过 accessor 方法直接从
-//! mmap'd 字节切片读取，无需拷贝到 owned Vec。
+//! When `DataFlowGraph.mem = Some(GraphMemory)` (the `.kzo` loading path), the
+//! 24 per-Node scalar tables plus `nodes` and `inputs` are read directly from the
+//! mmap'd byte slices via accessor methods, with no copy into owned `Vec`s.
 //!
-//! 当 `mem = None` 时（构建路径），accessor 方法回退到 owned Vec 字段访问。
+//! When `mem = None` (the build path), accessor methods fall back to owned `Vec`
+//! field access.
 //!
-//! 5 个变长复杂表（gate_branches / record_lit_infos / select_infos /
-//! trait_construct_infos / record_extend_infos）+ subgraphs + downstreams
-//! 在两条路径都保持 owned（加载期 eager-load），无需 mem 分支。
+//! The five variable-length complex tables (`gate_branches` / `record_lit_infos` /
+//! `select_infos` / `trait_construct_infos` / `record_extend_infos`) plus
+//! `subgraphs` and `downstreams` stay owned on both paths (eager-loaded at load
+//! time) and need no `mem` branching.
 
 #![allow(non_snake_case)]
 
 use crate::ir::Ir::*;
 use super::Spec::*;
 
-// ==================== LE 读取辅助 ====================
+// ==================== LE read helpers ====================
 
 #[inline]
 fn rd_u32(r: &[u8], off: usize) -> u32 {
@@ -37,15 +39,18 @@ fn rd_u8(r: &[u8], off: usize) -> u8 {
     r[off]
 }
 
-// ==================== accessor 生成宏 ====================
+// ==================== Accessor generation macros ====================
 //
-// 类别 A（定宽标量 Option）、B（布尔 bitmap）、C（含字符串）三类 accessor 高度重复，
-// 以下 3 个宏生成方法体。类别 D（定宽复合）及 5 个 on-demand 变长表结构异构，不宏化。
+// Category A (fixed-width scalar Option), B (boolean bitmap), and C (with strings)
+// accessors are highly repetitive; the three macros below generate the method bodies.
+// Category D (fixed-width composite) and the five on-demand variable-length tables are
+// structurally heterogeneous and are not macro-generated.
 
-/// 类别 A accessor：zerocopy 读取定宽标量，哨兵值 = None。
+/// Category A accessor: zerocopy reads a fixed-width scalar; the sentinel value means `None`.
 ///
-/// `$read` 为 rd_u8/rd_u16/rd_u32（带类型注解的 helper，规避闭包参数推断问题）。
-/// `$wrap` 将解码整数包装为目标类型（`|v| v` 表示本身即整数）。
+/// `$read` is `rd_u8`/`rd_u16`/`rd_u32` (a type-annotated helper to work around closure
+/// parameter inference issues). `$wrap` wraps the decoded integer into the target type
+/// (`|v| v` means the value is already the integer).
 macro_rules! accessor_opt {
     ($method:ident, $field:ident, $kind:ident, $read:ident, $width:expr, $sentinel:expr, $ret:ty, $wrap:expr) => {
         #[inline]
@@ -65,7 +70,7 @@ macro_rules! accessor_opt {
     };
 }
 
-/// 类别 B accessor：zerocopy 读取 bitmap 布尔位。
+/// Category B accessor: zerocopy reads a boolean bitmap bit.
 macro_rules! accessor_bool {
     ($method:ident, $field:ident, $kind:ident) => {
         #[inline]
@@ -80,7 +85,7 @@ macro_rules! accessor_bool {
     };
 }
 
-/// 类别 C accessor：zerocopy 读取 StrRef → &str（从 StringPool section）。
+/// Category C accessor: zerocopy reads a `StrRef` -> `&str` (from the StringPool section).
 macro_rules! accessor_str {
     ($method:ident, $field:ident, $kind:ident) => {
         #[inline]
@@ -105,12 +110,12 @@ macro_rules! accessor_str {
     };
 }
 
-// ==================== accessor 方法 ====================
+// ==================== Accessor methods ====================
 
 impl DataFlowGraph {
-    // ---- 计数 ----
+    // ---- Counts ----
 
-    /// 节点总数（构建路径 = nodes.len()，加载路径 = header.node_count）
+    /// Total node count (build path = `nodes.len()`; load path = `header.node_count`).
     #[inline]
     pub fn node_count(&self) -> usize {
         if let Some(ref mem) = self.mem {
@@ -122,7 +127,7 @@ impl DataFlowGraph {
 
     // ---- Node ----
 
-    /// 按索引读取节点（Copy，14B 从 mmap 切片读取）
+    /// Reads a node by index (Copy; 14 bytes read from the mmap slice).
     #[inline]
     pub fn node(&self, idx: usize) -> Node {
         if let Some(ref mem) = self.mem {
@@ -141,16 +146,16 @@ impl DataFlowGraph {
 
     // ---- Inputs ----
 
-    /// 读取节点的输入切片（zerocopy：从 mmap Inputs section transmute 为 &[NodeId]）
+    /// Reads the input slice for a node (zerocopy: transmuted from the mmap Inputs section into `&[NodeId]`).
     #[inline]
     pub fn inputs(&self, offset: u32, count: u8) -> &[NodeId] {
         if let Some(ref mem) = self.mem {
             let r = mem.section(SectionKind::Inputs);
             let start = offset as usize * 4;
             let n = count as usize;
-            // SAFETY: NodeId is #[repr(transparent)] over u32（4B, 4B 对齐）。
-            // Inputs section 起始 4B 对齐（section align = 4），start = offset*4 也是 4 的倍数。
-            // 切片 [start..start+n*4] 在 section 边界内（IR 保证 offset+count <= total）。
+            // SAFETY: NodeId is #[repr(transparent)] over u32 (4 bytes, 4-byte aligned).
+            // The Inputs section starts 4-byte aligned (section align = 4), and start = offset*4 is a multiple of 4.
+            // The slice [start..start+n*4] is within the section bounds (the IR guarantees offset+count <= total).
             unsafe {
                 std::slice::from_raw_parts(r.as_ptr().add(start) as *const NodeId, n)
             }
@@ -159,7 +164,7 @@ impl DataFlowGraph {
         }
     }
 
-    // ---- 类别 A: 定宽标量表（zerocopy，sentinel 表示 None）----
+    // ---- Category A: fixed-width scalar tables (zerocopy, sentinel means None) ----
 
     accessor_opt!(call_target, call_targets, CallTargets, rd_u32, 4, u32::MAX, SubGraphId, |v| SubGraphId(v));
     accessor_opt!(field_access_info, field_access_infos, FieldAccessInfos, rd_u16, 2, u16::MAX, u16, |v| v);
@@ -167,7 +172,7 @@ impl DataFlowGraph {
     accessor_opt!(await_event_source, await_event_sources, AwaitEventSources, rd_u32, 4, u32::MAX, NodeId, |v| NodeId(v));
     accessor_opt!(writeback_target, writeback_targets, WritebackTargets, rd_u32, 4, u32::MAX, NodeId, |v| NodeId(v));
 
-    // hoisted_owner: SubGraphId（无 None，直接读）
+    // hoisted_owner: SubGraphId (no None, read directly)
     #[inline]
     pub fn hoisted_owner(&self, idx: usize) -> SubGraphId {
         if let Some(ref mem) = self.mem {
@@ -183,21 +188,21 @@ impl DataFlowGraph {
     accessor_opt!(pattern_field_index, pattern_field_indices, PatternFieldIndices, rd_u16, 2, u16::MAX, u16, |v| v);
     accessor_opt!(closure_call_arg_count, closure_call_arg_counts, ClosureCallArgCounts, rd_u8, 1, u8::MAX, u8, |v| v);
 
-    // ---- 类别 B: 布尔表（zerocopy，bitmap 读取）----
+    // ---- Category B: boolean tables (zerocopy, bitmap read) ----
 
     accessor_bool!(tail_call_flag, tail_call_flags, TailCallFlags);
     accessor_bool!(safe_op_flag, safe_op_flags, SafeOpFlags);
     accessor_bool!(is_hoisted_node, hoisted_node, HoistedNode);
     accessor_bool!(slice_inclusive, slice_inclusive, SliceInclusive);
 
-    // ---- 类别 C: 含字符串表（zerocopy，StrRef → &str from StringPool）----
+    // ---- Category C: tables with strings (zerocopy, StrRef -> &str from StringPool) ----
 
     accessor_str!(ffi_call_name, ffi_call_names, FfiCallNames);
     accessor_str!(field_set_name, field_set_names, FieldSetNames);
     accessor_str!(pattern_ctor_name, pattern_ctor_names, PatternCtorNames);
     accessor_str!(cast_target_type, cast_target_types, CastTargetTypes);
 
-    // ---- 类别 D: 定宽复合表（zerocopy，validity byte + 字段）----
+    // ---- Category D: fixed-width composite tables (zerocopy, validity byte + fields) ----
 
     #[inline]
     pub fn closure_info(&self, idx: usize) -> Option<ClosureInfo> {
@@ -263,7 +268,7 @@ impl DataFlowGraph {
         }
     }
 
-    // ---- 定宽变长表（zerocopy，tag + payload）----
+    // ---- Fixed-width variable-length tables (zerocopy, tag + payload) ----
 
     #[inline]
     pub fn const_value(&self, idx: usize) -> Option<ConstValue> {
@@ -320,33 +325,35 @@ impl DataFlowGraph {
         }
     }
 
-    // ---- Downstreams（zerocopy CSR 访问）----
+    // ---- Downstreams (zerocopy CSR access) ----
 
-    /// 返回节点 `idx` 的下游节点切片。
+    /// Returns the downstream-node slice for node `idx`.
     ///
-    /// 加载路径：从 mmap Downstreams section 直接返回 `&[NodeId]` 切片，
-    /// 无堆分配（消除 `Vec<Vec<NodeId>>` 的 ~700KB 内存放大和热路径 clone）。
+    /// Load path: returns a `&[NodeId]` slice directly from the mmap Downstreams
+    /// section with no heap allocation (eliminates the ~700KB memory blowup of
+    /// `Vec<Vec<NodeId>>` and hot-path clones).
     ///
-    /// 构建路径：返回 `self.downstreams[idx]` 的引用。
+    /// Build path: returns a reference to `self.downstreams[idx]`.
     ///
-    /// CSR 布局：`[u32; N+1]` offsets（元素数索引）紧接 `[u32; M]` flat。
-    /// offsets[i]..offsets[i+1] 是节点 i 的下游在 flat 中的元素范围。
+    /// CSR layout: `[u32; N+1]` offsets (element-count index) followed by
+    /// `[u32; M]` flat. `offsets[i]..offsets[i+1]` is the element range of node i's
+    /// downstreams within the flat region.
     #[inline]
     pub fn downstream_slice(&self, idx: usize) -> &[NodeId] {
         if let Some(ref mem) = self.mem {
             let r = mem.section(SectionKind::Downstreams);
             let n = mem.header().node_count as usize;
-            // offsets 区：[u32; N+1]，紧跟 flat 区
+            // Offsets region: [u32; N+1], followed by the flat region.
             let offsets_start = 0;
             let flat_start = (n + 1) * 4;
             let start_elem = rd_u32(r, offsets_start + idx * 4) as usize;
             let end_elem = rd_u32(r, offsets_start + (idx + 1) * 4) as usize;
             let byte_start = flat_start + start_elem * 4;
             let count = end_elem - start_elem;
-            // SAFETY: NodeId 是 #[repr(transparent)] over u32（4B，4B 对齐）。
-            // Downstreams section 4B 对齐，flat_start = (N+1)*4 是 4 的倍数，
-            // byte_start = flat_start + start_elem*4 也是 4 的倍数。
-            // 切片范围在 section 边界内（序列化保证 offsets[N] = M = flat 长度）。
+            // SAFETY: NodeId is #[repr(transparent)] over u32 (4 bytes, 4-byte aligned).
+            // The Downstreams section is 4-byte aligned, flat_start = (N+1)*4 is a multiple of 4,
+            // and byte_start = flat_start + start_elem*4 is also a multiple of 4.
+            // The slice range is within the section bounds (serialization guarantees offsets[N] = M = flat length).
             unsafe {
                 std::slice::from_raw_parts(r.as_ptr().add(byte_start) as *const NodeId, count)
             }
@@ -355,14 +362,15 @@ impl DataFlowGraph {
         }
     }
 
-    // ---- String Pool（zerocopy：加载路径直接引用 mmap，避免 .to_vec() 拷贝）----
+    // ---- String Pool (zerocopy: load path references mmap directly, avoiding .to_vec() copies) ----
 
-    /// 返回字符串池字节切片。
+    /// Returns the string pool byte slice.
     ///
-    /// 加载路径（mem=Some）：直接返回 mmap StringPool section 的 `&[u8]` 切片，
-    /// 无堆分配（消除 `.to_vec()` 拷贝，典型节省数 KB）。
+    /// Load path (`mem = Some`): returns the `&[u8]` slice of the mmap StringPool
+    /// section directly, with no heap allocation (eliminates the `.to_vec()` copy,
+    /// typically saving several KB).
     ///
-    /// 构建路径（mem=None）：返回 `&self.string_pool[..]`。
+    /// Build path (`mem = None`): returns `&self.string_pool[..]`.
     #[inline]
     pub fn string_pool_slice(&self) -> &[u8] {
         if let Some(ref mem) = self.mem {
@@ -372,14 +380,15 @@ impl DataFlowGraph {
         }
     }
 
-    // ---- SubGraph 变长字段（zerocopy CSR：消除 per-subgraph Vec 堆分配）----
+    // ---- SubGraph variable-length fields (zerocopy CSR: eliminates per-subgraph Vec heap allocations) ----
 
-    /// 返回子图 `sg_idx` 的 upvalue_outer_nodes 切片。
+    /// Returns the `upvalue_outer_nodes` slice for subgraph `sg_idx`.
     ///
-    /// 加载路径：从 mmap SgUpvalueNodes section 直接返回 `&[NodeId]` 切片，
-    /// 无堆分配（消除每个子图的 `Vec<NodeId>` 分配，典型节省 ~56B/subgraph）。
+    /// Load path: returns a `&[NodeId]` slice directly from the mmap
+    /// SgUpvalueNodes section with no heap allocation (eliminates the per-subgraph
+    /// `Vec<NodeId>` allocation, typically saving ~56B/subgraph).
     ///
-    /// 构建路径：返回 `self.subgraphs[sg_idx].upvalue_outer_nodes` 的引用。
+    /// Build path: returns a reference to `self.subgraphs[sg_idx].upvalue_outer_nodes`.
     #[inline]
     pub fn sg_upvalue_outer_nodes(&self, sg_idx: usize) -> &[NodeId] {
         if let Some(ref mem) = self.mem {
@@ -387,9 +396,9 @@ impl DataFlowGraph {
             let r = mem.section(SectionKind::SgUpvalueNodes);
             let byte_start = off as usize;
             let count = len as usize;
-            // SAFETY: NodeId is #[repr(transparent)] over u32（4B，4B 对齐）。
-            // SgUpvalueNodes section 4B 对齐，offset 是序列化时写入的（4 的倍数）。
-            // 切片范围在 section 边界内（序列化保证 offset + count*4 <= section len）。
+            // SAFETY: NodeId is #[repr(transparent)] over u32 (4 bytes, 4-byte aligned).
+            // The SgUpvalueNodes section is 4-byte aligned, and offset was written during serialization (a multiple of 4).
+            // The slice range is within the section bounds (serialization guarantees offset + count*4 <= section len).
             unsafe {
                 std::slice::from_raw_parts(r.as_ptr().add(byte_start) as *const NodeId, count)
             }
@@ -398,12 +407,13 @@ impl DataFlowGraph {
         }
     }
 
-    /// 返回子图 `sg_idx` 的 nested_ranges 切片。
+    /// Returns the `nested_ranges` slice for subgraph `sg_idx`.
     ///
-    /// 加载路径：从 mmap SgNestedRanges section 直接返回 `&[(u32, u32)]` 切片，
-    /// 无堆分配（消除每个子图的 `Vec<(u32, u32)>` 分配）。
+    /// Load path: returns a `&[(u32, u32)]` slice directly from the mmap
+    /// SgNestedRanges section with no heap allocation (eliminates the per-subgraph
+    /// `Vec<(u32, u32)>` allocation).
     ///
-    /// 构建路径：返回 `self.subgraphs[sg_idx].nested_ranges` 的引用。
+    /// Build path: returns a reference to `self.subgraphs[sg_idx].nested_ranges`.
     #[inline]
     pub fn sg_nested_ranges(&self, sg_idx: usize) -> &[(u32, u32)] {
         if let Some(ref mem) = self.mem {
@@ -411,9 +421,9 @@ impl DataFlowGraph {
             let r = mem.section(SectionKind::SgNestedRanges);
             let byte_start = off as usize;
             let count = len as usize;
-            // SAFETY: (u32, u32) 在 repr(Rust) 下为 8B（两个连续 u32），4B 对齐。
-            // SgNestedRanges section 4B 对齐，offset 是 4 的倍数。
-            // 序列化时每个元素写入两个 u32（8B），与 (u32, u32) 布局一致。
+            // SAFETY: (u32, u32) is 8 bytes under repr(Rust) (two consecutive u32s), 4-byte aligned.
+            // The SgNestedRanges section is 4-byte aligned, and offset is a multiple of 4.
+            // During serialization each element is written as two u32s (8 bytes), matching the (u32, u32) layout.
             unsafe {
                 std::slice::from_raw_parts(r.as_ptr().add(byte_start) as *const (u32, u32), count)
             }
@@ -422,14 +432,14 @@ impl DataFlowGraph {
         }
     }
 
-    // ---- 以下表在两条路径都保持 owned，accessor 直接索引 ----
-    //（gate_branches / record_lit_infos / select_infos /
-    //  trait_construct_infos / record_extend_infos / subgraphs）
-    // 这些表不需要 mem 分支，执行路径继续用 graph.field[idx] 直接访问。
+    // ---- The tables below stay owned on both paths; accessors index directly. ----
+    //(gate_branches / record_lit_infos / select_infos /
+    //  trait_construct_infos / record_extend_infos / subgraphs)
+    // These tables need no mem branch; the execution path keeps using graph.field[idx] directly.
 
-    // ---- 5 个复杂变长表 on-demand accessor（zerocopy：消除 Vec<Option<T>> 数组）----
+    // ---- Five complex variable-length table on-demand accessors (zerocopy: eliminates Vec<Option<T>> arrays) ----
 
-    /// 轻量检查节点 idx 是否有 SelectInfo（热路径，不构造 owned 数据）。
+    /// Lightweight check whether node `idx` has a SelectInfo (hot path; constructs no owned data).
     #[inline]
     pub fn has_select_info(&self, idx: usize) -> bool {
         if self.mem.is_some() {
@@ -439,7 +449,7 @@ impl DataFlowGraph {
         }
     }
 
-    /// 按需解析 GateBranches（加载路径从 mmap section 解析单条目）。
+    /// Parses GateBranches on demand (load path parses a single entry from the mmap section).
     pub fn gate_branches_at(&self, idx: usize) -> Option<GateBranches> {
         if let Some(ref mem) = self.mem {
             let off = self.gate_branch_offsets.get(idx).copied()?;
@@ -467,7 +477,7 @@ impl DataFlowGraph {
         }
     }
 
-    /// 按需解析 RecordLitInfo（加载路径从 mmap section + string_pool 解析）。
+    /// Parses RecordLitInfo on demand (load path parses from the mmap section + string_pool).
     pub fn record_lit_info_at(&self, idx: usize) -> Option<RecordLitInfo> {
         if let Some(ref mem) = self.mem {
             let off = self.record_lit_info_offsets.get(idx).copied()?;
@@ -491,7 +501,7 @@ impl DataFlowGraph {
         }
     }
 
-    /// 按需解析 SelectInfo（加载路径从 mmap section 解析单条目）。
+    /// Parses SelectInfo on demand (load path parses a single entry from the mmap section).
     pub fn select_info_at(&self, idx: usize) -> Option<SelectInfo> {
         if let Some(ref mem) = self.mem {
             let off = self.select_info_offsets.get(idx).copied()?;
@@ -514,7 +524,7 @@ impl DataFlowGraph {
         }
     }
 
-    /// 按需解析 TraitConstructInfo（加载路径从 mmap section + string_pool 解析）。
+    /// Parses TraitConstructInfo on demand (load path parses from the mmap section + string_pool).
     pub fn trait_construct_info_at(&self, idx: usize) -> Option<TraitConstructInfo> {
         if let Some(ref mem) = self.mem {
             let off = self.trait_construct_info_offsets.get(idx).copied()?;
@@ -543,7 +553,7 @@ impl DataFlowGraph {
         }
     }
 
-    /// 按需解析 RecordExtendInfo（加载路径从 mmap section + string_pool 解析）。
+    /// Parses RecordExtendInfo on demand (load path parses from the mmap section + string_pool).
     pub fn record_extend_info_at(&self, idx: usize) -> Option<RecordExtendInfo> {
         if let Some(ref mem) = self.mem {
             let off = self.record_extend_info_offsets.get(idx).copied()?;

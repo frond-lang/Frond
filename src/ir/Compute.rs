@@ -1,23 +1,24 @@
-//! Compute.rs — compute_fn 计算函数表模块
+//! Compute.rs — compute_fn table module.
 //!
-//! 从 Engine.rs 拆分而来，集中存放所有 compute_fn（构建期绑定的节点计算函数），
-//! 包括：
-//! - 哨兵常量（THUNK_FRAME_ID / IO / CTOR / TYPE_NAME 等）
-//! - reflect 辅助函数 + utf8 解码工具
-//! - compute_fn 生成宏（read_node_inputs / impl_cmp_compute / impl_int_ops / impl_float_ops）
-//! - 全部 compute_fn（算术 / 比较 / 记录 / 数组 / 字符串 / channel / async / 闭包 等）
-//! - 同步执行辅助：force_lazy_value_sync / run_frame_sync / run_defers_sync / unwrap_cell
+//! Split out of Engine.rs, this module centralizes every `compute_fn` (a
+//! build-time bound node computation function), including:
+//! - Sentinel constants (THUNK_FRAME_ID / IO / CTOR / TYPE_NAME, etc.)
+//! - reflect helpers + UTF-8 decode utilities
+//! - compute_fn generation macros (read_node_inputs / impl_cmp_compute / impl_int_ops / impl_float_ops)
+//! - All compute_fns (arithmetic / comparison / record / array / string / channel / async / closure, etc.)
+//! - Synchronous execution helpers: force_lazy_value_sync / run_frame_sync / run_defers_sync / unwrap_cell
 //!
-//! 调度器（Engine.rs）通过 graph.compute_fns[idx] 间接调用这些函数，
-//! ir/Ir.rs 的 build_compute_fn_table 通过 super::Compute:: 引用。
+//! The scheduler (Engine.rs) calls these indirectly via `graph.compute_fns[idx]`,
+//! and `ir/Ir.rs`'s `build_compute_fn_table` references them through `super::Compute::`.
 
 use super::Ir::*;
 use crate::value::Value;
 use crate::engine::{prepare_frame_nodes, switch_subgraph, notify_downstream};
 use std::sync::OnceLock;
 
-/// 缓存环境变量布尔标志，避免热路径每次调用 std::env::var（getenv 系统调用 + String 分配）。
-/// 首次调用读取 env，后续直接返回缓存的 bool。
+/// Caches environment-variable boolean flags so hot paths do not call `std::env::var`
+/// (a `getenv` syscall plus a `String` allocation) on every invocation. The first call
+/// reads the env var; subsequent calls return the cached `bool`.
 #[inline]
 fn env_flag(name: &str) -> bool {
     static FLAG_CALL: OnceLock<bool> = OnceLock::new();
@@ -34,29 +35,34 @@ fn env_flag(name: &str) -> bool {
 }
 
 // =========================================================================
-// 哨兵常量 — 集中定义，避免散落魔数
+// Sentinel constants — centralized to avoid scattered magic numbers.
 // =========================================================================
 
-/// Thunk 帧使用的哨兵 FrameId（不参与正常分配，避免与 alloc_frame_id 冲突）。
+/// Sentinel `FrameId` used for thunk frames (does not participate in normal
+/// allocation, avoiding conflicts with `alloc_frame_id`).
 const THUNK_FRAME_ID: FrameId = FrameId(u32::MAX);
-/// LoopBody 回退子帧使用的哨兵 FrameId（不参与正常分配）。
+/// Sentinel `FrameId` used for the LoopBody fallback subframe (does not
+/// participate in normal allocation).
 const LOOPBODY_FALLBACK_FRAME_ID: FrameId = FrameId(u32::MAX - 1);
 
-/// IO 写入成功返回值（i32）。仅在 `#[cfg(not(has_extern_c))]` 的 fallback 路径使用。
+/// Return value (i32) for a successful IO write. Only used in the
+/// `#[cfg(not(has_extern_c))]` fallback path.
 #[cfg(not(has_extern_c))]
 const IO_OK: i32 = 0;
-/// IO 写入失败返回值（i32）。仅在 `#[cfg(not(has_extern_c))]` 的 fallback 路径使用。
+/// Return value (i32) for a failed IO write. Only used in the
+/// `#[cfg(not(has_extern_c))]` fallback path.
 #[cfg(not(has_extern_c))]
 const IO_ERR: i32 = -1;
-/// UTF-8 解码失败/越界返回值（i64）。
+/// Return value (i64) for UTF-8 decode failure / out-of-bounds access.
 const UTF8_DECODE_ERR: i64 = -1;
 
-/// Result 变体构造器名（与 stdlib 的 Result 类型定义保持同步）。
+/// `Result` variant constructor names (kept in sync with the stdlib `Result` type definition).
 pub(crate) const CTOR_OK: &str = "Ok";
 pub(crate) const CTOR_ERR: &str = "Error";
 pub(crate) const CTOR_ERR_ALT: &str = "Err";
 
-/// reflect 类型名常量（单点维护，供 __reflect_type_name / compute_cast_to_str 共用）。
+/// reflect type-name constants (single source of truth, shared by
+/// `__reflect_type_name` / `compute_cast_to_str`).
 const TYPE_NAME_NULL: &str = "null";
 const TYPE_NAME_VOID: &str = "void";
 const TYPE_NAME_STR: &str = "str";
@@ -64,14 +70,15 @@ const TYPE_NAME_ARRAY: &str = "array";
 const TYPE_NAME_UNKNOWN: &str = "unknown";
 
 // =========================================================================
-// 运行时错误构造 — 统一使用 ErrorVal（与 Arena::alloc_error_val 同构）
+// Runtime error construction — uniformly uses ErrorVal (isomorphic to Arena::alloc_error_val).
 // =========================================================================
 
-/// 构造运行时错误值：用 ErrorValue（专用错误类型）包装在 ThrowVal::Err 中。
+/// Constructs a runtime error value by wrapping an `ErrorValue` (the dedicated
+/// error type) inside a `ThrowVal::Err`.
 ///
-/// 与 `ValueArena::alloc_error_val` 使用相同的 `HeapObj::ErrorVal` 表示，
-/// 消除各 compute_fn 中手构造 RecordValue 的重复模式。
-/// compute_fn 无 Arena 访问权，直接构造 `Value::ref_val`。
+/// Uses the same `HeapObj::ErrorVal` representation as `ValueArena::alloc_error_val`,
+/// eliminating the repeated hand-rolled `RecordValue` pattern across compute_fns.
+/// compute_fns have no Arena access, so they construct `Value::ref_val` directly.
 fn make_error_throw(type_name: &str, msg: &str) -> Value {
     use crate::value::{HeapObj, ErrorValue, ThrowValue, ThrowPayload};
     let err_val = Value::ref_val(HeapObj::ErrorVal(ErrorValue {
@@ -83,11 +90,11 @@ fn make_error_throw(type_name: &str, msg: &str) -> Value {
 }
 
 // =========================================================================
-// reflect 辅助函数 — 消除 FFI/fallback 双路径重复
+// reflect helpers — eliminate duplication between the FFI and fallback paths.
 // =========================================================================
 
-/// 返回 Value 的 reflect kind 编号（ABI 协议：0-12）。
-/// 单一权威来源，FFI 与 fallback 路径共用，确保一致。
+/// Returns the reflect kind number of a `Value` (ABI protocol: 0–12).
+/// Single authoritative source shared by FFI and fallback paths to ensure consistency.
 fn reflect_kind(v: &Value) -> u8 {
     match v {
         Value::Null => 0,
@@ -108,7 +115,8 @@ fn reflect_kind(v: &Value) -> u8 {
     }
 }
 
-/// 返回 Value 的 reflect kind 显示名（单点维护，FFI 与 fallback 共用）。
+/// Returns the reflect kind display name of a `Value` (single source of truth,
+/// shared by FFI and fallback paths).
 fn reflect_kind_str(v: &Value) -> &'static str {
     match v {
         Value::Null => "Null",
@@ -127,7 +135,8 @@ fn reflect_kind_str(v: &Value) -> &'static str {
     }
 }
 
-/// 返回 Value 的类型名（单点维护，FFI 与 fallback / cast_to_str 共用）。
+/// Returns the type name of a `Value` (single source of truth, shared by FFI,
+/// fallback, and `cast_to_str`).
 fn reflect_type_name(v: &Value) -> String {
     match v {
         Value::Null => TYPE_NAME_NULL.to_string(),
@@ -144,19 +153,20 @@ fn reflect_type_name(v: &Value) -> String {
     }
 }
 
-/// UTF-8 解码：从 bytes[offset] 起解码一个 codepoint。
-/// 成功返回 (codepoint, consumed_bytes)，失败（越界/非法首字节）返回 None。
-/// 单一实现，消除 FFI/fallback 双路径重复。
+/// UTF-8 decode: decodes one codepoint starting at `bytes[offset]`.
+/// Returns `Some((codepoint, consumed_bytes))` on success, or `None` on
+/// failure (out of bounds or illegal leading byte).
+/// Single implementation, eliminating duplication between FFI and fallback paths.
 fn utf8_decode_at(bytes: &[u8], offset: usize) -> Option<(u32, usize)> {
     if offset >= bytes.len() {
         return None;
     }
     let c = bytes[offset];
-    // ASCII（1 字节）
+    // ASCII (1 byte)
     if c < 0x80 {
         return Some((c as u32, 1));
     }
-    // 2 字节序列：110xxxxx 10xxxxxx
+    // 2-byte sequence: 110xxxxx 10xxxxxx
     if (c & 0xE0) == 0xC0 {
         if offset + 1 >= bytes.len() {
             return None;
@@ -164,7 +174,7 @@ fn utf8_decode_at(bytes: &[u8], offset: usize) -> Option<(u32, usize)> {
         let cp = ((c as u32 & 0x1F) << 6) | (bytes[offset + 1] as u32 & 0x3F);
         return Some((cp, 2));
     }
-    // 3 字节序列：1110xxxx 10xxxxxx 10xxxxxx
+    // 3-byte sequence: 1110xxxx 10xxxxxx 10xxxxxx
     if (c & 0xF0) == 0xE0 {
         if offset + 2 >= bytes.len() {
             return None;
@@ -174,7 +184,7 @@ fn utf8_decode_at(bytes: &[u8], offset: usize) -> Option<(u32, usize)> {
             | (bytes[offset + 2] as u32 & 0x3F);
         return Some((cp, 3));
     }
-    // 4 字节序列：11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+    // 4-byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
     if (c & 0xF8) == 0xF0 {
         if offset + 3 >= bytes.len() {
             return None;
@@ -185,27 +195,29 @@ fn utf8_decode_at(bytes: &[u8], offset: usize) -> Option<(u32, usize)> {
             | (bytes[offset + 3] as u32 & 0x3F);
         return Some((cp, 4));
     }
-    // 非法首字节
+    // Illegal leading byte
     None
 }
 
-/// 将 u32 codepoint 转为 char，非法 codepoint 回退为 U+0000。
-/// 单点统一，消除 3 处重复的 `char::from_u32(x).unwrap_or('\0')`。
+/// Converts a `u32` codepoint to a `char`, falling back to U+0000 for invalid codepoints.
+/// Single unified helper that eliminates three duplicate
+/// `char::from_u32(x).unwrap_or('\0')` call sites.
 #[inline]
 pub fn char_from_u32_or_nul(u: u32) -> char {
     char::from_u32(u).unwrap_or('\0')
 }
 
 // =========================================================================
-// compute_fn 生成宏 — 批量生成类型特化计算函数
+// compute_fn generation macros — batch-generate type-specialized compute functions.
 // =========================================================================
 
-/// 读取节点输入的样板宏。
+/// Boilerplate macro for reading a node's inputs.
 ///
-/// 每个 compute_fn 开头都需要从 frame.graph 取出 node 和 inputs 切片，
-/// 这 3 行代码在 100+ 个 compute_fn 中完全重复。本宏消除该重复。
+/// Every compute_fn starts by pulling the node and its inputs slice out of
+/// `frame.graph`. These three lines are fully duplicated across 100+ compute_fns.
+/// This macro eliminates that duplication.
 ///
-/// 用法（在 compute_fn 函数体内）：
+/// Usage (inside a compute_fn body):
 /// ```ignore
 /// pub fn compute_foo(frame: &mut Frame, node: NodeId) -> Value {
 ///     read_node_inputs!(frame, node, graph, n, inputs);
@@ -213,8 +225,8 @@ pub fn char_from_u32_or_nul(u: u32) -> char {
 ///     ...
 /// }
 /// ```
-/// 展开后 `graph`、`n`、`inputs` 三个绑定在当前作用域可用。
-/// `inputs` 的生命周期绑定到 `graph`（frame.graph 的 Arc clone）。
+/// After expansion, the three bindings `graph`, `n`, and `inputs` are in scope.
+/// `inputs` is tied to the lifetime of `graph` (an `Arc` clone of `frame.graph`).
 macro_rules! read_node_inputs {
     ($frame:ident, $node:ident, $graph:ident, $n:ident, $inputs:ident) => {
         let $graph = $frame.graph.clone();
@@ -223,7 +235,7 @@ macro_rules! read_node_inputs {
     };
 }
 
-/// 批量生成比较 compute_fn（返回 bool）。
+/// Batch-generates comparison compute_fns (returns `bool`).
 macro_rules! impl_cmp_compute {
     ($($name:ident: $op:tt for $acc:ident);* $(;)?) => {
         $(
@@ -238,11 +250,13 @@ macro_rules! impl_cmp_compute {
 }
 
 // =========================================================================
-// SIMD 批处理 — compute_fn 内部批算（通过 EvalContext 自主决策）
+// SIMD batch processing — batch evaluation inside compute_fns (decided
+// autonomously by the EvalContext).
 // =========================================================================
 
-/// 批量提取二元运算输入 → SIMD/rayon 批算 → 返回 (local NodeId, Value) 列表。
-/// 不写 frame.value_table、不通知下游——由 engine 热循环通过 NodeResult::Batch 处理。
+/// Batch-extracts binary-op inputs → SIMD/rayon batch eval → returns a list of
+/// `(local NodeId, Value)`. Does not write `frame.value_table` and does not
+/// notify downstream — the engine hot loop handles these via `NodeResult::Batch`.
 macro_rules! compute_bin_batch_results {
     ($frame:expr, $graph:expr, $locals:expr, $ns:expr, $rust:ty, $ctor:ident, $acc:ident, $batch_fn:ident, $op:expr) => {{
         let n = $locals.len();
@@ -263,7 +277,9 @@ macro_rules! compute_bin_batch_results {
     }};
 }
 
-/// 批量提取比较运算输入 → SIMD/rayon 批算 → 返回 (local NodeId, bool Value) 列表。
+/// Batch-extracts comparison-op inputs → SIMD/rayon batch eval → returns a list
+/// of `(local NodeId, bool Value)`. Does not write `frame.value_table` and does
+/// not notify downstream — the engine hot loop handles these via `NodeResult::Batch`.
 macro_rules! compute_cmp_batch_results {
     ($frame:expr, $graph:expr, $locals:expr, $ns:expr, $rust:ty, $acc:ident, $batch_fn:ident, $op:expr) => {{
         let n = $locals.len();
@@ -284,7 +300,9 @@ macro_rules! compute_cmp_batch_results {
     }};
 }
 
-/// 批量提取一元运算输入 → SIMD/rayon 批算 → 返回 (local NodeId, Value) 列表。
+/// Batch-extracts unary-op inputs → SIMD/rayon batch eval → returns a list of
+/// `(local NodeId, Value)`. Does not write `frame.value_table` and does not
+/// notify downstream — the engine hot loop handles these via `NodeResult::Batch`.
 macro_rules! compute_unary_batch_results {
     ($frame:expr, $graph:expr, $locals:expr, $ns:expr, $rust:ty, $ctor:ident, $acc:ident, $op:expr) => {{
         let n = $locals.len();
@@ -303,11 +321,13 @@ macro_rules! compute_unary_batch_results {
     }};
 }
 
-/// SIMD 批处理：对一组同类型同操作的节点做批量计算。
+/// SIMD batch processing: evaluates a group of same-type, same-op nodes in bulk.
 ///
-/// 从 frame 读取输入，调用 Value.rs 的 SIMD 批算函数，返回 (local NodeId, Value) 列表。
-/// 不支持类型返回 None，调用方（wrap_fn! 宏）回退到单节点计算。
-/// 不写 frame.value_table、不通知下游——由 engine 热循环通过 NodeResult::Batch 处理。
+/// Reads inputs from the frame, calls the SIMD batch-eval functions in `Value.rs`,
+/// and returns a list of `(local NodeId, Value)`. Returns `None` for unsupported
+/// types — the caller (the `wrap_fn!` macro) then falls back to per-node evaluation.
+/// Does not write `frame.value_table` and does not notify downstream — the engine
+/// hot loop handles these via `NodeResult::Batch`.
 pub fn do_simd_batch(
     frame: &Frame,
     locals: &[NodeId],
@@ -315,7 +335,7 @@ pub fn do_simd_batch(
     node_start: u32,
 ) -> Option<Vec<(NodeId, Value)>> {
     use crate::value::{ValueTag, BinOp, CmpOp, UnaryOp};
-    let _ = (BinOp::Add, CmpOp::Eq, UnaryOp::Neg); // 抑制 unused import
+    let _ = (BinOp::Add, CmpOp::Eq, UnaryOp::Neg); // suppress unused imports
     let graph = &frame.graph;
 
     if locals.is_empty() { return None; }
@@ -337,7 +357,7 @@ pub fn do_simd_batch(
                 ValueTag::U128 => Some(compute_bin_batch_results!(frame, graph, locals, node_start, u128, u128, as_u128, batch_binop, op)),
                 ValueTag::Isize => Some(compute_bin_batch_results!(frame, graph, locals, node_start, isize, isize_val, as_isize, batch_binop, op)),
                 ValueTag::Usize => Some(compute_bin_batch_results!(frame, graph, locals, node_start, usize, usize_val, as_usize, batch_binop, op)),
-                _ => None, // F16/F128/Bool/Char → 不支持，回退到单节点路径
+                _ => None, // F16/F128/Bool/Char → unsupported, fall back to single-node path
             }
         }
         BatchInfo { tag, op: BatchOp::Cmp(op) } => {
@@ -356,7 +376,7 @@ pub fn do_simd_batch(
                 ValueTag::U128 => Some(compute_cmp_batch_results!(frame, graph, locals, node_start, u128, as_u128, batch_cmp, op)),
                 ValueTag::Isize => Some(compute_cmp_batch_results!(frame, graph, locals, node_start, isize, as_isize, batch_cmp, op)),
                 ValueTag::Usize => Some(compute_cmp_batch_results!(frame, graph, locals, node_start, usize, as_usize, batch_cmp, op)),
-                _ => None, // F16/F128/Bool/Char → 不支持
+                _ => None, // F16/F128/Bool/Char → unsupported
             }
         }
         BatchInfo { tag, op: BatchOp::Unary(op) } => {
@@ -373,17 +393,17 @@ pub fn do_simd_batch(
                 ValueTag::U128 => Some(compute_unary_batch_results!(frame, graph, locals, node_start, u128, u128, as_u128, op)),
                 ValueTag::Isize => Some(compute_unary_batch_results!(frame, graph, locals, node_start, isize, isize_val, as_isize, op)),
                 ValueTag::Usize => Some(compute_unary_batch_results!(frame, graph, locals, node_start, usize, usize_val, as_usize, op)),
-                _ => None, // F16/F128/F32/F64/Bool/Char → 不支持
+                _ => None, // F16/F128/F32/F64/Bool/Char → unsupported
             }
         }
     }
 }
 
 // =========================================================================
-// compute_fns — 真实计算函数（构建期绑定的函数索引）
+// compute_fns — actual compute functions (build-time bound function indices).
 // =========================================================================
 
-/// compute_fn: i32 小于等于比较 (<=)
+/// compute_fn: i32 less-than-or-equal comparison (`<=`).
 pub fn compute_le_i32(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let a = frame.get_value_by_global(inputs[0]).as_i32();
@@ -391,7 +411,7 @@ pub fn compute_le_i32(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(a <= b)
 }
 
-// ---- i32 比较（索引 8-12, 25；算术/位运算/一元由宏生成）----
+// ---- i32 comparisons (indices 8–12, 25; arithmetic/bitwise/unary generated by macro) ----
 
 impl_cmp_compute! {
     compute_eq_i32: == for as_i32;
@@ -401,7 +421,7 @@ impl_cmp_compute! {
     compute_ge_i32: >= for as_i32;
 }
 
-// ---- i64 比较（索引 55-60；算术/位运算/一元由宏生成）----
+// ---- i64 comparisons (indices 55–60; arithmetic/bitwise/unary generated by macro) ----
 
 impl_cmp_compute! {
     compute_eq_i64: == for as_i64;
@@ -412,8 +432,8 @@ impl_cmp_compute! {
     compute_ge_i64: >= for as_i64;
 }
 
-// ---- i128 比较（索引 69-74；算术/位运算/一元由宏生成）----
-// i128 路径覆盖 i128/u128 类型，并通过 as_int_i128 支持所有整数类型输入
+// ---- i128 comparisons (indices 69–74; arithmetic/bitwise/unary generated by macro) ----
+// The i128 path covers i128/u128 types and supports all integer-typed inputs via `as_int_i128`.
 
 impl_cmp_compute! {
     compute_eq_i128: == for as_int_i128;
@@ -424,25 +444,30 @@ impl_cmp_compute! {
     compute_ge_i128: >= for as_int_i128;
 }
 
-// ---- 整数位运算（索引 78-92）----
-// BitAnd/BitOr/BitXor 对 i32/i64/i128 三族，Shl/Shr 对 i32/i64/i128 三族
-// 通过 as_int_i128 通用读取，结果按目标类型构造
-// 注：具体位运算 compute_fn 由下方 impl_int_ops 宏按类型生成
+// ---- Integer bitwise operations (indices 78–92) ----
+// BitAnd/BitOr/BitXor for i32/i64/i128 families, Shl/Shr for i32/i64/i128 families.
+// Read uniformly via `as_int_i128`; results are constructed with the target type.
+// Note: the concrete bitwise compute_fns are generated by the `impl_int_ops` macro below.
 
 // =========================================================================
-// 全基本类型 compute_fn（索引 92-）：用 paste 宏为每个类型生成全套运算
+// All primitive-type compute_fns (indices 92+): generated in full per type via the `paste` macro.
 // =========================================================================
-// 整数 12 类型 × 12 运算 = 144；浮点 4 类型 × 6 运算 = 24；合计 168。
-// 比较运算沿用按族共用的版本（结果为 bool，输入用 as_int_i128/as_float_f64 跨类型读取）。
-// 算术/位运算/一元按具体类型生成，结果天然带正确 tag 并按类型宽度截断/回绕。
+// Integers: 12 types × 12 ops = 144; floats: 4 types × 6 ops = 24; total = 168.
+// Comparisons reuse the per-family shared versions (results are `bool`, inputs are
+// read cross-type via `as_int_i128`/`as_float_f64`).
+// Arithmetic/bitwise/unary are generated per concrete type, so results carry the
+// correct tag and are truncated/wrapped at the type's width.
 //
-// 类型规格表：(类型名, Rust 类型, Value ctor, accessor, 是否整数)
-// 索引从 92 开始分配。
+// Type spec table: (type name, Rust type, Value ctor, accessor, is_integer)
+// Indices start at 92.
 
-/// 为指定整数类型生成全套 compute_fn（add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot）
+/// Generates the full set of compute_fns for a given integer type
+/// (add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot).
 ///
-/// 算术逻辑复用 Value.rs 的纯算术核心（`arith_*` 函数），runtime 与编译期 ConstFold 共用。
-/// compute_fn 仅负责 Frame 取值与 Value 包装，算术本身无 Frame 依赖。
+/// Arithmetic logic reuses the pure arithmetic core in `Value.rs` (the `arith_*`
+/// functions), shared by both the runtime and compile-time const-fold.
+/// The compute_fn only handles Frame value fetches and Value wrapping; the
+/// arithmetic itself has no Frame dependency.
 macro_rules! impl_int_ops {
     ($ty:ident, $rust:ty, $ctor:ident, $acc:ident) => {
         pastey::paste! {
@@ -476,7 +501,7 @@ macro_rules! impl_int_ops {
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
                 let b = frame.get_value_by_global(inputs[1]).$acc();
-                // 整数除零返回 0（checked 语义，由 arith_div_$ty 实现）
+                // Integer divide-by-zero returns 0 (checked semantics, implemented by `arith_div_$ty`).
                 Value::$ctor(crate::value::[<arith_div_$ty>](a, b))
             }
             pub fn [<compute_mod_$ty>](frame: &mut Frame, node: NodeId) -> Value {
@@ -516,7 +541,7 @@ macro_rules! impl_int_ops {
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = frame.get_value_by_global(inputs[0]).$acc();
-                // 移位量按 i32 读取（与原语义一致），纯函数内部 cast u32
+                // Shift amount is read as i32 (matching the original semantics); the pure function internally casts to u32.
                 let shift = frame.get_value_by_global(inputs[1]).as_i32();
                 Value::$ctor(crate::value::[<arith_shl_$ty>](a, shift))
             }
@@ -546,9 +571,9 @@ macro_rules! impl_int_ops {
     };
 }
 
-/// 为指定浮点类型生成全套 compute_fn（add/sub/mul/div/mod/neg）
+/// Generates the full set of compute_fns for a given float type (add/sub/mul/div/mod/neg).
 ///
-/// 算术逻辑复用 Value.rs 的纯算术核心（`arith_*` 函数）。
+/// Arithmetic logic reuses the pure arithmetic core in `Value.rs` (the `arith_*` functions).
 macro_rules! impl_float_ops {
     ($ty:ident, $rust:ty, $ctor:ident, $acc:ident) => {
         pastey::paste! {
@@ -603,7 +628,7 @@ macro_rules! impl_float_ops {
     };
 }
 
-// 整数类型展开（12 类型 × 12 运算 = 144 函数）
+// Integer type expansion (12 types × 12 ops = 144 functions)
 impl_int_ops!(i8,    i8,    i8,    as_i8);
 impl_int_ops!(i16,   i16,   i16,   as_i16);
 impl_int_ops!(i32,   i32,   i32,   as_i32);
@@ -617,13 +642,13 @@ impl_int_ops!(u128,  u128,  u128,  as_u128);
 impl_int_ops!(isize, isize, isize_val, as_isize);
 impl_int_ops!(usize, usize, usize_val, as_usize);
 
-// 浮点类型展开（4 类型 × 6 运算 = 24 函数）
+// Float type expansion (4 types × 6 ops = 24 functions)
 impl_float_ops!(f16, F16, f16, as_f16);
 impl_float_ops!(f32, f32, f32, as_f32);
 impl_float_ops!(f64, f64, f64, as_f64);
 impl_float_ops!(f128, F128, f128, as_f128);
 
-// ---- f64 比较（索引 16-21；算术/一元由宏生成）----
+// ---- f64 comparisons (indices 16–21; arithmetic/unary generated by macro) ----
 
 impl_cmp_compute! {
     compute_eq_f64: == for as_f64;
@@ -634,25 +659,25 @@ impl_cmp_compute! {
     compute_ge_f64: >= for as_f64;
 }
 
-// ---- f128 比较（索引 302-307）：IEEE 754 语义，不经 to_f64 丢精度 ----
-// F128 的 derive PartialEq 是 bit-pattern 比较（NaN==NaN 为 true），
-// 不能直接用于 IEEE 语义。这里手动实现：
-//   - NaN 与任何值比较：eq/lt/gt/le/ge → false，ne → true
-//   - -0 == +0（bit pattern 仅符号位不同时视为相等）
-//   - 其余用 totalOrder 排序键（sign-aware bit-pattern）
+// ---- f128 comparisons (indices 302–307): IEEE 754 semantics, no precision loss via to_f64 ----
+// F128's derived `PartialEq` is a bit-pattern comparison (so `NaN == NaN` is `true`),
+// which cannot be used directly for IEEE semantics. Implemented manually here:
+//   - NaN compared with anything: eq/lt/gt/le/ge → false, ne → true
+//   - -0 == +0 (treated as equal when only the sign bit differs)
+//   - Otherwise uses the `totalOrder` sort key (sign-aware bit-pattern)
 
-/// F128 NaN 判定
+/// F128 NaN test.
 #[inline]
 fn f128_is_nan(bits: u128) -> bool {
     (bits >> 112) & 0x7FFF == 0x7FFF && (bits & ((1u128 << 112) - 1)) != 0
 }
 
-/// F128 totalOrder 排序键（非 NaN 值）
+/// F128 `totalOrder` sort key (for non-NaN values).
 #[inline]
 fn f128_sort_key(bits: u128) -> u128 {
-    // 负数（sign=1）：翻转所有位 → 映射到 [0, 0x7FFF...FFF]
-    // 正数（sign=0）：置符号位为 1 → 映射到 [0x8000...000, 0xFFFF...FFF]
-    // 这样 -0 < +0（totalOrder 语义），-Inf < +Inf 等
+    // Negative (sign=1): flip all bits → maps to [0, 0x7FFF...FFF].
+    // Positive (sign=0): set the sign bit → maps to [0x8000...000, 0xFFFF...FFF].
+    // This makes -0 < +0 (totalOrder semantics), -Inf < +Inf, etc.
     if (bits >> 127) != 0 { !bits } else { bits | (1u128 << 127) }
 }
 
@@ -693,7 +718,7 @@ pub fn compute_lt_f128(frame: &mut Frame, node: NodeId) -> Value {
     let lt = if f128_is_nan(ab) || f128_is_nan(bb) {
         false
     } else if (ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0 {
-        false // -0 == +0，不小于
+        false // -0 == +0, not less than
     } else {
         f128_sort_key(ab) < f128_sort_key(bb)
     };
@@ -709,7 +734,7 @@ pub fn compute_gt_f128(frame: &mut Frame, node: NodeId) -> Value {
     let gt = if f128_is_nan(ab) || f128_is_nan(bb) {
         false
     } else if (ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0 {
-        false // -0 == +0，不大于
+        false // -0 == +0, not greater than
     } else {
         f128_sort_key(ab) > f128_sort_key(bb)
     };
@@ -725,7 +750,7 @@ pub fn compute_le_f128(frame: &mut Frame, node: NodeId) -> Value {
     let le = if f128_is_nan(ab) || f128_is_nan(bb) {
         false
     } else {
-        // -0 == +0 → le=true；否则 totalOrder less-or-equal
+        // -0 == +0 → le=true; otherwise totalOrder less-or-equal
         (ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0
             || f128_sort_key(ab) < f128_sort_key(bb)
     };
@@ -747,9 +772,9 @@ pub fn compute_ge_f128(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(ge)
 }
 
-// ---- bool 逻辑（索引 22-24, 27）----
+// ---- bool logic (indices 22–24, 27) ----
 
-/// compute_fn: bool 与（复用纯算术核心）
+/// compute_fn: bool AND (reuses the pure arithmetic core).
 pub fn compute_and_bool(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let a = frame.get_value_by_global(inputs[0]).as_bool();
@@ -757,7 +782,7 @@ pub fn compute_and_bool(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(crate::value::arith_and_bool(a, b))
 }
 
-/// compute_fn: bool 或（复用纯算术核心）
+/// compute_fn: bool OR (reuses the pure arithmetic core).
 pub fn compute_or_bool(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let a = frame.get_value_by_global(inputs[0]).as_bool();
@@ -765,14 +790,14 @@ pub fn compute_or_bool(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(crate::value::arith_or_bool(a, b))
 }
 
-/// compute_fn: bool 非（一元，复用纯算术核心）
+/// compute_fn: bool NOT (unary, reuses the pure arithmetic core).
 pub fn compute_not_bool(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let a = frame.get_value_by_global(inputs[0]).as_bool();
     Value::bool_val(crate::value::arith_not_bool(a))
 }
 
-/// compute_fn: bool 相等
+/// compute_fn: bool equality.
 pub fn compute_eq_bool(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let a = frame.get_value_by_global(inputs[0]).as_bool();
@@ -780,7 +805,7 @@ pub fn compute_eq_bool(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(a == b)
 }
 
-/// compute_fn: bool 不等（与 eq_bool 对称）
+/// compute_fn: bool inequality (symmetric with `eq_bool`).
 pub fn compute_ne_bool(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let a = frame.get_value_by_global(inputs[0]).as_bool();
@@ -788,29 +813,30 @@ pub fn compute_ne_bool(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(a != b)
 }
 
-// ---- throw 包装（索引 28，无 try-catch）----
+// ---- throw wrapping (index 28, no try-catch) ----
 
-/// compute_fn: 将值包装为 ThrowVal(Err)（throw 语句用）。
+/// compute_fn: wraps a value as `ThrowVal(Err)` (used by `throw` statements).
 ///
-/// Kuzo 无 try-catch，throw 产 ThrowVal(Err) + Return 信号，逐层透传至顶层。
-/// Err payload 直接持有 thrown 值本身（Bug #27 修复前曾把原始类型包装为
-/// Error(value:v) record，导致需要 Error(Error(v)) 嵌套解构）。
-/// - 输入为 ThrowVal（已是 throw 值）→ 直接返回（幂等）
-/// - 其他值（标量/Str/Record/Adt/Array）→ 直接作为 ThrowVal(Err(v))
+/// Kuzo has no try-catch; `throw` produces a `ThrowVal(Err)` plus a `Return`
+/// signal that propagates up to the top level. The Err payload holds the thrown
+/// value itself (before Bug #27 was fixed, the original type was wrapped as an
+/// `Error(value:v)` record, requiring `Error(Error(v))` nested destructuring).
+/// - Input is a `ThrowVal` (already a thrown value) → returned directly (idempotent).
+/// - Any other value (scalar/Str/Record/Adt/Array) → wrapped directly as `ThrowVal(Err(v))`.
 pub fn compute_throw_wrap_err(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
     use crate::value::{HeapObj, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
-    // 已是 ThrowVal → 直接 re-throw（幂等，支持 re-throw）
+    // Already a ThrowVal → re-throw directly (idempotent, supports re-throw).
     if let Some(HeapObj::ThrowVal(_)) = v.heap_obj() {
         return NodeResult::Return(v);
     }
-    // 任意值直接作为 Err payload（原始类型不再包装为 Error record）
+    // Any value becomes the Err payload directly (the original type is no longer wrapped as an Error record).
     let throw_val = Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(v) }));
     NodeResult::Return(throw_val)
 }
 
-/// compute_fn: 将值包装为 ThrowVal(Ok(val))（Ok 构造器用）。
+/// compute_fn: wraps a value as `ThrowVal(Ok(val))` (used by the `Ok` constructor).
 pub fn compute_throw_ok(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -818,11 +844,12 @@ pub fn compute_throw_ok(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Ok(val) }))
 }
 
-/// compute_fn: 将值包装为 ThrowVal(Err(v))（Err 构造器用）。
+/// compute_fn: wraps a value as `ThrowVal(Err(v))` (used by the `Err` constructor).
 ///
-/// 输入通常为 record_construct 节点的结果（Record/Adt），但 Err 构造器对任意
-/// 值类型一视同仁：直接作为 ThrowVal(Err(v))。与 compute_throw_wrap_err 一致，
-/// 不再对原始类型做 Error(value:v) 包装（Bug #27）。
+/// The input is typically the result of a `record_construct` node (Record/Adt),
+/// but the `Err` constructor treats any value type uniformly: it wraps it
+/// directly as `ThrowVal(Err(v))`. Consistent with `compute_throw_wrap_err`, it
+/// no longer wraps the original type as `Error(value:v)` (Bug #27).
 pub fn compute_throw_err(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, ThrowValue, ThrowPayload};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -830,15 +857,18 @@ pub fn compute_throw_err(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(v) }))
 }
 
-/// compute_fn (idx 47): `?` 运算符（Propagate）。
+/// compute_fn (idx 47): the `?` operator (Propagate).
 ///
-/// 输入为 ThrowVal：
-/// - Ok(val) → 返回 NodeResult::Value(val)（解包）
-/// - Err(err) → 返回 NodeResult::Return(ThrowVal(Err))，函数提前返回错误
+/// Input is a `ThrowVal`:
+/// - `Ok(val)` → returns `NodeResult::Value(val)` (unwrapped).
+/// - `Err(err)` → returns `NodeResult::Return(ThrowVal(Err))`, causing the
+///   function to return early with the error.
 ///
-/// 输入为 Nullable 值：
-/// - null → 返回 NodeResult::Return(null)，函数提前返回 null
-/// - 非 null → 返回 NodeResult::Value(v)（nullable 值与非空值表示同构，直接透传）
+/// Input is a Nullable value:
+/// - `null` → returns `NodeResult::Return(null)`, causing the function to
+///   return early with null.
+/// - non-null → returns `NodeResult::Value(v)` (nullable and non-null values
+///   share the same representation, so the value is passed through directly).
 pub fn compute_propagate(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
@@ -847,24 +877,25 @@ pub fn compute_propagate(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) ->
         match &tv.payload {
             crate::value::ThrowPayload::Ok(val) => NodeResult::Value(val.clone()),
             crate::value::ThrowPayload::Err(_) => {
-                // 错误传播：返回 Return，携带原始 ThrowVal(Err) 逐层透传
+                // Error propagation: return Return carrying the original ThrowVal(Err), which propagates up the call stack.
                 NodeResult::Return(v.clone())
             }
         }
     } else if v.is_null() {
-        // Nullable 传播：值为 null 时，返回 Return 携带 null 提前返回
+        // Nullable propagation: when the value is null, return Return carrying null to exit early.
         NodeResult::Return(v.clone())
     } else {
-        // 非 null 的 Nullable 值：直接透传
+        // Non-null Nullable value: pass through directly.
         NodeResult::Value(v)
     }
 }
 
-/// compute_fn (idx 46): @extern("C") FFI 调用。
+/// compute_fn (idx 46): `@extern("C")` FFI call.
 ///
-/// 根据节点的 ffi_call_names 元数据获取函数名，从输入收集参数值，
-/// 分发到对应的 Ffi::wrapper 函数，返回结果 Value。
-/// FFI 调用是同步的，不设 pending_call，不挂起帧。
+/// Looks up the function name from the node's `ffi_call_names` metadata,
+/// collects argument values from the inputs, dispatches to the corresponding
+/// `Ffi::wrapper` function, and returns the resulting `Value`.
+/// FFI calls are synchronous: they set no `pending_call` and do not suspend the frame.
 #[cfg(has_extern_c)]
 pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
     use crate::ffi::Ffi::wrapper;
@@ -872,7 +903,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
     let fn_name = graph.ffi_call_name(node.0 as usize)
         .expect("compute_ffi_call: no ffi_call_name");
 
-    // 从 Value 提取 str 参数（HeapObj::Str → owned String，避免临时 Value 生命周期问题）
+    // Extract a str argument from a Value (HeapObj::Str → owned String, avoiding temporary Value lifetime issues).
     fn extract_str(v: &Value) -> String {
         match v.heap_obj() {
             Some(crate::value::HeapObj::Str(s)) => s.bytes().to_string(),
@@ -880,7 +911,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         }
     }
 
-    // 从 Value 提取 u8[] 参数（统一走 ArrayValue::collect_u8_bytes）
+    // Extract a u8[] argument from a Value (unified through ArrayValue::collect_u8_bytes).
     fn extract_u8_buf(v: &Value) -> Vec<u8> {
         match v.heap_obj() {
             Some(crate::value::HeapObj::Array(arr)) => arr.collect_u8_bytes(),
@@ -888,20 +919,24 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         }
     }
 
-    // 将 FFI 读取的数据写回 Kuzo u8[] 数组（原地修改底层 HeapObj，&self 语义）。
+    // Writes data read by FFI back into a Kuzo u8[] array (in-place mutation of
+    // the underlying HeapObj, with `&self` semantics).
     //
-    // extract_u8_buf 返回 clone 的 Vec，FFI 写入局部 Vec 后需写回原数组，
-    // 否则 Kuzo 侧读取的数据为零（H-2 修复）。
-    // 仅写回 buf[0..n]，n 由 FFI 返回值决定（调用方传入）。
+    // `extract_u8_buf` returns a cloned `Vec`; after FFI writes into the local
+    // Vec, it must be written back to the original array, otherwise the Kuzo
+    // side reads zeros (H-2 fix).
+    // Only `buf[0..n]` is written back, where `n` is the FFI return value
+    // (provided by the caller).
     fn writeback_u8_buf(buf_val: &Value, data: &[u8], n: usize) {
         if let Value::Ref(arc) = buf_val {
-            // Safety: 引擎单线程执行，caller 帧在 callee 执行期间 Suspended，
-            // 不会有并发访问同一 HeapObj 的路径（与 compute_record_field_set 一致）。
+            // Safety: the engine executes on a single thread; the caller frame is
+            // Suspended while the callee runs, so there is no concurrent access to
+            // the same HeapObj (consistent with `compute_record_field_set`).
             let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::value::HeapObj;
             unsafe {
                 if let crate::value::HeapObj::Array(arr) = &mut *ptr {
                     let len = n.min(data.len()).min(arr.elements.len());
-                    // SOA 快路径：U8 连续存储直接 memcpy
+                    // SOA fast path: U8 contiguous storage, direct memcpy.
                     if let Some(crate::value::ScalarSoA::U8(ref mut soa_data)) = arr.scalar_soa {
                         let len = len.min(soa_data.len());
                         soa_data[..len].copy_from_slice(&data[..len]);
@@ -1300,9 +1335,9 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             Value::u8(r)
         }
 
-        // ── reflect: __reflect_format/__reflect_scalar_to_str 已拆分为独立
-        // compute_fn（CF_REFLECT_FORMAT/CF_REFLECT_SCALAR_TO_STR，idx 290/291），
-        // 不再走 FFI 分派路径 ──
+        // ── reflect: __reflect_format/__reflect_scalar_to_str have been split into
+        // standalone compute_fns (CF_REFLECT_FORMAT/CF_REFLECT_SCALAR_TO_STR, idx 290/291),
+        // and no longer go through the FFI dispatch path ──
         "__reflect_kind" => {
             let v = frame.get_value_by_global(inputs[0]);
             Value::u8(reflect_kind(&v))
@@ -1392,7 +1427,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             Value::u32(align)
         }
 
-        // ── str: UTF-8 逐字符解码（纯 Rust 位运算，与 C 实现语义一致）──
+        // ── str: UTF-8 per-character decode (pure Rust bit operations, matching the C implementation's semantics) ──
         "__str_utf8_decode_at" => {
             let s = extract_str(&frame.get_value_by_global(inputs[0]));
             let offset = frame.get_value_by_global(inputs[1]).as_usize();
@@ -1419,13 +1454,14 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             }
         }
 
-        // ── 未实现的 FFI 函数 ──
+        // ── Unimplemented FFI functions ──
         other => panic!("compute_ffi_call: unimplemented FFI function '{}'", other),
     }
 }
 
-/// compute_fn (idx 46) fallback：has_extern_c 未设置时（无 C 编译器），
-/// 对纯 Rust 可实现的 FFI 函数（cast）用 Rust 直接计算，其余返回默认值。
+/// compute_fn (idx 46) fallback: when `has_extern_c` is not set (no C compiler),
+/// computes the FFI functions implementable in pure Rust (casts) directly in
+/// Rust; all others return a default value.
 #[cfg(not(has_extern_c))]
 pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -1433,7 +1469,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         .expect("compute_ffi_call: no ffi_call_name");
 
     match fn_name {
-        // ── IO: 用 Rust std 直接实现 ──
+        // ── IO: implemented directly via Rust std ──
         "__stdout_write_raw" => {
             if let Some(crate::value::HeapObj::Str(s)) = frame.get_value_by_global(inputs[0]).heap_obj() {
                 use std::io::Write;
@@ -1454,7 +1490,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             }
         }
 
-        // ── time: 用 Rust std 直接实现 ──
+        // ── time: implemented directly via Rust std ──
         "__instant_now_ns" => {
             let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
             Value::i64(ns as i64)
@@ -1472,7 +1508,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             Value::i32(0)
         }
 
-        // ── cast: widening to i128（纯 Rust 计算）──
+        // ── cast: widening to i128 (pure Rust computation) ──
         "__cast_i8_to_i128" => Value::i128(frame.get_value_by_global(inputs[0]).as_i8() as i128),
         "__cast_i16_to_i128" => Value::i128(frame.get_value_by_global(inputs[0]).as_i16() as i128),
         "__cast_i32_to_i128" => Value::i128(frame.get_value_by_global(inputs[0]).as_i32() as i128),
@@ -1483,7 +1519,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         "__cast_u64_to_i128" => Value::i128(frame.get_value_by_global(inputs[0]).as_u64() as i128),
         "__cast_usize_to_i128" => Value::i128(frame.get_value_by_global(inputs[0]).as_usize() as i128),
 
-        // ── cast: narrowing from i128（纯 Rust 计算）──
+        // ── cast: narrowing from i128 (pure Rust computation) ──
         "__cast_i128_to_i8" => Value::i8(frame.get_value_by_global(inputs[0]).as_i128() as i8),
         "__cast_i128_to_i16" => Value::i16(frame.get_value_by_global(inputs[0]).as_i128() as i16),
         "__cast_i128_to_i32" => Value::i32(frame.get_value_by_global(inputs[0]).as_i128() as i32),
@@ -1497,9 +1533,9 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         // ── cast: char ──
         "__cast_char_to_u8" => Value::u8(frame.get_value_by_global(inputs[0]).as_u32() as u8),
 
-        // ── reflect: __reflect_format/__reflect_scalar_to_str 已拆分为独立
-        // compute_fn（CF_REFLECT_FORMAT/CF_REFLECT_SCALAR_TO_STR，idx 290/291），
-        // 不再走 FFI 分派路径 ──
+        // ── reflect: __reflect_format/__reflect_scalar_to_str have been split into
+        // standalone compute_fns (CF_REFLECT_FORMAT/CF_REFLECT_SCALAR_TO_STR, idx 290/291),
+        // and no longer go through the FFI dispatch path ──
         "__reflect_kind" => {
             let v = frame.get_value_by_global(inputs[0]);
             Value::u8(reflect_kind(&v))
@@ -1580,7 +1616,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             Value::u32(align)
         }
 
-        // ── str: UTF-8 逐字符解码（纯 Rust 位运算，与 C 实现语义一致）──
+        // ── str: UTF-8 per-character decode (pure Rust bit operations, matching the C implementation's semantics) ──
         "__str_utf8_decode_at" => {
             let s = match frame.get_value_by_global(inputs[0]).heap_obj() {
                 Some(crate::value::HeapObj::Str(s)) => s.bytes().to_string(),
@@ -1613,25 +1649,27 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             }
         }
 
-        // ── 未实现的 FFI 函数（无 C 编译器时返回默认值）──
+        // ── Unimplemented FFI functions (return a default value when no C compiler is available) ──
         _ => Value::i32(0),
     }
 }
 
 // =========================================================================
-// reflect 独立 compute_fn（290-291）
+// Standalone reflect compute_fns (290–291)
 //
-// 从 compute_ffi_call 拆分出来，避免 lazy force 逻辑与 FFI 调用耦合。
-// 这两个函数是唯一涉及 LazyValue 强制求值的 reflect 操作，独立后：
-//   - 不再依赖 ffi_call_name 元数据
-//   - 不走 FFI 分派路径
-//   - lazy force 逻辑与 reflect 格式化逻辑内聚
+// Split out of `compute_ffi_call` to avoid coupling lazy-force logic with FFI
+// dispatch. These are the only reflect operations that involve forcing a
+// LazyValue; once separated:
+//   - they no longer depend on `ffi_call_name` metadata,
+//   - they do not go through the FFI dispatch path, and
+//   - the lazy-force logic is colocated with the reflect formatting logic.
 // =========================================================================
 
-/// compute_fn (idx 290): `__reflect_format` — 任意值 → str
+/// compute_fn (idx 290): `__reflect_format` — any value → str.
 ///
-/// 格式化前先强制求值 LazyValue（若输入是 lazy），再调用 Reflect::format_value。
-/// 不依赖 ffi_call_name，直接读取 inputs[0]。
+/// Before formatting, forces evaluation of the LazyValue (if the input is
+/// lazy), then calls `Reflect::format_value`. Does not depend on
+/// `ffi_call_name`; reads `inputs[0]` directly.
 pub fn compute_reflect_format(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, _n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
@@ -1640,10 +1678,11 @@ pub fn compute_reflect_format(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&s)))
 }
 
-/// compute_fn (idx 291): `__reflect_scalar_to_str` — 标量值 → str
+/// compute_fn (idx 291): `__reflect_scalar_to_str` — scalar value → str.
 ///
-/// 语义与 compute_reflect_format 一致（均走 format_value），独立保留以
-/// 对应 Raw.kz 中的两个不同 @extern("C") 原语声明。
+/// Semantically identical to `compute_reflect_format` (both go through
+/// `format_value`); kept separate to match the two distinct `@extern("C")`
+/// primitive declarations in `Raw.kz`.
 pub fn compute_reflect_scalar_to_str(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, _n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
@@ -1652,7 +1691,8 @@ pub fn compute_reflect_scalar_to_str(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&s)))
 }
 
-/// compute_fn: 类型构造（从输入收集字段值，根据 kind 构造 Record/Adt/Newtype HeapObj）
+/// compute_fn: type construction (collects field values from inputs and builds
+/// a Record/Adt/Newtype HeapObj based on `kind`).
 pub fn compute_record_construct(frame: &mut Frame, node: NodeId) -> Value {
     use crate::ir::Ir::{RecordLitKind, RecordLitInfo};
     use crate::value::{AdtField, AdtValue, HeapObj, NewtypeValue, RecordValue, ValueArena};
@@ -1691,7 +1731,7 @@ pub fn compute_record_construct(frame: &mut Frame, node: NodeId) -> Value {
             }))
         }
         RecordLitKind::Newtype => {
-            // Newtype：单字段，将 inner Value 存入全局 arena 得到 ValueHandle
+            // Newtype: single field; store the inner Value in the global arena to obtain a ValueHandle.
             let inner_val = fields.into_iter().next().unwrap_or(Value::VOID);
             let inner = ValueArena::with_global_mut(|a| a.alloc_value(&inner_val));
             Value::ref_val(HeapObj::Newtype(NewtypeValue {
@@ -1702,10 +1742,11 @@ pub fn compute_record_construct(frame: &mut Frame, node: NodeId) -> Value {
     }
 }
 
-/// compute_fn: 记录字段访问（按 field 名称从 Record/Adt 取字段值）
+/// compute_fn: record field access (fetches a field value from a Record/Adt by field name).
 ///
-/// 统一机制：Record 与 Adt 均通过 `find_field(name)` 按名取值，
-/// 不依赖编译期 field_idx，消除 idx fallback 与 Record/Adt 双路径差异。
+/// Unified mechanism: both Record and Adt use `find_field(name)` for name-based
+/// lookup, independent of the compile-time `field_idx`. This eliminates the idx
+/// fallback and any Record/Adt path divergence.
 pub fn compute_record_field_get(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let record_val = frame.get_value_by_global(inputs[0]);
@@ -1722,7 +1763,7 @@ pub fn compute_record_field_get(frame: &mut Frame, node: NodeId) -> Value {
     })
 }
 
-/// compute_fn: 数组构造（从输入收集元素构造 ArrayValue）
+/// compute_fn: array construction (collects elements from inputs and builds an ArrayValue).
 pub fn compute_array_construct(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, ArrayValue};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -1733,25 +1774,29 @@ pub fn compute_array_construct(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(HeapObj::Array(ArrayValue::new(elements)))
 }
 
-/// compute_fn: 栈分配版记录构造（288）
+/// compute_fn: stack-allocated record construction (288).
 ///
-/// 分析器标记为不逃逸的分配点使用此 compute_fn。
-/// 当前实现等同 compute_record_construct（Value 模型限制下 Arc 是唯一引用方式），
-/// 预留分离点：未来 Value 模型支持帧局部分配后，此函数切换为真正的栈分配。
+/// Used at allocation sites the analyzer marks as non-escaping.
+/// The current implementation is identical to `compute_record_construct`
+/// (under the Value model, `Arc` is the only reference mechanism), and is kept
+/// as a separation point: once the Value model supports frame-local
+/// allocation, this function can switch to genuine stack allocation.
 pub fn compute_record_construct_stack(frame: &mut Frame, node: NodeId) -> Value {
     compute_record_construct(frame, node)
 }
 
-/// compute_fn: 栈分配版数组构造（289）
+/// compute_fn: stack-allocated array construction (289).
 ///
-/// 分析器标记为不逃逸的分配点使用此 compute_fn。
-/// 当前实现等同 compute_array_construct，预留分离点。
+/// Used at allocation sites the analyzer marks as non-escaping.
+/// The current implementation is identical to `compute_array_construct`, kept
+/// as a separation point.
 pub fn compute_array_construct_stack(frame: &mut Frame, node: NodeId) -> Value {
     compute_array_construct(frame, node)
 }
 
-/// compute_fn: 数组索引（从 ArrayValue 按 i32 索引取元素）
-/// 索引越界时返回 ThrowVal(Err) 错误值，逐层透传至顶层。
+/// compute_fn: array indexing (fetches an element from an ArrayValue by i32 index).
+/// Returns a `ThrowVal(Err)` error value on out-of-bounds access, which
+/// propagates up to the top level.
 pub fn compute_array_index(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let recv_val = frame.get_value_by_global(inputs[0]);
@@ -1772,12 +1817,14 @@ pub fn compute_array_index(frame: &mut Frame, node: NodeId) -> Value {
     }
 }
 
-/// compute_fn: 切片 `recv[start..end]` / `recv[start..=end]`。
+/// compute_fn: slicing `recv[start..end]` / `recv[start..=end]`.
 ///
-/// 三输入：recv, start, end。inclusive 标志从 graph.slice_inclusive[node] 读取。
-/// - str：按码点索引切片，返回新 str
-/// - array：按元素索引切片，返回新 array
-/// 越界时 clamp 到 [0, len]，与 Rust 切片语义一致（不 panic）。
+/// Three inputs: recv, start, end. The `inclusive` flag is read from
+/// `graph.slice_inclusive[node]`.
+/// - str: sliced by codepoint index, returns a new str.
+/// - array: sliced by element index, returns a new array.
+/// Out-of-bounds indices are clamped to `[0, len]`, matching Rust slice
+/// semantics (no panic).
 pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, ArrayValue, KuzoStr};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -1806,7 +1853,7 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
             }))
         }
         Some(crate::value::HeapObj::Str(s)) => {
-            // 按码点索引切片：collect chars in [start, end)，重组为 str
+            // Slice by codepoint index: collect chars in [start, end) and reassemble into a str.
             let chars: Vec<char> = s.bytes().chars().collect();
             let len = chars.len();
             let st = start.min(len);
@@ -1824,9 +1871,9 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
     }
 }
 
-/// compute_fn: 字符串拼接 `lhs + rhs`（两侧均为 str）。
+/// compute_fn: string concatenation `lhs + rhs` (both sides must be str).
 ///
-/// 两输入：lhs, rhs。任一非 str 时返回错误值。
+/// Two inputs: lhs, rhs. Returns an error value if either side is not a str.
 pub fn compute_str_concat(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::HeapObj;
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -1841,11 +1888,11 @@ pub fn compute_str_concat(frame: &mut Frame, node: NodeId) -> Value {
     }
 }
 
-/// compute_fn (idx 270): 全局变量读取。
+/// compute_fn (idx 270): global variable read.
 ///
-/// 无输入，从 graph.global_var_storage[slot] 读取值。
-/// slot index 从 graph.global_load_slots[node] 获取。
-/// 全局变量不依赖帧链，任何函数都能正确读取。
+/// No inputs; reads the value from `graph.global_var_storage[slot]`.
+/// The slot index is obtained from `graph.global_load_slots[node]`.
+/// Global variables do not depend on the frame chain, so any function can read them correctly.
 pub fn compute_global_load(frame: &mut Frame, node: NodeId) -> Value {
     let slot = frame.graph.global_load_slot(node.0 as usize)
         .expect("global_load node has no slot");
@@ -1855,11 +1902,12 @@ pub fn compute_global_load(frame: &mut Frame, node: NodeId) -> Value {
     val
 }
 
-/// compute_fn (idx 271): 全局变量写入。
+/// compute_fn (idx 271): global variable write.
 ///
-/// inputs[0] = 值来源节点，写入 graph.global_var_storage[slot]。
-/// slot index 从 graph.global_store_slots[node] 获取。
-/// 返回写入的值（供下游链式使用）。
+/// `inputs[0]` is the value-source node; the value is written to
+/// `graph.global_var_storage[slot]`. The slot index is obtained from
+/// `graph.global_store_slots[node]`. Returns the written value (for downstream
+/// chained use).
 pub fn compute_global_store(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let val = frame.get_value_by_global(inputs[0]);
@@ -1870,13 +1918,13 @@ pub fn compute_global_store(frame: &mut Frame, node: NodeId) -> Value {
     val
 }
 
-/// compute_fn (idx 308): 记忆化缓存查询。
+/// compute_fn (idx 308): memoization cache lookup.
 ///
-/// inputs[0..param_count] = 参数值（用作缓存 key）。
-/// MemoInfo.table_index 索引 graph.memo_tables 中的哈希表。
-/// 返回 Record `{hit: bool, value: Value}`：
-/// - 命中：hit=true, value=缓存值
-/// - 未命中：hit=false, value=Void
+/// `inputs[0..param_count]` are the parameter values (used as the cache key).
+/// `MemoInfo.table_index` indexes into `graph.memo_tables`'s hash table.
+/// Returns a Record `{hit: bool, value: Value}`:
+/// - hit: `hit=true`, `value=cached value`
+/// - miss: `hit=false`, `value=Void`
 pub fn compute_memo_check(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, RecordValue};
     use std::hash::{Hash, Hasher};
@@ -1884,7 +1932,7 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId) -> Value {
     let info = graph.memo_info(node.0 as usize)
         .expect("memo_check node has no MemoInfo");
     let param_count = info.param_count as usize;
-    // 构造缓存 key：将参数值哈希为 u64
+    // Build the cache key: hash the parameter values into a u64.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let param_vals: Vec<Value> = inputs[..param_count].iter()
         .map(|&inp| frame.get_value_by_global(inp))
@@ -1896,7 +1944,7 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId) -> Value {
         val.hash(&mut hasher);
     }
     let key = hasher.finish();
-    // 查缓存表
+    // Look up the cache table.
     let table = &frame.graph.memo_tables;
     let hit_val = {
         let guard = table[info.table_index as usize].lock().unwrap();
@@ -1907,7 +1955,7 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId) -> Value {
     }
     match hit_val {
         Some(cached) => {
-            // 命中：返回 record(hit=true, value=cached)
+            // Hit: return record(hit=true, value=cached).
             Value::ref_val(HeapObj::Record(RecordValue {
                 type_name: String::new(),
                 fields: vec![Value::bool_val(true), cached],
@@ -1916,7 +1964,7 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId) -> Value {
             }))
         }
         None => {
-            // 未命中：返回 record(hit=false, value=void)
+            // Miss: return record(hit=false, value=void).
             Value::ref_val(HeapObj::Record(RecordValue {
                 type_name: String::new(),
                 fields: vec![Value::bool_val(false), Value::VOID],
@@ -1927,11 +1975,11 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId) -> Value {
     }
 }
 
-/// compute_fn (idx 309): 记忆化缓存写入。
+/// compute_fn (idx 309): memoization cache write.
 ///
-/// inputs[0..param_count] = 参数值（用作缓存 key），
-/// inputs[param_count] = 结果值。
-/// 写入缓存表后透传结果值（供下游使用）。
+/// `inputs[0..param_count]` are the parameter values (used as the cache key),
+/// and `inputs[param_count]` is the result value. Writes the result into the
+/// cache table and then forwards it (for downstream use).
 pub fn compute_memo_store(frame: &mut Frame, node: NodeId) -> Value {
     use std::hash::{Hash, Hasher};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -1939,7 +1987,7 @@ pub fn compute_memo_store(frame: &mut Frame, node: NodeId) -> Value {
         .expect("memo_store node has no MemoInfo");
     let param_count = info.param_count as usize;
     let result_val = frame.get_value_by_global(inputs[param_count]);
-    // 构造缓存 key
+    // Build the cache key.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let param_vals: Vec<Value> = inputs[..param_count].iter()
         .map(|&inp| frame.get_value_by_global(inp))
@@ -1952,7 +2000,7 @@ pub fn compute_memo_store(frame: &mut Frame, node: NodeId) -> Value {
         eprintln!("[MEMO_STORE] table={} key={} params={:?} result={:?}",
             info.table_index, key, param_vals, result_val);
     }
-    // 写缓存表
+    // Write to the cache table.
     let table = &frame.graph.memo_tables;
     {
         let mut guard = table[info.table_index as usize].lock().unwrap();
@@ -1961,12 +2009,13 @@ pub fn compute_memo_store(frame: &mut Frame, node: NodeId) -> Value {
     result_val
 }
 
-/// compute_fn (idx 272): 记录扩展。
+/// compute_fn (idx 272): record extension.
 ///
-/// inputs[0] = base RecordValue，inputs[1..] = 更新字段值。
-/// RecordExtendInfo.update_names 给出 inputs[1..] 对应的字段名。
-/// 从 base 克隆字段与字段名，按 update_names 替换同名字段或追加新字段，
-/// 构造新 RecordValue（保留 base 的 type_name）。
+/// `inputs[0]` is the base RecordValue; `inputs[1..]` are the updated field
+/// values. `RecordExtendInfo.update_names` gives the field names corresponding
+/// to `inputs[1..]`. Clones the base's fields and field names, then either
+/// replaces same-named fields or appends new ones per `update_names`, building a
+/// new RecordValue (preserving the base's `type_name`).
 pub fn compute_record_extend(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, RecordValue};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -1975,36 +2024,36 @@ pub fn compute_record_extend(frame: &mut Frame, node: NodeId) -> Value {
         .as_ref()
         .expect("record extend node has no RecordExtendInfo");
 
-    // 取 base RecordValue
+    // Take the base RecordValue.
     let base_val = frame.get_value_by_global(inputs[0]);
     let base_record: RecordValue = match base_val.heap_obj() {
         Some(HeapObj::Record(r)) => r.clone(),
         _ => {
-            // base 非 record：退化为空记录，所有 update 字段作为新字段追加
+            // base not a record: degrade to an empty record; all update fields are appended as new fields.
             RecordValue::new(String::new(), Vec::new(), Vec::new())
         }
     };
 
-    // 收集 update 值（inputs[1..]，按 update_names 顺序）
+    // Collect the update values (inputs[1..], in `update_names` order).
     let update_values: Vec<Value> = inputs[1..]
         .iter()
         .map(|&in_node| frame.get_value_by_global(in_node))
         .collect();
 
-    // 克隆 base 字段与字段名，按 update_names 替换/追加
+    // Clone the base fields and field names, then replace/append per `update_names`.
     let mut fields: Vec<Value> = base_record.fields.clone();
     let mut field_names: Vec<Option<String>> = base_record.field_names.clone();
     for (i, update_name) in info.update_names.iter().enumerate() {
         let update_val = update_values[i].clone();
-        // 查找同名字段位置
+        // Find the position of a same-named field.
         let pos = field_names.iter().position(|n| n.as_deref() == Some(update_name));
         match pos {
             Some(idx) => {
-                // 替换已有字段值
+                // Replace the existing field value.
                 fields[idx] = update_val;
             }
             None => {
-                // 追加新字段
+                // Append a new field.
                 fields.push(update_val);
                 field_names.push(Some(update_name.clone()));
             }
@@ -2019,10 +2068,11 @@ pub fn compute_record_extend(frame: &mut Frame, node: NodeId) -> Value {
     }))
 }
 
-/// compute_fn (idx 273): 原子构造。
+/// compute_fn (idx 273): atomic construction.
 ///
-/// inputs[0] = 初始值节点，包装为 AtomicValue（共享底层内存的原子容器）。
-/// AtomicValue.data 为 Value，compute_fn 上下文无需 arena 即可构造。
+/// `inputs[0]` is the initial-value node; it is wrapped in an `AtomicValue`
+/// (an atomic container sharing the underlying memory). `AtomicValue.data` is a
+/// Value, so this compute_fn can construct it without an arena.
 pub fn compute_atomic_construct(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, AtomicValue};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -2030,12 +2080,13 @@ pub fn compute_atomic_construct(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(HeapObj::AtomicVal(AtomicValue::new(val)))
 }
 
-/// compute_fn: 模式匹配 — 构造器名判别（idx 274）。
+/// compute_fn: pattern match — constructor name discrimination (idx 274).
 ///
-/// 输入：scrutinee。元数据：构造器名（graph.pattern_ctor_names）。
-/// 检查 scrutinee 是否为 ADT 且 constructor 匹配，或 Record 且 type_name 匹配，
-/// 或 ThrowVal 且构造器名为 "Ok"/"Error" 匹配对应 payload 变体。
-/// 返回 bool。
+/// Input: scrutinee. Metadata: constructor name (`graph.pattern_ctor_names`).
+/// Checks whether the scrutinee is an ADT whose `constructor` matches, or a
+/// Record whose `type_name` matches, or a ThrowVal whose constructor name is
+/// "Ok"/"Error" matching the corresponding payload variant.
+/// Returns `bool`.
 pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let val = frame.get_value_by_global(inputs[0]);
@@ -2044,7 +2095,7 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId) -> Value {
     let matched = match val.heap_obj() {
         Some(crate::value::HeapObj::Adt(a)) => a.constructor == ctor_name,
         Some(crate::value::HeapObj::Record(r)) => r.type_name == ctor_name,
-        // Newtype：构造器名 == 类型名，匹配 NewtypeValue.type_name
+        // Newtype: constructor name == type name; match `NewtypeValue.type_name`.
         Some(crate::value::HeapObj::Newtype(n)) => n.type_name == ctor_name,
         Some(crate::value::HeapObj::ThrowVal(tv)) => match &tv.payload {
             crate::value::ThrowPayload::Ok(_) => ctor_name == CTOR_OK,
@@ -2055,12 +2106,12 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(matched)
 }
 
-/// compute_fn: 模式匹配 — ADT/Record/ThrowVal 按位置提取字段（idx 275）。
+/// compute_fn: pattern match — positional field extraction from ADT/Record/ThrowVal (idx 275).
 ///
-/// 输入：scrutinee。元数据：字段索引（graph.pattern_field_indices）。
-/// 从 ADT 按位置取字段值，或从 Record 按位置取字段值，
-/// 或从 ThrowVal 取内部值（索引 0：Ok 的 val 或 Err 的 record）。
-/// 返回字段值（越界返回 Void）。
+/// Input: scrutinee. Metadata: field index (`graph.pattern_field_indices`).
+/// Fetches a field value from an ADT by position, or from a Record by position,
+/// or extracts the inner value from a ThrowVal (index 0: Ok's `val` or Err's
+/// `record`). Returns the field value (out-of-bounds returns Void).
 pub fn compute_pattern_adt_field_get(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let val = frame.get_value_by_global(inputs[0]);
@@ -2074,7 +2125,7 @@ pub fn compute_pattern_adt_field_get(frame: &mut Frame, node: NodeId) -> Value {
         Some(crate::value::HeapObj::Record(r)) => {
             r.fields.get(idx).cloned().unwrap_or(Value::VOID)
         }
-        // Newtype：单字段，idx 0 取 inner 值（通过 ValueArena 全局句柄解引用）
+        // Newtype: single field; idx 0 fetches the inner value (via the ValueArena global handle dereference).
         Some(crate::value::HeapObj::Newtype(n)) => {
             if idx == 0 {
                 crate::value::ValueArena::with_global(|a| a.get_value(n.inner))
@@ -2086,8 +2137,9 @@ pub fn compute_pattern_adt_field_get(frame: &mut Frame, node: NodeId) -> Value {
             if idx == 0 {
                 match &tv.payload {
                     crate::value::ThrowPayload::Ok(v) => v.clone(),
-                    // Err 直接持有 thrown 值本身（Bug #27），match 模式 `Error(v)`
-                    // 的 v 直接绑定到 throw 的值，无需 Error(Error(v)) 嵌套解构
+                    // Err holds the thrown value itself (Bug #27); the `v` in
+                    // the `Error(v)` match pattern binds directly to the thrown
+                    // value, no `Error(Error(v))` nested destructuring needed.
                     crate::value::ThrowPayload::Err(v) => v.clone(),
                 }
             } else {
@@ -2098,10 +2150,10 @@ pub fn compute_pattern_adt_field_get(frame: &mut Frame, node: NodeId) -> Value {
     }
 }
 
-/// compute_fn: 模式匹配 — 字符串相等判别（idx 276）。
+/// compute_fn: pattern match — string equality discrimination (idx 276).
 ///
-/// 输入：scrutinee, str_const。比较两个值是否为相等字符串。
-/// 返回 bool。
+/// Inputs: scrutinee, str_const. Compares whether the two values are equal strings.
+/// Returns `bool`.
 pub fn compute_pattern_str_eq(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let lhs = frame.get_value_by_global(inputs[0]);
@@ -2117,11 +2169,13 @@ pub fn compute_pattern_str_eq(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(lhs_str == rhs_str)
 }
 
-/// compute_fn: str 比较（292-297）
+/// compute_fn: str comparisons (292–297).
 ///
-/// 按 Unicode 码点序列字典序比较（Rust str 的 Ord 语义，UTF-8 字节序与码点序一致）。
-/// 操作数非 str 时返回 false（Eq/Le/Ge）或按 Ord 语义不 panic 地返回 false。
-/// 使用 KuzoStr.compare（Ordering）避免重复分配。
+/// Compared lexicographically by Unicode codepoint sequence (Rust `str`'s `Ord`
+/// semantics; UTF-8 byte order matches codepoint order).
+/// Returns `false` when an operand is not a str (for Eq/Le/Ge), or returns
+/// `false` without panicking under `Ord` semantics.
+/// Uses `KuzoStr.compare` (`Ordering`) to avoid redundant allocations.
 fn str_compare_operands(frame: &mut Frame, node: NodeId) -> Option<std::cmp::Ordering> {
     read_node_inputs!(frame, node, graph, n, inputs);
     let lhs = frame.get_value_by_global(inputs[0]);
@@ -2158,17 +2212,18 @@ pub fn compute_ge_str(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(matches!(str_compare_operands(frame, node), Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)))
 }
 
-/// compute_fn: 通用类型转换 — 任意值 → str（idx 277）。
+/// compute_fn: generic type conversion — any value → str (idx 277).
 ///
-/// 输入：源值节点。按 Value 变体分派格式化为 KuzoStr：
-///   - 标量整数 → as_int_i128().to_string()
-///   - 标量浮点 → as_float_f64().to_string()
+/// Input: source-value node. Dispatches formatting per `Value` variant to
+/// produce a KuzoStr:
+///   - scalar integer → `as_int_i128().to_string()`
+///   - scalar float → `as_float_f64().to_string()`
 ///   - bool → "true"/"false"
-///   - char → String::from(char)
-///   - Str → clone（identity）
+///   - char → `String::from(char)`
+///   - Str → clone (identity)
 ///   - Null → "null"
 ///   - Void → "void"
-///   - 其他 Ref → "<non-scalar>"
+///   - other Ref → "<non-scalar>"
 pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, KuzoStr, ValueTag};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -2188,7 +2243,7 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId) -> Value {
                 ValueTag::F16 | ValueTag::F32 | ValueTag::F64 | ValueTag::F128 => {
                     val.as_float_f64().to_string()
                 }
-                // 所有整数类型
+                // All integer types.
                 _ => val.as_int_i128().to_string(),
             }
         }
@@ -2200,11 +2255,13 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(HeapObj::Str(KuzoStr::new(s)))
 }
 
-/// compute_fn: 通用类型转换 — 标量 → 标量（idx 278）。
+/// compute_fn: generic type conversion — scalar → scalar (idx 278).
 ///
-/// 输入：源值节点。元数据：目标类型名（graph.cast_target_types）。
-/// 覆盖所有标量互转：int↔int（截断/扩展）、int↔float、float↔float、bool→int、char→int。
-/// 目标类型从 cast_target_types 元数据读取，按 ValueTag 分派构造对应 Value。
+/// Input: source-value node. Metadata: target type name
+/// (`graph.cast_target_types`). Covers all scalar-to-scalar conversions:
+/// int↔int (truncate/extend), int↔float, float↔float, bool→int, char→int.
+/// The target type is read from the `cast_target_types` metadata and the
+/// corresponding Value is constructed by dispatching on `ValueTag`.
 pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::ValueTag;
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -2214,7 +2271,7 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
 
     let target_tag = match ValueTag::from_name(target_ty) {
         Some(tag) => tag,
-        // 未知目标类型：safe cast 返回 Null，否则返回 Void
+        // Unknown target type: safe cast returns Null, otherwise returns Void.
         None => {
             return if graph.safe_op_flag(node.0 as usize) {
                 Value::Null
@@ -2224,12 +2281,12 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
         }
     };
 
-    // 源值是否为浮点
+    // Whether the source value is a float.
     let src_is_float = matches!(
         &val,
         Value::Scalar(_, ValueTag::F16 | ValueTag::F32 | ValueTag::F64 | ValueTag::F128)
     );
-    // 统一读取源值为 f64：浮点用 as_float_f64，整数用 as_int_i128 as f64
+    // Read the source value uniformly as f64: floats use `as_float_f64`, integers use `as_int_i128 as f64`.
     let src_f64 = if src_is_float { val.as_float_f64() } else { val.as_int_i128() as f64 };
 
     match target_tag {
@@ -2248,7 +2305,7 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
         ValueTag::F16 => Value::f16(crate::value::F16::from_f64(src_f64)),
         ValueTag::F32 => Value::f32(src_f64 as f32),
         ValueTag::F64 => Value::f64(src_f64),
-        // 用 as_f128() 精确访问器：整数源走 from_i128/from_u128，浮点源走 to_f64（已精确舍入）
+        // Use the precise `as_f128()` accessor: integer sources go through from_i128/from_u128, float sources go through to_f64 (already precisely rounded).
         ValueTag::F128 => Value::f128(val.as_f128()),
         ValueTag::Bool => Value::bool_val(if src_is_float { src_f64 != 0.0 } else { val.as_int_i128() != 0 }),
         ValueTag::Char => Value::char_val(char_from_u32_or_nul(if src_is_float { src_f64 as u32 } else { val.as_int_i128() as u32 })),
@@ -2256,10 +2313,11 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
     }
 }
 
-/// compute_fn (idx 279): 非空断言 `expr!`。
+/// compute_fn (idx 279): non-null assertion `expr!`.
 ///
-/// 输入为 nullable 值：Null → panic（编程错误，非可恢复流程）；
-/// 非 Null → 原样返回（Scalar/Ref 透传，即解包 nullable）。
+/// Input is a nullable value: `Null` → panic (a programming error, not a
+/// recoverable flow); non-Null → returned as-is (Scalar/Ref pass-through, i.e.
+/// unwrapping the nullable).
 pub fn compute_non_null_assert(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
@@ -2269,29 +2327,31 @@ pub fn compute_non_null_assert(frame: &mut Frame, node: NodeId) -> Value {
     v
 }
 
-/// compute_fn (idx 280): 取引用 `&expr`（RefOf）。
+/// compute_fn (idx 280): take a reference `&expr` (RefOf).
 ///
-/// 将输入值包装进 `Arc<HeapObj::Cell>`，返回 `Value::Ref(arc)`。
-/// 多个引用共享同一 Cell（通过 Arc clone），写入对所有人可见。
-/// 对于已是 Ref 的值（record 等），直接共享同一 Arc（无需二次包装）。
+/// Wraps the input value in an `Arc<HeapObj::Cell>` and returns
+/// `Value::Ref(arc)`. Multiple references share the same Cell (via Arc clone),
+/// so writes are visible to all of them. For values that are already a Ref
+/// (records, etc.), the same Arc is shared directly (no second wrapping needed).
 pub fn compute_ref_of(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
     match &v {
-        // 标量/Null/Void → 包装进 Cell
+        // Scalar/Null/Void → wrap in a Cell.
         Value::Scalar(_, _) | Value::Null | Value::Void => {
             let cell = crate::value::Cell::new(v.clone());
             Value::ref_val(crate::value::HeapObj::Cell(cell))
         }
-        // 已是堆引用：直接共享 Arc（引用语义，不深拷贝）
+        // Already a heap reference: share the Arc directly (reference semantics, no deep copy).
         Value::Ref(_) => v,
     }
 }
 
-/// compute_fn (idx 281): 解引用读取 `*ref`（Deref）。
+/// compute_fn (idx 281): dereference read `*ref` (Deref).
 ///
-/// 输入为 `Arc<HeapObj::Cell>`：返回 Cell 内部值。
-/// 输入为其他 Ref（record/array 等）：原样返回（`&rec` 共享 Arc，`*r` 即 rec 本身）。
+/// Input is an `Arc<HeapObj::Cell>`: returns the value inside the Cell.
+/// Input is any other Ref (record/array, etc.): returned as-is (`&rec` shares
+/// the Arc, so `*r` is just `rec` itself).
 pub fn compute_deref_read(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
@@ -2301,11 +2361,12 @@ pub fn compute_deref_read(frame: &mut Frame, node: NodeId) -> Value {
     }
 }
 
-/// compute_fn (idx 282): 解引用写入 `*ref = value`（DerefAssign）。
+/// compute_fn (idx 282): dereference write `*ref = value` (DerefAssign).
 ///
-/// inputs[0] = 引用（Cell），inputs[1] = 新值。
-/// 将新值写入 Cell，返回写入的值（供链式使用）。
-/// 对非 Cell 引用（record 共享 Arc）不做处理（record 字段写入走 record_field_set）。
+/// `inputs[0]` is the reference (Cell); `inputs[1]` is the new value. Writes
+/// the new value into the Cell and returns the written value (for chained use).
+/// Non-Cell references (a record's shared Arc) are left untouched (record field
+/// writes go through `record_field_set`).
 pub fn compute_deref_write(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let ref_val = frame.get_value_by_global(inputs[0]);
@@ -2317,27 +2378,34 @@ pub fn compute_deref_write(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 
-/// compute_fn: 记录字段赋值（就地修改 RecordValue 的字段，返回 void）
+/// compute_fn: record field assignment (in-place mutation of a RecordValue's
+/// field; returns void).
 ///
-/// inputs[0] = 记录值节点，inputs[1] = 新值。
-/// 字段名从 graph.field_set_names[node] 获取，通过 Arc::make_mut 就地修改。
-/// 修改后写回值表槽，使变更对其他节点可见。
+/// `inputs[0]` is the record-value node; `inputs[1]` is the new value. The
+/// field name is obtained from `graph.field_set_names[node]` and mutated in
+/// place via `Arc::make_mut`. After mutation the value is written back to the
+/// value-table slot so the change is visible to other nodes.
 pub fn compute_record_field_set(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let new_value = frame.get_value_by_global(inputs[1]);
     let field_name = graph.field_set_name(node.0 as usize)
         .expect("field set node has no field name");
     let record_node_local = NodeId(inputs[0].0.wrapping_sub(frame.node_offset));
-    // &self 语义：直接修改 Arc 底层 HeapObj，确保修改对所有持有者可见。
-    // 这对迭代器模式（next() 修改 self.pos）等场景至关重要：
-    // for 循环通过尾递归传递迭代器引用，若 COW 则 pos 永不更新 → 死循环。
+    // &self semantics: mutate the Arc's underlying HeapObj directly, so the
+    // change is visible to all owners. This is critical for iterator-style
+    // patterns (next() mutating self.pos): the for loop passes the iterator
+    // reference via tail recursion; if COW kicked in, pos would never update →
+    // infinite loop.
     //
-    // Arc::make_mut 在 refcount>1 时 COW，破坏 &self 引用语义。
-    // 此处通过 Arc::as_ptr 获取可变指针直接修改，绕过 Rust 别名规则。
+    // Arc::make_mut would COW when refcount > 1, breaking &self reference
+    // semantics. Here we obtain a mutable pointer via Arc::as_ptr and mutate
+    // directly, bypassing Rust's aliasing rules.
     //
-    // Safety: 引擎单线程执行（LockStrategy::Single 无锁，Multi 在帧级别互斥），
-    // caller 帧在 callee 执行期间处于 Suspended 状态，不会有并发访问同一 HeapObj。
-    // Arc 的引用计数不变（不 clone 也不 drop），仅修改堆数据。
+    // Safety: the engine executes single-threaded (LockStrategy::Single is
+    // lock-free; Multi is mutually exclusive at the frame level). The caller
+    // frame is Suspended while the callee runs, so there is no concurrent
+    // access to the same HeapObj. The Arc's refcount is unchanged (no clone or
+    // drop), only the heap data is mutated.
     if let Some(val) = frame.value_table.get_value_mut(record_node_local.0 as usize) {
         if let Value::Ref(arc) = val {
             let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::value::HeapObj;
@@ -2363,14 +2431,16 @@ pub fn compute_record_field_set(frame: &mut Frame, node: NodeId) -> Value {
     Value::VOID
 }
 
-/// compute_fn (idx 301): 数组索引存储 `arr[i] = x`。
+/// compute_fn (idx 301): array index store `arr[i] = x`.
 ///
-/// 三输入：arr, index, value。原地修改 Array 堆对象的 elements 向量。
-/// 与 record_field_set 同语义：通过 Arc::as_ptr 直接修改堆数据，
-/// 确保 &self 引用语义（修改对所有持有者可见）。
+/// Three inputs: arr, index, value. Mutates the Array heap object's `elements`
+/// vector in place. Same semantics as `record_field_set`: mutates the heap data
+/// directly via `Arc::as_ptr` to preserve `&self` reference semantics (the
+/// change is visible to all owners).
 ///
-/// Safety: 引擎单线程执行，caller 帧在 callee 执行期间 Suspended，无并发访问。
-/// 越界索引扩展数组到 idx+1（补 Void），与动态数组语义一致。
+/// Safety: the engine executes single-threaded; the caller frame is Suspended
+/// while the callee runs, so there is no concurrent access. Out-of-bounds
+/// indices grow the array to `idx + 1` (padding with Void), matching dynamic-array semantics.
 pub fn compute_array_store(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let idx = frame.get_value_by_global(inputs[1]).as_usize();
@@ -2384,11 +2454,11 @@ pub fn compute_array_store(frame: &mut Frame, node: NodeId) -> Value {
                 if let crate::value::HeapObj::Array(arr) = &mut *ptr {
                     if idx >= arr.elements.len() {
                         arr.elements.resize(idx + 1, Value::VOID);
-                        // SOA 布局在 resize 后需重建（新增元素填充 Void，SOA 无法简单扩展）
+                        // SOA layout must be rebuilt after resize (new elements are padded with Void; SOA cannot simply extend).
                         arr.scalar_soa = None;
                     }
                     arr.elements[idx] = new_value.clone();
-                    // 同步更新 SOA：若类型匹配则就地写入，否则失效 SOA 缓存
+                    // Sync the SOA: if the type matches, write in place; otherwise invalidate the SOA cache.
                     if let Some(ref mut soa) = arr.scalar_soa {
                         if !soa.try_store(idx, &new_value) {
                             arr.scalar_soa = None;
@@ -2401,7 +2471,7 @@ pub fn compute_array_store(frame: &mut Frame, node: NodeId) -> Value {
     Value::VOID
 }
 
-/// compute_fn: null 检查（检查值是否为 null，返回 bool）
+/// compute_fn: null check (checks whether a value is null; returns `bool`).
 pub fn compute_is_null(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let val = frame.get_value_by_global(inputs[0]);
@@ -2409,9 +2479,10 @@ pub fn compute_is_null(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(is_null)
 }
 
-/// compute_fn: 长度（返回 i32，与默认整数运算类型一致）
-/// - Array：元素个数
-/// - Str：Unicode 码点数（与 str[i] 索引语义一致，均按码点计数）
+/// compute_fn: length (returns i32, matching the default integer-arithmetic type).
+/// - Array: element count.
+/// - Str: Unicode codepoint count (consistent with `str[i]` indexing, both
+///   counted by codepoint).
 pub fn compute_array_len(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let val = frame.get_value_by_global(inputs[0]);
@@ -2423,8 +2494,9 @@ pub fn compute_array_len(frame: &mut Frame, node: NodeId) -> Value {
     Value::i32(len)
 }
 
-/// compute_fn: 引用相等比较（===），比较两个 Ref 的 Arc 指针是否指向同一对象。
-/// 返回 bool。两边均为 Ref 时用 Arc::ptr_eq；否则返回 false。
+/// compute_fn: reference equality comparison (`===`), checks whether two Refs'
+/// Arc pointers refer to the same object. Returns `bool`. Uses `Arc::ptr_eq`
+/// when both sides are Refs; otherwise returns `false`.
 pub fn compute_ref_eq(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let lhs = frame.get_value_by_global(inputs[0]);
@@ -2436,7 +2508,7 @@ pub fn compute_ref_eq(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(eq)
 }
 
-/// compute_fn: 引用不等比较（!==），RefEq 的否定。
+/// compute_fn: reference inequality comparison (`!==`), the negation of RefEq.
 pub fn compute_ref_neq(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let lhs = frame.get_value_by_global(inputs[0]);
@@ -2448,8 +2520,9 @@ pub fn compute_ref_neq(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(neq)
 }
 
-/// compute_fn: 复合类型（record/adt/newtype/array/closure/throw 等）语义相等。
-/// 对 Ref 走 heap_equals 深度比较；对标量/Null/Void 回退到 value_equals。
+/// compute_fn: semantic equality for composite types (record/adt/newtype/array/closure/throw, etc.).
+/// Refs go through `heap_equals` for deep comparison; scalars/Null/Void fall
+/// back to `value_equals`.
 pub fn compute_eq_obj(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let lhs = frame.get_value_by_global(inputs[0]);
@@ -2460,7 +2533,7 @@ pub fn compute_eq_obj(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(eq)
 }
 
-/// compute_fn: 复合类型语义不等，compute_eq_obj 的否定。
+/// compute_fn: semantic inequality for composite types; the negation of `compute_eq_obj`.
 pub fn compute_ne_obj(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let lhs = frame.get_value_by_global(inputs[0]);
@@ -2471,7 +2544,7 @@ pub fn compute_ne_obj(frame: &mut Frame, node: NodeId) -> Value {
     Value::bool_val(neq)
 }
 
-/// compute_fn: 列表拼接（ConcatList），两个 Array 拼接为新 Array。
+/// compute_fn: list concatenation (ConcatList) — concatenates two Arrays into a new Array.
 pub fn compute_concat_list(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, ArrayValue};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -2488,7 +2561,7 @@ pub fn compute_concat_list(frame: &mut Frame, node: NodeId) -> Value {
     }
 }
 
-/// compute_fn: 范围生成（Range，a..b，左闭右开）。
+/// compute_fn: range generation (Range, `a..b`, half-open).
 pub fn compute_range(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, Range};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -2497,7 +2570,7 @@ pub fn compute_range(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(HeapObj::Range(Range::new(start, end, false)))
 }
 
-/// compute_fn: 范围生成（RangeInclusive，a..=b，左闭右闭）。
+/// compute_fn: range generation (RangeInclusive, `a..=b`, closed).
 pub fn compute_range_inclusive(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, Range};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -2506,24 +2579,25 @@ pub fn compute_range_inclusive(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(HeapObj::Range(Range::new(start, end, true)))
 }
 
-/// compute_fn: Elvis 运算（lhs ?: rhs）。
+/// compute_fn: Elvis operation (`lhs ?: rhs`).
 ///
-/// 统一处理 Nullable 与 Throw 两种"可能缺失值"的类型（Bug #28）：
-/// - ThrowVal(Ok(v)) → 返回 v（解包成功值）
-/// - ThrowVal(Err(_)) → 返回 rhs（错误时用默认值）
-/// - null（Nullable）→ 返回 rhs
-/// - 其他非空值 → 返回 lhs
+/// Uniformly handles Nullable and Throw, the two "potentially-absent value"
+/// types (Bug #28):
+/// - `ThrowVal(Ok(v))` → returns `v` (unwraps the success value).
+/// - `ThrowVal(Err(_))` → returns `rhs` (default value on error).
+/// - `null` (Nullable) → returns `rhs`.
+/// - any other non-null value → returns `lhs`.
 pub fn compute_elvis(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let lhs = frame.get_value_by_global(inputs[0]);
-    // Throw 类型：Ok 解包，Err 用默认值
+    // Throw type: Ok unwraps, Err uses the default value.
     if let Some(crate::value::HeapObj::ThrowVal(tv)) = lhs.heap_obj() {
         return match &tv.payload {
             crate::value::ThrowPayload::Ok(v) => v.clone(),
             crate::value::ThrowPayload::Err(_) => frame.get_value_by_global(inputs[1]),
         };
     }
-    // Nullable 类型：null 用默认值，非空返回 lhs
+    // Nullable type: null uses the default value; non-null returns lhs.
     if lhs.is_null() {
         frame.get_value_by_global(inputs[1])
     } else {
@@ -2531,16 +2605,18 @@ pub fn compute_elvis(frame: &mut Frame, node: NodeId) -> Value {
     }
 }
 
-/// compute_fn: Call 节点启动子图（参数收集 + 标记 frame.pending_call）。
+/// compute_fn: Call node launches a subgraph (collects arguments + sets
+/// `frame.pending_call`).
 ///
-/// 统一 sync/async 调用路径：从 target_sg.has_suspend 推导 is_async，
-/// 核心循环检测 pending_call 后据此决定是否启动子帧 + 挂起当前帧。
-/// 不直接 start_subgraph（compute_fn 无 Engine 引用）。
+/// Unifies the sync/async call path: `is_async` is derived from
+/// `target_sg.has_suspend`, and the core loop decides whether to spawn a
+/// subframe + suspend the current frame after observing `pending_call`.
+/// Does not call `start_subgraph` directly (compute_fns have no Engine reference).
 pub fn compute_call_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
     let graph = frame.graph.clone();
     let call_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
 
-    // safe_op 短路：?.method(args) 在接收者为 null 时返回 Null，不发起调用
+    // safe_op short-circuit: `?.method(args)` returns Null when the receiver is null, without invoking the call.
     if graph.safe_op_flag(node.0 as usize) {
         let n = graph.node(node.0 as usize);
         if n.input_count > 0 {
@@ -2552,7 +2628,7 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
         }
     }
 
-    // 静态绑定：有 call_target → 收集参数 + 返回 NodeResult::Call
+    // Static binding: has call_target → collect args + return NodeResult::Call.
     if let Some(target_sg) = graph.call_target(node.0 as usize) {
         if env_flag("KUZO_DEBUG_CALL") {
             eprintln!("[CALL] node={:?} target_sg={} frame.sg={} frame.offset={}",
@@ -2577,7 +2653,7 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
         });
     }
 
-    // 动态分派：vtable_call_methods（从 TraitVal 运行时查询方法子图）
+    // Dynamic dispatch: vtable_call_methods (queries the method subgraph at runtime from a TraitVal).
     if let Some(method_idx) = graph.vtable_call_method(node.0 as usize) {
         let n = graph.node(node.0 as usize);
         let inputs = graph.inputs(n.inputs_offset, n.input_count);
@@ -2614,11 +2690,11 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
         });
     }
 
-    // 两者都无：编译器保证 Call 节点必有其一；此处不 panic，保持容错
+    // Neither present: the compiler guarantees a Call node has at least one; no panic here, kept fault-tolerant.
     NodeResult::Value(Value::VOID)
 }
 
-/// compute_fn: Gate 节点选择分支 + 返回 NodeResult::Call。
+/// compute_fn: Gate node selects a branch + returns `NodeResult::Call`.
 pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
     let graph = frame.graph.clone();
     let branches = graph.gate_branches_at(node.0 as usize);
@@ -2626,7 +2702,7 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
         .as_ref()
         .expect("Gate node has no branches");
 
-    // 读条件值
+    // Read the condition value.
     let cond_raw = frame.get_value_by_global(branches.condition_input);
     let cond = cond_raw.as_bool();
 
@@ -2638,7 +2714,7 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
             branches.branches.iter().map(|(c, sg, _)| (*c, sg.0)).collect::<Vec<_>>());
     }
 
-    // 选分支
+    // Select a branch.
     let (target_sg, branch_inputs) = branches
         .branches
         .iter()
@@ -2646,7 +2722,7 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
         .map(|(_, sg, inputs)| (*sg, inputs.clone()))
         .expect("no matching gate branch");
 
-    // 收集参数
+    // Collect arguments.
     let param_count = graph.subgraphs[target_sg.0 as usize].param_count as usize;
     let args: Vec<Value> = branch_inputs
         .iter()
@@ -2677,19 +2753,21 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
     })
 }
 
-/// compute_await（idx 38）：await 节点返回 NodeResult::Await。
+/// compute_await (idx 38): the await node returns `NodeResult::Await`.
 ///
-/// spec 4.4：事件源未就绪 → await 未就绪 → 帧无更多就绪节点 → 挂起。
-/// 核心循环收到 NodeResult::Await 后解析事件源 → 检查就绪 → 就绪则注入值继续 → 未就绪则挂起。
+/// Spec 4.4: event source not ready → await not ready → frame has no more ready
+/// nodes → suspend. When the core loop receives `NodeResult::Await`, it resolves
+/// the event source → checks readiness → if ready, injects the value and
+/// continues; if not ready, suspends.
 pub fn compute_await(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
     use crate::ir::Ir::PendingAwait;
 
     read_node_inputs!(frame, node, graph, n, inputs);
-    // inputs[0] = 事件对象节点（AsyncHandle/Channel/Timer）
+    // inputs[0] = event-object node (AsyncHandle/Channel/Timer).
     let event_obj = frame.get_value_by_global(inputs[0]);
     let await_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
 
-    // EventSource 节点从 await_event_sources 表读取（元数据引用，非数据依赖）
+    // The EventSource node is read from the await_event_sources table (a metadata reference, not a data dependency).
     let es_node = graph.await_event_source(node.0 as usize);
     let event_kind = match es_node {
         Some(es) => graph
@@ -2712,10 +2790,10 @@ pub fn compute_await(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> Nod
     })
 }
 
-/// compute_channel_create（idx 283）：创建 ChannelValue 堆对象。
+/// compute_channel_create (idx 283): creates a ChannelValue heap object.
 ///
-/// 输入：inputs[0] = capacity (usize)
-/// 输出：Value::ref_val(HeapObj::ChannelVal(Arc<ChannelValue>))
+/// Input: `inputs[0] = capacity` (usize).
+/// Output: `Value::ref_val(HeapObj::ChannelVal(Arc<ChannelValue>))`.
 pub fn compute_channel_create(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let capacity = frame.get_value_by_global(inputs[0]).as_usize();
@@ -2724,14 +2802,16 @@ pub fn compute_channel_create(frame: &mut Frame, node: NodeId) -> Value {
     ))
 }
 
-/// compute_channel_send（idx 284）：非阻塞发送 + 返回 NodeResult::ChannelNotify。
+/// compute_channel_send (idx 284): non-blocking send + returns
+/// `NodeResult::ChannelNotify`.
 ///
-/// 输入：inputs[0] = channel ref, inputs[1] = value
-/// 发送后返回 NodeResult::ChannelNotify，核心循环消费时触发 ChannelReady 事件
-/// 唤醒等待该 channel 的挂起帧（内联触发，零延迟）。
+/// Inputs: `inputs[0] = channel ref`, `inputs[1] = value`.
+/// After sending, returns `NodeResult::ChannelNotify`; when the core loop
+/// consumes it, it triggers a `ChannelReady` event that wakes the suspended
+/// frames waiting on that channel (inline trigger, zero latency).
 pub fn compute_channel_send(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
     read_node_inputs!(frame, node, graph, n, inputs);
-    // safe_op 短路：?.send(v) 在接收者为 null 时返回 Null
+    // safe_op short-circuit: `?.send(v)` returns Null when the receiver is null.
     if graph.safe_op_flag(node.0 as usize) {
         let ch_val = frame.get_value_by_global(inputs[0]);
         if ch_val.is_null() {
@@ -2754,9 +2834,9 @@ pub fn compute_channel_send(frame: &mut Frame, node: NodeId, _ctx: &EvalContext)
     }
 }
 
-/// compute_channel_close（idx 285）：关闭 channel。
+/// compute_channel_close (idx 285): closes the channel.
 ///
-/// 输入：inputs[0] = channel ref
+/// Input: `inputs[0] = channel ref`.
 pub fn compute_channel_close(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let ch_val = frame.get_value_by_global(inputs[0]);
@@ -2766,18 +2846,20 @@ pub fn compute_channel_close(frame: &mut Frame, node: NodeId) -> Value {
     Value::VOID
 }
 
-/// compute_fn: 闭包构造（idx 40）。
+/// compute_fn: closure construction (idx 40).
 ///
-/// 从 graph.closure_infos 取子图 id + arity，合并 inputs（捕获值）构造 Closure 堆对象。
-/// 节点的 inputs 即捕获的 upvalues（按 compile_lambda 中 captured 顺序）。
+/// Reads the subgraph id + arity from `graph.closure_infos`, merges the inputs
+/// (captured values) to construct a Closure heap object. The node's inputs are
+/// the captured upvalues (in the order of `captured` in `compile_lambda`).
 pub fn compute_closure_construct(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, Closure, Cell};
     read_node_inputs!(frame, node, graph, n, inputs);
     let info = graph.closure_info(node.0 as usize)
         .expect("closure construct node has no ClosureInfo");
-    // 用 Cell 包装每个 upvalue，使逃逸闭包（跨函数调用）能通过 Cell
-    // 的 interior mutability 持久化 upvalue 修改。
-    // same_function 调用不使用 Cell（直接从父帧读最新值）。
+    // Wrap each upvalue in a Cell so that escaping closures (cross-function
+    // calls) can persist upvalue mutations via the Cell's interior mutability.
+    // same_function calls do not use the Cell (they read the latest value
+    // directly from the parent frame).
     let upvalues: Vec<Value> = inputs
         .iter()
         .map(|&in_node| frame.get_value_by_global(in_node))
@@ -2795,11 +2877,11 @@ pub fn compute_closure_construct(frame: &mut Frame, node: NodeId) -> Value {
     }))
 }
 
-/// compute_fn: inline_trait 构造（idx 266）。
+/// compute_fn: inline_trait construction (idx 266).
 ///
-/// 从 graph.trait_construct_infos 取 trait 名 + 方法列表，
-/// 合并节点 inputs（各方法 upvalues 依次拼接）构造多个 Closure，
-/// 打包成 TraitValue 堆对象。
+/// Reads the trait name + method list from `graph.trait_construct_infos`,
+/// merges the node's inputs (each method's upvalues concatenated in order) to
+/// build multiple Closures, and packs them into a TraitValue heap object.
 pub fn compute_trait_construct(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, Closure, TraitValue};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -2808,7 +2890,7 @@ pub fn compute_trait_construct(frame: &mut Frame, node: NodeId) -> Value {
         .as_ref()
         .expect("trait construct node has no TraitConstructInfo");
 
-    // 从 inputs 按各方法 upvalue_count 依次切分，构造每个方法的 Closure
+    // Slice `inputs` per each method's `upvalue_count` in order, and build each method's Closure.
     let mut method_values: Vec<Value> = Vec::with_capacity(info.methods.len());
     let mut input_cursor = 0usize;
     for m in &info.methods {
@@ -2838,25 +2920,27 @@ pub fn compute_trait_construct(frame: &mut Frame, node: NodeId) -> Value {
     }))
 }
 
-/// compute_fn: lazy 构造（idx 267）。
+/// compute_fn: lazy construction (idx 267).
 ///
-/// 从 graph.lazy_construct_infos 取 thunk 子图 id，
-/// 合并节点 inputs（upvalues）构造 LazyValue 堆对象。
-/// thunk 未求值，首次 force 时启动子图计算并缓存结果。
+/// Reads the thunk subgraph id from `graph.lazy_construct_infos`, merges the
+/// node's inputs (upvalues) to construct a LazyValue heap object. The thunk is
+/// unevaluated; on the first force it starts subgraph computation and caches
+/// the result.
 pub fn compute_lazy_construct(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, LazyValue, Closure};
     read_node_inputs!(frame, node, graph, n, inputs);
     let info = graph.lazy_construct_info(node.0 as usize)
         .expect("lazy construct node has no LazyConstructInfo");
 
-    // upvalues 从 inputs 收集，存入 Closure（thunk 首次 force 时用）
+    // Collect upvalues from `inputs` into a Closure (used when the thunk is first forced).
     let upvalues: Vec<Value> = inputs
         .iter()
         .map(|&in_node| frame.get_value_by_global(in_node))
         .collect();
 
-    // 用 Closure 包装 thunk 子图（func_id = thunk_sg），存为 LazyValue.data
-    // force 时从 data 取 Closure，启动子图计算，结果缓存到 cached
+    // Wrap the thunk subgraph in a Closure (func_id = thunk_sg) and store it as
+    // LazyValue.data. On force, take the Closure from `data`, start subgraph
+    // computation, and cache the result in `cached`.
     let thunk_closure = Value::ref_val(HeapObj::Closure(Closure {
         func_id: info.thunk_sg.0,
         arity: 0,
@@ -2875,37 +2959,39 @@ pub fn compute_lazy_construct(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 // =========================================================================
-// LazyValue force 机制：同步执行 thunk 子图，缓存结果
+// LazyValue force mechanism: synchronously executes the thunk subgraph and caches the result.
 // =========================================================================
 
-/// 强制求值 LazyValue：同步执行 thunk 子图，返回计算结果。
+/// Forces evaluation of a LazyValue: synchronously executes the thunk subgraph
+/// and returns the result.
 ///
-/// 若已 forced，直接返回 cached 值；否则创建 thunk 帧，同步运行至完成，
-/// 将结果缓存到 LazyValue（通过 Arc::make_mut 原地更新），返回结果。
+/// If already forced, returns the cached value directly; otherwise creates a
+/// thunk frame, runs it synchronously to completion, caches the result in the
+/// LazyValue (updated in place via `Arc::make_mut`), and returns the result.
 ///
-/// 此函数在 compute_reflect_format / compute_reflect_scalar_to_str 中调用，
-/// 用于在格式化前强制求值 lazy 值。
+/// Called by `compute_reflect_format` / `compute_reflect_scalar_to_str` to
+/// force lazy values before formatting.
 pub fn force_lazy_value_sync(caller_frame: &mut Frame, lazy_val: &Value) -> Value {
     use crate::value::HeapObj;
 
-    // 提取 LazyValue 引用
+    // Extract the LazyValue reference.
     let arc = match lazy_val {
         Value::Ref(r) => r,
-        _ => return lazy_val.clone(), // 非 LazyValue，直接返回
+        _ => return lazy_val.clone(), // not a LazyValue, return directly
     };
 
-    // 检查是否已 forced
+    // Check whether already forced.
     {
         if let HeapObj::LazyVal(lazy) = &**arc {
             if lazy.forced.load(std::sync::atomic::Ordering::Relaxed) {
                 return lazy.cached.lock().unwrap().clone().unwrap_or(Value::NULL);
             }
         } else {
-            return lazy_val.clone(); // 非 LazyVal，直接返回
+            return lazy_val.clone(); // not a LazyVal, return directly
         }
     }
 
-    // 取 thunk Closure
+    // Take the thunk Closure.
     let closure = {
         let HeapObj::LazyVal(lazy) = &**arc else { return lazy_val.clone() };
         match &lazy.data {
@@ -2920,13 +3006,13 @@ pub fn force_lazy_value_sync(caller_frame: &mut Frame, lazy_val: &Value) -> Valu
     let graph = caller_frame.graph.clone();
     let thunk_sg = SubGraphId(closure.func_id);
 
-    // 创建 thunk 帧
+    // Create the thunk frame.
     let (node_start, node_end) = graph.subgraphs[thunk_sg.0 as usize].node_range;
     let node_count = (node_end.0 - node_start.0) as usize;
     let mut thunk_frame = Frame::new(THUNK_FRAME_ID, thunk_sg, node_count, graph.clone());
     prepare_frame_nodes(&mut thunk_frame, &graph);
 
-    // 注入 upvalues 作为参数
+    // Inject upvalues as arguments.
     let offset = node_start.0 as usize;
     let param_count = graph.subgraphs[thunk_sg.0 as usize].param_count as usize;
     for (i, arg) in closure.upvalues.iter().enumerate().take(param_count) {
@@ -2936,14 +3022,16 @@ pub fn force_lazy_value_sync(caller_frame: &mut Frame, lazy_val: &Value) -> Valu
         thunk_frame.push_ready(local_id);
     }
 
-    // thunk 帧的 upvalues 已作为参数注入（上方循环），不需通过 parent_frame_ptr 访问外层变量。
-    // 设为 null 避免 caller_frame 的 &mut 借用与裸指针解引用构成别名 UB。
+    // The thunk frame's upvalues have been injected as arguments (loop above);
+    // outer variables are not accessed via `parent_frame_ptr`. Set to null to
+    // avoid the caller_frame's `&mut` borrow forming aliased UB with the raw
+    // pointer deref.
     thunk_frame.parent_frame_ptr = std::ptr::null_mut();
 
-    // 同步执行 thunk 帧
+    // Synchronously execute the thunk frame.
     let result = run_frame_sync(&mut thunk_frame, &graph);
 
-    // 缓存结果到 LazyValue（通过 Mutex/AtomicBool 的 interior mutability 更新）
+    // Cache the result in the LazyValue (updated via the Mutex/AtomicBool's interior mutability).
     if let HeapObj::LazyVal(lazy) = &**arc {
         lazy.forced.store(true, std::sync::atomic::Ordering::Relaxed);
         *lazy.cached.lock().unwrap() = Some(result.clone());
@@ -2952,14 +3040,15 @@ pub fn force_lazy_value_sync(caller_frame: &mut Frame, lazy_val: &Value) -> Valu
     result
 }
 
-/// 同步路径循环迭代重置：LoopBody 完成 Continue/None 后重置循环帧的
-/// cond/gate/iter_next，使其重新进入下一迭代。
+/// Synchronous-path loop-iteration reset: after a LoopBody finishes a
+/// Continue/None, resets the loop frame's cond/gate/iter_next so it re-enters
+/// the next iteration.
 ///
-/// 与 Engine::reset_loop_iteration 对应，但不处理 body_frame 复用
-/// （同步路径每次迭代都新建 child_frame，不复用）。
-/// 同步路径不通过帧队列驱动，而是 run_frame_sync_inner 主循环直接从
-/// ready_queue pop 节点执行，因此 reset 后 cond/iter_next 入队即可
-/// 被主循环重新拾取执行。
+/// Mirrors `Engine::reset_loop_iteration` but does not handle body_frame reuse
+/// (the sync path creates a new child_frame for each iteration, never reusing).
+/// The sync path is not driven by a frame queue; instead, the
+/// `run_frame_sync_inner` main loop pops nodes directly from the `ready_queue`,
+/// so after reset, cond/iter_next are pushed and picked up again by the main loop.
 fn reset_loop_frame_for_next_iteration(frame: &mut Frame, graph: &DataFlowGraph) {
     let loop_sg_id = frame.subgraph_id;
     let (loop_kind, cond_node, return_node, iter_next_node) = {
@@ -2968,11 +3057,12 @@ fn reset_loop_frame_for_next_iteration(frame: &mut Frame, graph: &DataFlowGraph)
     };
     let loop_offset = frame.node_offset;
 
-    // 0. 清空 ready_queue（必须在 push cond/iter_next 之前）
-    // 若不清空，旧就绪条目残留，会先于 cond/iter_next 执行，引用过时值
+    // 0. Clear the ready_queue (must precede pushing cond/iter_next).
+    // If not cleared, stale ready entries would execute before cond/iter_next,
+    // referencing outdated values.
     frame.ready_queue.clear();
 
-    // 1. For 循环：重置 iter_next_node
+    // 1. For loop: reset iter_next_node.
     if loop_kind == LoopKind::For {
         if let Some(next_node) = iter_next_node {
             let next_local = NodeId(next_node.0.wrapping_sub(loop_offset));
@@ -2987,12 +3077,12 @@ fn reset_loop_frame_for_next_iteration(frame: &mut Frame, graph: &DataFlowGraph)
         }
     }
 
-    // 2. 重置 cond_node
+    // 2. Reset cond_node.
     if let Some(cond_node) = cond_node {
         let cond_local = NodeId(cond_node.0.wrapping_sub(loop_offset));
         let i = cond_local.0 as usize;
         if loop_kind == LoopKind::For {
-            // For 循环 cond 依赖 iter_next，pending=1
+            // For loop cond depends on iter_next, pending=1.
             if i < frame.pending_inputs.len() {
                 frame.pending_inputs[i] = 1;
             }
@@ -3000,14 +3090,14 @@ fn reset_loop_frame_for_next_iteration(frame: &mut Frame, graph: &DataFlowGraph)
                 frame.value_table.reset_slot(i);
             }
         } else {
-            // While/Loop cond 无输入依赖，pending=0
+            // While/Loop cond has no input dependency, pending=0.
             if i < frame.pending_inputs.len() {
                 frame.pending_inputs[i] = 0;
             }
             if i < frame.value_table.len() {
                 frame.value_table.reset_slot(i);
             }
-            // Const cond_node 重新预填充
+            // Re-pre-fill a Const cond_node.
             if graph.node(cond_node.0 as usize).kind == NodeKind::Const {
                 if let Some(cv) = graph.const_value(cond_node.0 as usize) {
                     let handle = cv.to_value(graph.string_pool_slice());
@@ -3020,7 +3110,7 @@ fn reset_loop_frame_for_next_iteration(frame: &mut Frame, graph: &DataFlowGraph)
         }
     }
 
-    // 3. 重置 Gate 节点（= return_node，pending=1，等 cond notify）
+    // 3. Reset the Gate node (= return_node; pending=1, waits for cond notify).
     let gate_local = NodeId(return_node.0.wrapping_sub(loop_offset));
     let gi = gate_local.0 as usize;
     if gi < frame.pending_inputs.len() {
@@ -3030,29 +3120,32 @@ fn reset_loop_frame_for_next_iteration(frame: &mut Frame, graph: &DataFlowGraph)
         frame.value_table.reset_slot(gi);
     }
 
-    // 4. 重置循环帧状态
+    // 4. Reset loop-frame state.
     frame.control_signal = ControlSignal::None;
     frame.state = FrameState::Ready;
 }
 
-/// 同步执行帧至完成，处理嵌套函数调用、控制信号、vtable 分派。
+/// Synchronously runs a frame to completion, handling nested function calls,
+/// control signals, and vtable dispatch.
 ///
-/// 这是 Engine 异步执行模型的同步简化版：
-/// - 帧内节点按就绪队列调度执行
-/// - 遇到 Call 节点时递归调用 run_frame_sync 执行子帧
-/// - 控制信号（return/break/continue）终止循环
+/// This is the synchronous simplified version of Engine's async execution model:
+/// - Nodes within a frame are scheduled by the ready queue.
+/// - On a Call node, recursively calls `run_frame_sync` to execute the subframe.
+/// - Control signals (return/break/continue) terminate the loop.
 ///
-/// defer 执行：帧完成后（任何终止路径），按 LIFO 顺序执行 defer_table 中的
-/// defer body 子图。defer body 通过递归 run_frame_sync 执行（支持嵌套 defer）。
+/// Defer execution: after the frame finishes (any termination path), runs the
+/// defer bodies in `defer_table` in LIFO order. Defer bodies are run via
+/// recursive `run_frame_sync` (supports nested defers).
 fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
     let result = run_frame_sync_inner(frame, graph);
-    // 执行 defer（LIFO）：任何终止路径都执行 defer
+    // Execute defers (LIFO): any termination path runs the defers.
     run_defers_sync(frame, graph);
     result
 }
 
-/// 执行帧的 defer_table 中的 defer body（LIFO 顺序）。
-/// defer body 是独立子图，创建新帧并通过 run_frame_sync 同步执行。
+/// Executes the defer bodies in the frame's `defer_table` (LIFO order).
+/// A defer body is an independent subgraph; a new frame is created and run
+/// synchronously via `run_frame_sync`.
 fn run_defers_sync(frame: &mut Frame, graph: &DataFlowGraph) {
     let sg_id = frame.subgraph_id;
     let defer_entries: Vec<crate::ir::Ir::DeferEntry> =
@@ -3071,15 +3164,15 @@ fn run_defers_sync(frame: &mut Frame, graph: &DataFlowGraph) {
     }
 }
 
-/// run_frame_sync 的内部实现（不执行 defer）。
+/// Inner implementation of `run_frame_sync` (does not execute defers).
 ///
-/// 统一热循环：pop → compute_fn → match NodeResult
-/// - Call: 递归创建子帧 + 同步执行 + 注入返回值
-/// - Return/Break/Continue: 设置 control_signal 终止循环
-/// - Await/ChannelNotify/Cancel/SelectWait: 同步路径不支持，返回 NULL
+/// Unified hot loop: pop → compute_fn → match NodeResult.
+/// - Call: recursively create a subframe + run synchronously + inject the return value.
+/// - Return/Break/Continue: set `control_signal` to terminate the loop.
+/// - Await/ChannelNotify/Cancel/SelectWait: not supported on the sync path, returns NULL.
 ///
-/// 不支持：async/await、channel/timer 事件、select、循环体复用。
-/// 适用于 thunk 子图（纯计算 + 同步函数调用）。
+/// Not supported: async/await, channel/timer events, select, loop-body reuse.
+/// Suitable for thunk subgraphs (pure computation + synchronous function calls).
 fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
     use crate::ir::Ir::{ControlSignal, LoopKind, NodeKind};
 
@@ -3089,7 +3182,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
         if iter_guard > 100000 {
             return Value::NULL;
         }
-        // 1. 检查控制信号
+        // 1. Check the control signal.
         let cs = frame.control_signal.clone();
         match cs {
             ControlSignal::Return(v) => return v,
@@ -3097,7 +3190,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
             ControlSignal::None => {}
         }
 
-        // 2. POP
+        // 2. POP.
         let local_id = match frame.pop_ready() {
             Some(n) => n,
             None => {
@@ -3117,7 +3210,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
         let node = graph.node(graph_node_id.0 as usize);
         let ctx = EvalContext { node_start };
 
-        // 3. COMPUTE
+        // 3. COMPUTE.
         let result = (graph.compute_fns[node.compute_fn.0 as usize])(frame, graph_node_id, &ctx);
 
         // 4. MATCH NodeResult
@@ -3142,7 +3235,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 }
             }
             NodeResult::Call(pending) => {
-                // 尾调用：复用当前帧
+                // Tail call: reuse the current frame.
                 if graph.tail_call_flag(graph_node_id.0 as usize) {
                     switch_subgraph(frame, graph, pending.target_sg, &pending.args);
                     continue;
@@ -3150,7 +3243,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
 
                 let target_loop_kind = graph.subgraphs[pending.target_sg.0 as usize].loop_kind;
 
-                // LoopBody：不支持循环体复用（thunk 不应有循环），回退为普通调用
+                // LoopBody: loop-body reuse is not supported (thunks should not contain loops); fall back to a normal call.
                 let (child_start, child_end) = graph.subgraphs[pending.target_sg.0 as usize].node_range;
                 let child_count = (child_end.0 - child_start.0) as usize;
                 let mut child_frame = Frame::new(
@@ -3161,7 +3254,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 );
                 prepare_frame_nodes(&mut child_frame, graph);
 
-                // 注入参数
+                // Inject arguments.
                 let child_offset = child_start.0 as usize;
                 let child_param_count = graph.subgraphs[pending.target_sg.0 as usize].param_count as usize;
                 for (i, arg) in pending.args.iter().enumerate().take(child_param_count) {
@@ -3171,7 +3264,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                     child_frame.push_ready(lid);
                 }
 
-                // 设置帧链指针
+                // Set up the frame-chain pointers.
                 let same_function = graph.subgraphs[frame.subgraph_id.0 as usize].function_id
                     == graph.subgraphs[pending.target_sg.0 as usize].function_id;
                 child_frame.parent_frame_ptr = if same_function {
@@ -3190,15 +3283,15 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 };
                 child_frame.closure_val = pending.closure_val.clone();
 
-                // 同步执行子帧
+                // Synchronously execute the child frame.
                 let child_result = run_frame_sync(&mut child_frame, graph);
                 let child_signal = child_frame.control_signal.clone();
 
-                // 注入返回值到当前帧
+                // Inject the return value into the current frame.
                 let consumer_count = graph.downstream_slice(graph_node_id.0 as usize).len() as u16;
                 frame.set_value(pending.call_node_local, child_result.clone(), consumer_count);
 
-                // throw 传播
+                // Propagate throw.
                 let is_throw_err = matches!(
                     child_result.heap_obj(),
                     Some(crate::value::HeapObj::ThrowVal(t)) if matches!(t.payload, crate::value::ThrowPayload::Err(_))
@@ -3208,14 +3301,14 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                     continue;
                 }
 
-                // Gate 分支控制信号传播
+                // Propagate the Gate branch control signal.
                 let is_gate = graph.node(graph_node_id.0 as usize).kind == NodeKind::Gate;
                 if is_gate && !matches!(child_signal, ControlSignal::None) {
                     frame.control_signal = child_signal;
                     continue;
                 }
 
-                // LoopBody 完成处理
+                // LoopBody completion handling.
                 if target_loop_kind == LoopKind::LoopBody {
                     match child_signal {
                         ControlSignal::Break | ControlSignal::Return(_) => {
@@ -3253,7 +3346,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 frame.control_signal = ControlSignal::Continue;
                 continue;
             }
-            // 同步路径不支持：async/await、channel/timer、select
+            // Not supported on the sync path: async/await, channel/timer, select.
             NodeResult::Await(_)
             | NodeResult::ChannelNotify(_)
             | NodeResult::Cancel(_)
@@ -3264,11 +3357,12 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
     }
 }
 
-/// compute_fn: 偏应用构造（idx 286）。
+/// compute_fn: partial application construction (idx 286).
 ///
-/// 从 partial_infos 取子图 id + bound_count，合并 inputs（已绑定参数值）
-/// 构造 HeapObj::Partial。remaining_arity = subgraph.param_count - bound_count。
-/// 顶层函数偏应用时 upvalues 为空，self_upvalue_idx = -1。
+/// Reads the subgraph id + bound_count from `partial_infos`, merges the inputs
+/// (already-bound argument values) to construct `HeapObj::Partial`.
+/// `remaining_arity = subgraph.param_count - bound_count`.
+/// For top-level function partial application, upvalues are empty and `self_upvalue_idx = -1`.
 pub fn compute_partial_construct(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, PartialApplication};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -3289,8 +3383,8 @@ pub fn compute_partial_construct(frame: &mut Frame, node: NodeId) -> Value {
     }))
 }
 
-/// compute_str_bytes（idx 287）：str.bytes() → u8[]
-/// 将 KuzoStr 的 UTF-8 字节序列构造为 u8 数组。
+/// compute_str_bytes (idx 287): `str.bytes()` -> `u8[]`.
+/// Constructs a `u8` array from the UTF-8 byte sequence of a `KuzoStr`.
 pub fn compute_str_bytes(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, ArrayValue};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -3305,19 +3399,21 @@ pub fn compute_str_bytes(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(HeapObj::Array(ArrayValue::new(bytes)))
 }
 
-/// compute_fn: 可调用值调用（idx 41）— 统一处理 Closure | Partial。
+/// compute_fn: callable value invocation (idx 41) — uniformly handles `Closure | Partial`.
 ///
-/// inputs[0] = 可调用值节点，inputs[1..1+arg_count] = 调用参数节点（arg_count 从
-/// closure_call_arg_counts 元数据读取，不含闭包值和 effect 依赖）。
+/// `inputs[0]` = callable value node, `inputs[1..1+arg_count]` = call argument nodes
+/// (`arg_count` is read from the `closure_call_arg_counts` metadata, excluding the
+/// closure value and effect dependencies).
 ///
-/// 统一调用语义：
-/// - Closure: needed_arity = subgraph.param_count - upvalues.len()
-/// - Partial: needed_arity = remaining_arity
+/// Unified call semantics:
+/// - Closure: `needed_arity = subgraph.param_count - upvalues.len()`
+/// - Partial: `needed_arity = remaining_arity`
 ///
-/// 当新参数数 < needed_arity → 产出新的 Partial（链式偏应用）；
-/// 当新参数数 >= needed_arity → 合并 bound_args + 新参数 + upvalues，设 pending_call。
-/// 解包 Cell 包装的 upvalue：若值是 Cell 则返回内部值的克隆，否则原样克隆。
-/// 用于 compute_closure_call 将 Cell upvalues 转为原始值注入子帧参数。
+/// When the new argument count < `needed_arity` -> produce a new `Partial` (chained partial application);
+/// When the new argument count >= `needed_arity` -> merge `bound_args` + new args + upvalues, set `pending_call`.
+/// Unwraps a `Cell`-wrapped upvalue: if the value is a `Cell`, returns a clone of the inner value;
+/// otherwise returns a clone as-is.
+/// Used by `compute_closure_call` to convert `Cell` upvalues into raw values injected into the child frame parameters.
 fn unwrap_cell(v: &Value) -> Value {
     match v.heap_obj() {
         Some(crate::value::HeapObj::Cell(cell)) => cell.get(),
@@ -3329,12 +3425,12 @@ pub fn compute_closure_call(frame: &mut Frame, node: NodeId, _ctx: &EvalContext)
     use crate::value::{HeapObj, PartialApplication};
     read_node_inputs!(frame, node, graph, n, inputs);
     let callable_val = frame.get_value_by_global(inputs[0]);
-    // safe_op 短路：?.method(args) 在接收者为 null 时返回 Null
+    // safe_op short-circuit: `?.method(args)` returns Null when the receiver is null.
     if graph.safe_op_flag(node.0 as usize) && callable_val.is_null() {
         return NodeResult::Value(Value::Null);
     }
 
-    // 从元数据读取实参数（不含闭包值和 effect 依赖）
+    // Read the actual argument count from metadata (excluding closure value and effect dependencies).
     let arg_count = graph.closure_call_arg_count(node.0 as usize)
         .expect("closure_call node has no arg_count") as usize;
     let new_args: Vec<Value> = inputs
@@ -3344,12 +3440,12 @@ pub fn compute_closure_call(frame: &mut Frame, node: NodeId, _ctx: &EvalContext)
         .map(|&in_node| frame.get_value_by_global(in_node))
         .collect();
 
-    // 统一提取可调用值的启动信息
+    // Uniformly extract the launch info of the callable value.
     let (func_id, upvalues, bound_args, needed_arity, self_upvalue_idx) = match callable_val.heap_obj() {
         Some(HeapObj::Closure(c)) => {
             let total_params = graph.subgraphs[c.func_id as usize].param_count as usize;
             let needed = total_params.saturating_sub(c.upvalues.len());
-            // 解包 Cell upvalues 为原始值注入参数（Cell 用于逃逸闭包的持久化回写）
+            // Unwrap Cell upvalues into raw values for parameter injection (Cell is used for escaped closure persistent writeback).
             let upvalues: Vec<Value> = c.upvalues.iter().map(|v| unwrap_cell(v)).collect();
             (c.func_id, upvalues, Vec::new(), needed, c.self_upvalue_idx)
         }
@@ -3360,7 +3456,7 @@ pub fn compute_closure_call(frame: &mut Frame, node: NodeId, _ctx: &EvalContext)
         _ => panic!("compute_closure_call: input is not callable (Closure or Partial)"),
     };
 
-    // 链式偏应用：新参数不足 → 产出新 Partial
+    // Chained partial application: insufficient new args -> produce a new Partial.
     if new_args.len() < needed_arity {
         let provided = new_args.len();
         let mut extended = bound_args;
@@ -3375,7 +3471,7 @@ pub fn compute_closure_call(frame: &mut Frame, node: NodeId, _ctx: &EvalContext)
         })));
     }
 
-    // 满 arity：合并 bound_args + new_args[..needed] + upvalues，返回 NodeResult::Call
+    // Full arity: merge `bound_args` + `new_args[..needed]` + upvalues, return `NodeResult::Call`.
     let target_sg = SubGraphId(func_id);
     let call_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
     let upvalues_len = upvalues.len();
@@ -3384,8 +3480,8 @@ pub fn compute_closure_call(frame: &mut Frame, node: NodeId, _ctx: &EvalContext)
     args.extend(new_args.iter().take(needed_arity).cloned());
     args.extend(upvalues);
 
-    // 递归闭包：将自身引用注入到 self_upvalue_idx 对应的 upvalue slot
-    // 边界检查：防止 usize 下溢与数组越界（self_upvalue_idx 必须落在 upvalues 区间内）
+    // Recursive closure: inject the self reference into the upvalue slot at `self_upvalue_idx`.
+    // Bounds check: prevent usize underflow and array out-of-bounds (`self_upvalue_idx` must fall within the upvalues range).
     if self_upvalue_idx >= 0 {
         assert!(upvalues_len <= args.len(), "upvalues_len exceeds args.len()");
         let self_upvalue_idx = self_upvalue_idx as usize;
@@ -3405,28 +3501,30 @@ pub fn compute_closure_call(frame: &mut Frame, node: NodeId, _ctx: &EvalContext)
     })
 }
 
-/// compute_fn: 取消 async handle 对应的子帧。
+/// compute_fn: cancels the child frame corresponding to an async handle.
 ///
-/// inputs[0] = async handle 值（i32 标量，值为 async_id）。
-/// 返回 NodeResult::Cancel，核心循环从 AsyncJoinRuntime 查 async_id → child_fid 执行取消。
+/// `inputs[0]` = async handle value (an `i32` scalar whose value is `async_id`).
+/// Returns `NodeResult::Cancel`; the core loop looks up `async_id` -> `child_fid` in
+/// `AsyncJoinRuntime` to perform the cancellation.
 pub fn compute_cancel_async_handle(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
     read_node_inputs!(frame, node, graph, n, inputs);
     let handle_val = frame.get_value_by_global(inputs[0]);
-    // safe_op 短路：?.cancel() 在接收者为 null 时返回 Null
+    // safe_op short-circuit: `?.cancel()` returns Null when the receiver is null.
     if graph.safe_op_flag(node.0 as usize) && handle_val.is_null() {
         return NodeResult::Value(Value::Null);
     }
-    // async handle 是 i32 标量，值即 async_id
+    // The async handle is an i32 scalar; its value is the async_id.
     let async_id = crate::ir::Ir::AsyncHandleId(handle_val.as_i32() as u32);
     NodeResult::Cancel(async_id)
 }
 
-/// compute_fn: select 门控节点（idx 43）— 返回 NodeResult::SelectWait。
+/// compute_fn: select gate node (idx 43) — returns `NodeResult::SelectWait`.
 ///
-/// 核心循环收到后检查所有分支事件源的就绪状态（能访问 Engine 全部状态）。
+/// Upon receiving this, the core loop checks the ready state of all branch event
+/// sources (it has access to the full Engine state).
 pub fn compute_select_gate(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
     let graph = frame.graph.clone();
-    // 校验 gate 节点确实绑定了 SelectInfo
+    // Verify that the gate node actually has a bound SelectInfo.
     let info = graph.select_info_at(node.0 as usize);
     let _ = info
         .as_ref()
@@ -3436,14 +3534,14 @@ pub fn compute_select_gate(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
 }
 
 
-/// noop compute_fn（匹配真实签名）。
+/// noop compute_fn (matches the real signature).
 pub fn noop_compute_real(_frame: &mut Frame, _node: NodeId) -> Value {
     Value::VOID
 }
 
-/// compute_fn for Const nodes (新签名，不通过 wrap_fn! 包装)。
-/// 从 const_values 表物化值并返回。
-/// 非 Const 节点（也使用 CF_NOOP）返回 Value::VOID（兼容 noop_compute_real）。
+/// compute_fn for Const nodes (new signature, not wrapped via `wrap_fn!`).
+/// Materializes a value from the `const_values` table and returns it.
+/// Non-Const nodes (which also use `CF_NOOP`) return `Value::VOID` (compatible with `noop_compute_real`).
 pub fn compute_const(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
     if let Some(cv) = frame.graph.const_value(node.0 as usize) {
         NodeResult::Value(crate::engine::alloc_const_value(cv, frame.graph.string_pool_slice()))
@@ -3452,36 +3550,41 @@ pub fn compute_const(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> Nod
     }
 }
 
-/// compute_return (idx 311): 提取输入值并返回 NodeResult::Return。
+/// compute_return (idx 311): extracts the input value and returns `NodeResult::Return`.
 ///
-/// inputs[0] = 返回值。可选的 inputs[1] = 前序副作用依赖（仅用于就绪判定，值被忽略）。
-/// 替代旧的 control_signal_nodes[SignalKind::Return] 表检查。
+/// `inputs[0]` = return value. Optional `inputs[1]` = prior side-effect dependency
+/// (used only for readiness checks; its value is ignored).
+/// Replaces the old `control_signal_nodes[SignalKind::Return]` table lookup.
 pub fn compute_return(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
     read_node_inputs!(frame, node, graph, n, inputs);
     let v = frame.get_value_by_global(inputs[0]);
     NodeResult::Return(v)
 }
 
-/// compute_break (idx 312): 返回 NodeResult::Break。
+/// compute_break (idx 312): returns `NodeResult::Break`.
 ///
-/// 可选 inputs[0] = 前序副作用依赖（仅用于就绪判定，值被忽略）。
-/// 替代旧的 control_signal_nodes[SignalKind::Break] 表检查。
+/// Optional `inputs[0]` = prior side-effect dependency (used only for readiness
+/// checks; its value is ignored).
+/// Replaces the old `control_signal_nodes[SignalKind::Break]` table lookup.
 pub fn compute_break(_frame: &mut Frame, _node: NodeId, _ctx: &EvalContext) -> NodeResult {
     NodeResult::Break
 }
 
-/// compute_continue (idx 313): 返回 NodeResult::Continue。
+/// compute_continue (idx 313): returns `NodeResult::Continue`.
 ///
-/// 可选 inputs[0] = 前序副作用依赖（仅用于就绪判定，值被忽略）。
-/// 替代旧的 control_signal_nodes[SignalKind::Continue] 表检查。
+/// Optional `inputs[0]` = prior side-effect dependency (used only for readiness
+/// checks; its value is ignored).
+/// Replaces the old `control_signal_nodes[SignalKind::Continue]` table lookup.
 pub fn compute_continue(_frame: &mut Frame, _node: NodeId, _ctx: &EvalContext) -> NodeResult {
     NodeResult::Continue
 }
 
-/// compute_fn (idx 48): 序列节点 — 等待所有输入就绪后返回最后一个输入的值。
+/// compute_fn (idx 48): sequence node — waits for all inputs to be ready, then returns
+/// the value of the last input.
 ///
-/// 用于语句顺序链接：inputs = [prev_effect, current_value]，返回 current_value。
-/// prev_effect 仅作数据依赖边（顺序约束），确保前一个语句完成后才执行当前语句。
+/// Used for statement sequencing: `inputs = [prev_effect, current_value]`, returns `current_value`.
+/// `prev_effect` acts only as a data-dependency edge (ordering constraint) to ensure the previous
+/// statement completes before the current one executes.
 pub fn compute_seq(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     if n.input_count == 0 {
@@ -3491,16 +3594,22 @@ pub fn compute_seq(frame: &mut Frame, node: NodeId) -> Value {
     frame.get_value_by_global(last_input)
 }
 
-/// compute_writeback（idx 49）：赋值外层变量，通过 root_frame_ptr 写回函数根帧。
+/// compute_writeback (idx 49): assigns an outer variable, writing back to the function
+/// root frame via `root_frame_ptr`.
 ///
-/// inputs[0] = 值来源（当前帧内节点），writeback_targets[node] = 外层全局 NodeId。
-/// 非阻塞：compute_fn 内直接完成写入，无 pending、无 Engine 层消费。
+/// `inputs[0]` = value source (a node in the current frame),
+/// `writeback_targets[node]` = the outer global `NodeId`.
+/// Non-blocking: the write completes directly inside the `compute_fn` — no pending state,
+/// no Engine-layer consumption.
 ///
-/// 三条回写路径（按优先级）：
-/// 1. parent_frame_ptr 链：同函数闭包调用，写入最近的包含 target 的父帧
-/// 2. root_frame_ptr：同函数闭包调用，写入函数根帧（使其他 same_function 调用可见）
-/// 3. closure_val Cell：逃逸闭包（跨函数调用，帧链为 null），通过 Cell 的 interior
-///    mutability 更新闭包 upvalues，使下次调用能读到最新值
+/// Three writeback paths (in priority order):
+/// 1. `parent_frame_ptr` chain: same-function closure call, writes to the nearest parent
+///    frame containing the target.
+/// 2. `root_frame_ptr`: same-function closure call, writes to the function root frame
+///    (so other `same_function` calls can observe the latest value).
+/// 3. `closure_val` Cell: escaped closure (cross-function call, frame chain is null),
+///    updates the closure upvalues via the `Cell`'s interior mutability so the next call
+///    reads the latest value.
 pub fn compute_writeback(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
     let graph = frame.graph.clone();
     let n = graph.node(node.0 as usize);
@@ -3520,22 +3629,28 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) ->
             sg.node_range.0 .0, sg.node_range.1 .0, sg.function_id, frame.value_table.len());
     }
 
-    // 路径 0：写入当前帧（same_function 闭包调用场景）。
-    // same_function 帧的值表扩展到父帧大小，target 可能在当前帧范围内。
-    // 若不写当前帧：a() 修改 log 后 WriteBack 只写父帧链（main 帧），
-    // a 子帧自身的 log 仍为旧值；后续 b() 从 a 子帧（parent_frame）读取
-    // upvalue 时得到陈旧值，导致闭包链共享可变捕获失效（Bug #31）。
+    // Path 0: write to the current frame (same_function closure call scenario).
+    // The value table of a same_function frame is extended to the parent frame size,
+    // so the target may fall within the current frame's range.
+    // If the current frame is not written: after a() modifies `log`, WriteBack only
+    // writes the parent frame chain (the main frame); the `log` in a's own child frame
+    // remains stale. A subsequent b() reading the upvalue from a's child frame
+    // (parent_frame) gets a stale value, breaking mutable capture sharing across the
+    // closure chain (Bug #31).
     let cur_local = target.0.wrapping_sub(frame.node_offset);
     if (cur_local as usize) < frame.value_table.len() {
         frame.set_value(NodeId(cur_local), val.clone(), consumer_count);
     }
 
-    // 路径 1：遍历 parent_frame_ptr 链，写入所有包含 target 的祖先帧。
-    // 不能只写最近父帧就 break：嵌套 same_function 子图（如 if 分支 → 循环体 →
-    // 循环帧 → main）中，中间帧（循环帧）也需要更新，否则下一迭代的 body
-    // 从循环帧拷贝时会读到旧值。
-    // SAFETY: parent_frame_ptr 指向同函数帧（setup_frame_chain 设置），
-    // caller 帧在 callee 执行期间处于 Suspended 状态，无并发访问。
+    // Path 1: walk the `parent_frame_ptr` chain, writing to every ancestor frame that
+    // contains the target.
+    // We cannot break after writing only the nearest parent: in nested same_function
+    // subgraphs (e.g. if branch -> loop body -> loop frame -> main), intermediate frames
+    // (the loop frame) also need updating; otherwise the next iteration's body reads a
+    // stale value when copying from the loop frame.
+    // SAFETY: `parent_frame_ptr` points to a same-function frame (set by `setup_frame_chain`);
+    // the caller frame is in the Suspended state while the callee executes, so there is no
+    // concurrent access.
     let mut written_parent = false;
     let mut ptr = frame.parent_frame_ptr;
     while !ptr.is_null() {
@@ -3548,7 +3663,8 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) ->
         ptr = f.parent_frame_ptr;
     }
 
-    // 路径 2：写入 root_frame_ptr（函数根帧），使同函数闭包调用能从根帧读到最新值。
+    // Path 2: write to `root_frame_ptr` (the function root frame) so that same-function
+    // closure calls can read the latest value from the root frame.
     if !frame.root_frame_ptr.is_null() {
         let root = unsafe { &mut *frame.root_frame_ptr };
         let local = target.0.wrapping_sub(root.node_offset);
@@ -3559,10 +3675,12 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) ->
                 &format!("writeback target {:?} out of root frame range", target)));
         }
     } else if !written_parent {
-        // 路径 3：逃逸闭包（帧链为 null）— 通过 closure_val 的 Cell 回写 upvalue。
-        // 逃逸闭包跨函数调用时，parent/root 均为 null，无法通过帧链回写。
-        // closure_val 中的 upvalues 以 Cell 包装（compute_closure_construct），
-        // 通过 Cell::set 持久化修改，使下次调用能读到最新值。
+        // Path 3: escaped closure (frame chain is null) — write back the upvalue via the
+        // `closure_val`'s Cell.
+        // When an escaped closure is called across functions, both `parent` and `root`
+        // are null, so writeback via the frame chain is impossible.
+        // The upvalues inside `closure_val` are wrapped in Cells (see `compute_closure_construct`);
+        // we persist the mutation via `Cell::set` so the next call reads the latest value.
         let mut written_cell = false;
         if let Some(ref closure_val) = frame.closure_val {
             if let Value::Ref(arc) = closure_val {
@@ -3585,7 +3703,8 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) ->
                 }
             }
         }
-        // 路径 4：非逃逸闭包的根帧场景（顶层函数内的赋值），写入当前帧
+        // Path 4: non-escaped closure root-frame scenario (assignment inside a top-level
+        // function) — write to the current frame.
         if !written_cell {
             let local = target.0.wrapping_sub(frame.node_offset);
             if (local as usize) < frame.value_table.len() {
@@ -3599,14 +3718,16 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) ->
     NodeResult::Value(val)
 }
 
-/// compute_tailrec_writeback（idx 310）：尾递归转迭代专用 WriteBack。
+/// compute_tailrec_writeback (idx 310): a WriteBack specialized for tail-recursion-to-iteration.
 ///
-/// 与 compute_writeback 相同的回写逻辑，额外返回 NodeResult::Continue。
-/// 在 TailRec 循环中，body_sg 完成时：
-/// - Continue（rec arm 的 WriteBack 返回）→ reset_loop_iteration（循环继续）
-/// - None（base arm 无 WriteBack）→ 循环退出，返回 body_sg 的返回值
+/// Performs the same writeback logic as `compute_writeback`, but additionally returns
+/// `NodeResult::Continue`.
+/// In a TailRec loop, when `body_sg` completes:
+/// - `Continue` (returned by the rec arm's WriteBack) -> `reset_loop_iteration` (loop continues)
+/// - `None` (base arm has no WriteBack) -> loop exits, returning `body_sg`'s return value
 pub fn compute_tailrec_writeback(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
-    // 正常回写 → Continue（循环继续）；越界等错误（NodeResult::Return）→ 向上传播（非静默）
+    // Normal writeback -> Continue (loop continues); out-of-bounds and other errors
+    // (NodeResult::Return) -> propagate upward (not silent).
     match compute_writeback(frame, node, _ctx) {
         NodeResult::Value(_) => NodeResult::Continue,
         other => other,

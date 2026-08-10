@@ -75,8 +75,8 @@ pub struct AstArena<'a> {
     pub patterns: Vec<Spanned<Pattern<'a>>>,
 }
 
-/// 为 AstArena 生成成对的 alloc + accessor 方法。
-/// `$id` 为 newtype 构造器（ExprId/StmtId/TypeId/PatternId），`$node` 为节点类型。
+/// Generates paired alloc + accessor methods for `AstArena`.
+/// `$id` is the newtype constructor (ExprId/StmtId/TypeId/PatternId), and `$node` is the node type.
 macro_rules! arena_accessors {
     ($alloc:ident, $get:ident, $id:ident, $field:ident, $node:ty) => {
         pub fn $alloc(&mut self, span: Span, node: $node) -> $id {

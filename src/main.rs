@@ -1,16 +1,16 @@
-//! kuzo CLI — project-based 子命令集
+//! kuzo CLI — project-based subcommand set
 //!
-//! 子命令：
-//!   kuzo init [name]               脚手架化新项目（创建 kuzo.toml + src/Main.kz）
-//!   kuzo build [-O N]              只编译（项目内）→ out/<项目名>.resin
-//!   kuzo run [-O N]                编译 + 立即执行（项目内，同 cargo run）
-//!   kuzo run <file.resin>          执行指定产物（.resin 加载）
-//!   kuzo debug --stage S           诊断模式
-//!   kuzo inspect <file.resin>      查看 .resin 元信息
+//! Subcommands:
+//!   kuzo init [name]               Scaffold a new project (creates kuzo.toml + src/Main.kz)
+//!   kuzo build [-O N]              Compile only (within a project) → out/<project_name>.kzo
+//!   kuzo run [-O N]                Compile + execute immediately (within a project, like cargo run)
+//!   kuzo run <file.kzo>          Execute a specified artifact (.kzo load)
+//!   kuzo debug --stage S           Diagnostic mode
+//!   kuzo inspect <file.kzo>      View .kzo metadata
 //!
-//! build/run(无参)/debug 必须在项目内（向上查找 kuzo.toml），入口来自 manifest。
-//! run <file.resin> 不依赖项目（产物分发语义）。
-//! worker 数由 engine 自动判断（含 async → 多 worker，纯同步 → 单线程）。
+//! build/run (no args)/debug must be run inside a project (searches upward for kuzo.toml); the entry point comes from the manifest.
+//! run <file.kzo> does not require a project (artifact distribution semantics).
+//! The worker count is determined automatically by the engine (async → multiple workers, pure sync → single-threaded).
 
 use std::fs;
 use std::io::{self, Read};
@@ -28,9 +28,9 @@ use kuzo::module::Error::LoadError;
 use kuzo::sema::Sema::{populate_module, SemaResult, TypeArena};
 use kuzo::sema::Inference::InferContext;
 
-/// Kuzo 语言 Rust 实现 CLI
+/// Kuzo language Rust implementation CLI.
 #[derive(Parser)]
-#[command(name = "kuzo", version, about = "Kuzo language Rust implementation")]
+#[command(name = "kuzo", version, about = "")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -38,62 +38,62 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 脚手架化新项目
+    /// Scaffold a new project.
     Init {
-        /// 项目名称（在 ./name 目录创建，省略则在当前目录）
+        /// Project name (created in ./name directory; defaults to the current directory when omitted).
         name: Option<String>,
     },
-    /// 只编译（项目内）→ out/<项目名>.resin
+    /// Compile only (within a project) → out/<project_name>.kzo.
     Build {
-        /// 输出路径（覆盖 manifest [build] output_dir + 项目名）
+        /// Output path (overrides manifest [build] output_dir + project name).
         #[arg(short = 'o', long = "output", value_name = "PATH")]
         output: Option<String>,
-        /// 优化等级 0-3（默认 2）
+        /// Optimization level 0-3 (default 2).
         #[arg(short = 'O', long = "opt-level", value_name = "LEVEL")]
         opt_level: Option<u8>,
     },
-    /// 编译 + 立即执行（项目内，无参）；或执行指定产物（有参）
+    /// Compile + execute immediately (within a project, no args); or execute a specified artifact (with args).
     Run {
-        /// .resin 产物路径（有参 = 执行指定产物，无需项目；无参 = 项目内编译+执行）
+        /// .kzo artifact path (with args = execute the specified artifact, no project needed; without args = compile + execute within a project).
         file: Option<String>,
-        /// 优化等级 0-3（默认 2，仅无参模式有效）
+        /// Optimization level 0-3 (default 2, only effective in no-arg mode).
         #[arg(short = 'O', long = "opt-level", value_name = "LEVEL")]
         opt_level: Option<u8>,
     },
-    /// 诊断模式（默认完整 pipeline，--stage 指定到某阶段停止并输出）
+    /// Diagnostic mode (default: full pipeline; --stage stops at a specified stage and outputs).
     Debug {
-        /// 入口文件（默认从 manifest 读，`-` 表示 stdin）
+        /// Entry file (defaults to the manifest; `-` means stdin).
         file: Option<String>,
-        /// 诊断阶段：tokens（仅词法）、ast（解析后打印 AST）、
-        /// check（仅类型检查）、emit-c（提取 C 代码）、emit-ffi（生成 FFI 绑定）、
-        /// full（默认，完整 pipeline + 执行统计）
+        /// Diagnostic stage: tokens (lex only), ast (print AST after parsing),
+        /// check (type check only), emit-c (extract C code), emit-ffi (generate FFI bindings),
+        /// full (default: full pipeline + execution statistics).
         #[arg(long)]
         stage: Option<DebugStage>,
     },
-    /// 查看 .resin 元信息
+    /// View .kzo metadata.
     Inspect {
-        /// .resin 文件路径
+        /// .kzo file path.
         file: String,
-        /// 显示每个 section 的详情（kind/offset/len）
+        /// Show details for each section (kind/offset/len).
         #[arg(short = 'v', long = "verbose")]
         verbose: bool,
     },
 }
 
-/// debug 子命令的阶段选项
+/// Stage options for the debug subcommand.
 #[derive(Clone, Debug, clap::ValueEnum)]
 enum DebugStage {
-    /// 仅词法分析，打印 Token 列表
+    /// Lexical analysis only; print the token list.
     Tokens,
-    /// 解析后打印 AST（S-表达式）
+    /// Print the AST (S-expressions) after parsing.
     Ast,
-    /// 仅类型检查
+    /// Type check only.
     Check,
-    /// 提取 @extern("C") 函数生成 .c 到 stdout
+    /// Extract @extern("C") functions and emit .c to stdout.
     EmitC,
-    /// 生成 Rust FFI 绑定 + wrapper 到 stdout
+    /// Generate Rust FFI bindings + wrapper to stdout.
     EmitFfi,
-    /// 完整 pipeline + 执行统计（默认）
+    /// Full pipeline + execution statistics (default).
     Full,
 }
 
@@ -108,9 +108,9 @@ fn main() {
     }
 }
 
-// ==================== 项目清单 ====================
+// ==================== Project manifest ====================
 
-/// 从 CLI u8 参数构造 OptLevel，越界值钳制到合法范围。
+/// Constructs an `OptLevel` from a CLI `u8` argument; out-of-range values are clamped to the valid range.
 fn opt_level_from(v: Option<u8>) -> kuzo::pass::Optimizer::OptLevel {
     use kuzo::pass::Optimizer::OptLevel;
     match v {
@@ -126,24 +126,24 @@ fn opt_level_from(v: Option<u8>) -> kuzo::pass::Optimizer::OptLevel {
     }
 }
 
-/// 项目清单文件名
+/// Project manifest file name.
 const MANIFEST_NAME: &str = "kuzo.toml";
-/// 默认入口文件
+/// Default entry file.
 const DEFAULT_ENTRY: &str = "src/Main.kz";
-/// 默认输出目录
+/// Default output directory.
 const DEFAULT_OUTPUT_DIR: &str = "out";
 
-/// 项目清单（serde 反序列化，TOML 格式）
+/// Project manifest (deserialized via serde, TOML format).
 ///
-/// 格式：
+/// Format:
 /// ```toml
 /// [package]
-/// name = "myapp"           # 必需
-/// entry = "src/Main.kz"  # 可选，默认 src/Main.kz
+/// name = "myapp"           # required
+/// entry = "src/Main.kz"  # optional, defaults to src/Main.kz
 ///
 /// [build]
-/// output_dir = "out"       # 可选，默认 "out"
-/// opt_level = 2            # 可选，默认 2
+/// output_dir = "out"       # optional, defaults to "out"
+/// opt_level = 2            # optional, defaults to 2
 /// ```
 #[derive(serde::Deserialize)]
 struct Manifest {
@@ -171,8 +171,8 @@ fn default_entry() -> String { DEFAULT_ENTRY.to_string() }
 fn default_output_dir() -> String { DEFAULT_OUTPUT_DIR.to_string() }
 fn default_opt_level() -> u8 { 2 }
 
-/// 从当前目录向上逐级查找包含清单文件的目录，返回项目根目录路径
-/// （最多向上 64 级）
+/// Searches upward from the current directory for a directory containing the manifest file,
+/// returning the project root path (up to 64 levels up).
 fn find_project_root() -> Option<String> {
     let mut current = std::env::current_dir().ok()?;
     for _ in 0..64 {
@@ -187,8 +187,8 @@ fn find_project_root() -> Option<String> {
     None
 }
 
-/// 加载项目清单：向上查找项目根，读取并解析 kuzo.toml
-/// 无 manifest 时报错退出（project-based）
+/// Loads the project manifest: searches upward for the project root, then reads and parses kuzo.toml.
+/// Exits with an error if no manifest is found (project-based).
 fn load_manifest() -> (String, Manifest) {
     let root = find_project_root().unwrap_or_else(|| {
         eprintln!("error: not a Kuzo project (no {} found in current or parent directories)", MANIFEST_NAME);
@@ -208,7 +208,7 @@ fn load_manifest() -> (String, Manifest) {
     (root, manifest)
 }
 
-/// 解析入口文件路径：显式 file 优先，否则从 manifest 读 entry（相对于项目根）
+/// Resolves the entry file path: an explicit `file` takes priority; otherwise reads `entry` from the manifest (relative to the project root).
 fn resolve_entry_path(file: Option<String>) -> String {
     match file {
         Some(f) => f,
@@ -223,25 +223,25 @@ fn resolve_entry_path(file: Option<String>) -> String {
     }
 }
 
-// ==================== init 子命令 ====================
+// ==================== init subcommand ====================
 
 fn cmd_init(name: Option<String>) {
-    // target_dir 是完整路径，proj_name 取 basename 作为项目名
+    // target_dir is the full path; proj_name takes the basename as the project name
     let target_dir = name.as_deref().unwrap_or("");
     let proj_name = if target_dir.is_empty() {
-        // 未指定路径：用当前目录名作为项目名
+        // No path specified: use the current directory name as the project name
         std::env::current_dir().ok()
             .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "app".to_string())
     } else {
-        // 指定路径：取 basename 作为项目名
+        // Path specified: take the basename as the project name
         std::path::Path::new(target_dir)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "app".to_string())
     };
 
-    // 检查目标目录状态
+    // Check target directory state
     if !target_dir.is_empty() {
         match fs::metadata(target_dir) {
             Ok(_) => {
@@ -296,7 +296,7 @@ fn cmd_init(name: Option<String>) {
     } else {
         format!("{}/{}", target_dir, DEFAULT_ENTRY)
     };
-    // Console 在 builtin/io 下，默认可见无需 import
+    // Console is under builtin/io and visible by default, so no import is needed.
     let main_content = "fun main(): void {\n    println(\"Hello, Kuzo!\")\n}\n";
     if let Err(e) = fs::write(&main_path, main_content) {
         eprintln!("error: could not write '{}': {}", main_path, e);
@@ -308,7 +308,7 @@ fn cmd_init(name: Option<String>) {
     println!("  {}", main_path);
 }
 
-// ==================== debug 子命令 ====================
+// ==================== debug subcommand ====================
 
 fn cmd_debug(file: Option<String>, stage: Option<DebugStage>) {
     let stage = stage.unwrap_or(DebugStage::Full);
@@ -325,7 +325,7 @@ fn cmd_debug(file: Option<String>, stage: Option<DebugStage>) {
     }
 }
 
-/// 仅词法分析，打印 Token 列表
+/// Lexical analysis only; print the token list.
 fn debug_tokens(source: &str) {
     let mut lexer = Lexer::new(source);
     let mut sink = TokenCollector::new();
@@ -342,7 +342,7 @@ fn debug_tokens(source: &str) {
     }
 }
 
-/// 解析并打印 AST（S-表达式）
+/// Parse and print the AST (S-expressions).
 fn debug_ast(source: &str) {
     let arena = bumpalo::Bump::new();
     let mut lexer = Lexer::new(source);
@@ -368,7 +368,7 @@ fn debug_ast(source: &str) {
     }
 }
 
-/// 提取 @extern("C") 函数生成 .c 到 stdout
+/// Extract @extern("C") functions and emit .c to stdout.
 fn debug_emit_c(source: &str) {
     let arena = bumpalo::Bump::new();
     let mut lexer = Lexer::new(source);
@@ -401,7 +401,7 @@ fn debug_emit_c(source: &str) {
     }
 }
 
-/// 生成 Rust FFI 绑定 + wrapper 到 stdout
+/// Generate Rust FFI bindings + wrapper to stdout.
 fn debug_emit_ffi(source: &str) {
     let arena = bumpalo::Bump::new();
     let mut lexer = Lexer::new(source);
@@ -434,9 +434,9 @@ fn debug_emit_ffi(source: &str) {
     }
 }
 
-// ==================== 公共管线（debug_check / cmd_run 共享） ====================
+// ==================== Shared pipeline (debug_check / cmd_run) ====================
 
-/// 解析入口模块。arena 必须在返回的 Module 存活期间保持有效。
+/// Parses the entry module. The arena must remain valid for the lifetime of the returned `Module`.
 fn parse_entry_module<'a>(arena: &'a bumpalo::Bump, source: &'a str, filename: &'a str) -> Module<'a> {
     let mut lexer = Lexer::new(source);
     let mut sink = TokenCollector::new();
@@ -458,8 +458,8 @@ fn parse_entry_module<'a>(arena: &'a bumpalo::Bump, source: &'a str, filename: &
     module
 }
 
-/// 加载全部模块（builtin + std + 用户依赖），返回 (loader, std_keys, dep_keys)。
-/// 入口文件所在目录被添加为搜索路径，以解析用户模块（如 Math/Geometry.kz）。
+/// Loads all modules (builtin + std + user dependencies), returning (loader, std_keys, dep_keys).
+/// The directory containing the entry file is added as a search path to resolve user modules (e.g. Math/Geometry.kz).
 fn load_all_modules(
     entry_module: &Module,
     entry_path: &str,
@@ -498,8 +498,8 @@ fn load_all_modules(
     (loader, std_keys, dep_keys)
 }
 
-/// 运行完整 Sema 管线：注册内建类型 → predeclare 全部模块 → 逐模块检查。
-/// 任何模块的类型错误都会打印并 exit(1)。成功时返回 (type_arena, sema_result)。
+/// Runs the full Sema pipeline: register builtin types → predeclare all modules → check each module.
+/// Any type error in any module is printed and exits with exit(1). Returns (type_arena, sema_result) on success.
 fn run_sema_pipeline(
     loader: &ModuleLoader,
     std_keys: &[String],
@@ -522,8 +522,8 @@ fn run_sema_pipeline(
         .collect();
     ctx.register_module_aliases(root_env, &module_logical_paths);
 
-    // predeclare：先注册所有模块的函数和类型构造器到 root_env，
-    // 解决模块间前向引用问题。check_module_with_env 内部会再次 predeclare（幂等）。
+    // predeclare: register all module functions and type constructors into root_env first,
+    // to resolve cross-module forward references. check_module_with_env will predeclare again internally (idempotent).
     for (_, m) in loader.builtin_modules() {
         ctx.predeclare_declarations(m, root_env);
     }
@@ -540,9 +540,9 @@ fn run_sema_pipeline(
 
     let mut prev_err_len = 0usize;
 
-    // populate：在 check 前填充所有模块的定义表（类型方法签名等），
-    // 解决模块检查顺序导致的跨模块方法查找失败问题。
-    // check_module_with_env 内部会再次调用（幂等，put_type_def 拒绝重复）。
+    // populate: fill in the definition tables (type method signatures, etc.) for all modules before checking,
+    // to resolve cross-module method lookup failures caused by module check ordering.
+    // check_module_with_env will call it again internally (idempotent; put_type_def rejects duplicates).
     for (_, m) in loader.builtin_modules() {
         populate_module(ctx.arena, ctx.sema_result, m);
     }
@@ -558,7 +558,7 @@ fn run_sema_pipeline(
     }
     populate_module(ctx.arena, ctx.sema_result, entry_module);
 
-    // 构造 all_modules 列表：供跨模块单态化使用（泛型调用需访问被调函数所在模块的 arena）
+    // Build the all_modules list: used for cross-module monomorphization (generic calls need access to the callee module's arena).
     let mut all_modules: Vec<&Module> = Vec::new();
     for (_, m) in loader.builtin_modules() {
         all_modules.push(m);
@@ -609,12 +609,12 @@ fn run_sema_pipeline(
     if !ctx.sema_result.errors.is_empty() {
         process::exit(1);
     }
-    // ctx 借用 type_arena 和 sema_result，在此丢弃后两者所有权归还调用方。
+    // ctx borrows type_arena and sema_result; dropping it here returns ownership of both to the caller.
     drop(ctx);
     (type_arena, sema_result)
 }
 
-/// 仅类型检查
+/// Type check only.
 fn debug_check(source: &str, filename: &str) {
     let arena = bumpalo::Bump::new();
     let entry_module = parse_entry_module(&arena, source, filename);
@@ -624,12 +624,12 @@ fn debug_check(source: &str, filename: &str) {
     println!("ok: {} (no type errors)", filename);
 }
 
-// ==================== 编译管线（build/run/debug 复用） ====================
+// ==================== Compile pipeline (shared by build/run/debug) ====================
 
-/// 完整编译管线：Parse → Module Load → Sema → Analyzer → Build → Optimizer
+/// Full compile pipeline: Parse → Module Load → Sema → Analyzer → Build → Optimizer.
 ///
-/// 返回编译后的 `DataFlowGraph`（已优化）。`debug` 为 true 时打印各阶段摘要。
-/// 任何阶段失败（类型错误、IR 错误、无入口）均打印并 exit(1)。
+/// Returns the compiled `DataFlowGraph` (optimized). When `debug` is true, prints per-stage summaries.
+/// Any stage failure (type errors, IR errors, no entry point) is printed and exits with exit(1).
 fn compile_graph(entry_path: &str, opt_level: kuzo::pass::Optimizer::OptLevel, debug: bool) -> kuzo::ir::Ir::DataFlowGraph {
     let source = read_source(entry_path);
 
@@ -647,7 +647,7 @@ fn compile_graph(entry_path: &str, opt_level: kuzo::pass::Optimizer::OptLevel, d
         eprintln!("[2/5] Loading modules ...");
     }
 
-    // 2. 模块加载
+    // 2. Module loading
     let (loader, std_keys, dep_keys) = load_all_modules(&entry_module, entry_path);
 
     if debug {
@@ -657,7 +657,7 @@ fn compile_graph(entry_path: &str, opt_level: kuzo::pass::Optimizer::OptLevel, d
         eprintln!("[3/5] Type checking ...");
     }
 
-    // 3. Sema check（共享管线，任何模块类型错误均打印并 exit）
+    // 3. Sema check (shared pipeline; any module type error is printed and exits)
     let (type_arena, sema_result) =
         run_sema_pipeline(&loader, &std_keys, &dep_keys, &entry_module, entry_path);
 
@@ -666,8 +666,8 @@ fn compile_graph(entry_path: &str, opt_level: kuzo::pass::Optimizer::OptLevel, d
         eprintln!("[4/5] Compiling IR ...");
     }
 
-    // 4. 静态分析（Sema 后、IR 前）：死代码/死变量/死函数 + 记忆化策略
-    //    对 entry 模块运行分析；debug 模式下打印报告摘要。
+    // 4. Static analysis (after Sema, before IR): dead code/dead vars/dead functions + memoization strategy.
+    //    Runs analysis on the entry module; prints a report summary in debug mode.
     let mut analysis_report = Analyzer::analyze(&entry_module, &entry_module.arena, &sema_result);
     if debug {
         eprintln!("  Analyzer: dead_code={} dead_var={} dead_func={} memo_candidates={} dead_param={} inline={} stack_alloc={} non_exhaustive={} unreachable_arms={}",
@@ -682,8 +682,8 @@ fn compile_graph(entry_path: &str, opt_level: kuzo::pass::Optimizer::OptLevel, d
             analysis_report.match_report.unreachable_arms.len());
     }
 
-    // 5. IR 编译
-    // 收集所有非 entry 模块（builtin + std + dep），传给 IR builder 编译为子图
+    // 5. IR compilation
+    // Collect all non-entry modules (builtin + std + dep) and pass them to the IR builder to compile as subgraphs.
     let mut non_entry_modules: Vec<&_> = loader.builtin_modules().map(|(_, m)| m).collect();
     for key in &std_keys {
         if let Some(m) = loader.get_module_by_key(key) {
@@ -695,8 +695,8 @@ fn compile_graph(entry_path: &str, opt_level: kuzo::pass::Optimizer::OptLevel, d
             non_entry_modules.push(m);
         }
     }
-    // 为每个非 entry 模块生成静态分析报告（memoize/dead_code/inline 等通用覆盖）
-    // 持有 owned Box 避免泄漏：引用仅在 build() 期间有效，build 完成后随 owner 释放
+    // Generate a static analysis report for each non-entry module (general coverage of memoize/dead_code/inline, etc.).
+    // Hold owned Boxes to avoid leaks: references are only valid during build(); released with the owner after build completes.
     let mut graph = {
         let builtin_analyses_owned: Vec<Box<Analyzer::AnalysisReport>> = non_entry_modules
             .iter()
@@ -713,7 +713,7 @@ fn compile_graph(entry_path: &str, opt_level: kuzo::pass::Optimizer::OptLevel, d
             .build()
     };
 
-    // 检查 IR 编译错误（未实现的特性降级、找不到函数等）
+    // Check for IR compilation errors (unimplemented feature fallbacks, missing functions, etc.).
     if !graph.ir_errors.is_empty() {
         for err in &graph.ir_errors {
             eprintln!("{}: IR error: {}", entry_path, err);
@@ -721,7 +721,7 @@ fn compile_graph(entry_path: &str, opt_level: kuzo::pass::Optimizer::OptLevel, d
         process::exit(1);
     }
 
-    // 检查入口子图：无 main 函数时优雅报错，避免 Engine panic
+    // Check the entry subgraph: report gracefully when there is no main function, to avoid an Engine panic.
     if graph.entry_subgraph.is_none() {
         eprintln!("error: no entry point found in {} (expected a `main` function)", entry_path);
         process::exit(1);
@@ -732,7 +732,7 @@ fn compile_graph(entry_path: &str, opt_level: kuzo::pass::Optimizer::OptLevel, d
             graph.nodes.len(), graph.subgraphs.len(), graph.compute_fns.len());
     }
 
-    // 循环分析（IR 后）：识别不变量 + 可展开循环，填充 analysis_report.loop_analysis
+    // Loop analysis (after IR): identify invariants + unrollable loops, populating analysis_report.loop_analysis.
     analysis_report.loop_analysis = kuzo::pass::Analyzer::analyze_loops(&graph);
     if debug {
         eprintln!("  LoopAnalysis: invariants={} unrollable={}",
@@ -740,8 +740,8 @@ fn compile_graph(entry_path: &str, opt_level: kuzo::pass::Optimizer::OptLevel, d
             analysis_report.loop_analysis.unrollable.len());
     }
 
-    // IR 后优化：LICM/Unroll/Inline + ConstFold/CSE/CopyProp/DCE 固定点迭代
-    // opt_level 驱动：O0 跳过，O1 仅固定点，O2 全量，O3 全量+提高迭代上限
+    // Post-IR optimization: LICM/Unroll/Inline + ConstFold/CSE/CopyProp/DCE fixed-point iteration.
+    // Driven by opt_level: O0 skips, O1 fixed-point only, O2 full, O3 full + raised iteration limit.
     kuzo::pass::Optimizer::optimize_with_analysis(&mut graph, Some(&analysis_report), opt_level);
 
     if debug {
@@ -755,11 +755,11 @@ fn compile_graph(entry_path: &str, opt_level: kuzo::pass::Optimizer::OptLevel, d
     graph
 }
 
-// ==================== build 子命令 ====================
+// ==================== build subcommand ====================
 
 fn cmd_build(output: Option<String>, opt_level_cli: Option<u8>) {
     let (root, manifest) = load_manifest();
-    // opt_level 优先级：CLI flag > manifest [build] opt_level > 默认 O2
+    // opt_level priority: CLI flag > manifest [build] opt_level > default O2
     let opt_level = opt_level_from(opt_level_cli.or(Some(manifest.build.opt_level)));
 
     let entry = if std::path::Path::new(&manifest.package.entry).is_absolute() {
@@ -770,7 +770,7 @@ fn cmd_build(output: Option<String>, opt_level_cli: Option<u8>) {
 
     let graph = compile_graph(&entry, opt_level, false);
 
-    // 输出路径：-o 优先，否则 output_dir/<项目名>.resin
+    // Output path: -o takes priority; otherwise output_dir/<project_name>.kzo
     let out_path = match output {
         Some(o) => o,
         None => {
@@ -779,62 +779,62 @@ fn cmd_build(output: Option<String>, opt_level_cli: Option<u8>) {
             } else {
                 format!("{}/{}", root, manifest.build.output_dir)
             };
-            // 确保输出目录存在
+            // Ensure the output directory exists
             if let Err(e) = fs::create_dir_all(&dir) {
                 eprintln!("error: could not create output directory '{}': {}", dir, e);
                 process::exit(1);
             }
-            format!("{}/{}.resin", dir, manifest.package.name)
+            format!("{}/{}.kzo", dir, manifest.package.name)
         }
     };
 
-    // 序列化为 .resin
-    let resin_data = kuzo::resin::Format::serialize_resin(&graph);
-    if let Err(e) = fs::write(&out_path, &resin_data) {
+    // Serialize to .kzo
+    let kzo_data = kuzo::solidify::Format::serialize_solidify(&graph);
+    if let Err(e) = fs::write(&out_path, &kzo_data) {
         eprintln!("error: could not write '{}': {}", out_path, e);
         process::exit(1);
     }
 
-    let size_kb = resin_data.len() as f64 / 1024.0;
+    let size_kb = kzo_data.len() as f64 / 1024.0;
     eprintln!("Compiled {} → {} ({:.1} KB, {} nodes, {} subgraphs, opt-level {})",
         manifest.package.entry, out_path, size_kb,
         graph.nodes.len(), graph.subgraphs.len(), opt_level as u8);
 }
 
-// ==================== run 子命令（重载） ====================
+// ==================== run subcommand (overloaded) ====================
 
-/// `kuzo run` 重载入口：
-/// - 无参：项目内编译 + 立即执行（同 cargo run）
-/// - 有参 <file.resin>：执行指定产物（.resin 加载）
+/// `kuzo run` overloaded entry:
+/// - No args: compile + execute immediately within a project (like cargo run).
+/// - With args <file.kzo>: execute the specified artifact (.kzo load).
 fn cmd_run(file: Option<String>, opt_level_cli: Option<u8>) {
     match file {
         None => {
-            // opt_level 优先级：CLI flag > manifest [build] opt_level > 默认 O2
+            // opt_level priority: CLI flag > manifest [build] opt_level > default O2
             let (_, manifest) = load_manifest();
             let opt_level = opt_level_from(opt_level_cli.or(Some(manifest.build.opt_level)));
             run_from_project(opt_level, false)
         }
-        Some(f) => run_from_resin(&f),
+        Some(f) => run_from_kzo(&f),
     }
 }
 
-/// 项目内编译 + 执行（debug full 也复用）
+/// Compile + execute within a project (also reused by debug full).
 fn run_from_project(opt_level: kuzo::pass::Optimizer::OptLevel, debug: bool) {
     let entry_path = resolve_entry_path(None);
     if debug {
         eprintln!("[5/5] Executing ...");
     }
     let graph = compile_graph(&entry_path, opt_level, debug);
-    // serialize → zerocopy load → run（验证 .resin zerocopy 路径）
-    let resin_data = kuzo::resin::Format::serialize_resin(&graph);
-    let graph = match kuzo::resin::Format::load_zerocopy_from_bytes(resin_data) {
+    // serialize → zerocopy load → run (validates the .kzo zerocopy path)
+    let kzo_data = kuzo::solidify::Format::serialize_solidify(&graph);
+    let graph = match kuzo::solidify::Format::load_zerocopy_from_bytes(kzo_data) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("error: failed to load serialized graph: {}", e);
             process::exit(1);
         }
     };
-    // Engine 执行（worker 数自动判断）
+    // Engine execution (worker count determined automatically)
     let result = EngineRef::new(graph).run();
     if debug {
         eprintln!("  Result: {:?}", result);
@@ -842,44 +842,44 @@ fn run_from_project(opt_level: kuzo::pass::Optimizer::OptLevel, debug: bool) {
     }
 }
 
-/// 执行指定 .resin 产物：mmap 加载 → 重建运行时字段 → Engine 执行
-fn run_from_resin(path: &str) {
-    // 校验扩展名
-    if !path.ends_with(".resin") {
-        eprintln!("error: expected .resin file, got: {}", path);
-        eprintln!("  hint: run `kuzo build` first to compile, then `kuzo run out/<name>.resin`");
+/// Execute a specified .kzo artifact: mmap load → rebuild runtime fields → Engine execution.
+fn run_from_kzo(path: &str) {
+    // Validate file extension
+    if !path.ends_with(".kzo") {
+        eprintln!("error: expected .kzo file, got: {}", path);
+        eprintln!("  hint: run `kuzo build` first to compile, then `kuzo run out/<name>.kzo`");
         process::exit(1);
     }
     if !std::path::Path::new(path).exists() {
         eprintln!("error: file not found: {}", path);
         process::exit(1);
     }
-    let graph = match kuzo::resin::Format::load_resin_from_file(path) {
+    let graph = match kuzo::solidify::Format::load_solidify_from_file(path) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("error: invalid .resin file {}: {}", path, e);
+            eprintln!("error: invalid .kzo file {}: {}", path, e);
             process::exit(1);
         }
     };
-    // 检查入口子图
+    // Check the entry subgraph
     if graph.entry_subgraph.is_none() {
         eprintln!("error: no entry point in {}", path);
         process::exit(1);
     }
-    // Engine 执行（worker 数自动判断）
+    // Engine execution (worker count determined automatically)
     let _result = EngineRef::new(graph).run();
 }
 
-// ==================== inspect 子命令 ====================
+// ==================== inspect subcommand ====================
 
 fn cmd_inspect(file: &str, verbose: bool) {
-    if !file.ends_with(".resin") {
-        eprintln!("error: expected .resin file, got: {}", file);
+    if !file.ends_with(".kzo") {
+        eprintln!("error: expected .kzo file, got: {}", file);
         process::exit(1);
     }
-    match kuzo::resin::Format::inspect_resin_from_file(file) {
+    match kuzo::solidify::Format::inspect_solidify_from_file(file) {
         Ok(info) => {
-            println!("RESIN File: {}", file);
+            println!("KZO File: {}", file);
             println!("  Schema:       v{}", info.schema_version);
             println!("  ABI:          v{}", info.abi_version);
             println!("  Nodes:        {}", info.node_count);
@@ -901,7 +901,7 @@ fn cmd_inspect(file: &str, verbose: bool) {
                 println!("  {:<22} {:>6} {:>10} {:>10}", "----", "--", "------", "---");
                 let mut total: u64 = 0;
                 for &(kind_u8, offset, len) in &info.sections {
-                    let name = kuzo::resin::Spec::SectionKind::from_u8(kind_u8)
+                    let name = kuzo::solidify::Spec::SectionKind::from_u8(kind_u8)
                         .map(|k| k.name())
                         .unwrap_or("Unknown");
                     println!("  {:<22} {:>6} {:>10} {:>10}", name, kind_u8, offset, len);
@@ -914,13 +914,13 @@ fn cmd_inspect(file: &str, verbose: bool) {
             }
         }
         Err(e) => {
-            eprintln!("error: invalid .resin file: {}", e);
+            eprintln!("error: invalid .kzo file: {}", e);
             process::exit(1);
         }
     }
 }
 
-// ==================== 公共工具 ====================
+// ==================== Common utilities ====================
 
 fn read_source(path: &str) -> String {
     if path == "-" {

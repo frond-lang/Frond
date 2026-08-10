@@ -1,5 +1,5 @@
 // =========================================================================
-// Arena — Bucket + ValueArena + ValueTrait + 相等性 + 深克隆
+// Arena — Bucket + ValueArena + ValueTrait + equality + deep clone
 // =========================================================================
 
 use std::cell::RefCell;
@@ -19,10 +19,10 @@ use super::ops::PARALLEL_THRESHOLD;
 use super::ops::par_chunk_size;
 
 // =========================================================================
-// 第三部分：Bucket<T> + ValueArena（全分桶 SoA 存储）
+// Part 3: Bucket<T> + ValueArena (fully bucketed SoA storage)
 // =========================================================================
 
-/// 类型分桶：连续存储同类型值 + 并行引用计数 + 空闲列表回收。
+/// Type bucket: contiguous storage of same-type values + parallel reference counting + free-list recycling.
 struct Bucket<T: Clone> {
     data: Vec<T>,
     refcounts: Vec<u32>,
@@ -57,7 +57,7 @@ impl<T: Clone> Bucket<T> {
         &mut self.data[idx as usize]
     }
 
-    /// 当前已分配槽位数（含空闲未回收），用于 FFI 边界校验 handle 合法性
+    /// Current number of allocated slots (including free/unreclaimed), used for FFI handle validity checks
     #[inline]
     fn len(&self) -> usize {
         self.data.len()
@@ -82,7 +82,7 @@ impl<T: Clone> Bucket<T> {
         self.refcounts[idx as usize]
     }
 
-    /// 清空该桶的所有数据、引用计数与空闲列表，回收内存。
+    /// Clears all data, refcounts, and free-list of this bucket, reclaiming memory.
     fn reset(&mut self) {
         self.data.clear();
         self.refcounts.clear();
@@ -90,8 +90,8 @@ impl<T: Clone> Bucket<T> {
     }
 }
 
-/// Value 的统一存储：按类型分桶（SoA），每种标量类型独立连续存储。
-/// 堆对象（HeapObj）用 Arc，存于 ref_bucket。
+/// Unified storage for Value: bucketed by type (SoA), each scalar type stored in independent contiguous storage.
+/// Heap objects (HeapObj) use Arc and are stored in ref_bucket.
 pub struct ValueArena {
     char_bucket: Bucket<u32>,
     i8_bucket: Bucket<i8>,
@@ -149,24 +149,24 @@ impl_scalar_bucket_methods! {
 }
 
 impl ValueArena {
-    // ─── 全局 arena 访问（供 extern "C" 反射原语使用）──────────────
-    // Kuzo 是单线程编译器，thread_local 足够。
+    // ─── Global arena access (for extern "C" reflection primitives) ──────────────
+    // Kuzo is a single-threaded compiler; thread_local is sufficient.
     thread_local! {
         static GLOBAL_ARENA: RefCell<ValueArena> = RefCell::new(ValueArena::new());
     }
 
-    /// 全局 arena 只读访问
+    /// Global arena read-only access
     pub fn with_global<R>(f: impl FnOnce(&ValueArena) -> R) -> R {
         Self::GLOBAL_ARENA.with(|cell| f(&cell.borrow()))
     }
 
-    /// 全局 arena 可变访问
+    /// Global arena mutable access
     pub fn with_global_mut<R>(f: impl FnOnce(&mut ValueArena) -> R) -> R {
         Self::GLOBAL_ARENA.with(|cell| f(&mut cell.borrow_mut()))
     }
 
-    /// 从 ValueHandle 查全局 arena 拿 HeapObj（反射原语核心路径）
-    /// 返回 Arc clone，避免 thread_local borrow 跨函数返回的生命周期问题。
+    /// Looks up the HeapObj from the global arena via a ValueHandle (core path for reflection primitives).
+    /// Returns an Arc clone to avoid lifetime issues from returning a thread_local borrow across functions.
     pub fn get_global_obj(handle: ValueHandle) -> Option<Arc<HeapObj>> {
         if handle.tag() != ValueTag::Ref {
             return None;
@@ -174,9 +174,9 @@ impl ValueArena {
         Some(Self::with_global(|arena| arena.get_ref(handle).clone()))
     }
 
-    /// 校验 handle 是否指向 arena 中合法槽位（FFI 边界防御）。
-    /// 标量按 tag 查对应分桶 index 范围；Null/Void/Bool 为单例恒有效。
-    /// 用于 extern "C" 反射原语入口，防止 C 侧脏 handle 导致越界 panic。
+    /// Validates whether a handle points to a legal slot in the arena (FFI boundary defense).
+    /// Scalars check the index range in the corresponding bucket; Null/Void/Bool are singletons and always valid.
+    /// Used at extern "C" reflection primitive entry points to prevent out-of-bounds panics from dirty C-side handles.
     pub fn is_valid_handle(handle: ValueHandle) -> bool {
         Self::with_global(|arena| arena.is_valid_handle_inner(handle))
     }
@@ -229,8 +229,8 @@ impl ValueArena {
         }
     }
 
-    /// 重置 arena，清空所有分桶并回收内存。
-    /// 用于反射操作后的批量清理，避免反射原语 alloc 后无人 dec_ref 导致内存堆积。
+    /// Resets the arena, clearing all buckets and reclaiming memory.
+    /// Used for batch cleanup after reflection operations, preventing memory buildup from reflection primitive allocs with no dec_ref.
     pub fn reset(&mut self) {
         self.char_bucket.reset();
         self.i8_bucket.reset();
@@ -286,7 +286,7 @@ impl ValueArena {
         F128(((hi as u128) << 64 | lo as u128).to_le_bytes())
     }
 
-    // ---- 堆对象分配 ----
+    // ---- Heap object allocation ----
     #[inline]
     pub fn alloc_ref(&mut self, obj: HeapObj) -> ValueHandle {
         let idx = self.ref_bucket.alloc(Arc::new(obj));
@@ -302,7 +302,7 @@ impl ValueArena {
         self.ref_bucket.get(h.index() as u32)
     }
 
-    // ---- Bool 单例 ----
+    // ---- Bool singleton ----
     #[inline]
     pub fn bool_val(v: bool) -> ValueHandle {
         if v { ValueHandle::TRUE } else { ValueHandle::FALSE }
@@ -312,7 +312,7 @@ impl ValueArena {
         h.index() == 1
     }
 
-    // ---- Null/Void 单例 ----
+    // ---- Null/Void singletons ----
     #[inline]
     pub fn null(&self) -> ValueHandle {
         ValueHandle::NULL
@@ -322,13 +322,13 @@ impl ValueArena {
         ValueHandle::VOID
     }
 
-    // ---- Value ↔ ValueHandle 转换（反射 FFI 边界用）----
-    // 反射原语接收 u32 (ValueHandle raw)，但 HeapObj 字段已迁移为 Value。
-    // alloc_value 将 Value 字段转回 ValueHandle 供 FFI 返回；
-    // get_value 将入口 ValueHandle 转为 Value 供内部递归处理。
+    // ---- Value ↔ ValueHandle conversion (for reflection FFI boundary) ----
+    // Reflection primitives receive u32 (ValueHandle raw), but HeapObj fields have been migrated to Value.
+    // alloc_value converts Value fields back to ValueHandle for FFI return;
+    // get_value converts the entry ValueHandle to Value for internal recursive processing.
 
-    /// 将 Value 转换为 ValueHandle（反射 FFI 边界：Value 字段 → ValueHandle raw u32）。
-    /// 标量按 tag 分桶分配，Bool/Null/Void 走单例，Ref 走 ref_bucket。
+    /// Converts a Value to a ValueHandle (reflection FFI boundary: Value field → ValueHandle raw u32).
+    /// Scalars are bucketed by tag; Bool/Null/Void use singletons; Ref uses ref_bucket.
     pub fn alloc_value(&mut self, v: &Value) -> ValueHandle {
         match v {
             Value::Null => ValueHandle::NULL,
@@ -360,7 +360,7 @@ impl ValueArena {
         }
     }
 
-    /// 将 ValueHandle 转换为 Value（反射 FFI 边界：入口 handle → Value 供递归处理）。
+    /// Converts a ValueHandle to a Value (reflection FFI boundary: entry handle → Value for recursive processing).
     pub fn get_value(&self, h: ValueHandle) -> Value {
         match h.tag() {
             ValueTag::Null => Value::Null,
@@ -387,7 +387,7 @@ impl ValueArena {
         }
     }
 
-    // ---- 堆对象快捷构造器 ----
+    // ---- Heap object convenience constructors ----
     pub fn alloc_str(&mut self, s: impl Into<String>) -> ValueHandle {
         self.alloc_ref(HeapObj::Str(KuzoStr::new(s)))
     }
@@ -401,8 +401,8 @@ impl ValueArena {
         self.alloc_ref(HeapObj::Record(r))
     }
 
-    /// 就地修改记录字段（通过 Arc::make_mut，refcount==1 时零拷贝）。
-    /// field_name 为字段名，在 record.field_names 中查找索引。
+    /// In-place modification of a record field (via Arc::make_mut; zero-copy when refcount==1).
+    /// `field_name` is the field name to look up in record.field_names.
     pub fn set_record_field_by_name(
         &mut self,
         handle: ValueHandle,
@@ -477,7 +477,7 @@ impl ValueArena {
         self.alloc_ref(HeapObj::ReceiverVal(ReceiverValue { channel }))
     }
 
-    /// 从 i64 按 tag 构造对应整数
+    /// Constructs the corresponding integer type from an i64, selected by tag
     pub fn int_from_i64(&mut self, tag: ValueTag, v: i64) -> ValueHandle {
         match tag {
             ValueTag::I8 => self.alloc_i8(v as i8),
@@ -496,7 +496,7 @@ impl ValueArena {
         }
     }
 
-    // ---- 引用计数 ----
+    // ---- Reference counting ----
     pub fn inc_ref(&mut self, h: ValueHandle) {
         match h.tag() {
             ValueTag::Null | ValueTag::Void | ValueTag::Bool => {}
@@ -544,11 +544,11 @@ impl ValueArena {
         }
     }
 
-    /// 为数组填充 SoA 快路径（当元素同类型标量时）。
-    /// 元素已迁移为 Value，直接用 Value 自带的标量访问器读取，无需经过 arena bucket。
+    /// Fills the SoA fast path for an array (when elements are same-type scalars).
+    /// Elements have been migrated to Value; the Value's built-in scalar accessors are used directly, without going through arena buckets.
     pub fn optimize_array_soa(&mut self, arr: &mut ArrayValue) {
         if arr.elements.is_empty() { return; }
-        // 取首元素标量 tag，全部元素必须同 tag 才能启用 SoA
+        // Take the first element's scalar tag; all elements must have the same tag to enable SoA
         let tag = match arr.elements[0].scalar_tag() {
             Some(t) => t,
             None => return,
@@ -573,7 +573,7 @@ impl ValueArena {
             ValueTag::U128 => ScalarSoA::U128(arr.elements.iter().map(|h| h.as_u128()).collect()),
             ValueTag::Isize => ScalarSoA::Isize(arr.elements.iter().map(|h| h.as_isize()).collect()),
             ValueTag::Usize => ScalarSoA::Usize(arr.elements.iter().map(|h| h.as_usize()).collect()),
-            // F16/F128 直接读 union bit pattern，不走 f64 中转（保持 NaN bit 精确性）
+            // F16/F128: read the union bit pattern directly, without f64 intermediate (preserves NaN bit exactness)
             ValueTag::F16 => ScalarSoA::F16(arr.elements.iter().map(|h| {
                 let Value::Scalar(sv, _) = h else { unreachable!("tag checked above") };
                 unsafe { sv.f16_val }
@@ -586,17 +586,17 @@ impl ValueArena {
         });
     }
 
-    /// 格式化值为字符串（Display 语义）
+    /// Formats a value as a string (Display semantics)
     pub fn format_value(&self, h: ValueHandle) -> String {
         self.display_value(h).to_string()
     }
 
-    /// 返回一个实现 Display 的包装器
+    /// Returns a wrapper that implements Display
     pub fn display_value<'a>(&'a self, h: ValueHandle) -> ValueDisplay<'a> {
         ValueDisplay { arena: self, handle: h }
     }
 
-    /// 返回一个实现 Debug 的包装器
+    /// Returns a wrapper that implements Debug
     pub fn debug_value<'a>(&'a self, h: ValueHandle) -> ValueDebug<'a> {
         ValueDebug { arena: self, handle: h }
     }
@@ -608,7 +608,7 @@ impl Default for ValueArena {
     }
 }
 
-/// Display 包装器：通过 arena 格式化值
+/// Display wrapper: formats a value via the arena
 pub struct ValueDisplay<'a> {
     arena: &'a ValueArena,
     handle: ValueHandle,
@@ -620,7 +620,7 @@ impl<'a> fmt::Display for ValueDisplay<'a> {
     }
 }
 
-/// Debug 包装器：通过 arena 格式化值
+/// Debug wrapper: formats a value via the arena
 pub struct ValueDebug<'a> {
     arena: &'a ValueArena,
     handle: ValueHandle,
@@ -688,12 +688,12 @@ fn arena_debug(arena: &ValueArena, h: ValueHandle, f: &mut fmt::Formatter) -> fm
 }
 
 // =========================================================================
-// ValueTrait —— 对外统一接口（方法携带 &ValueArena）
+// ValueTrait — unified external interface (methods carry &ValueArena)
 // =========================================================================
 
-/// Kuzo 统一值 trait：所有值类型的对外接口。
+/// Kuzo unified value trait: the external interface for all value types.
 pub trait ValueTrait: Sized + Clone + Copy + PartialEq + Eq + Hash {
-    // ---- 谓词（仅看 tag，不需要 arena）----
+    // ---- Predicates (tag only, no arena needed) ----
     fn is_null(&self) -> bool;
     fn is_void(&self) -> bool;
     fn is_bool(&self) -> bool;
@@ -705,7 +705,7 @@ pub trait ValueTrait: Sized + Clone + Copy + PartialEq + Eq + Hash {
     fn is_ref(&self) -> bool;
     fn requires_release(&self) -> bool;
 
-    // ---- 堆谓词（需要 arena 解引用 HeapObj）----
+    // ---- Heap predicates (need arena to dereference HeapObj) ----
     fn is_string(&self, arena: &ValueArena) -> bool;
     fn is_array(&self, arena: &ValueArena) -> bool;
     fn is_record(&self, arena: &ValueArena) -> bool;
@@ -713,11 +713,11 @@ pub trait ValueTrait: Sized + Clone + Copy + PartialEq + Eq + Hash {
     fn is_closure(&self, arena: &ValueArena) -> bool;
     fn is_callable(&self, arena: &ValueArena) -> bool;
 
-    // ---- 类型信息 ----
+    // ---- Type info ----
     fn type_name(&self, arena: &ValueArena) -> &'static str;
     fn scalar_tag(&self) -> Option<ValueTag>;
 
-    // ---- 标量访问器（需要 arena 取值）----
+    // ---- Scalar accessors (need arena to read values) ----
     fn as_bool(&self, arena: &ValueArena) -> Option<bool>;
     fn as_i8(&self, arena: &ValueArena) -> Option<i8>;
     fn as_i16(&self, arena: &ValueArena) -> Option<i16>;
@@ -737,7 +737,7 @@ pub trait ValueTrait: Sized + Clone + Copy + PartialEq + Eq + Hash {
     fn as_f16(&self, arena: &ValueArena) -> Option<F16>;
     fn as_f128(&self, arena: &ValueArena) -> Option<F128>;
 
-    // ---- 堆访问器 ----
+    // ---- Heap accessors ----
     fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a KuzoStr>;
     fn as_array<'a>(&self, arena: &'a ValueArena) -> Option<&'a ArrayValue>;
     fn as_record<'a>(&self, arena: &'a ValueArena) -> Option<&'a RecordValue>;
@@ -760,23 +760,23 @@ pub trait ValueTrait: Sized + Clone + Copy + PartialEq + Eq + Hash {
     fn as_ref<'a>(&self, arena: &'a ValueArena) -> Option<&'a HeapRef>;
     fn ref_kind(&self, arena: &ValueArena) -> Option<RefKind>;
 
-    // ---- 数值提升 ----
+    // ---- Numeric promotion ----
     fn as_int_i64(&self, arena: &ValueArena) -> Option<i64>;
     fn as_int_i128(&self, arena: &ValueArena) -> Option<i128>;
     fn as_float_f64(&self, arena: &ValueArena) -> Option<f64>;
 
-    // ---- 相等与深克隆 ----
+    // ---- Equality and deep clone ----
     fn equals(&self, other: &Self, arena: &ValueArena) -> bool;
     fn deep_clone(&self, arena: &mut ValueArena) -> Self;
 }
 
 // =========================================================================
 // =========================================================================
-// ValueHandle —— ValueTrait 实现（通过 ValueArena 访问桶内数据）
+// ValueHandle — ValueTrait implementation (accesses bucket data via ValueArena)
 // =========================================================================
 
 impl ValueTrait for ValueHandle {
-    // ---- 谓词（仅看 tag，不需要 arena）----
+    // ---- Predicates (tag only, no arena needed) ----
     #[inline]
     fn is_null(&self) -> bool {
         self.tag() == ValueTag::Null
@@ -818,7 +818,7 @@ impl ValueTrait for ValueHandle {
         !matches!(self.tag(), ValueTag::Null | ValueTag::Void | ValueTag::Bool)
     }
 
-    // ---- 堆谓词（需要 arena 解引用 HeapObj）----
+    // ---- Heap predicates (need arena to dereference HeapObj) ----
     #[inline]
     fn is_string(&self, arena: &ValueArena) -> bool {
         matches!(arena.heap_obj_opt(*self), Some(HeapObj::Str(_)))
@@ -847,7 +847,7 @@ impl ValueTrait for ValueHandle {
         )
     }
 
-    // ---- 类型信息 ----
+    // ---- Type info ----
     fn type_name(&self, arena: &ValueArena) -> &'static str {
         match self.tag() {
             ValueTag::Null => "null",
@@ -866,7 +866,7 @@ impl ValueTrait for ValueHandle {
         }
     }
 
-    // ---- 标量访问器（需要 arena 取值）----
+    // ---- Scalar accessors (need arena to read values) ----
     #[inline]
     fn as_bool(&self, arena: &ValueArena) -> Option<bool> {
         if self.tag() == ValueTag::Bool {
@@ -1012,7 +1012,7 @@ impl ValueTrait for ValueHandle {
         }
     }
 
-    // ---- 堆访问器 ----
+    // ---- Heap accessors ----
     #[inline]
     fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a KuzoStr> {
         match arena.heap_obj_opt(*self)? {
@@ -1159,7 +1159,7 @@ impl ValueTrait for ValueHandle {
         arena.heap_obj_opt(*self).map(|o| o.ref_kind())
     }
 
-    // ---- 数值提升 ----
+    // ---- Numeric promotion ----
     fn as_int_i64(&self, arena: &ValueArena) -> Option<i64> {
         match self.tag() {
             ValueTag::I8 => Some(arena.get_i8(*self) as i64),
@@ -1204,7 +1204,7 @@ impl ValueTrait for ValueHandle {
         }
     }
 
-    // ---- 相等与深克隆 ----
+    // ---- Equality and deep clone ----
     fn equals(&self, other: &Self, arena: &ValueArena) -> bool {
         if self.tag() != other.tag() {
             return false;
@@ -1248,21 +1248,21 @@ impl ValueTrait for ValueHandle {
 }
 
 // =========================================================================
-// 堆对象深比较与深克隆（带 ptr_eq 缓存以共享子图）
+// Heap object deep equality and deep clone (with ptr_eq cache for subgraph sharing)
 // =========================================================================
 
-// -------------------- SoA SIMD 快路径 --------------------
+// -------------------- SoA SIMD fast path --------------------
 
-/// 尝试用 SIMD 批量比较两个 SoA 数组。
-/// 仅当双方 SoA 类型相同时生效，返回 `Some(bool)`。
-/// 类型不匹配时返回 `None`，由调用方回退到逐元素路径。
+/// Attempts a SIMD batch comparison of two SoA arrays.
+/// Only takes effect when both sides share the same SoA type, returning `Some(bool)`.
+/// Returns `None` on type mismatch, leaving the caller to fall back to the element-wise path.
 fn try_simd_soa_equals(a: &ScalarSoA, b: &ScalarSoA) -> Option<bool> {
     match (a, b) {
         (ScalarSoA::I32(va), ScalarSoA::I32(vb)) => Some(simd_eq_i32(va, vb)),
         (ScalarSoA::I64(va), ScalarSoA::I64(vb)) => Some(simd_eq_i64(va, vb)),
         (ScalarSoA::F32(va), ScalarSoA::F32(vb)) => Some(simd_eq_f32_bits(va, vb)),
         (ScalarSoA::F64(va), ScalarSoA::F64(vb)) => Some(simd_eq_f64_bits(va, vb)),
-        // 其余类型用普通 slice 比较（Rust slice PartialEq 已优化）
+        // Remaining types use plain slice comparison (Rust slice PartialEq is already optimized)
         (ScalarSoA::I8(va), ScalarSoA::I8(vb)) => Some(va == vb),
         (ScalarSoA::I16(va), ScalarSoA::I16(vb)) => Some(va == vb),
         (ScalarSoA::U8(va), ScalarSoA::U8(vb)) => Some(va == vb),
@@ -1275,10 +1275,10 @@ fn try_simd_soa_equals(a: &ScalarSoA, b: &ScalarSoA) -> Option<bool> {
         (ScalarSoA::U128(va), ScalarSoA::U128(vb)) => Some(va == vb),
         (ScalarSoA::Isize(va), ScalarSoA::Isize(vb)) => Some(va == vb),
         (ScalarSoA::Usize(va), ScalarSoA::Usize(vb)) => Some(va == vb),
-        // F16/F128 按 bit pattern 比较（与 F32/F64 的 to_bits() 语义一致，NaN == NaN 为 true）
+        // F16/F128 compared by bit pattern (consistent with F32/F64 to_bits() semantics; NaN == NaN is true)
         (ScalarSoA::F16(va), ScalarSoA::F16(vb)) => Some(va == vb),
         (ScalarSoA::F128(va), ScalarSoA::F128(vb)) => Some(va == vb),
-        _ => None, // 类型不匹配，回退
+        _ => None, // type mismatch, fall back
     }
 }
 
@@ -1362,7 +1362,7 @@ fn simd_eq_i64_chunk(a: &[i64], b: &[i64]) -> bool {
         .all(|(&x, &y)| x == y)
 }
 
-/// f32 按位比较（避免 NaN 不等问题）。
+/// f32 bitwise comparison (avoids NaN inequality issues).
 #[inline]
 fn simd_eq_f32_bits(a: &[f32], b: &[f32]) -> bool {
     if a.len() != b.len() {
@@ -1413,7 +1413,7 @@ fn simd_eq_f32_bits_chunk(a: &[f32], b: &[f32]) -> bool {
         .all(|(&x, &y)| x.to_bits() == y.to_bits())
 }
 
-/// f64 按位比较（避免 NaN 不等问题）。
+/// f64 bitwise comparison (avoids NaN inequality issues).
 #[inline]
 fn simd_eq_f64_bits(a: &[f64], b: &[f64]) -> bool {
     if a.len() != b.len() {
@@ -1464,10 +1464,10 @@ fn simd_eq_f64_bits_chunk(a: &[f64], b: &[f64]) -> bool {
         .all(|(&x, &y)| x.to_bits() == y.to_bits())
 }
 
-// -------------------- SoA SIMD 批量哈希 --------------------
+// -------------------- SoA SIMD batch hash --------------------
 
-/// 用 SIMD 批量哈希 SoA 数据。
-/// 对 I32/I64/F32/F64 走 SIMD 累积，其余类型回退到逐元素哈希。
+/// Hashes SoA data in SIMD batches.
+/// I32/I64/F32/F64 take the SIMD accumulation path; remaining types fall back to per-element hashing.
 pub fn simd_hash_soa<H: Hasher>(soa: &ScalarSoA, state: &mut H) {
     match soa {
         ScalarSoA::I32(v) => simd_hash_i32(v, state),
@@ -1565,9 +1565,9 @@ fn simd_hash_f64<H: Hasher>(v: &[f64], state: &mut H) {
     }
 }
 
-// -------------------- SoA deep_clone 快路径 --------------------
+// -------------------- SoA deep_clone fast path --------------------
 
-/// SoA 快路径深克隆：标量为 Copy，直接用 Value 构造器内联重建，无需经过 arena bucket。
+/// SoA fast-path deep clone: scalars are `Copy`, so they are rebuilt inline via the `Value` constructors without going through arena buckets.
 fn simd_soa_deep_clone(soa: &ScalarSoA) -> Vec<Value> {
     match soa {
         ScalarSoA::I32(v) => v.iter().map(|&x| Value::i32(x)).collect(),
@@ -1598,13 +1598,13 @@ pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
             if x.fixed_size != y.fixed_size || x.elements.len() != y.elements.len() {
                 return false;
             }
-            // SoA SIMD 快路径：双方都有 scalar_soa 且同类型
+            // SoA SIMD fast path: both sides have scalar_soa of the same type
             if let (Some(sa), Some(sb)) = (&x.scalar_soa, &y.scalar_soa) {
                 if let Some(result) = try_simd_soa_equals(sa, sb) {
                     return result;
                 }
             }
-            // 回退：逐元素比较（元素为 Value）
+            // Fall back: element-wise comparison (elements are Values)
             x.elements
                 .iter()
                 .zip(&y.elements)
@@ -1680,7 +1680,7 @@ pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
                 }
         }
         (HeapObj::LazyVal(x), HeapObj::LazyVal(y)) => {
-            // 已 force 的惰性值比较缓存结果；未 force 的按 thunk 闭包比较
+            // Forced lazy values compare their cached results; unforced ones compare by thunk closure
             let xf = x.forced.load(std::sync::atomic::Ordering::Relaxed);
             let yf = y.forced.load(std::sync::atomic::Ordering::Relaxed);
             if xf && yf {
@@ -1700,26 +1700,26 @@ pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
             let yv = y.load();
             value_equals_with_arena(&xv, &yv, arena)
         }
-        // AsyncVal：每个 AsyncHandle 代表独立的异步操作，两个不同实例永不相等
-        // （同一实例的相等性由上层 Arc::ptr_eq 保证）
+        // AsyncVal: each AsyncHandle represents an independent async operation; two distinct instances are never equal
+        // (equality of the same instance is guaranteed by the upper-layer Arc::ptr_eq)
         (HeapObj::AsyncVal(_), HeapObj::AsyncVal(_)) => false,
-        // Arc 包装的共享资源：按指针身份比较（语义正确——同一通道才相等）
+        // Arc-wrapped shared resources: compared by pointer identity (semantically correct—only the same channel is equal)
         (HeapObj::ChannelVal(x), HeapObj::ChannelVal(y)) => std::sync::Arc::ptr_eq(x, y),
         (HeapObj::SenderVal(x), HeapObj::SenderVal(y)) => std::sync::Arc::ptr_eq(&x.channel, &y.channel),
         (HeapObj::ReceiverVal(x), HeapObj::ReceiverVal(y)) => std::sync::Arc::ptr_eq(&x.channel, &y.channel),
         (HeapObj::CoroutineFrame, HeapObj::CoroutineFrame) => false,
-        // 不同 HeapObj 变体之间永不相等
+        // Different HeapObj variants are never equal
         _ => false,
     }
 }
 
-/// Value 语义相等（用于 HeapObj 字段比较）。
-/// 标量按 tag + bit 比较；Ref 走 heap_equals 递归；Null/Void 按判别。
+/// Value semantic equality (used for HeapObj field comparison).
+/// Scalars compare by tag + bit; Ref recurses through `heap_equals`; Null/Void compare by discriminant.
 pub fn value_equals(a: &Value, b: &Value) -> bool {
     value_equals_with_arena(a, b, &ValueArena::default())
 }
 
-/// Value 语义相等（带 ValueArena，用于 ValueHandle 比较）。
+/// Value semantic equality (with `ValueArena`, used for `ValueHandle` comparison).
 pub fn value_equals_with_arena(a: &Value, b: &Value, arena: &ValueArena) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) | (Value::Void, Value::Void) => true,
@@ -1727,9 +1727,10 @@ pub fn value_equals_with_arena(a: &Value, b: &Value, arena: &ValueArena) -> bool
             if at != bt {
                 return false;
             }
-            // 按 tag 比较 union 字段 bit pattern。
-            // 注意：match arm 体以 unsafe{} 开头时，Rust 将其解析为「表达式块」并视作整条 arm 体，
-            // 后续 `==` 会被当作下一条 arm 的模式。必须用括号包裹比较表达式。
+            // Compare the union field bit pattern by tag.
+            // Note: when a match arm body starts with `unsafe {}`, Rust parses it as an "expression block"
+            // and treats it as the entire arm body; a subsequent `==` would be parsed as the next arm's
+            // pattern. The comparison expression must be wrapped in parentheses.
             match at {
                 ValueTag::Bool => (unsafe { av.bool_val } == unsafe { bv.bool_val }),
                 ValueTag::Char => (unsafe { av.char_val } == unsafe { bv.char_val }),
@@ -1757,15 +1758,15 @@ pub fn value_equals_with_arena(a: &Value, b: &Value, arena: &ValueArena) -> bool
     }
 }
 
-/// 深克隆缓存：Value 路径与 ValueHandle 路径各自维护 ptr→结果缓存，
-/// 避免环引用（如 Cell）导致无限递归。两条路径的缓存相互独立，
-/// 因为 HeapObj 字段处于部分迁移状态（部分为 Value，部分仍为 ValueHandle）。
+/// Deep-clone cache: the Value path and the ValueHandle path each maintain a ptr→result cache,
+/// preventing infinite recursion from reference cycles (e.g. Cell). The two paths' caches are
+/// independent because HeapObj fields are partially migrated (some are Values, some remain ValueHandles).
 struct DeepCloneCache {
     handle: FxHashMap<*const HeapObj, ValueHandle>,
     value: FxHashMap<*const HeapObj, Value>,
 }
 
-/// Value 路径深克隆：标量/空值直接 clone（廉价），Ref 递归克隆 HeapObj。
+/// Value-path deep clone: scalars/nulls clone directly (cheap); Ref recursively clones the HeapObj.
 fn deep_clone_value(v: &Value, arena: &mut ValueArena, cache: &mut DeepCloneCache) -> Value {
     match v {
         Value::Null | Value::Void | Value::Scalar(_, _) => v.clone(),
@@ -1830,7 +1831,7 @@ fn deep_clone_heap(
     match obj {
         HeapObj::Str(s) => HeapObj::Str(s.clone()),
         HeapObj::Array(a) => {
-            // SoA 快路径：标量是 Copy 的，直接 clone SoA，元素用 Value 重建
+            // SoA fast path: scalars are Copy; clone SoA directly and rebuild elements via Value
             if let Some(soa) = &a.scalar_soa {
                 let elems: Vec<Value> = simd_soa_deep_clone(soa);
                 return HeapObj::Array(ArrayValue {
@@ -1840,7 +1841,7 @@ fn deep_clone_heap(
                     scalar_soa: Some(soa.clone()),
                 });
             }
-            // 回退：逐元素 deep_clone（元素为 Value）
+            // Fall back: element-wise deep_clone (elements are Values)
             let elems: Vec<Value> = a
                 .elements
                 .iter()
@@ -1854,7 +1855,7 @@ fn deep_clone_heap(
             })
         }
         HeapObj::Record(r) => {
-            // fields 已迁移为 Value
+            // fields have been migrated to Value
             let fields: Vec<Value> = r
                 .fields
                 .iter()
@@ -1868,7 +1869,7 @@ fn deep_clone_heap(
             })
         }
         HeapObj::Adt(a) => {
-            // AdtField.value 已迁移为 Value
+            // AdtField.value has been migrated to Value
             let fields: Vec<AdtField> = a
                 .fields
                 .iter()
@@ -1886,7 +1887,7 @@ fn deep_clone_heap(
         }
         HeapObj::Newtype(n) => HeapObj::Newtype(NewtypeValue {
             type_name: n.type_name.clone(),
-            // inner 仍为 ValueHandle
+            // inner is still a ValueHandle
             inner: deep_clone_handle(n.inner, arena, cache),
         }),
         HeapObj::Cell(c) => {
@@ -1895,7 +1896,7 @@ fn deep_clone_heap(
         }
         HeapObj::Range(r) => HeapObj::Range(r.clone()),
         HeapObj::Closure(c) => {
-            // upvalues 已迁移为 Value，bound_args 仍为 ValueHandle
+            // upvalues have been migrated to Value; bound_args are still ValueHandles
             let upvalues: Vec<Value> = c
                 .upvalues
                 .iter()
@@ -1936,7 +1937,7 @@ fn deep_clone_heap(
             })
         }
         HeapObj::ThrowVal(t) => match &t.payload {
-            // ThrowPayload::Ok/Err 均持有 Value，递归深拷贝
+            // ThrowPayload::Ok/Err both hold Values; deep-copy recursively
             ThrowPayload::Ok(v) => HeapObj::ThrowVal(ThrowValue {
                 payload: ThrowPayload::Ok(deep_clone_value(v, arena, cache)),
             }),
@@ -1948,7 +1949,7 @@ fn deep_clone_heap(
         HeapObj::TraitVal(t) => HeapObj::TraitVal(t.clone()),
         HeapObj::LazyVal(l) => HeapObj::LazyVal(l.clone()),
         HeapObj::ErrorVal(e) => HeapObj::ErrorVal(e.clone()),
-        // AtomicValue.data 为 Value，递归深拷贝
+        // AtomicValue.data is a Value; deep-copy recursively
         HeapObj::AtomicVal(a) => HeapObj::AtomicVal(AtomicValue::new(deep_clone_value(&a.load(), arena, cache))),
         HeapObj::AsyncVal(a) => HeapObj::AsyncVal(a.clone()),
         HeapObj::ChannelVal(c) => HeapObj::ChannelVal(c.clone()),
@@ -1959,11 +1960,11 @@ fn deep_clone_heap(
 }
 
 // =========================================================================
-// ValueArena 便捷构造器（镜像旧 ValueHandle 构造器 API）+ 格式化/哈希辅助
+// ValueArena convenience constructors (mirroring the legacy ValueHandle constructor API) + formatting/hash helpers
 // =========================================================================
 
 impl ValueArena {
-    /// 若句柄为 Ref，返回对应堆对象引用；否则返回 None。
+    /// If the handle is a Ref, returns the corresponding heap object reference; otherwise None.
     #[inline]
     pub fn heap_obj_opt(&self, h: ValueHandle) -> Option<&HeapObj> {
         if h.tag() == ValueTag::Ref {
@@ -1973,14 +1974,14 @@ impl ValueArena {
         }
     }
 
-    // ---- 单例便捷构造器（无分配）----
-    // null()/void() 由既有 impl ValueArena 提供（已改为 &self）。
+    // ---- Singleton convenience constructors (no allocation) ----
+    // null()/void() are provided by the existing impl ValueArena (already changed to &self).
     #[inline]
     pub fn bool(&self, v: bool) -> ValueHandle {
         Self::bool_val(v)
     }
 
-    // ---- 标量分配便捷别名 ----
+    // ---- Scalar allocation convenience aliases ----
     #[inline]
     pub fn i8(&mut self, v: i8) -> ValueHandle {
         self.alloc_i8(v)
@@ -2054,7 +2055,7 @@ impl ValueArena {
         self.alloc_char(c as u32)
     }
 
-    // ---- 堆对象便捷构造器 ----
+    // ---- Heap object convenience constructors ----
     pub fn str(&mut self, s: impl Into<String>) -> ValueHandle {
         self.alloc_ref(HeapObj::Str(KuzoStr::new(s)))
     }
@@ -2168,7 +2169,7 @@ impl ValueArena {
         self.alloc_ref(HeapObj::ReceiverVal(ReceiverValue { channel }))
     }
 
-    // ---- 格式化包装器 ----
+    // ---- Formatting wrappers ----
     pub fn display(&self, h: ValueHandle) -> ValueDisplay<'_> {
         ValueDisplay { arena: self, handle: h }
     }
@@ -2176,7 +2177,7 @@ impl ValueArena {
         ValueDebug { arena: self, handle: h }
     }
 
-    // ---- 按值哈希 ----
+    // ---- Hash by value ----
     pub fn hash_value<H: Hasher>(&self, h: ValueHandle, state: &mut H) {
         match h.tag() {
             ValueTag::Null => 0u8.hash(state),
@@ -2261,9 +2262,10 @@ impl ValueArena {
     }
 }
 
-// `read_int_as!` 按 tag 从字节读取整数并提升为 i128 / u128。
-// 整数类型（含 Isize/Usize）经符号扩展后转目标类型，非整数 tag 回退 0。
-// 有符号源在转 u128 时经 i128 中转，以保留与原逐臂代码一致的语义。
+// `read_int_as!` reads an integer from bytes by tag and promotes it to i128 / u128.
+// Integer types (including Isize/Usize) are sign-extended before conversion to the target type;
+// non-integer tags fall back to 0.
+// Signed sources go through i128 when converting to u128, preserving the semantics of the original per-arm code.
 macro_rules! read_int_as {
     ($tag:expr, $bytes:expr, i128) => {
         match $tag {
@@ -2301,8 +2303,8 @@ macro_rules! read_int_as {
     };
 }
 
-// `write_int_bytes!` 按 dst_tag 将整数（i128 或 u128）写入目标字节缓冲，
-// 复用既有 write_*_le 辅助函数以保持与原逐臂代码一致的截断/填充语义。
+// `write_int_bytes!` writes an integer (i128 or u128) into the destination byte buffer by dst_tag,
+// reusing the existing write_*_le helpers to preserve the truncation/padding semantics of the original per-arm code.
 macro_rules! write_int_bytes {
     ($val:expr, $tag:expr, $dst:expr) => {
         match $tag {

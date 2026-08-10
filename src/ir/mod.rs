@@ -6,7 +6,7 @@
 //! - [`Builder`]: IR builder (IrBuilder + all compile_* methods + build() entry point).
 //! - [`Compute`]: compute_fn implementations (node execution semantics).
 //!
-//! 二进制产物序列化见顶层 [`crate::resin`] 模块。
+//! Binary artifact serialization is handled by the top-level [`crate::solidify`] module.
 
 pub mod Ir;
 pub mod Builder;

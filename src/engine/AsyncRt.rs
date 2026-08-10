@@ -1,4 +1,5 @@
-//! 异步运行时 + 事件处理：TimerRuntime / AsyncJoinRuntime + 事件到达/取消/timer 检查。
+//! Async runtime + event handling: TimerRuntime / AsyncJoinRuntime + event arrival/cancel/timer
+//! checks.
 
 use super::*;
 use crate::ir::Ir::*;
@@ -7,23 +8,25 @@ use crate::value::Value;
 use std::collections::BinaryHeap;
 use std::cmp::Reverse;
 
-/// Timer 事件 Record 中 duration 字段名。
+/// Name of the `duration` field in a Timer event Record.
 const TIMER_DURATION_NS_FIELD: &str = "duration_ns";
 
 // =========================================================================
-// TimerRuntime / AsyncJoinRuntime — 图外运行时
+// TimerRuntime / AsyncJoinRuntime — out-of-graph runtimes
 // =========================================================================
 
-/// Timer 运行时：最小堆管理 timer deadline + 触发检查。
+/// Timer runtime: a min-heap managing timer deadlines + firing checks.
 ///
-/// spec 3.5 EventSource::Timer。事件循环每次迭代检查到期 timer。
-/// 堆顶 = 最早到期项，`next_deadline()` 供事件循环计算 park timeout。
+/// See spec 3.5 EventSource::Timer. The event loop checks for expired timers on each iteration.
+/// The heap top is the earliest-expiring entry; `next_deadline()` lets the event loop compute the
+/// park timeout.
 pub struct TimerRuntime {
-    /// 最小堆（Reverse 使 BinaryHeap 表现为 min-heap）
+    /// Min-heap (Reverse makes BinaryHeap behave as a min-heap).
     heap: BinaryHeap<Reverse<TimerHeapEntry>>,
-    /// 递增 ID 分配器（不再用 Vec 索引，允许弹出入堆）
+    /// Monotonically-increasing id allocator (no longer a Vec index, so entries can be popped and
+    /// re-pushed).
     next_id: u32,
-    /// 已触发但未被 is_fired 查询的 ID 集合（惰性清理）
+    /// Set of fired ids that have not yet been queried by is_fired (lazily cleaned).
     fired_set: std::collections::HashSet<crate::ir::Ir::TimerId>,
 }
 
@@ -45,7 +48,7 @@ impl PartialOrd for TimerHeapEntry {
 }
 impl Ord for TimerHeapEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // 按 deadline 升序（min-heap：最早到期在堆顶）
+        // Ascending by deadline (min-heap: earliest expiry at the top).
         self.deadline.cmp(&other.deadline)
     }
 }
@@ -68,8 +71,8 @@ impl TimerRuntime {
         }));
         id
     }
-    /// 检查到期 timer，弹出并返回已触发的 TimerId 列表。
-    /// 堆顶未到期时立即返回（O(log n) 弹出）。
+    /// Checks for expired timers, pops them, and returns the list of fired TimerIds.
+    /// Returns immediately when the heap top has not expired (O(log n) pop).
     pub fn check_and_fire(&mut self) -> Vec<crate::ir::Ir::TimerId> {
         let now = std::time::Instant::now();
         let mut fired = Vec::new();
@@ -80,22 +83,23 @@ impl TimerRuntime {
             let Reverse(entry) = self.heap.pop().unwrap();
             fired.push(entry.id);
         }
-        // 记录到 fired_set 供 is_fired 查询
+        // Record into fired_set for is_fired queries.
         for id in &fired {
             self.fired_set.insert(*id);
         }
         fired
     }
-    /// 检查 timer 是否已触发，若是则消费（移除）该条目。
-    /// 消费式读取避免 fired_set 无界增长。
+    /// Checks whether a timer has fired; if so, consumes (removes) the entry.
+    /// Consuming reads prevent fired_set from growing unbounded.
     pub fn is_fired(&mut self, id: crate::ir::Ir::TimerId) -> bool {
         self.fired_set.remove(&id)
     }
-    /// 返回最近到期 timer 的 deadline（供事件循环计算 park timeout）。
+    /// Returns the nearest timer deadline (for the event loop to compute the park timeout).
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
         self.heap.peek().map(|Reverse(e)| e.deadline)
     }
-    /// 清理 fired_set（所有已触发 timer 的事件已通过 check_timers → on_event_arrived 派发）。
+    /// Clears fired_set (all fired-timer events have already been dispatched via check_timers ->
+    /// on_event_arrived).
     pub fn cleanup(&mut self) {
         self.fired_set.clear();
     }
@@ -107,13 +111,14 @@ impl Default for TimerRuntime {
     }
 }
 
-/// AsyncJoin 运行时：管理 async 调用 → AsyncHandle 映射 + 完成结果。
+/// AsyncJoin runtime: manages the async-call -> AsyncHandle mapping + completion results.
 ///
-/// async 函数调用启动子帧时注册 async_id → child_fid。
-/// 子帧完成时设置 result + 触发 AsyncJoin 事件唤醒等待的 await 帧。
+/// When an async function call starts a child frame, it registers async_id -> child_fid. When the
+/// child frame completes, it sets the result and fires an AsyncJoin event to wake the awaiting
+/// frame.
 ///
-/// 使用双 HashMap 实现 O(1) 双向查找：async_id → entry + child_fid → async_id。
-/// FrameId 单调递增不复用，child_index 无冲突风险。
+/// Uses dual HashMaps for O(1) bidirectional lookup: async_id -> entry + child_fid -> async_id.
+/// FrameIds are monotonically increasing and never reused, so child_index has no collision risk.
 pub struct AsyncJoinRuntime {
     entries: std::collections::HashMap<crate::ir::Ir::AsyncHandleId, AsyncJoinEntry>,
     child_index: std::collections::HashMap<FrameId, crate::ir::Ir::AsyncHandleId>,
@@ -131,18 +136,8 @@ impl AsyncJoinRuntime {
             next_async_id: 0,
         }
     }
-    /// 分配新的 async_id（i32 标量值）
-    pub fn alloc_id(&mut self) -> crate::ir::Ir::AsyncHandleId {
-        assert!(self.next_async_id < u32::MAX, "AsyncHandleId overflow: too many async calls");
-        let id = crate::ir::Ir::AsyncHandleId(self.next_async_id);
-        self.next_async_id += 1;
-        id
-    }
-    pub fn register(&mut self, async_id: crate::ir::Ir::AsyncHandleId, child_fid: FrameId) {
-        self.child_index.insert(child_fid, async_id);
-        self.entries.insert(async_id, AsyncJoinEntry { child_fid, result: None });
-    }
-    /// 原子地分配 async_id 并注册 child_fid（消除 alloc_id + register 的竞态窗口）。
+    /// Atomically allocates an async_id and registers child_fid (eliminating the race window
+    /// between alloc_id + register).
     pub fn alloc_and_register(&mut self, child_fid: FrameId) -> crate::ir::Ir::AsyncHandleId {
         let async_id = crate::ir::Ir::AsyncHandleId(self.next_async_id);
         self.next_async_id += 1;
@@ -151,8 +146,8 @@ impl AsyncJoinRuntime {
         async_id
     }
     pub fn find_by_child(&self, child_fid: FrameId) -> Option<crate::ir::Ir::AsyncHandleId> {
-        // 仅返回未完成（result=None）的 entry：已完成旧 entry 的 child_fid 映射
-        // 可能尚未清理，需二次检查 result 状态。
+        // Only return incomplete (result=None) entries: a completed old entry's child_fid mapping
+        // may not have been cleaned up yet, so the result state must be double-checked.
         let async_id = self.child_index.get(&child_fid)?;
         let entry = self.entries.get(async_id)?;
         if entry.result.is_none() { Some(*async_id) } else { None }
@@ -160,8 +155,8 @@ impl AsyncJoinRuntime {
     pub fn find_child_by_async_id(&self, async_id: crate::ir::Ir::AsyncHandleId) -> Option<FrameId> {
         self.entries.get(&async_id).map(|e| e.child_fid)
     }
-    /// 尝试获取 async 结果。若结果已就绪则消费（移除）该 entry。
-    /// 消费式读取避免 entries 无界增长。
+    /// Tries to fetch an async result. If the result is ready, consumes (removes) the entry.
+    /// Consuming reads prevent entries from growing unbounded.
     pub fn try_get_result(&mut self, async_id: crate::ir::Ir::AsyncHandleId) -> Option<Value> {
         let entry = self.entries.get(&async_id)?;
         if entry.result.is_none() {
@@ -176,7 +171,8 @@ impl AsyncJoinRuntime {
             e.result = Some(value);
         }
     }
-    /// 移除指定 async_id 的 entry（waiter 已被 on_event_arrived 唤醒，值已注入）。
+    /// Removes the entry for the given async_id (the waiter has already been woken by
+    /// on_event_arrived and the value injected).
     pub fn remove_entry(&mut self, async_id: crate::ir::Ir::AsyncHandleId) {
         if let Some(entry) = self.entries.remove(&async_id) {
             self.child_index.remove(&entry.child_fid);
@@ -191,20 +187,24 @@ impl Default for AsyncJoinRuntime {
 }
 
 // =========================================================================
-// EventSource trait — 事件源抽象
+// EventSource trait — event-source abstraction
 //
-// 统一 await 事件源的「解码 + 原子检查就绪」语义，消除 resolve_check_and_register_await
-// 中按 EventSourceKind 的三路特判分支。新增事件源 = 新增一个 unit struct + impl + 一行分派。
+// Unifies the "decode + atomically check readiness" semantics of await event sources, eliminating
+// the three-way EventSourceKind branch inside resolve_check_and_register_await. Adding a new event
+// source = adding a unit struct + impl + one dispatch line.
 //
-// 每个实现负责：
-// 1. 从 PendingAwait 解码源专属数据
-// 2. 在源专属锁内检查就绪（锁在返回前释放，避免与 event_waiters 锁顺序冲突）
-// 3. 返回 (event, ready_value)：ready_value=Some 表示已就绪，None 表示需注册 waiter
+// Each implementation is responsible for:
+// 1. Decoding source-specific data from PendingAwait.
+// 2. Checking readiness inside the source-specific lock (the lock is released before returning, to
+//    avoid a lock-ordering conflict with the event_waiters lock).
+// 3. Returning (event, ready_value): ready_value=Some means ready; None means a waiter must be
+//    registered.
 //
-// waiter 注册由调用方统一执行，消除三路重复 push。
+// Waiter registration is performed uniformly by the caller, eliminating the three-way duplicated
+// push.
 // =========================================================================
 
-/// 事件源 trait：统一 await 事件源的解码 + 就绪检查。
+/// Event-source trait: unifies decode + readiness check for await event sources.
 trait EventSource<S: LockStrategy> {
     fn resolve(
         &self,
@@ -225,8 +225,10 @@ impl<S: LockStrategy> EventSource<S> for AsyncJoinSource {
     ) -> (RuntimeEvent, Option<Value>) {
         let async_id = crate::ir::Ir::AsyncHandleId(pending.event_obj.as_i32() as u32);
         let event = RuntimeEvent::AsyncJoin(async_id);
-        // try_get_result 消费式读取：result 已就绪则移除 entry 返回值。
-        // async_join_runtime 锁为临时量，语句末释放；event_waiters 锁由调用方另取，无嵌套。
+        // try_get_result is a consuming read: if the result is ready it removes the entry and
+        // returns the value.
+        // The async_join_runtime lock is a temporary; released at end of statement. The
+        // event_waiters lock is taken separately by the caller, so there is no nesting.
         let val = engine.async_join_runtime.lock().try_get_result(async_id);
         (event, val)
     }
@@ -243,7 +245,7 @@ impl<S: LockStrategy> EventSource<S> for ChannelSource {
             .heap_obj()
             .and_then(|h| h.channel())
             .expect("await on non-channel value");
-        // recv 失败但 channel 已关闭 → 注入 Null；否则 None（需注册 waiter）。
+        // recv failed but the channel is closed -> inject Null; otherwise None (register a waiter).
         let v = ch
             .recv()
             .or_else(|| if ch.is_closed() { Some(Value::Null) } else { None });
@@ -266,8 +268,9 @@ impl<S: LockStrategy> EventSource<S> for TimerSource {
             }
             _ => pending.event_obj.as_i64(),
         };
-        // start + is_fired 在 timer_runtime 锁内原子化（check_and_fire 同锁），
-        // 显式 drop 释放 timer 锁后再由调用方注册 waiter（避免与 event_waiters 锁顺序冲突）。
+        // start + is_fired are atomicized inside the timer_runtime lock (check_and_fire uses the
+        // same lock). Explicitly drop the timer lock before the caller registers the waiter (to
+        // avoid a lock-ordering conflict with the event_waiters lock).
         let mut tr = engine.timer_runtime.lock();
         let timer_id = tr.start(std::time::Duration::from_nanos(duration_ns as u64));
         let event = RuntimeEvent::TimerFired(timer_id);
@@ -279,18 +282,22 @@ impl<S: LockStrategy> EventSource<S> for TimerSource {
 }
 
 // =========================================================================
-// impl<S: LockStrategy> Engine<S> — 事件处理方法
+// impl<S: LockStrategy> Engine<S> — event-handling methods
 // =========================================================================
 
 impl<S: LockStrategy> Engine<S> {
-    /// 解析 await 事件源 + 原子检查就绪并注册 waiter（消除 TOCTOU 竞态）。
+    /// Resolves the await event source, atomically checks readiness, and registers a waiter
+    /// (eliminating the TOCTOU race).
     ///
-    /// 返回 (event, ready_value, await_node_local)：
-    /// - ready_value = Some(v)：事件已就绪，调用方直接注入值继续执行
-    /// - ready_value = None：事件未就绪，waiter 已注册，调用方只需设帧状态后 return
+    /// Returns (event, ready_value, await_node_local):
+    /// - ready_value = Some(v): the event is ready; the caller injects the value and continues
+    ///   execution.
+    /// - ready_value = None: the event is not ready; a waiter has been registered and the caller
+    ///   only needs to set the frame state and return.
     ///
-    /// 事件源解码 + 就绪检查委托 EventSource trait；waiter 注册在此统一执行。
-    /// 各源专属锁在 EventSource::resolve 内释放，event_waiters 锁不与源锁嵌套。
+    /// Event-source decode + readiness check are delegated to the EventSource trait; waiter
+    /// registration is performed uniformly here. Each source-specific lock is released inside
+    /// EventSource::resolve, so the event_waiters lock never nests with a source lock.
     pub(super) fn resolve_check_and_register_await(
         &self,
         pending: &crate::ir::Ir::PendingAwait,
@@ -306,18 +313,20 @@ impl<S: LockStrategy> Engine<S> {
                 panic!("SubgraphComplete should not go through await path");
             }
         };
-        // 统一 waiter 注册：仅未就绪时注册。源专属锁已在各 EventSource::resolve 内释放，
-        // 此处 event_waiters 锁不与源锁嵌套，避免锁顺序冲突。
+        // Uniform waiter registration: only register when not ready. Each source-specific lock has
+        // already been released inside EventSource::resolve, so the event_waiters lock here does
+        // not nest with a source lock, avoiding lock-ordering conflicts.
         if val.is_none() {
             self.event_waiters.lock().push((event, fid));
         }
         (event, val, await_node)
     }
 
-    /// 将事件值注入等待帧并唤醒（设 Ready + 推就绪队列 + 通知下游）。
-    /// select 帧重新 push gate 节点（不注入值），普通 await 帧注入事件值。
-    /// 返回 true 表示成功处理，false 表示帧非 WaitingEvent 状态（已被其他事件唤醒）。
-    /// 被 on_event_arrived 和 process_frame 的 pending_events 消费共用。
+    /// Injects the event value into the waiting frame and wakes it (sets Ready + pushes to the
+    /// ready queue + notifies downstream). For select frames, re-pushes the gate node (no value
+    /// injected); for ordinary await frames, injects the event value. Returns true on successful
+    /// handling, false if the frame is not in the WaitingEvent state (already woken by another
+    /// event). Shared by on_event_arrived and the pending_events consumption in process_frame.
     pub(super) fn apply_event_to_frame(&self, frame: &mut Frame, value: Value) -> bool {
         let await_node = match frame.suspend_state {
             SuspendState::WaitingEvent(node) => node,
@@ -326,7 +335,7 @@ impl<S: LockStrategy> Engine<S> {
         let node_offset = frame.node_offset;
         let await_graph_id = NodeId(await_node.0 + node_offset);
 
-        // select 帧（gate 节点有 SelectInfo）：重新 push gate 节点，不注入值
+        // select frame (gate node has SelectInfo): re-push the gate node, do not inject a value.
         let is_select = self.graph.has_select_info(await_graph_id.0 as usize);
         if is_select {
             frame.state = FrameState::Ready;
@@ -334,7 +343,7 @@ impl<S: LockStrategy> Engine<S> {
             frame.suspend_event = None;
             frame.push_ready(await_node);
         } else {
-            // 普通 await 帧：注入事件值到 await 节点
+            // Ordinary await frame: inject the event value into the await node.
             let consumer_count =
                 self.graph.downstream_slice(await_graph_id.0 as usize).len() as u16;
             frame.set_value(await_node, value, consumer_count);
@@ -352,9 +361,10 @@ impl<S: LockStrategy> Engine<S> {
         true
     }
 
-    /// 事件到达：注入值到等待帧 + 唤醒。返回被唤醒的 waiter 数量。
+    /// Event arrival: injects the value into the waiting frame and wakes it. Returns the number of
+    /// woken waiters.
     pub(super) fn on_event_arrived(&self, event: RuntimeEvent, value: Value, queue: &QueueHandle<'_>) -> usize {
-        // 找等待该事件的帧（短临界区）
+        // Find the frames waiting on this event (short critical section).
         let waiters: Vec<FrameId> = {
             let mut event_waiters = self.event_waiters.lock();
             let waiters: Vec<FrameId> = event_waiters
@@ -362,7 +372,7 @@ impl<S: LockStrategy> Engine<S> {
                 .filter(|(e, _)| *e == event)
                 .map(|(_, fid)| *fid)
                 .collect();
-            // 用 HashSet 避免 O(n²) retain（Vec::contains 是 O(n)）
+            // Use a HashSet to avoid O(n^2) retain (Vec::contains is O(n)).
             let waiter_set: std::collections::HashSet<FrameId> = waiters.iter().copied().collect();
             event_waiters.retain(|(_, fid)| !waiter_set.contains(fid));
             waiters
@@ -370,15 +380,17 @@ impl<S: LockStrategy> Engine<S> {
         let woken = waiters.len();
 
         for fid in waiters {
-            // 取出帧（保持 Box 不 unbox 以维持地址稳定）
+            // Take out the frame (keep it boxed to preserve address stability).
             let mut frame_box = {
                 let mut frames = self.frames.lock();
                 match frames.remove(&fid) {
                     Some(b) => b,
                     None => {
-                        // 帧正被 process_frame 处理（不在 HashMap）。
-                        // 暂存事件，process_frame insert 帧后消费（竞态兜底）。
-                        // waiter 已在上方从 event_waiters 移除，无需重复清理。
+                        // The frame is being processed by process_frame (not in the HashMap).
+                        // Stash the event; process_frame will consume it after reinserting the
+                        // frame (race fallback).
+                        // The waiter has already been removed from event_waiters above, so no
+                        // duplicate cleanup is needed.
                         self.pending_events.lock().insert(fid, (event, value.clone()));
                         continue;
                     }
@@ -387,25 +399,25 @@ impl<S: LockStrategy> Engine<S> {
             let frame: &mut Frame = &mut *frame_box;
 
             if !self.apply_event_to_frame(frame, value.clone()) {
-                // 非事件等待帧（已被其他事件唤醒）：放回 + 跳过
+                // Not an event-waiting frame (already woken by another event): put it back + skip.
                 self.frames.lock().insert(fid, frame_box);
                 continue;
             }
 
-            // 放回帧 + 入队（同一个 Box，地址不变）
+            // Put the frame back + enqueue (same Box, address unchanged).
             self.frames.lock().insert(fid, frame_box);
             queue.push(fid);
         }
         woken
     }
 
-    /// 取消帧：Suspended → Cancelling + 入就绪队列。
+    /// Cancels a frame: Suspended -> Cancelling + enqueue.
     pub(super) fn cancel_frame(&self, frame_id: FrameId, queue: &QueueHandle<'_>) {
         let mut frame_box = {
             let mut frames = self.frames.lock();
             match frames.remove(&frame_id) {
                 Some(b) => b,
-                None => return, // 帧正被其他 worker 处理，跳过
+                None => return, // Frame is being processed by another worker; skip.
             }
         };
         let frame: &mut Frame = &mut *frame_box;
@@ -415,18 +427,19 @@ impl<S: LockStrategy> Engine<S> {
             return;
         }
 
-        // 移除事件等待注册
+        // Remove the event-waiter registration.
         if let Some(event) = frame.suspend_event {
             self.event_waiters
                 .lock()
                 .retain(|(e, fid)| !(*e == event && *fid == frame_id));
         } else {
-            // select 帧：移除该帧所有事件等待
+            // select frame: remove all event-waiter entries for this frame.
             self.event_waiters
                 .lock()
                 .retain(|(_, fid)| *fid != frame_id);
         }
-        // 清理 pending_events（事件到达时帧不在 HashMap 的暂存事件）
+        // Clean up pending_events (events stashed when the frame was absent from the HashMap on
+        // arrival).
         self.pending_events.lock().remove(&frame_id);
 
         frame.state = FrameState::Cancelling;
@@ -437,15 +450,16 @@ impl<S: LockStrategy> Engine<S> {
         queue.push(frame_id);
     }
 
-    /// 检查 timer 事件
+    /// Checks for timer events.
     pub(super) fn check_timers(&self, queue: &QueueHandle<'_>) {
         let fired_timers = self.timer_runtime.lock().check_and_fire();
         for tid in &fired_timers {
             self.on_event_arrived(RuntimeEvent::TimerFired(*tid), Value::VOID, queue);
         }
-        // 所有已触发 timer 的事件已通过 on_event_arrived 派发，
-        // fired_set 中的残余条目（is_fired 未消费的）可安全清理：
-        // is_fired 仅在 start() 同锁内调用（检查新 timer），不会查询旧条目
+        // All fired-timer events have been dispatched via on_event_arrived, so the residual entries
+        // in fired_set (those not consumed by is_fired) can be safely cleaned up:
+        // is_fired is only called inside the same lock as start() (checking a new timer) and never
+        // queries old entries.
         if !fired_timers.is_empty() {
             self.timer_runtime.lock().cleanup();
         }

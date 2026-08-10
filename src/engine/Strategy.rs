@@ -1,4 +1,5 @@
-//! 并发策略：LockStrategy / Single / Multi / QueueHandle + 单/多线程入口 + worker。
+//! Concurrency strategies: LockStrategy / Single / Multi / QueueHandle + single-/multi-threaded
+//! entry points + worker.
 
 use super::*;
 use crate::ir::Ir::*;
@@ -11,15 +12,16 @@ use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
 use std::sync::Arc;
 
 // =========================================================================
-// LockStrategy — 编译期锁策略（单线程 RefCell vs 多线程 ParkingMutex）
+// LockStrategy — compile-time lock strategy (single-threaded RefCell vs multi-threaded ParkingMutex)
 // =========================================================================
 
-/// 锁策略：编译期决定字段包装方式（单线程 RefCell vs 多线程 ParkingMutex）
+/// Lock strategy: decides the field-wrapping type at compile time (single-threaded RefCell vs
+/// multi-threaded ParkingMutex).
 pub trait LockStrategy: 'static {
     type Mutex<T>: Lockable<T>;
 }
 
-/// 可锁定 trait：提供 lock() 方法返回 guard
+/// Lockable trait: provides a `lock()` method that returns a guard.
 pub trait Lockable<T> {
     type Guard<'a>: DerefMut<Target = T>
     where
@@ -27,7 +29,7 @@ pub trait Lockable<T> {
     fn lock(&self) -> Self::Guard<'_>;
 }
 
-// 单线程策略：RefCell（borrow flag，~2ns，无系统调用）
+// Single-threaded strategy: RefCell (borrow flag, ~2ns, no syscall).
 pub struct Single;
 impl LockStrategy for Single {
     type Mutex<T> = RefCell<T>;
@@ -42,7 +44,7 @@ impl<T> Lockable<T> for RefCell<T> {
     }
 }
 
-// 多线程策略：ParkingMutex（CAS，无竞争时 ~10ns）
+// Multi-threaded strategy: ParkingMutex (CAS, ~10ns when uncontended).
 pub struct Multi;
 impl LockStrategy for Multi {
     type Mutex<T> = ParkingMutex<T>;
@@ -57,7 +59,7 @@ impl<T> Lockable<T> for ParkingMutex<T> {
     }
 }
 
-/// 帧队列抽象：Single 用 RefCell<VecDeque>，Multi 用 DequeWorker
+/// Frame-queue abstraction: Single uses `RefCell<VecDeque>`, Multi uses `DequeWorker`.
 pub enum QueueHandle<'a> {
     Single(&'a RefCell<std::collections::VecDeque<FrameId>>),
     Multi(&'a DequeWorker<FrameId>),
@@ -72,11 +74,11 @@ impl QueueHandle<'_> {
 }
 
 // =========================================================================
-// impl Engine<Single> — 单线程模式
+// impl Engine<Single> — single-threaded mode
 // =========================================================================
 
 impl Engine<Single> {
-    /// 创建单线程 Engine（用 RefCell 包装所有字段）
+    /// Creates a single-threaded Engine (wraps every field with RefCell).
     pub(super) fn new_single(graph: DataFlowGraph) -> Self {
         let graph = Arc::new(graph);
         Self {
@@ -99,19 +101,20 @@ impl Engine<Single> {
         }
     }
 
-    /// 单线程事件循环（替代 run_event_loop + run_entry）
+    /// Single-threaded event loop (replaces run_event_loop + run_entry).
     ///
-    /// 空闲时策略（队列空 + 有 pending events）：
-    /// - 有 pending timer：park 到最近 deadline（Condvar.wait_for）
-    /// - 无 pending timer 但有 event_waiters：yield_now（等 channel/async 事件）
-    /// - 无 pending 且无 waiters：panic（死锁检测）
+    /// Idle policy (queue empty + pending events present):
+    /// - With a pending timer: park until the nearest deadline (Condvar.wait_for).
+    /// - Without a pending timer but with event_waiters: yield_now (waiting on channel/async events).
+    /// - Without pending work and without waiters: panic (deadlock detection).
     pub(super) fn run_single(&self) -> Value {
         let entry_sg = self.graph.entry_subgraph.expect("no entry subgraph");
         let fid = self.init_frame(entry_sg);
         let rq = self.ready_frames.as_ref().unwrap();
         rq.borrow_mut().push_back(fid);
 
-        // 单线程 park 用的 Condvar（无需被外部唤醒，仅用于 wait_for 精确等待）
+        // Condvar used for single-threaded parking (no external wake-up needed; used only for
+        // precise wait_for timing).
         let park_mutex = ParkingMutex::new(());
         let park_cv = Condvar::new();
 
@@ -122,17 +125,18 @@ impl Engine<Single> {
                 panic!("event loop stuck: guard={}", loop_guard);
             }
             let queue = QueueHandle::Single(rq);
-            // 先 pop（RefMut 在语句结束时释放），再处理空队列逻辑
+            // Pop first (the RefMut is released at the end of the statement), then handle the
+            // empty-queue logic.
             let fid = rq.borrow_mut().pop_front();
             let fid = match fid {
                 Some(f) => f,
                 None => {
-                    // 队列空：检查 timer（check_timers → on_event_arrived → push 需要 borrow_mut）
+                    // Queue empty: check timers (check_timers -> on_event_arrived -> push needs borrow_mut).
                     self.check_timers(&queue);
                     if let Some(result) = self.result.lock().take() {
                         return result;
                     }
-                    // 仍然无就绪帧：决定 park 策略
+                    // Still no ready frame: decide the park policy.
                     if rq.borrow().is_empty() {
                         let next_deadline = self.timer_runtime.lock().next_deadline();
                         let ew_empty = self.event_waiters.lock().is_empty();
@@ -142,7 +146,7 @@ impl Engine<Single> {
                             );
                         }
                         if let Some(deadline) = next_deadline {
-                            // 有 pending timer：park 到 deadline（精确等待，不忙轮询）
+                            // Pending timer present: park until the deadline (precise wait, no busy polling).
                             let now = std::time::Instant::now();
                             let wait_dur = deadline.saturating_duration_since(now);
                             if !wait_dur.is_zero() {
@@ -150,7 +154,7 @@ impl Engine<Single> {
                                 park_cv.wait_for(&mut guard, wait_dur);
                             }
                         } else {
-                            // 无 timer 但有 event_waiters：yield 等 channel/async/subgraph 事件
+                            // No timer but event_waiters present: yield waiting for channel/async/subgraph events.
                             std::thread::yield_now();
                         }
                     }
@@ -166,11 +170,11 @@ impl Engine<Single> {
 }
 
 // =========================================================================
-// impl Engine<Multi> — 多 worker 模式
+// impl Engine<Multi> — multi-worker mode
 // =========================================================================
 
 impl Engine<Multi> {
-    /// 创建多线程 Engine（用 ParkingMutex 包装所有字段）
+    /// Creates a multi-threaded Engine (wraps every field with ParkingMutex).
     pub(super) fn new_multi(graph: DataFlowGraph, num_workers: usize) -> Self {
         let graph = Arc::new(graph);
         Self {
@@ -193,7 +197,7 @@ impl Engine<Multi> {
         }
     }
 
-    /// 多 worker 模式执行入口子图（替代 run_multi_worker）
+    /// Multi-worker entry point that executes the entry subgraph (replaces run_multi_worker).
     pub(super) fn run_multi(self: Arc<Self>) -> Value {
         let entry_sg = self.graph.entry_subgraph.expect("no entry subgraph");
         let entry_fid = self.init_frame(entry_sg);
@@ -226,10 +230,10 @@ impl Engine<Multi> {
 }
 
 // =========================================================================
-// work-stealing worker 主循环（自由函数，供 run_multi 使用）
+// work-stealing worker main loop (free function, used by run_multi)
 // =========================================================================
 
-/// Worker 主循环：pop_local → try_steal → try_global → park。
+/// Worker main loop: pop_local -> try_steal -> try_global -> park.
 fn worker_main(
     worker_id: usize,
     local_queue: DequeWorker<FrameId>,
@@ -239,12 +243,12 @@ fn worker_main(
     let mut steal_seed: u64 = worker_id as u64 ^ GOLDEN_RATIO_64;
 
     loop {
-        // 结果已产生：退出
+        // A result has been produced: exit.
         if shared.result.lock().is_some() {
             return;
         }
 
-        // 1. pop_local（LIFO，缓存友好）
+        // 1. pop_local (LIFO, cache-friendly).
         if let Some(fid) = local_queue.pop() {
             let queue = QueueHandle::Multi(&local_queue);
             shared.process_frame(fid, &queue);
@@ -255,7 +259,7 @@ fn worker_main(
             continue;
         }
 
-        // 2. try_steal（随机 victim，FIFO 窃取）
+        // 2. try_steal (random victim, FIFO steal).
         if let Some(fid) = try_steal(&stealers, worker_id, &mut steal_seed) {
             let queue = QueueHandle::Multi(&local_queue);
             shared.process_frame(fid, &queue);
@@ -266,7 +270,7 @@ fn worker_main(
             continue;
         }
 
-        // 3. try_global（全局注入队列）
+        // 3. try_global (global injector queue).
         if let Some(fid) = shared.global_queue.as_ref().unwrap().steal().success() {
             let queue = QueueHandle::Multi(&local_queue);
             shared.process_frame(fid, &queue);
@@ -277,9 +281,10 @@ fn worker_main(
             continue;
         }
 
-        // 4+5. 无工作：在 wakeup 锁内减少活跃计数 + park
-        // 合并 active_count 减量与 park 到同一 wakeup 锁临界区，消除 lost-wakeup 窗口：
-        // notify_one 必须先获取 wakeup 锁，因此无法在减量与 wait_for 之间插入通知
+        // 4+5. No work: decrement the active count and park within the wakeup lock.
+        // Combining the active_count decrement and the park into the same wakeup-lock critical
+        // section eliminates the lost-wakeup window: notify_one must acquire the wakeup lock first,
+        // so a notification cannot slip between the decrement and wait_for.
         {
             let mut guard = shared.wakeup.as_ref().unwrap().0.lock();
             if shared.result.lock().is_some() {
@@ -292,21 +297,21 @@ fn worker_main(
                 *active += 1;
                 continue;
             }
-            // park 前检查 timer（可能在 park 准备期间有 timer 到期）
+            // Check timers before parking (a timer may have expired during park preparation).
             let queue = QueueHandle::Multi(&local_queue);
             shared.check_timers(&queue);
-            // check_timers 可能将就绪帧推入 local_queue，需重新检查避免无效 park
+            // check_timers may push ready frames into local_queue; re-check to avoid a spurious park.
             if !local_queue.is_empty() || !shared.global_queue.as_ref().unwrap().is_empty() {
                 let mut active = shared.active_count.as_ref().unwrap().lock();
                 *active += 1;
                 continue;
             }
-            // 减少活跃计数（在 wakeup 锁内，消除 lost-wakeup 窗口）
+            // Decrement the active count (inside the wakeup lock, eliminating the lost-wakeup window).
             let should_exit = {
                 let mut active = shared.active_count.as_ref().unwrap().lock();
                 *active -= 1;
                 if *active == 0 {
-                    // 最后一个活跃 worker：检查是否有 pending timer 或 event_waiters
+                    // Last active worker: check whether there are pending timers or event_waiters.
                     let has_pending_timer = shared.timer_runtime.lock().next_deadline().is_some();
                     let has_event_waiters = !shared.event_waiters.lock().is_empty();
                     !has_pending_timer && !has_event_waiters
@@ -315,11 +320,11 @@ fn worker_main(
                 }
             };
             if should_exit {
-                // 无 pending 工作：唤醒其他 parked worker 后退出
+                // No pending work: wake the other parked workers, then exit.
                 shared.wakeup.as_ref().unwrap().1.notify_all();
                 return;
             }
-            // park timeout = 最近 timer deadline（无 timer 则默认 10ms）
+            // park timeout = nearest timer deadline (defaults to 10ms when there is no timer).
             let park_timeout = shared.timer_runtime.lock().next_deadline()
                 .map(|deadline| {
                     let now = std::time::Instant::now();
@@ -336,7 +341,7 @@ fn worker_main(
     }
 }
 
-/// 随机选择 victim worker 进行窃取。
+/// Randomly selects a victim worker to steal from.
 fn try_steal(
     stealers: &[Stealer<FrameId>],
     worker_id: usize,
@@ -347,7 +352,7 @@ fn try_steal(
         return None;
     }
 
-    // xorshift64 伪随机
+    // xorshift64 pseudo-random.
     *seed ^= *seed << 13;
     *seed ^= *seed >> 7;
     *seed ^= *seed << 17;

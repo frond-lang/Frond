@@ -8,99 +8,125 @@ use crate::ir::Ir::*;
 use std::sync::Arc;
 
 
-/// 2. 编译每个函数的函数体
-/// 3. 计算 fan-out（downstreams）
+/// 2. Compile the body of each function.
+/// 3. Compute fan-out (downstreams).
 ///
-/// 本阶段实现核心 Expr 变体编译（Const/BinOp/Call/FieldAccess/Ident/Block）。
-/// 控制流（If/Match/Loop）留到阶段 4。
-/// compute_fn 用 noop_compute 占位，Engine 阶段替换为类型特化函数。
+/// This stage implements compilation of the core Expr variants
+/// (Const/BinOp/Call/FieldAccess/Ident/Block).
+/// Control flow (If/Match/Loop) is deferred to stage 4.
+/// `compute_fn` is placeholdered with `noop_compute`; the Engine stage replaces it
+/// with a type-specialized function.
 pub struct IrBuilder<'a> {
     pub sema: &'a crate::sema::Sema::SemaResult,
     pub type_arena: &'a crate::sema::Sema::TypeArena,
     pub module: &'a crate::ast::Ast::Module<'a>,
-    /// builtin 模块列表（预编译，函数注册到 func_subgraphs）
+    /// List of builtin modules (precompiled; functions are registered into `func_subgraphs`).
     pub builtin_modules: Vec<&'a crate::ast::Ast::Module<'a>>,
-    /// 当前正在编译的 builtin 模块（None = 用户模块）
+    /// The builtin module currently being compiled (`None` = user module).
     pub compiling_builtin: Option<&'a crate::ast::Ast::Module<'a>>,
-    /// 静态分析报告（entry 模块）
+    /// Static analysis report (for the entry module).
     pub analysis: Option<&'a crate::pass::Analyzer::AnalysisReport>,
-    /// builtin 模块的静态分析报告（索引与 builtin_modules 对应）
+    /// Static analysis reports for builtin modules (indexed in parallel with `builtin_modules`).
     pub builtin_analyses: Vec<Option<&'a crate::pass::Analyzer::AnalysisReport>>,
     pub graph: DataFlowGraph,
-    /// 函数名 → 子图 id 映射（Call 编译时查找绑定 call_target）
+    /// Function name -> subgraph id map (looked up when compiling `Call` to bind `call_target`).
     pub func_subgraphs: rustc_hash::FxHashMap<String, SubGraphId>,
-    /// 类型方法子图表：(type_id, method_idx) → SubGraphId
-    /// type_id = FIRST_DYNAMIC_TYPE_ID + type_def_index，method_idx = 方法在 TypeDefInfo.methods 中的位置
-    /// 替代 func_subgraphs 中 "TypeName.method" 字符串键
+    /// Type method subgraph table: (type_id, method_idx) -> SubGraphId.
+    /// `type_id = FIRST_DYNAMIC_TYPE_ID + type_def_index`; `method_idx` is the position of the
+    /// method within `TypeDefInfo.methods`. Replaces the `"TypeName.method"` string key
+    /// previously stored in `func_subgraphs`.
     pub method_subgraphs: rustc_hash::FxHashMap<(u16, u16), SubGraphId>,
-    /// trait 默认方法子图表（单态化）：(type_id, trait_def_idx, method_idx) → SubGraphId
-    /// 为每个实现 trait 的类型生成特化子图，使 self 在 body 中有具体类型信息。
+    /// Trait default-method subgraph table (monomorphized): (type_id, trait_def_idx, method_idx) -> SubGraphId.
+    /// A specialized subgraph is generated for each type implementing the trait, so that `self`
+    /// carries concrete type information inside the body.
     pub trait_default_subgraphs: rustc_hash::FxHashMap<(u16, u16, u16), SubGraphId>,
-    /// 当前正在编译的 trait 默认方法特化实例在 sema.trait_default_instances 中的索引。
-    /// expr_type_name/expr_type_id 通过此索引查 sema 的 TraitDefaultInstance.type_name
-    /// 获取 self 的具体类型（消费 sema 产出，非 IR 持有语义信息）。
+    /// Index into `sema.trait_default_instances` of the trait default-method specialization
+    /// currently being compiled.
+    /// `expr_type_name`/`expr_type_id` use this index to look up
+    /// `TraitDefaultInstance.type_name` in sema and obtain the concrete type of `self`
+    /// (consuming sema output; the IR does not hold semantic information).
     pub current_trait_default_idx: Option<usize>,
-    /// 当前正在编译的函数子图 id（defer 注册用）
+    /// The subgraph id of the function currently being compiled (used for `defer` registration).
     pub current_function_sg: Option<SubGraphId>,
-    /// 循环上下文栈：栈顶为当前循环的上下文（continue 跳转目标 + For 迭代器节点）
+    /// Loop context stack: the top entry is the current loop's context
+    /// (continue jump target + For iterator node).
     pub loop_stack: Vec<LoopContext>,
-    /// 变量作用域栈：变量名 → 产出该变量值的 NodeId
+    /// Variable scope stack: variable name -> NodeId producing that variable's value.
     pub scope_stack: Vec<rustc_hash::FxHashMap<String, NodeId>>,
-    /// 捕获变量作用域栈：每层 lambda 的捕获变量 (name, outer_node) 列表。
-    /// 用于 Assignment 判定是否需 WriteBack：捕获变量赋值需写回外层节点。
+    /// Captured-variable scope stack: per lambda layer, the list of captured
+    /// variables `(name, outer_node)`.
+    /// Used by `Assignment` to decide whether a WriteBack is required: assignments to
+    /// captured variables must write back to the outer node.
     pub captured_scopes: Vec<Vec<(String, NodeId)>>,
-    /// 被内层 lambda 捕获的本地变量：变量名 → 捕获时的原始节点 ID。
-    /// 外层 Assignment 对这些变量赋值时需生成 WriteBack 到原始节点，
-    /// 使闭包在 same_function 调用时能从父帧读到最新值（引用捕获语义）。
+    /// Local variables captured by an inner lambda: variable name -> original node id at
+    /// capture time.
+    /// When an outer `Assignment` assigns to one of these variables it must emit a WriteBack
+    /// to the original node, so the closure can read the latest value from the parent frame
+    /// during a `same_function` call (capture-by-reference semantics).
     pub captured_vars: rustc_hash::FxHashMap<String, NodeId>,
-    /// 类型字段作用域栈：构造器/类型名 → 字段名列表（与 scope_stack 平行管理）
+    /// Type-field scope stack: constructor/type name -> field name list
+    /// (managed in parallel with `scope_stack`).
     pub type_scope_stack: Vec<rustc_hash::FxHashMap<String, TypeFieldInfo>>,
-    /// 当前正在编译的函数的 function_id（用于子图标记，root_frame_ptr 继承判定）
+    /// `function_id` of the function currently being compiled (used for subgraph tagging and
+    /// `root_frame_ptr` inheritance decisions).
     pub current_function_id: u32,
-    /// 当前正在编译的子图的节点起始 NodeId（用于判断变量是否为外层变量）
+    /// Starting NodeId of the subgraph currently being compiled (used to determine whether a
+    /// variable belongs to an outer scope).
     pub current_sg_start: u32,
-    /// 当前语句块中前一个效果节点（用于让后续效果节点依赖前一个，保证语句顺序）
+    /// The previous effect node in the current statement block (subsequent effect nodes depend
+    /// on it to preserve statement ordering).
     pub current_effect: Option<NodeId>,
-    /// 当前是否在尾位置（尾调用分析用）。
-    /// compile_function 入口设 true，Return value 设 true，
-    /// Block trailing 继承，If/Match 分支继承，参数/条件/赋值右侧设 false。
+    /// Whether the current position is a tail position (for tail-call analysis).
+    /// Set to `true` at the `compile_function` entry and at `Return value`;
+    /// inherited by `Block` trailing expressions and by `If`/`Match` branches;
+    /// set to `false` for arguments, conditions, and assignment right-hand sides.
     pub in_tail_position: bool,
-    /// 尾递归转迭代上下文：Some 时 compile_call 拦截 self 调用为 WriteBack + Call(while_sg)。
-    /// None = 不在尾递归转迭代 body 编译中。
+    /// Tail-recursion-to-iteration context: when `Some`, `compile_call` intercepts self-calls
+    /// as `WriteBack + Call(while_sg)`.
+    /// `None` = not compiling a tail-recursion-to-iteration body.
     pub(crate) tail_rec_ctx: Option<TailRecCtx>,
-    /// 非尾递归转迭代上下文
+    /// Non-tail-recursion-to-iteration context.
     pub(crate) non_tail_rec_ctx: Option<NonTailRecCtx>,
-    /// 当前正在编译的单态化实例的类型参数映射（类型参数名 → TypeHandle）。
-    /// 为空表示不在泛型实例上下文中（普通非泛型函数）。
-    /// compile_cast_call 解析 target 类型参数时查此表替换为具体类型；
-    /// expr_type_name 在 sema.expr_types 未命中时回退查实例局部 expr_types。
+    /// Type-parameter mapping for the monomorphization instance currently being compiled
+    /// (type-parameter name -> TypeHandle).
+    /// Empty means we are not in a generic-instantiation context (a plain non-generic function).
+    /// `compile_cast_call` consults this table to substitute concrete types when resolving target
+    /// type parameters; `expr_type_name` falls back to the instance-local `expr_types` when sema's
+    /// `expr_types` misses.
     pub current_type_args: Vec<(String, crate::sema::Sema::TypeHandle)>,
-    /// 当前正在编译的单态化实例 ID（None = 非泛型函数）。
-    /// 用作 sema.monomorph_instances 的索引，查实例局部 expr_types。
+    /// ID of the monomorphization instance currently being compiled (`None` = non-generic function).
+    /// Used as an index into `sema.monomorph_instances` to look up instance-local `expr_types`.
     pub current_instance_id: Option<u32>,
-    /// 编译期错误列表（未实现特性、找不到函数等，编译结束后可检查）
+    /// Compile-time error list (unimplemented features, missing functions, etc.; inspectable
+    /// after compilation).
     pub errors: Vec<String>,
-    /// 全局变量名 → slot index 映射（顶层 var/val 声明，跨函数共享）
+    /// Global variable name -> slot index map (top-level `var`/`val` declarations, shared across
+    /// functions).
     pub global_var_slots: rustc_hash::FxHashMap<String, u32>,
-    /// 顶层 var/val 声明语句列表（在 entry 函数编译时注入初始化代码）
-    /// 元素：(模块索引, StmtId)，None = entry 模块，Some(i) = builtin_modules[i]
+    /// Top-level `var`/`val` declaration statement list (initialization code is injected when
+    /// compiling the entry function).
+    /// Element: (module index, StmtId); `None` = entry module, `Some(i)` = `builtin_modules[i]`.
     pub top_level_var_decls: Vec<(Option<usize>, crate::ast::Ast::StmtId)>,
-    /// 记忆化缓存表计数器（每个 memoized 函数分配一个 table_index）
+    /// Memoization cache table counter (each memoized function is allocated a `table_index`).
     pub memo_table_count: u32,
-    /// 字符串 intern 池（构建期写入，build() 末尾 move 到 graph.string_pool）
+    /// String intern pool (written during construction; moved into `graph.string_pool` at the end
+    /// of `build()`).
     pub string_pool: Vec<u8>,
-    /// 字符串 intern 去重表：字符串内容 → 在 string_pool 中的 offset
+    /// String intern dedup table: string content -> offset within `string_pool`.
     pub string_map: rustc_hash::FxHashMap<String, u32>,
-    // 逃逸分析由 analyzer 统一产出（analyze_escape），IR 通过 analysis.escape 消费。
-    // 旧 escape_context_stack 已删除。
+    // Escape analysis is produced uniformly by the analyzer (analyze_escape); the IR consumes
+    // it via `analysis.escape`. The old `escape_context_stack` has been removed.
 }
 
 // =========================================================================
-// 内置构造/方法/cast 分派注册表（数据驱动，消除方法名/类型名特判分支）
+// Builtin constructor / method / cast dispatch registry
+// (data-driven, eliminates special-case branches on method/type names).
 // =========================================================================
 
-/// cast 转换对注册表：不遵循默认 `__cast_{S}_to_{T}` 命名规则的转换对。
-/// 新增转换对只需追加一行，无需改编译分支。
+/// Registry of cast conversion pairs that do not follow the default
+/// `__cast_{S}_to_{T}` naming convention.
+/// Adding a conversion pair only requires appending a row; no compile branch
+/// needs to change.
 const SPECIAL_CAST_PAIRS: &[(&str, &str, &str)] = &[
     // (source, target, mangled_fn)
     ("u8[]", "str", "__cast_bytes_to_str"),
@@ -108,16 +134,18 @@ const SPECIAL_CAST_PAIRS: &[(&str, &str, &str)] = &[
     ("char", "str", "__cast_char_to_str"),
 ];
 
-/// FFI 原语 intrinsic 注册表：FFI 函数名 → compute_fn。
-/// 这些原语以 @extern("C") 声明但 compute_fn 直接绑定到 reflect 实现，
-/// 不走 FFI 分派（避免 lazy force 逻辑与 FFI 调用耦合）。
-/// 新增原语只需追加一行，无需改编译分支。
+/// FFI intrinsic registry: FFI function name -> `compute_fn`.
+/// These primitives are declared with `@extern("C")` but their `compute_fn` is bound directly
+/// to the reflect implementation, bypassing FFI dispatch (to avoid coupling lazy-force logic
+/// with FFI calls).
+/// Adding a primitive only requires appending a row; no compile branch needs to change.
 const FFI_INTRINSIC_TABLE: &[(&str, ComputeFnId)] = &[
     ("__reflect_format", CF_REFLECT_FORMAT),
     ("__reflect_scalar_to_str", CF_REFLECT_SCALAR_TO_STR),
 ];
 
-/// 解析 cast 函数名：先查特殊转换对注册表，未命中则按默认命名规则生成。
+/// Resolve a cast function name: consult the special-pair registry first, and if there is no
+/// hit, fall back to the default naming convention.
 fn cast_mangled_name(source: &str, target: &str) -> String {
     for &(s, t, fn_name) in SPECIAL_CAST_PAIRS {
         if s == source && t == target {
@@ -128,69 +156,76 @@ fn cast_mangled_name(source: &str, target: &str) -> String {
 }
 
 // =========================================================================
-// 逃逸分析已迁移到 analyzer（analyze_escape + analyze_lambda_escape）
-// IR 通过 analysis.escape 消费，不再有平行实现。
+// Escape analysis has been migrated to the analyzer
+// (analyze_escape + analyze_lambda_escape). The IR consumes it via
+// `analysis.escape`; there is no longer a parallel implementation.
 // =========================================================================
 
-/// 内置构造器的降级策略。
+/// Lowering strategy for builtin constructors.
 ///
-/// 新增内置构造器只需在 `BUILTIN_CTORS` 追加一行，无需新增 if 分支。
+/// Adding a builtin constructor only requires appending a row to `BUILTIN_CTORS`;
+/// no new `if` branch is needed.
 enum BuiltinCtorLower {
-    /// Ok(val)：单节点 compute_throw_ok（idx 44）
+    /// `Ok(val)`: single-node `compute_throw_ok` (idx 44).
     Ok,
-    /// Err(...)：内层 record_construct + 外层 throw_err 包装（idx 45）
+    /// `Err(...)`: inner `record_construct` wrapped by outer `throw_err` (idx 45).
     Err,
-    /// channel(capacity)：单节点 compute_channel_create（idx 283）
+    /// `channel(capacity)`: single-node `compute_channel_create` (idx 283).
     Channel,
 }
 
-/// 内置构造器分派表：构造器名 → 降级策略。
+/// Builtin constructor dispatch table: constructor name -> lowering strategy.
 const BUILTIN_CTORS: &[(&str, BuiltinCtorLower)] = &[
     ("Ok", BuiltinCtorLower::Ok),
     ("Err", BuiltinCtorLower::Err),
     ("channel", BuiltinCtorLower::Channel),
 ];
 
-/// 尾递归转迭代上下文：compile_call 拦截 self 调用时使用。
-/// self_name = 当前函数名，param_nodes = 参数节点列表。
+/// Tail-recursion-to-iteration context: used by `compile_call` when intercepting self-calls.
+/// `self_name` is the current function name; `param_nodes` is the parameter node list.
 #[derive(Clone)]
 pub(crate) struct TailRecCtx {
     self_name: String,
     param_nodes: Vec<NodeId>,
 }
 
-/// 非尾递归转迭代上下文：在 body_sg 编译中拦截自调用为 push + continue。
+/// Non-tail-recursion-to-iteration context: intercepts self-calls as `push + continue` while
+/// compiling `body_sg`.
 #[derive(Clone)]
 pub(crate) struct NonTailRecCtx {
-    /// 函数自身名称
+    /// The function's own name.
     pub self_name: String,
-    /// 函数参数节点列表（编译续延时更新为当前栈帧的 param_cur 节点）
+    /// Function parameter node list (updated to the current frame's `param_cur` node when
+    /// compiling continuations).
     pub param_nodes: Vec<NodeId>,
-    /// 工作栈数组节点（函数子图中的局部变量）
+    /// Work-stack array node (a local variable within the function subgraph).
     pub stack_node: NodeId,
-    /// 栈指针节点（sp，函数子图中的局部变量）
+    /// Stack-pointer node (`sp`; a local variable within the function subgraph).
     pub sp_node: NodeId,
-    /// 结果变量节点（result，函数子图中的局部变量）
+    /// Result variable node (`result`; a local variable within the function subgraph).
     pub result_node: NodeId,
-    /// 调用点 ExprId → 节点的映射。
-    /// 编译续延时，遇到映射中的 ExprId 则返回对应节点（result 或 saved）。
+    /// Call-site ExprId -> node mapping.
+    /// When compiling a continuation, encountering an ExprId in this map returns the
+    /// corresponding node (`result` or a `saved` node).
     pub call_result_map: rustc_hash::FxHashMap<crate::ast::Ast::ExprId, NodeId>,
-    /// 截断标志：拦截第一个自调用后设为 true，后续自调用生成 void 常量。
+    /// Truncation flag: set to `true` after intercepting the first self-call; subsequent
+    /// self-calls generate a void constant.
     pub truncated: bool,
-    /// 栈帧步长 = param_count + 1(state) + max_saved_count
+    /// Frame stride = param_count + 1 (state) + max_saved_count.
     pub stride: u32,
-    /// 函数参数数量
+    /// Number of function parameters.
     pub param_count: usize,
-    /// 最大保存值数量 = call_sites.len() - 1
+    /// Maximum number of saved values = `call_sites.len() - 1`.
     pub max_saved: usize,
-    /// 当前编译的 state 号（0 = INIT）
+    /// The state number currently being compiled (0 = INIT).
     pub current_state: u32,
-    /// 当前栈帧的 saved 节点列表（body_sg pop 阶段从栈帧读取）
+    /// Saved node list for the current frame (read from the frame during the `body_sg` pop
+    /// phase).
     pub saved_nodes: Vec<NodeId>,
 }
 
 impl<'a> IrBuilder<'a> {
-    /// 创建构建器。
+    /// Create a new builder.
     pub fn new(sema: &'a crate::sema::Sema::SemaResult, type_arena: &'a crate::sema::Sema::TypeArena, module: &'a crate::ast::Ast::Module<'a>) -> Self {
         Self {
             sema,
@@ -228,8 +263,8 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    /// 字符串 intern：将字符串内容追加到 string_pool，返回 (offset, len)。
-    /// 相同字符串只存一次（去重通过 string_map）。
+    /// String interning: append the string content to `string_pool` and return `(offset, len)`.
+    /// Identical strings are stored only once (deduplication via `string_map`).
     pub fn intern_str(&mut self, s: &str) -> (u32, u32) {
         let len = s.len() as u32;
         if len == 0 {
@@ -244,7 +279,7 @@ impl<'a> IrBuilder<'a> {
         (off, len)
     }
 
-    /// 设置 builtin 模块列表（builder 风格，链式调用）。
+    /// Set the builtin module list (builder style, chainable).
     pub fn with_builtins(
         mut self,
         modules: Vec<&'a crate::ast::Ast::Module<'a>>,
@@ -253,9 +288,10 @@ impl<'a> IrBuilder<'a> {
         self
     }
 
-    /// 注入静态分析报告（builder 风格，链式调用）。
-    /// 报告仅对 entry 模块有效，IrBuilder 编译 entry 模块时查询报告
-    /// 跳过死代码/死函数，执行内联与栈分配标记。
+    /// Inject the static analysis report (builder style, chainable).
+    /// The report is only valid for the entry module; when compiling the entry module the
+    /// `IrBuilder` consults the report to skip dead code/dead functions and to apply inlining
+    /// and stack-allocation annotations.
     pub fn with_analysis(
         mut self,
         analysis: &'a crate::pass::Analyzer::AnalysisReport,
@@ -264,7 +300,8 @@ impl<'a> IrBuilder<'a> {
         self
     }
 
-    /// 注入 builtin 模块的静态分析报告（索引与 builtin_modules 对应）。
+    /// Inject static analysis reports for builtin modules (indexed in parallel with
+    /// `builtin_modules`).
     pub fn with_builtin_analyses(
         mut self,
         analyses: Vec<Option<&'a crate::pass::Analyzer::AnalysisReport>>,
@@ -273,9 +310,12 @@ impl<'a> IrBuilder<'a> {
         self
     }
 
-    /// 返回当前正在编译模块对应的静态分析报告（通用查询入口）。
-    /// entry 模块 → self.analysis；builtin 模块 → builtin_analyses 对应索引。
-    /// 移除 compiling_builtin 限制，所有模块统一走此入口查询 memoize/inline/dead_code 等。
+    /// Return the static analysis report for the module currently being compiled (generic
+    /// query entry point).
+    /// Entry module -> `self.analysis`; builtin module -> the corresponding index in
+    /// `builtin_analyses`.
+    /// The `compiling_builtin` restriction is removed; all modules uniformly go through this
+    /// entry to query memoize/inline/dead_code, etc.
     #[inline]
     fn current_analysis(&self) -> Option<&'a crate::pass::Analyzer::AnalysisReport> {
         if let Some(builtin) = self.compiling_builtin {
@@ -287,58 +327,62 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    /// 查询语句是否为死代码。
+    /// Query whether a statement is dead code.
     #[inline]
     fn is_dead_stmt(&self, stmt_id: crate::ast::Ast::StmtId) -> bool {
         self.current_analysis().map_or(false, |r| r.dead_code.dead_stmts.contains(&stmt_id))
     }
 
-    /// 查询函数是否为死函数。
-    /// FuncId = 当前模块 declarations 索引。
+    /// Query whether a function is dead.
+    /// `FuncId` = index into the current module's `declarations`.
     #[inline]
     fn is_dead_func(&self, decl_idx: usize) -> bool {
         self.current_analysis().map_or(false, |r| r.dead_func.dead.contains(&crate::pass::Analyzer::FuncId(decl_idx as u32)))
     }
 
-    /// 查询表达式是否为内联候选的调用点。
-    /// 返回被调函数的 FuncId，IrBuilder 应展开其 body 而非 launch 子图。
+    /// Query whether an expression is an inline-candidate call site.
+    /// Returns the callee's `FuncId`; the `IrBuilder` should expand its body rather than launch
+    /// a subgraph.
     #[inline]
     fn inline_target(&self, expr_id: crate::ast::Ast::ExprId) -> Option<crate::pass::Analyzer::FuncId> {
         let report = self.current_analysis()?;
         report.inline.expansions.get(&expr_id).copied()
     }
 
-    /// 查询表达式是否标记为栈分配。
+    /// Query whether an expression is marked for stack allocation.
     #[inline]
     fn should_stack_alloc(&self, expr_id: crate::ast::Ast::ExprId) -> bool {
         self.current_analysis().map_or(false, |r| r.stack_alloc.candidates.contains(&expr_id))
     }
 
-    /// 返回当前正在编译的模块（builtin 优先，否则用户模块）。
+    /// Return the module currently being compiled (builtin takes priority, otherwise the user
+    /// module).
     fn current_module(&self) -> &'a crate::ast::Ast::Module<'a> {
         self.compiling_builtin.unwrap_or(self.module)
     }
 
-    /// 进入新作用域（变量和类型字段同步 push）。
+    /// Enter a new scope (variables and type fields are pushed together).
     fn enter_scope(&mut self) {
         self.scope_stack.push(rustc_hash::FxHashMap::default());
         self.type_scope_stack.push(rustc_hash::FxHashMap::default());
     }
 
-    /// 退出作用域（变量和类型字段同步 pop）。
+    /// Exit a scope (variables and type fields are popped together).
     fn exit_scope(&mut self) {
         self.scope_stack.pop();
         self.type_scope_stack.pop();
     }
 
-    /// 在当前作用域注册类型字段信息（构造器名/类型名 → TypeFieldInfo）。
+    /// Register type field info in the current scope (constructor name / type name ->
+    /// `TypeFieldInfo`).
     fn bind_type_fields(&mut self, name: &str, info: TypeFieldInfo) {
         if let Some(scope) = self.type_scope_stack.last_mut() {
             scope.insert(name.to_string(), info);
         }
     }
 
-    /// 从作用域栈逐层查找类型字段信息（构造器名或类型名）。
+    /// Look up type field info by walking the scope stack from inner to outer (constructor name
+    /// or type name).
     fn lookup_type_fields(&self, name: &str) -> Option<TypeFieldInfo> {
         for scope in self.type_scope_stack.iter().rev() {
             if let Some(info) = scope.get(name) {
@@ -348,34 +392,36 @@ impl<'a> IrBuilder<'a> {
         None
     }
 
-    /// 绑定变量名到 NodeId（当前作用域）。
+    /// Bind a variable name to a NodeId (in the current scope).
     fn bind_var(&mut self, name: &str, node_id: NodeId) {
         if let Some(scope) = self.scope_stack.last_mut() {
             scope.insert(name.to_string(), node_id);
         }
     }
 
-    /// 查找变量绑定的 NodeId（从内到外查）。
+    /// Look up the NodeId bound to a variable (searching from inner to outer scope).
     fn lookup_var(&self, name: &str) -> Option<NodeId> {
         for scope in self.scope_stack.iter().rev() {
             if let Some(&node_id) = scope.get(name) {
                 return Some(node_id);
             }
         }
-        // 全局变量：返回 None，由调用方通过 is_global_var + global_var_slots 处理
+        // Global variables: return None; the caller handles them via is_global_var + global_var_slots.
         None
     }
 
-    /// 检查名称是否为全局变量，返回 slot index。
+    /// Check whether a name is a global variable and return its slot index.
     fn lookup_global_var(&self, name: &str) -> Option<u32> {
         self.global_var_slots.get(name).copied()
     }
 
-    /// 编译全局变量读取节点（compute_global_load, idx 270）。
-    /// 无输入，运行时从 global_var_storage[slot] 读取。
+    /// Compile a global-variable load node (`compute_global_load`, idx 270).
+    /// Takes no input; at runtime it reads from `global_var_storage[slot]`.
     fn compile_global_load(&mut self, slot: u32) -> NodeId {
-        // 追加 current_effect 作为隐式依赖输入，确保 load 在前序 global_store 完成后才执行。
-        // compute_global_load 不读取输入值，此 input 仅用于调度器排序。
+        // Append `current_effect` as an implicit dependency input to ensure the load executes
+        // only after prior `global_store` operations complete.
+        // `compute_global_load` does not read the input value; this input exists solely for
+        // scheduler ordering.
         let (input_count, inputs_offset) = match self.current_effect {
             Some(eff) => (1, self.graph.inputs_pool.push(&[eff])),
             None => (0, self.graph.inputs_pool.push(&[])),
@@ -390,8 +436,9 @@ impl<'a> IrBuilder<'a> {
         node
     }
 
-    /// 编译全局变量写入节点（compute_global_store, idx 271）。
-    /// inputs[0] = 值来源节点，运行时写入 global_var_storage[slot]。
+    /// Compile a global-variable store node (`compute_global_store`, idx 271).
+    /// `inputs[0]` is the value-source node; at runtime it writes to
+    /// `global_var_storage[slot]`.
     fn compile_global_store(&mut self, val_node: NodeId, slot: u32) -> NodeId {
         let inputs_offset = self.graph.inputs_pool.push(&[val_node]);
         let node = self.graph.add_node(Node {
@@ -404,13 +451,16 @@ impl<'a> IrBuilder<'a> {
         node
     }
 
-    /// 判断 NodeId 是否在当前子图范围内（非外层变量）。
+    /// Determine whether a NodeId falls within the current subgraph's range (i.e. is not an
+    /// outer variable).
     fn is_in_current_subgraph(&self, node: NodeId) -> bool {
         node.0 >= self.current_sg_start
     }
 
-    /// Bug #49: 检查当前函数子图是否已注册 defer（defer 编译后 defer_table 非空）。
-    /// 用于决定局部变量重赋值是否需要 WriteBack 到原始节点。
+    /// Bug #49: check whether the current function subgraph has registered a defer (after defer
+    /// compilation, `defer_table` is non-empty).
+    /// Used to decide whether a local variable reassignment needs a WriteBack to the original
+    /// node.
     fn current_function_has_defer(&self) -> bool {
         if let Some(sg_id) = self.current_function_sg {
             if let Some(sg) = self.graph.subgraphs.get(sg_id.0 as usize) {
@@ -420,8 +470,9 @@ impl<'a> IrBuilder<'a> {
         false
     }
 
-    /// 编译 WriteBack 节点：赋值外层变量，通过 root_frame_ptr 写回函数根帧。
-    /// 返回 WriteBack 节点的 NodeId。
+    /// Compile a WriteBack node: assigns an outer variable, writing it back to the function's
+    /// root frame via `root_frame_ptr`.
+    /// Returns the NodeId of the WriteBack node.
     fn compile_writeback_node(&mut self, val_node: NodeId, target_outer: NodeId) -> NodeId {
         let wb_off = self.graph.inputs_pool.push(&[val_node]);
         let wb_node = self.graph.add_node(Node {
@@ -434,10 +485,10 @@ impl<'a> IrBuilder<'a> {
         wb_node
     }
 
-    /// CompoundAssignOp → 对应二元运算的 ComputeFnId。
+    /// Map a `CompoundAssignOp` to the `ComputeFnId` of the corresponding binary operation.
     ///
-    /// 通过 arith_base 按具体类型查表，算术运算用 offset 0-4，
-    /// 位运算用 offset 5-9（仅整数）。
+    /// Looks up `arith_base` by concrete type: arithmetic operations use offsets 0-4;
+    /// bitwise operations use offsets 5-9 (integers only).
     fn compound_assign_op_to_compute_fn(
         &mut self,
         op: crate::ast::Ast::CompoundAssignOp,
@@ -446,28 +497,29 @@ impl<'a> IrBuilder<'a> {
         use crate::ast::Ast::CompoundAssignOp;
         let ty = self.expr_type_name_checked(target_expr, "compound_assign_op");
         let is_float = crate::value::ValueTag::from_name(ty).and_then(scalar_meta).map(|m| m.is_float).unwrap_or(false);
-        let base = Self::arith_base(ty).unwrap_or(CF_ADD_I32_FULL.0); // 回退 i32
-        // 整数 offset: add(0) sub(1) mul(2) div(3) mod(4) bitand(5) bitor(6) bitxor(7) shl(8) shr(9)
-        // 浮点 offset: add(0) sub(1) mul(2) div(3) mod(4) neg(5)
+        let base = Self::arith_base(ty).unwrap_or(CF_ADD_I32_FULL.0); // fallback: i32
+        // Integer offsets: add(0) sub(1) mul(2) div(3) mod(4) bitand(5) bitor(6) bitxor(7) shl(8) shr(9)
+        // Float offsets:   add(0) sub(1) mul(2) div(3) mod(4) neg(5)
         let offset = match op {
             CompoundAssignOp::AddAssign => 0,
             CompoundAssignOp::SubAssign => 1,
             CompoundAssignOp::MulAssign => 2,
             CompoundAssignOp::DivAssign => 3,
             CompoundAssignOp::ModAssign => 4,
-            // 位运算仅整数支持；浮点走到这里表示 sema 未拦截，回退到 i32 路径
+            // Bitwise ops are integers-only; a float reaching here means sema failed to intercept,
+            // so fall back to the i32 path.
             CompoundAssignOp::BitAndAssign if !is_float => 5,
             CompoundAssignOp::BitOrAssign if !is_float => 6,
             CompoundAssignOp::BitXorAssign if !is_float => 7,
             CompoundAssignOp::ShlAssign if !is_float => 8,
             CompoundAssignOp::ShrAssign if !is_float => 9,
-            // 浮点不应出现位运算；若出现则回退 noop
+            // Floats must not perform bitwise ops; if one appears, fall back to noop.
             _ => return CF_NOOP,
         };
         ComputeFnId(base + offset)
     }
 
-    /// 注册占位子图（节点范围待编译后填充）。
+    /// Register a placeholder subgraph (node range is filled in after compilation).
     pub fn register_subgraph_placeholder(
         &mut self,
         _name: &str,
@@ -498,12 +550,12 @@ impl<'a> IrBuilder<'a> {
         id
     }
 
-    /// 编译表达式为 Node，返回其 NodeId。
+    /// Compile an expression into a Node and return its NodeId.
     pub fn compile_expr(&mut self, expr_id: crate::ast::Ast::ExprId) -> NodeId {
         let spanned = self.current_module().arena.expr(expr_id);
         let expr = &spanned.node;
         match expr {
-            // 常量
+            // Constants
             crate::ast::Ast::Expr::IntLit { .. }
             | crate::ast::Ast::Expr::FloatLit { .. }
             | crate::ast::Ast::Expr::BoolLit(_)
@@ -512,12 +564,15 @@ impl<'a> IrBuilder<'a> {
             | crate::ast::Ast::Expr::NullLit
             | crate::ast::Ast::Expr::VoidLit => self.compile_const_with_value(expr_id),
 
-            // 变量引用
+            // Variable reference
             crate::ast::Ast::Expr::Ident(name) => match self.lookup_var(name) {
                 Some(node_id) => {
-                    // 当 current_effect 存在时，创建 CF_SEQ 依赖节点确保变量读取在前序副作用完成后执行。
-                    // 这防止表达式在 while/loop 等子图的 WriteBack 更新变量值之前读取旧值。
-                    // 与 compile_global_load 的 current_effect 依赖机制一致。
+                    // When `current_effect` exists, create a CF_SEQ dependency node to ensure the
+                    // variable read executes only after prior side effects complete.
+                    // This prevents an expression from reading a stale value before a WriteBack in
+                    // a while/loop subgraph updates it.
+                    // Consistent with the `current_effect` dependency mechanism in
+                    // `compile_global_load`.
                     match self.current_effect {
                         Some(eff) => self.chain_effects(Some(eff), node_id),
                         None => node_id,
@@ -526,10 +581,12 @@ impl<'a> IrBuilder<'a> {
                 None => match self.lookup_global_var(name) {
                     Some(slot) => self.compile_global_load(slot),
                     None => {
-                        // nullary ADT/类型构造器检测：当 Ident 既非局部变量也非全局变量，
-                        // 检查是否为无参构造器（如 `Lt`/`Leaf`/`Red`），编译为无参构造节点。
-                        // 有参构造器（field_names 非空）不在此处理（应走 Call 路径带参数）。
-                        // Newtype 总有 inner 值，不可能是 nullary。
+                        // Nullary ADT / type constructor detection: when an Ident is neither a
+                        // local nor a global variable, check whether it is a nullary constructor
+                        // (e.g. `Lt`/`Leaf`/`Red`) and compile it as a nullary construct node.
+                        // Parameterized constructors (non-empty `field_names`) are not handled
+                        // here (they go through the `Call` path with arguments).
+                        // A newtype always has an inner value, so it can never be nullary.
                         let tf_info = self.lookup_constructor_field_names(name)
                             .or_else(|| self.lookup_type_field_names(name));
                         match tf_info {
@@ -555,14 +612,15 @@ impl<'a> IrBuilder<'a> {
                 },
             },
 
-            // 二元运算
+            // Binary operations
             crate::ast::Ast::Expr::Binary { op, lhs, rhs } => {
                 self.compile_binary(*op, expr_id, *lhs, *rhs)
             }
 
-            // 函数调用
+            // Function call
             crate::ast::Ast::Expr::Call { callee, args, type_args } => {
-                // __cast_to<T>(x) / __cast_try_to<T>(x)：根据源/目标类型映射到具体 cast 函数
+                // __cast_to<T>(x) / __cast_try_to<T>(x): map to a concrete cast function based on
+                // source/target types.
                 if let crate::ast::Ast::Expr::Ident(name) = &self.current_module().arena.expr(*callee).node {
                     if matches!(*name, "__cast_to" | "__cast_try_to") {
                         return self.compile_cast_call(*name, args, type_args.as_deref());
@@ -574,11 +632,11 @@ impl<'a> IrBuilder<'a> {
                 self.compile_method_call(expr_id, *recv, method, args)
             }
 
-            // 字段访问
+            // Field access
             crate::ast::Ast::Expr::FieldAccess { recv, field } => {
                 self.compile_field_access(expr_id, *recv, field)
             }
-            // 安全字段访问 recv?.field：编译为普通字段访问 + safe 标记
+            // Safe field access `recv?.field`: compiled as a normal field access + safe flag.
             crate::ast::Ast::Expr::SafeAccess { recv, field } => {
                 let node = self.compile_field_access(expr_id, *recv, field);
                 self.graph.set_safe_op(node);
@@ -586,25 +644,25 @@ impl<'a> IrBuilder<'a> {
             }
             crate::ast::Ast::Expr::Index { recv, index } => self.compile_index(*recv, *index),
 
-            // Block 表达式
+            // Block expression
             crate::ast::Ast::Expr::Block { stmts, trailing } => self.compile_block(stmts, trailing),
 
-            // If 表达式 → Gate 节点 + 分支子图
+            // If expression -> Gate node + branch subgraphs
             crate::ast::Ast::Expr::If {
                 cond,
                 then_branch,
                 else_branch,
             } => self.compile_if(*cond, *then_branch, *else_branch),
 
-            // Match 表达式 → Gate 链
+            // Match expression -> Gate chain
             crate::ast::Ast::Expr::Match { scrutinee, arms } => {
                 self.compile_match(*scrutinee, arms)
             }
 
-            // 记录构造
+            // Record construction
             crate::ast::Ast::Expr::RecordLit(fields) => self.compile_record_lit(expr_id, fields),
 
-            // Lambda 表达式 → 闭包子图 + 闭包构造节点
+            // Lambda expression -> closure subgraph + closure construct node
             crate::ast::Ast::Expr::Lambda { params, body, is_async, .. } => {
                 let body_expr = match body {
                     crate::ast::Ast::LambdaBody::Block(e) | crate::ast::Ast::LambdaBody::Expression(e) => *e,
@@ -612,15 +670,16 @@ impl<'a> IrBuilder<'a> {
                 self.compile_lambda(params, body_expr, *is_async, None, Some(expr_id))
             }
 
-            // 数组构造
+            // Array construction
             crate::ast::Ast::Expr::ArrayLit { elements, .. } => {
                 self.compile_array_lit(expr_id, elements)
             }
 
-            // 赋值表达式：target = value
-            // 用于 defer body 等表达式上下文中的赋值。
-            // 与 Stmt::Assignment 的 Ident 逻辑保持一致：
-            //   捕获变量 → WriteBack；外层变量 → WriteBack；全局变量 → global_store；本地 → bind_var
+            // Assignment expression: `target = value`.
+            // Used for assignments in expression contexts such as defer bodies.
+            // Consistent with the `Ident` logic of `Stmt::Assignment`:
+            //   captured variable -> WriteBack; outer variable -> WriteBack;
+            //   global variable -> global_store; local -> bind_var.
             crate::ast::Ast::Expr::Assign { target, value } => {
                 let raw_val = self.compile_subexpr(*value);
                 let val_node = self.chain_effects(self.current_effect, raw_val);
@@ -665,7 +724,7 @@ impl<'a> IrBuilder<'a> {
                         });
                         self.graph.set_field_set_name(set_node, field.to_string());
                     }
-                    // recv?.field = value：obj 为 null 时跳过赋值
+                    // `recv?.field = value`: skip the assignment when `obj` is null.
                     crate::ast::Ast::Expr::SafeAccess { recv: obj, field } => {
                         let obj_node = self.compile_subexpr(*obj);
                         let off = self.graph.inputs_pool.push(&[obj_node, val_node]);
@@ -694,7 +753,7 @@ impl<'a> IrBuilder<'a> {
                 self.compile_void_const()
             }
 
-            // 复合赋值：target op= value
+            // Compound assignment: `target op= value`
             crate::ast::Ast::Expr::CompoundAssign { op, target, value } => {
                 let val_node = self.compile_subexpr(*value);
                 let target_expr = &self.current_module().arena.expr(*target).node;
@@ -717,7 +776,7 @@ impl<'a> IrBuilder<'a> {
                     crate::ast::Ast::Expr::FieldAccess { recv: obj, field }
                     | crate::ast::Ast::Expr::SafeAccess { recv: obj, field } => {
                         let obj_node = self.compile_subexpr(*obj);
-                        // 读当前字段值
+                        // Read the current field value.
                         let get_off = self.graph.inputs_pool.push(&[obj_node]);
                         let get_node = self.graph.add_node(Node {
                             kind: NodeKind::FieldAccess,
@@ -725,7 +784,7 @@ impl<'a> IrBuilder<'a> {
                             inputs_offset: get_off,
                             compute_fn: CF_RECORD_FIELD_GET, // record_field_get
                         });
-                        // 运算
+                        // Operation.
                         let bin_off = self.graph.inputs_pool.push(&[get_node, val_node]);
                         let result_node = self.graph.add_node(Node {
                             kind: NodeKind::BinOp,
@@ -733,7 +792,7 @@ impl<'a> IrBuilder<'a> {
                             inputs_offset: bin_off,
                             compute_fn: bin_compute,
                         });
-                        // 写回
+                        // Write back.
                         let set_off = self.graph.inputs_pool.push(&[obj_node, result_node]);
                         let set_node = self.graph.add_node(Node {
                             kind: NodeKind::BinOp,
@@ -744,10 +803,10 @@ impl<'a> IrBuilder<'a> {
                         self.graph.set_field_set_name(set_node, field.to_string());
                         result_node
                     }
-                    // `*ref op= value` → 读 Cell + 运算 + 写回 Cell
+                    // `*ref op= value` -> read Cell + operation + write back to Cell.
                     crate::ast::Ast::Expr::Deref(ref_inner) => {
                         let ref_node = self.compile_subexpr(*ref_inner);
-                        // 读当前值：compute_deref_read(281)
+                        // Read the current value: compute_deref_read (281).
                         let read_off = self.graph.inputs_pool.push(&[ref_node]);
                         let read_node = self.graph.add_node(Node {
                             kind: NodeKind::UnOp,
@@ -755,7 +814,7 @@ impl<'a> IrBuilder<'a> {
                             inputs_offset: read_off,
                             compute_fn: CF_DEREF_READ,
                         });
-                        // 运算
+                        // Operation.
                         let bin_off = self.graph.inputs_pool.push(&[read_node, val_node]);
                         let result_node = self.graph.add_node(Node {
                             kind: NodeKind::BinOp,
@@ -763,7 +822,7 @@ impl<'a> IrBuilder<'a> {
                             inputs_offset: bin_off,
                             compute_fn: bin_compute,
                         });
-                        // 写回 Cell：compute_deref_write(282)
+                        // Write back to Cell: compute_deref_write (282).
                         let write_off = self.graph.inputs_pool.push(&[ref_node, result_node]);
                         let _write_node = self.graph.add_node(Node {
                             kind: NodeKind::BinOp,
@@ -777,10 +836,10 @@ impl<'a> IrBuilder<'a> {
                 }
             }
 
-            // select 表达式 → Gate 节点（compute_select_gate）+ 每分支独立子图
+            // select expression -> Gate node (compute_select_gate) + an independent subgraph per branch.
             crate::ast::Ast::Expr::Select(arms) => self.compile_select(arms),
 
-            // `?` 运算符（Propagate）：解包 Throw，Err 时提前返回
+            // `?` operator (Propagate): unwraps a Throw; on Err, returns early.
             crate::ast::Ast::Expr::Propagate(inner) => {
                 let inner_node = self.compile_subexpr(*inner);
                 let inputs_offset = self.graph.inputs_pool.push(&[inner_node]);
@@ -793,7 +852,7 @@ impl<'a> IrBuilder<'a> {
                 n
             }
 
-            // 一元运算：!（逻辑非）、-（算术取负）、~（按位取反）
+            // Unary operations: `!` (logical not), `-` (arithmetic negation), `~` (bitwise not).
             crate::ast::Ast::Expr::Unary { op, operand } => {
                 let operand_node = self.compile_subexpr(*operand);
                 let inputs_offset = self.graph.inputs_pool.push(&[operand_node]);
@@ -804,19 +863,20 @@ impl<'a> IrBuilder<'a> {
                     inputs_offset,
                     compute_fn,
                 });
-                // 编译期标记 SIMD 批量化：Neg/BitNot + 标量类型
+                // Compile-time SIMD batching tag: Neg/BitNot + scalar type.
                 if let Some(info) = self.unary_batch_info(*op, *operand) {
                     self.graph.set_batch_info(node, info);
                 }
                 node
             }
 
-            // 字符串插值："text {expr} more {expr}" → 链式 str_concat
+            // String interpolation: `"text {expr} more {expr}"` -> chained `str_concat`.
             crate::ast::Ast::Expr::StrInterp(parts) => {
                 self.compile_str_interp(parts)
             }
 
-            // 取引用 `&expr` → compute_ref_of(280)：标量包装进 Cell，堆对象共享 Arc
+            // Take a reference `&expr` -> `compute_ref_of` (280): scalars are boxed into a Cell;
+            // heap objects share an Arc.
             crate::ast::Ast::Expr::RefOf(inner) => {
                 let inner_node = self.compile_subexpr(*inner);
                 let inputs_offset = self.graph.inputs_pool.push(&[inner_node]);
@@ -828,7 +888,8 @@ impl<'a> IrBuilder<'a> {
                 })
             }
 
-            // 解引用读取 `*ref` → compute_deref_read(281)：Cell 返回内部值，其他 Ref 透传
+            // Dereference read `*ref` -> `compute_deref_read` (281): returns the inner value for a
+            // Cell; other Ref types pass through.
             crate::ast::Ast::Expr::Deref(inner) => {
                 let inner_node = self.compile_subexpr(*inner);
                 let inputs_offset = self.graph.inputs_pool.push(&[inner_node]);
@@ -840,7 +901,8 @@ impl<'a> IrBuilder<'a> {
                 })
             }
 
-            // 非空断言 `expr!` → compute_non_null_assert(279)：Null panic，非 Null 透传
+            // Non-null assertion `expr!` -> `compute_non_null_assert` (279): panics on Null;
+            // non-Null passes through.
             crate::ast::Ast::Expr::NonNullAssert(inner) => {
                 let inner_node = self.compile_subexpr(*inner);
                 let inputs_offset = self.graph.inputs_pool.push(&[inner_node]);
@@ -852,7 +914,7 @@ impl<'a> IrBuilder<'a> {
                 })
             }
 
-            // Elvis：lhs ?: rhs → compute_elvis（idx 265）
+            // Elvis: `lhs ?: rhs` -> `compute_elvis` (idx 265).
             crate::ast::Ast::Expr::Elvis { lhs, rhs } => {
                 let lhs_node = self.compile_subexpr(*lhs);
                 let rhs_node = self.compile_subexpr(*rhs);
@@ -865,42 +927,45 @@ impl<'a> IrBuilder<'a> {
                 })
             }
 
-            // 安全方法调用 recv?.method(args)：编译为普通方法调用 + safe 标记
+            // Safe method call `recv?.method(args)`: compiled as a normal method call + safe flag.
             crate::ast::Ast::Expr::SafeMethodCall { recv, method, args, .. } => {
                 let node = self.compile_method_call(expr_id, *recv, method, args);
                 self.graph.set_safe_op(node);
                 node
             }
 
-            // 记录扩展 `(...base, field: value, ...)` → base + updates 输入节点 + RecordExtendInfo
+            // Record extension `(...base, field: value, ...)` -> base + updates input nodes +
+            // RecordExtendInfo.
             crate::ast::Ast::Expr::RecordExtend { base, updates } => {
                 self.compile_record_extend(*base, updates)
             }
 
-            // 原子构造 `atomic expr` → 单输入节点包装为 AtomicValue
+            // Atomic construction `atomic expr` -> single-input node wrapping into an AtomicValue.
             crate::ast::Ast::Expr::Atomic(operand) => self.compile_atomic(*operand),
 
-            // inline_trait 表达式 → 每方法编译子图 + TraitValue 构造节点
+            // inline_trait expression -> per-method compiled subgraph + TraitValue construct node.
             crate::ast::Ast::Expr::InlineTrait(methods) => self.compile_inline_trait(expr_id, methods),
 
-            // lazy 表达式 → thunk 子图 + LazyValue 构造节点
+            // lazy expression -> thunk subgraph + LazyValue construct node.
             crate::ast::Ast::Expr::Lazy(operand) => self.compile_lazy(expr_id, *operand),
 
-            // 切片 `recv[start..end]` / `recv[start..=end]` → 三输入节点 + inclusive 标志
+            // Slice `recv[start..end]` / `recv[start..=end]` -> three-input node + inclusive flag.
             crate::ast::Ast::Expr::Slice { recv, start, end, inclusive } => {
                 self.compile_slice(*recv, *start, *end, *inclusive)
             }
         }
     }
 
-    /// 编译子表达式（非尾位置）。
+    /// Compile a sub-expression (not in tail position).
     ///
-    /// 操作数、函数参数、if 条件、字段访问基础值等子表达式的值会被父表达式
-    /// 消费而非直接作为函数返回值，因此一律不在尾位置：编译前关闭
-    /// in_tail_position，编译后恢复。这样子表达式内的 Call 不会被误标为
-    /// 尾调用（否则 switch_subgraph 帧复用会切走当前帧，破坏父表达式对其余
-    /// 子表达式/运算节点的执行，如 fib(n-1)+fib(n-2) 中 fib(n-1) 误标尾调用
-    /// 会导致 fib(n-2) 与加法节点永不执行）。
+    /// The value of a sub-expression (operand, function argument, `if` condition, field-access
+    /// base, etc.) is consumed by its parent expression rather than returned directly as the
+    /// function result, so it is never in tail position: `in_tail_position` is turned off before
+    /// compilation and restored afterwards. This prevents a `Call` inside a sub-expression from
+    /// being mis-tagged as a tail call (otherwise `switch_subgraph` frame reuse would swap away
+    /// the current frame, breaking the parent expression's execution of the remaining
+    /// sub-expressions / operation nodes; e.g. in `fib(n-1)+fib(n-2)`, mis-tagging `fib(n-1)` as
+    /// a tail call would cause `fib(n-2)` and the addition node to never execute).
     fn compile_subexpr(&mut self, expr_id: crate::ast::Ast::ExprId) -> NodeId {
         let prev_tail = self.in_tail_position;
         self.in_tail_position = false;
@@ -909,7 +974,7 @@ impl<'a> IrBuilder<'a> {
         node
     }
 
-    /// 编译常量表达式（无输入）。
+    /// Compile a constant expression (no inputs).
     fn compile_const(&mut self) -> NodeId {
         let inputs_offset = self.graph.inputs_pool.push(&[]);
         self.graph.add_node(Node {
@@ -920,7 +985,7 @@ impl<'a> IrBuilder<'a> {
         })
     }
 
-    /// 编译 void 常量节点（return/break/continue 无值时用）。
+    /// Compile a void constant node (used when `return`/`break`/`continue` has no value).
     fn compile_void_const(&mut self) -> NodeId {
         let inputs_offset = self.graph.inputs_pool.push(&[]);
         let n = self.graph.add_node(Node {
@@ -933,7 +998,7 @@ impl<'a> IrBuilder<'a> {
         n
     }
 
-    /// 编译带原始值的常量表达式，填充 const_values。
+    /// Compile a constant expression carrying a raw value, populating `const_values`.
     fn compile_const_with_value(&mut self, expr_id: crate::ast::Ast::ExprId) -> NodeId {
         let inputs_offset = self.graph.inputs_pool.push(&[]);
         let node_id = self.graph.add_node(Node {
@@ -954,19 +1019,22 @@ impl<'a> IrBuilder<'a> {
         node_id
     }
 
-    /// 从 AST 表达式解析常量值。
+    /// Parse a constant value from an AST expression.
     ///
-    /// 返回值语义：
-    /// - `Ok(Some(cv))`：合法常量字面量，已通过类型范围检查
-    /// - `Ok(None)`：非常量表达式（如变量引用），无法折叠为常量
-    /// - `Err(msg)`：常量字面量解析失败（语法错误或超出目标类型范围）
+    /// Return value semantics:
+    /// - `Ok(Some(cv))`: a valid constant literal that passed type-range checks.
+    /// - `Ok(None)`: a non-constant expression (e.g. a variable reference) that cannot be folded
+    ///   into a constant.
+    /// - `Err(msg)`: constant-literal parsing failed (syntax error or value out of target-type
+    ///   range).
     fn parse_const_value(&mut self, expr_id: crate::ast::Ast::ExprId) -> Result<Option<ConstValue>, String> {
         let spanned = self.current_module().arena.expr(expr_id);
         let span = spanned.span;
         match &spanned.node {
             crate::ast::Ast::Expr::IntLit { raw, suffix } => {
-                // suffix 优先；无 suffix 时参考 sema 推断的类型选择对应整数 ConstValue，
-                // 确保字面量的运行时 tag 与上下文类型一致
+                // Suffix takes priority; when absent, consult the type inferred by sema to pick
+                // the corresponding integer ConstValue, ensuring the literal's runtime tag matches
+                // the contextual type.
                 let ty = suffix
                     .map(|s| s.to_string())
                     .or_else(|| self.expr_type_name(expr_id).map(|s| s.to_string()));
@@ -976,22 +1044,25 @@ impl<'a> IrBuilder<'a> {
                         "internal: missing ExprInfo for int literal expr {:?}", expr_id)),
                 };
 
-                // u128 范围 (0..=2^128-1) 超出 i128，直接用 u128::from_str_radix 解析。
-                // 与浮点 suffix 分派同理：u128 是唯一超出 i128 表示范围的整数类型，
-                // 独立解析路径是数学必然，非特例判断。
+                // The u128 range (0..=2^128-1) exceeds i128, so parse directly with
+                // `u128::from_str_radix`.
+                // As with float-suffix dispatch, u128 is the only integer type whose range
+                // exceeds i128; the dedicated parse path is mathematically necessary, not a
+                // special-case judgement.
                 if ty_name == "u128" {
                     let v = parse_int_to_u128(raw, span)?;
                     return Ok(Some(ConstValue::U128(v)));
                 }
 
-                // 解析整数：支持 0x/0o/0b 前缀 + 下划线分隔符
+                // Parse the integer: supports 0x/0o/0b prefixes and underscore separators.
                 let v = parse_int_to_i128(raw, span)?;
 
-                // 范围检查 + 类型转换（通用方法，通过宏统一所有整数类型）
+                // Range check + type conversion (generic approach, unified for all integer types
+                // via a macro).
                 Ok(Some(check_int_range(v, ty_name, raw, span)?))
             }
             crate::ast::Ast::Expr::FloatLit { raw, suffix } => {
-                // 去除下划线分隔符（Rust parse 不接受下划线）
+                // Strip underscore separators (Rust's `parse` does not accept underscores).
                 let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
                 let is_hex = cleaned.starts_with("0x") || cleaned.starts_with("0X");
                 let cv = match suffix {
@@ -1034,7 +1105,7 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    /// 编译占位节点（本阶段未实现的 Expr 变体）。
+    /// Compile a placeholder node (for Expr variants not yet implemented at this stage).
     fn compile_placeholder(&mut self) -> NodeId {
         let inputs_offset = self.graph.inputs_pool.push(&[]);
         self.graph.add_node(Node {
@@ -1045,23 +1116,29 @@ impl<'a> IrBuilder<'a> {
         })
     }
 
-    /// 编译 If 表达式为 Gate 节点 + 两个分支子图。
+    /// Compile an `If` expression into a Gate node + two branch subgraphs.
     ///
-    /// cond 编译为条件节点，then/else 各编译为独立子图。
-    /// Gate 节点的 condition_input 指向 cond 节点，branches 携带分支子图 id。
-    /// 分支子图无参数（闭包变量捕获留到后续阶段）。
+    /// `cond` is compiled into a condition node; `then`/`else` are each compiled into independent
+    /// subgraphs.
+    /// The Gate node's `condition_input` points to the cond node, and `branches` carries the
+    /// branch subgraph ids.
+    /// Branch subgraphs take no parameters (closure variable capture is deferred to a later
+    /// stage).
     fn compile_if(
         &mut self,
         cond: crate::ast::Ast::ExprId,
         then_branch: crate::ast::Ast::ExprId,
         else_branch: Option<crate::ast::Ast::ExprId>,
     ) -> NodeId {
-        // 条件不在尾位置：其值仅供 Gate 选择分支，而非直接返回。
-        // 分支结果表达式则继承当前尾位置（if 表达式的值=选中分支的值）。
+        // The condition is not in tail position: its value only selects a branch for the Gate
+        // rather than being returned directly.
+        // The branch result expressions inherit the current tail position (the value of the `if`
+        // expression equals the value of the selected branch).
         let cond_node = self.compile_subexpr(cond);
-        // 保存 current_effect：分支编译（compile_branch_subgraph）不恢复 current_effect，
-        // else 分支中的副作用（如非尾递归拦截的 barrier）会泄漏到 Gate 的 effect 依赖，
-        // 导致 Gate 等待 barrier 就绪而无法在 base case 路径完成。
+        // Save `current_effect`: branch compilation (`compile_branch_subgraph`) does not restore
+        // `current_effect`, so side effects in the else branch (e.g. a non-tail-recursion
+        // interception barrier) would leak into the Gate's effect dependency, causing the Gate
+        // to wait for the barrier to become ready and prevent completion along the base-case path.
         let prev_effect = self.current_effect;
         self.current_effect = None;
         let (then_sg, then_inputs) = self.compile_branch_subgraph(then_branch);
@@ -1070,8 +1147,9 @@ impl<'a> IrBuilder<'a> {
             None => (self.compile_void_subgraph(), Vec::new()),
         };
         self.current_effect = prev_effect;
-        // Gate 依赖 cond_node（条件值）和 current_effect（effect 链前序副作用），
-        // 确保 Gate 在前序语句（如 println）完成后才执行。
+        // The Gate depends on `cond_node` (the condition value) and `current_effect` (the prior
+        // side effects in the effect chain), ensuring the Gate executes only after prior
+        // statements (e.g. `println`) complete.
         let gate_inputs: Vec<NodeId> = match self.current_effect {
             Some(eff) => vec![cond_node, eff],
             None => vec![cond_node],
@@ -1096,35 +1174,44 @@ impl<'a> IrBuilder<'a> {
         gate_node
     }
 
-    /// 编译分支表达式为子图（If 的 then/else 分支、Match arm body、Defer body）。
+    /// Compile a branch expression into a subgraph (an `If` then/else branch, a Match arm body,
+    /// or a defer body).
     ///
-    /// 分支子图在独立子帧中执行，无法直接访问父帧的值表。
-    /// 因此需要捕获分支表达式中的自由变量（引用外层作用域的标识符）：
-    /// 1. 收集表达式中的所有标识符
-    /// 2. 过滤出在当前作用域栈中已绑定的（即外层变量）
-    /// 3. 在子图开头创建捕获节点（Const 占位），运行时由 Gate/defer 注入值
-    /// 4. 将捕获名绑定到捕获节点，使编译体引用捕获节点而非外层节点
+    /// A branch subgraph executes in an independent child frame and cannot directly access the
+    /// parent frame's value table.
+    /// Therefore, the free variables in the branch expression (identifiers referencing outer
+    /// scopes) must be captured:
+    /// 1. Collect all identifiers within the expression.
+    /// 2. Filter out those already bound in the current scope stack (i.e. outer variables).
+    /// 3. Create capture nodes at the start of the subgraph (Const placeholders); at runtime
+    ///    the Gate/defer injects the values.
+    /// 4. Bind the captured names to the capture nodes, so the compiled body references the
+    ///    capture nodes rather than the outer nodes.
     ///
-    /// 返回 (子图 id, 捕获的外层节点列表)。
-    /// 调用方将外层节点列表作为 GateBranches.branch_inputs 传递，
-    /// Gate 节点在启动子图时通过 start_subgraph 注入捕获值。
+    /// Returns `(subgraph id, list of captured outer nodes)`.
+    /// The caller passes the outer-node list as `GateBranches.branch_inputs`; the Gate node
+    /// injects the captured values via `start_subgraph` when launching the subgraph.
     fn compile_branch_subgraph(&mut self, expr: crate::ast::Ast::ExprId) -> (SubGraphId, Vec<NodeId>) {
         let node_start = self.graph.nodes.len() as u32;
 
-        // 帧链穿透（root_frame_ptr）使分支子图可直接引用外层节点，
-        // 无需 capture 机制（不创建局部副本，赋值通过 WriteBack 写回根帧）。
-        // branch_inputs 为空：Gate 不注入参数，分支内节点通过 get_value_by_global
-        // 帧链回溯读取外层变量。
+        // Frame-chain passthrough (`root_frame_ptr`) lets the branch subgraph directly reference
+        // outer nodes without a capture mechanism (no local copy is created; assignments write
+        // back to the root frame via WriteBack).
+        // `branch_inputs` is empty: the Gate injects no arguments; nodes inside the branch read
+        // outer variables via `get_value_by_global` frame-chain backtracking.
         self.enter_scope();
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
 
-        // 记录编译前函数子图的 event_source_decls 长度。
-        // 编译分支体期间 build_await_node 会把 EventSourceDecl 注册到 current_function_sg
-        // （函数子图），但运行时 compute_await 用 frame.subgraph_id（分支子图）查找——
-        // 分支子图的 event_source_decls 为空导致 fallback 到 AsyncJoin，使 channel.recv /
-        // timer.await 被误判为 async join（Bug #24）。编译后将新增 decls 迁移到分支子图。
-        // 嵌套分支正确：内层分支编译时先 drain 自己的 decls，外层 drain 时只剩自己的。
+        // Record the length of the function subgraph's `event_source_decls` before compilation.
+        // While compiling the branch body, `build_await_node` registers EventSourceDecls into
+        // `current_function_sg` (the function subgraph), but at runtime `compute_await` looks
+        // them up using `frame.subgraph_id` (the branch subgraph) -- the branch subgraph's empty
+        // `event_source_decls` causes a fallback to AsyncJoin, misclassifying `channel.recv` /
+        // `timer.await` as async join (Bug #24). After compilation, the newly added decls are
+        // migrated into the branch subgraph.
+        // Nested branches are handled correctly: an inner branch drains its own decls first, so
+        // by the time an outer branch drains, only its own remain.
         let prev_decl_count = self.current_function_sg
             .and_then(|sg_id| self.graph.subgraphs.get(sg_id.0 as usize))
             .map(|sg| sg.event_source_decls.len())
@@ -1137,7 +1224,8 @@ impl<'a> IrBuilder<'a> {
         let node_end = self.graph.nodes.len() as u32;
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
 
-        // 将编译分支体期间新增的 event_source_decls 从函数子图迁移到分支子图
+        // Migrate the event_source_decls newly added while compiling the branch body from the
+        // function subgraph into the branch subgraph.
         let branch_decls: Vec<_> = if let Some(func_sg_id) = self.current_function_sg {
             if let Some(func_sg) = self.graph.subgraphs.get_mut(func_sg_id.0 as usize) {
                 func_sg.event_source_decls.drain(prev_decl_count..).collect()
@@ -1170,7 +1258,7 @@ impl<'a> IrBuilder<'a> {
         (sg_id, Vec::new())
     }
 
-    /// 编译 void 子图（无 else 分支时用）。
+    /// Compile a void subgraph (used when there is no `else` branch).
     fn compile_void_subgraph(&mut self) -> SubGraphId {
         let inputs_offset = self.graph.inputs_pool.push(&[]);
         let node = self.graph.add_node(Node {
@@ -1203,20 +1291,23 @@ impl<'a> IrBuilder<'a> {
         sg_id
     }
 
-    /// 编译 select 表达式。
+    /// Compile a `select` expression.
     ///
-    /// 每个 SelectArm 编译为独立子图（含事件源检查 + body）。
-    /// Gate 节点（compute_select_gate）选第一个就绪分支：有就绪分支 → 启动该分支子图；
-    /// 无就绪分支 → 帧挂起，注册所有事件源等待，任一事件到达时唤醒重新检查。
+    /// Each `SelectArm` is compiled into an independent subgraph (event-source check + body).
+    /// The Gate node (`compute_select_gate`) selects the first ready branch: if a ready branch
+    /// exists, it launches that branch's subgraph; if none is ready, the frame suspends,
+    /// registers all event sources to wait, and wakes up to re-check when any event arrives.
     fn compile_select(&mut self, arms: &[crate::ast::Ast::SelectArm<'_>]) -> NodeId {
         let mut branches = Vec::with_capacity(arms.len());
 
         for arm in arms {
             let (event_kind, event_source_node, body_expr) = match arm {
                 crate::ast::Ast::SelectArm::Receive { channel_expr, body, .. } => {
-                    // channel_expr 形如 `ch.recv()`：编译时需取 recv 的 receiver（channel 值），
-                    // 而非整个方法调用（recv() 返回接收的值，非 channel 本身）。
-                    // 通过 sema method_dispatches 的 intrinsic 标记判定（消除字符串守卫）。
+                    // `channel_expr` is of the form `ch.recv()`: at compile time we must take the
+                    // receiver of `recv` (the channel value), not the entire method call
+                    // (`recv()` returns the received value, not the channel itself).
+                    // Determined via the intrinsic flag in sema's `method_dispatches` (eliminates
+                    // string guards).
                     let ch_node = match &self.current_module().arena.expr(*channel_expr).node {
                         crate::ast::Ast::Expr::MethodCall { recv, .. } => {
                             let key = crate::sema::Sema::module_expr_key(
@@ -1242,7 +1333,8 @@ impl<'a> IrBuilder<'a> {
                 }
             };
 
-            // 为每个分支创建子图：先注册占位（node_range 待编译后回填）
+            // Create a subgraph for each branch: register a placeholder first (node_range is
+            // back-filled after compilation).
             let node_start = self.graph.nodes.len() as u32;
             let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
             self.graph.add_subgraph(SubGraph {
@@ -1269,7 +1361,7 @@ impl<'a> IrBuilder<'a> {
             self.current_function_sg = Some(sg_id);
             self.enter_scope();
 
-            // 编译 body（body 中的变量绑定在子图作用域内）
+            // Compile the body (variable bindings inside the body live in the subgraph scope).
             let result_node = self.compile_expr(body_expr);
 
             self.exit_scope();
@@ -1287,9 +1379,9 @@ impl<'a> IrBuilder<'a> {
             });
         }
 
-        // 创建 Gate 节点（select 的核心：选第一个就绪分支）
-        // Gate 依赖所有分支的 event_source_node + current_effect，
-        // 确保在所有事件源（channel/timer）求值完成后才检查就绪状态。
+        // Create the Gate node (the core of `select`: choose the first ready branch).
+        // The Gate depends on every branch's `event_source_node` + `current_effect`, ensuring
+        // readiness is checked only after all event sources (channel/timer) are evaluated.
         let mut gate_inputs: Vec<NodeId> = branches.iter().map(|b| b.event_source_node).collect();
         if let Some(eff) = self.current_effect {
             gate_inputs.push(eff);
@@ -1306,13 +1398,17 @@ impl<'a> IrBuilder<'a> {
         gate_node
     }
 
-    /// 编译 Lambda 表达式为闭包子图 + 闭包构造节点。
+    /// Compile a `Lambda` expression into a closure subgraph + closure construct node.
     ///
-    /// 追加参数模型：捕获变量追加到子图参数列表末尾。
-    /// - 子图 param_count = lambda 参数数 + 捕获变量数
-    /// - 子图前 N 个节点 = lambda 参数节点，后续 = 捕获 upvalue 参数节点
-    /// - 当前作用域创建闭包构造节点（compute_fn 40），inputs = 捕获值节点
-    /// - Lambda 表达式的值 = 闭包构造节点（运行时产出 Closure 堆对象）
+    /// Appended-parameter model: captured variables are appended to the end of the subgraph's
+    /// parameter list.
+    /// - Subgraph `param_count` = lambda parameter count + captured-variable count.
+    /// - The first N nodes of the subgraph are lambda parameter nodes; the rest are captured
+    ///   upvalue parameter nodes.
+    /// - A closure construct node (`compute_fn` 40) is created in the current scope; its inputs
+    ///   are the captured value nodes.
+    /// - The value of the Lambda expression is the closure construct node (at runtime it produces
+    ///   a Closure heap object).
     fn compile_lambda(
         &mut self,
         params: &[crate::ast::Ast::Param<'_>],
@@ -1321,15 +1417,18 @@ impl<'a> IrBuilder<'a> {
         fn_name: Option<&str>,
         lambda_expr_id: Option<crate::ast::Ast::ExprId>,
     ) -> NodeId {
-        // 1. 自由变量分析：收集 body 中引用的外层变量（排除 lambda 自身参数）
+        // 1. Free-variable analysis: collect outer variables referenced in the body (excluding the
+        //    lambda's own parameters).
         let param_names: rustc_hash::FxHashSet<&str> =
             params.iter().map(|p| p.name).collect();
         let mut ident_names: Vec<String> = Vec::new();
         self.collect_free_idents_expr(body_expr, &mut ident_names);
         let mut captured: Vec<(String, NodeId)> = Vec::new();
 
-        // 自引用检测：命名函数在 body 中引用自身 → 作为 upvalue 占位
-        // 运行时 compute_closure_call 将闭包值注入该 slot，支持递归调用
+        // Self-reference detection: a named function that references itself in its body becomes an
+        // upvalue placeholder.
+        // At runtime `compute_closure_call` injects the closure value into that slot, enabling
+        // recursive calls.
         let self_upvalue_idx = if let Some(fname) = fn_name {
             if !param_names.contains(fname)
                 && ident_names.iter().any(|n| n == fname)
@@ -1349,15 +1448,17 @@ impl<'a> IrBuilder<'a> {
             if param_names.contains(ident.as_str()) {
                 continue;
             }
-            // 跳过自引用名（已作为占位 upvalue 添加）
+            // Skip the self-reference name (already added as a placeholder upvalue).
             if Some(ident.as_str()) == fn_name && self_upvalue_idx >= 0 {
                 continue;
             }
             if let Some(node) = self.lookup_var(ident) {
                 if !captured.iter().any(|(n, _)| n == ident) {
-                    // 如果变量已被外层 lambda 捕获，使用外层的原始节点。
-                    // 这确保 WriteBack target 指向最外层定义节点（根帧），
-                    // 而非中间 lambda 的 upvalue 参数节点（中间帧拷贝）。
+                    // If the variable has already been captured by an outer lambda, use the outer
+                    // original node.
+                    // This ensures the WriteBack target points to the outermost defining node (root
+                    // frame), not an intermediate lambda's upvalue parameter node (an
+                    // intermediate-frame copy).
                     let outer_node = self.captured_scopes.iter().rev()
                         .find_map(|scope| scope.iter()
                             .find(|(n, _)| n.as_str() == ident.as_str())
@@ -1370,12 +1471,13 @@ impl<'a> IrBuilder<'a> {
 
         let param_count = (params.len() + captured.len()) as u8;
 
-        // 2. 注册占位子图（节点范围待编译后填充）
+        // 2. Register a placeholder subgraph (node range is filled in after compilation).
         let sg_id = self.register_subgraph_placeholder("", param_count, is_async);
         let node_start = self.graph.nodes.len() as u32;
 
-        // 3. 进入 lambda 作用域：先创建 lambda 参数节点，再创建捕获 upvalue 参数节点，
-        //    全部 bind_var（捕获节点在 lambda 作用域内遮蔽外层同名绑定）
+        // 3. Enter the lambda scope: create lambda parameter nodes first, then captured upvalue
+        //    parameter nodes, and `bind_var` all of them (capture nodes shadow outer bindings of
+        //    the same name within the lambda scope).
         self.enter_scope();
         for param in params {
             let inputs_offset = self.graph.inputs_pool.push(&[]);
@@ -1398,18 +1500,25 @@ impl<'a> IrBuilder<'a> {
             self.bind_var(name, upvalue_node);
         }
 
-        // 4. 编译 body 得到返回节点
-        //    设置 current_sg_start = node_start 使 is_in_current_subgraph 正确识别
-        //    lambda 内节点（含 upvalue 占位节点），避免捕获变量赋值误走本地路径。
-        //    重置 current_effect = None 隔离 lambda 体与外层 effect 链，确保
-        //    无 trailing 表达式时 block 返回 lambda 内新建的 void_const 而非外层 effect 节点。
-        //    压入 captured_scopes 使 Assignment 能识别捕获变量并创建 WriteBack。
+        // 4. Compile the body to obtain the return node.
+        //    Set `current_sg_start = node_start` so `is_in_current_subgraph` correctly
+        //    identifies nodes inside the lambda (including upvalue placeholder nodes), preventing
+        //    captured-variable assignments from taking the local path by mistake.
+        //    Reset `current_effect = None` to isolate the lambda body from the outer effect chain,
+        //    ensuring that a block with no trailing expression returns the `void_const` created
+        //    inside the lambda rather than an outer effect node.
+        //    Push onto `captured_scopes` so that `Assignment` can recognize captured variables
+        //    and create WriteBacks.
 
-        // 逃逸分析（Bug #41 + Bug #40 循环捕获）：
-        // 消费 analyzer 的统一逃逸表，IR 不再做平行逃逸分析。
-        // 1. 尾位置逃逸（Bug #41）：lambda 在 enclosing 函数的尾位置 → 定义帧在函数返回后销毁
-        // 2. 循环体捕获逃逸（Bug #40）：lambda 捕获了循环体局部变量 → 循环体帧销毁后访问 null
-        // 两种情况都需分配独立 function_id，走跨函数 Cell 路径持久化 upvalue。
+        // Escape analysis (Bug #41 + Bug #40 loop capture):
+        // Consume the analyzer's unified escape table; the IR performs no parallel escape
+        // analysis.
+        // 1. Tail-position escape (Bug #41): a lambda at the tail position of its enclosing
+        //    function -> the defining frame is destroyed after the function returns.
+        // 2. Loop-body capture escape (Bug #40): a lambda captures a loop-body local variable
+        //    -> after the loop-body frame is destroyed, the access reads null.
+        // Both cases require allocating an independent `function_id` and taking the cross-function
+        // Cell path to persist the upvalue.
         let escapes = lambda_expr_id.is_some_and(|id| {
             self.current_analysis()
                 .map_or(false, |r| {
@@ -1428,20 +1537,24 @@ impl<'a> IrBuilder<'a> {
         self.current_sg_start = node_start;
         let prev_effect = self.current_effect;
         self.current_effect = None;
-        // 设置 current_function_sg 使 defer 语句能注册到 lambda 子图的 defer_table。
-        // 不设置时 defer body 会丢失（current_function_sg 为 None 或指向外层函数）。
+        // Set `current_function_sg` so defer statements can register into the lambda subgraph's
+        // `defer_table`.
+        // If left unset, defer bodies would be lost (`current_function_sg` would be `None` or point
+        // to the outer function).
         let prev_func_sg = self.current_function_sg;
         self.current_function_sg = Some(sg_id);
-        // 逃逸 lambda 使用独立 function_id，使 body 内子图（if-else/match 分支等）
-        // 继承此 id，与 enclosing function 区分 → 跨函数 Cell 路径。
+        // Escaping lambdas use an independent `function_id` so that subgraphs inside the body
+        // (if-else/match branches, etc.) inherit this id and are distinguished from the enclosing
+        // function -> cross-function Cell path.
         let prev_func_id = self.current_function_id;
         if escapes {
             self.current_function_id = sg_id.0;
         }
         self.captured_scopes.push(captured.clone());
 
-        // 统一入口：memoize/tail_rec/non_tail_rec 对闭包同样生效
-        // （lambda 不在 call_graph，lookup_memo_strategy 返回 None → 走默认 compile_expr）
+        // Unified entry: memoize/tail_rec/non_tail_rec apply equally to closures
+        // (the lambda is not in the call_graph, so `lookup_memo_strategy` returns None -> the
+        // default `compile_expr` path is taken).
         let lambda_name = fn_name.unwrap_or("");
         let return_node = self.compile_function_body(lambda_name, None, body_expr, params, false);
 
@@ -1452,12 +1565,15 @@ impl<'a> IrBuilder<'a> {
         self.captured_scopes.pop();
         self.exit_scope();
 
-        // 5. 更新子图 node_range + return_node + function_id + upvalue 元数据
-        // function_id：逃逸 lambda 用独立 id（sg_id.0），非逃逸 lambda 继承外层 id。
-        // - 逃逸：same_function=false → 跨函数 Cell 路径（定义帧已销毁，Cell 持久化 upvalue）
-        // - 非逃逸：same_function=true → 帧链路径（定义帧存活，共享状态）
-        // upvalue_count + upvalue_outer_nodes 供 start_subgraph 在 same_function
-        // 调用时注入当前父帧值（引用捕获语义）。
+        // 5. Update the subgraph's node_range + return_node + function_id + upvalue metadata.
+        // `function_id`: escaping lambdas use an independent id (`sg_id.0`); non-escaping lambdas
+        // inherit the outer id.
+        // - Escaping: `same_function=false` -> cross-function Cell path (defining frame destroyed;
+        //   Cell persists the upvalue).
+        // - Non-escaping: `same_function=true` -> frame-chain path (defining frame alive; shared
+        //   state).
+        // `upvalue_count` + `upvalue_outer_nodes` are used by `start_subgraph` to inject the
+        // current parent-frame values on `same_function` calls (capture-by-reference semantics).
         let node_end = self.graph.nodes.len() as u32;
         let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
         sg.node_range = (NodeId(node_start), NodeId(node_end));
@@ -1468,13 +1584,15 @@ impl<'a> IrBuilder<'a> {
         sg.upvalue_count = captured.len() as u8;
         sg.upvalue_outer_nodes = captured.iter().map(|(_, n)| *n).collect();
 
-        // 注册被捕获的变量到 captured_vars：外层 Assignment 对这些变量赋值时
-        // 需生成 WriteBack 到原始节点，使 same_function 闭包调用能读到最新值。
+        // Register captured variables into `captured_vars`: when an outer `Assignment` assigns to
+        // one of these variables, it must emit a WriteBack to the original node, so a
+        // `same_function` closure call reads the latest value.
         for (name, node) in &captured {
             self.captured_vars.entry(name.clone()).or_insert(*node);
         }
 
-        // 6. 在当前作用域创建闭包构造节点（inputs = 捕获值外层节点，compute_fn 40）
+        // 6. Create the closure construct node in the current scope (inputs = captured outer
+        //    nodes, `compute_fn` 40).
         let upvalue_nodes: Vec<NodeId> = captured.iter().map(|(_, n)| *n).collect();
         let inputs_offset = self.graph.inputs_pool.push(&upvalue_nodes);
         let construct_node = self.graph.add_node(Node {
@@ -1494,21 +1612,23 @@ impl<'a> IrBuilder<'a> {
         construct_node
     }
 
-    /// 编译 inline_trait 表达式：每个方法编译为子图（含 upvalues 捕获），
-    /// 构造 TraitValue 构造节点（compute_fn=266），运行时打包多个 Closure。
+    /// Compile an `inline_trait` expression: each method is compiled into a subgraph (with upvalue
+    /// captures), and a TraitValue construct node (`compute_fn=266`) is created that at runtime
+    /// packs the closures together.
     ///
-    /// 方法子图的编译参考 compile_lambda：自由变量分析 → 占位子图 →
-    /// 进入作用域（参数 + upvalues）→ 编译方法体 → 填充 node_range。
-    /// 所有方法的 upvalues 依次拼接为构造节点的 inputs。
+    /// Method-subgraph compilation mirrors `compile_lambda`: free-variable analysis ->
+    /// placeholder subgraph -> enter scope (params + upvalues) -> compile body -> fill
+    /// `node_range`.
+    /// The upvalues of all methods are concatenated in order as the construct node's inputs.
     fn compile_inline_trait(&mut self, expr_id: crate::ast::Ast::ExprId, methods: &[crate::ast::Ast::MethodDecl<'_>]) -> NodeId {
-        // 推断 trait 名（从 sema.expr_types 拿 Ty::TraitObject）
+        // Infer the trait name (from `sema.expr_types` as `Ty::TraitObject`).
         let trait_name = self.expr_type_name(expr_id)
             .map(|s| s.to_string())
             .unwrap_or_else(|| "Unknown".to_string());
 
-        // 按 trait_def.methods 声明顺序重排 inline_trait 方法，
-        // 确保 method_values[i] 对应 trait_def.methods[i]，
-        // 使 vtable 能用 method_idx 位置索引分派（Task 10）。
+        // Reorder the `inline_trait` methods by the declaration order in `trait_def.methods`,
+        // ensuring `method_values[i]` corresponds to `trait_def.methods[i]`, so the vtable can
+        // dispatch by `method_idx` positional index (Task 10).
         let method_order: Vec<usize> = if let Some(trait_def) = self.sema.get_trait_def(&trait_name) {
             let mut order: Vec<usize> = (0..methods.len()).collect();
             order.sort_by_key(|&i| {
@@ -1537,7 +1657,8 @@ impl<'a> IrBuilder<'a> {
                 }
             };
 
-            // 1. 自由变量分析：收集 body 中引用的外层变量（排除方法自身参数）
+            // 1. Free-variable analysis: collect outer variables referenced in the body (excluding
+            //    the method's own parameters).
             let param_names: rustc_hash::FxHashSet<&str> =
                 m.params.iter().map(|p| p.name).collect();
             let mut ident_names: Vec<String> = Vec::new();
@@ -1556,11 +1677,11 @@ impl<'a> IrBuilder<'a> {
 
             let param_count = (m.params.len() + captured.len()) as u8;
 
-            // 2. 注册占位子图
+            // 2. Register a placeholder subgraph.
             let sg_id = self.register_subgraph_placeholder("", param_count, m.is_async);
             let node_start = self.graph.nodes.len() as u32;
 
-            // 3. 进入方法作用域：参数节点 + upvalue 节点
+            // 3. Enter the method scope: parameter nodes + upvalue nodes.
             self.enter_scope();
             for param in &m.params {
                 let inputs_offset = self.graph.inputs_pool.push(&[]);
@@ -1583,8 +1704,9 @@ impl<'a> IrBuilder<'a> {
                 self.bind_var(name, upvalue_node);
             }
 
-            // 4. 编译方法体
-            //    设置 current_sg_start + 重置 current_effect + 压入 captured_scopes（与 compile_lambda 一致）
+            // 4. Compile the method body.
+            //    Set `current_sg_start` + reset `current_effect` + push `captured_scopes`
+            //    (consistent with `compile_lambda`).
             let prev_sg_start = self.current_sg_start;
             self.current_sg_start = node_start;
             let prev_effect = self.current_effect;
@@ -1598,7 +1720,7 @@ impl<'a> IrBuilder<'a> {
             self.captured_scopes.pop();
             self.exit_scope();
 
-            // 5. 填充子图 node_range + upvalue 元数据
+            // 5. Fill in the subgraph's `node_range` + upvalue metadata.
             let node_end = self.graph.nodes.len() as u32;
             let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
             sg.node_range = (NodeId(node_start), NodeId(node_end));
@@ -1608,7 +1730,7 @@ impl<'a> IrBuilder<'a> {
             sg.upvalue_count = captured.len() as u8;
             sg.upvalue_outer_nodes = captured.iter().map(|(_, n)| *n).collect();
 
-            // 6. 收集 upvalue 节点 + 记录方法信息
+            // 6. Collect upvalue nodes + record method info.
             let upvalue_count = captured.len() as u8;
             for (_, n) in &captured {
                 all_upvalue_nodes.push(*n);
@@ -1621,7 +1743,8 @@ impl<'a> IrBuilder<'a> {
             });
         }
 
-        // 构造 TraitValue 构造节点（inputs = 所有方法 upvalues 依次拼接）
+        // Construct the TraitValue construct node (inputs = the concatenated upvalues of all
+        // methods).
         let inputs_offset = self.graph.inputs_pool.push(&all_upvalue_nodes);
         let construct_node = self.graph.add_node(Node {
             kind: NodeKind::BinOp,
@@ -1640,14 +1763,17 @@ impl<'a> IrBuilder<'a> {
         construct_node
     }
 
-    /// 编译 lazy 表达式：operand 编译为无参数 thunk 子图，
-    /// 构造 LazyValue 构造节点（compute_fn=267），运行时创建未求值的 LazyValue。
+    /// Compile a `lazy` expression: the operand is compiled into a zero-parameter thunk
+    /// subgraph, and a LazyValue construct node (`compute_fn=267`) is created that at runtime
+    /// produces an unevaluated LazyValue.
     ///
-    /// thunk 子图捕获外层自由变量（与 lambda 相同的捕获机制），
-    /// 首次 force 时启动子图计算，结果缓存供后续 force 复用。
+    /// The thunk subgraph captures outer free variables (the same capture mechanism as for
+    /// lambdas). On the first force it launches the subgraph to compute the value; the result is
+    /// cached for reuse by subsequent forces.
     fn compile_lazy(&mut self, expr_id: crate::ast::Ast::ExprId, operand: crate::ast::Ast::ExprId) -> NodeId {
-        let _ = expr_id; // trait_name 推断暂不需要，保留参数供未来 force 语义使用
-        // 1. 自由变量分析
+        let _ = expr_id; // trait_name inference is not yet needed; the parameter is retained for
+                         // future force semantics.
+        // 1. Free-variable analysis.
         let mut ident_names: Vec<String> = Vec::new();
         self.collect_free_idents_expr(operand, &mut ident_names);
         let mut captured: Vec<(String, NodeId)> = Vec::new();
@@ -1661,11 +1787,11 @@ impl<'a> IrBuilder<'a> {
 
         let param_count = captured.len() as u8;
 
-        // 2. 注册占位子图（thunk：无显式参数，仅 upvalues）
+        // 2. Register a placeholder subgraph (thunk: no explicit parameters, only upvalues).
         let sg_id = self.register_subgraph_placeholder("", param_count, false);
         let node_start = self.graph.nodes.len() as u32;
 
-        // 3. 进入 thunk 作用域：upvalue 节点
+        // 3. Enter the thunk scope: upvalue nodes.
         self.enter_scope();
         for (name, _outer_node) in &captured {
             let inputs_offset = self.graph.inputs_pool.push(&[]);
@@ -1678,11 +1804,11 @@ impl<'a> IrBuilder<'a> {
             self.bind_var(name, upvalue_node);
         }
 
-        // 4. 编译 operand 得到返回节点
+        // 4. Compile the operand to obtain the return node.
         let return_node = self.compile_expr(operand);
         self.exit_scope();
 
-        // 5. 填充子图 node_range
+        // 5. Fill in the subgraph's `node_range`.
         let node_end = self.graph.nodes.len() as u32;
         let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
         sg.node_range = (NodeId(node_start), NodeId(node_end));
@@ -1690,7 +1816,7 @@ impl<'a> IrBuilder<'a> {
         sg.return_node = return_node;
         sg.has_suspend = false;
 
-        // 6. 构造 LazyValue 构造节点（inputs = upvalues）
+        // 6. Construct the LazyValue construct node (inputs = upvalues).
         let upvalue_nodes: Vec<NodeId> = captured.iter().map(|(_, n)| *n).collect();
         let inputs_offset = self.graph.inputs_pool.push(&upvalue_nodes);
         let construct_node = self.graph.add_node(Node {
@@ -1706,10 +1832,11 @@ impl<'a> IrBuilder<'a> {
         construct_node
     }
 
-    /// 递归收集表达式中的所有 Ident 名称（去重，保留首次出现顺序）。
+    /// Recursively collect all Ident names in an expression (deduplicated, preserving
+    /// first-occurrence order).
     ///
-    /// 简化版自由变量分析：遍历常见 Expr 变体收集标识符引用，
-    /// 由调用方排除 lambda 参数并检查外层作用域绑定。
+    /// A simplified free-variable analysis: traverse common Expr variants collecting identifier
+    /// references; the caller excludes lambda parameters and checks outer-scope bindings.
     fn collect_free_idents_expr(&self, expr_id: crate::ast::Ast::ExprId, names: &mut Vec<String>) {
         use crate::ast::Ast::LambdaBody;
         let spanned = self.current_module().arena.expr(expr_id);
@@ -1793,7 +1920,7 @@ impl<'a> IrBuilder<'a> {
                     self.collect_free_idents_expr(arm.body, names);
                 }
             }
-            // 单 operand 表达式：RefOf/Deref/Propagate/NonNullAssert/Atomic/Lazy
+            // Single-operand expressions: RefOf/Deref/Propagate/NonNullAssert/Atomic/Lazy.
             crate::ast::Ast::Expr::RefOf(inner)
             | crate::ast::Ast::Expr::Deref(inner)
             | crate::ast::Ast::Expr::Propagate(inner)
@@ -1802,32 +1929,32 @@ impl<'a> IrBuilder<'a> {
             | crate::ast::Ast::Expr::Lazy(inner) => {
                 self.collect_free_idents_expr(*inner, names);
             }
-            // Elvis：lhs ?: rhs
+            // Elvis: `lhs ?: rhs`.
             crate::ast::Ast::Expr::Elvis { lhs, rhs } => {
                 self.collect_free_idents_expr(*lhs, names);
                 self.collect_free_idents_expr(*rhs, names);
             }
-            // 切片：recv[start..end]（inclusive 不影响 ident 收集）
+            // Slice: `recv[start..end]` (`inclusive` does not affect ident collection).
             crate::ast::Ast::Expr::Slice { recv, start, end, .. } => {
                 self.collect_free_idents_expr(*recv, names);
                 self.collect_free_idents_expr(*start, names);
                 self.collect_free_idents_expr(*end, names);
             }
-            // 安全方法调用：recv?.method(args)
+            // Safe method call: `recv?.method(args)`.
             crate::ast::Ast::Expr::SafeMethodCall { recv, args, .. } => {
                 self.collect_free_idents_expr(*recv, names);
                 for &a in args {
                     self.collect_free_idents_expr(a, names);
                 }
             }
-            // 记录扩展：{ base with x: 1, ... }
+            // Record extension: `{ base with x: 1, ... }`.
             crate::ast::Ast::Expr::RecordExtend { base, updates } => {
                 self.collect_free_idents_expr(*base, names);
                 for f in updates {
                     self.collect_free_idents_expr(f.value, names);
                 }
             }
-            // 数组字面量的 fill 子句：[value, ..count]
+            // Array literal `fill` clause: `[value, ..count]`.
             crate::ast::Ast::Expr::ArrayLit { elements, fill } => {
                 for &e in elements {
                     self.collect_free_idents_expr(e, names);
@@ -1837,7 +1964,7 @@ impl<'a> IrBuilder<'a> {
                     self.collect_free_idents_expr(*c, names);
                 }
             }
-            // 字符串插值：可能含 {expr}
+            // String interpolation: may contain `{expr}`.
             crate::ast::Ast::Expr::StrInterp(parts) => {
                 for part in parts {
                     if let crate::ast::Ast::InterpolationPart::Expression(e) = part {
@@ -1845,7 +1972,7 @@ impl<'a> IrBuilder<'a> {
                     }
                 }
             }
-            // select 表达式：每分支含 channel_expr/duration + body
+            // select expression: each branch contains channel_expr/duration + body.
             crate::ast::Ast::Expr::Select(arms) => {
                 for arm in arms {
                     match arm {
@@ -1860,7 +1987,7 @@ impl<'a> IrBuilder<'a> {
                     }
                 }
             }
-            // inline_trait：方法体内可能引用外层变量
+            // inline_trait: method bodies may reference outer variables.
             crate::ast::Ast::Expr::InlineTrait(methods) => {
                 for m in methods {
                     if let Some(body_expr) = m.body {
@@ -1868,12 +1995,13 @@ impl<'a> IrBuilder<'a> {
                     }
                 }
             }
-            // 常量/无子表达式变体：IntLit/FloatLit/BoolLit/CharLit/StrLit/NullLit/VoidLit
+            // Constant / no-subexpression variants: IntLit/FloatLit/BoolLit/CharLit/StrLit/NullLit/VoidLit.
             _ => {}
         }
     }
 
-    /// 递归收集语句中的 Ident 名称（collect_free_idents_expr 的语句版本）。
+    /// Recursively collect Ident names in a statement (statement version of
+    /// `collect_free_idents_expr`).
     fn collect_free_idents_stmt(&self, stmt_id: crate::ast::Ast::StmtId, names: &mut Vec<String>) {
         let spanned = self.current_module().arena.stmt(stmt_id);
         match &spanned.node {
@@ -1928,10 +2056,11 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    /// 创建序列节点：等待 prev_effect 完成后返回 current_node 的值。
+    /// Create a sequence node: after `prev_effect` completes, returns `current_node`'s value.
     ///
-    /// 用于语句顺序链接：确保 prev_effect 执行完毕后才执行后续依赖 current_node 的节点。
-    /// compute_seq (idx 48) 取所有输入，返回最后一个输入的值。
+    /// Used for statement-order chaining: ensures nodes depending on `current_node` execute only
+    /// after `prev_effect` completes.
+    /// `compute_seq` (idx 48) takes all inputs and returns the value of the last input.
     fn chain_effects(&mut self, prev: Option<NodeId>, current: NodeId) -> NodeId {
         match prev {
             Some(prev_node) => {
@@ -1947,14 +2076,16 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    /// 创建指向 `target_sg` 的 Call 节点（无输入依赖，立即就绪）。
+    /// Create a Call node targeting `target_sg` (no input dependency; immediately ready).
     ///
-    /// 用于循环的初始调用与 continue 跳转。
+    /// Used for the initial call of a loop and for `continue` jumps.
     fn compile_recursive_call(&mut self, target_sg: SubGraphId) -> NodeId {
-        // 追加 current_effect 作为隐式依赖（与 compile_call 一致），
-        // 确保 while/loop 的递归 Call 在前序语句（如数组字面量）完成后才执行。
-        // 否则 Call 节点无输入依赖，可能在 arr 值就绪前启动子图帧，
-        // 导致帧无法复制 arr 的 Ref 值，循环体内 arr[0] 返回 <non-scalar>。
+        // Append `current_effect` as an implicit dependency (consistent with `compile_call`),
+        // ensuring the while/loop recursive Call executes only after prior statements (e.g. an
+        // array literal) complete.
+        // Otherwise the Call node has no input dependency and could launch the subgraph frame
+        // before the `arr` value is ready, preventing the frame from copying `arr`'s Ref value
+        // and causing `arr[0]` inside the loop body to return `<non-scalar>`.
         let mut inputs: Vec<NodeId> = Vec::new();
         if let Some(eff) = self.current_effect {
             inputs.push(eff);
@@ -1971,7 +2102,7 @@ impl<'a> IrBuilder<'a> {
         call_node
     }
 
-    /// 创建指向 `target_sg` 的 Call 节点，传入指定参数节点。
+    /// Create a Call node targeting `target_sg`, passing the given argument nodes.
     fn make_call(&mut self, target_sg: SubGraphId, arg_nodes: &[NodeId]) -> NodeId {
         let inputs_offset = self.graph.inputs_pool.push(arg_nodes);
         let call_node = self.graph.add_node(Node {
@@ -1984,7 +2115,7 @@ impl<'a> IrBuilder<'a> {
         call_node
     }
 
-    /// 创建指向函数名的 Call 节点（通过 func_subgraphs 查找目标）。
+    /// Create a Call node targeting a function name (looked up via `func_subgraphs`).
     fn make_call_by_name(&mut self, name: &str, arg_nodes: &[NodeId]) -> NodeId {
         let inputs_offset = self.graph.inputs_pool.push(arg_nodes);
         let call_node = self.graph.add_node(Node {
@@ -1999,10 +2130,11 @@ impl<'a> IrBuilder<'a> {
         call_node
     }
 
-    /// 创建 vtable 动态分派 Call 节点（trait 值的方法调用）。
+    /// Create a vtable dynamic-dispatch Call node (method call on a trait value).
     ///
-    /// 与 make_call_by_name 区别：目标子图 id 运行时从 TraitVal 的 vtable 查询，
-    /// 而非编译期绑定。用于 For 循环 iterable 是 trait 值（Iterator<T>）时。
+    /// Unlike `make_call_by_name`: the target subgraph id is looked up at runtime from the
+    /// TraitVal's vtable rather than bound at compile time. Used when a For-loop iterable is a
+    /// trait value (`Iterator<T>`).
     fn make_vtable_call(&mut self, recv_node: NodeId, trait_name: &str, method_name: &str) -> NodeId {
         let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
         let call_node = self.graph.add_node(Node {
@@ -2023,11 +2155,12 @@ impl<'a> IrBuilder<'a> {
         call_node
     }
 
-    /// 从 Sema 查询表达式的类型信息（用于 For 循环分派决策）。
-    /// 返回 (类型名, 是否为 trait 对象)：
-    /// - (Some("RangeIterator"), false) → 静态分派 "RangeIterator.next"
-    /// - (Some("Iterator"), true) → vtable 动态分派（inline_trait 值）
-    /// - (None, false) → 类型推断失败，走 vtable 兜底
+    /// Look up an expression's type information from sema (used for For-loop dispatch
+    /// decisions).
+    /// Returns `(type name, is_trait_object)`:
+    /// - `(Some("RangeIterator"), false)` -> static dispatch to `"RangeIterator.next"`.
+    /// - `(Some("Iterator"), true)` -> vtable dynamic dispatch (an inline_trait value).
+    /// - `(None, false)` -> type inference failed; fall back to vtable dispatch.
     fn lookup_expr_iter_info(&self, expr: crate::ast::Ast::ExprId) -> (Option<String>, bool) {
         let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr.0 as u64);
         if let Some(info) = self.sema.expr_types.get(&key) {
@@ -2036,20 +2169,25 @@ impl<'a> IrBuilder<'a> {
         (None, false)
     }
 
-    /// 注册 For 循环子图（递归子图，param_count=1 接收迭代器）。
+    /// Register the For-loop subgraph (a recursive subgraph; `param_count=1` to receive the
+    /// iterator).
     ///
-    /// 结构：
-    /// - for_sg (param_count=1): 接收迭代器
-    ///   - param_0 = 迭代器
-    ///   - next_call = Call("Iterator.next", [param_0])  // 返回 T?
-    ///   - is_null_node = UnOp(is_null, [next_call])
-    ///   - body_sg (param_count=2): 迭代器 + 当前值（bind name, 编译 body, 尾递归 for_sg）
-    ///   - void_sg (param_count=0): 退出
-    ///   - gate = Gate(is_null_node): true→void_sg(退出), false→body_sg(继续)
+    /// Structure:
+    /// - `for_sg` (`param_count=1`): receives the iterator.
+    ///   - `param_0` = iterator.
+    ///   - `next_call` = `Call("Iterator.next", [param_0])` // returns `T?`.
+    ///   - `is_null_node` = `UnOp(is_null, [next_call])`.
+    ///   - `body_sg` (`param_count=2`): iterator + current value (bind name, compile body,
+    ///     tail-recurses into `for_sg`).
+    ///   - `void_sg` (`param_count=0`): exit.
+    ///   - `gate` = `Gate(is_null_node)`: `true` -> `void_sg` (exit), `false` -> `body_sg`
+    ///     (continue).
     ///
-    /// 执行：next() 返回非 null → body_sg 执行后尾递归 for_sg；返回 null → void_sg 退出。
-    /// Break 信号终止 body_sg 帧 → Gate 完成 → for_sg 结束。
-    /// Continue 编译为 Call(for_sg, [iter_param]) + Return 信号 → 尾递归下一轮。
+    /// Execution: `next()` returns non-null -> `body_sg` executes and then tail-recurses into
+    /// `for_sg`; returns null -> `void_sg` exits.
+    /// A Break signal terminates the `body_sg` frame -> the Gate completes -> `for_sg` ends.
+    /// Continue is compiled as `Call(for_sg, [iter_param]) + Return` signal -> tail-recurses
+    /// into the next iteration.
     fn register_for_subgraph(
         &mut self,
         name: &str,
@@ -2059,7 +2197,7 @@ impl<'a> IrBuilder<'a> {
     ) -> SubGraphId {
         let node_start = self.graph.nodes.len() as u32;
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
-        // 占位注册（先占 id，便于递归引用）
+        // Placeholder registration (reserve the id first to allow recursive references).
         self.graph.add_subgraph(SubGraph {
             id: sg_id,
             node_range: (NodeId(node_start), NodeId(node_start)),
@@ -2080,7 +2218,7 @@ impl<'a> IrBuilder<'a> {
             reset_plan: None,
         });
 
-        // param_0 = 迭代器
+        // param_0 = iterator.
         let iter_off = self.graph.inputs_pool.push(&[]);
         let iter_param = self.graph.add_node(Node {
             kind: NodeKind::Const,
@@ -2089,10 +2227,11 @@ impl<'a> IrBuilder<'a> {
             compute_fn: CF_NOOP,
         });
 
-        // next_call = Call("{iter_type_name}.next", [iter_param]) → T?
-        // 动态分派：is_trait_object=true 时走 vtable（运行时从 TraitVal 查 next）
-        // 静态分派：具体类型按类型名 mangled 绑定（如 "ArrayIter.next"）
-        // 兜底：类型推断失败（None）走 vtable
+        // next_call = Call("{iter_type_name}.next", [iter_param]) -> T?
+        // Dynamic dispatch: when `is_trait_object=true`, go through the vtable (look up `next` at
+        // runtime from the TraitVal).
+        // Static dispatch: concrete types are bound by mangled type name (e.g. "ArrayIter.next").
+        // Fallback: type inference failed (None) -> vtable dispatch.
         let next_call = if is_trait_object || iter_type_name.is_none() {
             let trait_name = iter_type_name.as_deref().unwrap_or("Iterator");
             self.make_vtable_call(iter_param, trait_name, "next")
@@ -2101,7 +2240,7 @@ impl<'a> IrBuilder<'a> {
             self.make_call_by_name(&next_method, &[iter_param])
         };
 
-        // is_null_node = UnOp(is_null, [next_call])
+        // is_null_node = UnOp(is_null, [next_call]).
         let is_null_off = self.graph.inputs_pool.push(&[next_call]);
         let is_null_node = self.graph.add_node(Node {
             kind: NodeKind::UnOp,
@@ -2110,18 +2249,20 @@ impl<'a> IrBuilder<'a> {
             compute_fn: CF_IS_NULL, // is_null
         });
 
-        // body_sg (param_count=2: 迭代器 + 当前值)
-        // 重置 current_effect = None（同 register_while_subgraph，避免循环体帧
-        // reset_loop_iteration 后外部 effect 依赖导致死锁）
+        // body_sg (param_count=2: iterator + current value).
+        // Reset `current_effect = None` (same as `register_while_subgraph`, to avoid an
+        // external effect dependency causing a deadlock after `reset_loop_iteration` of the
+        // loop-body frame).
         let prev_effect = self.current_effect;
         self.current_effect = None;
         let body_sg = self.compile_for_body_subgraph(body, sg_id, name);
 
-        // void_sg (退出)
+        // void_sg (exit).
         let void_sg = self.compile_void_subgraph();
         self.current_effect = prev_effect;
 
-        // gate = Gate(is_null_node): true→void_sg, false→body_sg(inputs=[iter_param, next_call])
+        // gate = Gate(is_null_node): true -> void_sg, false -> body_sg (inputs=[iter_param,
+        // next_call]).
         let gate_off = self.graph.inputs_pool.push(&[is_null_node]);
         let gate_node = self.graph.add_node(Node {
             kind: NodeKind::Gate,
@@ -2156,11 +2297,12 @@ impl<'a> IrBuilder<'a> {
         sg_id
     }
 
-    /// 编译 For 循环体子图（param_count=2: 迭代器 + 当前值）。
+    /// Compile the For-loop body subgraph (`param_count=2`: iterator + current value).
     ///
-    /// - param_0 = 迭代器（尾递归用）
-    /// - param_1 = 当前值（绑定到循环变量 name）
-    /// - 编译 body，末尾尾递归 Call(for_sg, [param_0])（依赖 body_last 保证顺序）
+    /// - `param_0` = iterator (for tail recursion).
+    /// - `param_1` = current value (bound to the loop variable `name`).
+    /// - Compiles `body`; at the end emits a tail-recursive `Call(for_sg, [param_0])` (depends
+    ///   on `body_last` to preserve ordering).
     fn compile_for_body_subgraph(
         &mut self,
         body: crate::ast::Ast::ExprId,
@@ -2169,7 +2311,7 @@ impl<'a> IrBuilder<'a> {
     ) -> SubGraphId {
         let node_start = self.graph.nodes.len() as u32;
 
-        // param_0 = 迭代器（body_sg 内的节点，由 Gate branch inputs 注入）
+        // param_0 = iterator (a node inside body_sg, injected by the Gate branch inputs).
         let iter_off = self.graph.inputs_pool.push(&[]);
         let iter_param = self.graph.add_node(Node {
             kind: NodeKind::Const,
@@ -2178,7 +2320,7 @@ impl<'a> IrBuilder<'a> {
             compute_fn: CF_NOOP,
         });
 
-        // param_1 = 当前值（绑定到循环变量 name）
+        // param_1 = current value (bound to the loop variable `name`).
         let val_off = self.graph.inputs_pool.push(&[]);
         let val_param = self.graph.add_node(Node {
             kind: NodeKind::Const,
@@ -2203,7 +2345,8 @@ impl<'a> IrBuilder<'a> {
         self.loop_stack.pop();
         self.exit_scope();
 
-        // 去尾递归：return_node = body_last，帧复用由 Engine 侧 reset_loop_iteration 处理
+        // Tail-recursion eliminated: `return_node = body_last`; frame reuse is handled by the
+        // Engine's `reset_loop_iteration`.
         let node_end = self.graph.nodes.len() as u32;
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
@@ -2228,16 +2371,21 @@ impl<'a> IrBuilder<'a> {
         sg_id
     }
 
-    /// 注册 While 循环子图（递归子图）。
+    /// Register the While-loop subgraph (a recursive subgraph).
     ///
-    /// 结构：
-    /// - cond_node = compile_expr(condition)
-    /// - gate_node = Gate(cond): true → body_sg(尾递归), false → void_sg(退出)
-    /// - body_sg: 编译 body，末尾 Call 回 while_sg（依赖 body 末尾节点保证顺序）
+    /// Structure:
+    /// - `cond_node` = `compile_expr(condition)`.
+    /// - `gate_node` = `Gate(cond)`: `true` -> `body_sg` (tail recursion), `false` -> `void_sg`
+    ///   (exit).
+    /// - `body_sg`: compiles `body`; at the end emits a `Call` back to `while_sg` (depends on
+    ///   the body's trailing node to preserve ordering).
     ///
-    /// 执行：cond 为 true 时 body_sg 执行后尾递归 while_sg；false 时 void_sg 退出。
-    /// Break 信号终止 body_sg 帧 → while_sg 的 Gate 完成 → 循环结束。
-    /// Continue 编译为 Call(while_sg) + Return 信号 → 尾递归下一轮（跳过 body 剩余）。
+    /// Execution: when `cond` is true, `body_sg` executes and then tail-recurses into
+    /// `while_sg`; when false, `void_sg` exits.
+    /// A Break signal terminates the `body_sg` frame -> `while_sg`'s Gate completes -> the loop
+    /// ends.
+    /// Continue is compiled as `Call(while_sg) + Return` signal -> tail-recurses into the next
+    /// iteration (skipping the rest of the body).
     fn register_while_subgraph(
         &mut self,
         condition: crate::ast::Ast::ExprId,
@@ -2245,7 +2393,7 @@ impl<'a> IrBuilder<'a> {
     ) -> SubGraphId {
         let node_start = self.graph.nodes.len() as u32;
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
-        // 占位注册（先占 id，便于递归引用）
+        // Placeholder registration (reserve the id first to allow recursive references).
         self.graph.add_subgraph(SubGraph {
             id: sg_id,
             node_range: (NodeId(node_start), NodeId(node_start)),
@@ -2266,20 +2414,22 @@ impl<'a> IrBuilder<'a> {
             reset_plan: None,
         });
 
-        // 编译 condition
-        // 重置 current_effect = None，避免在循环子图内创建依赖外部 effect 链的 CF_SEQ 节点。
-        // 循环体帧经 reset_loop_iteration 后值表被清空，外部 effect 节点不会重新复制，
-        // 依赖它们的 CF_SEQ 节点会永久 pending 导致死锁。
+        // Compile the condition.
+        // Reset `current_effect = None` to avoid creating CF_SEQ nodes inside the loop subgraph
+        // that depend on the external effect chain.
+        // After `reset_loop_iteration`, the loop-body frame's value table is cleared and external
+        // effect nodes are not re-copied; CF_SEQ nodes depending on them would stay pending
+        // forever, causing a deadlock.
         let prev_effect = self.current_effect;
         self.current_effect = None;
         let cond_node = self.compile_subexpr(condition);
-        // body 子图（末尾尾递归调用 while_sg）
+        // body subgraph (trailing tail-recursive call to while_sg).
         let body_sg = self.compile_loop_body_subgraph(body, sg_id);
-        // void 子图（false 分支，循环结束）
+        // void subgraph (false branch; loop ends).
         let void_sg = self.compile_void_subgraph();
         self.current_effect = prev_effect;
 
-        // Gate 节点：cond true → body_sg, false → void_sg
+        // Gate node: cond true -> body_sg, false -> void_sg.
         let gate_off = self.graph.inputs_pool.push(&[cond_node]);
         let gate_node = self.graph.add_node(Node {
             kind: NodeKind::Gate,
@@ -2313,14 +2463,16 @@ impl<'a> IrBuilder<'a> {
         sg_id
     }
 
-    /// 查询当前函数/方法的 memo 策略（通用入口，统一 FuncId 查询）。
+    /// Look up the memo strategy for the current function/method (generic entry point, unified
+    /// `FuncId` query).
     ///
-    /// 通过 mangled 名查 CallGraph.name_to_func 获取 FuncId：
-    /// - FunDecl / lambda / monomorph 实例：self_type = None，mangled = name
-    /// - 方法：self_type = Some(type_name)，mangled = "{type_name}.{name}"
+    /// Obtains the `FuncId` by looking up the mangled name in `CallGraph.name_to_func`:
+    /// - FunDecl / lambda / monomorph instance: `self_type = None`, mangled = name.
+    /// - Method: `self_type = Some(type_name)`, mangled = `"{type_name}.{name}"`.
     ///
-    /// mangled 名格式与 build_call_graph 注册方法时一致（"Type.method"）。
-    /// memo_pass 已做唯一决策，一个函数最多有一个 strategy。
+    /// The mangled-name format matches how methods are registered in `build_call_graph`
+    /// (`"Type.method"`).
+    /// `memo_pass` already makes the unique decision; a function has at most one strategy.
     fn lookup_memo_strategy(
         &self,
         name: &str,
@@ -2337,16 +2489,18 @@ impl<'a> IrBuilder<'a> {
             .map(|c| c.strategy.clone())
     }
 
-    /// 统一的函数体编译入口：查询 memo 策略并分派到对应的编译路径。
+    /// Unified function-body compilation entry point: queries the memo strategy and dispatches
+    /// to the corresponding compilation path.
     ///
-    /// 所有函数编译入口（compile_function / compile_monomorph_instance /
-    /// compile_builtin_method / compile_user_method / compile_lambda）都调用此方法，
-    /// 确保 memoize / tail_rec / non_tail_rec 优化对 FunDecl、方法、lambda、
-    /// monomorph 实例统一生效。
+    /// All function compilation entry points (`compile_function` /
+    /// `compile_monomorph_instance` / `compile_builtin_method` / `compile_user_method` /
+    /// `compile_lambda`) call this method, ensuring memoize / tail_rec / non_tail_rec
+    /// optimizations apply uniformly to FunDecls, methods, lambdas, and monomorph instances.
     ///
-    /// self_type：方法传 Some(type_name)，其余传 None。用于构造 mangled 名查 FuncId。
-    /// 前置条件：调用方已设置 current_sg_start = node_start（compile_memoize
-    /// 依赖此值计算参数节点 id = current_sg_start + param_index）。
+    /// `self_type`: pass `Some(type_name)` for methods, `None` otherwise. Used to construct the
+    /// mangled name for the `FuncId` lookup.
+    /// Precondition: the caller has set `current_sg_start = node_start` (`compile_memoize`
+    /// relies on this value to compute parameter node ids = `current_sg_start + param_index`).
     fn compile_function_body(
         &mut self,
         name: &str,
@@ -2357,7 +2511,8 @@ impl<'a> IrBuilder<'a> {
     ) -> NodeId {
         let prev_tail = self.in_tail_position;
         self.in_tail_position = !is_void_fn;
-        // 统一查询 memo 策略（memo_pass 已做唯一决策，互斥）
+        // Unified memo-strategy query (memo_pass already makes the unique decision; mutually
+        // exclusive).
         let strategy = self.lookup_memo_strategy(name, self_type);
         let r = match strategy {
             Some(crate::pass::Analyzer::MemoStrategy::TailRecToLoop { info }) => {
@@ -2375,18 +2530,21 @@ impl<'a> IrBuilder<'a> {
         r
     }
 
-    /// 记忆化缓存：消费 Memoize 策略，在函数入口插入缓存检查 Gate + body 后插入缓存写入。
+    /// Memoization cache: consumes the Memoize strategy and inserts a cache-check Gate at the
+    /// function entry and a cache-write after the body.
     ///
-    /// 由 compile_function 在检测到 MemoStrategy::Memoize 时调用。
-    /// 参数节点已由 compile_function 创建并 bind_var，此方法构造缓存结构。
+    /// Called by `compile_function` when it detects `MemoStrategy::Memoize`.
+    /// The parameter nodes have already been created and `bind_var`'d by `compile_function`;
+    /// this method constructs the cache structure.
     ///
-    /// 结构：
-    /// - memo_check 节点：输入 = 参数节点们，返回 record(hit, value)
-    /// - field_get(hit) → Gate(hit) 分流
-    /// - hit=true 分支：field_get(value) 作为返回值（passthrough 子图）
-    /// - hit=false 分支：正常编译函数体 + memo_store(参数, body_result)
+    /// Structure:
+    /// - `memo_check` node: inputs = the parameter nodes; returns `record(hit, value)`.
+    /// - `field_get(hit)` -> `Gate(hit)` for branching.
+    /// - `hit=true` branch: `field_get(value)` as the return value (passthrough subgraph).
+    /// - `hit=false` branch: compile the function body normally + `memo_store(args, body_result)`.
     ///
-    /// 递归调用保留为普通 Call（缓存命中时直接返回，不展开）。
+    /// Recursive calls remain ordinary Calls (on cache hit they return directly without
+    /// expanding).
     fn compile_memoize(
         &mut self,
         _name: &str,
@@ -2394,12 +2552,14 @@ impl<'a> IrBuilder<'a> {
         _params: &[crate::ast::Ast::Param<'_>],
         cache_key: &crate::pass::Analyzer::CacheKeySpec,
     ) -> NodeId {
-        // 分配缓存表索引
+        // Allocate a cache-table index.
         let table_index = self.memo_table_count;
         self.memo_table_count += 1;
 
-        // 收集参与缓存 key 的参数节点（按 cache_key.param_indices）
-        // 参数节点是子图前 param_count 个节点（current_sg_start 为函数子图起始）
+        // Collect the parameter nodes that participate in the cache key (by
+        // `cache_key.param_indices`).
+        // The parameter nodes are the first `param_count` nodes of the subgraph
+        // (`current_sg_start` is the start of the function subgraph).
         let param_nodes: Vec<NodeId> = cache_key.param_indices.iter()
             .map(|&idx| {
                 let node_id = self.current_sg_start + idx;
@@ -2408,7 +2568,7 @@ impl<'a> IrBuilder<'a> {
             .collect();
         let memo_param_count = param_nodes.len() as u8;
 
-        // 1. 创建 memo_check 节点：输入 = 参数节点们
+        // 1. Create the memo_check node: inputs = the parameter nodes.
         let check_inputs = self.graph.inputs_pool.push(&param_nodes);
         let memo_check_node = self.graph.add_node(Node {
             kind: NodeKind::BinOp,
@@ -2421,7 +2581,8 @@ impl<'a> IrBuilder<'a> {
             param_count: memo_param_count,
         });
 
-        // 2. 从 memo_check 返回的 record 中取 hit 字段（作为 Gate 条件）
+        // 2. Extract the `hit` field from the record returned by `memo_check` (used as the Gate
+        //    condition).
         let hit_inputs = self.graph.inputs_pool.push(&[memo_check_node]);
         let hit_node = self.graph.add_node(Node {
             kind: NodeKind::FieldAccess,
@@ -2431,8 +2592,10 @@ impl<'a> IrBuilder<'a> {
         });
         self.graph.set_field_set_name(hit_node, "hit".to_string());
 
-        // 3. hit=true 分支子图：从 record 取 value 字段（缓存命中，直接返回缓存值）
-        //    使用 compile_branch_subgraph 模式：独立子图 + 帧链穿透访问 memo_check_node
+        // 3. hit=true branch subgraph: extract the `value` field from the record (cache hit:
+        //    return the cached value directly).
+        //    Uses the `compile_branch_subgraph` pattern: an independent subgraph + frame-chain
+        //    passthrough to access `memo_check_node`.
         let hit_sg = {
             let node_start = self.graph.nodes.len() as u32;
             self.enter_scope();
@@ -2472,8 +2635,10 @@ impl<'a> IrBuilder<'a> {
             sg_id
         };
 
-        // 4. hit=false 分支子图：正常编译函数体 + memo_store（缓存未命中，计算并写入缓存）
-        //    使用 compile_branch_subgraph 模式：独立子图 + 帧链穿透访问参数和递归调用
+        // 4. hit=false branch subgraph: compile the function body normally + memo_store (cache
+        //    miss: compute and write to the cache).
+        //    Uses the `compile_branch_subgraph` pattern: an independent subgraph + frame-chain
+        //    passthrough to access parameters and recursive calls.
         let miss_sg = {
             let node_start = self.graph.nodes.len() as u32;
             self.enter_scope();
@@ -2481,15 +2646,17 @@ impl<'a> IrBuilder<'a> {
             self.current_sg_start = node_start;
             let prev_effect = self.current_effect;
             self.current_effect = None;
-            // miss_sg 中递归 Call 不标记 tail_call：tail_call 的 switch_subgraph
-            // 帧复用会跳过 Memoize 的 Gate 结构，导致返回值丢失（递归 Call 复用
-            // miss_sg 帧执行 callee 子图，value_table 索引错位 → 返回 null）。
-            // 强制非尾位置，递归 Call 走正常 Call 创建新帧，正确返回结果。
+            // Recursive Calls inside miss_sg are NOT tagged as tail_calls: `switch_subgraph`
+            // frame reuse for a tail_call would skip the Memoize Gate structure, losing the
+            // return value (the recursive Call reuses the miss_sg frame to execute the callee
+            // subgraph, causing a `value_table` index mismatch -> returns null).
+            // Force non-tail position so recursive Calls go through the normal Call path and
+            // create a new frame, correctly returning the result.
             let prev_tail = self.in_tail_position;
             self.in_tail_position = false;
             let body_node = self.compile_expr(body_expr);
             self.in_tail_position = prev_tail;
-            // memo_store: 输入 = 参数节点们 + body_node
+            // memo_store: inputs = the parameter nodes + body_node.
             let mut store_inputs = param_nodes.clone();
             store_inputs.push(body_node);
             let store_off = self.graph.inputs_pool.push(&store_inputs);
@@ -2530,7 +2697,8 @@ impl<'a> IrBuilder<'a> {
             sg_id
         };
 
-        // 5. Gate 节点：hit true → hit_sg（返回缓存值），false → miss_sg（计算+写缓存）
+        // 5. Gate node: hit true -> hit_sg (return the cached value), false -> miss_sg (compute
+        //    + write to the cache).
         let prev_effect = self.current_effect;
         self.current_effect = None;
         let gate_off = self.graph.inputs_pool.push(&[hit_node]);
@@ -2554,15 +2722,17 @@ impl<'a> IrBuilder<'a> {
         gate_node
     }
 
-    /// 尾递归转迭代：消费 TailRecInfo 构造 while_sg IR。
+    /// Tail-recursion to iteration: consumes `TailRecInfo` to construct the `while_sg` IR.
     ///
-    /// 由 compile_function 在检测到 MemoStrategy::TailRecToLoop 时调用。
-    /// 参数节点已由 compile_function 创建并 bind_var，此方法构造循环结构。
+    /// Called by `compile_function` when it detects `MemoStrategy::TailRecToLoop`.
+    /// The parameter nodes have already been created and `bind_var`'d by `compile_function`;
+    /// this method constructs the loop structure.
     ///
-    /// 结构：
-    /// - while_sg: cond = NOT(base_case 条件), Gate(cond) → body_sg / exit_sg
-    /// - body_sg: 编译原函数体（tail_rec_ctx 拦截尾调用为 WriteBack + Call(while_sg)）
-    /// - exit_sg: 编译 base_case 返回值
+    /// Structure:
+    /// - `while_sg`: `cond = NOT(base_case condition)`, `Gate(cond)` -> `body_sg` / `exit_sg`.
+    /// - `body_sg`: compiles the original function body (`tail_rec_ctx` intercepts tail calls as
+    ///   `WriteBack + Call(while_sg)`).
+    /// - `exit_sg`: compiles the base-case return value.
     fn compile_tail_rec_to_loop(
         &mut self,
         name: &str,
@@ -2570,13 +2740,13 @@ impl<'a> IrBuilder<'a> {
         params: &[crate::ast::Ast::Param<'_>],
         info: &crate::pass::Analyzer::TailRecInfo,
     ) -> NodeId {
-        // 1. 收集参数节点（compile_function 已 bind_var）
+        // 1. Collect parameter nodes (already `bind_var`'d by `compile_function`).
         let param_nodes: Vec<NodeId> = params
             .iter()
             .filter_map(|p| self.lookup_var(p.name))
             .collect();
 
-        // 2. 占位注册 while_sg
+        // 2. Placeholder-register while_sg.
         let node_start = self.graph.nodes.len() as u32;
         let while_sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
@@ -2599,22 +2769,28 @@ impl<'a> IrBuilder<'a> {
             reset_plan: None,
         });
 
-        // 3. 构造循环条件 cond_node（在 while_sg node_range 内）
+        // 3. Build the loop condition `cond_node` (within while_sg's node_range).
         let cond_node = self.build_tail_rec_cond(&info.base_cases, &info.rec_branches);
 
-        // 4. 设置 tail_rec_ctx（compile_call 拦截 self 调用为 WriteBack + Call(while_sg)）
+        // 4. Set `tail_rec_ctx` (`compile_call` intercepts self-calls as `WriteBack +
+        //    Call(while_sg)`).
         self.tail_rec_ctx = Some(TailRecCtx {
             self_name: name.to_string(),
             param_nodes,
         });
 
-        // 5. 编译 body_sg：编译原函数体（LoopBody，完成后 reset_loop_iteration 自动回跳）
-        //    尾调用 self(args) 被 compile_call 拦截为 WriteBack（无 Call，无 tail_call）
-        //    base_case 路径也被编译，但 cond 保证不执行（DCE 可消除）
-        //    强制 in_tail_position = true：void 函数的 in_tail_position 默认为 false
-        //    （compile_function 第 5208 行 `!is_void_fn`），但尾递归转换的 body_sg 中
-        //    自调用必须在尾位置被拦截为 WriteBack，否则会生成真正的递归 Call 节点
-        //    导致死循环（循环条件基于初始参数值，参数永不更新）。
+        // 5. Compile body_sg: compiles the original function body (LoopBody; after completion
+        //    `reset_loop_iteration` auto-jumps back).
+        //    A tail call `self(args)` is intercepted by `compile_call` as a WriteBack (no Call,
+        //    no tail_call).
+        //    The base-case path is also compiled, but `cond` guarantees it never executes (DCE
+        //    can eliminate it).
+        //    Force `in_tail_position = true`: a void function's `in_tail_position` defaults to
+        //    `false` (line 5208 of `compile_function`: `!is_void_fn`), but in the body_sg of a
+        //    tail-recursion transform, self-calls must be intercepted in tail position as a
+        //    WriteBack; otherwise a genuine recursive Call node would be generated, causing an
+        //    infinite loop (the loop condition is based on the initial parameter values, which
+        //    are never updated).
         let prev_effect = self.current_effect;
         let prev_tail = self.in_tail_position;
         self.current_effect = None;
@@ -2623,12 +2799,13 @@ impl<'a> IrBuilder<'a> {
         self.in_tail_position = prev_tail;
         self.current_effect = prev_effect;
 
-        // 6. 清除 tail_rec_ctx
+        // 6. Clear `tail_rec_ctx`.
         self.tail_rec_ctx = None;
 
-        // 7. 编译 exit_sg：编译 base_case 返回值
-        //    v1 支持单 base_case：直接编译返回值表达式
-        //    多 base_case 取第一个有条件的（cond 保证只有一个成立）
+        // 7. Compile exit_sg: compiles the base-case return value.
+        //    v1 supports a single base_case: directly compile the return-value expression.
+        //    For multiple base_cases, take the first one with a condition (`cond` guarantees
+        //    only one holds).
         let exit_expr = info.base_cases
             .iter()
             .find(|(c, _)| c.is_some())
@@ -2637,7 +2814,7 @@ impl<'a> IrBuilder<'a> {
             .unwrap_or(body_expr);
         let (exit_sg, exit_inputs) = self.compile_branch_subgraph(exit_expr);
 
-        // 8. Gate(cond): true → body_sg, false → exit_sg
+        // 8. Gate(cond): true -> body_sg, false -> exit_sg.
         let gate_inputs: Vec<NodeId> = match self.current_effect {
             Some(eff) => vec![cond_node, eff],
             None => vec![cond_node],
@@ -2660,7 +2837,7 @@ impl<'a> IrBuilder<'a> {
             },
         );
 
-        // 9. 填充 while_sg 元数据
+        // 9. Fill in while_sg metadata.
         let node_end = self.graph.nodes.len() as u32;
         let sg = &mut self.graph.subgraphs[while_sg_id.0 as usize];
         sg.node_range = (NodeId(node_start), NodeId(node_end));
@@ -2669,20 +2846,23 @@ impl<'a> IrBuilder<'a> {
         sg.loop_kind = LoopKind::TailRec;
         sg.cond_node = Some(cond_node);
 
-        // 10. 创建 Call 节点启动 while_sg（与 register_while_subgraph + compile_recursive_call 一致）。
-        // while_sg 作为 same_function 子图帧运行，body_sg 完成后 reset_loop_iteration
-        // 读取 while_sg 的 loop_kind=While + cond_node 正确重置循环。
-        // 若直接返回 gate_node，while_sg 节点会在函数主子图帧中执行，
-        // reset_loop_iteration 读取函数主子图的 loop_kind=None → 循环重置失败。
+        // 10. Create a Call node to launch while_sg (consistent with
+        //     `register_while_subgraph` + `compile_recursive_call`).
+        //     while_sg runs as a `same_function` subgraph frame; after body_sg completes,
+        //     `reset_loop_iteration` reads while_sg's `loop_kind=While` + `cond_node` to correctly
+        //     reset the loop.
+        //     If `gate_node` were returned directly, while_sg's nodes would execute in the
+        //     function's main subgraph frame, where `reset_loop_iteration` would read
+        //     `loop_kind=None` -> loop reset would fail.
         let call_node = self.compile_recursive_call(while_sg_id);
         call_node
     }
 
-    /// 构造尾递归转迭代的循环条件。
-    /// 规则：
-    /// - 有 base_case with Some(cond)：cond = AND(NOT(base_cond_i))
-    /// - 无 base_case with Some(cond)：cond = OR(rec_cond_i)（德摩根实现）
-    /// - 两者都无：cond = Const(true)（不应发生）
+    /// Build the loop condition for tail-recursion-to-iteration.
+    /// Rules:
+    /// - Has a base_case with `Some(cond)`: `cond = AND(NOT(base_cond_i))`.
+    /// - No base_case with `Some(cond)`: `cond = OR(rec_cond_i)` (implemented via De Morgan).
+    /// - Neither: `cond = Const(true)` (should not happen).
     fn build_tail_rec_cond(
         &mut self,
         base_cases: &[(Option<crate::ast::Ast::ExprId>, crate::ast::Ast::ExprId)],
@@ -2694,7 +2874,7 @@ impl<'a> IrBuilder<'a> {
             .collect();
 
         if !base_conds.is_empty() {
-            // cond = AND(NOT(base_cond_i))
+            // cond = AND(NOT(base_cond_i)).
             let mut negated_nodes: Vec<NodeId> = Vec::new();
             for c in &base_conds {
                 let cond_node = self.compile_subexpr(*c);
@@ -2718,20 +2898,23 @@ impl<'a> IrBuilder<'a> {
             }
             result
         } else {
-            // 无 base_case with Some(cond)：cond = OR(rec_cond_i) = NOT(AND(NOT(rec_cond_i)))
-            // 若 rec_branches 中存在 cond=None 的兜底分支（如 if-else 的 else），
-            // 意味着总有一条 rec 路径执行，cond 应为 Const(true)，
-            // 由 body_sg 内部 Gate + Continue 信号分派 rec/base。
+            // No base_case with `Some(cond)`: `cond = OR(rec_cond_i) = NOT(AND(NOT(rec_cond_i)))`.
+            // If a rec_branch has `cond=None` (a fallback branch, e.g. the `else` of an if-else),
+            // then some rec path always executes, so `cond` should be `Const(true)`, and the
+            // rec/base split is dispatched by body_sg's internal Gate + Continue signal.
             let has_none_rec = rec_branches.iter().any(|(c, _)| c.is_none());
             let rec_conds: Vec<crate::ast::Ast::ExprId> = rec_branches
                 .iter()
                 .filter_map(|(c, _)| *c)
                 .collect();
             if rec_conds.is_empty() || has_none_rec {
-                // 无 ExprId 条件可合成，或存在兜底 rec 分支（match/if-else 尾递归）。
-                // cond = Const(true)，body_sg 始终执行，靠 Continue 信号区分 rec/base：
-                // rec arm 的 WriteBack 设置 Continue → 循环继续；
-                // base arm 无 WriteBack → None → 循环退出（返回 body_sg 返回值）。
+                // No synthesizable ExprId condition, or a fallback rec branch exists
+                // (match/if-else tail recursion).
+                // `cond = Const(true)`; body_sg always executes, and the rec/base split is
+                // distinguished by the Continue signal:
+                //   A rec arm's WriteBack sets Continue -> the loop continues;
+                //   a base arm has no WriteBack -> None -> the loop exits (returns body_sg's
+                //   return value).
                 let off = self.graph.inputs_pool.push(&[]);
                 let true_node = self.graph.add_node(Node {
                     kind: NodeKind::Const,
@@ -2774,16 +2957,16 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    // ---- 非尾递归转迭代辅助方法 ----
+    // ---- Non-tail-recursion-to-iteration helpers ----
 
-    /// 创建 i32 常量节点。
+    /// Create an i32 constant node.
     fn make_i32_const(&mut self, val: i32) -> NodeId {
         let n = self.compile_const();
         self.graph.const_values[n.0 as usize] = Some(ConstValue::I32(val));
         n
     }
 
-    /// 创建二元运算节点。
+    /// Create a binary-operation node.
     fn make_binop(&mut self, lhs: NodeId, rhs: NodeId, cf: ComputeFnId) -> NodeId {
         let off = self.graph.inputs_pool.push(&[lhs, rhs]);
         self.graph.add_node(Node {
@@ -2794,7 +2977,7 @@ impl<'a> IrBuilder<'a> {
         })
     }
 
-    /// 创建数组存储节点 arr[idx] = val。
+    /// Create an array-store node `arr[idx] = val`.
     fn make_array_store(&mut self, arr: NodeId, idx: NodeId, val: NodeId) -> NodeId {
         let off = self.graph.inputs_pool.push(&[arr, idx, val]);
         self.graph.add_node(Node {
@@ -2805,7 +2988,7 @@ impl<'a> IrBuilder<'a> {
         })
     }
 
-    /// 创建数组索引节点 arr[idx]。
+    /// Create an array-index node `arr[idx]`.
     fn make_array_index(&mut self, arr: NodeId, idx: NodeId) -> NodeId {
         let off = self.graph.inputs_pool.push(&[arr, idx]);
         self.graph.add_node(Node {
@@ -2816,7 +2999,7 @@ impl<'a> IrBuilder<'a> {
         })
     }
 
-    /// 创建 Continue 信号屏障节点（依赖 dep，触发 Continue 信号）。
+    /// Create a Continue-signal barrier node (depends on `dep`; triggers the Continue signal).
     fn make_continue_barrier(&mut self, dep: NodeId) -> NodeId {
         let off = self.graph.inputs_pool.push(&[dep]);
         let n = self.graph.add_node(Node {
@@ -2828,20 +3011,25 @@ impl<'a> IrBuilder<'a> {
         n
     }
 
-    /// 非尾递归转迭代：消费 NonTailRecInfo 构造"工作栈 + while 循环 + 状态机"IR。
+    /// Non-tail-recursion to iteration: consumes `NonTailRecInfo` to construct the
+    /// "work-stack + while-loop + state-machine" IR.
     ///
-    /// 由 compile_function 在检测到 MemoStrategy::NonTailRecToLoop 时调用。
-    /// 参数节点已由 compile_function 创建并 bind_var，此方法构造循环结构。
+    /// Called by `compile_function` when it detects `MemoStrategy::NonTailRecToLoop`.
+    /// The parameter nodes have already been created and `bind_var`'d by `compile_function`;
+    /// this method constructs the loop structure.
     ///
-    /// 结构：
-    /// - 函数子图：param 节点 + 局部变量（stack, sp, result）+ 初始帧入栈 + Call(while_sg)
-    /// - while_sg: cond = sp > 0, Gate(cond) → body_sg / result_sg
-    /// - body_sg (LoopBody): pop 栈帧 → 读 param_cur/state/saved → Gate 链按 state 分派
-    /// - state_N_sg: 编译函数体（non_tail_rec_ctx 拦截自调用为 push + barrier(Continue)）
-    /// - result_sg: 返回 result_node
+    /// Structure:
+    /// - Function subgraph: param nodes + local variables (stack, sp, result) + initial frame
+    ///   push + `Call(while_sg)`.
+    /// - `while_sg`: `cond = sp > 0`, `Gate(cond)` -> `body_sg` / `result_sg`.
+    /// - `body_sg` (LoopBody): pop a frame -> read `param_cur`/state/saved -> Gate chain
+    ///   dispatches by state.
+    /// - `state_N_sg`: compile the function body (`non_tail_rec_ctx` intercepts self-calls as
+    ///   `push + barrier(Continue)`).
+    /// - `result_sg`: returns `result_node`.
     ///
-    /// 栈帧布局（步长 stride = param_count + 1 + max_saved）：
-    /// [param_0, ..., param_{P-1}, state, saved_0, ..., saved_{max_saved-1}]
+    /// Frame layout (stride = param_count + 1 + max_saved):
+    /// `[param_0, ..., param_{P-1}, state, saved_0, ..., saved_{max_saved-1}]`
     fn compile_non_tail_rec_to_loop(
         &mut self,
         name: &str,
@@ -2855,13 +3043,13 @@ impl<'a> IrBuilder<'a> {
         let max_saved = num_call_sites.saturating_sub(1);
         let stride = (param_count + 1 + max_saved) as u32;
 
-        // 1. 收集参数节点（compile_function 已 bind_var）
+        // 1. Collect parameter nodes (compile_function has already bind_var'd them)
         let param_nodes: Vec<NodeId> = params
             .iter()
             .filter_map(|p| self.lookup_var(p.name))
             .collect();
 
-        // 2. 创建局部变量：stack_node（空数组）、sp_node（0）、result_node（void）
+        // 2. Create local variables: stack_node (empty array), sp_node (0), result_node (void)
         let stack_off = self.graph.inputs_pool.push(&[]);
         let stack_node = self.graph.add_node(Node {
             kind: NodeKind::BinOp,
@@ -2872,8 +3060,8 @@ impl<'a> IrBuilder<'a> {
         let sp_node = self.make_i32_const(0);
         let result_node = self.compile_void_const();
 
-        // 3. 初始帧入栈：stack[0..P] = params, stack[P] = 0 (INIT), stack[P+1..] = 0; sp = 1
-        // 所有 array_store 必须链入 effect 链，确保 Call(while_sg) 在栈填充后执行。
+        // 3. Push the initial frame: stack[0..P] = params, stack[P] = 0 (INIT), stack[P+1..] = 0; sp = 1
+        // All array_stores must be chained into the effect chain to ensure Call(while_sg) executes after the stack is filled.
         let zero_init = self.make_i32_const(0);
         let mut init_effect: Option<NodeId> = None;
         for i in 0..param_count {
@@ -2893,7 +3081,7 @@ impl<'a> IrBuilder<'a> {
         let sp_init_wb = self.compile_writeback_node(one_init, sp_node);
         self.current_effect = Some(self.chain_effects(init_effect, sp_init_wb));
 
-        // 4. 占位注册 while_sg
+        // 4. Placeholder-register while_sg
         let while_node_start = self.graph.nodes.len() as u32;
         let while_sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
@@ -2916,14 +3104,14 @@ impl<'a> IrBuilder<'a> {
             reset_plan: None,
         });
 
-        // 5. cond_node: sp > 0（在 while_sg node_range 内）
+        // 5. cond_node: sp > 0 (within while_sg node_range)
         let zero_cond = self.make_i32_const(0);
         let cond_node = self.make_binop(sp_node, zero_cond, CF_GT_I32);
 
-        // 保存 init effect 链（含 sp=1 WriteBack），body_sg 编译会重置 current_effect
+        // Save the init effect chain (including sp=1 WriteBack); body_sg compilation will reset current_effect
         let init_effect_chain = self.current_effect;
 
-        // 6. 编译 body_sg（LoopBody：pop + 读帧 + 状态分派）
+        // 6. Compile body_sg (LoopBody: pop + read frame + state dispatch)
         let body_sg = self.compile_non_tail_rec_body_sg(
             body_expr,
             params,
@@ -2938,10 +3126,10 @@ impl<'a> IrBuilder<'a> {
             stride,
         );
 
-        // 恢复 init effect 链，使 Call(while_sg) 依赖 init 代码（含 sp=1 WriteBack）
+        // Restore the init effect chain so Call(while_sg) depends on the init code (including sp=1 WriteBack)
         self.current_effect = init_effect_chain;
 
-        // 7. 编译 result_sg（false 分支，返回 result_node）
+        // 7. Compile result_sg (false branch, returns result_node)
         let result_sg = {
             let rs_start = self.graph.nodes.len() as u32;
             let off = self.graph.inputs_pool.push(&[result_node]);
@@ -2993,7 +3181,7 @@ impl<'a> IrBuilder<'a> {
             },
         );
 
-        // 9. 填充 while_sg 元数据
+        // 9. Populate while_sg metadata
         let while_node_end = self.graph.nodes.len() as u32;
         let while_sg = &mut self.graph.subgraphs[while_sg_id.0 as usize];
         while_sg.node_range = (NodeId(while_node_start), NodeId(while_node_end));
@@ -3007,19 +3195,19 @@ impl<'a> IrBuilder<'a> {
             reset_condition_tree: vec![cond_node],
         });
 
-        // 10. 创建 Call 节点启动 while_sg
+        // 10. Create the Call node to launch while_sg
         let call_node = self.compile_recursive_call(while_sg_id);
         call_node
     }
 
-    /// 编译非尾递归转迭代的 body_sg（LoopBody 子图）。
+    /// Compile the body_sg for non-tail-recursion-to-iteration (LoopBody subgraph).
     ///
-    /// 结构：
-    /// 1. Pop: sp = sp - 1 (WriteBack), 读取栈帧
-    /// 2. 读 param_cur[i] = stack[sp * stride + i]
-    /// 3. 读 state = stack[sp * stride + P]
-    /// 4. 读 saved[i] = stack[sp * stride + P + 1 + i]
-    /// 5. Gate 链按 state 分派到各 state_N_sg
+    /// Structure:
+    /// 1. Pop: sp = sp - 1 (WriteBack), read the stack frame
+    /// 2. Read param_cur[i] = stack[sp * stride + i]
+    /// 3. Read state = stack[sp * stride + P]
+    /// 4. Read saved[i] = stack[sp * stride + P + 1 + i]
+    /// 5. Gate chain dispatches by state to each state_N_sg
     fn compile_non_tail_rec_body_sg(
         &mut self,
         body_expr: crate::ast::Ast::ExprId,
@@ -3038,14 +3226,14 @@ impl<'a> IrBuilder<'a> {
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = body_node_start;
 
-        // 压入循环上下文（Continue 信号回跳目标 = while_sg）
+        // Push the loop context (Continue signal jump-back target = while_sg)
         self.loop_stack.push(LoopContext {
             sg: while_sg_id,
             iter_node: None,
             body_node_start,
         });
 
-        // 记录编译前函数子图的 event_source_decls 长度（同 compile_loop_body_subgraph）
+        // Record the function subgraph's event_source_decls length before compilation (same as compile_loop_body_subgraph)
         let prev_decl_count = self.current_function_sg
             .and_then(|sg_id| self.graph.subgraphs.get(sg_id.0 as usize))
             .map(|sg| sg.event_source_decls.len())
@@ -3057,7 +3245,7 @@ impl<'a> IrBuilder<'a> {
         let pop_wb = self.compile_writeback_node(sp_minus_1, sp_node);
         self.current_effect = Some(pop_wb);
 
-        // 2. 读栈帧：frame_base = sp_minus_1 * stride
+        // 2. Read the stack frame: frame_base = sp_minus_1 * stride
         let stride_node = self.make_i32_const(stride as i32);
         let frame_base = self.make_binop(sp_minus_1, stride_node, CF_MUL_I32);
 
@@ -3082,10 +3270,10 @@ impl<'a> IrBuilder<'a> {
             saved_nodes.push(self.make_array_index(stack_node, idx));
         }
 
-        // 将 param_cur / state_node / saved_nodes 链入 effect，
-        // 确保它们在 dispatch Gate 启动 state_N_sg 之前已就绪。
-        // 否则 Gate 仅依赖 cmp(state_node==i)，可能在 param_cur 尚未计算时
-        // 启动 state_N_sg，导致帧拷贝得到 void 参数值。
+        // Chain param_cur / state_node / saved_nodes into the effect chain,
+        // ensuring they are ready before the dispatch Gate launches state_N_sg.
+        // Otherwise the Gate only depends on cmp(state_node==i), which could launch
+        // state_N_sg before param_cur is computed, causing the frame copy to receive void parameter values.
         for &pc in &param_cur {
             self.current_effect = Some(self.chain_effects(self.current_effect, pc));
         }
@@ -3095,26 +3283,26 @@ impl<'a> IrBuilder<'a> {
         }
         let frame_read_effect = self.current_effect;
 
-        // 3. 编译各 state_N_sg（每个 state 编译函数体，设置 non_tail_rec_ctx 拦截自调用）
+        // 3. Compile each state_N_sg (each state compiles the function body; non_tail_rec_ctx intercepts self-calls)
         let num_states = call_sites.len() + 1;
         let mut state_sgs: Vec<SubGraphId> = Vec::with_capacity(num_states);
 
         for state_idx in 0..num_states {
-            // 构建 call_result_map：
-            // state 0: 空（所有调用都是新鲜的）
-            // state N: call_sites[0..N-2] → saved[0..N-2], call_sites[N-1] → result_node
+            // Build call_result_map:
+            // state 0: empty (all calls are fresh)
+            // state N: call_sites[0..N-2] -> saved[0..N-2], call_sites[N-1] -> result_node
             let mut call_result_map: rustc_hash::FxHashMap<crate::ast::Ast::ExprId, NodeId> =
                 rustc_hash::FxHashMap::default();
             for i in 0..state_idx {
                 if i + 1 < state_idx {
                     call_result_map.insert(call_sites[i], saved_nodes[i]);
                 } else {
-                    // i == state_idx - 1：最近完成的调用结果在 result_node
+                    // i == state_idx - 1: the most recently completed call result is in result_node
                     call_result_map.insert(call_sites[i], result_node);
                 }
             }
 
-            // 设置 non_tail_rec_ctx
+            // Set up non_tail_rec_ctx
             self.non_tail_rec_ctx = Some(NonTailRecCtx {
                 self_name: self_name.to_string(),
                 param_nodes: param_cur.clone(),
@@ -3130,13 +3318,13 @@ impl<'a> IrBuilder<'a> {
                 saved_nodes: saved_nodes.clone(),
             });
 
-            // 编译 state_N_sg
+            // Compile state_N_sg
             let sg_node_start = self.graph.nodes.len() as u32;
             let prev_sg_start_inner = self.current_sg_start;
             self.current_sg_start = sg_node_start;
 
             self.enter_scope();
-            // 绑定参数名到 param_cur 节点（而非函数 param 节点）
+            // Bind parameter names to param_cur nodes (instead of the function's param nodes)
             for (i, param) in params.iter().enumerate() {
                 if i < param_cur.len() {
                     self.bind_var(param.name, param_cur[i]);
@@ -3151,20 +3339,20 @@ impl<'a> IrBuilder<'a> {
             self.in_tail_position = prev_tail;
             self.current_effect = prev_effect_inner;
 
-            // 清除 non_tail_rec_ctx
+            // Clear non_tail_rec_ctx
             self.non_tail_rec_ctx = None;
             self.exit_scope();
             self.current_sg_start = prev_sg_start_inner;
 
-            // 始终 WriteBack body 结果到 result_node。
-            // 递归路径：barrier 的 Continue 信号在 WriteBack 执行前终止 state_sg，
-            //   WriteBack 不会执行。
-            // base case 路径：body 正常完成，WriteBack 将结果写入 result_node。
+            // Always WriteBack the body result to result_node.
+            // Recursion path: the barrier's Continue signal terminates state_sg before the WriteBack executes,
+            //   so the WriteBack does not run.
+            // Base case path: the body completes normally, and the WriteBack writes the result to result_node.
             let return_node = self.compile_writeback_node(body_node, result_node);
 
             let sg_node_end = self.graph.nodes.len() as u32;
 
-            // 迁移 event_source_decls（同 compile_branch_subgraph）
+            // Migrate event_source_decls (same as compile_branch_subgraph)
             let state_decls: Vec<_> = if let Some(func_sg_id) = self.current_function_sg {
                 if let Some(func_sg) = self.graph.subgraphs.get_mut(func_sg_id.0 as usize) {
                     func_sg.event_source_decls.drain(prev_decl_count..).collect()
@@ -3198,12 +3386,12 @@ impl<'a> IrBuilder<'a> {
             state_sgs.push(state_sg);
         }
 
-        // 4. 构建 Gate 链按 state 分派（从后往前构建 else 链）
+        // 4. Build the Gate chain dispatching by state (build the else chain from back to front)
         let void_sg = self.compile_void_subgraph();
         let mut false_sg = void_sg;
-        let mut dispatch_gate: NodeId = NodeId(u32::MAX); // 哨兵值，循环中必定被覆盖
+        let mut dispatch_gate: NodeId = NodeId(u32::MAX); // sentinel value, always overwritten in the loop
 
-        // 重置 current_effect，避免 Gate 链依赖 state 编译残留的 effect
+        // Reset current_effect to prevent the Gate chain from depending on residual effects from state compilation
         self.current_effect = None;
 
         for i in (0..num_states).rev() {
@@ -3212,8 +3400,8 @@ impl<'a> IrBuilder<'a> {
             // cmp = state_node == i
             let state_const = self.make_i32_const(i as i32);
             let cmp = self.make_binop(state_node, state_const, CF_EQ_I32);
-            // 将 cmp 依赖于 frame_read_effect，确保 param_cur / saved_nodes 已就绪
-            // 后才启动 state_N_sg（否则帧拷贝得到 void 参数值）
+            // Make cmp depend on frame_read_effect to ensure param_cur / saved_nodes are ready
+            // before launching state_N_sg (otherwise the frame copy receives void parameter values)
             let cmp_eff = self.chain_effects(frame_read_effect, cmp);
 
             // Gate(cmp_eff): true → state_sgs[i], false → false_sg
@@ -3237,10 +3425,10 @@ impl<'a> IrBuilder<'a> {
             );
 
             if i == 0 {
-                // 第一个 Gate 留在 body_sg
+                // The first Gate stays in body_sg
                 dispatch_gate = gate_node;
             } else {
-                // 包装为子图，作为前一个 Gate 的 false 分支
+                // Wrap as a subgraph, serving as the previous Gate's false branch
                 let wrap_end = self.graph.nodes.len() as u32;
                 let wrap_sg = SubGraphId(self.graph.subgraphs.len() as u32);
                 self.graph.add_subgraph(SubGraph {
@@ -3266,13 +3454,13 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 5. 弹出循环上下文，注册 body_sg
+        // 5. Pop the loop context and register body_sg
         self.loop_stack.pop();
         self.current_sg_start = prev_sg_start;
 
         let body_node_end = self.graph.nodes.len() as u32;
 
-        // 迁移 body_sg 自身的 event_source_decls
+        // Migrate body_sg's own event_source_decls
         let body_decls: Vec<_> = if let Some(func_sg_id) = self.current_function_sg {
             if let Some(func_sg) = self.graph.subgraphs.get_mut(func_sg_id.0 as usize) {
                 func_sg.event_source_decls.drain(prev_decl_count..).collect()
@@ -3306,15 +3494,15 @@ impl<'a> IrBuilder<'a> {
         body_sg
     }
 
-    /// 注册 Loop 循环子图（无 condition，靠 Break 终止）。
+    /// Register the Loop subgraph (no condition; terminates via Break).
     ///
-    /// 结构（与 While 统一，cond 恒 true）：
+    /// Structure (unified with While, cond is always true):
     /// - cond_node = Const(true)
-    /// - gate_node = Gate(cond): true → body_sg, false → void_sg(不可达)
-    /// - body_sg: 编译 body，不尾递归（Engine 侧帧复用）
+    /// - gate_node = Gate(cond): true -> body_sg, false -> void_sg (unreachable)
+    /// - body_sg: compiles the body, not tail-recursive (frame reuse on the Engine side)
     ///
-    /// 执行：body 执行后 Engine 侧 reset_loop_iteration 重置 Gate 重新执行；
-    /// Break 信号终止 body_sg → Gate 完成 → 循环结束。
+    /// Execution: after the body runs, the Engine's reset_loop_iteration resets the Gate to re-execute;
+    /// the Break signal terminates body_sg -> Gate completes -> the loop ends.
     fn register_loop_subgraph(&mut self, body: crate::ast::Ast::ExprId) -> SubGraphId {
         let node_start = self.graph.nodes.len() as u32;
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
@@ -3338,19 +3526,19 @@ impl<'a> IrBuilder<'a> {
             reset_plan: None,
         });
 
-        // cond_node = Const(true)（loop 无条件件，恒真）
+        // cond_node = Const(true) (loop has no condition; always true)
         let cond_node = self.compile_bool_const(true);
-        // 重置 current_effect = None（同 register_while_subgraph，避免循环体帧
-        // reset_loop_iteration 后外部 effect 依赖导致死锁）
+        // Reset current_effect = None (same as register_while_subgraph, to avoid deadlock from
+        // external effect dependencies after the loop body's reset_loop_iteration)
         let prev_effect = self.current_effect;
         self.current_effect = None;
-        // body 子图（不尾递归）
+        // body subgraph (not tail-recursive)
         let body_sg = self.compile_loop_body_subgraph(body, sg_id);
-        // void 子图（不可达分支，break 退出时用）
+        // void subgraph (unreachable branch; used on break exit)
         let void_sg = self.compile_void_subgraph();
         self.current_effect = prev_effect;
 
-        // Gate 节点：cond(true) → body_sg, false → void_sg(不可达)
+        // Gate node: cond(true) -> body_sg, false -> void_sg (unreachable)
         let gate_off = self.graph.inputs_pool.push(&[cond_node]);
         let gate_node = self.graph.add_node(Node {
             kind: NodeKind::Gate,
@@ -3384,10 +3572,10 @@ impl<'a> IrBuilder<'a> {
         sg_id
     }
 
-    /// 编译循环体子图：编译 body，不尾递归（帧复用由 Engine 侧 reset_loop_iteration 处理）。
+    /// Compile the loop body subgraph: compiles the body, not tail-recursive (frame reuse handled by Engine-side reset_loop_iteration).
     ///
-    /// `loop_sg` 为 While 的 while_sg 或 Loop 的 loop_sg。
-    /// return_node = body_last（body 末尾节点），Engine 侧检测 LoopBody 完成后重置循环。
+    /// `loop_sg` is the while_sg of a While or the loop_sg of a Loop.
+    /// return_node = body_last (the body's last node); the Engine detects LoopBody completion and resets the loop.
     fn compile_loop_body_subgraph(
         &mut self,
         body: crate::ast::Ast::ExprId,
@@ -3396,14 +3584,14 @@ impl<'a> IrBuilder<'a> {
         let node_start = self.graph.nodes.len() as u32;
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
-        // 压入循环上下文（continue 跳转目标，While/Loop 无迭代器参数）
+        // Push the loop context (continue jump target; While/Loop have no iterator parameter)
         self.loop_stack.push(LoopContext {
             sg: loop_sg,
             iter_node: None,
             body_node_start: node_start,
         });
 
-        // 记录编译前函数子图的 event_source_decls 长度（同 compile_branch_subgraph，Bug #24）
+        // Record the function subgraph's event_source_decls length before compilation (same as compile_branch_subgraph, Bug #24)
         let prev_decl_count = self.current_function_sg
             .and_then(|sg_id| self.graph.subgraphs.get(sg_id.0 as usize))
             .map(|sg| sg.event_source_decls.len())
@@ -3415,7 +3603,7 @@ impl<'a> IrBuilder<'a> {
         let node_end = self.graph.nodes.len() as u32;
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
 
-        // 将编译循环体期间新增的 event_source_decls 从函数子图迁移到循环体子图
+        // Migrate the event_source_decls added during loop-body compilation from the function subgraph to the loop body subgraph
         let body_decls: Vec<_> = if let Some(func_sg_id) = self.current_function_sg {
             if let Some(func_sg) = self.graph.subgraphs.get_mut(func_sg_id.0 as usize) {
                 func_sg.event_source_decls.drain(prev_decl_count..).collect()
@@ -3449,29 +3637,29 @@ impl<'a> IrBuilder<'a> {
     }
 
     ///
-    /// 每个 arm 编译为一个 Gate：
-    /// - 判别节点 = 模式匹配结果（bool），作为 Gate 的 condition_input
-    /// - Gate(true) → arm body 子图
-    /// - Gate(false) → 下一个 arm 的 Gate 子图（作为 else 分支）
+    /// Each arm is compiled into a Gate:
+    /// - discriminant node = pattern match result (bool), used as the Gate's condition_input
+    /// - Gate(true) -> arm body subgraph
+    /// - Gate(false) -> next arm's Gate subgraph (as the else branch)
     ///
-    /// 链式结构（从最后一个 arm 往前构建）：每个非首个 arm 的 Gate + pattern 包装为独立
-    /// 子图（param_count=1，接收 scrutinee 作为参数），作为前一个 arm 的 else 分支。
-    ///首个 arm 的 Gate 留在父帧，return_node = 该 Gate。
+    /// Chain structure (built from the last arm backwards): each non-first arm's Gate + pattern is wrapped as an independent
+    /// subgraph (param_count=1, receiving the scrutinee as a parameter), serving as the previous arm's else branch.
+    /// The first arm's Gate stays in the parent frame; return_node = that Gate.
     ///
-    /// scrutinee 通过 Gate 的 branch inputs 逐层注入到 wrap 子图的 param 节点，
-    /// 使每个 wrap 子图内的 pattern 判别能访问 scrutinee。
+    /// The scrutinee is injected layer by layer into the wrap subgraphs' param nodes via the Gate's branch inputs,
+    /// so that pattern discrimination inside each wrap subgraph can access the scrutinee.
     ///
-    /// 两阶段编译：
-    /// 1. 从前往后：对每个 arm 编译 pattern 判别 + 变量绑定 + body 子图
-    /// 2. 从后往前：构建 Gate else 链，包装 wrap 子图
+    /// Two-phase compilation:
+    /// 1. Front to back: compile each arm's pattern discriminant + variable binding + body subgraph
+    /// 2. Back to front: build the Gate else chain, wrapping the wrap subgraphs
     ///
-    /// 模式变量通过 bind_var 绑定到字段提取节点，body 子图通过帧链穿透访问。
+    /// Pattern variables are bound to field-extraction nodes via bind_var; the body subgraph accesses them through the frame chain.
     fn compile_match(
         &mut self,
         scrutinee: crate::ast::Ast::ExprId,
         arms: &[crate::ast::Ast::MatchArm],
     ) -> NodeId {
-        // 空 match：返回 void 常量节点，避免 panic
+        // Empty match: return a void constant node to avoid panic
         if arms.is_empty() {
             return self.compile_void_const();
         }
@@ -3479,17 +3667,17 @@ impl<'a> IrBuilder<'a> {
         let scrutinee_node = self.compile_subexpr(scrutinee);
         let n_arms = arms.len();
 
-        // 第一阶段：从前往后编译每个 arm 的 pattern + body
+        // Phase 1: front to back, compile each arm's pattern + body
         struct ArmData {
             wrap_start: u32,
             scrutinee_in_frame: NodeId,
             cond_node: NodeId,
             body_sg: SubGraphId,
             body_inputs: Vec<NodeId>,
-            // 该 arm 编译前的 current_effect，用于 Gate 构建。
-            // compile_branch_subgraph 不隔离 current_effect，后续 arm body 中
-            // 的副作用（如 non_tail_rec 拦截的 Continue barrier）会泄漏到
-            // 前序 arm 的 Gate 输入，导致前序 arm 永不执行（Bug #56）。
+            // The current_effect before this arm is compiled; used for Gate construction.
+            // compile_branch_subgraph does not isolate current_effect, so side effects in later arm bodies
+            // (such as the Continue barrier intercepted by non_tail_rec) leak into the prior arm's Gate input,
+            // causing the prior arm to never execute (Bug #56).
             effect_before: Option<NodeId>,
         }
 
@@ -3498,11 +3686,11 @@ impl<'a> IrBuilder<'a> {
         for (i, arm) in arms.iter().enumerate() {
             let wrap_start = self.graph.nodes.len() as u32;
 
-            // 保存当前 effect：此 arm 的 Gate 应仅依赖此前已完成的副作用，
-            // 不应依赖后续 arm body 编译产生的副作用。
+            // Save the current effect: this arm's Gate should only depend on side effects completed before it,
+            // not on side effects produced by later arm body compilation.
             let effect_before = self.current_effect;
 
-            // scrutinee 来源：i==0 在父帧直接用 scrutinee_node；i>0 用 param 节点
+            // Scrutinee source: i==0 uses scrutinee_node directly in the parent frame; i>0 uses a param node
             let scrutinee_in_frame = if i == 0 {
                 scrutinee_node
             } else {
@@ -3515,13 +3703,13 @@ impl<'a> IrBuilder<'a> {
                 })
             };
 
-            // 进入 scope 绑定模式变量
+            // Enter a scope to bind pattern variables
             self.enter_scope();
 
-            // 编译 pattern：生成判别节点 + 绑定变量到字段提取节点
+            // Compile the pattern: produce the discriminant node + bind variables to field-extraction nodes
             let pattern_node = self.compile_pattern_match(scrutinee_in_frame, arm.pattern);
 
-            // 守卫条件：pattern_match && guard
+            // Guard condition: pattern_match && guard
             let cond_node = if let Some(guard) = arm.guard {
                 let guard_node = self.compile_subexpr(guard);
                 self.compile_bool_and(pattern_node, guard_node)
@@ -3529,7 +3717,7 @@ impl<'a> IrBuilder<'a> {
                 pattern_node
             };
 
-            // 编译 body 子图（模式变量在 scope 中可查找）
+            // Compile the body subgraph (pattern variables are look-up-able in the scope)
             let (body_sg, body_inputs) = self.compile_branch_subgraph(arm.body);
 
             self.exit_scope();
@@ -3544,28 +3732,28 @@ impl<'a> IrBuilder<'a> {
             });
         }
 
-        // 第二阶段：从后往前构建 Gate else 链
+        // Phase 2: back to front, build the Gate else chain
         let mut pending_else_sg: Option<SubGraphId> = None;
         let mut result_gate: Option<NodeId> = None;
 
         for (i, ad) in arm_data.iter().enumerate().rev() {
-            // 所有 arm 都使用 cond_node 作为判别条件。
-            // 这确保 Gate 依赖字段提取节点（通过 cond_node 的依赖链），
-            // 使变量绑定的字段提取节点在 Gate 之前执行。
-            // 最后一个 arm 如果是穷尽匹配（如 _），cond_node 为 true，无额外开销。
+            // All arms use cond_node as the discriminant.
+            // This ensures the Gate depends on the field-extraction nodes (via cond_node's dependency chain),
+            // so the variable-bound field-extraction nodes execute before the Gate.
+            // If the last arm is an exhaustive match (e.g. _), cond_node is true with no extra cost.
             let pattern_node = ad.cond_node;
 
-            // false 分支：有 pending_else（来自 i+1）则用之并传入当前帧的 scrutinee
+            // false branch: if there is a pending_else (from i+1), use it and pass in the current frame's scrutinee
             let (false_sg, false_inputs) = match pending_else_sg {
                 Some(else_sg) => (else_sg, vec![ad.scrutinee_in_frame]),
                 None => (self.compile_void_subgraph(), Vec::new()),
             };
 
-            // Gate 依赖 pattern_node（条件值）和该 arm 编译前的 effect（前序副作用）。
-            // 使用 arm 级别的 effect_before 而非全局 current_effect：
-            // compile_branch_subgraph 不隔离 current_effect，后续 arm body 中的副作用
-            // （如 non_tail_rec 拦截的 Continue barrier）会泄漏到前序 arm 的 Gate，
-            // 导致前序 arm 永不执行（Bug #56）。
+            // The Gate depends on pattern_node (the condition value) and the effect before this arm was compiled (prior side effects).
+            // Use the arm-level effect_before rather than the global current_effect:
+            // compile_branch_subgraph does not isolate current_effect, so side effects in later arm bodies
+            // (such as the Continue barrier intercepted by non_tail_rec) leak into the prior arm's Gate,
+            // causing the prior arm to never execute (Bug #56).
             let gate_inputs: Vec<NodeId> = match ad.effect_before {
                 Some(eff) => vec![pattern_node, eff],
                 None => vec![pattern_node],
@@ -3619,7 +3807,7 @@ impl<'a> IrBuilder<'a> {
         result_gate.expect("match must have at least one arm")
     }
 
-    /// 编译 bool 常量节点。
+    /// Compile a bool constant node.
     fn compile_bool_const(&mut self, b: bool) -> NodeId {
         let inputs_offset = self.graph.inputs_pool.push(&[]);
         let n = self.graph.add_node(Node {
@@ -3632,7 +3820,7 @@ impl<'a> IrBuilder<'a> {
         n
     }
 
-    /// 编译 bool AND 节点（用于守卫条件 pattern && guard）。
+    /// Compile a bool AND node (used for guard conditions pattern && guard).
     fn compile_bool_and(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
         let off = self.graph.inputs_pool.push(&[lhs, rhs]);
         self.graph.add_node(Node {
@@ -3643,7 +3831,7 @@ impl<'a> IrBuilder<'a> {
         })
     }
 
-    /// 编译 bool OR 节点（用于或模式 p1 | p2）。
+    /// Compile a bool OR node (used for or-patterns p1 | p2).
     fn compile_bool_or(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
         let off = self.graph.inputs_pool.push(&[lhs, rhs]);
         self.graph.add_node(Node {
@@ -3654,15 +3842,15 @@ impl<'a> IrBuilder<'a> {
         })
     }
 
-    /// 编译模式匹配判别节点（返回 bool），同时绑定模式变量到字段提取节点。
+    /// Compile a pattern-match discriminant node (returns bool), binding pattern variables to field-extraction nodes.
     ///
-    /// 递归处理所有模式类型：
-    /// - Wildcard/Variable → const(true)，Variable 绑定变量到 scrutinee
-    /// - Literal → eq(scrutinee, lit)，按类型选择 compute_fn
-    /// - Constructor → 构造器名判别 + 递归子模式
-    /// - Record → 字段提取 + 递归子模式
-    /// - OrPattern → left_match || right_match
-    /// - Guard → pattern_match && condition
+    /// Recursively handles all pattern types:
+    /// - Wildcard/Variable -> const(true); Variable binds the variable to the scrutinee
+    /// - Literal -> eq(scrutinee, lit), selecting compute_fn by type
+    /// - Constructor -> constructor-name discriminant + recursive sub-patterns
+    /// - Record -> field extraction + recursive sub-patterns
+    /// - OrPattern -> left_match || right_match
+    /// - Guard -> pattern_match && condition
     fn compile_pattern_match(
         &mut self,
         scrutinee_node: NodeId,
@@ -3672,8 +3860,8 @@ impl<'a> IrBuilder<'a> {
         match &pattern.node {
             crate::ast::Ast::Pattern::Wildcard => self.compile_bool_const(true),
             crate::ast::Ast::Pattern::Variable { name } => {
-                // 无参 ADT 构造器（如 JNull、Nil）在解析时无法与变量区分，
-                // 通过 sema 的 ctor_def_index 判别：若为已知构造器则按 Constructor 编译
+                // Nullary ADT constructors (e.g. JNull, Nil) cannot be distinguished from variables at parse time;
+                // disambiguate via sema's ctor_def_index: if it is a known constructor, compile as Constructor
                 if self.sema.ctor_def_index.contains_key(*name) {
                     self.compile_pattern_constructor(scrutinee_node, name, &[])
                 } else {
@@ -3703,7 +3891,7 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    /// 编译字面量模式判别节点。
+    /// Compile a literal pattern discriminant node.
     fn compile_pattern_literal_match(
         &mut self,
         scrutinee_node: NodeId,
@@ -3711,7 +3899,7 @@ impl<'a> IrBuilder<'a> {
     ) -> NodeId {
         match pl {
             crate::ast::Ast::PatternLiteral::Null => {
-                // null 判别：compute_is_null（idx 34）
+                // null discriminant: compute_is_null (idx 34)
                 let off = self.graph.inputs_pool.push(&[scrutinee_node]);
                 self.graph.add_node(Node {
                     kind: NodeKind::BinOp,
@@ -3721,7 +3909,7 @@ impl<'a> IrBuilder<'a> {
                 })
             }
             crate::ast::Ast::PatternLiteral::String(s) => {
-                // 字符串判别：compute_pattern_str_eq（idx 276）
+                // string discriminant: compute_pattern_str_eq (idx 276)
                 let str_node = self.compile_str_const(s);
                 let off = self.graph.inputs_pool.push(&[scrutinee_node, str_node]);
                 self.graph.add_node(Node {
@@ -3744,8 +3932,8 @@ impl<'a> IrBuilder<'a> {
             }
             crate::ast::Ast::PatternLiteral::Float(s) => {
                 let lit_node = self.compile_pattern_literal(pl);
-                // f128/f32/f16 后缀需用 CF_EQ_OBJ 精确比较（避免 f128→f64 精度损失）
-                // f64 或无后缀用 CF_EQ_F64（f32/f16→f64 无损）
+                // f128/f32/f16 suffixes need CF_EQ_OBJ for exact comparison (avoiding f128->f64 precision loss)
+                // f64 or no suffix uses CF_EQ_F64 (f32/f16->f64 is lossless)
                 let cleaned: String = s.chars().filter(|c| *c != '_').collect();
                 let (_, suffix) = detect_float_suffix(&cleaned);
                 let compute_fn = match suffix {
@@ -3777,15 +3965,15 @@ impl<'a> IrBuilder<'a> {
                     kind: NodeKind::BinOp,
                     input_count: 2,
                     inputs_offset: off,
-                    compute_fn: CF_EQ_I32, // eq_i32 (char 存为 i32)
+                    compute_fn: CF_EQ_I32, // eq_i32 (char stored as i32)
                 })
             }
         }
     }
 
-    /// 选择整数字面量相等判别的 compute_fn。
+    /// Select the compute_fn for integer literal equality discriminant.
     fn select_literal_eq_fn(&self, s: &str, _is_unsigned: bool) -> ComputeFnId {
-        // 用 ValueTag::from_name + TypeFamily 分派，消除字符串比较
+        // Dispatch via ValueTag::from_name + TypeFamily to eliminate string comparison
         if let Some(suffix) = s.find(|c: char| c.is_ascii_alphabetic()) {
             let suffix_str = &s[suffix..];
             if let Some(tag) = crate::value::ValueTag::from_name(suffix_str) {
@@ -3798,17 +3986,17 @@ impl<'a> IrBuilder<'a> {
                 };
             }
         }
-        CF_EQ_I32 // eq_i32 默认
+        CF_EQ_I32 // eq_i32 default
     }
 
-    /// 编译构造器模式：构造器名判别 + 递归子模式。
+    /// Compile a constructor pattern: constructor-name discriminant + recursive sub-patterns.
     fn compile_pattern_constructor(
         &mut self,
         scrutinee_node: NodeId,
         name: &str,
         patterns: &[crate::ast::Ast::PatternRef],
     ) -> NodeId {
-        // 构造器名判别节点
+        // Constructor-name discriminant node
         let ctor_match_off = self.graph.inputs_pool.push(&[scrutinee_node]);
         let ctor_match_node = self.graph.add_node(Node {
             kind: NodeKind::BinOp,
@@ -3818,10 +4006,10 @@ impl<'a> IrBuilder<'a> {
         });
         self.graph.set_pattern_ctor_name(ctor_match_node, name.to_string());
 
-        // 递归处理子模式：提取字段 + 判别
+        // Recursively process sub-patterns: extract fields + discriminate
         let mut result = ctor_match_node;
         for (i, &sub_pattern_id) in patterns.iter().enumerate() {
-            // 字段提取节点（按位置）
+            // Field-extraction node (by position)
             let field_get_off = self.graph.inputs_pool.push(&[scrutinee_node]);
             let field_get_node = self.graph.add_node(Node {
                 kind: NodeKind::BinOp,
@@ -3831,12 +4019,12 @@ impl<'a> IrBuilder<'a> {
             });
             self.graph.set_pattern_field_index(field_get_node, i as u16);
 
-            // 递归编译子模式（可能绑定变量）
+            // Recursively compile the sub-pattern (may bind variables)
             let sub_match = self.compile_pattern_match(field_get_node, sub_pattern_id);
 
             // result = result && sub_match
-            // field_get_node 作为额外依赖输入：确保变量绑定的字段提取节点
-            // 在 Gate 触发前执行（compute_and_bool 只读 inputs[0..2]，inputs[2] 仅用于调度）
+            // field_get_node is an extra dependency input: ensures the variable-bound field-extraction node
+            // executes before the Gate triggers (compute_and_bool only reads inputs[0..2]; inputs[2] is for scheduling only)
             let and_off = self.graph.inputs_pool.push(&[result, sub_match, field_get_node]);
             result = self.graph.add_node(Node {
                 kind: NodeKind::BinOp,
@@ -3849,7 +4037,7 @@ impl<'a> IrBuilder<'a> {
         result
     }
 
-    /// 编译记录模式：字段提取 + 递归子模式。
+    /// Compile a record pattern: field extraction + recursive sub-patterns.
     fn compile_pattern_record(
         &mut self,
         scrutinee_node: NodeId,
@@ -3858,7 +4046,7 @@ impl<'a> IrBuilder<'a> {
         let mut result = self.compile_bool_const(true);
 
         for field in fields.iter() {
-            // 字段提取节点（按名访问，复用 compute_record_field_get idx 30）
+            // Field-extraction node (by name, reuses compute_record_field_get idx 30)
             let field_get_off = self.graph.inputs_pool.push(&[scrutinee_node]);
             let field_get_node = self.graph.add_node(Node {
                 kind: NodeKind::FieldAccess,
@@ -3868,10 +4056,10 @@ impl<'a> IrBuilder<'a> {
             });
             self.graph.set_field_set_name(field_get_node, field.name.to_string());
 
-            // 递归编译子模式
+            // Recursively compile the sub-pattern
             let sub_match = self.compile_pattern_match(field_get_node, field.pattern);
 
-            // field_get_node 作为额外依赖输入（同 compile_pattern_constructor）
+            // field_get_node is an extra dependency input (same as compile_pattern_constructor)
             let and_off = self.graph.inputs_pool.push(&[result, sub_match, field_get_node]);
             result = self.graph.add_node(Node {
                 kind: NodeKind::BinOp,
@@ -3884,21 +4072,21 @@ impl<'a> IrBuilder<'a> {
         result
     }
 
-    /// 编译字面量模式为 Const 节点。
+    /// Compile a literal pattern into a Const node.
     fn compile_pattern_literal(&mut self, pl: &crate::ast::Ast::PatternLiteral) -> NodeId {
         let const_val = match pl {
             crate::ast::Ast::PatternLiteral::Int(s) => {
-                // 去除下划线分隔符 + 后缀，只保留数字和正负号
+                // Strip underscore separators + suffix; keep only digits and sign
                 let digits: String = s.chars()
                     .filter(|c| *c != '_' && (c.is_ascii_digit() || *c == '-' || *c == '+'))
                     .collect();
                 digits.parse::<i32>().ok().map(ConstValue::I32)
             }
             crate::ast::Ast::PatternLiteral::Float(s) => {
-                // 去除下划线分隔符 + 类型后缀（f64/f32/f16/f128）
-                // Bug #42：模式位置 `0.0f64` 的后缀导致 parse::<f64>() 失败，
-                // Const 节点值为 None 不被预填充，CF_EQ_F64 永久等待输入 → match hang
-                // f128 后缀需精确存储为 F128，避免 f128→f64 精度损失
+                // Strip underscore separators + type suffix (f64/f32/f16/f128)
+                // Bug #42: the suffix in pattern-position `0.0f64` caused parse::<f64>() to fail,
+                // leaving the Const node's value as None (not pre-populated), so CF_EQ_F64 waited forever for input -> match hang
+                // f128 suffix must be stored exactly as F128 to avoid f128->f64 precision loss
                 let cleaned: String = s.chars().filter(|c| *c != '_').collect();
                 let (stripped, suffix) = detect_float_suffix(&cleaned);
                 let is_hex = stripped.starts_with("0x") || stripped.starts_with("0X");
@@ -3919,7 +4107,7 @@ impl<'a> IrBuilder<'a> {
                                 .map(|f| ConstValue::F16(crate::value::F16::from_f64(f).to_bits()))
                         }
                     }
-                    // f64 或无后缀（默认 f64）：f32/f16→f64 无损，可用 CF_EQ_F64
+                    // f64 or no suffix (default f64): f32/f16->f64 is lossless, can use CF_EQ_F64
                     _ => {
                         if is_hex { parse_hex_float_f64(stripped).map(ConstValue::F64) }
                         else { stripped.parse::<f64>().ok().map(ConstValue::F64) }
@@ -3928,7 +4116,7 @@ impl<'a> IrBuilder<'a> {
             }
             crate::ast::Ast::PatternLiteral::Bool(b) => Some(ConstValue::Bool(*b)),
             crate::ast::Ast::PatternLiteral::String(_) => {
-                Some(ConstValue::Bool(true)) // 占位，实际用 compile_str_const
+                Some(ConstValue::Bool(true)) // placeholder; actually uses compile_str_const
             }
             crate::ast::Ast::PatternLiteral::Char(c) => Some(ConstValue::I32(*c as i32)),
             crate::ast::Ast::PatternLiteral::Null => Some(ConstValue::Null),
@@ -3944,7 +4132,7 @@ impl<'a> IrBuilder<'a> {
         n
     }
 
-    /// 编译字符串常量节点（用于模式匹配的字符串字面量）。
+    /// Compile a string constant node (used for string literals in pattern matching).
     fn compile_str_const(&mut self, s: &str) -> NodeId {
         let (offset, len) = self.intern_str(s);
         let inputs_offset = self.graph.inputs_pool.push(&[]);
@@ -3958,11 +4146,11 @@ impl<'a> IrBuilder<'a> {
         n
     }
 
-    /// 编译字符串插值：将 `"text {expr} more {expr}"` 降级为链式 str_concat。
+    /// Compile string interpolation: lower `"text {expr} more {expr}"` into a chained str_concat.
     ///
-    /// 每个 Literal 部分编译为字符串常量节点；
-    /// 每个 Expression 部分通过 `compute_reflect_format`（idx 290）转换为字符串；
-    /// 所有部分通过 `compute_str_concat`（idx 269）链式拼接。
+    /// Each Literal part is compiled into a string constant node;
+    /// each Expression part is converted to a string via `compute_reflect_format` (idx 290);
+    /// all parts are chained together via `compute_str_concat` (idx 269).
     fn compile_str_interp(
         &mut self,
         parts: &[crate::ast::Ast::InterpolationPart<'_>],
@@ -3971,7 +4159,7 @@ impl<'a> IrBuilder<'a> {
             return self.compile_str_const("");
         }
 
-        // 收集所有部分的节点
+        // Collect all part nodes
         let mut nodes: Vec<NodeId> = Vec::with_capacity(parts.len());
         for part in parts {
             match part {
@@ -3982,8 +4170,8 @@ impl<'a> IrBuilder<'a> {
                 }
                 crate::ast::Ast::InterpolationPart::Expression(expr_id) => {
                     let expr_node = self.compile_subexpr(*expr_id);
-                    // 通过 compute_reflect_format 将任意值转为字符串
-                    //（独立 compute_fn，不走 FFI 分派，自带 lazy force）
+                    // Convert any value to a string via compute_reflect_format
+                    // (a standalone compute_fn, not going through FFI dispatch, with built-in lazy force)
                     let inputs_offset = self.graph.inputs_pool.push(&[expr_node]);
                     let reflect_node = self.graph.add_node(Node {
                         kind: NodeKind::Call,
@@ -3996,12 +4184,12 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 单个部分：直接返回
+        // Single part: return directly
         if nodes.len() == 1 {
             return nodes[0];
         }
 
-        // 链式拼接：((part0 concat part1) concat part2) ...
+        // Chained concat: ((part0 concat part1) concat part2) ...
         let mut result = nodes[0];
         for &next in &nodes[1..] {
             let inputs_offset = self.graph.inputs_pool.push(&[result, next]);
@@ -4015,8 +4203,8 @@ impl<'a> IrBuilder<'a> {
         result
     }
 
-    /// 将任意值节点通过 compute_reflect_format（idx 290）转为字符串节点。
-    /// 用于 `str + non-str` 拼接时将非字符串操作数转为字符串（与字符串插值一致）。
+    /// Convert any value node to a string node via compute_reflect_format (idx 290).
+    /// Used to convert non-string operands to strings for `str + non-str` concatenation (same as string interpolation).
     fn make_reflect_format_node(&mut self, value_node: NodeId) -> NodeId {
         let inputs_offset = self.graph.inputs_pool.push(&[value_node]);
         self.graph.add_node(Node {
@@ -4027,12 +4215,12 @@ impl<'a> IrBuilder<'a> {
         })
     }
 
-    /// 返回用于 expr_types 复合 key 的模块名。
+    /// Return the module name used for the expr_types composite key.
     ///
-    /// 单态化实例上下文中，函数体表达式属于被调函数所在模块，
-    /// expr_types 的 key 必须用实例的 module_name（而非调用点模块名），
-    /// 否则跨模块泛型调用时类型查找失败（如 Math.abs 调用 cast(x).to(i32)
-    /// 时 source_ty 解析为 void）。
+    /// In a monomorphization-instance context, the function body expressions belong to the module
+    /// of the callee function; the expr_types key must use the instance's module_name (not the call-site
+    /// module name), otherwise cross-module generic calls fail type lookup (e.g. when Math.abs calls
+    /// cast(x).to(i32), source_ty resolves to void).
     fn expr_key_module(&self) -> &'a str {
         if let Some(inst_id) = self.current_instance_id {
             if let Some(inst) = self.sema.monomorph_instances.get(inst_id as usize) {
@@ -4042,15 +4230,16 @@ impl<'a> IrBuilder<'a> {
         self.current_module().name
     }
 
-    /// 查询表达式的类型名（来自 Sema）。
+    /// Look up an expression's type name (from Sema).
     ///
-    /// 优先取 ExprInfo.type_name（adt/generic 等场景），无记录时回退到 "unknown"。
-    /// 当 Sema 无记录时（trait 默认方法特化版本中的 self），查 sema 的
-    /// TraitDefaultInstance.type_name 获取 self 的具体实现类型。
+    /// Prefer ExprInfo.type_name (adt/generic scenarios); fall back to "unknown" when no record exists.
+    /// When Sema has no record (self in a specialized trait default method version), look up
+    /// sema's TraitDefaultInstance.type_name to get self's concrete implementation type.
     fn expr_type_name(&self, expr_id: crate::ast::Ast::ExprId) -> Option<&str> {
-        // trait 默认方法特化版本中的 self：消费 sema 的 TraitDefaultInstance.type_name。
-        // sema 推断 trait 默认方法 body 时 self 是抽象 SelfType，特化实例记录了具体实现类型名。
-        // IR 通过 current_trait_default_idx 索引查 sema 产出，不持有类型名字符串。
+        // self in a specialized trait default method version: consume sema's TraitDefaultInstance.type_name.
+        // When sema infers a trait default method body, self is the abstract SelfType; the specialized
+        // instance records the concrete implementation type name.
+        // The IR indexes sema output via current_trait_default_idx; it does not hold the type-name string.
         if let Some(idx) = self.current_trait_default_idx {
             if let crate::ast::Ast::Expr::Ident(name) = &self.module.arena.expr(expr_id).node {
                 if *name == "self" {
@@ -4061,7 +4250,7 @@ impl<'a> IrBuilder<'a> {
             }
         }
         let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr_id.0 as u64);
-        // 实例上下文：优先查实例局部 expr_types（类型参数已替换为具体类型）
+        // Instance context: prefer the instance-local expr_types (type parameters replaced with concrete types)
         if let Some(inst_id) = self.current_instance_id {
             if let Some(inst) = self.sema.monomorph_instances.get(inst_id as usize) {
                 if let Some(info) = inst.expr_types.get(&key) {
@@ -4074,7 +4263,7 @@ impl<'a> IrBuilder<'a> {
                 }
             }
         }
-        // 全局 expr_types 回退
+        // Global expr_types fallback
         if let Some(info) = self.sema.expr_types.get(&key) {
             return Some(
                 info.type_name
@@ -4086,8 +4275,9 @@ impl<'a> IrBuilder<'a> {
         None
     }
 
-    /// `expr_type_name` 的检查版：sema 契约保证 ExprInfo 已登记，
-    /// 若缺失说明 sema 推断有漏记——上报编译错误（非静默），并以 "i32" 占位继续编译以发现更多错误。
+    /// Checked version of `expr_type_name`: the sema contract guarantees ExprInfo is registered.
+    /// A missing entry indicates a sema inference omission -- report a compile error (not silent),
+    /// and use "i32" as a placeholder to continue compiling and surface further errors.
     #[inline]
     fn expr_type_name_checked(&mut self, expr_id: crate::ast::Ast::ExprId, context: &str) -> &str {
         let has_type = self.expr_type_name(expr_id).is_some();
@@ -4099,10 +4289,11 @@ impl<'a> IrBuilder<'a> {
         "i32"
     }
 
-    /// 判断表达式是否为 nullable 类型（Ty::Nullable）。
-    /// nullable 类型的 ==/!= 需要 null 判别式比较：?. 短路或 null 字面量
-    /// 产生 Value::Null，str/i32 等专用比较函数不处理 Null 导致结果错误。
-    /// 分派到 CF_EQ_OBJ/CF_NE_OBJ（value_equals_with_arena 正确处理 Null）。
+    /// Determine whether an expression is a nullable type (Ty::Nullable).
+    /// Nullable types' ==/!= need null-discriminant comparison: ?. short-circuit or null literals
+    /// produce Value::Null, and dedicated comparison functions for str/i32 etc. do not handle Null,
+    /// yielding wrong results.
+    /// Dispatch to CF_EQ_OBJ/CF_NE_OBJ (value_equals_with_arena correctly handles Null).
     fn expr_is_nullable(&self, expr_id: crate::ast::Ast::ExprId) -> bool {
         let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr_id.0 as u64);
         self.sema
@@ -4112,19 +4303,19 @@ impl<'a> IrBuilder<'a> {
             .unwrap_or(false)
     }
 
-    /// 类型族：返回 `TypeFamily`（调用方用 `|` 合并整数变体按位宽分派）。
-    /// i8/i16/u8/u16/u32/char → SignedInt32/UnsignedInt32/Char；i64/u64/isize/usize → SignedInt64/UnsignedInt64；
-    /// i128/u128 → SignedInt128/UnsignedInt128；bool → Bool；浮点 → Float。
+    /// Type family: returns the `TypeFamily` (caller merges integer variants with `|` to dispatch by bit-width).
+    /// i8/i16/u8/u16/u32/char -> SignedInt32/UnsignedInt32/Char; i64/u64/isize/usize -> SignedInt64/UnsignedInt64;
+    /// i128/u128 -> SignedInt128/UnsignedInt128; bool -> Bool; floats -> Float.
     fn int_family(ty_name: &str) -> crate::types::TypeFamily {
         match crate::value::ValueTag::from_name(ty_name).and_then(scalar_meta) {
             Some(m) => m.family,
-            None => crate::types::TypeFamily::SignedInt32, // 未知整数类型回退到 Int32 路径
+            None => crate::types::TypeFamily::SignedInt32, // unknown integer type falls back to the Int32 path
         }
     }
 
-    /// 从类型名获取 TypeFamily（含 Str 等非标量内置类型）。
-    /// 与 int_family 不同，此方法直接用 ValueTag::from_name + family()，
-    /// 不经过 scalar_meta，因此对 str 返回 TypeFamily::Str 而非回退到 SignedInt32。
+    /// Get TypeFamily from a type name (including non-scalar built-in types like Str).
+    /// Unlike int_family, this method uses ValueTag::from_name + family() directly,
+    /// bypassing scalar_meta, so for str it returns TypeFamily::Str instead of falling back to SignedInt32.
     fn type_family(ty_name: &str) -> crate::types::TypeFamily {
         match crate::value::ValueTag::from_name(ty_name) {
             Some(tag) => tag.family(),
@@ -4132,16 +4323,16 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    /// 算术/位运算 compute_fn 查表：按具体类型名返回算术基址。
-    /// 整数类型每 12 个连续索引（add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot）；
-    /// 浮点类型每 6 个连续索引（add/sub/mul/div/mod/neg，无位运算）。
-    /// 返回 None 表示该类型不支持算术运算。
-    /// 基址来自 `scalar_meta`，与 compute_fn_table! 的索引单点同步。
+    /// Arithmetic/bitwise compute_fn table lookup: returns the arithmetic base by type name.
+    /// Integer types: 12 consecutive indices each (add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot);
+    /// float types: 6 consecutive indices each (add/sub/mul/div/mod/neg, no bitwise ops).
+    /// Returns None when the type does not support arithmetic.
+    /// The base comes from `scalar_meta`, kept in single-point sync with the compute_fn_table! indices.
     fn arith_base(ty_name: &str) -> Option<u32> {
         crate::value::ValueTag::from_name(ty_name).and_then(scalar_meta).map(|m| m.arith_base)
     }
 
-    /// 根据 op + 表达式类型选择 compute_fn id。
+    /// Select a compute_fn id by op + expression type.
     fn select_binary_compute_fn(
         &mut self,
         op: crate::ast::Ast::BinaryOp,
@@ -4149,10 +4340,11 @@ impl<'a> IrBuilder<'a> {
         lhs_expr: crate::ast::Ast::ExprId,
         _rhs_expr: crate::ast::Ast::ExprId,
     ) -> ComputeFnId {
-        // 消费 sema 提升后类型：binary_expr_id 的 ExprInfo.type_name 是 sema
-        // 推断的二元运算结果类型。算术运算的结果类型即提升后操作数类型（i32+f64→f64），
-        // 比较运算的结果类型是 bool，需用操作数类型选 compute_fn。
-        // 分步检查避免 borrow 冲突：先检查 lhs 类型是否存在，报告错误，再获取类型引用
+        // Consume the sema-promoted type: binary_expr_id's ExprInfo.type_name is the binary
+        // operation's result type inferred by sema. For arithmetic, the result type is the promoted
+        // operand type (i32+f64 -> f64); for comparisons, the result type is bool, so the operand type
+        // must be used to select the compute_fn.
+        // Check in two steps to avoid borrow conflicts: first check whether the lhs type exists and report errors, then get the type reference
         let has_lhs_ty = self.expr_type_name(lhs_expr).is_some();
         if !has_lhs_ty {
             self.errors.push(format!(
@@ -4160,27 +4352,27 @@ impl<'a> IrBuilder<'a> {
         }
         let lhs_ty = self.expr_type_name(lhs_expr).unwrap_or("i32");
         let ty_name = match self.expr_type_name(binary_expr_id) {
-            Some(t) if Self::type_family(t) == crate::types::TypeFamily::Bool => lhs_ty,  // 比较运算：用操作数类型
-            Some(t) => t,             // 算术运算：用提升后类型
-            None => lhs_ty,           // sema 无记录：回退到 lhs 类型
+            Some(t) if Self::type_family(t) == crate::types::TypeFamily::Bool => lhs_ty,  // comparison: use operand type
+            Some(t) => t,             // arithmetic: use promoted type
+            None => lhs_ty,           // no sema record: fall back to lhs type
         };
         let ty_meta = crate::value::ValueTag::from_name(ty_name).and_then(scalar_meta);
         let is_float = ty_meta.as_ref().map(|m| m.is_float).unwrap_or(false);
-        // f128 需专用比较路径：经 to_f64 会丢 60 位精度，导致不同 f128 误判相等
+        // f128 needs a dedicated comparison path: going through to_f64 drops 60 bits of precision, causing distinct f128 values to be misjudged as equal
         let is_f128 = crate::value::ValueTag::from_name(ty_name) == Some(crate::value::ValueTag::F128);
-        // is_int：非浮点且非 bool（复用 TypeFamily 枚举，消除字符串比较）
+        // is_int: non-float and non-bool (reuses the TypeFamily enum, eliminating string comparison)
         let is_int = !is_float && Self::int_family(ty_name) != crate::types::TypeFamily::Bool;
         let base = Self::arith_base(ty_name);
 
-        // Elvis (??) 运算：lhs 为 null 时返回 rhs，否则返回 lhs。
-        // 不依赖操作数类型，必须在 str/复合类型分支之前处理。
+        // Elvis (??) operator: returns rhs when lhs is null, otherwise lhs.
+        // Does not depend on operand types; must be handled before the str/composite-type branches.
         if matches!(op, crate::ast::Ast::BinaryOp::Elvis) {
             return CF_ELVIS;
         }
 
-        // nullable 类型的 ==/!=：?. 短路或 null 字面量产生 Value::Null，
-        // str/i32 等专用比较函数不处理 Null（heap_obj() 返回 None 导致恒 false）。
-        // 分派到 CF_EQ_OBJ/CF_NE_OBJ（value_equals_with_arena 正确处理 Null 判别）。
+        // ==/!= for nullable types: ?. short-circuit or null literals produce Value::Null,
+        // and dedicated comparison functions for str/i32 etc. do not handle Null (heap_obj() returns None, always false).
+        // Dispatch to CF_EQ_OBJ/CF_NE_OBJ (value_equals_with_arena correctly handles Null discrimination).
         if matches!(op, crate::ast::Ast::BinaryOp::Eq | crate::ast::Ast::BinaryOp::NotEq)
             && self.expr_is_nullable(lhs_expr)
         {
@@ -4191,15 +4383,15 @@ impl<'a> IrBuilder<'a> {
             };
         }
 
-        // str + str → 字符串拼接（compute_str_concat, 269）
+        // str + str -> string concatenation (compute_str_concat, 269)
         if Self::type_family(ty_name) == crate::types::TypeFamily::Str
             && matches!(op, crate::ast::Ast::BinaryOp::Add)
         {
             return CF_STR_CONCAT;
         }
 
-        // str 比较 → 专用 str 比较 compute_fn（292-297）
-        // 不走 i32 路径：str 无 as_i32 语义，走 i32 会恒为 0 导致结果错误
+        // str comparison -> dedicated str comparison compute_fn (292-297)
+        // Does not go through the i32 path: str has no as_i32 semantics; the i32 path would always be 0, yielding wrong results
         if Self::type_family(ty_name) == crate::types::TypeFamily::Str {
             return match op {
                 crate::ast::Ast::BinaryOp::Eq => CF_EQ_STR,
@@ -4208,16 +4400,16 @@ impl<'a> IrBuilder<'a> {
                 crate::ast::Ast::BinaryOp::Gt => CF_GT_STR,
                 crate::ast::Ast::BinaryOp::LtEq => CF_LE_STR,
                 crate::ast::Ast::BinaryOp::GtEq => CF_GE_STR,
-                _ => CF_EQ_STR, // 算术等已在上面处理，此处不会到达
+                _ => CF_EQ_STR, // arithmetic etc. already handled above; unreachable here
             };
         }
 
-        // 复合类型（record/adt/newtype/array/closure/throw 等）相等/不等 →
-        // 通用语义比较 compute_fn（298-299）。走 i32 路径会因 as_i32() 恒为 0
-        // 导致所有复合类型判为相等。
-        // 判定依据：scalar_meta 为 None 意味着非标量类型。此时 Str 和 Nullable
-        // 已在上方分支处理，剩余 None 即全部复合类型（Array/Ref/Fn/Adt/Record/...）。
-        // scalar_meta 是标量类型的单一真相源，故 is_none() 是复合类型的充要条件。
+        // ==/!= for composite types (record/adt/newtype/array/closure/throw etc.) ->
+        // generic semantic comparison compute_fn (298-299). Going through the i32 path would make
+        // as_i32() always 0, judging all composite types as equal.
+        // Rationale: scalar_meta being None means a non-scalar type. At this point Str and Nullable
+        // are already handled above; the remaining None cases are all composite types (Array/Ref/Fn/Adt/Record/...).
+        // scalar_meta is the single source of truth for scalar types, so is_none() is the necessary and sufficient condition for composite types.
         if matches!(op, crate::ast::Ast::BinaryOp::Eq | crate::ast::Ast::BinaryOp::NotEq)
             && ty_meta.is_none()
         {
@@ -4228,9 +4420,9 @@ impl<'a> IrBuilder<'a> {
             };
         }
 
-        // 算术运算（add/sub/mul/div/mod）：整数和浮点都支持，按具体类型查表
-        // 整数索引顺序: add(0) sub(1) mul(2) div(3) mod(4) bitand(5) bitor(6) bitxor(7) shl(8) shr(9) neg(10) bitnot(11)
-        // 浮点索引顺序: add(0) sub(1) mul(2) div(3) mod(4) neg(5)
+        // Arithmetic (add/sub/mul/div/mod): supported by both integers and floats; look up by concrete type
+        // Integer index order: add(0) sub(1) mul(2) div(3) mod(4) bitand(5) bitor(6) bitxor(7) shl(8) shr(9) neg(10) bitnot(11)
+        // Float index order: add(0) sub(1) mul(2) div(3) mod(4) neg(5)
         let arith_offset = |op: &crate::ast::Ast::BinaryOp| -> Option<u32> {
             match op {
                 crate::ast::Ast::BinaryOp::Add => Some(0),
@@ -4245,11 +4437,11 @@ impl<'a> IrBuilder<'a> {
             if let Some(b) = base {
                 return ComputeFnId(b + off);
             }
-            // 未知类型回退到 i32 路径
+            // Unknown type falls back to the i32 path
             return ComputeFnId(116 + off);
         }
 
-        // 位运算（bitand/bitor/bitxor/shl/shr）：仅整数支持
+        // Bitwise (bitand/bitor/bitxor/shl/shr): only supported by integers
         if is_int {
             let bit_offset = match op {
                 crate::ast::Ast::BinaryOp::BitAnd => Some(5),
@@ -4263,17 +4455,17 @@ impl<'a> IrBuilder<'a> {
                 if let Some(b) = base {
                     return ComputeFnId(b + off);
                 }
-                return ComputeFnId(CF_ADD_I32_FULL.0 + off); // 回退 i32
+                return ComputeFnId(CF_ADD_I32_FULL.0 + off); // fall back to i32
             }
         }
 
-        // 比较运算：结果为 bool，输入按类型族读取
-        // fam 为 TypeFamily 枚举，用 | 合并有符号/无符号整数变体按位宽分派（编译器穷尽检查）
+        // Comparison: result is bool; input read by type family
+        // fam is the TypeFamily enum; use | to merge signed/unsigned integer variants to dispatch by bit-width (compiler exhaustive check)
         let fam = Self::int_family(ty_name);
         use crate::types::TypeFamily;
-        // 6 个比较 op 共享 f128→float→(bool)→i128→i64→i32 级联，宏消除重复。
-        // Eq/NotEq 有 Bool 分支；Lt/Gt/LtEq/GtEq 无 Bool 分支（bool 不可比较大小）。
-        // 宏只展开级联块（=> 右侧），match 模式保持显式以保留编译器穷尽检查。
+        // The 6 comparison ops share an f128->float->(bool)->i128->i64->i32 cascade; a macro removes the repetition.
+        // Eq/NotEq have a Bool branch; Lt/Gt/LtEq/GtEq have no Bool branch (bool cannot be ordered).
+        // The macro only expands the cascade block (=> right side); match patterns stay explicit to preserve the compiler's exhaustive check.
         macro_rules! cmp_arm {
             ($f128:ident, $f64:ident, $bool:ident, $i128:ident, $i64:ident, $i32:ident) => {
                 if is_f128 { $f128 }
@@ -4310,7 +4502,7 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    /// 根据 op + operand 表达式类型选择一元运算 compute_fn id。
+    /// Select a unary operation compute_fn id by op + operand expression type.
     fn select_unary_compute_fn(
         &mut self,
         op: crate::ast::Ast::UnaryOp,
@@ -4322,24 +4514,24 @@ impl<'a> IrBuilder<'a> {
         match op {
             crate::ast::Ast::UnaryOp::Not => CF_NOT_BOOL, // not_bool
             crate::ast::Ast::UnaryOp::Neg => {
-                // 整数 neg 在 base+10，浮点 neg 在 base+5
+                // integer neg is at base+10; float neg is at base+5
                 if let Some(b) = base {
                     let off = if is_float { 5 } else { 10 };
                     return ComputeFnId(b + off);
                 }
-                CF_NEG_I32_FULL // 回退 neg_i32
+                CF_NEG_I32_FULL // fall back to neg_i32
             }
             crate::ast::Ast::UnaryOp::BitNot => {
-                // 仅整数，bitnot 在 base+11
+                // integers only; bitnot is at base+11
                 if let Some(b) = base {
                     return ComputeFnId(b + 11);
                 }
-                CF_BITNOT_I32_FULL // 回退 bitnot_i32
+                CF_BITNOT_I32_FULL // fall back to bitnot_i32
             }
         }
     }
 
-    /// 编译二元运算。
+    /// Compile a binary operation.
     fn compile_binary(
         &mut self,
         op: crate::ast::Ast::BinaryOp,
@@ -4347,8 +4539,8 @@ impl<'a> IrBuilder<'a> {
         lhs: crate::ast::Ast::ExprId,
         rhs: crate::ast::Ast::ExprId,
     ) -> NodeId {
-        // Range/RangeInclusive 编译为 range_iter(start, end, inclusive) 函数调用
-        // （Range 本身是迭代器，For 循环通过 RangeIterator.next 静态分派）
+        // Range/RangeInclusive compiled as a range_iter(start, end, inclusive) function call
+        // (Range itself is an iterator; the For loop statically dispatches via RangeIterator.next)
         match op {
             crate::ast::Ast::BinaryOp::Range | crate::ast::Ast::BinaryOp::RangeInclusive => {
                 let lhs_node = self.compile_subexpr(lhs);
@@ -4357,17 +4549,17 @@ impl<'a> IrBuilder<'a> {
                 let bool_node = self.compile_bool_const(inclusive);
                 self.make_call_by_name("range_iter", &[lhs_node, rhs_node, bool_node])
             }
-            // Bug #38: &&/|| 短路求值——降级为 Gate 条件分支，确保 RHS 仅在
-            // LHS 不满足短路条件时才被求值（与 if 表达式相同的条件数据流）。
+            // Bug #38: &&/|| short-circuit evaluation -- lowered to a Gate conditional branch, ensuring RHS is
+            // evaluated only when LHS does not satisfy the short-circuit condition (same conditional dataflow as the if expression).
             //   lhs && rhs  =>  if lhs { rhs } else { false }
             //   lhs || rhs  =>  if lhs { true } else { rhs }
             crate::ast::Ast::BinaryOp::And | crate::ast::Ast::BinaryOp::Or => {
                 self.compile_short_circuit(op, lhs, rhs)
             }
             _ => {
-                // str + non-str / non-str + str → 将非字符串操作数通过
-                // compute_reflect_format 转为字符串后用 str_concat 拼接
-                //（与字符串插值 "{expr}" 的降级路径一致）
+                // str + non-str / non-str + str -> convert the non-string operand to a string via
+                // compute_reflect_format, then concat with str_concat
+                // (same lowering path as string interpolation "{expr}")
                 if matches!(op, crate::ast::Ast::BinaryOp::Add) {
                     let lhs_ty = self.expr_type_name(lhs).unwrap_or("");
                     let rhs_ty = self.expr_type_name(rhs).unwrap_or("");
@@ -4396,7 +4588,7 @@ impl<'a> IrBuilder<'a> {
                         });
                     }
                 }
-                // 操作数不在尾位置：其值被运算节点消费，而非直接返回。
+                // Operands are not in tail position: their values are consumed by the operation node, not returned directly.
                 let lhs_node = self.compile_subexpr(lhs);
                 let rhs_node = self.compile_subexpr(rhs);
                 let inputs_offset = self.graph.inputs_pool.push(&[lhs_node, rhs_node]);
@@ -4407,7 +4599,7 @@ impl<'a> IrBuilder<'a> {
                     inputs_offset,
                     compute_fn,
                 });
-                // 编译期标记 SIMD 批量化信息：标量类型 + 运算 → 运行期按 (tag,op) 分组批算
+                // Compile-time SIMD batching marker: scalar type + op -> runtime batches by (tag, op) group
                 if let Some(info) = self.binary_batch_info(op, lhs) {
                     self.graph.set_batch_info(node, info);
                 }
@@ -4416,14 +4608,14 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    /// Bug #38: 编译 &&/|| 短路求值。
+    /// Bug #38: compile &&/|| short-circuit evaluation.
     ///
-    /// 利用 Gate 条件分支确保 RHS 仅在 LHS 不满足短路条件时才被求值：
+    /// Uses a Gate conditional branch to ensure RHS is evaluated only when LHS does not satisfy the short-circuit condition:
     ///   lhs && rhs  =>  if lhs { rhs } else { false }
     ///   lhs || rhs  =>  if lhs { true } else { rhs }
     ///
-    /// 与 compile_if 的 Gate 模式一致：cond_node + then_sg + else_sg。
-    /// then/else 分支体为 Const 节点（短路值）或 RHS 表达式（需求值分支）。
+    /// Consistent with compile_if's Gate pattern: cond_node + then_sg + else_sg.
+    /// The then/else branch bodies are Const nodes (short-circuit value) or the RHS expression (the branch needing evaluation).
     fn compile_short_circuit(
         &mut self,
         op: crate::ast::Ast::BinaryOp,
@@ -4432,8 +4624,8 @@ impl<'a> IrBuilder<'a> {
     ) -> NodeId {
         let cond_node = self.compile_subexpr(lhs);
         let is_and = matches!(op, crate::ast::Ast::BinaryOp::And);
-        // && : lhs=true → 求 rhs ; lhs=false → false（短路）
-        // || : lhs=true → true（短路）   ; lhs=false → 求 rhs
+        // && : lhs=true -> evaluate rhs ; lhs=false -> false (short-circuit)
+        // || : lhs=true -> true (short-circuit)   ; lhs=false -> evaluate rhs
         let (then_sg, then_inputs) = if is_and {
             self.compile_branch_subgraph(rhs)
         } else {
@@ -4468,7 +4660,7 @@ impl<'a> IrBuilder<'a> {
         gate_node
     }
 
-    /// 编译常量 bool 分支（短路值），用于 && 的 false 分支和 || 的 true 分支。
+    /// Compile a constant bool branch (short-circuit value), used for &&'s false branch and ||'s true branch.
     fn compile_bool_branch(&mut self, value: bool) -> (SubGraphId, Vec<NodeId>) {
         let node_start = self.graph.nodes.len() as u32;
         self.enter_scope();
@@ -4503,10 +4695,10 @@ impl<'a> IrBuilder<'a> {
         (sg_id, Vec::new())
     }
 
-    /// 将 Kuzo BinaryOp + 类型名映射为 BatchInfo（可批量化的运算+标量类型组合）。
+    /// Map a Kuzo BinaryOp + type name to a BatchInfo (batchable op + scalar type combination).
     ///
-    /// 返回 None 表示该运算不可 SIMD 批量化（如 And/Or/RefEq/ConcatList/Range
-    /// 等非标量算术运算，或非标量类型）。
+    /// Returns None when the op is not SIMD-batchable (e.g. And/Or/RefEq/ConcatList/Range
+    /// and other non-scalar arithmetic ops, or non-scalar types).
     fn binary_batch_info(
         &self,
         op: crate::ast::Ast::BinaryOp,
@@ -4536,16 +4728,16 @@ impl<'a> IrBuilder<'a> {
             BinaryOp::Gt => BatchOp::Cmp(VCmpOp::Gt),
             BinaryOp::LtEq => BatchOp::Cmp(VCmpOp::Le),
             BinaryOp::GtEq => BatchOp::Cmp(VCmpOp::Ge),
-            // And/Or/RefEq/RefNeq/ConcatList/Range/RangeInclusive/Elvis → 不可批量化
+            // And/Or/RefEq/RefNeq/ConcatList/Range/RangeInclusive/Elvis -> not batchable
             _ => return None,
         };
         Some(BatchInfo { tag, op: batch_op })
     }
 
-    /// 将 Kuzo UnaryOp + 类型名映射为 BatchInfo。
+    /// Map a Kuzo UnaryOp + type name to a BatchInfo.
     ///
-    /// Neg（整数/浮点取负）和 BitNot（整数按位取反）可批量化；
-    /// Not（bool 逻辑非）不走 SIMD 批算。
+    /// Neg (integer/float negation) and BitNot (integer bitwise not) are batchable;
+    /// Not (bool logical not) does not go through SIMD batching.
     fn unary_batch_info(
         &self,
         op: crate::ast::Ast::UnaryOp,
@@ -4561,32 +4753,32 @@ impl<'a> IrBuilder<'a> {
         let batch_op = match op {
             UnaryOp::Neg => BatchOp::Unary(VUnaryOp::Neg),
             UnaryOp::BitNot if !is_float => BatchOp::Unary(VUnaryOp::Bnot),
-            // Not（bool 逻辑非）→ 不可批量化
+            // Not (bool logical not) -> not batchable
             _ => return None,
         };
         Some(BatchInfo { tag, op: batch_op })
     }
 
-    /// 类型名 → ValueTag 映射（委托 `ValueTag::from_name`，与 Value 单点同步）。
+    /// Map a type name to a ValueTag (delegates to `ValueTag::from_name`, single-point sync with Value).
     fn ty_name_to_scalar_tag(ty: &str) -> Option<crate::value::ValueTag> {
         crate::value::ValueTag::from_name(ty)
     }
 
-    /// 编译 cast 调用：__cast_to<T>(x) / __cast_try_to<T>(x)。
+    /// Compile a cast call: __cast_to<T>(x) / __cast_try_to<T>(x).
     ///
-    /// 通用路径：
-    ///   - 标量 → str：compute_cast_to_str 单节点（idx 277），覆盖所有整数/浮点/bool/char
-    ///   - 标量 → 标量：compute_cast_scalar 单节点（idx 278），覆盖所有整数/浮点互转
-    /// 特殊路径（FFI）：
-    ///   - u8[]/bytes → str：仍走 cast_mangled_name 查 SPECIAL_CAST_PAIRS
+    /// General path:
+    ///   - scalar -> str: compute_cast_to_str single node (idx 277), covers all integer/float/bool/char
+    ///   - scalar -> scalar: compute_cast_scalar single node (idx 278), covers all integer/float conversions
+    /// Special path (FFI):
+    ///   - u8[]/bytes -> str: still goes through cast_mangled_name to look up SPECIAL_CAST_PAIRS
     fn compile_cast_call(
         &mut self,
         _name: &str,
         args: &[crate::ast::Ast::ExprId],
         type_args: Option<&[crate::ast::Ast::TypeRef]>,
     ) -> NodeId {
-        // 获取目标类型名
-        // 泛型上下文中，target 可能是类型参数名（如 "T"），需查 current_type_args 替换为具体类型名
+        // Get the target type name
+        // In a generic context, target may be a type-parameter name (e.g. "T"); look up current_type_args to replace it with the concrete type name
         let target_ty = type_args
             .and_then(|ta| ta.first())
             .and_then(|&tid| {
@@ -4598,7 +4790,7 @@ impl<'a> IrBuilder<'a> {
                 }
             })
             .map(|name| {
-                // 类型参数替换：查 current_type_args（单态化实例上下文）
+                // Type-parameter replacement: look up current_type_args (monomorphization instance context)
                 if let Some((_, h)) = self.current_type_args.iter().find(|(n, _)| n == name) {
                     if let Some(resolved) = self.type_arena.type_name(*h) {
                         return resolved.to_string();
@@ -4608,12 +4800,12 @@ impl<'a> IrBuilder<'a> {
             })
             .unwrap_or_else(|| "i64".to_string());
 
-        // 获取源类型名（从 Sema expr_types）
+        // Get the source type name (from Sema expr_types)
         let source_ty = self.expr_type_name(args[0]).unwrap_or("i64").to_string();
 
         let input = self.compile_subexpr(args[0]);
 
-        // 通用路径 1：任意类型 → str
+        // General path 1: any type -> str
         if Self::type_family(&target_ty) == crate::types::TypeFamily::Str {
             let inputs_offset = self.graph.inputs_pool.push(&[input]);
             return self.graph.add_node(Node {
@@ -4624,7 +4816,7 @@ impl<'a> IrBuilder<'a> {
             });
         }
 
-        // 通用路径 2：标量 → 标量（int↔int, int↔float, float↔float, bool↔int, char↔int）
+        // General path 2: scalar -> scalar (int<->int, int<->float, float<->float, bool<->int, char<->int)
         if Self::ty_name_to_scalar_tag(&source_ty).is_some()
             && Self::ty_name_to_scalar_tag(&target_ty).is_some()
         {
@@ -4639,7 +4831,7 @@ impl<'a> IrBuilder<'a> {
             return node;
         }
 
-        // 特殊路径：u8[]/bytes → str 等 FFI cast
+        // Special path: u8[]/bytes -> str and other FFI casts
         let mangled = cast_mangled_name(&source_ty, &target_ty);
         let inputs_offset = self.graph.inputs_pool.push(&[input]);
         let call_node = self.graph.add_node(Node {
@@ -4654,27 +4846,28 @@ impl<'a> IrBuilder<'a> {
         call_node
     }
 
-    /// 编译函数调用。
+    /// Compile a function call.
     ///
-    /// 若 callee 是已知函数名 → Call 节点 + set_call_target。
-    /// 若 callee 是类型名（如 `Iterator(arr, 0)`）→ 编译为记录构造节点。
+    /// If the callee is a known function name -> Call node + set_call_target.
+    /// If the callee is a type name (e.g. `Iterator(arr, 0)`) -> compile into a record-construction node.
     fn compile_call(
         &mut self,
         call_expr_id: crate::ast::Ast::ExprId,
         callee: crate::ast::Ast::ExprId,
         args: &[crate::ast::Ast::ExprId],
     ) -> NodeId {
-        // 泛型调用优先走单态化实例路径：inline expansion 不处理类型参数替换，
-        // 对泛型函数 inline 会导致 body 中类型参数 T 无法解析为具体类型。
+        // Generic calls prefer the monomorphization-instance path: inline expansion does not handle
+        // type-parameter substitution, so inlining a generic function would leave type parameter T
+        // unresolved to a concrete type in the body.
         let call_inst_key = crate::sema::Sema::module_expr_key(
             self.expr_key_module(),
             call_expr_id.0 as u64,
         );
         let is_generic_call = self.sema.call_instantiations.contains_key(&call_inst_key);
 
-        // ── 内联展开：分析器标记的调用点，直接编译 callee body 而非 launch 子图 ──
-        // 纯函数 + 小体 + 非递归 → 绑定实参到形参，编译 body，避免调用开销
-        // 泛型调用跳过 inline（类型参数需通过 monomorph 实例子图替换）
+        // -- Inline expansion: call sites flagged by the analyzer compile the callee body directly instead of launching a subgraph --
+        // pure function + small body + non-recursive -> bind actuals to formals, compile body, avoid call overhead
+        // generic calls skip inlining (type parameters need replacement via the monomorph instance subgraph)
         if !is_generic_call {
             if let Some(callee_func) = self.inline_target(call_expr_id) {
                 if let crate::ast::Ast::Decl::FunDecl { params, body, .. } =
@@ -4687,13 +4880,13 @@ impl<'a> IrBuilder<'a> {
 
         let callee_expr = self.current_module().arena.expr(callee);
 
-        // 内置构造器检测：Ok(val) / Err(record) / channel(capacity)
-        // 通过 BUILTIN_CTORS 注册表查表降级，未命中的错误类型走下方 record 构造路径
+        // Built-in constructor detection: Ok(val) / Err(record) / channel(capacity)
+        // Lowered via the BUILTIN_CTORS registry lookup; missed error types fall through to the record construction path below
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
             if !self.func_subgraphs.contains_key(*name) {
                 if let Some(lower) = BUILTIN_CTORS.iter().find_map(|(n, l)| (*n == *name).then_some(l)) {
                     return match lower {
-                        // Ok(val) → compute_throw_ok（idx 44），输入 = val
+                        // Ok(val) -> compute_throw_ok (idx 44), input = val
                         BuiltinCtorLower::Ok => {
                             let mut inputs = Vec::with_capacity(args.len());
                             for &arg in args {
@@ -4707,7 +4900,7 @@ impl<'a> IrBuilder<'a> {
                                 compute_fn: CF_THROW_OK, // throw_ok
                             })
                         }
-                        // Err(...) → 先 record_construct，再 throw_err 包装（idx 45）
+                        // Err(...) -> first record_construct, then wrap with throw_err (idx 45)
                         BuiltinCtorLower::Err => {
                             let inner = self.compile_record_like(crate::ir::Compute::CTOR_ERR, args);
                             let inputs_offset = self.graph.inputs_pool.push(&[inner]);
@@ -4718,7 +4911,7 @@ impl<'a> IrBuilder<'a> {
                                 compute_fn: CF_THROW_ERR, // throw_err
                             })
                         }
-                        // channel(capacity) → compute_channel_create（idx 283），输入 = args
+                        // channel(capacity) -> compute_channel_create (idx 283), input = args
                         BuiltinCtorLower::Channel => {
                             let mut inputs = Vec::with_capacity(args.len());
                             for &arg in args {
@@ -4737,14 +4930,14 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 类型构造器/ADT/Newtype 构造器检测：callee 是 Ident 且不是已知函数
+        // Type constructor / ADT / Newtype constructor detection: callee is an Ident and not a known function
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
             if !self.func_subgraphs.contains_key(*name) {
-                // 先查类型名（Record 或单构造器 ADT），再查多构造器 ADT 的构造器名
+                // First look up the type name (Record or single-constructor ADT), then the constructor name of a multi-constructor ADT
                 let tf_info = self.lookup_type_field_names(name)
                     .or_else(|| self.lookup_constructor_field_names(name));
                 if let Some(info) = tf_info {
-                    // 编译为构造节点（compute_record_construct = 29，根据 kind 分派 HeapObj）
+                    // Compile into a construction node (compute_record_construct = 29, dispatches to HeapObj by kind)
                     let mut inputs = Vec::with_capacity(args.len());
                     for &arg in args {
                         inputs.push(self.compile_subexpr(arg));
@@ -4767,10 +4960,10 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 闭包调用检测：callee 是 Ident，非已知函数，但在作用域中绑定（变量持有 Closure/Partial）
-        // → 用 compute_closure_call（idx 41），inputs[0] = 可调用值节点，inputs[1..1+arg_count] = 调用参数
-        // 末尾追加 current_effect 作为隐式依赖（确保 Call 在前序 effect 完成后才执行）
-        // arg_count 元数据记录实参数（不含闭包值和 effect），供链式偏应用判断使用
+        // Closure call detection: callee is an Ident, not a known function, but bound in scope (variable holds a Closure/Partial)
+        // -> use compute_closure_call (idx 41); inputs[0] = callable value node, inputs[1..1+arg_count] = call arguments
+        // current_effect appended at the end as an implicit dependency (ensures Call executes only after prior effects complete)
+        // arg_count metadata records the actual argument count (excluding closure value and effect), used for chained partial-application detection
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
             if !self.func_subgraphs.contains_key(*name) {
                 if let Some(closure_node) = self.lookup_var(name) {
@@ -4795,16 +4988,16 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // @extern("C") FFI 调用检测：不启动子帧，直接调用 Ffi::wrapper
-        // 末尾追加 current_effect 作为隐式依赖（确保 FFI Call 在前序 effect 完成后才执行）
+        // @extern("C") FFI call detection: does not launch a sub-frame; calls Ffi::wrapper directly
+        // current_effect appended at the end as an implicit dependency (ensures the FFI Call executes only after prior effects complete)
         //
-        // 特殊拦截：__reflect_format / __reflect_scalar_to_str 拆分为独立 compute_fn
-        //（CF_REFLECT_FORMAT/CF_REFLECT_SCALAR_TO_STR），不走 FFI 分派，
-        // 避免 lazy force 逻辑与 FFI 调用耦合。这两个原语仍以 @extern("C") 声明
-        //（builtin 机制），但 compute_fn 直接绑定到 reflect 实现。
+        // Special interception: __reflect_format / __reflect_scalar_to_str are split into standalone compute_fns
+        // (CF_REFLECT_FORMAT/CF_REFLECT_SCALAR_TO_STR), not going through FFI dispatch,
+        // to avoid coupling the lazy-force logic with FFI calls. These two primitives are still declared as @extern("C")
+        // (via the builtin mechanism), but compute_fn is bound directly to the reflect implementation.
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
             if self.is_extern_c_func(name) {
-                // 查 FFI intrinsic 注册表，命中用注册的 compute_fn，未命中走 CF_FFI_CALL
+                // Look up the FFI intrinsic registry; a hit uses the registered compute_fn, a miss goes to CF_FFI_CALL
                 let (compute_fn, need_ffi_name) = FFI_INTRINSIC_TABLE
                     .iter()
                     .find(|(n, _)| *n == &**name)
@@ -4831,9 +5024,9 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 偏应用检测：callee 是已知函数名，但实参数 < 目标函数形参数
-        // → 生成 partial_construct 节点（idx 286），产出 HeapObj::Partial
-        // bound_args = 已提供的实参（按原函数参数顺序绑定前导参数）
+        // Partial application detection: callee is a known function name, but actual count < target function formal count
+        // -> generate a partial_construct node (idx 286), producing a HeapObj::Partial
+        // bound_args = the already-supplied actuals (binding leading parameters in the original function's parameter order)
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
             if let Some(&target_sg) = self.func_subgraphs.get(*name) {
                 if let Some(sg) = self.graph.subgraphs.get(target_sg.0 as usize) {
@@ -4860,10 +5053,10 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 动态闭包调用：callee 是非 Ident 表达式（如 arr[i]、field.access、
-        // 闭包字面量直接调用 fun() {...}() 等），运行时求值为 Closure/Partial。
-        // 用 compute_closure_call（idx 41）动态调用，inputs[0] = 可调用值节点。
-        // 末尾追加 current_effect 作为隐式依赖（与 Ident 闭包调用路径一致）。
+        // Dynamic closure call: callee is a non-Ident expression (e.g. arr[i], field.access,
+        // a closure literal invoked directly fun() {...}(), etc.), evaluated at runtime to a Closure/Partial.
+        // Use compute_closure_call (idx 41) for dynamic invocation; inputs[0] = callable value node.
+        // current_effect appended at the end as an implicit dependency (consistent with the Ident closure call path).
         if !matches!(&callee_expr.node, crate::ast::Ast::Expr::Ident(_)) {
             let callable_node = self.compile_subexpr(callee);
             let mut inputs = Vec::with_capacity(args.len() + 2);
@@ -4885,44 +5078,44 @@ impl<'a> IrBuilder<'a> {
             return call_node;
         }
 
-        // 尾递归转迭代拦截：当前在 TailRecToLoop body 编译中且 callee 是 self_name，
-        // 且在尾位置（避免参数中的递归调用被误拦截），
-        // 生成 WriteBack(参数, 实参) 替代 Call(self)。
-        // body_sg 是 LoopBody，完成后 reset_loop_iteration 自动回跳 while_sg 重新求值 cond。
+        // Tail-recursion-to-iteration interception: currently compiling in a TailRecToLoop body and callee is self_name,
+        // and in tail position (to avoid recursive calls in arguments being mistakenly intercepted),
+        // generate WriteBack(param, actual) instead of Call(self).
+        // body_sg is a LoopBody; after it completes, reset_loop_iteration automatically jumps back to while_sg to re-evaluate cond.
         if self.in_tail_position && self.tail_rec_ctx.is_some() {
-            // 尾递归拦截：生成 WriteBack(参数, 实参) 替代 Call(self)
+            // Tail-recursion interception: generate WriteBack(param, actual) instead of Call(self)
         }
         if self.in_tail_position {
             if let Some(ctx) = &self.tail_rec_ctx.clone() {
                 if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
                     if *name == ctx.self_name {
-                    // 编译所有实参表达式（先求值，再 WriteBack，避免参数间竞态）
+                    // Compile all actual-argument expressions (evaluate first, then WriteBack, to avoid races between parameters)
                     let arg_nodes: Vec<NodeId> = args
                         .iter()
                         .map(|&a| self.compile_subexpr(a))
                         .collect();
-                    // 对每个参数执行 WriteBack（写回函数级参数节点）。
-                    // barrier 机制：第一个 WriteBack 依赖所有 arg_nodes，
-                    // 后续 WriteBack 链式依赖前一个 WriteBack。
-                    // 这确保所有实参表达式在任意 WriteBack 执行前完成求值，
-                    // 避免 a+b 读到已被 WriteBack 更新的 a 值。
+                    // Perform a WriteBack for each parameter (writing back to the function-level param nodes).
+                    // Barrier mechanism: the first WriteBack depends on all arg_nodes;
+                    // subsequent WriteBacks chain-depend on the previous WriteBack.
+                    // This ensures all actual-argument expressions finish evaluating before any WriteBack executes,
+                    // preventing a+b from reading the already-WriteBack-updated value of a.
                     //
-                    // 只有最后一个 WriteBack 使用 CF_TAILREC_WRITEBACK（设置 Continue），
-                    // 非最后 WriteBack 使用 CF_WRITEBACK（不设 Continue）。
-                    // 原因：Continue 信号会导致帧立即退出并跳过 notify_downstream，
-                    // 若每个 WriteBack 都设 Continue，后续链式 WriteBack 永远不会就绪执行。
+                    // Only the last WriteBack uses CF_TAILREC_WRITEBACK (sets Continue);
+                    // non-last WriteBacks use CF_WRITEBACK (do not set Continue).
+                    // Reason: the Continue signal causes the frame to exit immediately and skip notify_downstream;
+                    // if every WriteBack set Continue, subsequent chained WriteBacks would never become ready to execute.
                     let wb_count = arg_nodes.len().min(ctx.param_nodes.len());
                     let mut last_wb: Option<NodeId> = None;
                     for (i, &arg_node) in arg_nodes.iter().enumerate() {
                         if i < ctx.param_nodes.len() {
                             let mut wb_inputs = vec![arg_node];
                             if i == 0 {
-                                // 第一个 WB：barrier，依赖所有其他 arg_nodes
+                                // First WB: a barrier depending on all other arg_nodes
                                 for &other in &arg_nodes[1..] {
                                     wb_inputs.push(other);
                                 }
                             } else if let Some(prev_wb) = last_wb {
-                                // 后续 WB：依赖前一个 WB（链式排序）
+                                // Subsequent WBs: depend on the previous WB (chain ordering)
                                 wb_inputs.push(prev_wb);
                             }
                             let is_last = i + 1 == wb_count;
@@ -4943,7 +5136,7 @@ impl<'a> IrBuilder<'a> {
                             last_wb = Some(wb_node);
                         }
                     }
-                    // 返回最后一个 WriteBack 节点（body_sg 完成后 reset_loop_iteration 自动回跳）
+                    // Return the last WriteBack node (after body_sg completes, reset_loop_iteration automatically jumps back)
                     return last_wb.unwrap_or_else(|| {
                         let off = self.graph.inputs_pool.push(&[]);
                         self.graph.add_node(Node {
@@ -4958,25 +5151,25 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 非尾递归转迭代拦截：非尾位置的自调用替换为 push 续延 + push 子任务 + barrier(Continue)
-        // 仅在 non_tail_rec_ctx 设置时拦截（compile_non_tail_rec_body_sg 的 state_N_sg 编译中）
+        // Non-tail-recursion-to-iteration interception: a self-call in non-tail position is replaced with push continuation + push sub-task + barrier(Continue)
+        // Only intercepted when non_tail_rec_ctx is set (during state_N_sg compilation in compile_non_tail_rec_body_sg)
         if !self.in_tail_position && self.non_tail_rec_ctx.is_some() {
             let ctx_clone = self.non_tail_rec_ctx.clone();
             if let Some(ctx) = &ctx_clone {
                 if let crate::ast::Ast::Expr::Ident(callee_name) = &callee_expr.node {
                     if *callee_name == ctx.self_name {
-                        // 1. 检查 call_result_map：如果当前调用已在映射中，返回映射的节点
+                        // 1. Check call_result_map: if the current call is already in the map, return the mapped node
                         if let Some(&mapped) = ctx.call_result_map.get(&call_expr_id) {
                             return mapped;
                         }
-                        // 2. 如果已截断，返回 void 常量（不生成 Call 节点）
+                        // 2. If already truncated, return a void constant (no Call node generated)
                         if ctx.truncated {
                             return self.compile_void_const();
                         }
-                        // 3. 拦截：push 续延帧 + push 子任务帧 + barrier(Continue)
+                        // 3. Intercept: push continuation frame + push sub-task frame + barrier(Continue)
 
-                        // 保存 current_effect：compile_subexpr 可能修改它，
-                        // 需要在实参编译后恢复，确保 store 链从正确的 effect 开始。
+                        // Save current_effect: compile_subexpr may modify it;
+                        // restore after compiling the actuals to ensure the store chain starts from the correct effect.
                         let saved_effect = self.current_effect;
                         let arg_nodes: Vec<NodeId> = args
                             .iter()
@@ -4992,10 +5185,10 @@ impl<'a> IrBuilder<'a> {
                         let sp_node = ctx.sp_node;
                         let result_node = ctx.result_node;
 
-                        // 计算栈索引：base_cont = sp * stride, base_task = (sp + 1) * stride
-                        // sp 已被 pop 递减（sp_node = original_sp - 1）
-                        // cont 写入 pop 释放的槽位（覆盖已消费的帧），task 写入下一个槽位
-                        // sp_new = sp + 2，pop 时 sp-1 先读 task（LIFO），再读 cont
+                        // Compute stack indices: base_cont = sp * stride, base_task = (sp + 1) * stride
+                        // sp has already been decremented by pop (sp_node = original_sp - 1)
+                        // cont writes to the slot freed by pop (overwriting the consumed frame); task writes to the next slot
+                        // sp_new = sp + 2; on pop, sp-1 reads task first (LIFO), then cont
                         let one_const = self.make_i32_const(1);
                         let sp_plus_1 = self.make_binop(sp_node, one_const, CF_ADD_I32);
                         let two_const = self.make_i32_const(2);
@@ -5004,25 +5197,25 @@ impl<'a> IrBuilder<'a> {
                         let base_cont = self.make_binop(sp_node, stride_val, CF_MUL_I32);
                         let base_task = self.make_binop(sp_plus_1, stride_val, CF_MUL_I32);
 
-                        // Push 续延帧（写入 pop 释放的槽位）
-                        // stack[base_cont + 0..P] = 当前参数（param_cur 节点）
-                        // 所有 store 必须通过 chain_effects 链入 effect 链，
-                        // 确保 barrier 在所有 store 完成后才触发 Continue。
+                        // Push continuation frame (write to the slot freed by pop)
+                        // stack[base_cont + 0..P] = current parameters (param_cur nodes)
+                        // All stores must be chained into the effect chain via chain_effects,
+                        // ensuring the barrier triggers Continue only after all stores complete.
                         for i in 0..param_count {
                             let offset = self.make_i32_const(i as i32);
                             let idx = self.make_binop(base_cont, offset, CF_ADD_I32);
                             let store = self.make_array_store(stack_node, idx, ctx.param_nodes[i]);
                             self.current_effect = Some(self.chain_effects(self.current_effect, store));
                         }
-                        // stack[base_cont + P] = state_after（当前 state + 1）
+                        // stack[base_cont + P] = state_after (current state + 1)
                         let state_after = self.make_i32_const((current_state + 1) as i32);
                         let state_offset_cont = self.make_i32_const(param_count as i32);
                         let state_idx_cont = self.make_binop(base_cont, state_offset_cont, CF_ADD_I32);
                         let state_store_cont =
                             self.make_array_store(stack_node, state_idx_cont, state_after);
                         self.current_effect = Some(self.chain_effects(self.current_effect, state_store_cont));
-                        // stack[base_cont + P + 1..P + 1 + num_saved] = 保存值
-                        // 对于 state S：slot j = saved_nodes[j] (j < S-1), result_node (j == S-1), 0 (j >= S)
+                        // stack[base_cont + P + 1..P + 1 + num_saved] = saved values
+                        // For state S: slot j = saved_nodes[j] (j < S-1), result_node (j == S-1), 0 (j >= S)
                         let zero_saved = self.make_i32_const(0);
                         for j in 0..max_saved {
                             let offset = self.make_i32_const((param_count + 1 + j) as i32);
@@ -5041,15 +5234,15 @@ impl<'a> IrBuilder<'a> {
                             self.current_effect = Some(self.chain_effects(self.current_effect, store));
                         }
 
-                        // Push 子任务帧（栈顶，pop 时先读）
-                        // stack[base_task + 0..P] = 实参（arg_nodes）
+                        // Push sub-task frame (top of stack; read first on pop)
+                        // stack[base_task + 0..P] = actuals (arg_nodes)
                         for i in 0..param_count {
                             let offset = self.make_i32_const(i as i32);
                             let idx = self.make_binop(base_task, offset, CF_ADD_I32);
                             let store = self.make_array_store(stack_node, idx, arg_nodes[i]);
                             self.current_effect = Some(self.chain_effects(self.current_effect, store));
                         }
-                        // stack[base_task + P] = 0（INIT state）
+                        // stack[base_task + P] = 0 (INIT state)
                         let state_offset_task = self.make_i32_const(param_count as i32);
                         let state_idx_task = self.make_binop(base_task, state_offset_task, CF_ADD_I32);
                         let state_store_task =
@@ -5063,16 +5256,16 @@ impl<'a> IrBuilder<'a> {
                             self.current_effect = Some(self.chain_effects(self.current_effect, store));
                         }
 
-                        // WriteBack sp = sp + 2（链接 effect 确保在所有 store 之后执行）
+                        // WriteBack sp = sp + 2 (chained into effect to ensure it runs after all stores)
                         let sp_new = self.chain_effects(self.current_effect, sp_plus_2);
                         let sp_wb = self.compile_writeback_node(sp_new, sp_node);
                         self.current_effect = Some(sp_wb);
 
-                        // 创建 barrier 节点（Continue 信号，阻止后续表达式执行）
+                        // Create the barrier node (Continue signal; blocks subsequent expression execution)
                         let barrier = self.make_continue_barrier(sp_wb);
                         self.current_effect = Some(barrier);
 
-                        // 设置截断标志
+                        // Set the truncated flag
                         if let Some(ctx) = &mut self.non_tail_rec_ctx {
                             ctx.truncated = true;
                         }
@@ -5083,8 +5276,8 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 普通函数调用
-        // 末尾追加 current_effect 作为隐式依赖（确保 Call 在前序 effect 完成后才执行）
+        // Regular function call
+        // current_effect appended at the end as an implicit dependency (ensures Call executes only after prior effects complete)
         let mut inputs = Vec::with_capacity(args.len() + 1);
         for &arg in args {
             inputs.push(self.compile_subexpr(arg));
@@ -5093,27 +5286,27 @@ impl<'a> IrBuilder<'a> {
             inputs.push(eff);
         }
         let inputs_offset = self.graph.inputs_pool.push(&inputs);
-        // 默认 sync call compute_fn（idx 36），async 函数用 compute_async_call_launch（idx 39）
+        // Default sync call compute_fn (idx 36); async functions use compute_async_call_launch (idx 39)
         let call_node = self.graph.add_node(Node {
             kind: NodeKind::Call,
             input_count: inputs.len() as u8,
             inputs_offset,
-            compute_fn: CF_CALL_LAUNCH, // compute_call_launch（sync）
+            compute_fn: CF_CALL_LAUNCH, // compute_call_launch (sync)
         });
 
-        // 绑定目标子图（如果 callee 是已知函数名）
-        // 优先查 call_instantiations：泛型调用点 → 单态化实例，用 mangled name 绑定特化子图
+        // Bind the target subgraph (if the callee is a known function name)
+        // Prefer call_instantiations lookup: generic call site -> monomorphization instance, bind the specialized subgraph by mangled name
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
             let inst_id = self.sema.call_instantiations.get(&call_inst_key);
             let mangled = inst_id.map(|&id| format!("{}#{}", name, id));
             let target_key: &str = mangled.as_deref().unwrap_or(name);
             if let Some(&target_sg) = self.func_subgraphs.get(target_key) {
                 self.graph.set_call_target(call_node, target_sg);
-                // is_async 由 compute_call_launch 运行时从 has_suspend 推导，
-                // 此处仅查 has_suspend 决定是否可标记尾调用。
+                // is_async is derived at runtime by compute_call_launch from has_suspend;
+                // here we only check has_suspend to decide whether the call can be marked tail.
                 let is_async = self.graph.subgraphs.get(target_sg.0 as usize)
                     .is_some_and(|sg| sg.has_suspend);
-                // 尾调用标记：尾位置 + 同步函数 + 有 call_target → 运行时 switch_subgraph 帧复用
+                // Tail-call marker: tail position + sync function + has call_target -> runtime switch_subgraph frame reuse
                 if self.in_tail_position && !is_async {
                     self.graph.set_tail_call(call_node);
                 }
@@ -5123,10 +5316,10 @@ impl<'a> IrBuilder<'a> {
         call_node
     }
 
-    /// 内联展开：编译 callee body，形参绑定到实参节点。
+    /// Inline expansion: compile the callee body with formals bound to actual nodes.
     ///
-    /// 进入新作用域 → 编译实参 → 绑定形参名 → 编译 body（非尾位置）→ 退出作用域。
-    /// 不生成 Call 节点和子图启动，直接把 body 的 IR 嵌入当前函数。
+    /// Enter a new scope -> compile actuals -> bind formal names -> compile body (non-tail position) -> exit scope.
+    /// Does not generate a Call node or launch a subgraph; embeds the body's IR directly into the current function.
     fn compile_inline_expansion(
         &mut self,
         body: crate::ast::Ast::ExprRef,
@@ -5134,32 +5327,32 @@ impl<'a> IrBuilder<'a> {
         args: &[crate::ast::Ast::ExprId],
     ) -> NodeId {
         self.enter_scope();
-        // 编译实参并绑定到形参名（实参节点在当前作用域上下文中编译）
+        // Compile actuals and bind to formal names (actual nodes are compiled in the current scope context)
         for (param, &arg) in params.iter().zip(args.iter()) {
             let arg_node = self.compile_subexpr(arg);
             self.bind_var(param.name, arg_node);
         }
-        // 编译 callee body（非尾位置，内联展开不保留尾调用语义）
+        // Compile the callee body (non-tail position; inline expansion does not preserve tail-call semantics)
         let body_node = self.compile_subexpr(body);
         self.exit_scope();
         body_node
     }
 
-    /// 查找类型声明的字段信息（按类型名）。
+    /// Look up a type declaration's field info (by type name).
     ///
-    /// 统一从 type_scope_stack 逐层查找（顶层 + 嵌套类型共享同一查找路径）。
+    /// Uniformly searches layer by layer through type_scope_stack (top-level + nested types share the same lookup path).
     fn lookup_type_field_names(&self, type_name: &str) -> Option<TypeFieldInfo> {
         self.lookup_type_fields(type_name)
     }
 
-    /// 查找多构造器 ADT 中指定构造器的字段信息。
+    /// Look up the field info of a specified constructor in a multi-constructor ADT.
     ///
-    /// 统一从 type_scope_stack 逐层查找（顶层 + 嵌套类型共享同一查找路径）。
+    /// Uniformly searches layer by layer through type_scope_stack (top-level + nested types share the same lookup path).
     fn lookup_constructor_field_names(&self, constructor_name: &str) -> Option<TypeFieldInfo> {
         self.lookup_type_fields(constructor_name)
     }
 
-    /// 检查函数名是否是 @extern("C") 函数（有 extern_c_body）。
+    /// Check whether a function name is an @extern("C") function (has extern_c_body).
     fn is_extern_c_func(&self, name: &str) -> bool {
         let modules: Vec<&crate::ast::Ast::Module<'_>> =
             std::iter::once(self.module).chain(self.builtin_modules.iter().copied()).collect();
@@ -5175,12 +5368,12 @@ impl<'a> IrBuilder<'a> {
         false
     }
 
-    /// 编译方法调用。
+    /// Compile a method call.
     ///
-    /// 方法分派统一走 (type_id, method_idx) 路径：
-    /// - intrinsic 方法（await/len/send/recv/close/bytes/cancel 等）通过
-    ///   MethodSigInfo.intrinsic 字段标注，直接降级为 compute_fn 节点
-    /// - 类型/trait 方法编译为 Call 节点，通过 (type_id, method_idx) 查 method_subgraphs
+    /// Method dispatch uniformly goes through the (type_id, method_idx) path:
+    /// - intrinsic methods (await/len/send/recv/close/bytes/cancel etc.) are flagged via
+    ///   MethodSigInfo.intrinsic and lowered directly to a compute_fn node
+    /// - type/trait methods are compiled into Call nodes, looking up method_subgraphs via (type_id, method_idx)
     fn compile_method_call(
         &mut self,
         call_expr_id: crate::ast::Ast::ExprId,
@@ -5190,10 +5383,10 @@ impl<'a> IrBuilder<'a> {
     ) -> NodeId {
         let recv_node = self.compile_subexpr(recv);
 
-        // ── intrinsic 降级 ──
-        // 优先查 sema method_dispatches 的语言级 intrinsic 标记（await/recv），
-        // 未命中则回退到 (type_id, method_idx) 查 MethodSigInfo.intrinsic（send/close/len 等）。
-        // 条件不满足（如参数数量不匹配）时 fall through 到 Call 节点路径。
+        // -- intrinsic lowering --
+        // First look up the language-level intrinsic flag in sema method_dispatches (await/recv);
+        // on miss, fall back to (type_id, method_idx) lookup of MethodSigInfo.intrinsic (send/close/len etc.).
+        // When conditions are not met (e.g. argument count mismatch), fall through to the Call node path.
         let dispatch_intrinsic = {
             let key = crate::sema::Sema::module_expr_key(
                 self.expr_key_module(),
@@ -5208,11 +5401,11 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 路径 0：模块函数调用（recv 是构造器/模块命名空间，不传 recv）
-        // sema MethodCall 路径 0a/0b 标记的 recv：ModuleRef.free_func(args) / TypeName.free_func(args)
-        // 不把 recv 作为参数传递（free_func 是自由函数，不接收 recv）
-        // 泛型调用优先查 call_instantiations 用 mangled name 绑定特化子图，
-        // 非泛型调用回退裸名（与 compile_call 的 mangled 查找逻辑一致）
+        // Path 0: module function call (recv is a constructor/module namespace; recv is not passed)
+        // recv flagged by sema MethodCall path 0a/0b: ModuleRef.free_func(args) / TypeName.free_func(args)
+        // recv is not passed as an argument (free_func is a free function; it does not take recv)
+        // Generic calls prefer call_instantiations lookup to bind the specialized subgraph by mangled name;
+        // non-generic calls fall back to the bare name (same mangled-lookup logic as compile_call)
         {
             let recv_key = crate::sema::Sema::module_expr_key(
                 self.expr_key_module(),
@@ -5248,8 +5441,8 @@ impl<'a> IrBuilder<'a> {
         }
 
         {
-            // Ty 驱动方法分派：(type_id, method_idx) 结构化键查 method_subgraphs
-            // 末尾追加 current_effect 作为隐式依赖（确保 Call 在前序 effect 完成后才执行）
+            // Ty-driven method dispatch: (type_id, method_idx) structured key lookup into method_subgraphs
+            // current_effect appended at the end as an implicit dependency (ensures Call executes only after prior effects complete)
             let mut inputs = Vec::with_capacity(2 + args.len());
             inputs.push(recv_node);
             for &arg in args {
@@ -5266,14 +5459,14 @@ impl<'a> IrBuilder<'a> {
                 compute_fn: CF_CALL_LAUNCH,
             });
 
-            // 分派优先级（语义优先级，非 fallback）：
-            //   1. trait object 动态分派（recv 类型为 trait → vtable 运行时分派）
-            //   2. 类型自有方法 / trait 方法覆写：(type_id, method_idx) 查 method_subgraphs
-            //   3. trait 默认方法：(type_id, trait_def_idx, method_idx_in_trait) 查 trait_default_subgraphs
+            // Dispatch priority (semantic priority, not fallback):
+            //   1. trait object dynamic dispatch (recv type is a trait -> vtable runtime dispatch)
+            //   2. type's own method / trait method override: (type_id, method_idx) lookup into method_subgraphs
+            //   3. trait default method: (type_id, trait_def_idx, method_idx_in_trait) lookup into trait_default_subgraphs
 
-            // 路径 1：trait object 动态分派（vtable）
+            // Path 1: trait object dynamic dispatch (vtable)
             if self.is_trait_object_recv(recv) {
-                // 查 trait_def.methods 获取 method_idx（与 TraitValue.method_values 索引一致）
+                // Look up method_idx from trait_def.methods (consistent with TraitValue.method_values index)
                 let trait_name = self.expr_type_name(recv).unwrap_or("");
                 let method_idx = self.sema.get_trait_def(trait_name)
                     .and_then(|td| td.methods.iter().position(|m| m.name.as_ref() == method))
@@ -5287,7 +5480,7 @@ impl<'a> IrBuilder<'a> {
                 return call_node;
             }
 
-            // 路径 2：类型自有方法 / trait 方法覆写
+            // Path 2: type's own method / trait method override
             if let Some(type_name) = self.expr_type_name(recv) {
                 if let Some(type_id) = self.expr_type_id(recv) {
                     if let Some(method_idx) = self.sema.lookup_method_idx(type_name, method) {
@@ -5299,7 +5492,7 @@ impl<'a> IrBuilder<'a> {
                 }
             }
 
-            // 路径 3：trait 默认方法（类型未覆写，回退到 trait 默认实现的单态化特化版本）
+            // Path 3: trait default method (type does not override; fall back to the monomorphized specialized version of the trait default impl)
             if let Some(type_id) = self.expr_type_id(recv) {
                 for trait_def in &self.sema.trait_defs {
                     if !self.type_implements_trait(type_id, &trait_def.name) {
@@ -5320,8 +5513,8 @@ impl<'a> IrBuilder<'a> {
                 }
             }
 
-            // 路径 4：自由函数方法调用（recv.method(args) → method(recv, args)）
-            // 当方法名匹配顶层自由函数时，将 recv 作为第一个参数传递
+            // Path 4: free-function method call (recv.method(args) -> method(recv, args))
+            // When the method name matches a top-level free function, recv is passed as the first argument
             if let Some(&target_sg) = self.func_subgraphs.get(method) {
                 self.graph.set_call_target(call_node, target_sg);
                 return call_node;
@@ -5331,10 +5524,10 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    /// 通过 (type_id, method_idx) 查 MethodSigInfo.intrinsic，返回降级策略。
+    /// Look up MethodSigInfo.intrinsic via (type_id, method_idx) and return the lowering strategy.
     ///
-    /// 内置类型的 intrinsic 方法（如 Async.await、Channel.send、Array.len）在 Sema 层
-    /// 注册合成 TypeDefInfo 时已标注 intrinsic 字段，此处统一查表获取，不按方法名特判。
+    /// Intrinsic methods of built-in types (e.g. Async.await, Channel.send, Array.len) have the intrinsic
+    /// field annotated when Sema registers the synthetic TypeDefInfo; this lookups uniformly, without special-casing by method name.
     fn lookup_intrinsic(
         &self,
         recv: crate::ast::Ast::ExprId,
@@ -5347,10 +5540,10 @@ impl<'a> IrBuilder<'a> {
         sig.intrinsic
     }
 
-    /// 根据 IntrinsicKind 尝试降级为 compute_fn 节点。
+    /// Try to lower to a compute_fn node based on IntrinsicKind.
     ///
-    /// 返回 None 表示条件不满足（如参数数量不匹配、recv 类型不符），
-    /// 调用方应 fall through 到 Call 节点路径。
+    /// Returns None when conditions are not met (e.g. argument count mismatch, recv type mismatch);
+    /// the caller should fall through to the Call node path.
     fn try_lower_intrinsic(
         &mut self,
         recv: crate::ast::Ast::ExprId,
@@ -5360,11 +5553,11 @@ impl<'a> IrBuilder<'a> {
     ) -> Option<NodeId> {
         use crate::sema::Sema::IntrinsicKind;
         match kind {
-            // await：无条件降级为 Await（EventSource + Await 双节点）
+            // await: unconditionally lower to Await (EventSource + Await dual node)
             IntrinsicKind::Await if args.is_empty() => {
                 Some(self.build_await_node(recv, recv_node))
             }
-            // recv：仅当 recv 类型为 Channel/Receiver 时降级为 Await
+            // recv: only lower to Await when recv's type is Channel/Receiver
             IntrinsicKind::ChannelAwait if args.is_empty() => {
                 if self.infer_event_source_kind(recv) == crate::ir::Ir::EventSourceKind::Channel {
                     Some(self.build_await_node(recv, recv_node))
@@ -5372,7 +5565,7 @@ impl<'a> IrBuilder<'a> {
                     None
                 }
             }
-            // cancel/len/close/bytes：单节点一元运算（无参数）
+            // cancel/len/close/bytes: single-node unary op (no arguments)
             IntrinsicKind::UnOp(idx) if args.is_empty() => {
                 let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
                 Some(self.graph.add_node(Node {
@@ -5382,7 +5575,7 @@ impl<'a> IrBuilder<'a> {
                     compute_fn: ComputeFnId(idx),
                 }))
             }
-            // send(value)：二元运算，inputs = [recv, value]
+            // send(value): binary op, inputs = [recv, value]
             IntrinsicKind::BinOp(idx) => {
                 let mut inputs = vec![recv_node];
                 for &arg in args {
@@ -5396,11 +5589,11 @@ impl<'a> IrBuilder<'a> {
                     compute_fn: ComputeFnId(idx),
                 }))
             }
-            _ => None, // 参数不匹配，走 Call 节点路径
+            _ => None, // argument mismatch; fall through to the Call node path
         }
     }
 
-    /// 检查类型是否实现了指定 trait（通过 witness_table 查询任意方法槽位）。
+    /// Check whether a type implements a specified trait (queries any method slot via witness_table).
     fn type_implements_trait(&self, type_id: u16, trait_name: &str) -> bool {
         for entry in self.sema.witness_table.entries().iter() {
             if entry.trait_name.as_ref() == trait_name && entry.type_id == type_id {
@@ -5410,9 +5603,9 @@ impl<'a> IrBuilder<'a> {
         false
     }
 
-    /// 判断 recv 是否是 trait object（需运行时动态分派）。
+    /// Determine whether recv is a trait object (needs runtime dynamic dispatch).
     ///
-    /// 查 recv 的类型名，若为 sema.trait_defs 中已注册的 trait 名则需走 vtable 动态分派。
+    /// Look up recv's type name; if it is a trait name registered in sema.trait_defs, it needs vtable dynamic dispatch.
     fn is_trait_object_recv(&self, recv: crate::ast::Ast::ExprId) -> bool {
         let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), recv.0 as u64);
         if let Some(info) = self.sema.expr_types.get(&key) {
@@ -5427,13 +5620,13 @@ impl<'a> IrBuilder<'a> {
         false
     }
 
-    /// 获取表达式的 type_id（从 SemaResult.expr_types 查询）。
+    /// Get the type_id of an expression (looked up from SemaResult.expr_types).
     ///
-    /// type_id 计算与 populate_witness_table 一致：type_def_index[name] + FIRST_DYNAMIC_TYPE_ID。
-    /// 当 Sema 无记录时（trait 默认方法特化版本中的 self），查 sema 的
-    /// TraitDefaultInstance.type_name 获取具体实现类型名再查 type_def_index。
+    /// type_id computation is consistent with populate_witness_table: type_def_index[name] + FIRST_DYNAMIC_TYPE_ID.
+    /// When Sema has no record (self in a specialized trait default method version), look up sema's
+    /// TraitDefaultInstance.type_name to get the concrete implementation type name, then query type_def_index.
     fn expr_type_id(&self, expr: crate::ast::Ast::ExprId) -> Option<u16> {
-        // trait 默认方法特化版本中的 self：消费 sema 的 TraitDefaultInstance.type_name
+        // self in a specialized trait default method version: consume sema's TraitDefaultInstance.type_name
         if let Some(idx) = self.current_trait_default_idx {
             if let crate::ast::Ast::Expr::Ident(name) = &self.module.arena.expr(expr).node {
                 if *name == "self" {
@@ -5449,9 +5642,9 @@ impl<'a> IrBuilder<'a> {
         }
         let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr.0 as u64);
         let info = self.sema.expr_types.get(&key)?;
-        // 与 expr_type_name 一致：优先 type_name，fallback 到 Ty::name()
-        // （array/nullable/str/Throw 等内置结构变体通过 Ty::name() 返回注册名，
-        // "unknown" 仅出现在 Adt/Record 等 arena 查询失败的退化路径）。
+        // Consistent with expr_type_name: prefer type_name, fall back to Ty::name()
+        // (built-in structural variants like array/nullable/str/Throw return their registered name via Ty::name();
+        // "unknown" only appears in degenerate paths where Adt/Record arena lookup fails).
         let type_name = info
             .type_name
             .as_deref()
@@ -5462,9 +5655,9 @@ impl<'a> IrBuilder<'a> {
             .map(|&idx| crate::types::dynamic_type_id(idx))
     }
 
-    /// 构建 Await 节点：EventSource 声明 + Await 节点（spec 4.5，未就绪→帧挂起）。
+    /// Build an Await node: EventSource declaration + Await node (spec 4.5; not ready -> frame suspends).
     ///
-    /// await/recv 共用：推断事件源类型 → 注册 EventSourceDecl → 生成 Await 节点。
+    /// Shared by await/recv: infer event-source kind -> register EventSourceDecl -> generate the Await node.
     fn build_await_node(
         &mut self,
         recv: crate::ast::Ast::ExprId,
@@ -5487,9 +5680,9 @@ impl<'a> IrBuilder<'a> {
                 });
             }
         }
-        // 末尾追加 current_effect 作为隐式依赖（与 compile_call 一致）：
-        // 确保 await 在前序 effect（如 producer.await()）完成后才执行，
-        // 否则 result_ch.recv() 会在 producer.await() 之前就绪并向空 channel 挂起，导致死锁。
+        // current_effect appended at the end as an implicit dependency (consistent with compile_call):
+        // ensures await executes only after prior effects (e.g. producer.await()) complete,
+        // otherwise result_ch.recv() would become ready before producer.await() and suspend on an empty channel, causing deadlock.
         let mut await_inputs = vec![recv_node];
         if let Some(eff) = self.current_effect {
             await_inputs.push(eff);
@@ -5505,17 +5698,17 @@ impl<'a> IrBuilder<'a> {
         await_node
     }
 
-    /// 从 recv 表达式推断事件源种类。
+    /// Infer the event-source kind from the recv expression.
     ///
-    /// Async<T> → AsyncJoin, Channel<T>/Receiver<T> → Channel, Timer → Timer
-    /// 默认 → AsyncJoin（5a-2 主要支持 await async handle）
+    /// Async<T> -> AsyncJoin, Channel<T>/Receiver<T> -> Channel, Timer -> Timer
+    /// default -> AsyncJoin (5a-2 primarily supports awaiting async handles)
     fn infer_event_source_kind(&self, recv: crate::ast::Ast::ExprId) -> EventSourceKind {
-        // 查 Sema expr_types 获取 recv 的类型名
+        // Look up the recv's type name in Sema expr_types
         let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), recv.0 as u64);
         if let Some(info) = self.sema.expr_types.get(&key) {
             if let Some(ref tn) = info.type_name {
                 let tn = tn.as_ref();
-                // 内置泛型 + Timer：派生自 Ty::from_type_name + family()（消除字符串匹配）
+                // Built-in generics + Timer: derived from Ty::from_type_name + family() (eliminates string matching)
                 if let Some(ty) = crate::types::Ty::from_type_name(tn) {
                     use crate::types::TypeFamily;
                     match ty.family() {
@@ -5530,18 +5723,18 @@ impl<'a> IrBuilder<'a> {
         EventSourceKind::AsyncJoin
     }
 
-    /// 编译字段访问。
+    /// Compile a field access.
     ///
-    /// 绑定 compute_record_field_get，仅存储 field 名称作为运行时按名查找依据。
+    /// Binds compute_record_field_get, storing only the field name as the runtime by-name lookup key.
     fn compile_field_access(
         &mut self,
         _expr_id: crate::ast::Ast::ExprId,
         recv: crate::ast::Ast::ExprId,
         field: &str,
     ) -> NodeId {
-        // 跨模块常量访问（Math.PI）：sema 已把 recv 的 expr key → mangled 名记入
-        // module_const_recv_exprs。命中时跳过 recv 编译，直接用 mangled 名查
-        // global_var_slots 发 compile_global_load，与本地全局变量访问同路径。
+        // Cross-module constant access (Math.PI): sema has recorded the recv's expr key → mangled
+        // name in module_const_recv_exprs. On a hit, skip recv compilation and look up the mangled
+        // name in global_var_slots to emit compile_global_load, sharing the local global var path.
         let recv_key = crate::sema::Sema::module_expr_key(
             self.expr_key_module(),
             recv.0 as u64,
@@ -5559,13 +5752,13 @@ impl<'a> IrBuilder<'a> {
             inputs_offset,
             compute_fn: CF_RECORD_FIELD_GET, // record_field_get
         });
-        // 统一存储 field 名称作为运行时唯一查找依据：
-        // Record/Adt 均通过 find_field(name) 按名取值，无需编译期 field_idx
+        // Uniformly store the field name as the runtime lookup key:
+        // Record/Adt both resolve via find_field(name) by name, no compile-time field_idx needed
         self.graph.set_field_set_name(node, field.to_string());
         node
     }
 
-    /// 编译索引访问。
+    /// Compile an index access.
     fn compile_index(&mut self, recv: crate::ast::Ast::ExprId, index: crate::ast::Ast::ExprId) -> NodeId {
         let recv_node = self.compile_subexpr(recv);
         let index_node = self.compile_subexpr(index);
@@ -5578,10 +5771,10 @@ impl<'a> IrBuilder<'a> {
         })
     }
 
-    /// 编译切片 `recv[start..end]`（inclusive=false）或 `recv[start..=end]`（inclusive=true）。
+    /// Compile a slice `recv[start..end]` (inclusive=false) or `recv[start..=end]` (inclusive=true).
     ///
-    /// 三输入节点（recv, start, end），inclusive 标志存于 graph.slice_inclusive。
-    /// 运行时对 str 按码点切片、对 array 按元素切片。
+    /// Three-input node (recv, start, end); the inclusive flag is stored in graph.slice_inclusive.
+    /// At runtime, str is sliced by code point and array by element.
     fn compile_slice(
         &mut self,
         recv: crate::ast::Ast::ExprId,
@@ -5603,9 +5796,9 @@ impl<'a> IrBuilder<'a> {
         node
     }
 
-    /// 编译记录构造（按位置参数 + 类型名）。
+    /// Compile a record construction (by positional args + type name).
     ///
-    /// 用于 `Err(args)` / `IOError(args)` 等构造器调用，字段名自动生成 `_0`, `_1`, ...
+    /// Used for `Err(args)` / `IOError(args)` and similar constructor calls; field names are auto-generated as `_0`, `_1`, ...
     fn compile_record_like(&mut self, type_name: &str, args: &[crate::ast::Ast::ExprId]) -> NodeId {
         let mut inputs = Vec::with_capacity(args.len());
         for &arg in args {
@@ -5633,8 +5826,8 @@ impl<'a> IrBuilder<'a> {
         node
     }
 
-    /// 编译记录构造表达式。
-    /// 分析器标记为不逃逸的分配点使用栈分配 compute_fn（288）。
+    /// Compile a record construction expression.
+    /// Allocation sites marked non-escaping by the analyzer use the stack-alloc compute_fn (288).
     fn compile_record_lit(&mut self, expr_id: crate::ast::Ast::ExprId, fields: &[crate::ast::Ast::RecordFieldExpr<'_>]) -> NodeId {
         let mut inputs = Vec::with_capacity(fields.len());
         let mut field_names = Vec::with_capacity(fields.len());
@@ -5643,7 +5836,7 @@ impl<'a> IrBuilder<'a> {
             field_names.push(Some(field.name.to_string()));
         }
         let inputs_offset = self.graph.inputs_pool.push(&inputs);
-        // 栈分配标记：不逃逸的分配用 compute_record_construct_stack（288）
+        // Stack-alloc marker: non-escaping allocations use compute_record_construct_stack (288)
         let compute_fn = if self.should_stack_alloc(expr_id) {
             CF_RECORD_CONSTRUCT_STACK // record_construct_stack
         } else {
@@ -5667,11 +5860,11 @@ impl<'a> IrBuilder<'a> {
         node
     }
 
-    /// 编译记录扩展表达式 `(...base, field: value, ...)`。
+    /// Compile a record extension expression `(...base, field: value, ...)`.
     ///
-    /// inputs[0] = base record，inputs[1..] = 更新字段值。
-    /// RecordExtendInfo 存储更新字段名列表（顺序对应 inputs[1..]）。
-    /// 运行时从 base 克隆字段，按更新字段名替换/追加，构造新 RecordValue。
+    /// inputs[0] = base record; inputs[1..] = update field values.
+    /// RecordExtendInfo stores the update field name list (in order, corresponding to inputs[1..]).
+    /// At runtime, clones fields from base, replaces/appends by update field names, and builds a new RecordValue.
     fn compile_record_extend(
         &mut self,
         base: crate::ast::Ast::ExprId,
@@ -5695,9 +5888,9 @@ impl<'a> IrBuilder<'a> {
         node
     }
 
-    /// 编译原子构造表达式 `atomic expr`。
+    /// Compile an atomic construction expression `atomic expr`.
     ///
-    /// 单输入节点，运行时将值包装为 AtomicValue（共享底层内存的原子容器）。
+    /// Single-input node; at runtime wraps the value as an AtomicValue (an atomic container sharing the underlying memory).
     fn compile_atomic(&mut self, operand: crate::ast::Ast::ExprId) -> NodeId {
         let operand_node = self.compile_subexpr(operand);
         let inputs_offset = self.graph.inputs_pool.push(&[operand_node]);
@@ -5709,15 +5902,15 @@ impl<'a> IrBuilder<'a> {
         })
     }
 
-    /// 编译数组构造表达式。
-    /// 分析器标记为不逃逸的分配点使用栈分配 compute_fn（289）。
+    /// Compile an array construction expression.
+    /// Allocation sites marked non-escaping by the analyzer use the stack-alloc compute_fn (289).
     fn compile_array_lit(&mut self, expr_id: crate::ast::Ast::ExprId, elements: &[crate::ast::Ast::ExprRef]) -> NodeId {
         let mut inputs = Vec::with_capacity(elements.len());
         for &elem in elements {
             inputs.push(self.compile_subexpr(elem));
         }
         let inputs_offset = self.graph.inputs_pool.push(&inputs);
-        // 栈分配标记：不逃逸的分配用 compute_array_construct_stack（289）
+        // Stack-alloc marker: non-escaping allocations use compute_array_construct_stack (289)
         let compute_fn = if self.should_stack_alloc(expr_id) {
             CF_ARRAY_CONSTRUCT_STACK // array_construct_stack
         } else {
@@ -5731,9 +5924,9 @@ impl<'a> IrBuilder<'a> {
         })
     }
 
-    /// 编译 Block 表达式。
+    /// Compile a Block expression.
     ///
-    /// 依次编译 stmts，trailing 表达式的 NodeId 作为 Block 产出。
+    /// Compiles stmts in order; the trailing expression's NodeId is the Block's result.
     fn compile_block(
         &mut self,
         stmts: &[crate::ast::Ast::StmtId],
@@ -5741,29 +5934,29 @@ impl<'a> IrBuilder<'a> {
     ) -> NodeId {
         self.enter_scope();
         let prev_effect = self.current_effect;
-        // 初始化 last_effect 为 prev_effect，使 block 的首条语句依赖前序 effect
-        // （如 entry 函数中全局变量初始化的 store 节点），保证 block 内的 load/call
-        // 在前序副作用完成后才执行。
+        // Initialize last_effect to prev_effect so the block's first statement depends on prior effects
+        // (e.g. the store nodes of global var initialization in the entry function), ensuring that
+        // load/call inside the block run only after prior side effects complete.
         let mut last_effect: Option<NodeId> = prev_effect;
         self.current_effect = None;
         for &stmt_id in stmts {
-            // 设置 current_effect 让后续效果节点（如 WriteBack）依赖前一个效果
+            // Set current_effect so subsequent effect nodes (e.g. WriteBack) depend on the prior effect
             self.current_effect = last_effect;
-            // 语句不在尾位置（Return 内部会为其 value 恢复 in_tail_position = true）
+            // Statements are not in tail position (Return internally restores in_tail_position = true for its value)
             let prev_tail = self.in_tail_position;
             self.in_tail_position = false;
             let effect = self.compile_stmt(stmt_id);
             self.in_tail_position = prev_tail;
             if let Some(eff) = effect {
-                // 控制流节点（CF_RETURN/CF_BREAK/CF_CONTINUE/CF_THROW_WRAP_ERR）的
-                // 前序副作用依赖已在 compile_stmt 中通过 inputs 烘焙，无需信号重定位。
-                // chain_effects 仅用于非控制流语句的顺序链接。
+                // Control-flow nodes (CF_RETURN/CF_BREAK/CF_CONTINUE/CF_THROW_WRAP_ERR) have their
+                // prior side-effect dependencies baked into inputs in compile_stmt; no signal relocation
+                // is needed. chain_effects is only used for sequential linking of non-control-flow statements.
                 let chained = self.chain_effects(last_effect, eff);
                 last_effect = Some(chained);
             }
         }
-        // trailing 表达式编译时继承 block 内 effect 链，
-        // 确保 trailing 中的 Call 节点依赖前序 effect（与 stmts 中的行为一致）
+        // The trailing expression inherits the block's effect chain on compilation,
+        // ensuring Call nodes in the trailing expression depend on prior effects (consistent with stmts)
         self.current_effect = last_effect;
         let result = match trailing {
             Some(expr_id) => {
@@ -5777,10 +5970,10 @@ impl<'a> IrBuilder<'a> {
         result
     }
 
-    /// 编译语句，返回效果节点（需顺序链接到块结果的节点）。
-    /// 返回 None 表示纯声明（变量绑定），其值节点通过变量引用自动可达。
+    /// Compile a statement, returning an effect node (to be sequentially linked into the block result node).
+    /// Returns None for pure declarations (variable bindings); their value node is automatically reachable via variable references.
     fn compile_stmt(&mut self, stmt_id: crate::ast::Ast::StmtId) -> Option<NodeId> {
-        // 分析器标记的死语句（不可达代码/死声明/死存储）跳过，不生成 IR 节点
+        // Skip analyzer-flagged dead statements (unreachable code / dead declarations / dead stores); emit no IR nodes
         if self.is_dead_stmt(stmt_id) {
             return None;
         }
@@ -5789,15 +5982,15 @@ impl<'a> IrBuilder<'a> {
         match stmt {
             crate::ast::Ast::Stmt::ValDecl { name, value, .. } => {
                 let value_node = self.compile_subexpr(*value);
-                // 为 val 声明创建独立 copy 节点（CF_SEQ 单输入 = identity），
-                // 使 val 绑定拥有独立节点 ID，而非别名源节点。
-                // 这确保闭包捕获 val 变量时捕获的是声明时的快照值，
-                // 而非源变量（可能是 var）的当前值。
-                // 例如：while 循环中 `val captured = i` 后 `fun() { captured }`，
-                // 若不创建 copy 节点，captured 别名 i 的节点，循环结束后所有
-                // 闭包都读到 i 的最终值；创建 copy 节点后，captured 拥有独立
-                // 节点（在循环体子图范围内），main 帧中该节点未就绪，
-                // same_function 路径回退到闭包的 Cell upvalue，返回正确快照值。
+                // Create an independent copy node for the val declaration (CF_SEQ single input = identity),
+                // so the val binding owns an independent node ID rather than aliasing the source node.
+                // This ensures that closures capturing the val variable capture the snapshot value at
+                // declaration time, rather than the current value of the source variable (which may be a var).
+                // For example: in a while loop, `val captured = i` followed by `fun() { captured }`;
+                // without a copy node, captured aliases i's node and all closures read i's final value
+                // after the loop ends. With a copy node, captured owns an independent node (within the
+                // loop body subgraph scope); in the main frame that node is not ready, so the
+                // same_function path falls back to the closure's Cell upvalue, returning the correct snapshot.
                 let copy_off = self.graph.inputs_pool.push(&[value_node]);
                 let copy_node = self.graph.add_node(Node {
                     kind: NodeKind::BinOp,
@@ -5819,11 +6012,11 @@ impl<'a> IrBuilder<'a> {
             }
             crate::ast::Ast::Stmt::Assignment { target, value } => {
                 let raw_val = self.compile_subexpr(*value);
-                // 链接 current_effect：确保赋值表达式在前序效果（如 if-Gate with continue）
-                // 完成后才执行。防止 continue 后的语句提前执行。
+                // Link current_effect: ensures the assignment expression executes only after prior effects
+                // (e.g. an if-Gate with continue) complete. Prevents statements after continue from running early.
                 let val_node = self.chain_effects(self.current_effect, raw_val);
                 let target_expr = &self.current_module().arena.expr(*target).node;
-                // 数组索引赋值 arr[i] = x：生成 CF_ARRAY_STORE 节点（三输入：arr, index, value）
+                // Array index assignment arr[i] = x: emit a CF_ARRAY_STORE node (three inputs: arr, index, value)
                 if let crate::ast::Ast::Expr::Index { recv, index } = target_expr {
                     let arr_node = self.compile_subexpr(*recv);
                     let idx_node = self.compile_subexpr(*index);
@@ -5837,36 +6030,40 @@ impl<'a> IrBuilder<'a> {
                     return Some(store_node);
                 }
                 if let crate::ast::Ast::Expr::Ident(name) = target_expr {
-                    // 检查是否为 lambda 捕获变量：captured_scopes 记录每层 lambda
-                    // 捕获的变量名与对应外层节点。捕获变量赋值需 WriteBack 到外层节点，
-                    // 使变更对外层可见（引用捕获语义）。
+                    // Check whether this is a lambda-captured variable: captured_scopes records, per lambda
+                    // layer, the captured variable names and their corresponding outer node. Assigning a
+                    // captured variable requires a WriteBack to the outer node so the change is visible
+                    // to the outer layer (by-reference capture semantics).
                     let captured_source = self.captured_scopes.iter().rev()
                         .find_map(|scope| scope.iter()
                             .find(|(n, _)| n.as_str() == *name)
                             .map(|(_, node)| *node));
                     if let Some(source) = captured_source {
-                        // 捕获变量 → WriteBack 到外层节点
+                        // Captured variable -> WriteBack to the outer node
                         let wb_node = self.compile_writeback_node(val_node, source);
                         self.bind_var(name, val_node);
                         return Some(wb_node);
                     } else if let Some(outer_node) = self.lookup_var(name) {
                         if !self.is_in_current_subgraph(outer_node) {
-                            // 外层变量 → WriteBack，返回效果节点确保被调度执行
+                            // Outer variable -> WriteBack, returning an effect node to ensure scheduled execution
                             let wb_node = self.compile_writeback_node(val_node, outer_node);
-                            // 绑定本地引用：后续同子图内读取使用新值（val_node），
-                            // 避免 cond_node 在 WriteBack 完成前读取根帧旧值。
-                            // WriteBack 负责跨迭代可见性（写回根帧）。
+                            // Bind a local reference: subsequent reads within the same subgraph use the new
+                            // value (val_node), preventing cond_node from reading the stale root-frame value
+                            // before WriteBack completes. WriteBack handles cross-iteration visibility
+                            // (writes back to the root frame).
                             self.bind_var(name, val_node);
                             return Some(wb_node);
                         } else if let Some(&captured_node) = self.captured_vars.get(*name) {
-                            // 被内层 lambda 捕获的本地变量 → WriteBack 到捕获时的原始节点，
-                            // 使 same_function 闭包调用能从父帧读到最新值（引用捕获语义）。
+                            // Local variable captured by an inner lambda -> WriteBack to the original node
+                            // captured at that time, so same_function closure calls can read the latest value
+                            // from the parent frame (by-reference capture semantics).
                             let wb_node = self.compile_writeback_node(val_node, captured_node);
                             self.bind_var(name, val_node);
                             return Some(wb_node);
                         } else if self.current_function_has_defer() {
-                            // Bug #49: 函数含 defer 时，局部变量重赋值需 WriteBack 到原始节点，
-                            // 使 defer body（引用原始节点）能读取到最新值而非编译期快照。
+                            // Bug #49: when a function contains defer, reassigning a local variable requires a
+                            // WriteBack to the original node, so the defer body (which references the original
+                            // node) reads the latest value rather than the compile-time snapshot.
                             let wb_node = self.compile_writeback_node(val_node, outer_node);
                             self.bind_var(name, val_node);
                             return Some(wb_node);
@@ -5874,7 +6071,7 @@ impl<'a> IrBuilder<'a> {
                             self.bind_var(name, val_node);
                         }
                     } else if let Some(slot) = self.lookup_global_var(name) {
-                        // 全局变量 → global_store，返回效果节点确保被调度执行
+                        // Global variable -> global_store, returning an effect node to ensure scheduled execution
                         let store_node = self.compile_global_store(val_node, slot);
                         return Some(store_node);
                     } else {
@@ -5901,12 +6098,12 @@ impl<'a> IrBuilder<'a> {
                 let target_expr = &self.current_module().arena.expr(*target).node;
                 let bin_compute = self.compound_assign_op_to_compute_fn(*op, *target);
                 if let crate::ast::Ast::Expr::Ident(name) = target_expr {
-                    // 检查是否为 lambda 捕获变量
+                    // Check whether this is a lambda-captured variable
                     let captured_source = self.captured_scopes.iter().rev()
                         .find_map(|scope| scope.iter()
                             .find(|(n, _)| n.as_str() == *name)
                             .map(|(_, node)| *node));
-                    // 读取当前值：局部变量 > 全局变量 > 占位
+                    // Read current value: local var > global var > placeholder
                     let cur_node = if let Some(n) = self.lookup_var(name) {
                         n
                     } else if let Some(slot) = self.lookup_global_var(name) {
@@ -5921,23 +6118,23 @@ impl<'a> IrBuilder<'a> {
                         inputs_offset: off,
                         compute_fn: bin_compute,
                     });
-                    // 链接 current_effect：防止 continue 后的复合赋值提前执行
+                    // Link current_effect: prevents a compound assignment after continue from running early
                     let result_node = self.chain_effects(self.current_effect, raw_result);
                     if captured_source.is_some() {
-                        // 捕获变量 → WriteBack 到外层节点 + 绑定本地引用
+                        // Captured variable -> WriteBack to the outer node + bind a local reference
                         self.compile_writeback_node(result_node, captured_source.unwrap());
                         self.bind_var(name, result_node);
                     } else if self.lookup_global_var(name).is_some() && self.lookup_var(name).is_none() {
-                        // 全局变量 → global_store
+                        // Global variable -> global_store
                         let slot = self.lookup_global_var(name).unwrap();
                         let store_node = self.compile_global_store(result_node, slot);
                         self.current_effect = Some(store_node);
                     } else if !self.is_in_current_subgraph(cur_node) {
-                        // 外层变量 → WriteBack + 绑定本地引用
+                        // Outer variable -> WriteBack + bind a local reference
                         self.compile_writeback_node(result_node, cur_node);
                         self.bind_var(name, result_node);
                     } else if let Some(&captured_node) = self.captured_vars.get(*name) {
-                        // 被内层 lambda 捕获的本地变量 → WriteBack 到原始节点
+                        // Local variable captured by an inner lambda -> WriteBack to the original node
                         self.compile_writeback_node(result_node, captured_node);
                         self.bind_var(name, result_node);
                     } else {
@@ -5958,8 +6155,8 @@ impl<'a> IrBuilder<'a> {
                     }
                     None => self.compile_void_const(),
                 };
-                // CF_RETURN: inputs[0] = 返回值, inputs[1] = 前序副作用依赖（可选）
-                // 前序副作用依赖确保 return 信号在前序语句完成后才触发
+                // CF_RETURN: inputs[0] = return value, inputs[1] = prior side-effect dependency (optional)
+                // The prior side-effect dependency ensures the return signal fires only after prior statements complete
                 let (off, count) = match prev_effect {
                     Some(eff) => (self.graph.inputs_pool.push(&[return_val_node, eff]), 2),
                     None => (self.graph.inputs_pool.push(&[return_val_node]), 1),
@@ -5975,8 +6172,8 @@ impl<'a> IrBuilder<'a> {
             crate::ast::Ast::Stmt::Throw { expr } => {
                 let prev_effect = self.current_effect;
                 let expr_node = self.compile_subexpr(*expr);
-                // CF_THROW_WRAP_ERR: inputs[0] = thrown 值, inputs[1] = 前序副作用依赖（可选）
-                // compute_throw_wrap_err 直接返回 NodeResult::Return(ThrowVal(Err(v)))
+                // CF_THROW_WRAP_ERR: inputs[0] = thrown value, inputs[1] = prior side-effect dependency (optional)
+                // compute_throw_wrap_err directly returns NodeResult::Return(ThrowVal(Err(v)))
                 let (off, count) = match prev_effect {
                     Some(eff) => (self.graph.inputs_pool.push(&[expr_node, eff]), 2),
                     None => (self.graph.inputs_pool.push(&[expr_node]), 1),
@@ -5990,7 +6187,7 @@ impl<'a> IrBuilder<'a> {
                 Some(wrap_node)
             }
             crate::ast::Ast::Stmt::Break => {
-                // CF_BREAK: 可选 inputs[0] = 前序副作用依赖
+                // CF_BREAK: optional inputs[0] = prior side-effect dependency
                 let (off, count) = match self.current_effect {
                     Some(eff) => (self.graph.inputs_pool.push(&[eff]), 1),
                     None => (self.graph.inputs_pool.push(&[]), 0),
@@ -6004,9 +6201,9 @@ impl<'a> IrBuilder<'a> {
                 Some(n)
             }
             crate::ast::Ast::Stmt::Continue => {
-                // CF_CONTINUE: 可选 inputs[0] = 前序副作用依赖
-                // Engine 侧 complete_and_wake_caller 检测 Continue → reset_loop_iteration 下一轮
-                // （Sema 保证 continue 必在循环内）
+                // CF_CONTINUE: optional inputs[0] = prior side-effect dependency
+                // The engine-side complete_and_wake_caller detects Continue -> reset_loop_iteration for the next round
+                // (Sema guarantees continue is always inside a loop)
                 let (off, count) = match self.current_effect {
                     Some(eff) => (self.graph.inputs_pool.push(&[eff]), 1),
                     None => (self.graph.inputs_pool.push(&[]), 0),
@@ -6034,23 +6231,23 @@ impl<'a> IrBuilder<'a> {
                 iterable,
                 body,
             } => {
-                // For 循环 = iterable（已是迭代器）→ 递归子图 (next() + is_null + body)
+                // For loop = iterable (already an iterator) -> recursive subgraph (next() + is_null + body)
                 let iterable_node = self.compile_subexpr(*iterable);
-                // 从 Sema 获取 iterable 类型信息（类型名 + 是否为 trait 对象）
+                // Obtain iterable type info from Sema (type name + whether it is a trait object)
                 let (iter_type_name, is_trait_object) = self.lookup_expr_iter_info(*iterable);
-                // 注册 For 循环子图（静态分派：按类型名绑定 next()；trait 对象走 vtable）
+                // Register the For loop subgraph (static dispatch: bind next() by type name; trait objects go through vtable)
                 let for_sg = self.register_for_subgraph(
                     name,
                     *body,
                     iter_type_name.as_deref(),
                     is_trait_object,
                 );
-                // 启动循环：Call(for_sg, [iterable_node])
+                // Start the loop: Call(for_sg, [iterable_node])
                 let call_node = self.make_call(for_sg, &[iterable_node]);
                 Some(call_node)
             }
             crate::ast::Ast::Stmt::Defer { expr } => {
-                // defer expr → 编译 expr 为独立子图，注册到当前函数子图的 defer_table
+                // defer expr -> compile expr as an independent subgraph and register it in the current function subgraph's defer_table
                 let (body_sg, captured_inputs) = self.compile_branch_subgraph(*expr);
                 let trigger = self.compile_void_const();
                 if let Some(cur_sg) = self.current_function_sg {
@@ -6080,7 +6277,7 @@ impl<'a> IrBuilder<'a> {
                         Some(construct_node)
                     }
                     crate::ast::Ast::Decl::TypeDecl { name, def, .. } => {
-                        // 注册嵌套类型字段到当前作用域（与顶层类型统一通过 type_scope_stack 查找）
+                        // Register nested type fields into the current scope (unified with top-level types via type_scope_stack lookup)
                         match def {
                             crate::ast::Ast::TypeDef::Record { fields } => {
                                 let field_names: Vec<String> = fields.iter().map(|f| f.name.to_string()).collect();
@@ -6091,7 +6288,7 @@ impl<'a> IrBuilder<'a> {
                                 });
                             }
                             crate::ast::Ast::TypeDef::Adt { constructors } => {
-                                // 注册类型名 + 各构造器名（映射到类型名）
+                                // Register the type name + each constructor name (mapped to the type name)
                                 self.bind_type_fields(name, TypeFieldInfo {
                                     field_names: Vec::new(),
                                     type_name: name.to_string(),
@@ -6119,7 +6316,7 @@ impl<'a> IrBuilder<'a> {
                         }
                         None
                     }
-                    // trait 声明：Sema 层注册类型，IR 层无需生成代码
+                    // Trait declaration: Sema registers the type; the IR layer generates no code
                     crate::ast::Ast::Decl::TraitDecl { .. } => None,
                     _ => None,
                 }
@@ -6127,8 +6324,8 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    /// 在用户模块和 builtin 模块中查找函数位置。
-    /// 返回 None = 用户模块，Some(i) = builtin_modules[i]。
+    /// Look up a function's location across the user module and builtin modules.
+    /// Returns None = user module, Some(i) = builtin_modules[i].
     fn find_function_location(&self, name: &str) -> Option<Option<usize>> {
         if self.module.find_function(name).is_some() {
             return Some(None);
@@ -6141,9 +6338,9 @@ impl<'a> IrBuilder<'a> {
         None
     }
 
-    /// 编译函数为子图（支持跨模块：用户模块 + builtin 模块）。
+    /// Compile a function into a subgraph (supports cross-module: user module + builtin modules).
     ///
-    /// 若函数不存在或声明类型不匹配，记录编译错误并返回占位子图（错误恢复）。
+    /// If the function does not exist or its declaration type mismatches, records a compile error and returns a placeholder subgraph (error recovery).
     pub fn compile_function(&mut self, name: &str) -> SubGraphId {
         let location = match self.find_function_location(name) {
             Some(loc) => loc,
@@ -6158,7 +6355,7 @@ impl<'a> IrBuilder<'a> {
             Some(i) => self.builtin_modules[i],
         };
 
-        // 设置当前编译模块（compile_expr 通过 current_module() 访问 AST arena）
+        // Set the current compiling module (compile_expr accesses the AST arena via current_module())
         let prev_builtin = self.compiling_builtin;
         self.compiling_builtin = match location {
             None => None,
@@ -6189,7 +6386,7 @@ impl<'a> IrBuilder<'a> {
         };
         let param_count = params.len();
 
-        // 复用预注册的 sg_id（build() 预注册 pass 已创建），避免重复子图
+        // Reuse the pre-registered sg_id (created by the build() pre-registration pass) to avoid duplicate subgraphs
         let sg_id = if let Some(&existing) = self.func_subgraphs.get(name) {
             existing
         } else {
@@ -6203,14 +6400,14 @@ impl<'a> IrBuilder<'a> {
         self.current_function_id = sg_id.0;
         let prev_effect = self.current_effect;
         self.current_effect = None;
-        // 设置 current_sg_start = node_start，使 compile_memoize 等子函数能正确引用
-        // 参数节点（参数节点 id = node_start + param_index）
+        // Set current_sg_start = node_start so that sub-functions like compile_memoize can correctly
+        // reference parameter nodes (param node id = node_start + param_index)
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
         self.enter_scope();
 
-        // 创建参数节点（Const 占位，值在运行时由 start_subgraph 注入）
-        // 这些节点必须是子图的前 param_count 个节点
+        // Create parameter nodes (Const placeholders; values are injected at runtime by start_subgraph)
+        // These nodes must be the first param_count nodes of the subgraph
         for param in &params {
             let inputs_offset = self.graph.inputs_pool.push(&[]);
             let param_node = self.graph.add_node(Node {
@@ -6222,9 +6419,9 @@ impl<'a> IrBuilder<'a> {
             self.bind_var(param.name, param_node);
         }
 
-        // entry 函数：在函数体之前编译所有模块的顶层 var/val 声明初始化
-        // 全局变量通过 global_store 写入共享存储区，所有函数通过 global_load 读取
-        // 按模块切换 compiling_builtin，使 compile_subexpr 访问正确的 AST arena
+        // Entry function: compile all modules' top-level var/val declaration initializations before the function body
+        // Global variables are written to the shared storage via global_store; all functions read via global_load
+        // Switch compiling_builtin per module so compile_subexpr accesses the correct AST arena
         if is_entry && !self.top_level_var_decls.is_empty() {
             let decls: Vec<(Option<usize>, crate::ast::Ast::StmtId)> = std::mem::take(&mut self.top_level_var_decls);
             for (mod_idx, stmt_id) in &decls {
@@ -6250,9 +6447,10 @@ impl<'a> IrBuilder<'a> {
             self.top_level_var_decls = decls;
         }
 
-        // tail call 优化仅对非 void 函数启用：void 函数的 trailing 表达式是副作用
-        // （如 println("done")），不应 tail call（switch_subgraph 会丢失当前帧状态）。
-        // 消费 sema 的 FuncSigInfo.return_type 判定 void（builtin 模块回退到 AST）。
+        // Tail-call optimization is enabled only for non-void functions: the trailing expression of a
+        // void function is a side effect (e.g. println("done")) and should not be tail-called
+        // (switch_subgraph would lose the current frame state).
+        // Consumes sema's FuncSigInfo.return_type to determine void (builtin modules fall back to AST).
         let is_void_fn = self.sema.get_func_sig(name)
             .map(|sig| matches!(self.type_arena.get(sig.return_type), crate::sema::Sema::Ty::Void))
             .unwrap_or_else(|| match return_type {
@@ -6273,7 +6471,7 @@ impl<'a> IrBuilder<'a> {
         sg.node_range = (NodeId(node_start), NodeId(node_end));
         sg.entry_node = NodeId(node_start);
         sg.return_node = return_node;
-        // 消费 sema 的 FuncSigInfo.is_async（builtin 模块回退到 AST is_async）
+        // Consumes sema's FuncSigInfo.is_async (builtin modules fall back to AST is_async)
         sg.has_suspend = self.sema.get_func_sig(name)
             .map(|sig| sig.is_async)
             .unwrap_or(is_async);
@@ -6283,18 +6481,18 @@ impl<'a> IrBuilder<'a> {
         sg_id
     }
 
-    /// 编译单态化实例为特化子图。
+    /// Compile a monomorphization instance into a specialized subgraph.
     ///
-    /// 与 `compile_function` 的区别：
-    /// - 使用 mangled name（`func_name#instance_id`）注册到 func_subgraphs，避免与非泛型版本冲突
-    /// - 设置 `current_type_args`（类型参数名 → TypeHandle），供 cast/expr_type_name 查询
-    /// - 编译完成后清空 `current_type_args`
+    /// Differences from `compile_function`:
+    /// - Registers under a mangled name (`func_name#instance_id`) in func_subgraphs to avoid clashing with the non-generic version
+    /// - Sets `current_type_args` (type param name -> TypeHandle) for cast/expr_type_name queries
+    /// - Clears `current_type_args` after compilation
     ///
-    /// 仅对有 type_args 的泛型实例调用（非泛型实例由 compile_function 处理）。
+    /// Called only for generic instances with type_args (non-generic instances are handled by compile_function).
     fn compile_monomorph_instance(&mut self, instance: &crate::sema::Sema::MonomorphInstance) {
         let func_name = instance.func_name.as_ref();
 
-        // 查找函数声明位置（用户模块或 builtin 模块）
+        // Look up the function declaration location (user module or builtin module)
         let location = match self.find_function_location(func_name) {
             Some(loc) => loc,
             None => {
@@ -6333,8 +6531,8 @@ impl<'a> IrBuilder<'a> {
         };
         let param_count = params.len();
 
-        // 构造类型参数映射：type_params 名 → type_args TypeHandle
-        // type_params 从 FuncSigInfo 获取（与 instance.type_args 顺序一致）
+        // Build the type parameter map: type_params name -> type_args TypeHandle
+        // type_params come from FuncSigInfo (in the same order as instance.type_args)
         let type_param_names: Vec<String> = self.sema.get_func_sig(func_name)
             .map(|sig| sig.type_params.iter().map(|n| n.to_string()).collect())
             .unwrap_or_default();
@@ -6345,10 +6543,10 @@ impl<'a> IrBuilder<'a> {
         let prev_instance_id = self.current_instance_id;
         self.current_instance_id = Some(instance.instance_id);
 
-        // mangled name：func_name#instance_id（与 sema 的 cache_key func_name#hash 格式一致）
+        // Mangled name: func_name#instance_id (consistent with sema's cache_key format func_name#hash)
         let mangled = format!("{}#{}", func_name, instance.instance_id);
 
-        // 预注册子图（复用占位符机制）
+        // Pre-register the subgraph (reusing the placeholder mechanism)
         let sg_id = if let Some(&existing) = self.func_subgraphs.get(mangled.as_str()) {
             existing
         } else {
@@ -6362,13 +6560,13 @@ impl<'a> IrBuilder<'a> {
         self.current_function_id = sg_id.0;
         let prev_effect = self.current_effect;
         self.current_effect = None;
-        // 设置 current_sg_start = node_start，使 compile_function_body 中的
-        // compile_memoize 能正确引用参数节点（id = node_start + param_index）
+        // Set current_sg_start = node_start so compile_memoize in compile_function_body
+        // can correctly reference parameter nodes (id = node_start + param_index)
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
         self.enter_scope();
 
-        // 创建参数节点（Const 占位，值在运行时由 start_subgraph 注入）
+        // Create parameter nodes (Const placeholders; values are injected at runtime by start_subgraph)
         for param in &params {
             let inputs_offset = self.graph.inputs_pool.push(&[]);
             let param_node = self.graph.add_node(Node {
@@ -6380,7 +6578,7 @@ impl<'a> IrBuilder<'a> {
             self.bind_var(param.name, param_node);
         }
 
-        // 编译函数体（统一入口：memoize/tail_rec/non_tail_rec 对泛型实例同样生效）
+        // Compile the function body (unified entry: memoize/tail_rec/non_tail_rec apply to generic instances too)
         let is_void_fn = self.sema.get_func_sig(func_name)
             .map(|sig| matches!(self.type_arena.get(sig.return_type), crate::sema::Sema::Ty::Void))
             .unwrap_or_else(|| match return_type {
@@ -6401,20 +6599,20 @@ impl<'a> IrBuilder<'a> {
         sg.node_range = (NodeId(node_start), NodeId(node_end));
         sg.entry_node = NodeId(node_start);
         sg.return_node = return_node;
-        // 消费 sema 的 FuncSigInfo.is_async（builtin 模块回退到 AST is_async）
+        // Consumes sema's FuncSigInfo.is_async (builtin modules fall back to AST is_async)
         sg.has_suspend = self.sema.get_func_sig(func_name)
             .map(|sig| sig.is_async)
             .unwrap_or(is_async);
         sg.function_id = sg_id.0;
 
-        // 恢复外层 type_args 上下文
+        // Restore the outer type_args context
         self.current_type_args = prev_type_args;
         self.current_instance_id = prev_instance_id;
     }
 
-    /// 编译 builtin 模块中 TypeDecl 的方法（通过 (type_id, method_idx) 查 method_subgraphs）。
+    /// Compile a TypeDecl method in a builtin module (looked up in method_subgraphs via (type_id, method_idx)).
     fn compile_builtin_method(&mut self, type_name: &str, method_idx: usize) {
-        // 在 builtin 模块中查找方法数据（直接按 method_idx 索引）
+        // Look up the method data in builtin modules (indexed directly by method_idx)
         let found = self.builtin_modules.iter().enumerate().find_map(|(mod_i, m)| {
             for d in &m.declarations {
                 if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &d.node {
@@ -6444,7 +6642,7 @@ impl<'a> IrBuilder<'a> {
 
         let m = self.builtin_modules[mod_i];
 
-        // 从 method_subgraphs 获取预注册的 sg_id（build() 步骤 0a 已创建）
+        // Obtain the pre-registered sg_id from method_subgraphs (created in build() step 0a)
         let type_id = match self.sema.type_def_index.get(type_name) {
             Some(&idx) => crate::types::dynamic_type_id(idx),
             None => return,
@@ -6477,8 +6675,8 @@ impl<'a> IrBuilder<'a> {
             self.bind_var(param.name, param_node);
         }
 
-        // 统一入口：memoize/tail_rec/non_tail_rec 对 builtin 方法同样生效
-        // （self_type = Some(type_name) 构造 mangled 名 "Type.method" 查 FuncId）
+        // Unified entry: memoize/tail_rec/non_tail_rec apply to builtin methods too
+        // (self_type = Some(type_name) builds the mangled name "Type.method" to look up FuncId)
         let is_void_fn = match return_type {
             None => true,
             Some(tr) => {
@@ -6501,9 +6699,9 @@ impl<'a> IrBuilder<'a> {
         sg.function_id = sg_id.0;
     }
 
-    /// 编译用户模块中 TypeDecl 的方法（通过 (type_id, method_idx) 查 method_subgraphs）。
+    /// Compile a TypeDecl method in the user module (looked up in method_subgraphs via (type_id, method_idx)).
     fn compile_user_method(&mut self, type_name: &str, method_idx: usize) {
-        // 在用户模块中查找方法数据（直接按 method_idx 索引）
+        // Look up the method data in the user module (indexed directly by method_idx)
         let found = self.module.declarations.iter().find_map(|d| {
             if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &d.node {
                 if *name == type_name {
@@ -6528,7 +6726,7 @@ impl<'a> IrBuilder<'a> {
             None => return,
         };
 
-        // 从 method_subgraphs 获取预注册的 sg_id（build() 步骤 0a 已创建）
+        // Obtain the pre-registered sg_id from method_subgraphs (created in build() step 0a)
         let type_id = match self.sema.type_def_index.get(type_name) {
             Some(&idx) => crate::types::dynamic_type_id(idx),
             None => return,
@@ -6559,8 +6757,8 @@ impl<'a> IrBuilder<'a> {
             self.bind_var(param.name, param_node);
         }
 
-        // 统一入口：memoize/tail_rec/non_tail_rec 对用户方法同样生效
-        // （self_type = Some(type_name) 构造 mangled 名 "Type.method" 查 FuncId）
+        // Unified entry: memoize/tail_rec/non_tail_rec apply to user methods too
+        // (self_type = Some(type_name) builds the mangled name "Type.method" to look up FuncId)
         let is_void_fn = match return_type {
             None => true,
             Some(tr) => {
@@ -6582,13 +6780,14 @@ impl<'a> IrBuilder<'a> {
         sg.function_id = sg_id.0;
     }
 
-    /// 编译 trait 默认方法的单态化特化版本（为指定实现类型生成专用子图）。
+    /// Compile the monomorphized specialization of a trait default method (generates a dedicated subgraph for a given impl type).
     ///
-    /// trait 默认方法在类型未覆盖时作为分派目标。为每个实现 trait 的类型生成
-    /// 特化子图，使 body 中的 self 拥有具体类型信息，从而 self.method() 调用
-    /// 能通过路径 2（类型自有方法）静态绑定到正确的方法子图。
+    /// A trait default method is the dispatch target when a type does not override it. For each type
+    /// implementing the trait, a specialized subgraph is generated so that self in the body has
+    /// concrete type information, allowing self.method() calls to statically bind to the correct
+    /// method subgraph via path 2 (the type's own methods).
     fn compile_trait_default_method(&mut self, trait_name: &str, method_idx: usize, impl_type_name: &str, instance_idx: usize) {
-        // 在用户模块中查找 TraitDecl 的有 body 方法（直接按 method_idx 索引）
+        // Look up the TraitDecl method with a body in the user module (indexed directly by method_idx)
         let found = self.module.declarations.iter().find_map(|d| {
             if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
                 if *name == trait_name {
@@ -6611,7 +6810,7 @@ impl<'a> IrBuilder<'a> {
             None => return,
         };
 
-        // 从 trait_default_subgraphs 获取预注册的特化子图 sg_id
+        // Obtain the pre-registered specialized subgraph sg_id from trait_default_subgraphs
         let trait_idx = match self.sema.trait_def_index.get(trait_name) {
             Some(&idx) => idx,
             None => return,
@@ -6629,8 +6828,8 @@ impl<'a> IrBuilder<'a> {
 
         self.current_function_sg = Some(sg_id);
         self.current_function_id = sg_id.0;
-        // 记录当前特化实例索引，expr_type_name/expr_type_id 通过此索引查 sema 的
-        // TraitDefaultInstance.type_name 获取 self 的具体类型（消费 sema 产出）。
+        // Record the current specialization instance index; expr_type_name/expr_type_id use it to look
+        // up sema's TraitDefaultInstance.type_name for self's concrete type (consumes sema output).
         self.current_trait_default_idx = Some(instance_idx);
         let prev_effect = self.current_effect;
         self.current_effect = None;
@@ -6662,11 +6861,11 @@ impl<'a> IrBuilder<'a> {
         sg.function_id = sg_id.0;
     }
     pub fn build(mut self) -> DataFlowGraph {
-        // 0. 预注册所有函数（builtin + std + dep + 用户）到 func_subgraphs，解决前向引用问题：
-        //    函数 A 调用函数 B 时，B 可能尚未编译（未注册到 func_subgraphs），
-        //    导致 call_target 未绑定、compute_call_launch 静默返回 VOID。
-        //    预注册后，所有函数名均可解析到 SubGraphId，body 在后续 pass 填充。
-        //    同时注册 mangled 名（模块路径.函数名），供 selective import alias 解析。
+        // 0. Pre-register all functions (builtin + std + dep + user) into func_subgraphs to solve forward references:
+        //    When function A calls function B, B may not yet be compiled (not registered in func_subgraphs),
+        //    causing call_target to be unbound and compute_call_launch to silently return VOID.
+        //    After pre-registration, all function names resolve to a SubGraphId; bodies are filled in a later pass.
+        //    Also register mangled names (module_path.function_name) for selective import alias resolution.
         let all_modules: Vec<&crate::ast::Ast::Module<'_>> = self
             .builtin_modules
             .iter()
@@ -6677,7 +6876,7 @@ impl<'a> IrBuilder<'a> {
             let module_path = crate::sema::Sema::module_logical_path(m.name);
             for d in &m.declarations {
                 if let crate::ast::Ast::Decl::FunDecl { name, params, is_async, .. } = &d.node {
-                    // 跳过 @extern("C") 函数：它们仅通过 FFI 调用，不需要子图
+                    // Skip @extern("C") functions: they are only called via FFI and need no subgraph
                     if let crate::ast::Ast::Decl::FunDecl { extern_c_body, .. } = &d.node {
                         if extern_c_body.is_some() {
                             continue;
@@ -6685,7 +6884,7 @@ impl<'a> IrBuilder<'a> {
                     }
                     let sg_id = self.register_subgraph_placeholder(name, params.len() as u8, *is_async);
                     self.func_subgraphs.insert(name.to_string(), sg_id);
-                    // 同时注册 mangled 名（模块路径.函数名），供 selective import alias 解析
+                    // Also register the mangled name (module_path.function_name) for selective import alias resolution
                     if let Some(ref mp) = module_path {
                         let mangled = format!("{}.{}", mp, name);
                         self.func_subgraphs.insert(mangled, sg_id);
@@ -6694,9 +6893,9 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 0a. 预注册类型方法子图到 method_subgraphs：(type_id, method_idx) → SubGraphId
-        //     同时注册 mangled name 到 func_subgraphs，供 selective import alias 解析
-        //     type_id = dynamic_type_id(type_def_index)，method_idx = 方法在 TypeDefInfo.methods 中的位置
+        // 0a. Pre-register type method subgraphs into method_subgraphs: (type_id, method_idx) -> SubGraphId
+        //     Also register the mangled name in func_subgraphs for selective import alias resolution
+        //     type_id = dynamic_type_id(type_def_index); method_idx = the method's position in TypeDefInfo.methods
         for m in &all_modules {
             for d in &m.declarations {
                 if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &d.node {
@@ -6719,12 +6918,12 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 0a-trait. 预注册 trait 默认方法单态化子图：
-        //   (type_id, trait_def_idx, method_idx) → SubGraphId
-        //   消费 Sema 后阶段收集的 trait_default_instances，为每个特化实例注册专用子图。
-        //   实例收集（含跳过显式覆写）已由 Monomorph::collect_trait_default_instances 完成。
+        // 0a-trait. Pre-register trait default method monomorphization subgraphs:
+        //   (type_id, trait_def_idx, method_idx) -> SubGraphId
+        //   Consumes trait_default_instances collected in the Sema post-phase; registers a dedicated subgraph for each specialization instance.
+        //   Instance collection (including skipping explicit overrides) is already done by Monomorph::collect_trait_default_instances.
         for inst in &self.sema.trait_default_instances {
-            // 查找 trait 默认方法的 AST 信息（method_name, params_count, is_async）
+            // Look up the AST info for the trait default method (method_name, params_count, is_async)
             let method_info = self.module.declarations.iter().find_map(|d| {
                 if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
                     if *name == inst.trait_name.as_ref() {
@@ -6749,10 +6948,10 @@ impl<'a> IrBuilder<'a> {
                 .insert((inst.type_id, inst.trait_idx, inst.method_idx), sg_id);
         }
 
-        // 0b. 注册 selective import alias 到 func_subgraphs：
-        //     遍历 sema.import_aliases，将 alias 名映射到 mangled 名对应的 sg_id。
-        //     alias 名（如 "area"）通过 import_alias → mangled 名（如 "Math.Geometry.circle_area"）
-        //     → func_subgraphs 查找 sg_id，注册 alias 名指向同一 sg_id。
+        // 0b. Register selective import aliases in func_subgraphs:
+        //     Iterate sema.import_aliases, mapping the alias name to the sg_id of the corresponding mangled name.
+        //     The alias name (e.g. "area") goes via import_alias -> mangled name (e.g. "Math.Geometry.circle_area")
+        //     -> func_subgraphs lookup for sg_id, registering the alias name to point to the same sg_id.
         let alias_entries: Vec<(String, String)> = self.sema.import_aliases.iter()
             .filter_map(|(alias, target)| match target {
                 crate::sema::Sema::AliasTarget::Symbol(mangled) => Some((alias.clone(), mangled.to_string())),
@@ -6765,11 +6964,13 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 0b. 收集所有模块（entry + builtin/std/dep）顶层 var/val 声明，
-        //     分配全局 slot。entry 函数编译时注入初始化代码（按模块切换 arena）。
-        //     全局变量存储在 DataFlowGraph.global_var_storage 中，跨函数共享，不依赖帧链。
-        //     模块索引：None = entry 模块，Some(i) = builtin_modules[i]
-        //     同时注册 mangled 名（module_path.name），供 selective import alias 解析。
+        // 0b. Collect top-level var/val declarations across all modules (entry + builtin/std/dep),
+        //     allocating global slots. The entry function injects initialization code at compile time
+        //     (switching arena per module).
+        //     Global variables are stored in DataFlowGraph.global_var_storage, shared across functions,
+        //     independent of the frame chain.
+        //     Module index: None = entry module, Some(i) = builtin_modules[i]
+        //     Also register mangled names (module_path.name) for selective import alias resolution.
         for d in &self.module.declarations {
             if let crate::ast::Ast::Decl::ExprDecl { stmt: Some(stmt_id), .. } = &d.node {
                 let stmt = &self.module.arena.stmt(*stmt_id).node;
@@ -6783,7 +6984,7 @@ impl<'a> IrBuilder<'a> {
                         let slot = self.global_var_slots.len() as u32;
                         self.global_var_slots.insert(name.to_string(), slot);
                         self.top_level_var_decls.push((None, *stmt_id));
-                        // 注册 mangled 名（module_path.name）指向同一 slot
+                        // Register the mangled name (module_path.name) pointing to the same slot
                         if let Some(ref mp) = crate::sema::Sema::module_logical_path(self.module.name) {
                             let mangled = format!("{}.{}", mp, name);
                             self.global_var_slots.insert(mangled, slot);
@@ -6806,7 +7007,7 @@ impl<'a> IrBuilder<'a> {
                             let slot = self.global_var_slots.len() as u32;
                             self.global_var_slots.insert(name.to_string(), slot);
                             self.top_level_var_decls.push((Some(i), *stmt_id));
-                            // 注册 mangled 名（module_path.name）指向同一 slot
+                            // Register the mangled name (module_path.name) pointing to the same slot
                             if let Some(ref mp) = crate::sema::Sema::module_logical_path(m.name) {
                                 let mangled = format!("{}.{}", mp, name);
                                 self.global_var_slots.insert(mangled, slot);
@@ -6817,9 +7018,9 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 0b-2. 注册 selective import alias 到 global_var_slots：
-        //       遍历 sema.import_aliases，将别名映射到 mangled 名对应的 slot。
-        //       如 "phi" → "Math.Algebra.GOLDEN_RATIO" → slot
+        // 0b-2. Register selective import aliases in global_var_slots:
+        //       Iterate sema.import_aliases, mapping the alias to the slot of the corresponding mangled name.
+        //       e.g. "phi" -> "Math.Algebra.GOLDEN_RATIO" -> slot
         for (alias, target) in &self.sema.import_aliases {
             if let crate::sema::Sema::AliasTarget::Symbol(mangled) = target {
                 if let Some(&slot) = self.global_var_slots.get(mangled.as_ref()) {
@@ -6828,9 +7029,9 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 0c. 注册所有模块的顶层类型到 base scope（与嵌套类型统一通过 type_scope_stack 查找）
-        //     ADT 同时注册类型名和各构造器名（构造器名映射到类型名，用于反射 type_name）
-        //     Newtype 注册构造器名（== 类型名），kind=Newtype 驱动 compute_record_construct 构造 NewtypeValue
+        // 0c. Register all modules' top-level types into the base scope (unified with nested types via type_scope_stack lookup)
+        //     ADT registers both the type name and each constructor name (constructor name maps to type name, for type_name reflection)
+        //     Newtype registers the constructor name (== type name); kind=Newtype drives compute_record_construct to build a NewtypeValue
         self.type_scope_stack.push(rustc_hash::FxHashMap::default());
         for m in &all_modules {
             for d in &m.declarations {
@@ -6845,13 +7046,13 @@ impl<'a> IrBuilder<'a> {
                             });
                         }
                         crate::ast::Ast::TypeDef::Adt { constructors } => {
-                            // 注册类型名（nullary 路径用于类型名查找，field_names 为空仅当无字段构造器）
+                            // Register the type name (nullary path used for type-name lookup; field_names is empty only when there are no field constructors)
                             self.bind_type_fields(name, TypeFieldInfo {
                                 field_names: Vec::new(),
                                 type_name: name.to_string(),
                                 kind: RecordLitKind::Adt,
                             });
-                            // 注册每个构造器名（映射到类型名）
+                            // Register each constructor name (mapped to the type name)
                             for ctor in constructors {
                                 let field_names: Vec<String> = ctor.fields.iter()
                                     .map(|f| f.name.unwrap_or("_").to_string())
@@ -6864,7 +7065,7 @@ impl<'a> IrBuilder<'a> {
                             }
                         }
                         crate::ast::Ast::TypeDef::Newtype { name: nt_name, .. } => {
-                            // Newtype：构造器名 == 类型名，kind=Newtype
+                            // Newtype: constructor name == type name, kind=Newtype
                             self.bind_type_fields(nt_name, TypeFieldInfo {
                                 field_names: Vec::new(),
                                 type_name: nt_name.to_string(),
@@ -6877,7 +7078,7 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 1. 先编译 builtin 模块的函数（注册到 func_subgraphs 供用户代码调用）
+        // 1. Compile builtin module functions first (register into func_subgraphs for user code to call)
         let builtin_fun_names: Vec<(Box<str>, usize)> = self
             .builtin_modules
             .iter()
@@ -6885,7 +7086,7 @@ impl<'a> IrBuilder<'a> {
             .flat_map(|(i, m)| {
                 m.declarations.iter().filter_map(move |d| match &d.node {
                     crate::ast::Ast::Decl::FunDecl { name, extern_c_body, .. } => {
-                        // 跳过 @extern("C") 函数
+                        // Skip @extern("C") functions
                         if extern_c_body.is_some() { return None; }
                         Some((name.to_string().into_boxed_str(), i))
                     }
@@ -6897,7 +7098,7 @@ impl<'a> IrBuilder<'a> {
             self.compile_function(name);
         }
 
-        // 1b. 编译 builtin 模块中 TypeDecl 的方法（按 method_idx 索引）
+        // 1b. Compile TypeDecl methods in builtin modules (indexed by method_idx)
         let builtin_methods: Vec<(String, usize)> = self
             .builtin_modules
             .iter()
@@ -6920,8 +7121,8 @@ impl<'a> IrBuilder<'a> {
             self.compile_builtin_method(type_name, *method_idx);
         }
 
-        // 2. 收集用户模块函数名（跳过 @extern("C") 函数 + 分析器标记的死函数）
-        //    死函数不编译子图：分析器已确认无调用路径可达（单模块分析）
+        // 2. Collect user module function names (skip @extern("C") functions + analyzer-flagged dead functions)
+        //    Dead functions are not compiled into subgraphs: the analyzer has confirmed no call path reaches them (single-module analysis)
         let fun_names: Vec<Box<str>> = self
             .module
             .declarations
@@ -6930,9 +7131,9 @@ impl<'a> IrBuilder<'a> {
             .filter_map(|(idx, d)| match &d.node {
                 crate::ast::Ast::Decl::FunDecl { name, extern_c_body, is_entry, .. } => {
                     if extern_c_body.is_some() { return None; }
-                    // 入口函数永不消除（分析器已排除，这里双重保险）
+                    // Entry functions are never eliminated (the analyzer already excludes them; this is a double check)
                     if *is_entry { return Some(name.to_string().into_boxed_str()); }
-                    // 分析器标记的死函数跳过
+                    // Skip analyzer-flagged dead functions
                     if self.is_dead_func(idx) { return None; }
                     Some(name.to_string().into_boxed_str())
                 }
@@ -6940,7 +7141,7 @@ impl<'a> IrBuilder<'a> {
             })
             .collect();
 
-        // 2b. 编译用户模块中 TypeDecl 的方法（按 method_idx 索引，须在步骤 3 前完成）
+        // 2b. Compile TypeDecl methods in the user module (indexed by method_idx; must complete before step 3)
         let user_methods: Vec<(String, usize)> = self
             .module
             .declarations
@@ -6962,9 +7163,9 @@ impl<'a> IrBuilder<'a> {
             self.compile_user_method(type_name, *method_idx);
         }
 
-        // 2c. 编译 trait 默认方法的单态化特化版本：
-        //     消费 Sema 后阶段收集的 trait_default_instances，为每个实例编译特化子图。
-        //     trait_default_subgraphs 中的条目由步骤 0a-trait 预注册。
+        // 2c. Compile the monomorphized specialization of trait default methods:
+        //     Consumes trait_default_instances collected in the Sema post-phase; compiles a specialized subgraph for each instance.
+        //     Entries in trait_default_subgraphs were pre-registered in step 0a-trait.
         for (inst_idx, inst) in self.sema.trait_default_instances.iter().enumerate() {
             self.compile_trait_default_method(
                 inst.trait_name.as_ref(),
@@ -6974,9 +7175,9 @@ impl<'a> IrBuilder<'a> {
             );
         }
 
-        // 2d. 预注册单态化实例子图占位符：使步骤 3 中编译用户函数时，
-        //     call node 可通过 mangled name 绑定到实例子图（实际编译体在步骤 3a 填充）。
-        //     若不预注册，compile_call 查不到 mangled name → set_call_target 未执行 → 运行时返回 void。
+        // 2d. Pre-register monomorphization instance subgraph placeholders: so that when compiling user functions
+        //     in step 3, call nodes can bind to the instance subgraph via mangled name (the actual body is filled in step 3a).
+        //     Without pre-registration, compile_call cannot find the mangled name -> set_call_target is not executed -> runtime returns void.
         for inst in self.sema.monomorph_instances.iter().filter(|inst| !inst.type_args.is_empty()) {
             let mangled = format!("{}#{}", inst.func_name, inst.instance_id);
             if !self.func_subgraphs.contains_key(mangled.as_str()) {
@@ -6988,14 +7189,14 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 3. 编译用户模块函数
+        // 3. Compile user module functions
         for name in &fun_names {
             self.compile_function(name);
         }
 
-        // 3a. 编译单态化实例：消费 Sema 的 monomorph_instances，
-        //     为每个泛型函数实例生成特化子图（mangled name 注册）。
-        //     仅处理有 type_args 的实例（非泛型实例由 compile_function 覆盖）。
+        // 3a. Compile monomorphization instances: consumes Sema's monomorph_instances,
+        //     generating a specialized subgraph for each generic function instance (registered under mangled name).
+        //     Only handles instances with type_args (non-generic instances are covered by compile_function).
         let instances: Vec<crate::sema::Sema::MonomorphInstance> = self.sema.monomorph_instances
             .iter()
             .filter(|inst| !inst.type_args.is_empty())
@@ -7005,11 +7206,11 @@ impl<'a> IrBuilder<'a> {
             self.compile_monomorph_instance(inst);
         }
 
-        // 计算 fan-out
+        // Compute fan-out
         self.graph.compute_downstreams();
 
-        // 设置入口子图：通过函数名查 func_subgraphs（compile_function 可能为每个函数
-        // 生成多个子图，declaration index 与 subgraph index 非 1:1 映射）
+        // Set the entry subgraph: look up the function name in func_subgraphs (compile_function may
+        // generate multiple subgraphs per function; declaration index and subgraph index are not 1:1)
         for d in &self.module.declarations {
             if let crate::ast::Ast::Decl::FunDecl { name, is_entry: true, .. } = &d.node {
                 if let Some(&sg) = self.func_subgraphs.get(*name) {
@@ -7019,17 +7220,17 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // 构建期填充计算函数表（运行时按 ComputeFnId 索引调用）
+        // Populate the compute-fn table at build time (indexed by ComputeFnId at runtime)
         self.graph.compute_fns = build_compute_fn_table();
 
-        // 初始化全局变量存储区（按 slot count 预分配 Mutex 槽）
+        // Initialize the global variable storage area (pre-allocate Mutex slots by slot count)
         let global_var_count = self.global_var_slots.len();
         let storage: Vec<std::sync::Mutex<Option<crate::value::Value>>> = (0..global_var_count)
             .map(|_| std::sync::Mutex::new(None))
             .collect();
         self.graph.global_var_storage = Arc::new(storage);
 
-        // 初始化记忆化缓存表（每个 memoized 函数一个 HashMap<u64, Value>）
+        // Initialize the memoization cache tables (one HashMap<u64, Value> per memoized function)
         let memo_table_count = self.memo_table_count as usize;
         let memo_tables: Vec<std::sync::Mutex<rustc_hash::FxHashMap<u64, crate::value::Value>>> =
             (0..memo_table_count)
@@ -7037,13 +7238,13 @@ impl<'a> IrBuilder<'a> {
                 .collect();
         self.graph.memo_tables = Arc::new(memo_tables);
 
-        // 移入 IR 编译期错误（未实现的特性等），供调用方检查
+        // Move IR compile-time errors (unimplemented features, etc.) in for the caller to inspect
         self.graph.ir_errors = std::mem::take(&mut self.errors);
 
-        // 预计算所有子图的 nested_ranges，运行时 O(len) 查询替代全图扫描
+        // Pre-compute nested_ranges for all subgraphs; runtime O(len) lookup replaces full-graph scans
         self.graph.compute_nested_ranges();
 
-        // 将构建期 string_pool move 到 graph.string_pool（ConstValue::Str 引用此池）
+        // Move the build-time string_pool into graph.string_pool (ConstValue::Str references this pool)
         let pool = std::mem::take(&mut self.string_pool);
         self.graph.string_pool = Arc::from(pool);
 
@@ -7051,7 +7252,7 @@ impl<'a> IrBuilder<'a> {
     }
 }
 
-/// 检测浮点字面量的类型后缀，返回 (stripped, suffix)。
+/// Detect the type suffix of a float literal, returning (stripped, suffix).
 fn detect_float_suffix(s: &str) -> (&str, Option<&str>) {
     for suffix in &["f128", "f64", "f32", "f16"] {
         if s.ends_with(suffix) {
@@ -7062,11 +7263,11 @@ fn detect_float_suffix(s: &str) -> (&str, Option<&str>) {
 }
 
 // =========================================================================
-// 整数字面量解析 + 类型范围检查
+// Integer literal parsing + type range checking
 // =========================================================================
 
-/// 将整数字面量原始文本解析为 i128，支持 0x/0o/0b 前缀和下划线分隔符。
-/// 解析失败（无效语法）时返回带 span 信息的错误。
+/// Parse the raw text of an integer literal into i128, supporting 0x/0o/0b prefixes and underscore separators.
+/// Returns an error with span info on parse failure (invalid syntax).
 fn parse_int_to_i128(raw: &str, span: crate::ast::Ast::Span) -> Result<i128, String> {
     let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
     let (digits, radix) = cleaned
@@ -7079,9 +7280,9 @@ fn parse_int_to_i128(raw: &str, span: crate::ast::Ast::Span) -> Result<i128, Str
     })
 }
 
-/// 将整数字面量原始文本解析为 u128，支持 0x/0o/0b 前缀和下划线分隔符。
-/// u128 无符号语义（不接受负号），用于 u128 suffix 字面量，覆盖完整 0..=2^128-1 范围。
-/// 解析失败（无效语法或负号）时返回带 span 信息的错误。
+/// Parse the raw text of an integer literal into u128, supporting 0x/0o/0b prefixes and underscore separators.
+/// u128 has unsigned semantics (no leading minus), used for u128-suffix literals to cover the full 0..=2^128-1 range.
+/// Returns an error with span info on parse failure (invalid syntax or a leading minus).
 fn parse_int_to_u128(raw: &str, span: crate::ast::Ast::Span) -> Result<u128, String> {
     let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
     let (digits, radix) = cleaned
@@ -7094,8 +7295,8 @@ fn parse_int_to_u128(raw: &str, span: crate::ast::Ast::Span) -> Result<u128, Str
     })
 }
 
-/// 对 i128 值进行目标类型范围检查并转换为 ConstValue。
-/// 超出范围时返回带类型名、合法范围和 span 信息的错误。
+/// Range-check an i128 value against the target type and convert it to a ConstValue.
+/// Returns an error with the type name, valid range, and span info when out of range.
 fn check_int_range(v: i128, ty_name: &str, raw: &str, span: crate::ast::Ast::Span) -> Result<ConstValue, String> {
     macro_rules! try_int {
         ($ty:ty, $variant:ident) => {
@@ -7108,7 +7309,7 @@ fn check_int_range(v: i128, ty_name: &str, raw: &str, span: crate::ast::Ast::Spa
             }
         };
     }
-    // 单一真相源：通过 ValueTag::from_name 派生，消除字符串特判
+    // Single source of truth: derived via ValueTag::from_name, eliminating string special-casing
     let tag = crate::value::ValueTag::from_name(ty_name).unwrap_or(crate::value::ValueTag::I32);
     match tag {
         crate::value::ValueTag::I8 => try_int!(i8, I8),
@@ -7128,65 +7329,65 @@ fn check_int_range(v: i128, ty_name: &str, raw: &str, span: crate::ast::Ast::Spa
 }
 
 // =========================================================================
-// 十六进制浮点字面量解析（IEEE 754 精确位模式）
+// Hexadecimal float literal parsing (exact IEEE 754 bit patterns)
 // =========================================================================
-// 格式: 0x<整数部分>.<小数部分>p<指数部分>
+// Format: 0x<integer part>.<fractional part>p<exponent part>
 //   0x1.921fb54442d18p+1 = 1.* 16^... * 2^(+1) = PI (f64)
-// 支持正负指数、可选符号、大小写 0x/P。
+// Supports positive/negative exponents, optional sign, and upper/lower-case 0x/P.
 
-/// 解析十六进制浮点字面量为 f64 位模式，返回 f64。
+/// Parse a hexadecimal float literal into an f64 bit pattern, returning f64.
 fn parse_hex_float_f64(s: &str) -> Option<f64> {
     let bits = parse_hex_float_to_u128(s, 11, 52, 1023)?;
     Some(f64::from_bits(bits as u64))
 }
 
-/// 解析十六进制浮点字面量为 f32 位模式，返回 f32。
+/// Parse a hexadecimal float literal into an f32 bit pattern, returning f32.
 fn parse_hex_float_f32(s: &str) -> Option<f32> {
     let bits = parse_hex_float_to_u128(s, 8, 23, 127)?;
     Some(f32::from_bits(bits as u32))
 }
 
-/// 解析十六进制浮点字面量为 f16 位模式，返回 u16 bits。
+/// Parse a hexadecimal float literal into an f16 bit pattern, returning u16 bits.
 fn parse_hex_float_f16(s: &str) -> Option<u16> {
     let bits = parse_hex_float_to_u128(s, 5, 10, 15)?;
     Some(bits as u16)
 }
 
-/// 解析十六进制浮点字面量为 f128 位模式，返回 [u8; 16]。
+/// Parse a hexadecimal float literal into an f128 bit pattern, returning [u8; 16].
 fn parse_hex_float_f128(s: &str) -> Option<[u8; 16]> {
     let bits = parse_hex_float_to_u128(s, 15, 112, 16383)?;
     Some(bits.to_le_bytes())
 }
 
-/// 通用十六进制浮点解析器。
-/// 参数: (字面量, 指数位数, 尾数位数, 指数偏置)
-/// 返回: u128 位模式（调用方截断到目标宽度）
+/// Generic hexadecimal float parser.
+/// Params: (literal, exponent bit width, mantissa bit width, exponent bias)
+/// Returns: a u128 bit pattern (the caller truncates to the target width)
 fn parse_hex_float_to_u128(s: &str, exp_bits: u32, mant_bits: u32, exp_bias: i64) -> Option<u128> {
-    // 去除 0x/0X 前缀
+    // Strip the 0x/0X prefix
     let body = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
 
-    // 分割尾数部分和指数部分（p 或 P）
+    // Split the mantissa part and the exponent part (p or P)
     let p_pos = body.find(|c| c == 'p' || c == 'P')?;
     let mantissa_str = &body[..p_pos];
     let exp_str = &body[p_pos + 1..];
 
-    // 解析尾数：可能包含 '.'
+    // Parse the mantissa: may contain a '.'
     let (int_part, frac_part) = match mantissa_str.find('.') {
         Some(dot) => (&mantissa_str[..dot], &mantissa_str[dot + 1..]),
         None => (mantissa_str, ""),
     };
 
-    // 将十六进制尾数转为数值（忽略小数点位置，先收集所有 hex 数字）
+    // Convert the hex mantissa to a numeric value (ignore the decimal point position; collect all hex digits first)
     let mut mantissa: u128 = 0;
-    let mut frac_hex_digits: i32 = 0; // 小数点后的 hex digit 数
+    let mut frac_hex_digits: i32 = 0; // number of hex digits after the decimal point
 
-    // 整数部分
+    // Integer part
     for c in int_part.chars() {
         let d = c.to_digit(16)?;
         mantissa = mantissa.checked_mul(16)?.checked_add(d as u128)?;
     }
 
-    // 小数部分
+    // Fractional part
     for c in frac_part.chars() {
         let d = c.to_digit(16)?;
         mantissa = mantissa.checked_mul(16)?.checked_add(d as u128)?;
@@ -7194,32 +7395,32 @@ fn parse_hex_float_to_u128(s: &str, exp_bits: u32, mant_bits: u32, exp_bias: i64
     }
 
     if mantissa == 0 {
-        // 零：可能带符号，但当前实现不解析符号前缀（词法器已处理负号）
+        // Zero: may carry a sign, but the current implementation does not parse a sign prefix (the lexer already handles the minus)
         return Some(0);
     }
 
-    // 解析二进制指数（p 后部分）
+    // Parse the binary exponent (the part after p)
     let exp2: i64 = exp_str.parse().ok()?;
 
-    // 实际指数 = exp2 - frac_hex_digits * 4（因为每个 hex digit = 4 bits）
+    // Actual exponent = exp2 - frac_hex_digits * 4 (because each hex digit = 4 bits)
     let binary_exp = exp2 - (frac_hex_digits as i64) * 4;
 
-    // 规范化 mantissa：找到最高有效位，计算 unbiased exp
-    // mantissa 的 MSB 位置（0-indexed from LSB）
+    // Normalize the mantissa: find the most significant bit, compute the unbiased exp
+    // MSB position of mantissa (0-indexed from LSB)
     let msb = 127 - mantissa.leading_zeros() as i64;
 
-    // 我们要把 mantissa 规范化为 1.xxx 形式：
-    // 当前 mantissa 表示一个整数，其二进制小数点在末尾。
-    // 规范化后：mantissa = 1.fraction * 2^(msb + binary_exp)
-    // 但 mantissa 的 MSB 就是隐含的 1，所以 unbiased_exp = msb + binary_exp
+    // We want to normalize the mantissa into the 1.xxx form:
+    // The current mantissa represents an integer with its binary point at the end.
+    // After normalization: mantissa = 1.fraction * 2^(msb + binary_exp)
+    // But the MSB of mantissa is the implicit 1, so unbiased_exp = msb + binary_exp
     let unbiased_exp = msb + binary_exp;
 
-    // 提取 fraction bits（去掉 MSB 后的位数）
+    // Extract the fraction bits (the bits after removing the MSB)
     let fraction_mant = mantissa & ((1u128 << msb) - 1);
     let frac_bits_available = msb as u32;
 
-    // 舍入 fraction 到 mant_bits 位（round-to-nearest-even）
-    // 返回 (fraction_field, exp_adjust)
+    // Round the fraction to mant_bits (round-to-nearest-even)
+    // Returns (fraction_field, exp_adjust)
     let (fraction, exp_adjust): (u128, i64) = if frac_bits_available > mant_bits {
         let shift = frac_bits_available - mant_bits;
         let kept = fraction_mant >> shift;
@@ -7257,7 +7458,7 @@ fn parse_hex_float_to_u128(s: &str, exp_bits: u32, mant_bits: u32, exp_bias: i64
         return Some(exp_field | frac_field);
     }
 
-    // biased_exp <= 0：次正规数或零
+    // biased_exp <= 0: subnormal or zero
     let shift = (1 - biased_exp) as u32;
     if shift >= 128 {
         return Some(0);
@@ -7271,14 +7472,15 @@ fn parse_hex_float_to_u128(s: &str, exp_bits: u32, mant_bits: u32, exp_bias: i64
 }
 
 // =========================================================================
-// 十进制浮点字面量 → IEEE 754 binary128 精确解析（不经 f64 中转）
+// Decimal float literal -> IEEE 754 binary128 exact parsing (no f64 intermediary)
 // =========================================================================
-// 算法：十进制 digits * 10^e10 → 大整数 M * 2^e2 → 规范化 113 位 mantissa
-//       + round-to-nearest-even 舍入 → binary128 位模式。
-// 大整数用 Vec<u64> little-endian 表示，仅需乘/除小整数与左/右移操作，
-// 避免大整数除以大整数（10^k = 2^k * 5^k，分步乘/除 5 即可）。
+// Algorithm: decimal digits * 10^e10 -> big integer M * 2^e2 -> normalize 113-bit mantissa
+//            + round-to-nearest-even rounding -> binary128 bit pattern.
+// Big integers are represented as Vec<u64> little-endian; only multiply/divide by small
+// integers and left/right shifts are needed, avoiding big-integer / big-integer division
+// (10^k = 2^k * 5^k, so multiply/divide by 5 step by step suffices).
 
-/// 十进制数字字符串 → Vec<u64> 大整数（little-endian limbs）。
+/// Decimal digit string -> Vec<u64> big integer (little-endian limbs).
 fn bigint_from_dec(s: &str) -> Vec<u64> {
     let mut limbs = vec![0u64];
     for c in s.chars() {
@@ -7296,7 +7498,7 @@ fn bigint_from_dec(s: &str) -> Vec<u64> {
     limbs
 }
 
-/// 大整数乘以小整数（原地）。
+/// Multiply a big integer by a small integer (in place).
 fn bigint_mul_small(limbs: &mut Vec<u64>, m: u64) {
     let mut carry = 0u128;
     for l in limbs.iter_mut() {
@@ -7309,7 +7511,7 @@ fn bigint_mul_small(limbs: &mut Vec<u64>, m: u64) {
     }
 }
 
-/// 大整数除以小整数（原地），返回余数。
+/// Divide a big integer by a small integer (in place), returning the remainder.
 fn bigint_divmod_small(limbs: &mut Vec<u64>, d: u64) -> u64 {
     let mut rem = 0u128;
     for l in limbs.iter_mut().rev() {
@@ -7323,7 +7525,7 @@ fn bigint_divmod_small(limbs: &mut Vec<u64>, d: u64) -> u64 {
     rem as u64
 }
 
-/// 大整数左移 n 位（原地）。
+/// Left-shift a big integer by n bits (in place).
 fn bigint_shl(limbs: &mut Vec<u64>, n: u32) {
     let word_shift = (n / 64) as usize;
     let bit_shift = n % 64;
@@ -7343,7 +7545,7 @@ fn bigint_shl(limbs: &mut Vec<u64>, n: u32) {
     }
 }
 
-/// 大整数位长度（最高有效位位置 + 1）。
+/// Big integer bit length (most significant bit position + 1).
 fn bigint_bit_len(limbs: &[u64]) -> u32 {
     let mut i = limbs.len();
     while i > 0 && limbs[i - 1] == 0 {
@@ -7355,7 +7557,7 @@ fn bigint_bit_len(limbs: &[u64]) -> u32 {
     ((i - 1) * 64 + (64 - limbs[i - 1].leading_zeros()) as usize) as u32
 }
 
-/// 提取大整数 bit [start, start+n-1]（n <= 128）。
+/// Extract bits [start, start+n-1] from a big integer (n <= 128).
 fn bigint_extract_bits(limbs: &[u64], start: u32, n: u32) -> u128 {
     let mut result: u128 = 0;
     for i in 0..n {
@@ -7369,7 +7571,7 @@ fn bigint_extract_bits(limbs: &[u64], start: u32, n: u32) -> u128 {
     result
 }
 
-/// 大整数第 pos 位是否为 1（pos 为 i64 以支持负值返回 false）。
+/// Whether bit `pos` of a big integer is 1 (pos is i64 to allow negative values to return false).
 fn bigint_bit(limbs: &[u64], pos: i64) -> bool {
     if pos < 0 {
         return false;
@@ -7380,7 +7582,7 @@ fn bigint_bit(limbs: &[u64], pos: i64) -> bool {
     word < limbs.len() && (limbs[word] >> bit) & 1 != 0
 }
 
-/// 大整数低 n 位是否非零。
+/// Whether the low n bits of a big integer are non-zero.
 fn bigint_low_nonzero(limbs: &[u64], n: u32) -> bool {
     if n == 0 {
         return false;
@@ -7401,7 +7603,7 @@ fn bigint_low_nonzero(limbs: &[u64], n: u32) -> bool {
     false
 }
 
-/// 大整数低 128 位转 u128。
+/// Convert the low 128 bits of a big integer to u128.
 fn bigint_to_u128(limbs: &[u64]) -> u128 {
     let mut r = 0u128;
     for i in 0..2.min(limbs.len()) {
@@ -7410,12 +7612,12 @@ fn bigint_to_u128(limbs: &[u64]) -> u128 {
     r
 }
 
-/// 十进制浮点字面量 → IEEE 754 binary128 位模式（[u8;16] little-endian）。
+/// Decimal float literal -> IEEE 754 binary128 bit pattern ([u8;16] little-endian).
 ///
-/// 不经 f64 中转，使用大整数运算实现精确转换（round-to-nearest-even）。
-/// 支持: [+-]digits[.digits][e[+-]digits]
+/// Performs exact conversion via big-integer arithmetic without an f64 intermediary (round-to-nearest-even).
+/// Supports: [+-]digits[.digits][e[+-]digits]
 pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
-    // 1. 解析十进制格式
+    // 1. Parse the decimal format
     let s = s.trim();
     let (sign, body) = if let Some(rest) = s.strip_prefix('-') {
         (true, rest)
@@ -7425,14 +7627,14 @@ pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
         (false, s)
     };
 
-    // 分割指数部分 e/E
+    // Split the exponent part e/E
     let (mantissa_str, exp_str) = match body.find(|c| c == 'e' || c == 'E') {
         Some(pos) => (&body[..pos], &body[pos + 1..]),
         None => (body, ""),
     };
     let exp10: i32 = if exp_str.is_empty() { 0 } else { exp_str.parse().ok()? };
 
-    // 分割小数点
+    // Split the decimal point
     let (int_part, frac_part) = match mantissa_str.find('.') {
         Some(pos) => (&mantissa_str[..pos], &mantissa_str[pos + 1..]),
         None => (mantissa_str, ""),
@@ -7446,19 +7648,19 @@ pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
     let frac_len = frac_part.len() as i32;
     let e10 = exp10 - frac_len;
 
-    // 零值快速返回
+    // Fast return for zero
     if digits_str.chars().all(|c| c == '0') {
         let bits: u128 = if sign { 1u128 << 127 } else { 0 };
         return Some(bits.to_le_bytes());
     }
 
-    // 2. digits → 大整数 M
+    // 2. digits -> big integer M
     let mut m_big = bigint_from_dec(&digits_str);
     let digits_bitlen = bigint_bit_len(&m_big);
     let mut e2: i64 = 0;
     let mut div_sticky = false;
 
-    // 3. 估算范围，快速处理 inf/0
+    // 3. Estimate range, fast-path inf/0
     let log2_est = (digits_bitlen as f64 - 1.0) + (e10 as f64) * 3.32193;
     if log2_est > 16384.0 {
         let bits: u128 = (if sign { 1u128 << 127 } else { 0 }) | (0x7FFFu128 << 112);
@@ -7469,7 +7671,7 @@ pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
         return Some(bits.to_le_bytes());
     }
 
-    // 4. 处理 e10：value = digits * 10^e10 = digits * 5^e10 * 2^e10
+    // 4. Handle e10: value = digits * 10^e10 = digits * 5^e10 * 2^e10
     if e10 > 0 {
         for _ in 0..e10 {
             bigint_mul_small(&mut m_big, 5);
@@ -7478,7 +7680,7 @@ pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
     } else if e10 < 0 {
         // value = digits / 10^k = (digits * 2^P / 5^k) * 2^(-k-P), k = -e10
         let k = (-e10) as u64;
-        // P 需保证 M/5^k 后至少 114 位精度：P >= 114 - digits_bitlen + 2.322*k
+        // P must ensure at least 114 bits of precision after M/5^k: P >= 114 - digits_bitlen + 2.322*k
         let p_needed = (2.4 * (k as f64)) as u32 + 128;
         bigint_shl(&mut m_big, p_needed);
         e2 = -(k as i64) - (p_needed as i64);
@@ -7490,7 +7692,7 @@ pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
         }
     }
 
-    // 5. 规范化 + 提取 mantissa + guard + sticky
+    // 5. Normalize + extract mantissa + guard + sticky
     let msb = bigint_bit_len(&m_big) as i64 - 1;
     if msb < 0 {
         let bits: u128 = if sign { 1u128 << 127 } else { 0 };
@@ -7500,7 +7702,7 @@ pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
 
     let (bits113, guard, sticky, final_exp): (u128, bool, bool, i64) =
         if unbiased_exp >= -16382 {
-            // 正规数：mantissa 113 位（bit msb 为隐含1）
+            // Normal number: mantissa is 113 bits (the msb is the implicit 1)
             let shift = msb - 112;
             if shift >= 0 {
                 let s = shift as u32;
@@ -7513,14 +7715,14 @@ pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
                 };
                 (mant, g, stk || div_sticky, unbiased_exp)
             } else {
-                // 左移补齐，M 精确表示（无 guard）
+                // Left-shift to fill; M is represented exactly (no guard)
                 let mut m = m_big.clone();
                 bigint_shl(&mut m, (-shift) as u32);
                 let mant = bigint_to_u128(&m) & ((1u128 << 113) - 1);
                 (mant, false, div_sticky, unbiased_exp)
             }
         } else {
-            // 次正规数：fraction 112 位，exp 固定 -16382
+            // Subnormal number: fraction is 112 bits, exp is fixed at -16382
             // fraction = M * 2^(e2 + 16494)
             let p = e2 + 16494;
             if p >= 0 {
@@ -7541,7 +7743,7 @@ pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
             }
         };
 
-    // 6. 舍入 round-to-nearest-even
+    // 6. Round to nearest even
     let mut mant = bits113;
     let mut exp = final_exp;
     let was_subnormal = final_exp < -16382;
@@ -7549,29 +7751,29 @@ pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
         mant += 1;
     }
     if was_subnormal {
-        // 次正规舍入后可能进位到最小正规数（mant 达到 2^112）
+        // Subnormal rounding may carry up to the smallest normal (mant reaches 2^112)
         if mant >= (1u128 << 112) {
             exp = -16382;
         }
     } else if mant >= (1u128 << 113) {
-        // 正规数舍入进位
+        // Normal number rounding carry
         mant >>= 1;
         exp += 1;
     }
 
-    // 7. 组装 binary128
+    // 7. Assemble binary128
     if exp >= 16383 {
         let bits: u128 = (if sign { 1u128 << 127 } else { 0 }) | (0x7FFFu128 << 112);
         return Some(bits.to_le_bytes());
     }
     if exp >= -16382 {
-        // 正规数
+        // Normal number
         let frac = mant & ((1u128 << 112) - 1);
         let biased = (exp + 16383) as u128;
         let bits = (if sign { 1u128 << 127 } else { 0 }) | (biased << 112) | frac;
         return Some(bits.to_le_bytes());
     }
-    // 次正规数
+    // Subnormal number
     let frac = mant & ((1u128 << 112) - 1);
     let bits = (if sign { 1u128 << 127 } else { 0 }) | frac;
     Some(bits.to_le_bytes())

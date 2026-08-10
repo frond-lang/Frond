@@ -1,98 +1,103 @@
 // =========================================================================
-// Ty — 统一类型枚举（唯一类型来源，Copy，无外部依赖）
+// Ty — the unified type enum (the single source of types, Copy, no external deps).
 // =========================================================================
 
 use super::Tag::*;
 use std::fmt;
 
-/// Kuzo 统一类型表示。
+/// The unified type representation for Kuzo.
 ///
-/// **唯一类型来源**：sema 和 IR 层都使用 `Ty`，不再有 `ConcreteType`。
+/// **Single source of types**: both the sema and IR layers use `Ty`; there is no longer
+/// a `ConcreteType`.
 ///
-/// **Copy 枚举**：所有载荷均为 `u32`（`TypeHandle` 或 `DetailId`），无堆分配。
-/// 结构数据（params/fields/method_sigs/name 等）存于 `TypeArena` 附属表，
-/// 通过 `DetailId` 索引。
+/// **Copy enum**: all payloads are `u32` (`TypeHandle` or `DetailId`), with no heap
+/// allocation. Structural data (params/fields/method_sigs/name, etc.) lives in the
+/// `TypeArena` side tables, indexed by `DetailId`.
 ///
-/// **分层设计：**
-/// - **Basic types**（24 内置 + 4 复合 + 7 泛型）：内置类型，变体本身可做家族判断
-/// - **Other types**（6 用户类型）：用户自定义类型，携带 `DetailId` 索引结构数据
+/// **Layered design:**
+/// - **Basic types** (24 builtin + 4 composite + 7 generic): builtin types whose
+///   variant alone is sufficient for family classification.
+/// - **Other types** (6 user types): user-defined types carrying a `DetailId` that
+///   indexes their structural data.
 ///
-/// 通过 `is_basic()` / `is_other()` 区分两层，通过 `family()` 做家族分派。
+/// The two layers are distinguished via `is_basic()` / `is_other()`, and family
+/// dispatch is done via `family()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ty {
-    // ── Basic: 18 个标量（无载荷）──
+    // -- Basic: 18 scalars (no payload) --
     Bool, Char,
     I8, I16, I32, I64, I128,
     U8, U16, U32, U64, U128,
     Isize, Usize,
     F16, F32, F64, F128,
 
-    // ── Basic: 3 个非标量内置（无载荷）──
+    // -- Basic: 3 non-scalar builtins (no payload) --
     Str,    // fat pointer
-    Null,   // 无值
-    Void,   // 无类型
+    Null,   // no value
+    Void,   // no type
 
-    // ── Basic: 7 个内置泛型（DetailId 索引 arena 中的子类型结构）──
-    /// Throw<V, E>（arena 存 { value: TypeHandle, error: TypeHandle }）
+    // -- Basic: 7 builtin generics (DetailId indexes subtype structure in the arena) --
+    /// `Throw<V, E>` (arena stores `{ value: TypeHandle, error: TypeHandle }`).
     Throw(DetailId),
-    /// Channel<T>（arena 存 { elem: TypeHandle }）
+    /// `Channel<T>` (arena stores `{ elem: TypeHandle }`).
     Channel(DetailId),
-    /// Async<T>（arena 存 { value: TypeHandle }）
+    /// `Async<T>` (arena stores `{ value: TypeHandle }`).
     Async(DetailId),
-    /// Lazy<T>（arena 存 { value: TypeHandle }）
+    /// `Lazy<T>` (arena stores `{ value: TypeHandle }`).
     Lazy(DetailId),
-    /// Atomic<T>（arena 存 { elem: TypeHandle }）
+    /// `Atomic<T>` (arena stores `{ elem: TypeHandle }`).
     Atomic(DetailId),
-    /// Sender<T>（arena 存 { elem: TypeHandle }）
+    /// `Sender<T>` (arena stores `{ elem: TypeHandle }`).
     Sender(DetailId),
-    /// Receiver<T>（arena 存 { elem: TypeHandle }）
+    /// `Receiver<T>` (arena stores `{ elem: TypeHandle }`).
     Receiver(DetailId),
-    /// Timer（事件源分派用，用户自定义类型但事件源语义内置）
+    /// Timer (used for event-source dispatch; a user-defined type with builtin event-source semantics).
     Timer(DetailId),
 
-    // ── Basic: 4 个复合类型（DetailId 索引 arena 中的结构详情）──
-    /// 数组 [T; N]（arena 存 { elem: TypeHandle, size: Option<u64> }）
+    // -- Basic: 4 composite types (DetailId indexes structural details in the arena) --
+    /// Array `[T; N]` (arena stores `{ elem: TypeHandle, size: Option<u64> }`).
     Array(DetailId),
-    /// 引用 &T / 裸指针 *T（arena 存 { inner: TypeHandle, is_raw: bool }）
+    /// Reference `&T` / raw pointer `*T` (arena stores `{ inner: TypeHandle, is_raw: bool }`).
     Ref(DetailId),
-    /// 函数 (P1, P2) -> R（arena 存 { params: Box<[TypeHandle]>, return_type: TypeHandle }）
+    /// Function `(P1, P2) -> R` (arena stores `{ params: Box<[TypeHandle]>, return_type: TypeHandle }`).
     Fn(DetailId),
-    /// 可空 T?（arena 存 { inner: TypeHandle }）
+    /// Nullable `T?` (arena stores `{ inner: TypeHandle }`).
     Nullable(DetailId),
 
-    // ── Other: 用户自定义类型（DetailId 索引结构数据）──
-    /// Adt（代数数据类型）（arena 存 { name: Box<str>, args: Box<[TypeHandle]> }）
+    // -- Other: user-defined types (DetailId indexes structural data) --
+    /// Adt (algebraic data type) (arena stores `{ name: Box<str>, args: Box<[TypeHandle]> }`).
     Adt(DetailId),
-    /// 记录类型 { x: i32, y: i32 }（arena 存 { fields: Box<[FieldType]>, name: Option<Box<str>> }）
+    /// Record type `{ x: i32, y: i32 }` (arena stores `{ fields: Box<[FieldType]>, name: Option<Box<str>> }`).
     Record(DetailId),
-    /// trait 类型 Ord<T>（arena 存 { name: Box<str>, args: Box<[TypeHandle]> }）
+    /// Trait type `Ord<T>` (arena stores `{ name: Box<str>, args: Box<[TypeHandle]> }`).
     Trait(DetailId),
-    /// trait 对象类型：inline_trait 值的存在类型
-    /// （arena 存 { trait_name: Box<str>, method_sigs: Box<[TraitMethodSig]> }）
+    /// Trait object type: the existential type of an `inline_trait` value
+    /// (arena stores `{ trait_name: Box<str>, method_sigs: Box<[TraitMethodSig]> }`).
     TraitObject(DetailId),
-    /// 模块引用类型（arena 存 { path: Box<str>, env: EnvId }）
+    /// Module reference type (arena stores `{ path: Box<str>, env: EnvId }`).
     ModuleRef(DetailId),
-    /// 用户泛型应用 List<i32>（arena 存 { name: Box<str>, args: Box<[TypeHandle]> }）
+    /// User generic application `List<i32>` (arena stores `{ name: Box<str>, args: Box<[TypeHandle]> }`).
     Generic(DetailId),
 
-    // ── 特殊 ──
-    /// 发散类型（return/throw 早退路径，与任意类型统一为对方）
+    // -- Special --
+    /// Bottom type (return/throw early-exit path; unifies with any type as the other side).
     Never,
-    /// 类型变量（推断中，载荷为 TypeArena::type_vars 下标）
+    /// Type variable (during inference; payload is an index into `TypeArena::type_vars`).
     TypeVar(u32),
-    /// 未知类型
+    /// Unknown type.
     Unknown,
 }
 
-/// 类型结构详情 ID（u32 索引到 TypeArena::details 表）。
+/// Structural detail ID (a `u32` index into the `TypeArena::details` table).
 ///
-/// 复合类型和用户类型的结构数据存于 TypeArena 附属表，通过此 ID 索引。
-/// `Ty` 所有变体只携带 `TypeHandle`(u32) / `DetailId`(u32) / `u32`，因此 Copy。
+/// Structural data for composite and user types lives in the `TypeArena` side tables,
+/// indexed by this ID. All `Ty` variants carry only `TypeHandle`(u32) / `DetailId`(u32) /
+/// `u32`, so `Ty` is `Copy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DetailId(pub u32);
 
 impl Ty {
-    /// 全类型家族分类（一次调用完成全部分派判断）。
+    /// Full type-family classification (completes all dispatch checks in a single call).
     #[inline]
     pub fn family(&self) -> TypeFamily {
         match self {
@@ -132,7 +137,7 @@ impl Ty {
         }
     }
 
-    // ── 谓词（全部从 family 派生）──
+    // -- Predicates (all derived from family) --
 
     #[inline]
     pub fn is_signed_int(&self) -> bool {
@@ -168,9 +173,9 @@ impl Ty {
             TypeFamily::Str | TypeFamily::Null | TypeFamily::Void) || self.is_builtin_generic()
     }
 
-    // ── 派生元信息（无 ScalarInfo 中间结构）──
+    // -- Derived metadata (no intermediate ScalarInfo struct) --
 
-    /// 位宽：标量返回 Some(bits)，Str/Null/Void/复合/特殊返回 None。
+    /// Bit width: scalars return `Some(bits)`; Str/Null/Void/composite/special return `None`.
     #[inline]
     pub fn bit_width(&self) -> Option<u16> {
         match self {
@@ -184,19 +189,19 @@ impl Ty {
         }
     }
 
-    /// 整数位宽（仅整数有）。
+    /// Integer bit width (only available for integers).
     #[inline]
     pub fn int_bit_width(&self) -> Option<u16> {
         if self.is_int() { self.bit_width() } else { None }
     }
 
-    /// 浮点位宽（仅浮点有）。
+    /// Float bit width (only available for floats).
     #[inline]
     pub fn float_bit_width(&self) -> Option<u16> {
         if self.is_float() { self.bit_width() } else { None }
     }
 
-    /// 整数宽化比较秩（同宽同符号共享秩）；非整数为 None。
+    /// Integer widening-comparison rank (same width and signedness share a rank); `None` for non-integers.
     #[inline]
     pub fn int_rank(&self) -> Option<u8> {
         match self {
@@ -209,22 +214,23 @@ impl Ty {
         }
     }
 
-    /// 字节宽度（标量: 1/2/4/8/16；str: 8；null/void: 0；复合: None）。
-    /// 派生自 BUILTIN_TABLE。
+    /// Byte width (scalars: 1/2/4/8/16; str: 8; null/void: 0; composite: `None`).
+    /// Derived from `BUILTIN_TABLE`.
     #[inline]
     pub fn byte_width(&self) -> Option<u8> {
         builtin_info_by_tag(self.to_value_tag()).map(|i| i.byte_width)
     }
 
-    /// 内置 type_id（1..=21），其他返回 None。派生自 BUILTIN_TABLE。
+    /// Builtin `type_id` (1..=21); returns `None` for others. Derived from `BUILTIN_TABLE`.
     #[inline]
     pub fn type_id(&self) -> Option<u16> {
         builtin_info_by_tag(self.to_value_tag()).map(|i| i.type_id)
     }
 
-    /// 类型族名（用于诊断和格式化）。
-    /// 标量返回 "i32" 等具体名；内置泛型返回 "Channel" 等族名；
-    /// Adt/Trait/Generic 的具体名需通过 arena 查 TypeDetail。
+    /// Type family name (used for diagnostics and formatting).
+    /// Scalars return a concrete name like "i32"; builtin generics return a family name
+    /// like "Channel"; the concrete names of Adt/Trait/Generic must be looked up in the
+    /// arena via `TypeDetail`.
     pub fn name(&self) -> &'static str {
         match self {
             Ty::I8 => "i8", Ty::I16 => "i16", Ty::I32 => "i32",
@@ -259,7 +265,7 @@ impl Ty {
         }
     }
 
-    /// 运行时 ValueTag（用于 ValueHandle 编码）。
+    /// Runtime `ValueTag` (used for `ValueHandle` encoding).
     #[inline]
     pub fn to_value_tag(&self) -> ValueTag {
         match self {
@@ -275,11 +281,11 @@ impl Ty {
             Ty::Str => ValueTag::Ref,
             Ty::Null => ValueTag::Null,
             Ty::Void => ValueTag::Void,
-            _ => ValueTag::Ref, // 复合类型运行时都是 Ref
+            _ => ValueTag::Ref, // composite types are all Ref at runtime
         }
     }
 
-    /// 是否携带 DetailId（即需查 arena 获取结构数据）。
+    /// Whether this variant carries a `DetailId` (i.e., requires an arena lookup for structural data).
     #[inline]
     pub fn has_detail(&self) -> bool {
         matches!(self,
@@ -290,15 +296,18 @@ impl Ty {
             | Ty::TraitObject(_) | Ty::ModuleRef(_) | Ty::Generic(_))
     }
 
-    /// 从类型名构造无参内置类型（标量 + str/null/void + 裸内置泛型名）。
-    /// 用户自定义类型由 sema type_binding_stack 解析，不在此函数职责内。
+    /// Construct a parameterless builtin type from a type name (scalars + str/null/void +
+    /// bare builtin generic names).
+    /// User-defined types are resolved by the sema `type_binding_stack` and are not the
+    /// responsibility of this function.
     pub fn from_type_name(name: &str) -> Option<Self> {
-        // 内置标量 + str + null + void
+        // Builtin scalars + str + null + void.
         if let Some(info) = builtin_info_by_name(name) {
             return Some(info.value_tag.into());
         }
-        // 内置泛型裸名（"Async" / "Async<i32>" 均识别为 Ty::Async）。
-        // DetailId 用 DetailId(u32::MAX) 占位（family() 不读载荷，占位安全）。
+        // Bare builtin generic names (both "Async" and "Async<i32>" are recognized as Ty::Async).
+        // DetailId uses DetailId(u32::MAX) as a placeholder (family() does not read the payload,
+        // so the placeholder is safe).
         let base = name.split('<').next().unwrap_or(name);
         let placeholder = DetailId(u32::MAX);
         Some(match base {
@@ -314,11 +323,12 @@ impl Ty {
         })
     }
 
-    /// int→float 精确 widening 路径判定。
-    /// 平台相关整数按 `isize::BITS` 归约到 i32/u32 或 i64/u64 后判定。
+    /// Determine the exact int-to-float widening path.
+    /// Platform-dependent integers are first reduced to i32/u32 or i64/u64 based on
+    /// `isize::BITS` before the check.
     pub fn int_to_float_widening(int_ty: &Ty, float_ty: &Ty) -> bool {
         let platform_bits = isize::BITS as u16;
-        // 平台相关整数先归约到等价定长整数。
+        // Reduce platform-dependent integers to their equivalent fixed-width integers first.
         let int_ty = match int_ty {
             Ty::Isize => {
                 if platform_bits <= 32 {
@@ -370,31 +380,32 @@ impl From<ValueTag> for Ty {
 }
 
 // =========================================================================
-// BUILTIN_TABLE — 内置类型元信息单一真相源
+// BUILTIN_TABLE — single source of truth for builtin type metadata.
 // =========================================================================
 
-/// 内置类型元信息（仅标量 + str/null/void）。
+/// Builtin type metadata (scalars + str/null/void only).
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltinInfo {
-    /// 类型名（如 "i32"），所有派生函数的唯一键
+    /// Type name (e.g. "i32"); the unique key for all derived functions.
     pub name: &'static str,
-    /// 对应的 ValueTag（运行时编码）
+    /// Corresponding `ValueTag` (runtime encoding).
     pub value_tag: ValueTag,
-    /// TypeDesc 层 type_id（1..=21 内置范围）
+    /// TypeDesc-layer `type_id` (within the 1..=21 builtin range).
     pub type_id: u16,
-    /// 字节大小（标量: 1/2/4/8/16；str: 8；null/void: 0）
+    /// Byte size (scalars: 1/2/4/8/16; str: 8; null/void: 0).
     pub byte_width: u8,
 }
 
-/// 21 个内置类型的元信息表，按 type_id 升序排列。
+/// Metadata table for the 21 builtin types, sorted by `type_id` ascending.
 ///
-/// **新增内置类型时，只需在此表追加一行**。全库派生设施自动同步：
-/// - Ty::type_id() / Ty::byte_width() / Ty::to_value_tag()
-/// - TypeDesc::lookup_by_type_id
-/// - Reflect::__reflect_type_name / __reflect_layout_*
-/// - Sema::int_kind_from_name / float_kind_from_name
+/// **To add a new builtin type, simply append a row to this table.** All derived
+/// facilities across the codebase sync automatically:
+/// - `Ty::type_id()` / `Ty::byte_width()` / `Ty::to_value_tag()`
+/// - `TypeDesc::lookup_by_type_id`
+/// - `Reflect::__reflect_type_name` / `__reflect_layout_*`
+/// - `Sema::int_kind_from_name` / `float_kind_from_name`
 pub const BUILTIN_TABLE: &[BuiltinInfo] = &[
-    // ---- 整数（1..=12）----
+    // ---- Integers (1..=12) ----
     BuiltinInfo { name: "i8",    value_tag: ValueTag::I8,    type_id: 1,  byte_width: 1  },
     BuiltinInfo { name: "i16",   value_tag: ValueTag::I16,   type_id: 2,  byte_width: 2  },
     BuiltinInfo { name: "i32",   value_tag: ValueTag::I32,   type_id: 3,  byte_width: 4  },
@@ -407,49 +418,49 @@ pub const BUILTIN_TABLE: &[BuiltinInfo] = &[
     BuiltinInfo { name: "u128",  value_tag: ValueTag::U128,  type_id: 10, byte_width: 16 },
     BuiltinInfo { name: "isize", value_tag: ValueTag::Isize, type_id: 11, byte_width: 8  },
     BuiltinInfo { name: "usize", value_tag: ValueTag::Usize, type_id: 12, byte_width: 8  },
-    // ---- 浮点（13..=16）----
+    // ---- Floats (13..=16) ----
     BuiltinInfo { name: "f16",   value_tag: ValueTag::F16,   type_id: 13, byte_width: 2  },
     BuiltinInfo { name: "f32",   value_tag: ValueTag::F32,   type_id: 14, byte_width: 4  },
     BuiltinInfo { name: "f64",   value_tag: ValueTag::F64,   type_id: 15, byte_width: 8  },
     BuiltinInfo { name: "f128",  value_tag: ValueTag::F128,  type_id: 16, byte_width: 16 },
-    // ---- 非算术标量（17..=18）----
+    // ---- Non-arithmetic scalars (17..=18) ----
     BuiltinInfo { name: "bool",  value_tag: ValueTag::Bool,  type_id: 17, byte_width: 1  },
     BuiltinInfo { name: "char",  value_tag: ValueTag::Char,  type_id: 18, byte_width: 4  },
-    // ---- 非标量内置（19..=21）----
+    // ---- Non-scalar builtins (19..=21) ----
     BuiltinInfo { name: "str",   value_tag: ValueTag::Ref,   type_id: 19, byte_width: 8  },
     BuiltinInfo { name: "null",  value_tag: ValueTag::Null,  type_id: 20, byte_width: 0  },
     BuiltinInfo { name: "void",  value_tag: ValueTag::Void,  type_id: 21, byte_width: 0  },
 ];
 
 // =========================================================================
-// 查找函数
+// Lookup functions.
 // =========================================================================
 
-/// 按 name 查 BuiltinInfo。
+/// Look up `BuiltinInfo` by name.
 #[inline]
 pub fn builtin_info_by_name(name: &str) -> Option<&'static BuiltinInfo> {
     BUILTIN_TABLE.iter().find(|s| s.name == name)
 }
 
-/// 按 ValueTag 查 BuiltinInfo。
+/// Look up `BuiltinInfo` by `ValueTag`.
 #[inline]
 pub fn builtin_info_by_tag(tag: ValueTag) -> Option<&'static BuiltinInfo> {
     BUILTIN_TABLE.iter().find(|s| s.value_tag == tag)
 }
 
-/// 按 type_id 查 BuiltinInfo。
+/// Look up `BuiltinInfo` by `type_id`.
 #[inline]
 pub fn builtin_info_by_type_id(type_id: u16) -> Option<&'static BuiltinInfo> {
     BUILTIN_TABLE.iter().find(|s| s.type_id == type_id)
 }
 
 // =========================================================================
-// 编译期断言（保护表完整性）
+// Compile-time assertions (guard table integrity).
 // =========================================================================
 
 const _: () = {
     assert!(BUILTIN_TABLE.len() == 21, "BUILTIN_TABLE must have 21 entries");
-    // type_id 唯一性检查
+    // type_id uniqueness check
     let mut seen = [false; 22];
     let mut i = 0;
     while i < BUILTIN_TABLE.len() {
@@ -461,74 +472,75 @@ const _: () = {
 };
 
 // =========================================================================
-// TypeDetail — TypeArena::details 表的元素
+// TypeDetail — element type of the TypeArena::details table.
 // =========================================================================
 
-/// TypeDetail — TypeArena::details 表的元素。
+/// TypeDetail — element type of the `TypeArena::details` table.
 ///
-/// 每个变体对应一个携带 DetailId 的 Ty 变体，存储该类型的结构数据。
-/// 所有变体均为 Box<[T]> / Box<str> 拥有所有权，arena 集中管理生命周期。
+/// Each variant corresponds to a `Ty` variant that carries a `DetailId`, storing that
+/// type's structural data. All variants own their data via `Box<[T]>` / `Box<str>`;
+/// the arena centrally manages lifetimes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeDetail {
-    /// Ty::Throw：Throw<V, E>
+    /// `Ty::Throw`: `Throw<V, E>`.
     Throw { value_type: TypeHandle, error_type: TypeHandle },
-    /// Ty::Channel：Channel<T>
+    /// `Ty::Channel`: `Channel<T>`.
     Channel { elem: TypeHandle },
-    /// Ty::Async：Async<T>
+    /// `Ty::Async`: `Async<T>`.
     Async { value: TypeHandle },
-    /// Ty::Lazy：Lazy<T>
+    /// `Ty::Lazy`: `Lazy<T>`.
     Lazy { value: TypeHandle },
-    /// Ty::Atomic：Atomic<T>
+    /// `Ty::Atomic`: `Atomic<T>`.
     Atomic { elem: TypeHandle },
-    /// Ty::Sender：Sender<T>
+    /// `Ty::Sender`: `Sender<T>`.
     Sender { elem: TypeHandle },
-    /// Ty::Receiver：Receiver<T>
+    /// `Ty::Receiver`: `Receiver<T>`.
     Receiver { elem: TypeHandle },
-    /// Ty::Array：[T; N]，size == None 为切片
+    /// `Ty::Array`: `[T; N]`; `size == None` denotes a slice.
     Array { elem: TypeHandle, size: Option<u64> },
-    /// Ty::Ref：&T / *T
+    /// `Ty::Ref`: `&T` / `*T`.
     Ref { inner: TypeHandle, is_raw: bool },
-    /// Ty::Fn：(P1, P2) -> R
+    /// `Ty::Fn`: `(P1, P2) -> R`.
     Fn { params: Box<[TypeHandle]>, return_type: TypeHandle },
-    /// Ty::Nullable：T?
+    /// `Ty::Nullable`: `T?`.
     Nullable { inner: TypeHandle },
-    /// Ty::Adt：代数数据类型 Option<T> 等
+    /// `Ty::Adt`: algebraic data type, e.g. `Option<T>`.
     Adt { name: Box<str>, type_args: Box<[TypeHandle]> },
-    /// Ty::Record：{ x: i32, y: i32 }
+    /// `Ty::Record`: `{ x: i32, y: i32 }`.
     Record { fields: Box<[FieldType]>, name: Option<Box<str>> },
-    /// Ty::Trait：trait 类型 Ord<T>
+    /// `Ty::Trait`: trait type `Ord<T>`.
     Trait { name: Box<str>, type_args: Box<[TypeHandle]> },
-    /// Ty::TraitObject：inline_trait 值的存在类型
+    /// `Ty::TraitObject`: existential type of an `inline_trait` value.
     TraitObject { trait_name: Box<str>, method_sigs: Box<[TraitMethodSig]> },
-    /// Ty::ModuleRef：模块引用（path + env）
+    /// `Ty::ModuleRef`: module reference (path + env).
     ModuleRef { path: Box<str>, env: EnvId },
-    /// Ty::Generic：用户泛型应用 List<i32>
+    /// `Ty::Generic`: user generic application `List<i32>`.
     Generic { name: Box<str>, args: Box<[TypeHandle]> },
 }
 
 // =========================================================================
-// SemKind / TypeVar / UnifyError（从 sema/Sema.rs 移入）
+// SemKind / TypeVar / UnifyError (moved from sema/Sema.rs).
 // =========================================================================
 
-/// 语义层的 kind：描述类型的"类型"。
+/// Semantic-layer kind: describes the "type of a type".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemKind {
-    /// 普通值类型
+    /// Ordinary value type.
     Star,
-    /// 类型构造器：`param -> result`
+    /// Type constructor: `param -> result`.
     Arrow { param: Box<SemKind>, result: Box<SemKind> },
-    /// kind 变量：用于 kind 推断，载荷为 `TypeArena::kind_vars` 下标
+    /// Kind variable: used during kind inference; payload is an index into `TypeArena::kind_vars`.
     Var(u32),
 }
 
 impl SemKind {
-    /// 默认 kind 为 Star
+    /// The default kind is `Star`.
     #[inline]
     pub fn star() -> Self {
         SemKind::Star
     }
 
-    /// 从 Ast::Kind 转换为 SemKind
+    /// Convert from `Ast::Kind` to `SemKind`.
     pub fn from_ast(kind: &crate::ast::Ast::Kind) -> Self {
         match kind {
             crate::ast::Ast::Kind::Star => SemKind::Star,
@@ -539,7 +551,7 @@ impl SemKind {
         }
     }
 
-    /// 计算 kind 的 arity（Star=0, * -> * =1, * -> * -> * =2）
+    /// Compute the arity of a kind (Star=0, * -> * =1, * -> * -> * =2).
     pub fn arity(&self) -> usize {
         match self {
             SemKind::Star => 0,
@@ -548,7 +560,7 @@ impl SemKind {
         }
     }
 
-    /// 对 kind 进行应用：给定参数 kind 列表，返回结果 kind。
+    /// Apply the kind to a list of argument kinds, returning the result kind.
     pub fn apply(&self, args: &[SemKind]) -> Option<SemKind> {
         if args.is_empty() {
             return Some(self.clone());
@@ -568,7 +580,7 @@ impl SemKind {
         }
     }
 
-    /// 提取箭头 kind 的参数 kind 列表和结果 kind。
+    /// Decompose an arrow kind into its parameter kind list and result kind.
     pub fn decompose(&self) -> (Vec<SemKind>, &SemKind) {
         let mut params = Vec::new();
         let mut current = self;
@@ -580,12 +592,13 @@ impl SemKind {
     }
 }
 
-/// 类型变量：用于局部推断（null 字面量、未标注 lambda 参数等）。
+/// Type variable: used for local inference (null literals, unannotated lambda parameters, etc.).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeVar {
     pub bound: Option<TypeHandle>,
     pub is_rigid: bool,
-    /// 类型变量的 kind：普通类型变量为 Star，泛型类型构造器参数为 Arrow。
+    /// Kind of the type variable: `Star` for ordinary type variables, `Arrow` for
+    /// generic type-constructor parameters.
     pub kind: SemKind,
 }
 
@@ -609,12 +622,12 @@ impl TypeVar {
     }
 }
 
-/// 类型统一错误。
+/// Type unification error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnifyError {
-    /// 两个类型结构不兼容
+    /// The two type structures are incompatible.
     TypeMismatch,
-    /// occurs check 失败：类型变量出现在目标类型中（无限类型）
+    /// Occurs check failed: the type variable occurs within the target type (infinite type).
     OccursCheckFailed,
 }
 

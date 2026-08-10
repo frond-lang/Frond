@@ -1,4 +1,4 @@
-//! Value.rs — Kuzo 统一值系统（合并 14 个子模块）
+//! Value.rs — Kuzo unified value system (merges 14 submodules)
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
@@ -7,19 +7,19 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::AtomicBool;
 
-// 从 Type 模块 re-export 类型判别标签
+// Re-export the type discriminant tag from the Type module
 pub use crate::types::ValueTag;
 
-// 跨子模块：HeapObj::hash（本文件）复用 Arena.rs 的 SIMD 批量哈希辅助函数
+// Cross-submodule: HeapObj::hash (in this file) reuses the SIMD batch hash helper from Arena.rs
 use super::arena::simd_hash_soa;
 
 // =========================================================================
-// 第一部分：标量基础类型（scalar.rs + char.rs）
+// Part 1: scalar primitive types (scalar.rs + char.rs)
 // =========================================================================
 
-// ---- F16 — IEEE 754 半精度浮点（binary16）----
+// ---- F16 — IEEE 754 half-precision float (binary16) ----
 
-/// IEEE 754 半精度浮点数：以 `u16` 存储 bit pattern
+/// IEEE 754 half-precision float: stores its bit pattern in a `u16`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct F16(pub u16);
 
@@ -49,22 +49,19 @@ impl F16 {
     pub fn to_bits(self) -> u16 {
         self.0
     }
-    pub fn from_bits(b: u16) -> Self {
-        F16(b)
-    }
 
-    // ---- IEEE 754 binary16 精确运算（不经过 f64 中转）----
-    // 布局：sign(1) | exp(5, bias=15) | fraction(10)
-    // 正规数 mantissa = (1 << 10) | fraction，共 11 位
-    // 次正规数 mantissa = fraction，指数 = 1 - bias = -14
-    // 与 F128 同一 unpack/pack 框架，因 mantissa 仅 11 位，u32 足够
+    // ---- IEEE 754 binary16 exact arithmetic (no f64 intermediate) ----
+    // Layout: sign(1) | exp(5, bias=15) | fraction(10)
+    // Normal mantissa = (1 << 10) | fraction, 11 bits total
+    // Subnormal mantissa = fraction, exponent = 1 - bias = -14
+    // Same unpack/pack framework as F128; since mantissa is only 11 bits, u32 is sufficient
 
     fn nan_val() -> Self { F16(0x7C00 | 1) }
     fn inf_val(sign: bool) -> Self { F16(if sign { 0xFC00 } else { 0x7C00 }) }
     fn zero_val(sign: bool) -> Self { F16(if sign { 0x8000 } else { 0 }) }
 
-    /// 拆解为 (sign, unbiased_exp, mantissa)。
-    /// 正规数 mantissa 含隐含 1（bit 10 = 1）；次正规数/零 mantissa = fraction。
+    /// Unpacks into (sign, unbiased_exp, mantissa).
+    /// For normal numbers the mantissa includes the implicit 1 (bit 10 = 1); for subnormals/zero the mantissa = fraction.
     fn unpack(&self) -> (bool, i32, u32) {
         let bits = self.0;
         let sign = (bits >> 15) != 0;
@@ -77,9 +74,9 @@ impl F16 {
         }
     }
 
-    /// 将 (sign, exp, mant, sticky) 规范化并舍入为 F16。
-    /// mant 的 MSB 是隐含 1（可在任意位置），pack 负责对齐到 bit 10。
-    /// 舍入模式：round-to-nearest-even。
+    /// Normalizes and rounds (sign, exp, mant, sticky) into an F16.
+    /// The MSB of `mant` is the implicit 1 (may be at any position); `pack` aligns it to bit 10.
+    /// Rounding mode: round-to-nearest-even.
     fn pack(sign: bool, exp: i32, mant: u32, sticky: bool) -> Self {
         if mant == 0 {
             return Self::zero_val(sign);
@@ -220,7 +217,7 @@ impl F16 {
         if ma == 0 || mb == 0 { return Self::zero_val(result_sign); }
 
         let result_exp = ea + eb;
-        // 11 × 11 = 22 位乘积，u32 足够
+        // 11 × 11 = 22-bit product, u32 is sufficient
         let prod = (ma as u32) * (mb as u32);
         let total_bits = 32 - prod.leading_zeros() as i32;
         let shift = total_bits - 11;
@@ -249,12 +246,12 @@ impl F16 {
         if ma == 0 { return Self::zero_val(result_sign); }
 
         let result_exp = ea - eb;
-        // (ma << 12) / mb，商 ~12 位，u32 足够
-        // ma/mb ∈ [0.5, 2)，(ma<<12)/mb ∈ [2^11, 2^13)，不溢出 u32
+        // (ma << 12) / mb, quotient ~12 bits, u32 is sufficient
+        // ma/mb ∈ [0.5, 2), (ma<<12)/mb ∈ [2^11, 2^13), no u32 overflow
         let quot = ((ma as u32) << 12) / mb;
         let stk = ((ma << 12) % mb) != 0;
-        // pack 语义：值 = mant * 2^(exp - 10)
-        // 真实商 = (ma/mb) * 2^result_exp = quot * 2^(result_exp - 12)
+        // pack semantics: value = mant * 2^(exp - 10)
+        // true quotient = (ma/mb) * 2^result_exp = quot * 2^(result_exp - 12)
         // exp = result_exp - 12 + 10 = result_exp - 2
         Self::pack(result_sign, result_exp - 2, quot, stk)
     }
@@ -304,7 +301,7 @@ impl fmt::Display for F16 {
     }
 }
 
-// IEEE 754 totalOrder 语义：NaN 视为最大（符号位区分），-0 < +0，负数按量级反序
+// IEEE 754 totalOrder semantics: NaN is largest (sign bit distinguishes), -0 < +0, negatives reverse by magnitude
 impl PartialOrd for F16 {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
 }
@@ -312,14 +309,14 @@ impl Ord for F16 {
     fn cmp(&self, other: &Self) -> Ordering {
         let a = self.0 as i16;
         let b = other.0 as i16;
-        // 负数（符号位=1）按量级反序：翻转符号位外的所有位
+        // Negatives (sign bit = 1) reverse by magnitude: flip all bits except the sign bit
         let ka = if a < 0 { a ^ 0x7FFF } else { a };
         let kb = if b < 0 { b ^ 0x7FFF } else { b };
         ka.cmp(&kb)
     }
 }
 
-/// f32 bit pattern → f16 bit pattern（IEEE 754 round-to-nearest）
+/// f32 bit pattern → f16 bit pattern (IEEE 754 round-to-nearest)
 fn f32_to_f16_bits(x: f32) -> u16 {
     let bits = x.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -392,15 +389,15 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits(sign | (new_exp << 23) | (mant << 13))
 }
 
-// ---- F128 — IEEE 754 四倍精度浮点（binary128）----
+// ---- F128 — IEEE 754 quadruple-precision float (binary128) ----
 
-/// IEEE 754 四倍精度浮点数：以 `[u8; 16]` 存储 bit pattern
+/// IEEE 754 quadruple-precision float: stores its bit pattern in `[u8; 16]`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct F128(pub [u8; 16]);
 
-/// f64→f128 是无损的（f64 的 53 位 mantissa 左移 60 位填满 binary128 的 113 位，无信息丢失）。
-/// f128→f64（to_f64）已实现 round-to-nearest-even，对超出 f64 精度的低位正确舍入。
-/// 因此 f64→f128→f64 往返保真；f128→f64→f128 仅在 f128 值超出 f64 精度时有舍入（符合 IEEE 754 语义）。
+/// f64→f128 is lossless (f64's 53-bit mantissa shifted left by 60 fills binary128's 113 bits with no loss).
+/// f128→f64 (to_f64) implements round-to-nearest-even, correctly rounding the low bits beyond f64 precision.
+/// Therefore f64→f128→f64 round-trips losslessly; f128→f64→f128 only rounds when the f128 value exceeds f64 precision (per IEEE 754 semantics).
 impl F128 {
     pub fn from_f64(x: f64) -> Self {
         let bits = x.to_bits();
@@ -435,29 +432,29 @@ impl F128 {
 
         // NaN / Inf
         if exp == 0x7FFF {
-            // 任意非零 payload → canonical NaN；Inf → Inf
+            // Any non-zero payload → canonical NaN; Inf → Inf
             let m: u64 = if mant != 0 { 1 } else { 0 };
             return f64::from_bits((sign << 63) | (0x7FF << 52) | m);
         }
 
-        // 真实指数（正规数 exp-16383，次正规数 -16382）
+        // True exponent (normal: exp-16383, subnormal: -16382)
         let true_exp = if exp == 0 { -16382 } else { exp - 16383 };
-        // 113 位完整 mantissa（正规数补隐含 1）
+        // Full 113-bit mantissa (normal numbers add the implicit 1)
         let full_mant: u128 = if exp == 0 { mant } else { mant | (1u128 << 112) };
 
-        // f64 指数（bias 1023）
+        // f64 exponent (bias 1023)
         let f64_exp = true_exp + 1023;
         if f64_exp >= 0x7FF {
-            // 溢出 → ±Inf
+            // Overflow → ±Inf
             return f64::from_bits((sign << 63) | (0x7FF << 52));
         }
         if f64_exp <= 0 {
-            // 次正规或下溢：需将 113 位 mantissa 右移到 f64 次正规位置
-            // f64 次正规 mantissa 在 bit 0..51，隐含位为 0，指数为 0（true_exp = -1022）
-            // 目标 shift = 112 - 51 + (1 - f64_exp) = 62 - f64_exp
+            // Subnormal or underflow: shift the 113-bit mantissa right to the f64 subnormal position
+            // f64 subnormal mantissa occupies bits 0..51, implicit bit is 0, exponent is 0 (true_exp = -1022)
+            // target shift = 112 - 51 + (1 - f64_exp) = 62 - f64_exp
             let shift = (62 - f64_exp) as u32;
             if shift >= 128 {
-                return f64::from_bits(sign << 63); // 下溢 → ±0
+                return f64::from_bits(sign << 63); // underflow → ±0
             }
             let round_bit = (full_mant >> (shift.saturating_sub(1))) & 1;
             let sticky = if shift >= 2 {
@@ -473,41 +470,35 @@ impl F128 {
             return f64::from_bits((sign << 63) | result_mant);
         }
 
-        // 正规数：113 位 mantissa → 53 位（隐含 1 + 52 位 fraction），右移 60 位并舍入
+        // Normal: 113-bit mantissa → 53 bits (implicit 1 + 52-bit fraction), shift right 60 bits and round
         let shift = 60u32;
         let round_bit = (full_mant >> (shift - 1)) & 1;
         let sticky = (full_mant & ((1u128 << (shift - 1)) - 1)) != 0;
         let mut result_mant = (full_mant >> shift) as u64;
-        // result_mant 此时为 53 位（含隐含 1），需放入 f64 的 52 位 fraction
+        // result_mant is now 53 bits (with implicit 1); must fit into f64's 52-bit fraction
         if round_bit != 0 && (sticky || (result_mant & 1) != 0) {
             result_mant += 1;
             if result_mant >> 53 != 0 {
-                // 进位导致 mantissa 溢出（1.111... → 10.000...），指数 +1，mantissa 归零
+                // Carry-out causes mantissa overflow (1.111... → 10.000...), exponent +1, mantissa resets to zero
                 return f64::from_bits((sign << 63) | (((f64_exp as u64) + 1) << 52));
             }
         }
         f64::from_bits((sign << 63) | ((f64_exp as u64) << 52) | (result_mant & ((1u64 << 52) - 1)))
     }
 
-    pub fn from_f32(x: f32) -> Self {
-        Self::from_f64(x as f64)
-    }
-    pub fn to_f32(self) -> f32 {
-        self.to_f64() as f32
-    }
-    /// 从 i128 精确构造 F128（不经 f64 中转，避免精度损失）。
-    /// F128 有 113 位尾数，可精确表示所有 i128 值。
+    /// Constructs an F128 from an i128 exactly (no f64 intermediate, avoiding precision loss).
+    /// F128 has a 113-bit mantissa and can represent all i128 values exactly.
     pub fn from_i128(x: i128) -> Self {
         if x == 0 {
             return Self::zero_val(false);
         }
         let sign = x < 0;
         let abs = x.unsigned_abs();
-        // abs 为 u128，MSB 即为隐含 1 的位置。exp = msb，mant = abs。
-        // pack 会将 MSB 对齐到 bit 112 并处理舍入（此处无舍入，abs 完整保留）。
+        // abs is u128; MSB is the position of the implicit 1. exp = msb, mant = abs.
+        // pack aligns the MSB to bit 112 and handles rounding (no rounding here, abs is fully preserved).
         Self::pack(sign, 0, abs, false)
     }
-    /// 从 u128 精确构造 F128（不经 f64 中转）。
+    /// Constructs an F128 from a u128 exactly (no f64 intermediate).
     pub fn from_u128(x: u128) -> Self {
         if x == 0 {
             return Self::zero_val(false);
@@ -526,17 +517,10 @@ impl F128 {
         let mant = bits & ((1u128 << 112) - 1);
         exp == 0x7FFF && mant == 0
     }
-    pub fn to_bits(self) -> [u8; 16] {
-        self.0
-    }
-    pub fn from_bits(b: [u8; 16]) -> Self {
-        F128(b)
-    }
-
-    // ---- IEEE 754 binary128 精确运算（不经过 f64 中转）----
-    // 布局：sign(1) | exp(15, bias=16383) | fraction(112)
-    // 正规数 mantissa = (1 << 112) | fraction，共 113 位
-    // 次正规数 mantissa = fraction，指数 = 1 - bias = -16382
+    // ---- IEEE 754 binary128 exact arithmetic (no f64 intermediate) ----
+    // Layout: sign(1) | exp(15, bias=16383) | fraction(112)
+    // Normal mantissa = (1 << 112) | fraction, 113 bits total
+    // Subnormal mantissa = fraction, exponent = 1 - bias = -16382
 
     fn nan_val() -> Self {
         F128(((0x7FFFu128 << 112) | 1).to_le_bytes())
@@ -548,8 +532,8 @@ impl F128 {
         F128(((sign as u128) << 127).to_le_bytes())
     }
 
-    /// 拆解为 (sign, unbiased_exp, mantissa)。
-    /// 正规数 mantissa 含隐含 1（bit 112 = 1）；次正规数/零 mantissa = fraction。
+    /// Unpacks into (sign, unbiased_exp, mantissa).
+    /// For normal numbers the mantissa includes the implicit 1 (bit 112 = 1); for subnormals/zero the mantissa = fraction.
     fn unpack(&self) -> (bool, i32, u128) {
         let bits = u128::from_le_bytes(self.0);
         let sign = (bits >> 127) != 0;
@@ -562,24 +546,24 @@ impl F128 {
         }
     }
 
-    /// 将 (sign, exp, mant, sticky) 规范化并舍入为 F128。
-    /// mant 的 MSB 是隐含 1（可以在任意位置），pack 负责对齐到 bit 112。
-    /// sticky 表示低于 mant 最低有效位是否有非零信息。
-    /// 舍入模式：round-to-nearest-even。
+    /// Normalizes and rounds (sign, exp, mant, sticky) into an F128.
+    /// The MSB of `mant` is the implicit 1 (may be at any position); `pack` aligns it to bit 112.
+    /// `sticky` indicates whether non-zero information exists below the LSB of `mant`.
+    /// Rounding mode: round-to-nearest-even.
     fn pack(sign: bool, exp: i32, mant: u128, sticky: bool) -> Self {
         if mant == 0 {
-            // 值极小，round-to-nearest-even 向下到 0
+            // Value is extremely small; round-to-nearest-even rounds down to 0
             return Self::zero_val(sign);
         }
 
-        // 规范化：将 MSB 对齐到 bit 112
+        // Normalize: align MSB to bit 112
         let msb = 127 - mant.leading_zeros() as i32;
         let shift = msb - 112;
         let mut adj_exp = exp + shift;
         let mut m = mant;
         let mut stk = sticky;
 
-        // guard 位：右移时移出的最高位
+        // guard bit: highest bit shifted out during right shift
         let mut guard = false;
         if shift > 0 {
             let sh = shift as u32;
@@ -604,22 +588,22 @@ impl F128 {
 
         let biased = adj_exp + 16383;
 
-        // 溢出 → ±Inf
+        // Overflow → ±Inf
         if biased >= 0x7FFF {
             return Self::inf_val(sign);
         }
 
-        // 次正规数或下溢
+        // Subnormal or underflow
         if biased <= 0 {
             let extra = (1 - biased) as u32;
             if extra >= 128 {
-                // 完全下溢
+                // Complete underflow
                 if guard && stk {
-                    return Self::zero_val(false); // 0 是偶数
+                    return Self::zero_val(false); // 0 is even
                 }
                 return Self::zero_val(sign);
             }
-            // 右移 extra 位，保留 guard/sticky
+            // Right-shift by `extra` bits, preserving guard/sticky
             if extra > 0 {
                 let new_guard = (m >> (extra - 1)) & 1 != 0;
                 if extra > 1 {
@@ -628,22 +612,22 @@ impl F128 {
                 guard = new_guard;
                 m >>= extra;
             }
-            // 舍入（round-to-nearest-even）
+            // Round (round-to-nearest-even)
             if guard && (stk || (m & 1) != 0) {
                 m = m.wrapping_add(1);
                 if m >= (1u128 << 112) {
-                    // 进位到最小正规数
+                    // Carry to smallest normal number
                     return F128((((sign as u128) << 127) | (1u128 << 112)).to_le_bytes());
                 }
             }
             return F128((((sign as u128) << 127) | m).to_le_bytes());
         }
 
-        // 正规数：m 的 bit 112 = 1，小数 = bits 0-111
-        // 舍入（round-to-nearest-even）
+        // Normal: bit 112 of m is 1, fraction = bits 0-111
+        // Round (round-to-nearest-even)
         if guard && (stk || (m & 1) != 0) {
             m = m.wrapping_add(1);
-            // 进位可能使 mantissa 从 113 位变 114 位（bit 113 = 1）
+            // Carry may grow mantissa from 113 to 114 bits (bit 113 = 1)
             if m >= (1u128 << 113) {
                 m >>= 1;
                 adj_exp += 1;
@@ -658,7 +642,7 @@ impl F128 {
         F128(bits.to_le_bytes())
     }
 
-    /// 113 位 × 113 位 → 226 位乘积 (hi, lo)
+    /// 113-bit × 113-bit → 226-bit product (hi, lo)
     fn mul_113(a: u128, b: u128) -> (u128, u128) {
         let a_lo = a as u64 as u128;
         let a_hi = (a >> 64) as u64 as u128;
@@ -674,8 +658,8 @@ impl F128 {
         (hi, lo)
     }
 
-    /// 256 位 / 113 位长除法，返回 (商, 余数!=0)
-    /// 被 rem 始终 < denom (< 2^113)，左移后 < 2^114，不会溢出 u128。
+    /// 256-bit / 113-bit long division, returns (quotient, remainder != 0).
+    /// The remainder is always < denom (< 2^113); after left-shift it is < 2^114, so no u128 overflow.
     fn div_256_by_113(numer_hi: u128, numer_lo: u128, denom: u128) -> (u128, bool) {
         let mut rem: u128 = 0;
         let mut quot: u128 = 0;
@@ -696,13 +680,13 @@ impl F128 {
         (quot, rem != 0)
     }
 
-    /// 精确取负
+    /// Exact negation
     pub fn neg_f128(self) -> Self {
         let bits = u128::from_le_bytes(self.0) ^ (1u128 << 127);
         F128(bits.to_le_bytes())
     }
 
-    /// 精确加法
+    /// Exact addition
     pub fn add_f128(self, other: Self) -> Self {
         if self.is_nan() || other.is_nan() {
             return Self::nan_val();
@@ -723,7 +707,7 @@ impl F128 {
         let (sb, eb, mb) = other.unpack();
 
         if ma == 0 && mb == 0 {
-            // +0 + +0 = +0; -0 + -0 = -0; 混合 → +0 (round-to-nearest)
+            // +0 + +0 = +0; -0 + -0 = -0; mixed → +0 (round-to-nearest)
             return Self::zero_val(sa && sb);
         }
         if ma == 0 {
@@ -733,12 +717,12 @@ impl F128 {
             return self;
         }
 
-        // 扩展 mantissa 左移 2 位（腾出 guard/round 位空间）
+        // Extend mantissa left by 2 bits (make room for guard/round bits)
         let ma_ext = ma << 2;
         let mb_ext = mb << 2;
         let result_exp;
 
-        // 对齐指数（较小的右移，保留 sticky）
+        // Align exponents (right-shift the smaller, preserving sticky)
         let (aligned_a, aligned_b, stk) = if ea > eb {
             let diff = (ea - eb) as u32;
             result_exp = ea;
@@ -762,7 +746,7 @@ impl F128 {
             (ma_ext, mb_ext, false)
         };
 
-        // 带符号加法
+        // Signed addition
         let (result_sign, result_mant) = if sa == sb {
             (sa, aligned_a.wrapping_add(aligned_b))
         } else if aligned_a >= aligned_b {
@@ -775,16 +759,16 @@ impl F128 {
             return Self::zero_val(false); // x + (-x) = +0
         }
 
-        // result_mant 是 115 位（113 + 2），pack 负责规范化到 113 位
+        // result_mant is 115 bits (113 + 2); pack normalizes it to 113 bits
         Self::pack(result_sign, result_exp - 2, result_mant, stk)
     }
 
-    /// 精确减法
+    /// Exact subtraction
     pub fn sub_f128(self, other: Self) -> Self {
         self.add_f128(other.neg_f128())
     }
 
-    /// 精确乘法
+    /// Exact multiplication
     pub fn mul_f128(self, other: Self) -> Self {
         if self.is_nan() || other.is_nan() {
             return Self::nan_val();
@@ -809,16 +793,16 @@ impl F128 {
 
         let result_exp = ea + eb;
 
-        // 113 × 113 = 226 位乘积
+        // 113 × 113 = 226-bit product
         let (hi, lo) = Self::mul_113(ma, mb);
 
-        // 确定乘积 MSB 位置
+        // Determine product MSB position
         let total_bits = if hi != 0 {
             128 + (128 - hi.leading_zeros() as i32)
         } else {
             128 - lo.leading_zeros() as i32
         };
-        let shift = total_bits - 113; // 右移到 113 位
+        let shift = total_bits - 113; // right-shift to 113 bits
 
         let (m, stk) = if shift >= 128 {
             (0u128, hi != 0 || lo != 0)
@@ -835,13 +819,13 @@ impl F128 {
             (lo, false)
         };
 
-        // pack 语义：值 = mant * 2^(exp - 112)
-        // 真实值 = (ma*mb) * 2^(result_exp - 224)
-        // mant = (ma*mb) >> shift，所以 exp = result_exp - 112 + shift
+        // pack semantics: value = mant * 2^(exp - 112)
+        // true value = (ma*mb) * 2^(result_exp - 224)
+        // mant = (ma*mb) >> shift, so exp = result_exp - 112 + shift
         Self::pack(result_sign, result_exp - 112 + shift, m, stk)
     }
 
-    /// 精确除法
+    /// Exact division
     pub fn div_f128(self, other: Self) -> Self {
         if self.is_nan() || other.is_nan() {
             return Self::nan_val();
@@ -850,7 +834,7 @@ impl F128 {
         let (sb, eb, mb) = other.unpack();
         let result_sign = sa ^ sb;
 
-        // Inf / Inf = NaN; x / 0 = NaN（x≠0）
+        // Inf / Inf = NaN; x / 0 = NaN (x≠0)
         if self.is_infinite() && other.is_infinite() {
             return Self::nan_val();
         }
@@ -872,18 +856,18 @@ impl F128 {
 
         let result_exp = ea - eb;
 
-        // 计算 (ma << 114) / mb，得到 ~115 位商（在 u128 范围内）
-        // ma/mb ∈ [0.5, 2)，所以 (ma<<114)/mb ∈ [2^113, 2^115)，不溢出 u128
-        // pack 语义：值 = mant * 2^(exp - 112)
-        // 真实商 = (ma/mb) * 2^result_exp = quot * 2^(result_exp - 114)
-        // 所以 exp = result_exp - 114 + 112 = result_exp - 2
+        // Compute (ma << 114) / mb, yielding a ~115-bit quotient (within u128 range)
+        // ma/mb ∈ [0.5, 2), so (ma<<114)/mb ∈ [2^113, 2^115), no u128 overflow
+        // pack semantics: value = mant * 2^(exp - 112)
+        // true quotient = (ma/mb) * 2^result_exp = quot * 2^(result_exp - 114)
+        // so exp = result_exp - 114 + 112 = result_exp - 2
         let numer_hi = ma >> 14;
         let numer_lo = ma << 14;
         let (quot, stk) = Self::div_256_by_113(numer_hi, numer_lo, mb);
         Self::pack(result_sign, result_exp - 2, quot, stk)
     }
 
-    /// 精确取模：IEEE 754 remainder（result = a - round_to_even(a/b) * b）
+    /// Exact modulo: IEEE 754 remainder (result = a - round_to_even(a/b) * b)
     pub fn rem_f128(self, other: Self) -> Self {
         if self.is_nan() || other.is_nan() {
             return Self::nan_val();
@@ -905,11 +889,11 @@ impl F128 {
 
         // q = round_to_even(a / b)
         let quot = self.div_f128(other);
-        // 将 q 舍入到最接近的偶数整数
+        // Round q to the nearest even integer
         let q_bits = u128::from_le_bytes(quot.0);
         let q_exp = ((q_bits >> 112) & 0x7FFF) as i32 - 16383;
         let q_int = if q_exp >= 0 {
-            // q >= 1，右移小数部分取整
+            // q >= 1, right-shift the fraction to take the integer part
             let shift = q_exp as u32;
             let q_mant = (q_bits & ((1u128 << 112) - 1)) | (1u128 << 112);
             if shift >= 113 {
@@ -921,7 +905,7 @@ impl F128 {
             0u128
         };
         // result = a - q_int * b
-        // 用 from_u128 精确构造（from_f64 对 q_int > 2^53 会丢精度）
+        // Use from_u128 for exact construction (from_f64 loses precision when q_int > 2^53)
         let q_val = Self::from_u128(q_int);
         let prod = q_val.mul_f128(other);
         self.sub_f128(prod)
@@ -947,8 +931,8 @@ impl fmt::Debug for F128 {
 
 impl fmt::Display for F128 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // NaN/Inf 特判，正常值经 to_f64（Phase A2 已 round-to-nearest-even）打印。
-        // 完整精确十进制输出作为后续优化项，不阻塞本计划。
+        // Special-case NaN/Inf; normal values are printed via to_f64 (Phase A2 already does round-to-nearest-even).
+        // Full exact decimal output is a future optimization and does not block this plan.
         if self.is_nan() {
             return write!(f, "NaN(f128)");
         }
@@ -960,7 +944,7 @@ impl fmt::Display for F128 {
     }
 }
 
-// IEEE 754 totalOrder 语义
+// IEEE 754 totalOrder semantics
 impl PartialOrd for F128 {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
 }
@@ -968,17 +952,17 @@ impl Ord for F128 {
     fn cmp(&self, other: &Self) -> Ordering {
         let a = u128::from_le_bytes(self.0);
         let b = u128::from_le_bytes(other.0);
-        // totalOrder 排序键：
-        //   负数（sign=1）：翻转所有位 → 映射到 [0, 0x7FFF...FFF]（-Inf 最小，-0 最大）
-        //   正数（sign=0）：置符号位 → 映射到 [0x8000...000, 0xFFFF...FFF]（+0 最小，+Inf 最大）
-        // 这样 -0 < +0（totalOrder 语义正确）
+        // totalOrder sort key:
+        //   negatives (sign=1): flip all bits → maps to [0, 0x7FFF...FFF] (-Inf smallest, -0 largest)
+        //   positives (sign=0): set sign bit → maps to [0x8000...000, 0xFFFF...FFF] (+0 smallest, +Inf largest)
+        // This makes -0 < +0 (correct totalOrder semantics)
         let ka = if (a >> 127) != 0 { !a } else { a | (1u128 << 127) };
         let kb = if (b >> 127) != 0 { !b } else { b | (1u128 << 127) };
         ka.cmp(&kb)
     }
 }
 
-// F16/F128 运算符 trait：走精确 IEEE 754 运算，不经过 f64 中转
+// F16/F128 operator traits: use exact IEEE 754 arithmetic without f64 intermediates
 macro_rules! impl_float_ops {
     ($t:ty, $add:ident, $sub:ident, $mul:ident, $div:ident, $rem:ident, $neg:ident) => {
         impl std::ops::Add for $t {
@@ -1011,12 +995,12 @@ macro_rules! impl_float_ops {
 impl_float_ops!(F16, add_f16, sub_f16, mul_f16, div_f16, rem_f16, neg_f16);
 impl_float_ops!(F128, add_f128, sub_f128, mul_f128, div_f128, rem_f128, neg_f128);
 
-// ---- ValueTag / ValueTag 已移至 Type.rs（通过 re-export 保持兼容）----
+// ---- ValueTag / ValueTag moved to Type.rs (re-exported for compatibility) ----
 
-// ---- ScalarValue — 标量值 union（16 字节）----
+// ---- ScalarValue — scalar value union (16 bytes) ----
 
-/// 标量值 union（16 字节，容纳 i128/u128/F128）。
-/// 通过 ValueTag 类型守卫访问，unsafe 代码必须有对应 tag 检查。
+/// Scalar value union (16 bytes, accommodates i128/u128/F128).
+/// Accessed via ValueTag type guards; unsafe code must perform the corresponding tag check.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub union ScalarValue {
@@ -1040,22 +1024,22 @@ pub union ScalarValue {
     pub f128_val: [u64; 2],
 }
 
-// ---- Value — Kuzo 运行时统一值表示（spec §3.3）----
+// ---- Value — Kuzo runtime unified value representation (spec §3.3) ----
 
-/// Kuzo 运行时统一值表示（spec §3.3）。
-/// Value 自包含：标量内联、堆对象通过 Arc 跨 worker 共享。
+/// Kuzo runtime unified value representation (spec §3.3).
+/// `Value` is self-contained: scalars are inline; heap objects are shared across workers via `Arc`.
 #[derive(Clone)]
 pub enum Value {
     Null,
     Void,
-    /// 标量值。tag 必须为标量变体（Bool/Char/I8.../F128），
-    /// 非标量 tag（Null/Void/Ref）禁止进入此路径。
+    /// Scalar value. The tag must be a scalar variant (Bool/Char/I8.../F128);
+    /// non-scalar tags (Null/Void/Ref) must not enter this path.
     Scalar(ScalarValue, ValueTag),
     Ref(Arc<HeapObj>),
 }
 
 impl Value {
-    /// 构造标量值。tag 必须为标量变体（由各 typed 构造器保证，非标量 tag 禁止进入此路径）。
+    /// Constructs a scalar value. The tag must be a scalar variant (guaranteed by each typed constructor; non-scalar tags must not enter this path).
     #[inline]
     fn scalar(sv: ScalarValue, tag: ValueTag) -> Self {
         Value::Scalar(sv, tag)
@@ -1066,8 +1050,8 @@ unsafe impl Send for Value {}
 unsafe impl Sync for Value {}
 
 impl Value {
-    // ---- 标量构造器 ----
-    // 所有构造器统一调用 Self::scalar()，tag 由各 typed 构造器正确传入。
+    // ---- Scalar constructors ----
+    // All constructors uniformly call Self::scalar(); the tag is correctly passed by each typed constructor.
     pub fn i32(v: i32) -> Self { Self::scalar(ScalarValue { i32_val: v }, ValueTag::I32) }
     pub fn i64(v: i64) -> Self { Self::scalar(ScalarValue { i64_val: v }, ValueTag::I64) }
     pub fn f64(v: f64) -> Self { Self::scalar(ScalarValue { f64_val: v }, ValueTag::F64) }
@@ -1083,7 +1067,7 @@ impl Value {
     pub fn isize_val(v: isize) -> Self { Self::scalar(ScalarValue { isize_val: v }, ValueTag::Isize) }
     pub fn usize_val(v: usize) -> Self { Self::scalar(ScalarValue { usize_val: v }, ValueTag::Usize) }
     pub fn f16(v: F16) -> Self { Self::scalar(ScalarValue { f16_val: v.0 }, ValueTag::F16) }
-    // 128 位标量构造器（bit pattern 存为 [u64; 2]）
+    // 128-bit scalar constructors (bit pattern stored as [u64; 2])
     pub fn i128(v: i128) -> Self {
         let bits = v as u128;
         Self::scalar(ScalarValue { i128_val: [(bits & 0xFFFF_FFFF_FFFF_FFFF) as u64, (bits >> 64) as u64] }, ValueTag::I128)
@@ -1095,16 +1079,16 @@ impl Value {
         Self::scalar(ScalarValue { f128_val: unsafe { std::mem::transmute(v.0) } }, ValueTag::F128)
     }
 
-    // ---- 堆对象构造器 ----
+    // ---- Heap object constructors ----
     pub fn ref_val(obj: HeapObj) -> Self { Value::Ref(Arc::new(obj)) }
     pub fn from_ref(r: HeapRef) -> Self { Value::Ref(r) }
 
     pub const NULL: Value = Value::Null;
     pub const VOID: Value = Value::Void;
 
-    // ---- 标量访问器（带 tag 守卫，整数类型间自动提升/截断）----
-    /// 通用整数读取：覆盖所有整数 ValueTag，统一中转为 i128。
-    /// 所有 as_iN/as_uN/as_isize/as_usize 委托本方法再 `as` 截断，避免特例匹配。
+    // ---- Scalar accessors (with tag guards; automatic promotion/truncation between integer types) ----
+    /// Generic integer read: covers all integer ValueTags, uniformly converting to i128.
+    /// All as_iN/as_uN/as_isize/as_usize delegate to this method and then `as`-truncate, avoiding special-case matching.
     pub fn as_int_i128(&self) -> i128 {
         match self {
             Value::Scalar(v, t) => unsafe {
@@ -1129,8 +1113,8 @@ impl Value {
             _ => 0,
         }
     }
-    /// 通用浮点读取：覆盖 F16/F32/F64/F128，统一中转为 f64。
-    /// 所有 as_fN 委托本方法，避免特例匹配。
+    /// Generic float read: covers F16/F32/F64/F128, uniformly converting to f64.
+    /// All as_fN delegate to this method, avoiding special-case matching.
     pub fn as_float_f64(&self) -> f64 {
         match self {
             Value::Scalar(v, t) => unsafe {
@@ -1139,7 +1123,7 @@ impl Value {
                     ValueTag::F32 => v.f32_val as f64,
                     ValueTag::F64 => v.f64_val,
                     ValueTag::F128 => F128(std::mem::transmute(v.f128_val)).to_f64(),
-                    // 整数 → f64 提升（支持混合 int-float 算术，Bug #55）
+                    // integer → f64 promotion (supports mixed int-float arithmetic, Bug #55)
                     ValueTag::I8 => v.i8_val as f64,
                     ValueTag::I16 => v.i16_val as f64,
                     ValueTag::I32 => v.i32_val as f64,
@@ -1160,7 +1144,7 @@ impl Value {
             _ => 0.0,
         }
     }
-    // ---- 整数访问器：统一委托 as_int_i128，支持任意整数类型互读 ----
+    // ---- Integer accessors: uniformly delegate to as_int_i128, supporting cross-reads between any integer types ----
     pub fn as_i8(&self) -> i8 { self.as_int_i128() as i8 }
     pub fn as_i16(&self) -> i16 { self.as_int_i128() as i16 }
     pub fn as_i32(&self) -> i32 { self.as_int_i128() as i32 }
@@ -1173,13 +1157,13 @@ impl Value {
     pub fn as_u128(&self) -> u128 { self.as_int_i128() as u128 }
     pub fn as_isize(&self) -> isize { self.as_int_i128() as isize }
     pub fn as_usize(&self) -> usize { self.as_int_i128() as usize }
-    // ---- 浮点访问器：统一委托 as_float_f64，支持任意浮点类型互读 ----
-    // F16/F32 经 f64 中转无额外精度损失（f64 尾数 52 位，足以精确表示所有整数到 F16/F32 的舍入）
+    // ---- Float accessors: uniformly delegate to as_float_f64, supporting cross-reads between any float types ----
+    // F16/F32 via f64 intermediate incur no extra precision loss (f64 has a 52-bit mantissa, sufficient to exactly represent all integers rounding to F16/F32)
     pub fn as_f16(&self) -> F16 { F16::from_f64(self.as_float_f64()) }
     pub fn as_f32(&self) -> f32 { self.as_float_f64() as f32 }
     pub fn as_f64(&self) -> f64 { self.as_float_f64() }
-    /// F128 访问器：对整数类型直接精确构造，不经 f64 中转（避免 i128 精度损失）。
-    /// F128 有 113 位尾数，可精确表示所有 i128/u128 值。
+    /// F128 accessor: for integer types, constructs directly without f64 intermediate (avoiding i128 precision loss).
+    /// F128 has a 113-bit mantissa and can represent all i128/u128 values exactly.
     pub fn as_f128(&self) -> F128 {
         match self {
             Value::Scalar(v, t) => unsafe {
@@ -1188,7 +1172,7 @@ impl Value {
                     ValueTag::F32 => F128::from_f64(v.f32_val as f64),
                     ValueTag::F64 => F128::from_f64(v.f64_val),
                     ValueTag::F128 => F128(std::mem::transmute(v.f128_val)),
-                    // 整数 → F128 直接构造，保证精度
+                    // integer → F128 direct construction, preserving precision
                     ValueTag::I8 => F128::from_i128(v.i8_val as i128),
                     ValueTag::I16 => F128::from_i128(v.i16_val as i128),
                     ValueTag::I32 => F128::from_i128(v.i32_val as i128),
@@ -1208,33 +1192,33 @@ impl Value {
             _ => F128::from_f64(0.0),
         }
     }
-    // ---- 其他标量访问器 ----
+    // ---- Other scalar accessors ----
     pub fn as_bool(&self) -> bool { match self { Value::Scalar(v, ValueTag::Bool) => unsafe { v.bool_val }, _ => false } }
     pub fn as_char(&self) -> char { match self { Value::Scalar(v, ValueTag::Char) => unsafe { char::from_u32_unchecked(v.char_val) }, _ => '\0' } }
 
-    // ---- 堆对象访问器 ----
+    // ---- Heap object accessors ----
     pub fn heap_obj(&self) -> Option<&HeapObj> { match self { Value::Ref(r) => Some(r.as_ref()), _ => None } }
     pub fn heap_ref(&self) -> Option<HeapRef> { match self { Value::Ref(r) => Some(r.clone()), _ => None } }
 
-    // ---- 判别 ----
+    // ---- Discriminants ----
     pub fn is_null(&self) -> bool { matches!(self, Value::Null) }
     pub fn is_void(&self) -> bool { matches!(self, Value::Void) }
     pub fn is_ref(&self) -> bool { matches!(self, Value::Ref(_)) }
 
-    // ---- 标量 tag 访问（供 Hash/Debug/反射适配）----
+    // ---- Scalar tag access (for Hash/Debug/reflection adaptation) ----
     pub fn scalar_tag(&self) -> Option<ValueTag> {
         match self { Value::Scalar(_, t) => Some(*t), _ => None }
     }
 
-    // ---- Weak 引用基础设施（用于打破 Cell 循环引用）----
-    /// 返回指向自身堆对象的 Weak 引用。
-    /// 仅对 `Value::Ref` 有意义；标量/Null/Void 返回 None。
-    /// 调用方可将 Weak 存入 Cell 内部以打破 `a = Cell(b); b = Cell(a)` 形成的环。
+    // ---- Weak reference infrastructure (used to break Cell reference cycles) ----
+    /// Returns a Weak reference to this value's heap object.
+    /// Only meaningful for `Value::Ref`; scalars/Null/Void return None.
+    /// Callers can store the Weak inside a Cell to break cycles formed by `a = Cell(b); b = Cell(a)`.
     pub fn make_weak(&self) -> Option<Weak<HeapObj>> {
         match self { Value::Ref(r) => Some(Arc::downgrade(r)), _ => None }
     }
 
-    /// 将 Weak 引用升级回 Value。若原对象已被回收则返回 None。
+    /// Upgrades a Weak reference back into a Value. Returns None if the original object has been reclaimed.
     pub fn upgrade_weak(weak: &Weak<HeapObj>) -> Option<Value> {
         weak.upgrade().map(Value::from_ref)
     }
@@ -1246,7 +1230,7 @@ impl fmt::Debug for Value {
             Value::Null => write!(f, "null"),
             Value::Void => write!(f, "()"),
             Value::Scalar(v, tag) => {
-                // 复用 ValueHandle 的标量格式化逻辑：按 tag 读取 union 字段
+                // Reuse ValueHandle's scalar formatting logic: read the union field by tag
                 match tag {
                     ValueTag::Bool => write!(f, "{}", unsafe { v.bool_val }),
                     ValueTag::Char => write!(f, "'{}'", Char::from_codepoint_unchecked(unsafe { v.char_val })),
@@ -1281,7 +1265,7 @@ impl Hash for Value {
             Value::Null | Value::Void => {}
             Value::Scalar(v, tag) => {
                 tag.hash(state);
-                // 按 tag 哈希对应 union 字段
+                // Hash the corresponding union field by tag
                 match tag {
                     ValueTag::Bool => unsafe { v.bool_val }.hash(state),
                     ValueTag::Char => unsafe { v.char_val }.hash(state),
@@ -1309,10 +1293,10 @@ impl Hash for Value {
     }
 }
 
-// ---- ValueHandle — 4B 索引句柄 ----
+// ---- ValueHandle — 4B index handle ----
 
-/// Kuzo 值的唯一句柄：4B 索引，编码类型桶 + 桶内索引。
-/// 高 8 位 = ValueTag，低 24 位 = 桶内索引。
+/// Unique handle for a Kuzo value: a 4B index encoding the type bucket + index within the bucket.
+/// High 8 bits = ValueTag, low 24 bits = index within the bucket.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueHandle(u32);
 
@@ -1322,18 +1306,19 @@ impl ValueHandle {
 
     #[inline]
     pub fn new(tag: ValueTag, index: usize) -> Self {
-        // [V-3] release 也保留检查：index >= 2^24 会静默截断（MASK 抹掉高位）导致
-        // 两个不同索引产生相同 ValueHandle → 句柄别名损坏。这是不可恢复的不变式违反，
-        // 显式 panic 优于静默损坏（arena 不应分配超 16M 个同类型值）。
+        // [V-3] release also keeps the check: index >= 2^24 would silently truncate (MASK strips the high bits),
+        // causing two distinct indices to produce the same ValueHandle → handle aliasing corruption. This is an
+        // unrecoverable invariant violation; an explicit panic is preferable to silent corruption (an arena should
+        // never allocate more than 16M values of the same type).
         assert!(index < (1 << 24), "ValueHandle index overflow: {index} >= 2^24");
         Self(((tag as u8 as u32) << Self::TAG_SHIFT) | (index as u32 & Self::INDEX_MASK))
     }
 
     #[inline]
     pub fn tag(self) -> ValueTag {
-        // FFI 防御：extern "C" 原语经 from_raw 还原的 u32 可能携带越界 tag
-        // （21..=255）。transmute 到 #[repr(u8)] enum 的非法判别值是 UB，
-        // 故用 match 显式映射，越界统一兜底为 Null，保证任何 u32 都安全。
+        // FFI defense: a u32 restored via from_raw in an extern "C" primitive may carry an out-of-range tag
+        // (21..=255). Transmuting to an invalid discriminant of a #[repr(u8)] enum is UB,
+        // so we use an explicit match; out-of-range values fall back to Null, ensuring any u32 is safe.
         match (self.0 >> Self::TAG_SHIFT) as u8 {
             0 => ValueTag::Null,
             1 => ValueTag::Void,
@@ -1365,13 +1350,13 @@ impl ValueHandle {
         (self.0 & Self::INDEX_MASK) as usize
     }
 
-    /// 从原始 u32 构造 ValueHandle（供 extern "C" 原语跨 ABI 边界还原）
+    /// Constructs a ValueHandle from a raw u32 (used by extern "C" primitives to cross ABI boundaries).
     #[inline]
     pub fn from_raw(raw: u32) -> Self {
         Self(raw)
     }
 
-    /// 转为原始 u32（供 extern "C" 原语跨 ABI 边界传递）
+    /// Converts to a raw u32 (used by extern "C" primitives to cross ABI boundaries).
     #[inline]
     pub fn to_raw(self) -> u32 {
         self.0
@@ -1403,13 +1388,13 @@ impl fmt::Display for ValueHandle {
 
 // ---- Char / CharError ----
 
-/// 字符错误：codepoint 越界
+/// Character error: codepoint out of range
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CharError {
     InvalidCodepoint,
 }
 
-/// Unicode 字符：包装 codepoint（u32）
+/// Unicode character: wraps a codepoint (u32)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Char {
     pub codepoint: u32,
@@ -1469,7 +1454,7 @@ impl Char {
     }
 
     pub fn successor(self) -> Self {
-        // [V-6] 跳过代理区 + 饱和到 0x10FFFF，避免 wrapping 回绕产生非法 codepoint
+        // [V-6] skip the surrogate range + saturate at 0x10FFFF, avoiding wrapping that would produce an invalid codepoint
         let next = if self.codepoint >= 0x10FFFF {
             0x10FFFF
         } else if self.codepoint == 0xD7FF {
@@ -1481,7 +1466,7 @@ impl Char {
     }
 
     pub fn predecessor(self) -> Self {
-        // [V-6] 跳过代理区 + 饱和到 0，避免 wrapping 回绕产生非法 codepoint
+        // [V-6] skip the surrogate range + saturate at 0, avoiding wrapping that would produce an invalid codepoint
         let prev = if self.codepoint == 0 {
             0
         } else if self.codepoint == 0xE000 {
@@ -1514,12 +1499,12 @@ impl From<char> for Char {
 }
 
 // =========================================================================
-// 第二部分：堆对象类型（合并 6 个文件）
+// Part 2: heap object types (merges 6 files)
 // =========================================================================
 
 // ---- str.rs → KuzoStr ----
 
-/// Kuzo 字符串：引用计数的不可变 UTF-8 字符串
+/// Kuzo string: a reference-counted immutable UTF-8 string
 #[derive(Debug, Clone)]
 pub struct KuzoStr {
     inner: Arc<str>,
@@ -1557,9 +1542,9 @@ impl KuzoStr {
         self.inner.cmp(&other.inner)
     }
 
-    /// 按码点索引取字符（UTF-8 安全）。
+    /// Returns the character at the given codepoint index (UTF-8 safe).
     ///
-    /// 返回第 idx 个 Unicode 码点。越界返回 None。
+    /// Returns the `idx`-th Unicode codepoint, or None if out of bounds.
     pub fn char_at(&self, idx: usize) -> Option<char> {
         self.inner.chars().nth(idx)
     }
@@ -1586,7 +1571,7 @@ impl fmt::Display for KuzoStr {
 
 // ---- composite.rs → ArrayValue, RecordField, RecordValue, AdtField, AdtValue, NewtypeValue, Cell, Range, RangeIter ----
 
-/// 数组值：元素可变（支持 push/pop），`fixed_size` 为 `Some` 时表示固定大小数组
+/// Array value: elements are mutable (supports push/pop); `fixed_size` of `Some` denotes a fixed-size array
 #[derive(Debug, Clone)]
 pub struct ArrayValue {
     pub elements: Vec<Value>,
@@ -1595,7 +1580,7 @@ pub struct ArrayValue {
     pub scalar_soa: Option<ScalarSoA>,
 }
 
-/// SoA 连续存储：当数组元素全为同类型标量时启用 SIMD 快路径
+/// SoA contiguous storage: enables SIMD fast paths when all array elements are scalars of the same type
 #[derive(Debug, Clone)]
 pub enum ScalarSoA {
     I8(Vec<i8>),
@@ -1619,9 +1604,9 @@ pub enum ScalarSoA {
 }
 
 impl ScalarSoA {
-    /// 尝试在指定索引写入标量值。
-    /// 返回 true 表示类型匹配且写入成功；false 表示类型不匹配（调用方应失效 SOA）。
-    /// 索引越界时自动扩展（补 0）。
+    /// Attempts to store a scalar value at the given index.
+    /// Returns true if the type matched and the store succeeded; false if the type did not match (caller should invalidate SOA).
+    /// Automatically grows (zero-filling) when the index is out of bounds.
     pub fn try_store(&mut self, idx: usize, val: &Value) -> bool {
         match (self, val) {
             (ScalarSoA::I8(v), Value::Scalar(sv, crate::value::ValueTag::I8)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.i8_val; } true }
@@ -1642,7 +1627,7 @@ impl ScalarSoA {
             (ScalarSoA::Usize(v), Value::Scalar(sv, crate::value::ValueTag::Usize)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.usize_val; } true }
             (ScalarSoA::F16(v), Value::Scalar(sv, crate::value::ValueTag::F16)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, 0); } v[idx] = sv.f16_val; } true }
             (ScalarSoA::F128(v), Value::Scalar(sv, crate::value::ValueTag::F128)) => { unsafe { if idx >= v.len() { v.resize(idx + 1, F128([0; 16])); } v[idx] = F128(std::mem::transmute(sv.f128_val)); } true }
-            _ => false, // 类型不匹配
+            _ => false, // type mismatch
         }
     }
 }
@@ -1669,8 +1654,8 @@ impl ArrayValue {
     pub fn pop(&mut self) -> Option<Value> {
         self.elements.pop()
     }
-    /// 统一收集 u8 字节：SOA 快路径（U8 连续存储）或回退到逐元素提取。
-    /// 封装双表示访问，调用方无需关心 SOA 是否启用。
+    /// Uniformly collects u8 bytes: SOA fast path (U8 contiguous storage) or fallback to per-element extraction.
+    /// Encapsulates dual-representation access; callers need not care whether SOA is enabled.
     pub fn collect_u8_bytes(&self) -> Vec<u8> {
         if let Some(crate::value::ScalarSoA::U8(ref data)) = self.scalar_soa {
             return data.clone();
@@ -1679,14 +1664,14 @@ impl ArrayValue {
     }
 }
 
-/// 记录字段：可选名称 + 值
+/// Record field: optional name + value
 #[derive(Debug, Clone)]
 pub struct RecordField {
     pub name: Option<String>,
     pub value: ValueHandle,
 }
 
-/// 记录值：具名类型的结构化数据
+/// Record value: structured data of a named type
 #[derive(Debug, Clone)]
 pub struct RecordValue {
     pub type_name: String,
@@ -1714,14 +1699,14 @@ impl RecordValue {
     }
 }
 
-/// ADT 字段：构造器的参数
+/// ADT field: a constructor argument
 #[derive(Debug, Clone)]
 pub struct AdtField {
     pub name: Option<String>,
     pub value: Value,
 }
 
-/// ADT 值：代数数据类型实例
+/// ADT value: an algebraic data type instance
 #[derive(Debug, Clone)]
 pub struct AdtValue {
     pub type_name: String,
@@ -1749,18 +1734,18 @@ impl AdtValue {
     }
 }
 
-/// Newtype 值：包装单个内部值的具名类型
+/// Newtype value: a named type wrapping a single inner value
 #[derive(Debug, Clone)]
 pub struct NewtypeValue {
     pub type_name: String,
     pub inner: ValueHandle,
 }
 
-/// Cell：可变引用单元（`&T` 引用语义的运行时载体）
+/// Cell: a mutable reference cell (runtime carrier of `&T` reference semantics).
 ///
-/// 内部持有 `Value`（自包含值，标量内联 + 堆对象 Arc 共享）。
-/// `&expr` 创建 `Arc<HeapObj::Cell>` 包装当前值；`*r` 读取 Cell；
-/// `*r = v` 写入 Cell。多個引用共享同一 Arc，写入对所有引用可见。
+/// Holds a `Value` internally (self-contained value; scalar inline + heap object Arc sharing).
+/// `&expr` creates an `Arc<HeapObj::Cell>` wrapping the current value; `*r` reads the Cell;
+/// `*r = v` writes the Cell. Multiple references share the same Arc; writes are visible to all references.
 #[derive(Debug)]
 pub struct Cell {
     pub inner: parking_lot::Mutex<Value>,
@@ -1776,7 +1761,7 @@ impl Cell {
     pub fn new(val: Value) -> Self {
         Self { inner: parking_lot::Mutex::new(val) }
     }
-    /// 返回内部值的克隆。
+    /// Returns a clone of the inner value.
     pub fn get(&self) -> Value {
         self.inner.lock().clone()
     }
@@ -1784,9 +1769,9 @@ impl Cell {
         *self.inner.lock() = val;
     }
 
-    /// 返回指向自身的 Weak 引用（用于打破循环引用）。
-    /// 调用方需确保 Cell 被包装在 `Arc<HeapObj::Cell>` 中；
-    /// 若传入的 Arc 并非 Cell，返回 None。
+    /// Returns a Weak reference to itself (used to break reference cycles).
+    /// The caller must ensure the Cell is wrapped in an `Arc<HeapObj::Cell>`;
+    /// if the supplied Arc is not a Cell, returns None.
     pub fn downgrade(arc: &Arc<HeapObj>) -> Option<Weak<HeapObj>> {
         match arc.as_ref() {
             HeapObj::Cell(_) => Some(Arc::downgrade(arc)),
@@ -1795,7 +1780,7 @@ impl Cell {
     }
 }
 
-/// 范围值
+/// Range value
 #[derive(Debug, Clone)]
 pub struct Range {
     pub start: i64,
@@ -1835,7 +1820,7 @@ impl Range {
     }
 }
 
-/// 范围迭代器（composite 内部）
+/// Range iterator (internal to composite)
 #[derive(Debug, Clone)]
 pub struct RangeIter {
     pub current: i64,
@@ -1845,10 +1830,10 @@ pub struct RangeIter {
 
 // ---- callable.rs → BuiltinFn, Builtin, Closure, PartialApplication, TraitValue, LazyValue ----
 
-/// 内建函数指针类型
+/// Built-in function pointer type
 pub type BuiltinFn = fn(&[ValueHandle]) -> Result<ValueHandle, String>;
 
-/// 内建函数值
+/// Built-in function value
 #[derive(Clone)]
 pub struct Builtin {
     pub fn_ptr: BuiltinFn,
@@ -1861,7 +1846,7 @@ impl fmt::Debug for Builtin {
     }
 }
 
-/// 闭包值
+/// Closure value
 #[derive(Debug, Clone)]
 pub struct Closure {
     pub func_id: u32,
@@ -1873,26 +1858,26 @@ pub struct Closure {
     pub cell_upvalues: u8,
 }
 
-/// 偏应用值：对函数/闭包绑定了前导参数后得到的可调用值。
+/// Partial application value: a callable produced by binding leading arguments to a function/closure.
 ///
-/// 统一调用语义：当新参数数 < remaining_arity → 产出新的 Partial（链式偏应用）；
-/// 当新参数数 >= remaining_arity → 合并 bound_args + 新参数 + upvalues 启动子图。
-/// upvalues 来自源 Closure（顶层函数偏应用时为空），与 Closure 的 upvalues 语义一致。
+/// Unified call semantics: when the new argument count < remaining_arity → produces a new Partial (chained partial application);
+/// when the new argument count >= remaining_arity → merges bound_args + new args + upvalues and launches the subgraph.
+/// upvalues come from the source Closure (empty when partially applying a top-level function), matching Closure's upvalue semantics.
 #[derive(Debug, Clone)]
 pub struct PartialApplication {
-    /// 目标子图 id（与 Closure.func_id 语义一致）
+    /// Target subgraph id (same semantics as Closure.func_id)
     pub func_id: u32,
-    /// 来自源 Closure 的 upvalues（顶层函数偏应用时为空）
+    /// upvalues from the source Closure (empty when partially applying a top-level function)
     pub upvalues: Vec<Value>,
-    /// 已绑定的前导参数（按原函数参数顺序）
+    /// Already-bound leading arguments (in original function parameter order)
     pub bound_args: Vec<Value>,
-    /// 仍需参数数 = subgraph.param_count - upvalues.len() - bound_args.len()
+    /// Remaining argument count = subgraph.param_count - upvalues.len() - bound_args.len()
     pub remaining_arity: u8,
-    /// 递归闭包自引用 upvalue 索引（-1 表示无自引用）
+    /// Recursive closure self-reference upvalue index (-1 means no self-reference)
     pub self_upvalue_idx: i32,
 }
 
-/// Trait 值
+/// Trait value
 #[derive(Debug, Clone)]
 pub struct TraitValue {
     pub trait_name: String,
@@ -1902,15 +1887,15 @@ pub struct TraitValue {
     pub owned: bool,
 }
 
-/// 惰性值
+/// Lazy value
 pub struct LazyValue {
-    /// 缓存的求值结果（首次 force 后填充）
-    /// Mutex 允许通过 &LazyValue 更新缓存（Arc 共享场景下的 interior mutability）
+    /// Cached evaluation result (filled after first force)
+    /// Mutex allows updating the cache through &LazyValue (interior mutability under Arc sharing)
     pub cached: Mutex<Option<Value>>,
-    /// 是否已求值
+    /// Whether it has been evaluated
     pub forced: AtomicBool,
-    /// thunk 子图的 Closure（func_id = thunk_sg, upvalues = 捕获值）
-    /// force 时取此 Closure 启动子图计算，结果存入 cached
+    /// Closure of the thunk subgraph (func_id = thunk_sg, upvalues = captured values)
+    /// On force, this Closure is taken to launch the subgraph computation; the result is stored in cached
     pub data: Option<Value>,
 }
 
@@ -1936,7 +1921,7 @@ impl fmt::Debug for LazyValue {
 
 // ---- control.rs → ErrorValue, ThrowPayload, ThrowValue ----
 
-/// 错误值
+/// Error value
 #[derive(Debug, Clone)]
 pub struct ErrorValue {
     pub type_name: String,
@@ -1944,31 +1929,31 @@ pub struct ErrorValue {
     pub is_error_subtype: bool,
 }
 
-/// 抛出载荷
+/// Throw payload
 ///
-/// Err 直接持有 Value（而非 Arc<RecordValue>），统一所有 throw 场景：
-/// - throw 原始类型（i32/str/bool）→ Err 持有裸标量值，无需 Error(value:v) 包装
-/// - throw record/adt → Err 持有 record Value
-/// - 内部错误（FieldError/IndexError 等）→ Err 持有构造好的 record Value
-/// 这使得 throw 任意值后，match 模式 `Error(v)` 的 v 直接绑定到 throw 的值本身。
+/// Err directly holds a Value (rather than Arc<RecordValue>), unifying all throw scenarios:
+/// - throw of a primitive (i32/str/bool) → Err holds a bare scalar value, no Error(value:v) wrapping needed
+/// - throw of a record/adt → Err holds the record Value
+/// - internal errors (FieldError/IndexError, etc.) → Err holds a pre-constructed record Value
+/// This means after throwing any value, the match pattern `Error(v)` binds v directly to the thrown value.
 #[derive(Debug, Clone)]
 pub enum ThrowPayload {
     Ok(Value),
     Err(Value),
 }
 
-/// 抛出值
+/// Throw value
 #[derive(Debug, Clone)]
 pub struct ThrowValue {
     pub payload: ThrowPayload,
 }
 
-// ---- iterator.rs → 已全部迁移至 Kuzo builtin (Iterator.kz) ----
-// 注：ArrayIterator / StringIterator / RangeIterator 均已迁移至 Kuzo builtin。
+// ---- iterator.rs → fully migrated to Kuzo builtin (Iterator.kz) ----
+// Note: ArrayIterator / StringIterator / RangeIterator have all been migrated to the Kuzo builtin.
 
 // ---- concurrent.rs → AtomicValue, AsyncStatus, AsyncHandle, ChannelValue, SenderValue, ReceiverValue ----
 
-/// 原子值
+/// Atomic value
 #[derive(Debug)]
 pub struct AtomicValue {
     data: Mutex<Value>,
@@ -1995,7 +1980,7 @@ impl Clone for AtomicValue {
     }
 }
 
-/// 异步任务状态
+/// Async task status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsyncStatus {
     Pending,
@@ -2005,7 +1990,7 @@ pub enum AsyncStatus {
     Failed,
 }
 
-/// 异步句柄
+/// Async handle
 #[derive(Debug)]
 pub struct AsyncHandle {
     status: Mutex<AsyncStatus>,
@@ -2044,13 +2029,13 @@ impl Clone for AsyncHandle {
     }
 }
 
-/// 全局 channel id 计数器（线程安全，单/多 worker 共用）
+/// Global channel id counter (thread-safe; shared by single/multi-worker)
 static CHANNEL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 通道值
+/// Channel value
 ///
-/// 统一存储 Engine 的 Value（非 ValueHandle），与 async 运行时一致。
-/// id 用于 RuntimeEvent::ChannelReady 事件标识（send 后内联触发 on_event_arrived）。
+/// Uniformly stores the Engine's Value (not ValueHandle), consistent with the async runtime.
+/// The id is used to identify RuntimeEvent::ChannelReady events (inline-triggered on_event_arrived after send).
 #[derive(Debug)]
 pub struct ChannelValue {
     id: u64,
@@ -2059,12 +2044,12 @@ pub struct ChannelValue {
     closed: Mutex<bool>,
 }
 
-/// channel send 失败原因（运行时条件，非程序员错误）。
+/// channel send failure reason (runtime condition, not a programmer error).
 #[derive(Debug, Clone, Copy)]
 pub enum ChannelSendError {
-    /// channel 已关闭
+    /// channel is closed
     Closed,
-    /// 有界 channel 已满
+    /// bounded channel is full
     Full { capacity: usize },
 }
 
@@ -2086,14 +2071,14 @@ impl ChannelValue {
             closed: Mutex::new(false),
         }
     }
-    /// 返回 channel 的唯一 id（用于 RuntimeEvent::ChannelReady 事件标识）
+    /// Returns the channel's unique id (used to identify RuntimeEvent::ChannelReady events)
     pub fn id(&self) -> u64 {
         self.id
     }
-    /// 非阻塞发送：push 到 buffer。满或已关闭时返回 Err（运行时条件，非程序员错误）。
+    /// Non-blocking send: pushes to the buffer. Returns Err when full or closed (runtime condition, not a programmer error).
     pub fn send(&self, val: Value) -> Result<(), ChannelSendError> {
         let mut buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
-        // [V-5] 持 buffer 锁期间检查 closed，与 close（同样持 buffer 锁）互斥，消除 TOCTOU
+        // [V-5] check closed while holding the buffer lock; this mutexes with close (which also holds the buffer lock), eliminating TOCTOU
         if *self.closed.lock().unwrap_or_else(|e| e.into_inner()) {
             return Err(ChannelSendError::Closed);
         }
@@ -2103,17 +2088,17 @@ impl ChannelValue {
         buf.push_back(val);
         Ok(())
     }
-    /// 接收：pop 从 buffer 前端，无数据返回 None（await 路径在 resolve_and_check_await 处理挂起）
+    /// Receive: pops from the front of the buffer; returns None when empty (the await path handles suspension in resolve_and_check_await)
     pub fn recv(&self) -> Option<Value> {
         let mut buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.pop_front()
     }
-    /// 是否有数据可读
+    /// Whether there is data available to read
     pub fn has_data(&self) -> bool {
         !self.buffer.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
     pub fn close(&self) {
-        // [V-5] 持 buffer 锁设置 closed，与 send 的持锁检查互斥（锁序 buffer→closed 一致，无死锁）
+        // [V-5] set closed while holding the buffer lock; this mutexes with send's locked check (lock order buffer→closed is consistent, no deadlock)
         let _buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
         *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
     }
@@ -2134,13 +2119,13 @@ impl Clone for ChannelValue {
     }
 }
 
-/// 发送端值
+/// Sender end value
 #[derive(Debug, Clone)]
 pub struct SenderValue {
     pub channel: Arc<ChannelValue>,
 }
 
-/// 接收端值
+/// Receiver end value
 #[derive(Debug, Clone)]
 pub struct ReceiverValue {
     pub channel: Arc<ChannelValue>,
@@ -2148,7 +2133,7 @@ pub struct ReceiverValue {
 
 // ---- heap.rs → HeapObj enum + HeapRef + RefKind + impl ----
 
-/// 堆对象：所有堆分配值类型的统一表示（23 种）
+/// Heap object: unified representation of all heap-allocated value types (23 kinds)
 #[derive(Debug, Clone)]
 pub enum HeapObj {
     Str(KuzoStr),
@@ -2173,10 +2158,10 @@ pub enum HeapObj {
     CoroutineFrame,
 }
 
-/// 堆引用：引用计数的堆对象
+/// Heap reference: a reference-counted heap object
 pub type HeapRef = Arc<HeapObj>;
 
-/// 引用类型枚举
+/// Reference kind enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefKind {
     Str, Array, Record, Adt, Newtype, Cell, Range, Closure, Partial, Builtin,
@@ -2185,8 +2170,8 @@ pub enum RefKind {
 }
 
 impl HeapObj {
-    /// 统一提取底层 channel：ChannelVal/SenderVal/ReceiverVal 共享同一 Arc<ChannelValue>。
-    /// 消除各处对三种类型的重复分派，send/close/await/select 统一调用此方法。
+    /// Uniformly extracts the underlying channel: ChannelVal/SenderVal/ReceiverVal all share the same Arc<ChannelValue>.
+    /// Eliminates repeated dispatch over the three types; send/close/await/select all call this method.
     pub fn channel(&self) -> Option<&Arc<ChannelValue>> {
         match self {
             HeapObj::ChannelVal(ch) => Some(ch),
@@ -2196,9 +2181,9 @@ impl HeapObj {
         }
     }
 
-    /// 统一字段访问：Record/Adt 按名查找字段值，
-    /// ChannelVal 按 channel 协议字段（sender/receiver）派生。
-    /// 消除 compute_record_field_get 中对字段名和类型的硬编码分派。
+    /// Uniform field access: Record/Adt look up a field value by name;
+    /// ChannelVal derives by channel protocol fields (sender/receiver).
+    /// Eliminates hardcoded dispatch over field names and types in compute_record_field_get.
     pub fn field_get(&self, name: &str) -> Option<Value> {
         match self {
             HeapObj::Record(r) => r.find_field(name).cloned(),
@@ -2303,7 +2288,7 @@ impl Hash for HeapObj {
             HeapObj::Str(s) => s.hash(state),
             HeapObj::Array(a) => {
                 a.elements.len().hash(state);
-                // SoA SIMD 快路径：批量哈希标量
+                // SoA SIMD fast path: batch-hash scalars
                 if let Some(soa) = &a.scalar_soa {
                     simd_hash_soa(soa, state);
                 } else {

@@ -14,7 +14,7 @@ pub mod module;
 
 pub mod ir;
 
-pub mod resin;
+pub mod solidify;
 
 pub mod engine;
 

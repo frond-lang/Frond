@@ -1,20 +1,21 @@
-//! Resin 二进制格式：序列化与反序列化（owned 路径，不含 mmap）
+//! Solidify binary format: serialization and deserialization (owned path, no mmap).
 //!
-//! 格式布局：
+//! Format layout:
 //! ```text
 //! ┌─────────────────────────────────────────────┐
-//! │ Header              (64B 定长)              │
+//! │ Header              (64B fixed)             │
 //! ├─────────────────────────────────────────────┤
-//! │ Section Index       (定长数组)              │
+//! │ Section Index       (fixed-length array)    │
 //! ├─────────────────────────────────────────────┤
-//! │ Nodes / Inputs / SubGraphs / 29 表 / ...    │
+//! │ Nodes / Inputs / SubGraphs / 29 tables / .. │
 //! └─────────────────────────────────────────────┘
 //! ```
 //!
-//! 特点：
-//! - load 路径把 .resin 读回 owned Vec 构造 DataFlowGraph（不改 DFG 字段）
-//! - 不用 mmap / zerocopy，纯 Vec<u8> + 手动 LE 读写
-//! - 验证 round-trip：serialize → load → 字段一致
+//! Characteristics:
+//! - The load path reads a `.kzo` back into owned `Vec`s to construct a `DataFlowGraph`
+//!   (without modifying DFG fields).
+//! - No mmap / zerocopy; pure `Vec<u8>` + manual LE read/write.
+//! - Validates round-trip: serialize -> load -> fields match.
 
 #![allow(non_snake_case)]
 
@@ -25,14 +26,17 @@ use crate::ir::Ir::*;
 
 use super::Spec::*;
 
-// ==================== 序列化/反序列化辅助宏 ====================
+// ==================== Serialization/deserialization helper macros ====================
 //
-// 类别 A（定宽标量 Option 表）、B（布尔表）、C（含字符串表）高度重复，
-// 以下 4 个宏消除样板。类别 D（定宽复合）和 E（变长字段）结构异构，不宏化。
+// Category A (fixed-width scalar Option tables), B (boolean tables), and C (tables with
+// strings) are highly repetitive; the four macros below eliminate the boilerplate.
+// Category D (fixed-width composite) and E (variable-length fields) are structurally
+// heterogeneous and are not macro-generated.
 
-/// 类别 A 序列化：`Vec<Option<T>>` → 定宽 uN 数组，None = 哨兵值。
+/// Category A serialization: `Vec<Option<T>>` -> fixed-width uN array, `None` = sentinel value.
 ///
-/// `$inner` 闭包接收 `&T`，返回待写入的原始整数（T 需 Copy 时直接解引用）。
+/// The `$inner` closure takes `&T` and returns the raw integer to write (when `T` is
+/// `Copy`, simply dereference).
 macro_rules! ser_opt_table {
     ($sections:expr, $n:expr, $graph:expr, $field:ident, $kind:ident, $width:expr, $write:ident, $sentinel:expr, $inner:expr) => {{
         let mut buf = Vec::with_capacity($n * $width);
@@ -47,7 +51,7 @@ macro_rules! ser_opt_table {
     }};
 }
 
-/// 类别 B 序列化：`Vec<bool>` → bitmap（每 bit 一个布尔值，8 倍压缩）。
+/// Category B serialization: `Vec<bool>` -> bitmap (one bit per boolean, 8x compression).
 macro_rules! ser_bool_table {
     ($sections:expr, $n:expr, $graph:expr, $field:ident, $kind:ident) => {{
         let mut buf = vec![0u8; ($n + 7) / 8];
@@ -60,7 +64,7 @@ macro_rules! ser_bool_table {
     }};
 }
 
-/// 类别 C 序列化：`Vec<Option<String>>` → (offset:u32, len:u32) 数组，intern 到字符串池。
+/// Category C serialization: `Vec<Option<String>>` -> `(offset:u32, len:u32)` array, interned into the string pool.
 macro_rules! ser_str_table {
     ($sections:expr, $n:expr, $graph:expr, $field:ident, $kind:ident, $pool:expr) => {{
         let mut buf = Vec::with_capacity($n * 8);
@@ -73,10 +77,11 @@ macro_rules! ser_str_table {
     }};
 }
 
-/// 类别 A 反序列化：定宽 uN 数组 → `Vec<Option<T>>`，哨兵值 = None。
+/// Category A deserialization: fixed-width uN array -> `Vec<Option<T>>`, sentinel value = `None`.
 ///
-/// 按宽度字面量 1/2/4 分派解码逻辑（`r` 与宏同语法上下文，规避卫生问题）。
-/// `$wrap` 将整数包装为目标类型（`|v| v` 表示本身即整数）。
+/// Dispatches on the width literal 1/2/4 for decoding logic (`r` shares the macro's
+/// syntactic context to work around hygiene issues). `$wrap` wraps the integer into
+/// the target type (`|v| v` means the value is already the integer).
 macro_rules! de_opt_table {
     ($mem:expr, $n:expr, $kind:ident, 1, $sentinel:expr, $wrap:expr) => {{
         let r = $mem.section(SectionKind::$kind);
@@ -109,17 +114,17 @@ macro_rules! de_opt_table {
     }};
 }
 
-// ==================== 序列化 ====================
+// ==================== Serialization ====================
 
-/// 序列化 DataFlowGraph 为 .resin 字节流
-pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
+/// Serializes a `DataFlowGraph` into a `.kzo` byte stream.
+pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
     let n = graph.nodes.len();
     let mut string_pool = StringPool::new();
 
-    // ---- 收集各 section 的字节 ----
+    // ---- Collect bytes for each section ----
     let mut sections: Vec<(SectionKind, Vec<u8>)> = Vec::new();
 
-    // 1. Nodes: 每个 Node 16B
+    // 1. Nodes: each Node is 16B
     {
         let mut buf = Vec::with_capacity(n * 16);
         for node in &graph.nodes {
@@ -127,13 +132,13 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
             write_u8(&mut buf, node.input_count);
             write_u32(&mut buf, node.inputs_offset);
             write_u32(&mut buf, node.compute_fn.0);
-            // padding 对齐到 16B（kind(1)+input_count(1)+pad(2)+inputs_offset(4)+compute_fn(4) = 12, pad 4）
+            // Pad to 16B alignment (kind(1)+input_count(1)+pad(2)+inputs_offset(4)+compute_fn(4) = 12, pad 4)
             write_u32(&mut buf, 0); // 4B padding
         }
         sections.push((SectionKind::Nodes, buf));
     }
 
-    // 2. Inputs: 连续 NodeId 数组
+    // 2. Inputs: contiguous NodeId array
     {
         let mut buf = Vec::with_capacity(graph.inputs_pool.data.len() * 4);
         for nid in &graph.inputs_pool.data {
@@ -142,7 +147,7 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
         sections.push((SectionKind::Inputs, buf));
     }
 
-    // 3. SubGraphs + 变长区
+    // 3. SubGraphs + variable-length regions
     {
         let mut sg_buf = Vec::new();
         let mut upvalue_nodes_buf = Vec::new();
@@ -153,7 +158,7 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
         let mut reset_plan_buf = Vec::new();
 
         for sg in &graph.subgraphs {
-            // 主结构定宽字段
+            // Main structure fixed-width fields
             write_u32(&mut sg_buf, sg.id.0);
             write_u32(&mut sg_buf, sg.node_range.0.0);
             write_u32(&mut sg_buf, sg.node_range.1.0);
@@ -207,7 +212,7 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
                 write_u32(&mut defer_entries_buf, de.body_subgraph.0);
                 write_u32(&mut defer_entries_buf, ci_off);
                 write_u32(&mut defer_entries_buf, de.captured_inputs.len() as u32);
-                // registered 是运行时状态，不序列化
+                // `registered` is runtime state and is not serialized.
                 for nid in &de.captured_inputs {
                     write_u32(&mut defer_captured_buf, nid.0);
                 }
@@ -218,7 +223,7 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
             if let Some(rp) = &sg.reset_plan {
                 let rp_off = reset_plan_buf.len() as u32;
                 write_u32(&mut sg_buf, rp_off);
-                // ResetPlan: 3 个 Vec<NodeId>
+                // ResetPlan: 3 Vec<NodeId>
                 write_u32(&mut reset_plan_buf, rp.reset_to_zero.len() as u32);
                 for nid in &rp.reset_to_zero { write_u32(&mut reset_plan_buf, nid.0); }
                 write_u32(&mut reset_plan_buf, rp.reset_to_one.len() as u32);
@@ -226,7 +231,7 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
                 write_u32(&mut reset_plan_buf, rp.reset_condition_tree.len() as u32);
                 for nid in &rp.reset_condition_tree { write_u32(&mut reset_plan_buf, nid.0); }
             } else {
-                write_u32(&mut sg_buf, 0); // 占位
+                write_u32(&mut sg_buf, 0); // placeholder
             }
         }
 
@@ -239,13 +244,13 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
         sections.push((SectionKind::SgResetPlan, reset_plan_buf));
     }
 
-    // ---- per-Node 定宽标量表 (类别 A) ----
+    // ---- per-Node fixed-width scalar tables (category A) ----
     ser_opt_table!(sections, n, graph, call_targets, CallTargets, 4, write_u32, u32::MAX, |s: &SubGraphId| s.0);
     ser_opt_table!(sections, n, graph, field_access_infos, FieldAccessInfos, 2, write_u16, u16::MAX, |x: &u16| *x);
     ser_opt_table!(sections, n, graph, vtable_call_methods, VtableCallMethods, 2, write_u16, u16::MAX, |x: &u16| *x);
     ser_opt_table!(sections, n, graph, await_event_sources, AwaitEventSources, 4, write_u32, u32::MAX, |s: &NodeId| s.0);
     ser_opt_table!(sections, n, graph, writeback_targets, WritebackTargets, 4, write_u32, u32::MAX, |s: &NodeId| s.0);
-    // hoisted_owners: SubGraphId（无 None，直接写）
+    // hoisted_owners: SubGraphId (no None, written directly)
     {
         let mut buf = Vec::with_capacity(n * 4);
         for v in &graph.hoisted_owners {
@@ -258,21 +263,21 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
     ser_opt_table!(sections, n, graph, pattern_field_indices, PatternFieldIndices, 2, write_u16, u16::MAX, |x: &u16| *x);
     ser_opt_table!(sections, n, graph, closure_call_arg_counts, ClosureCallArgCounts, 1, write_u8, u8::MAX, |x: &u8| *x);
 
-    // ---- per-Node 布尔表 (类别 B) ----
+    // ---- per-Node boolean tables (category B) ----
     ser_bool_table!(sections, n, graph, tail_call_flags, TailCallFlags);
     ser_bool_table!(sections, n, graph, safe_op_flags, SafeOpFlags);
     ser_bool_table!(sections, n, graph, hoisted_node, HoistedNode);
     ser_bool_table!(sections, n, graph, slice_inclusive, SliceInclusive);
 
-    // ---- per-Node 含字符串表 (类别 C) ----
-    // 每个节点写 (offset:u32, len:u32)，None = (u32::MAX, 0)，intern 到字符串池
+    // ---- per-Node tables with strings (category C) ----
+    // Each node writes (offset:u32, len:u32); None = (u32::MAX, 0), interned into the string pool.
     ser_str_table!(sections, n, graph, ffi_call_names, FfiCallNames, string_pool);
     ser_str_table!(sections, n, graph, field_set_names, FieldSetNames, string_pool);
     ser_str_table!(sections, n, graph, pattern_ctor_names, PatternCtorNames, string_pool);
     ser_str_table!(sections, n, graph, cast_target_types, CastTargetTypes, string_pool);
 
-    // ---- per-Node 含定宽复合表 (类别 D) ----
-    // ClosureInfo: 每个节点写 validity u8 + 定宽数据
+    // ---- per-Node fixed-width composite tables (category D) ----
+    // ClosureInfo: each node writes a validity u8 + fixed-width data.
     {
         let mut buf = Vec::with_capacity(n * 13);
         for v in &graph.closure_infos {
@@ -317,8 +322,8 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
         sections.push((SectionKind::MemoInfos, buf));
     }
 
-    // ---- per-Node 含变长字段表 (类别 E) ----
-    // ConstValues: tag u8 + payload 16B per node（None tag=0）
+    // ---- per-Node variable-length field tables (category E) ----
+    // ConstValues: tag u8 + 16B payload per node (None -> tag=0).
     {
         let mut buf = Vec::with_capacity(n * 17);
         for v in &graph.const_values {
@@ -327,7 +332,7 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
                 Some(cv) => {
                     let tag = const_tag_to_u8(cv);
                     write_u8(&mut buf, tag);
-                    // payload 16B
+                    // 16B payload
                     let mut payload = [0u8; 16];
                     match cv {
                         ConstValue::I8(x) => payload[0] = *x as u8,
@@ -349,8 +354,9 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
                         ConstValue::Bool(b) => payload[0] = *b as u8,
                         ConstValue::Char(c) => payload[0..4].copy_from_slice(&c.to_le_bytes()),
                         ConstValue::Str { offset, len } => {
-                            // ConstValue 持有 (offset, len) 引用 graph.string_pool，
-                            // 序列化时读出实际字符串，再加入序列化侧 string_pool（偏移可能不同）
+                            // ConstValue holds an (offset, len) reference into graph.string_pool.
+                            // On serialization, read the actual string and re-intern it into the
+                            // serializer-side string_pool (the offset may differ).
                             let off = *offset as usize;
                             let end = off + *len as usize;
                             let s = std::str::from_utf8(&graph.string_pool[off..end]).unwrap_or("");
@@ -367,8 +373,8 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
         sections.push((SectionKind::ConstValues, buf));
     }
 
-    // GateBranches: 每个节点 validity u8 + condition_input u32 + branches_count u32 + branches 数据
-    // branches 数据：(bool u8, SubGraphId u32, inputs_count u32, inputs [u32])
+    // GateBranches: per node validity u8 + condition_input u32 + branches_count u32 + branches data.
+    // branches data: (bool u8, SubGraphId u32, inputs_count u32, inputs [u32]).
     {
         let mut buf = Vec::new();
         for v in &graph.gate_branches {
@@ -514,21 +520,22 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
         sections.push((SectionKind::Downstreams, buf));
     }
 
-    // ---- 计算运行时字段计数 ----
+    // ---- Compute runtime field counts ----
     let global_var_count = graph.global_var_storage.len() as u32;
     let memo_table_count = graph.memo_tables.len() as u32;
 
-    // ---- 组装最终字节流 ----
+    // ---- Assemble the final byte stream ----
     let section_count = sections.len() as u16;
-    let header_size = ResinHeader::SIZE as u32;
+    let header_size = SolidifyHeader::SIZE as u32;
     let section_index_size = section_count as u32 * 9; // kind:u8 + offset:u32 + len:u32 = 9B
 
-    // 计算 offset（每个 section 对齐到 4 字节，避免 unaligned access）
-    // 对齐值 4 的依据：所有 section 数据都是 u32/u16/u8 数组，u32 是最宽的自然对齐。
-    // 对齐 padding 字节计入前一个 section 之后、当前 section 之前，不改变 section 的 len。
+    // Compute offsets (each section is aligned to 4 bytes to avoid unaligned access).
+    // Alignment value 4 rationale: all section data is u32/u16/u8 arrays; u32 is the widest natural alignment.
+    // Alignment padding bytes are placed after the previous section and before the current section,
+    // without changing the section's len.
     const SECTION_ALIGN: u32 = 4;
     let mut current_offset = header_size + section_index_size;
-    // 记录每个 section 前需要插入的 padding 字节数
+    // Record the number of padding bytes to insert before each section.
     let mut paddings: Vec<u8> = Vec::with_capacity(sections.len());
     let mut section_entries: Vec<SectionEntry> = Vec::new();
     for (kind, data) in &sections {
@@ -543,14 +550,14 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
         current_offset += data.len() as u32;
     }
 
-    // 写 Header
-    let mut header = ResinHeader {
-        magic: RESIN_MAGIC,
-        schema_version: RESIN_SCHEMA_VERSION,
+    // Write the header.
+    let mut header = SolidifyHeader {
+        magic: SOLIDIFY_MAGIC,
+        schema_version: SOLIDIFY_SCHEMA_VERSION,
         flags: 0,
         endianness: 1,
         pointer_width: 8,
-        abi_version: RESIN_ABI_VERSION,
+        abi_version: SOLIDIFY_ABI_VERSION,
         node_count: n as u32,
         subgraph_count: graph.subgraphs.len() as u32,
         entry_subgraph: graph.entry_subgraph.map(|s| s.0).unwrap_or(u32::MAX),
@@ -559,31 +566,31 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
         global_var_count,
         memo_table_count,
         compute_fn_count: COMPUTE_FN_COUNT,
-        crc32: 0, // 占位，最后回填
+        crc32: 0, // Placeholder, back-filled later.
         section_count,
         _reserved: [0, 0],
         _padding: [0u8; 12],
     };
 
-    // 写入 body（header 之后的所有内容），用于 CRC 计算
+    // Write the body (everything after the header) for CRC computation.
     let mut body = Vec::new();
-    // Section Index
+    // Section index
     for entry in &section_entries {
         body.push(entry.kind);
         body.extend_from_slice(&entry.offset.to_le_bytes());
         body.extend_from_slice(&entry.len.to_le_bytes());
     }
-    // Section data（每个 section 前插入对齐 padding）
+    // Section data (insert alignment padding before each section)
     for (i, (_, data)) in sections.iter().enumerate() {
         let pad = paddings[i] as usize;
         body.extend_from_slice(&vec![0u8; pad]);
         body.extend_from_slice(data);
     }
 
-    // CRC32（body）
+    // CRC32 (body)
     header.crc32 = crc32(&body);
 
-    // 最终输出
+    // Final output
     let mut output = Vec::with_capacity(header_size as usize + body.len());
     header.write_to(&mut output).unwrap();
     output.extend_from_slice(&body);
@@ -591,24 +598,25 @@ pub fn serialize_resin(graph: &DataFlowGraph) -> Vec<u8> {
     output
 }
 
-// ==================== 反序列化 ====================
+// ==================== Deserialization ====================
 
-/// 从 .resin 字节流加载 DataFlowGraph（owned 路径，用于测试）
-pub fn load_resin_from_bytes(data: &[u8]) -> io::Result<DataFlowGraph> {
+/// Loads a `DataFlowGraph` from a `.kzo` byte stream (owned path, used for tests).
+pub fn load_solidify_from_bytes(data: &[u8]) -> io::Result<DataFlowGraph> {
     let mem = GraphMemory::from_bytes(data)?;
     load_from_graph_memory(&mem)
 }
 
-/// 从 .resin 文件 mmap 加载 DataFlowGraph（零拷贝文件读取）
+/// Loads a `DataFlowGraph` from a `.kzo` file via mmap (zero-copy file reading).
 ///
-/// 文件直接映射到地址空间，避免 fs::read 的内核→用户空间拷贝。
-/// GraphMemory 持有 Mmap 所有权，随 DataFlowGraph 释放时自动 unmap。
-pub fn load_resin_from_file(path: &str) -> io::Result<DataFlowGraph> {
+/// The file is mapped directly into the address space, avoiding the kernel-to-userspace
+/// copy of `fs::read`. `GraphMemory` owns the `Mmap` and automatically unmaps it when the
+/// `DataFlowGraph` is dropped.
+pub fn load_solidify_from_file(path: &str) -> io::Result<DataFlowGraph> {
     let mem = GraphMemory::from_file(path)?;
     load_zerocopy(mem)
 }
 
-/// 从 GraphMemory 重建 owned DataFlowGraph（共用解析逻辑）
+/// Rebuilds an owned `DataFlowGraph` from a `GraphMemory` (shared parsing logic).
 fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     let n = mem.header().node_count as usize;
 
@@ -742,7 +750,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         subgraphs
     };
 
-    // ---- per-Node 定宽标量表 (类别 A) ----
+    // ---- per-Node fixed-width scalar tables (category A) ----
     let call_targets: Vec<Option<SubGraphId>> = de_opt_table!(mem, n, CallTargets, 4, u32::MAX, |v| SubGraphId(v));
     let field_access_infos: Vec<Option<u16>> = de_opt_table!(mem, n, FieldAccessInfos, 2, u16::MAX, |v| v);
     let vtable_call_methods: Vec<Option<u16>> = de_opt_table!(mem, n, VtableCallMethods, 2, u16::MAX, |v| v);
@@ -757,7 +765,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     let pattern_field_indices: Vec<Option<u16>> = de_opt_table!(mem, n, PatternFieldIndices, 2, u16::MAX, |v| v);
     let closure_call_arg_counts: Vec<Option<u8>> = de_opt_table!(mem, n, ClosureCallArgCounts, 1, u8::MAX, |v| v);
 
-    // ---- per-Node 布尔表 (类别 B) ----
+    // ---- per-Node boolean tables (category B) ----
     let read_bool_vec = |kind: SectionKind| -> Vec<bool> {
         let r = mem.section(kind);
         (0..n).map(|i| r[i / 8] & (1 << (i % 8)) != 0).collect()
@@ -767,7 +775,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     let hoisted_node = read_bool_vec(SectionKind::HoistedNode);
     let slice_inclusive = read_bool_vec(SectionKind::SliceInclusive);
 
-    // ---- per-Node 含字符串表 (类别 C) ----
+    // ---- per-Node tables with strings (category C) ----
     let read_str_vec = |kind: SectionKind| -> Vec<Option<String>> {
         let r = mem.section(kind);
         (0..n).map(|i| {
@@ -781,7 +789,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     let pattern_ctor_names = read_str_vec(SectionKind::PatternCtorNames);
     let cast_target_types = read_str_vec(SectionKind::CastTargetTypes);
 
-    // ---- per-Node 含定宽复合表 (类别 D) ----
+    // ---- per-Node fixed-width composite tables (category D) ----
     let closure_infos: Vec<Option<ClosureInfo>> = {
         let r = mem.section(SectionKind::ClosureInfos);
         let mut r = r;
@@ -843,7 +851,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         }).collect()
     };
 
-    // ---- per-Node 含变长字段表 (类别 E) ----
+    // ---- per-Node variable-length field tables (category E) ----
     let const_values: Vec<Option<ConstValue>> = {
         let r = mem.section(SectionKind::ConstValues);
         let mut r = r;
@@ -873,7 +881,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
                     17 => ConstValue::Bool(payload[0] != 0),
                     18 => ConstValue::Char(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])),
                     19 => {
-                        // (offset, len) 直接引用 string_pool，无需 leak
+                        // (offset, len) references the string_pool directly; no leak needed.
                         let off = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                         let len = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
                         ConstValue::Str { offset: off, len }
@@ -1032,7 +1040,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         for _ in 0..n {
             offsets.push(read_u32(&mut r));
         }
-        // flat data 紧跟在 offsets 之后
+        // flat data follows the offsets region
         let mut ds = Vec::with_capacity(n);
         for i in 0..n {
             let start = offsets[i] as usize;
@@ -1046,7 +1054,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         ds
     };
 
-    // ---- 运行时字段重建 ----
+    // ---- Rebuild runtime fields ----
     let entry_subgraph = if mem.header().entry_subgraph == u32::MAX { None } else { Some(SubGraphId(mem.header().entry_subgraph)) };
     let compute_fns = build_compute_fn_table();
     let global_var_storage = std::sync::Arc::new(
@@ -1059,7 +1067,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
             .map(|_| std::sync::Mutex::new(rustc_hash::FxHashMap::default()))
             .collect::<Vec<_>>()
     );
-    // 从 StringPool section 加载字符串池字节，ConstValue::Str { offset, len } 引用此池
+    // Load the string pool bytes from the StringPool section; ConstValue::Str { offset, len } references this pool.
     let string_pool: Arc<[u8]> = Arc::from(mem.section(SectionKind::StringPool).to_vec());
 
     Ok(DataFlowGraph {
@@ -1113,16 +1121,17 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     })
 }
 
-/// 从 GraphMemory zerocopy 加载 DataFlowGraph（生产路径）。
+/// Loads a `DataFlowGraph` from a `GraphMemory` via zerocopy (production path).
 ///
-/// 仅 eager-load 5 个复杂变长表 + subgraphs + downstreams + string_pool + 运行时字段。
-/// 24 个 per-Node 标量表 + nodes + inputs 通过 accessor 方法从 mmap 切片 zerocopy 读取，
-/// 不拷贝到 owned Vec。
+/// Only eager-loads the 5 complex variable-length tables + subgraphs + downstreams +
+/// string_pool + runtime fields. The 24 per-Node scalar tables plus `nodes` and `inputs`
+/// are read zerocopy from the mmap slices via accessor methods, without copying into owned
+/// `Vec`s.
 pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
     let n = mem.header().node_count as usize;
 
-    // SubGraphs (eager-load: 含变长字段 upvalue_nodes/nested_ranges/event_decls/defer_table/reset_plan)
-    // upvalue_outer_nodes / nested_ranges 走 zerocopy CSR accessor，不解析为 owned Vec。
+    // SubGraphs (eager-load: includes variable-length fields upvalue_nodes/nested_ranges/event_decls/defer_table/reset_plan)
+    // upvalue_outer_nodes / nested_ranges use zerocopy CSR accessors and are not parsed into owned Vecs.
     let (subgraphs, sg_uv_offsets, sg_nr_offsets) = {
         let sr = mem.section(SectionKind::SubGraphs);
         let ed = mem.section(SectionKind::SgEventDecls);
@@ -1149,13 +1158,13 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
             let iter_next_node = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(NodeId(v)) } };
             let upvalue_count = read_u8(&mut sr_r);
 
-            // upvalue_outer_nodes: zerocopy CSR — 存 offset/len，不解析为 Vec
+            // upvalue_outer_nodes: zerocopy CSR — store offset/len, do not parse into a Vec.
             let uv_off = read_u32(&mut sr_r);
             let uv_len = read_u32(&mut sr_r);
             sg_uv_offsets.push((uv_off, uv_len));
             let upvalue_outer_nodes: Vec<NodeId> = Vec::new();
 
-            // nested_ranges: zerocopy CSR — 存 offset/len，不解析为 Vec
+            // nested_ranges: zerocopy CSR — store offset/len, do not parse into a Vec.
             let nr_off = read_u32(&mut sr_r);
             let nr_len = read_u32(&mut sr_r);
             sg_nr_offsets.push((nr_off, nr_len));
@@ -1218,9 +1227,10 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         (subgraphs, sg_uv_offsets, sg_nr_offsets)
     };
 
-    // 5 个复杂变长表：zerocopy on-demand accessor。
-    // 扫描各 section 记录每条目的字节偏移（u32::MAX = None），不构造 owned 结构。
-    // accessor 方法在执行路径按需从 mmap 解析单条目，消除 Vec<Option<T>> 数组内存。
+    // Five complex variable-length tables: zerocopy on-demand accessors.
+    // Scan each section to record the byte offset of each entry (u32::MAX = None), without
+    // constructing owned structures. Accessor methods parse individual entries on demand from
+    // the mmap at execution time, eliminating the Vec<Option<T>> array memory.
     let (gate_branch_offsets, gate_branches): (Vec<u32>, Vec<Option<GateBranches>>) = {
         let r = mem.section(SectionKind::GateBranches);
         let mut r = r;
@@ -1334,10 +1344,10 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         (offsets, Vec::new())
     };
 
-    // Downstreams：不再 eager-load，通过 downstream_slice(idx) zerocopy 访问 CSR。
-    // 字段保持空 Vec（加载路径不使用）。
+    // Downstreams: no longer eager-loaded; accessed via downstream_slice(idx) zerocopy CSR.
+    // The field stays an empty Vec (unused on the load path).
 
-    // ---- 运行时字段重建 ----
+    // ---- Rebuild runtime fields ----
     let entry_subgraph = if mem.header().entry_subgraph == u32::MAX { None } else { Some(SubGraphId(mem.header().entry_subgraph)) };
     let compute_fns = build_compute_fn_table();
     let global_var_storage = std::sync::Arc::new(
@@ -1350,8 +1360,8 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
             .map(|_| std::sync::Mutex::new(rustc_hash::FxHashMap::default()))
             .collect::<Vec<_>>()
     );
-    // string_pool：zerocopy 路径不拷贝，通过 string_pool_slice() accessor 从 mmap 读取。
-    // 字段保持空 Arc（加载路径不使用）。
+    // string_pool: the zerocopy path does not copy; reads via the string_pool_slice() accessor from the mmap.
+    // The field stays an empty Arc (unused on the load path).
     let string_pool: Arc<[u8]> = Arc::from(Vec::new());
 
     Ok(DataFlowGraph {
@@ -1405,7 +1415,7 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
     })
 }
 
-/// 从字节流 zerocopy 加载（用于 serialize→load→run 路径，无需写文件）
+/// Loads zerocopy from a byte stream (for the serialize->load->run path; no file needed).
 pub fn load_zerocopy_from_bytes(data: Vec<u8>) -> io::Result<DataFlowGraph> {
     let mem = GraphMemory::from_bytes(&data)?;
     load_zerocopy(mem)
@@ -1413,8 +1423,8 @@ pub fn load_zerocopy_from_bytes(data: Vec<u8>) -> io::Result<DataFlowGraph> {
 
 // ==================== inspect ====================
 
-/// .resin 文件元信息（用于 inspect 命令）
-pub struct ResinInfo {
+/// `.kzo` file metadata (for the inspect command).
+pub struct SolidifyInfo {
     pub schema_version: u16,
     pub abi_version: u16,
     pub node_count: u32,
@@ -1428,16 +1438,16 @@ pub struct ResinInfo {
     pub crc32: u32,
     pub section_count: u16,
     pub file_size: usize,
-    /// 各 section 的详情（kind_u8, offset, len），仅在 inspect --verbose 时填充
+    /// Details of each section (kind_u8, offset, len); only populated when `inspect --verbose`.
     pub sections: Vec<(u8, u32, u32)>,
 }
 
-/// 读取 .resin 文件元信息（仅 Header，不加载全图），mmap 路径
-pub fn inspect_resin_from_file(path: &str) -> io::Result<ResinInfo> {
+/// Reads `.kzo` file metadata (header only, does not load the full graph); mmap path.
+pub fn inspect_solidify_from_file(path: &str) -> io::Result<SolidifyInfo> {
     let mem = GraphMemory::from_file(path)?;
     let h = mem.header();
     let file_size = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
-    Ok(ResinInfo {
+    Ok(SolidifyInfo {
         schema_version: h.schema_version,
         abi_version: h.abi_version,
         node_count: h.node_count,
@@ -1455,11 +1465,11 @@ pub fn inspect_resin_from_file(path: &str) -> io::Result<ResinInfo> {
     })
 }
 
-/// 读取 .resin 字节流元信息（仅 Header，不加载全图），owned 路径
-pub fn inspect_resin(data: &[u8]) -> io::Result<ResinInfo> {
+/// Reads `.kzo` byte-stream metadata (header only, does not load the full graph); owned path.
+pub fn inspect_solidify(data: &[u8]) -> io::Result<SolidifyInfo> {
     let mem = GraphMemory::from_bytes(data)?;
     let h = mem.header();
-    Ok(ResinInfo {
+    Ok(SolidifyInfo {
         schema_version: h.schema_version,
         abi_version: h.abi_version,
         node_count: h.node_count,
@@ -1477,27 +1487,28 @@ pub fn inspect_resin(data: &[u8]) -> io::Result<ResinInfo> {
     })
 }
 
-// ==================== Phase 4: Round-trip 测试 ====================
+// ==================== Phase 4: Round-trip tests ====================
 
 #[cfg(test)]
 mod round_trip_tests {
     use super::*;
     use crate::value::{ValueTag, BinOp};
 
-    /// 构造覆盖所有表类型和边界情况的合成 DataFlowGraph。
+    /// Builds a synthetic DataFlowGraph covering all table types and edge cases.
     ///
-    /// 16 个节点，每个表都有 Some/None 混合，覆盖：
-    /// - 所有 NodeKind
-    /// - 所有 ConstValue 变体（含 Str/I128/U128/F128）
-    /// - 类别 A/B/C/D/E 全部表
-    /// - SubGraph 全部变长字段（defer/reset_plan/nested_ranges/event_decls/upvalue_nodes）
-    /// - GateBranches/SelectInfo/TraitConstructInfo/RecordLitInfo/RecordExtendInfo 变长数据
-    /// - Downstreams 空与非空混合
+    /// 16 nodes; every table has a Some/None mix, covering:
+    /// - All NodeKind variants
+    /// - All ConstValue variants (including Str/I128/U128/F128)
+    /// - All category A/B/C/D/E tables
+    /// - All SubGraph variable-length fields (defer/reset_plan/nested_ranges/event_decls/upvalue_nodes)
+    /// - GateBranches/SelectInfo/TraitConstructInfo/RecordLitInfo/RecordExtendInfo variable-length data
+    /// - Downstreams with a mix of empty and non-empty
     fn make_test_graph() -> DataFlowGraph {
-        // ---- 字符串池：预先写入测试用字符串 ----
-        // 注意：ConstValue::Str 需要引用 string_pool，我们手动构造。
-        // 类别 C 表（ffi_call_names 等）用 owned String，序列化时自动 intern 到池中。
-        // 这里仅预存 ConstValue::Str 需要的引用。
+        // ---- String pool: pre-write the test strings ----
+        // Note: ConstValue::Str needs to reference the string_pool, which we build manually.
+        // Category C tables (ffi_call_names, etc.) use owned Strings that are auto-interned
+        // into the pool during serialization.
+        // Here we only pre-store the references needed by ConstValue::Str.
         let mut pool: Vec<u8> = Vec::new();
         let intern = |pool: &mut Vec<u8>, s: &str| -> (u32, u32) {
             let off = pool.len() as u32;
@@ -1506,7 +1517,7 @@ mod round_trip_tests {
         };
         let s_hello = intern(&mut pool, "hello");
 
-        // ---- Nodes: 覆盖所有 NodeKind（16 个节点） ----
+        // ---- Nodes: cover all NodeKind variants (16 nodes) ----
         let make_node = |kind: NodeKind, input_count: u8, inputs_offset: u32, cf: ComputeFnId| -> Node {
             Node { kind, input_count, inputs_offset, compute_fn: cf }
         };
@@ -1540,7 +1551,7 @@ mod round_trip_tests {
         ];
         let inputs_pool = InputsPool { data: inputs_data };
 
-        // ---- SubGraphs: 3 个子图，覆盖所有变长字段 ----
+        // ---- SubGraphs: 3 subgraphs, covering all variable-length fields ----
         let subgraphs = vec![
             SubGraph {
                 id: SubGraphId(0),
@@ -1627,27 +1638,27 @@ mod round_trip_tests {
             },
         ];
 
-        // ---- Downstreams: 空与非空混合 ----
+        // ---- Downstreams: mix of empty and non-empty ----
         let downstreams = vec![
             vec![NodeId(4)],                          // 0
             vec![NodeId(4)],                          // 1
-            vec![],                                    // 2 (空)
+            vec![],                                    // 2 (empty)
             vec![NodeId(6)],                          // 3
             vec![NodeId(5), NodeId(7), NodeId(8)],    // 4
             vec![NodeId(7)],                          // 5
-            vec![],                                    // 6 (空)
-            vec![],                                    // 7 (空)
-            vec![],                                    // 8 (空)
-            vec![],                                    // 9 (空)
+            vec![],                                    // 6 (empty)
+            vec![],                                    // 7 (empty)
+            vec![],                                    // 8 (empty)
+            vec![],                                    // 9 (empty)
             vec![NodeId(9)],                          // 10
-            vec![],                                    // 11 (空)
-            vec![],                                    // 12 (空)
-            vec![],                                    // 13 (空)
-            vec![],                                    // 14 (空)
-            vec![],                                    // 15 (空)
+            vec![],                                    // 11 (empty)
+            vec![],                                    // 12 (empty)
+            vec![],                                    // 13 (empty)
+            vec![],                                    // 14 (empty)
+            vec![],                                    // 15 (empty)
         ];
 
-        // ---- ConstValues: 覆盖所有变体 ----
+        // ---- ConstValues: cover all variants ----
         let const_values = vec![
             Some(ConstValue::I8(-1)),                                          // 0
             Some(ConstValue::I128(i128::MIN)),                                 // 1
@@ -1664,10 +1675,10 @@ mod round_trip_tests {
             Some(ConstValue::Null),                                            // 12
             Some(ConstValue::Void),                                            // 13
             Some(ConstValue::Bool(true)),                                      // 14
-            Some(ConstValue::Char(0x4E2D)),                                    // 15 '中'
+            Some(ConstValue::Char(0x4E2D)),                                    // 15 (U+4E2D)
         ];
 
-        // ---- 类别 A: 定宽标量表（Some/None 混合）----
+        // ---- Category A: fixed-width scalar tables (Some/None mix) ----
         let call_targets = vec![
             None, None, None, None, None, None, None,
             Some(SubGraphId(2)), None, None, None, None, None, None, None, None,
@@ -1714,13 +1725,13 @@ mod round_trip_tests {
             Some(3u8),
         ];
 
-        // ---- 类别 B: 布尔表 ----
+        // ---- Category B: boolean tables ----
         let tail_call_flags = vec![false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false];
         let safe_op_flags =    vec![false, false, false, false, false, false, true,  false, false, false, false, false, false, false, false, true];
         let hoisted_node =     vec![false, false, false, false, false, false, false, false, false, false, false, true,  true,  false, false, false];
         let slice_inclusive =  vec![false, false, false, false, false, false, false, false, false, false, false, false, false, false, true,  false];
 
-        // ---- 类别 C: 含字符串表 ----
+        // ---- Category C: tables with strings ----
         let ffi_call_names = vec![
             None, None, None, None, None, None, None,
             Some("printf".to_string()),
@@ -1744,7 +1755,7 @@ mod round_trip_tests {
             None, None,
         ];
 
-        // ---- 类别 D: 定宽复合表 ----
+        // ---- Category D: fixed-width composite tables ----
         let closure_infos = vec![
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None,
@@ -1773,7 +1784,7 @@ mod round_trip_tests {
             None, None, None, None, None, None, None, None, None, None, None,
         ];
 
-        // ---- 类别 E: 变长字段表 ----
+        // ---- Category E: variable-length field tables ----
         let gate_branches = vec![
             None, None, None, None, None, None, None, None,
             Some(GateBranches {
@@ -1883,9 +1894,9 @@ mod round_trip_tests {
         }
     }
 
-    /// 比较两个 DataFlowGraph 的所有可序列化字段是否一致
+    /// Compares all serializable fields of two DataFlowGraphs for equality.
     fn assert_graphs_equal(a: &DataFlowGraph, b: &DataFlowGraph, ctx: &str) {
-        // 基础字段
+        // Basic fields
         assert_eq!(a.nodes.len(), b.nodes.len(), "{}: nodes len", ctx);
         for i in 0..a.nodes.len() {
             assert_eq!(a.nodes[i].kind, b.nodes[i].kind, "{}: node[{}] kind", ctx, i);
@@ -1926,7 +1937,7 @@ mod round_trip_tests {
                 assert_eq!(sa.defer_table[j].trigger_node, sb.defer_table[j].trigger_node, "{}: sg[{}] defer[{}] trigger", ctx, i, j);
                 assert_eq!(sa.defer_table[j].body_subgraph, sb.defer_table[j].body_subgraph, "{}: sg[{}] defer[{}] body_sg", ctx, i, j);
                 assert_eq!(sa.defer_table[j].captured_inputs, sb.defer_table[j].captured_inputs, "{}: sg[{}] defer[{}] captured", ctx, i, j);
-                // registered 是运行时状态，不比较
+                // `registered` is runtime state and is not compared.
             }
             // reset_plan
             match (&sa.reset_plan, &sb.reset_plan) {
@@ -1948,7 +1959,7 @@ mod round_trip_tests {
             assert_eq!(a.downstreams[i], b.downstreams[i], "{}: downstreams[{}]", ctx, i);
         }
 
-        // ---- 类别 A 表 ----
+        // ---- Category A tables ----
         assert_eq!(a.call_targets, b.call_targets, "{}: call_targets", ctx);
         assert_eq!(a.field_access_infos, b.field_access_infos, "{}: field_access_infos", ctx);
         assert_eq!(a.vtable_call_methods, b.vtable_call_methods, "{}: vtable_call_methods", ctx);
@@ -1960,20 +1971,20 @@ mod round_trip_tests {
         assert_eq!(a.pattern_field_indices, b.pattern_field_indices, "{}: pattern_field_indices", ctx);
         assert_eq!(a.closure_call_arg_counts, b.closure_call_arg_counts, "{}: closure_call_arg_counts", ctx);
 
-        // ---- 类别 B 表 ----
+        // ---- Category B tables ----
         assert_eq!(a.tail_call_flags, b.tail_call_flags, "{}: tail_call_flags", ctx);
         assert_eq!(a.safe_op_flags, b.safe_op_flags, "{}: safe_op_flags", ctx);
         assert_eq!(a.hoisted_node, b.hoisted_node, "{}: hoisted_node", ctx);
         assert_eq!(a.slice_inclusive, b.slice_inclusive, "{}: slice_inclusive", ctx);
 
-        // ---- 类别 C 表 ----
+        // ---- Category C tables ----
         assert_eq!(a.ffi_call_names, b.ffi_call_names, "{}: ffi_call_names", ctx);
         assert_eq!(a.field_set_names, b.field_set_names, "{}: field_set_names", ctx);
         assert_eq!(a.pattern_ctor_names, b.pattern_ctor_names, "{}: pattern_ctor_names", ctx);
         assert_eq!(a.cast_target_types, b.cast_target_types, "{}: cast_target_types", ctx);
 
-        // ---- 类别 D 表 ----
-        // 这些类型未实现 PartialEq，手动比较
+        // ---- Category D tables ----
+        // These types do not implement PartialEq; compare manually.
         assert_eq!(a.closure_infos.len(), b.closure_infos.len(), "{}: closure_infos len", ctx);
         for i in 0..a.closure_infos.len() {
             match (&a.closure_infos[i], &b.closure_infos[i]) {
@@ -2030,8 +2041,8 @@ mod round_trip_tests {
             }
         }
 
-        // ---- 类别 E 表 ----
-        // ConstValues: Str 变体需通过 string_pool 比较实际字符串内容
+        // ---- Category E tables ----
+        // ConstValues: the Str variant must compare actual string content via the string_pool.
         assert_eq!(a.const_values.len(), b.const_values.len(), "{}: const_values len", ctx);
         for i in 0..a.const_values.len() {
             match (&a.const_values[i], &b.const_values[i]) {
@@ -2072,7 +2083,7 @@ mod round_trip_tests {
             }
         }
 
-        // RecordLitInfos — 未实现 PartialEq，手动比较
+        // RecordLitInfos — does not implement PartialEq; compare manually.
         assert_eq!(a.record_lit_infos.len(), b.record_lit_infos.len(), "{}: record_lit_infos len", ctx);
         for i in 0..a.record_lit_infos.len() {
             match (&a.record_lit_infos[i], &b.record_lit_infos[i]) {
@@ -2090,7 +2101,7 @@ mod round_trip_tests {
             }
         }
 
-        // SelectInfos — 未实现 PartialEq，手动比较
+        // SelectInfos — does not implement PartialEq; compare manually.
         assert_eq!(a.select_infos.len(), b.select_infos.len(), "{}: select_infos len", ctx);
         for i in 0..a.select_infos.len() {
             match (&a.select_infos[i], &b.select_infos[i]) {
@@ -2107,7 +2118,7 @@ mod round_trip_tests {
             }
         }
 
-        // TraitConstructInfos — 未实现 PartialEq，手动比较
+        // TraitConstructInfos — does not implement PartialEq; compare manually.
         assert_eq!(a.trait_construct_infos.len(), b.trait_construct_infos.len(), "{}: trait_construct_infos len", ctx);
         for i in 0..a.trait_construct_infos.len() {
             match (&a.trait_construct_infos[i], &b.trait_construct_infos[i]) {
@@ -2126,7 +2137,7 @@ mod round_trip_tests {
             }
         }
 
-        // RecordExtendInfos — 未实现 PartialEq，手动比较
+        // RecordExtendInfos — does not implement PartialEq; compare manually.
         assert_eq!(a.record_extend_infos.len(), b.record_extend_infos.len(), "{}: record_extend_infos len", ctx);
         for i in 0..a.record_extend_infos.len() {
             match (&a.record_extend_infos[i], &b.record_extend_infos[i]) {
@@ -2138,46 +2149,47 @@ mod round_trip_tests {
             }
         }
 
-        // String pool: 不直接比较原始字节。
-        // 原始图的 string_pool 可能只含 ConstValue::Str 预存字符串，
-        // 而类别 C/D/E 表用 owned String（序列化时 intern 到池中），
-        // 因此 loaded 图的池会包含更多字符串。正确性已由以下比较保证：
-        // - ConstValue::Str 的实际字符串内容比较（上文）
-        // - 类别 C/D/E 表的字符串字段比较（上文）
-        // 这里仅验证原始池中的字符串都能在 loaded 池中找到对应内容。
-        // （ConstValue::Str 已逐个验证，无需额外检查）
+        // String pool: raw bytes are not compared directly.
+        // The original graph's string_pool may contain only the pre-stored ConstValue::Str strings,
+        // while the Category C/D/E tables use owned Strings (interned into the pool during serialization),
+        // so the loaded graph's pool will contain more strings. Correctness is already ensured by the
+        // comparisons above:
+        // - ConstValue::Str actual string content comparison (above)
+        // - Category C/D/E table string field comparisons (above)
+        // Here we only verify that every string in the original pool can be found in the loaded pool.
+        // (ConstValue::Str is already verified individually; no extra check needed.)
 
-        // 运行时字段计数
+        // Runtime field counts
         assert_eq!(a.global_var_storage.len(), b.global_var_storage.len(), "{}: global_var_count", ctx);
         assert_eq!(a.memo_tables.len(), b.memo_tables.len(), "{}: memo_table_count", ctx);
     }
 
-    // ==================== 测试用例 ====================
+    // ==================== Test cases ====================
 
     #[test]
     fn test_round_trip_full() {
         let original = make_test_graph();
-        let bytes = serialize_resin(&original);
-        let loaded = load_resin_from_bytes(&bytes).expect("load failed");
+        let bytes = serialize_solidify(&original);
+        let loaded = load_solidify_from_bytes(&bytes).expect("load failed");
 
         assert_graphs_equal(&original, &loaded, "full round-trip");
     }
 
     #[test]
     fn test_round_trip_double_serialize() {
-        // 双重序列化验证：load → serialize → load → 比较
+        // Double-serialization verification: load -> serialize -> load -> compare.
         let original = make_test_graph();
-        let bytes1 = serialize_resin(&original);
-        let loaded1 = load_resin_from_bytes(&bytes1).expect("first load failed");
-        let bytes2 = serialize_resin(&loaded1);
-        let loaded2 = load_resin_from_bytes(&bytes2).expect("second load failed");
+        let bytes1 = serialize_solidify(&original);
+        let loaded1 = load_solidify_from_bytes(&bytes1).expect("first load failed");
+        let bytes2 = serialize_solidify(&loaded1);
+        let loaded2 = load_solidify_from_bytes(&bytes2).expect("second load failed");
 
         assert_graphs_equal(&loaded1, &loaded2, "double serialize");
     }
 
     #[test]
     fn test_const_value_all_variants() {
-        // 单独验证每个 ConstValue 变体的 round-trip
+        // Verifies the round-trip of each ConstValue variant individually.
         let variants = vec![
             ConstValue::I8(-128),
             ConstValue::I8(127),
@@ -2220,9 +2232,9 @@ mod round_trip_tests {
         ];
 
         for (i, cv) in variants.iter().enumerate() {
-            // 构造单节点图
+            // Build a single-node graph.
             let pool_bytes = if let ConstValue::Str { offset, len } = cv {
-                // Str 需要字符串池
+                // Str requires the string pool.
                 vec![b'a'; (offset + len) as usize]
             } else {
                 Vec::new()
@@ -2284,15 +2296,15 @@ mod round_trip_tests {
                 record_extend_info_offsets: Vec::new(),
             };
 
-            let bytes = serialize_resin(&graph);
-            let loaded = load_resin_from_bytes(&bytes).expect("load failed");
+            let bytes = serialize_solidify(&graph);
+            let loaded = load_solidify_from_bytes(&bytes).expect("load failed");
 
             match (&graph.const_values[0], &loaded.const_values[0]) {
                 (Some(a), Some(b)) => {
-                    // 特殊处理 NaN（NaN != NaN）
+                    // Special handling for NaN (NaN != NaN).
                     match (a, b) {
                         (ConstValue::F32(_), ConstValue::F32(_)) => {
-                            // 比较 bit pattern 而非值
+                            // Compare bit patterns rather than values.
                             let bits_a = if let ConstValue::F32(v) = a { v.to_bits() } else { 0 };
                             let bits_b = if let ConstValue::F32(v) = b { v.to_bits() } else { 0 };
                             assert_eq!(bits_a, bits_b, "variant[{}] F32 bits", i);
@@ -2312,8 +2324,8 @@ mod round_trip_tests {
 
     #[test]
     fn test_const_value_str_round_trip() {
-        // 专门验证 ConstValue::Str 的字符串内容 round-trip
-        let test_strings = vec!["", "a", "hello world", "中文测试", "🎉🚀", "a\nb\tc\\d\"e"];
+        // Verifies the round-trip of ConstValue::Str string content specifically.
+        let test_strings = vec!["", "a", "hello world", "chinese test", "🎉🚀", "a\nb\tc\\d\"e"];
         for s in test_strings {
             let mut pool = Vec::new();
             let offset = pool.len() as u32;
@@ -2377,10 +2389,10 @@ mod round_trip_tests {
                 record_extend_info_offsets: Vec::new(),
             };
 
-            let bytes = serialize_resin(&graph);
-            let loaded = load_resin_from_bytes(&bytes).expect("load failed");
+            let bytes = serialize_solidify(&graph);
+            let loaded = load_solidify_from_bytes(&bytes).expect("load failed");
 
-            // 验证字符串内容
+            // Verify string content.
             let cv = loaded.const_values[0].expect("const_value should exist");
             if let ConstValue::Str { offset: lo, len: ll } = cv {
                 let loaded_str = std::str::from_utf8(&loaded.string_pool[lo as usize..(lo + ll) as usize]).unwrap();
@@ -2389,7 +2401,7 @@ mod round_trip_tests {
                 panic!("expected Str variant, got {:?}", cv);
             }
 
-            // 验证 to_value 产生正确的 Value（Value::Ref(HeapObj::Str(KuzoStr))）
+            // Verify that to_value produces the correct Value (Value::Ref(HeapObj::Str(KuzoStr))).
             let v = cv.to_value(&loaded.string_pool);
             match &v {
                 crate::value::Value::Ref(arc) => {
@@ -2407,7 +2419,7 @@ mod round_trip_tests {
 
     #[test]
     fn test_empty_graph_round_trip() {
-        // 空图边界情况（0 节点）
+        // Empty-graph edge case (0 nodes).
         let graph = DataFlowGraph {
             nodes: vec![],
             inputs_pool: InputsPool::new(),
@@ -2458,14 +2470,14 @@ mod round_trip_tests {
             record_extend_info_offsets: Vec::new(),
         };
 
-        let bytes = serialize_resin(&graph);
-        let loaded = load_resin_from_bytes(&bytes).expect("load failed");
+        let bytes = serialize_solidify(&graph);
+        let loaded = load_solidify_from_bytes(&bytes).expect("load failed");
         assert_graphs_equal(&graph, &loaded, "empty graph");
     }
 
     #[test]
     fn test_bitmap_boundary() {
-        // 测试布尔表 bitmap 边界：1/8/9/16 个节点
+        // Tests boolean-table bitmap boundaries: 1/8/9/16 nodes.
         for n in [1usize, 7, 8, 9, 15, 16, 17] {
             let all_true = vec![true; n];
             let all_false = vec![false; n];
@@ -2529,8 +2541,8 @@ mod round_trip_tests {
                     record_extend_info_offsets: Vec::new(),
                 };
 
-                let bytes = serialize_resin(&graph);
-                let loaded = load_resin_from_bytes(&bytes).expect("load failed");
+                let bytes = serialize_solidify(&graph);
+                let loaded = load_solidify_from_bytes(&bytes).expect("load failed");
 
                 assert_eq!(loaded.tail_call_flags, *flags, "n={} {}: tail_call_flags", n, name);
                 assert_eq!(loaded.safe_op_flags, *flags, "n={} {}: safe_op_flags", n, name);
@@ -2542,12 +2554,12 @@ mod round_trip_tests {
 
     #[test]
     fn test_subgraph_varlen_fields() {
-        // 专门验证 SubGraph 所有变长字段的 round-trip
+        // Verifies the round-trip of all SubGraph variable-length fields specifically.
         let original = make_test_graph();
-        let bytes = serialize_resin(&original);
-        let loaded = load_resin_from_bytes(&bytes).expect("load failed");
+        let bytes = serialize_solidify(&original);
+        let loaded = load_solidify_from_bytes(&bytes).expect("load failed");
 
-        // sg[0]: 含 event_decls(2) + defer_table(2, 含 captured) + upvalue_nodes(1) + nested_ranges(2) + reset_plan
+        // sg[0]: contains event_decls(2) + defer_table(2, with captured) + upvalue_nodes(1) + nested_ranges(2) + reset_plan
         let sg0 = &loaded.subgraphs[0];
         assert_eq!(sg0.event_source_decls.len(), 2);
         assert_eq!(sg0.event_source_decls[0].kind, EventSourceKind::Channel);
@@ -2555,7 +2567,7 @@ mod round_trip_tests {
         assert_eq!(sg0.defer_table.len(), 2);
         assert_eq!(sg0.defer_table[0].captured_inputs, vec![NodeId(0), NodeId(1)]);
         assert!(sg0.defer_table[0].captured_inputs.len() == 2);
-        assert_eq!(sg0.defer_table[1].captured_inputs.len(), 0); // 空 captured
+        assert_eq!(sg0.defer_table[1].captured_inputs.len(), 0); // empty captured
         assert_eq!(sg0.upvalue_outer_nodes, vec![NodeId(3)]);
         assert_eq!(sg0.nested_ranges, vec![(11, 13), (14, 16)]);
         assert!(sg0.reset_plan.is_some());
@@ -2564,7 +2576,7 @@ mod round_trip_tests {
         assert_eq!(rp.reset_to_one, vec![NodeId(12)]);
         assert_eq!(rp.reset_condition_tree, vec![NodeId(4)]);
 
-        // sg[1]: 所有变长字段为空，无 reset_plan
+        // sg[1]: all variable-length fields empty, no reset_plan
         let sg1 = &loaded.subgraphs[1];
         assert!(sg1.event_source_decls.is_empty());
         assert!(sg1.defer_table.is_empty());
@@ -2572,23 +2584,23 @@ mod round_trip_tests {
         assert!(sg1.nested_ranges.is_empty());
         assert!(sg1.reset_plan.is_none());
 
-        // sg[2]: 含 event_decls(1) + upvalue_nodes(2) + reset_plan(仅 reset_to_one)
+        // sg[2]: contains event_decls(1) + upvalue_nodes(2) + reset_plan (only reset_to_one)
         let sg2 = &loaded.subgraphs[2];
         assert_eq!(sg2.event_source_decls.len(), 1);
         assert_eq!(sg2.event_source_decls[0].kind, EventSourceKind::AsyncJoin);
         assert_eq!(sg2.upvalue_outer_nodes, vec![NodeId(0), NodeId(1)]);
         assert!(sg2.reset_plan.is_some());
         let rp2 = sg2.reset_plan.as_ref().unwrap();
-        assert!(rp2.reset_to_zero.is_empty()); // 空数组
+        assert!(rp2.reset_to_zero.is_empty()); // empty array
         assert_eq!(rp2.reset_to_one, vec![NodeId(12)]);
-        assert!(rp2.reset_condition_tree.is_empty()); // 空数组
+        assert!(rp2.reset_condition_tree.is_empty()); // empty array
     }
 
     #[test]
     fn test_gate_branches_varlen() {
         let original = make_test_graph();
-        let bytes = serialize_resin(&original);
-        let loaded = load_resin_from_bytes(&bytes).expect("load failed");
+        let bytes = serialize_solidify(&original);
+        let loaded = load_solidify_from_bytes(&bytes).expect("load failed");
 
         let gb = loaded.gate_branches[8].as_ref().expect("gate_branches[8]");
         assert_eq!(gb.condition_input, NodeId(4));
@@ -2601,7 +2613,7 @@ mod round_trip_tests {
         assert_eq!(gb.branches[1].0, false);
         assert_eq!(gb.branches[1].1, SubGraphId(2));
         assert_eq!(gb.branches[1].2, vec![NodeId(2)]);
-        // branch 2: true, sg=0, inputs=[] (空)
+        // branch 2: true, sg=0, inputs=[] (empty)
         assert_eq!(gb.branches[2].0, true);
         assert_eq!(gb.branches[2].1, SubGraphId(0));
         assert!(gb.branches[2].2.is_empty());
@@ -2610,8 +2622,8 @@ mod round_trip_tests {
     #[test]
     fn test_select_info_varlen() {
         let original = make_test_graph();
-        let bytes = serialize_resin(&original);
-        let loaded = load_resin_from_bytes(&bytes).expect("load failed");
+        let bytes = serialize_solidify(&original);
+        let loaded = load_solidify_from_bytes(&bytes).expect("load failed");
 
         let si = loaded.select_infos[15].as_ref().expect("select_infos[15]");
         assert_eq!(si.branches.len(), 2);
@@ -2626,8 +2638,8 @@ mod round_trip_tests {
     #[test]
     fn test_trait_construct_info_varlen() {
         let original = make_test_graph();
-        let bytes = serialize_resin(&original);
-        let loaded = load_resin_from_bytes(&bytes).expect("load failed");
+        let bytes = serialize_solidify(&original);
+        let loaded = load_solidify_from_bytes(&bytes).expect("load failed");
 
         let ti = loaded.trait_construct_infos[14].as_ref().expect("trait_construct_infos[14]");
         assert_eq!(ti.trait_name, "MyTrait");
@@ -2644,14 +2656,14 @@ mod round_trip_tests {
     #[test]
     fn test_record_lit_info_varlen() {
         let original = make_test_graph();
-        let bytes = serialize_resin(&original);
-        let loaded = load_resin_from_bytes(&bytes).expect("load failed");
+        let bytes = serialize_solidify(&original);
+        let loaded = load_solidify_from_bytes(&bytes).expect("load failed");
 
         let ri = loaded.record_lit_infos[14].as_ref().expect("record_lit_infos[14]");
         assert_eq!(ri.type_name, "MyType");
         assert_eq!(ri.field_names.len(), 3);
         assert_eq!(ri.field_names[0], Some("x".to_string()));
-        assert_eq!(ri.field_names[1], None); // None 字段名
+        assert_eq!(ri.field_names[1], None); // None field name
         assert_eq!(ri.field_names[2], Some("z".to_string()));
         assert_eq!(ri.constructor, "Ctor");
         assert_eq!(ri.kind, RecordLitKind::Adt);
@@ -2660,14 +2672,14 @@ mod round_trip_tests {
     #[test]
     fn test_downstreams_csr() {
         let original = make_test_graph();
-        let bytes = serialize_resin(&original);
-        let loaded = load_resin_from_bytes(&bytes).expect("load failed");
+        let bytes = serialize_solidify(&original);
+        let loaded = load_solidify_from_bytes(&bytes).expect("load failed");
 
         assert_eq!(loaded.downstreams.len(), 16);
-        // 非空下游
+        // non-empty downstreams
         assert_eq!(loaded.downstreams[0], vec![NodeId(4)]);
         assert_eq!(loaded.downstreams[4], vec![NodeId(5), NodeId(7), NodeId(8)]);
-        // 空下游
+        // empty downstreams
         assert!(loaded.downstreams[2].is_empty());
         assert!(loaded.downstreams[6].is_empty());
         assert!(loaded.downstreams[15].is_empty());
@@ -2676,16 +2688,16 @@ mod round_trip_tests {
     #[test]
     fn test_crc_corruption_detection() {
         let original = make_test_graph();
-        let mut bytes = serialize_resin(&original);
+        let mut bytes = serialize_solidify(&original);
 
-        // 篡改 body 中的一个字节（跳过 header 的 crc32 字段）
-        // header 是 64B，篡改 body 部分
-        let corrupt_pos = 100; // 在 body 区域内
+        // Corrupt one byte in the body (skipping the header's crc32 field).
+        // The header is 64B; corrupt the body region.
+        let corrupt_pos = 100; // within the body region
         if corrupt_pos < bytes.len() {
             bytes[corrupt_pos] ^= 0xFF;
         }
 
-        let result = load_resin_from_bytes(&bytes);
+        let result = load_solidify_from_bytes(&bytes);
         assert!(result.is_err(), "corrupted file should be rejected");
         let err_msg = match result {
             Err(e) => e.to_string(),
@@ -2697,12 +2709,12 @@ mod round_trip_tests {
     #[test]
     fn test_magic_detection() {
         let original = make_test_graph();
-        let mut bytes = serialize_resin(&original);
+        let mut bytes = serialize_solidify(&original);
 
-        // 篡改 magic
+        // Corrupt the magic.
         bytes[0] = b'X';
 
-        let result = load_resin_from_bytes(&bytes);
+        let result = load_solidify_from_bytes(&bytes);
         assert!(result.is_err(), "bad magic should be rejected");
     }
 }

@@ -1,8 +1,8 @@
-//! Analyzer.rs — Sema 后静态分析器
+//! Analyzer.rs — post-Sema static analyzer
 //!
-//! 产出 AnalysisReport：死代码/死变量/死函数 + 记忆化策略。
-//! 三层多 pass 管线，rayon 并行。类型驱动副作用判定。
-//! 详见 docs/superpowers/specs/2026-08-03-analyzer-design.md
+//! Produces AnalysisReport: dead code/dead variables/dead functions + memoization strategy.
+//! Three-layer multi-pass pipeline with rayon parallelism. Type-driven side-effect classification.
+//! See docs/superpowers/specs/2026-08-03-analyzer-design.md
 
 use crate::ast::Ast::{
     AstArena, Decl, Expr, ExprId, InterpolationPart, LambdaBody, Module, Pattern, PatternId,
@@ -13,63 +13,63 @@ use crate::types::dynamic_type_id;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 // =========================================================================
-// 句柄类型（DOD 风格，与 Ast.rs 的 ExprId/StmtId 一致）
+// Handle types (DOD style, consistent with ExprId/StmtId in Ast.rs)
 // =========================================================================
 
-/// 函数索引（指向 Module.declarations 的下标）
+/// Function index (index into Module.declarations).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FuncId(pub u32);
 
-/// 变量定义点索引（指向 DefUseGraph.defs）
+/// Variable definition site index (index into DefUseGraph.defs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VarId(pub u32);
 
-/// 使用点索引（指向 DefUseGraph.uses）
+/// Use site index (index into DefUseGraph.uses).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UseId(pub u32);
 
 // =========================================================================
-// DefUseGraph — def-use 链 + 活跃变量
+// DefUseGraph — def-use chains + live variables
 // =========================================================================
 
-/// 变量定义点。
+/// Variable definition site.
 #[derive(Debug, Clone)]
 pub struct DefNode {
     pub name: String,
-    /// 定义语句（ValDecl/VarDecl）或赋值（Assignment）所在 StmtId。
-    /// 参数无对应语句，用 StmtId(0) 占位。
+    /// The StmtId of the defining statement (ValDecl/VarDecl) or assignment.
+    /// Parameters have no corresponding statement; StmtId(0) is used as a placeholder.
     pub stmt: StmtId,
-    /// 所在函数
+    /// Containing function.
     pub func: FuncId,
-    /// 是否可变绑定（var / 赋值目标）
+    /// Whether this is a mutable binding (var / assignment target).
     pub is_mutable: bool,
 }
 
-/// 变量使用点。
+/// Variable use site.
 #[derive(Debug, Clone)]
 pub struct UseNode {
     pub var: VarId,
-    /// 读取所在表达式
+    /// Expression containing the read.
     pub expr: ExprId,
-    /// 所在函数
+    /// Containing function.
     pub func: FuncId,
 }
 
-/// 每个函数内的 def-use 链 + 活跃变量集。
+/// Per-function def-use chains and live variable sets.
 #[derive(Debug, Default)]
 pub struct DefUseGraph {
     pub defs: Vec<DefNode>,
     pub uses: Vec<UseNode>,
-    /// VarId -> 使用点列表
+    /// VarId -> list of use sites.
     pub def_to_uses: Vec<Vec<UseId>>,
-    /// 变量名 -> 定义点（同一函数内最近定义）。key = (func, name)
+    /// Variable name -> definition site (most recent definition within the same function). key = (func, name).
     pub name_to_def: FxHashMap<(FuncId, String), VarId>,
-    /// 函数入口活跃集（参数）
+    /// Live-in set at function entry (parameters).
     pub live_in: FxHashMap<FuncId, FxHashSet<VarId>>,
-    /// 函数出口活跃集（本分析中恒为空，预留）
+    /// Live-out set at function exit (always empty in this analysis, reserved).
     pub live_out: FxHashMap<FuncId, FxHashSet<VarId>>,
-    /// 全局变量名集合（顶层 VarDecl/ValDecl）。函数内对全局变量的赋值
-    /// 不注册局部定义点，避免被误判为死变量。
+    /// Set of global variable names (top-level VarDecl/ValDecl). Assignments to global
+    /// variables inside functions do not register local definition sites, avoiding false dead-variable detection.
     pub global_vars: FxHashSet<String>,
 }
 
@@ -78,7 +78,7 @@ impl DefUseGraph {
         Self::default()
     }
 
-    /// 注册一个变量定义，返回其 VarId。
+    /// Registers a variable definition and returns its VarId.
     pub fn add_def(&mut self, name: &str, stmt: StmtId, func: FuncId, is_mutable: bool) -> VarId {
         let id = VarId(self.defs.len() as u32);
         self.defs.push(DefNode {
@@ -92,7 +92,7 @@ impl DefUseGraph {
         id
     }
 
-    /// 注册一个变量使用点。
+    /// Registers a variable use site.
     pub fn add_use(&mut self, var: VarId, expr: ExprId, func: FuncId) -> UseId {
         let id = UseId(self.uses.len() as u32);
         self.uses.push(UseNode { var, expr, func });
@@ -100,19 +100,20 @@ impl DefUseGraph {
         id
     }
 
-    /// 查询函数内某变量名的当前定义点。
+    /// Looks up the current definition site of a variable name within a function.
     pub fn lookup(&self, func: FuncId, name: &str) -> Option<VarId> {
         self.name_to_def.get(&(func, name.to_string())).copied()
     }
 
-    /// 该变量是否从未被读取。
+    /// Whether this variable is never read.
     pub fn is_never_read(&self, var: VarId) -> bool {
         self.def_to_uses[var.0 as usize].is_empty()
     }
 
-    /// 检查函数内某变量名是否有任何使用点（跨所有定义点）。
-    /// 用于闭包捕获的可变变量：赋值创建的新定义点可能无使用点，
-    /// 但同名变量在旧定义点有使用点（闭包读取），不应判为死变量。
+    /// Checks whether a variable name has any use site within a function (across all definition sites).
+    /// Used for closure-captured mutable variables: a new definition site created by assignment may
+    /// have no use site, but the same-named variable has use sites at the old definition site (closure
+    /// read), so it should not be classified as dead.
     pub fn is_name_ever_read(&self, func: FuncId, name: &str) -> bool {
         for (i, def) in self.defs.iter().enumerate() {
             if def.func == func && def.name == name {
@@ -126,66 +127,66 @@ impl DefUseGraph {
 }
 
 // =========================================================================
-// CallGraph — 调用图 + 递归检测
+// CallGraph — call graph + recursion detection
 // =========================================================================
 
-/// 函数可达性保留原因。
+/// Reason a function is retained as reachable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReachableReason {
-    // ── 确定入口（一定可达，永不消除）──
+    // -- Definite entry points (always reachable, never eliminated) --
     /// is_entry=true
     Entry,
-    /// extern_c_body 非 None
+    /// extern_c_body is not None
     ExternC,
-    /// @extern 属性
+    /// @extern attribute
     ExternAttr,
-    // ── 保守入口（可能可达，不消除但标记原因）──
-    /// trait 方法
+    // -- Conservative entry points (possibly reachable, retained but reason tagged) --
+    /// trait method
     TraitMethod,
-    /// 类型方法（impl 块内方法）
+    /// type method (method inside an impl block)
     TypeMethod,
-    /// public 可见性
+    /// public visibility
     Public,
-    // ── 可达性传播结果 ──
-    /// 被某可达函数调用
+    // -- Reachability propagation results --
+    /// Called by a reachable function
     CalledBy(FuncId),
-    /// 被记忆化候选依赖
+    /// Required by a memoization candidate dependency
     MemoDependency,
 }
 
 impl ReachableReason {
-    /// 确定入口：永不可达性分析消除。
+    /// Definite entry: never eliminated by reachability analysis.
     pub fn is_definite(&self) -> bool {
         matches!(self, Self::Entry | Self::ExternC | Self::ExternAttr)
     }
-    /// 保守入口：单模块分析时不消除，未来跨模块分析可降级。
+    /// Conservative entry: not eliminated during single-module analysis; may be downgraded by cross-module analysis.
     pub fn is_conservative(&self) -> bool {
         matches!(self, Self::TraitMethod | Self::TypeMethod | Self::Public)
     }
 }
 
-/// 调用图。
+/// Call graph.
 #[derive(Debug, Default)]
 pub struct CallGraph {
     pub nodes: Vec<FuncId>,
     /// caller -> [callee]
     pub edges: FxHashMap<FuncId, Vec<FuncId>>,
-    /// callee -> [callers]（逆向图）
+    /// callee -> [callers] (reverse graph)
     pub reverse: FxHashMap<FuncId, Vec<FuncId>>,
-    /// 直接递归函数
+    /// Directly recursive functions
     pub recursive: FxHashSet<FuncId>,
-    /// 相互递归的 SCC（强连通分量）
+    /// Mutually recursive SCCs (strongly connected components)
     pub mutually_recursive: Vec<FxHashSet<FuncId>>,
-    /// 入口/保留原因
+    /// Entry/retention reasons
     pub entry_reasons: FxHashMap<FuncId, ReachableReason>,
-    /// 函数名 -> FuncId（FunDecl 名 + 方法 mangled 名 "Type.method"）
+    /// Function name -> FuncId (FunDecl name + mangled method name "Type.method")
     pub name_to_func: FxHashMap<String, FuncId>,
-    /// 调用点 ExprId -> 被调函数 FuncId
-    /// 仅记录 callee 为本模块已知函数的调用点（外部函数不记录）
+    /// Call site ExprId -> callee FuncId.
+    /// Only records call sites whose callee is a known function in this module (external functions are not recorded).
     pub call_sites: FxHashMap<ExprId, FuncId>,
-    /// 方法 FuncId -> (decl_idx, method_idx)，用于从 module.declarations 定位方法体
+    /// Method FuncId -> (decl_idx, method_idx), used to locate method bodies from module.declarations.
     pub func_to_method_loc: FxHashMap<FuncId, (usize, usize)>,
-    /// 方法 FuncId 集合（快速判定 FuncId 是否为方法）
+    /// Set of method FuncIds (fast check for whether a FuncId is a method).
     pub method_func_ids: FxHashSet<FuncId>,
 }
 
@@ -194,7 +195,7 @@ impl CallGraph {
         Self::default()
     }
 
-    /// 添加调用边 caller -> callee（去重）。
+    /// Adds a call edge caller -> callee (deduplicated).
     pub fn add_edge(&mut self, caller: FuncId, callee: FuncId) {
         let v = self.edges.entry(caller).or_default();
         if !v.contains(&callee) {
@@ -206,17 +207,17 @@ impl CallGraph {
         }
     }
 
-    /// 判定 FuncId 是否为方法（而非 FunDecl）。
+    /// Whether the given FuncId is a method (rather than a FunDecl).
     #[inline]
     pub fn is_method(&self, func: FuncId) -> bool {
         self.method_func_ids.contains(&func)
     }
 
-    /// 通过 FuncId 获取函数/方法的元数据（统一入口，消除 FunDecl/Method 分散遍历）。
-    /// FunDecl → FuncId = decl_idx；Method → 通过 func_to_method_loc 定位。
+    /// Retrieves function/method metadata by FuncId (unified entry point, eliminating scattered FunDecl/Method traversal).
+    /// FunDecl -> FuncId = decl_idx; Method -> located via func_to_method_loc.
     pub fn get_func_meta<'a>(&self, func: FuncId, module: &'a Module) -> Option<FuncMetaRef<'a>> {
         if let Some(&(decl_idx, method_idx)) = self.func_to_method_loc.get(&func) {
-            // 方法
+            // Method
             let decl = module.declarations.get(decl_idx)?;
             if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &decl.node {
                 let method = methods.get(method_idx)?;
@@ -255,8 +256,8 @@ impl CallGraph {
         }
     }
 
-    /// 遍历所有函数（FunDecl + Method），返回 (FuncId, FuncMetaRef)。
-    /// 所有 pass 用此方法统一遍历，无需分别处理 FunDecl 和 TypeDecl.methods。
+    /// Iterates over all functions (FunDecl + Method), returning (FuncId, FuncMetaRef).
+    /// All passes use this method for unified traversal without separately handling FunDecl and TypeDecl.methods.
     pub fn iter_funcs<'a>(&'a self, module: &'a Module) -> impl Iterator<Item = (FuncId, FuncMetaRef<'a>)> + 'a {
         self.nodes.iter().filter_map(move |&fid| {
             self.get_func_meta(fid, module).map(|meta| (fid, meta))
@@ -264,16 +265,16 @@ impl CallGraph {
     }
 }
 
-/// 函数种类：FunDecl 或 Method。
+/// Function kind: FunDecl or Method.
 #[derive(Debug, Clone, Copy)]
 pub enum FuncKind<'a> {
-    /// FunDecl，值为 declarations 索引
+    /// FunDecl; value is the declarations index.
     Fun(usize),
-    /// Method，值为 (type_name, method_idx)
+    /// Method; value is (type_name, method_idx).
     Method(&'a str, usize),
 }
 
-/// 函数元数据引用（统一 FunDecl 和 Method 的访问）。
+/// Function metadata reference (unified access for FunDecl and Method).
 #[derive(Debug, Clone, Copy)]
 pub struct FuncMetaRef<'a> {
     pub name: &'a str,
@@ -282,25 +283,25 @@ pub struct FuncMetaRef<'a> {
     pub is_async: bool,
     pub visibility: crate::ast::Ast::Visibility,
     pub is_entry: bool,
-    /// 方法的 self 类型名（FunDecl 为 None）
+    /// Self type name for methods (None for FunDecl).
     pub self_type: Option<&'a str>,
     pub func_kind: FuncKind<'a>,
 }
 
 // =========================================================================
-// PurityTable / EscapeTable — Layer 2 产出
+// PurityTable / EscapeTable — Layer 2 outputs
 // =========================================================================
 
-/// 函数纯度。
+/// Function purity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purity {
-    /// 纯函数：无副作用，结果仅依赖参数，可记忆化
+    /// Pure function: no side effects, result depends only on arguments, can be memoized.
     Pure,
-    /// 非纯：有 I/O/并发/通信副作用
+    /// Impure: has I/O/concurrency/communication side effects.
     Impure,
 }
 
-/// 纯度表：FuncId -> Purity。
+/// Purity table: FuncId -> Purity.
 #[derive(Debug, Default)]
 pub struct PurityTable {
     pub map: FxHashMap<FuncId, Purity>,
@@ -321,25 +322,25 @@ impl PurityTable {
     }
 }
 
-/// 变量/分配逃逸信息。
+/// Variable/allocation escape information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscapeInfo {
-    /// 不逃逸：仅在函数内使用，分配可消除（若未使用）
+    /// Does not escape: only used within the function; allocation can be eliminated (if unused).
     NoEscape,
-    /// 逃逸：带种类标记
+    /// Escapes: tagged with escape kind.
     Escapes(EscapeKind),
 }
 
-/// 逃逸种类。
+/// Escape kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscapeKind {
-    /// 堆分配逃逸（ArrayLit/RecordLit/RecordExtend）→ stack_alloc 优化
+    /// Heap allocation escape (ArrayLit/RecordLit/RecordExtend) -> stack_alloc optimization.
     Alloc,
-    /// Lambda 逃逸（尾位置返回 / 循环体捕获）→ 独立 function_id 走 Cell 路径
+    /// Lambda escape (tail position return / loop body capture) -> independent function_id via Cell path.
     Lambda { loop_body_capture: bool },
 }
 
-/// 逃逸表：ExprId(分配点) -> EscapeInfo。
+/// Escape table: ExprId (allocation site) -> EscapeInfo.
 #[derive(Debug, Default)]
 pub struct EscapeTable {
     pub map: FxHashMap<ExprId, EscapeInfo>,
@@ -361,23 +362,23 @@ impl EscapeTable {
 }
 
 // =========================================================================
-// SideEffect — 类型驱动的副作用判定
+// SideEffect — type-driven side-effect classification
 // =========================================================================
 
-/// 表达式副作用分类。
+/// Expression side-effect classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SideEffect {
-    /// 无副作用，可消除
+    /// No side effects; can be eliminated.
     Pure,
-    /// 有副作用，不可消除
+    /// Has side effects; cannot be eliminated.
     Impure,
-    /// 分配但不逃逸，无外部可观察副作用
+    /// Allocates but does not escape; no externally observable side effects.
     AllocNoEscape,
 }
 
-/// 通过 sema.expr_types 解析方法调用的接收者类型，构造 mangled 名 `TypeName.method`。
+/// Resolves the receiver type of a method call via sema.expr_types and constructs the mangled name `TypeName.method`.
 ///
-/// 用于调用图边构建与副作用判定。返回 None 表示无法解析接收者类型。
+/// Used for call graph edge construction and side-effect classification. Returns None if the receiver type cannot be resolved.
 fn resolve_method_mangled(recv: ExprId, method: &str, module_name: &str, sema: &SemaResult) -> Option<String> {
     let key = module_expr_key(module_name, recv.0 as u64);
     let info = sema.expr_types.get(&key)?;
@@ -385,11 +386,11 @@ fn resolve_method_mangled(recv: ExprId, method: &str, module_name: &str, sema: &
     Some(format!("{}.{}", type_name, method))
 }
 
-/// 判定单个表达式的副作用。
+/// Classifies the side effect of a single expression.
 ///
-/// 递归判定子表达式：仅当所有子表达式均为 Pure/AllocNoEscape 时才可能为 Pure。
-/// 函数调用查 PurityTable；分配查 EscapeTable；字段访问查 Ty 可变性。
-/// 方法调用通过 sema 解析实现函数，查其纯度。
+/// Recursively classifies sub-expressions: only when all sub-expressions are Pure/AllocNoEscape can the result be Pure.
+/// Function calls consult the PurityTable; allocations consult the EscapeTable; field accesses consult Ty mutability.
+/// Method calls resolve the implementation function via sema and check its purity.
 pub fn classify_side_effect(
     expr_id: ExprId,
     arena: &AstArena,
@@ -401,7 +402,7 @@ pub fn classify_side_effect(
 ) -> SideEffect {
     let expr = &arena.expr(expr_id).node;
     match expr {
-        // ── 纯叶子 ──
+        // -- Pure leaves --
         Expr::IntLit { .. }
         | Expr::FloatLit { .. }
         | Expr::BoolLit(_)
@@ -411,7 +412,7 @@ pub fn classify_side_effect(
         | Expr::VoidLit
         | Expr::Ident(_) => SideEffect::Pure,
 
-        // ── 纯一元运算（递归判定操作数）──
+        // -- Pure unary operations (recursively classify operand) --
         Expr::Unary { operand, .. } => classify_side_effect(
             *operand, arena, module_name, sema, purity, escape, func_name_to_id,
         ),
@@ -419,14 +420,14 @@ pub fn classify_side_effect(
             *inner, arena, module_name, sema, purity, escape, func_name_to_id,
         ),
 
-        // ── 二元运算（递归判定两侧）──
+        // -- Binary operations (recursively classify both sides) --
         Expr::Binary { lhs, rhs, .. } => {
             let l = classify_side_effect(*lhs, arena, module_name, sema, purity, escape, func_name_to_id);
             let r = classify_side_effect(*rhs, arena, module_name, sema, purity, escape, func_name_to_id);
             combine(l, r)
         }
 
-        // ── if 表达式：条件 + 分支均纯才纯 ──
+        // -- if expression: pure only if condition + branches are all pure --
         Expr::If { cond, then_branch, else_branch } => {
             let c = classify_side_effect(*cond, arena, module_name, sema, purity, escape, func_name_to_id);
             let t = classify_side_effect(*then_branch, arena, module_name, sema, purity, escape, func_name_to_id);
@@ -437,7 +438,7 @@ pub fn classify_side_effect(
             acc
         }
 
-        // ── 块：所有语句 + trailing 均纯才纯 ──
+        // -- Block: pure only if all statements + trailing are pure --
         Expr::Block { stmts, trailing } => {
             let mut acc = SideEffect::Pure;
             for s in stmts {
@@ -452,15 +453,15 @@ pub fn classify_side_effect(
             acc
         }
 
-        // ── 字段访问：接收者纯即视为纯 ──
+        // -- Field access: pure if receiver is pure --
         Expr::FieldAccess { recv, .. } | Expr::SafeAccess { recv, .. } => classify_side_effect(
             *recv, arena, module_name, sema, purity, escape, func_name_to_id,
         ),
 
-        // ── 函数调用：查 PurityTable（含 sema 的 is_async/is_throwing 检查）──
+        // -- Function call: consult PurityTable (includes sema is_async/is_throwing checks) --
         Expr::Call { callee, args, .. } => {
             let callee_purity = if let Expr::Ident(name) = &arena.expr(*callee).node {
-                // sema 查 FuncSigInfo：async/throwing 函数一律视为非纯
+                // sema FuncSigInfo lookup: async/throwing functions are always impure
                 if let Some(sig) = sema.get_func_sig(*name) {
                     if sig.is_async || sig.is_throwing {
                         return SideEffect::Impure;
@@ -482,12 +483,12 @@ pub fn classify_side_effect(
             }
         }
 
-        // ── 方法调用：通过 sema 解析实现函数，查其纯度 ──
+        // -- Method call: resolve implementation function via sema and check its purity --
         Expr::MethodCall { recv, method, args, .. } | Expr::SafeMethodCall { recv, method, args, .. } => {
-            // 通过 sema 解析接收者类型 → mangled 名 TypeName.method → 查纯度
+            // Resolve receiver type via sema -> mangled name TypeName.method -> check purity
             let mangled = resolve_method_mangled(*recv, *method, module_name, sema);
             let callee_purity = mangled.as_deref().and_then(|name| {
-                // sema 查 MethodSigInfo：async/throwing 方法一律非纯
+                // sema MethodSigInfo lookup: async/throwing methods are always impure
                 if let Some(dot) = name.rfind('.') {
                     let type_name = &name[..dot];
                     if let Some(method_idx) = sema.lookup_method_idx(type_name, method) {
@@ -513,7 +514,7 @@ pub fn classify_side_effect(
             }
         }
 
-        // ── 分配（数组/记录字面量）：查 EscapeTable ──
+        // -- Allocations (array/record literals): consult EscapeTable --
         Expr::ArrayLit { elements, fill } => {
             let mut acc = if escape.is_no_escape(expr_id) {
                 SideEffect::AllocNoEscape
@@ -562,14 +563,14 @@ pub fn classify_side_effect(
             acc
         }
 
-        // ── Elvis：两侧均纯才纯 ──
+        // -- Elvis: pure only if both sides are pure --
         Expr::Elvis { lhs, rhs } => {
             let l = classify_side_effect(*lhs, arena, module_name, sema, purity, escape, func_name_to_id);
             let r = classify_side_effect(*rhs, arena, module_name, sema, purity, escape, func_name_to_id);
             combine(l, r)
         }
 
-        // ── 一律视为有副作用 ──
+        // -- Always treated as having side effects --
         Expr::StrInterp(_)
         | Expr::Assign { .. }
         | Expr::CompoundAssign { .. }
@@ -585,7 +586,7 @@ pub fn classify_side_effect(
     }
 }
 
-/// 判定语句的副作用。
+/// Classifies the side effect of a statement.
 fn classify_stmt_side_effect(
     stmt_id: StmtId,
     arena: &AstArena,
@@ -605,7 +606,7 @@ fn classify_stmt_side_effect(
     }
 }
 
-/// 合并两个副作用分类：任一 Impure 则 Impure；否则 AllocNoEscape 优先于 Pure。
+/// Combines two side-effect classifications: if either is Impure, the result is Impure; otherwise AllocNoEscape takes precedence over Pure.
 fn combine(a: SideEffect, b: SideEffect) -> SideEffect {
     match (a, b) {
         (SideEffect::Impure, _) | (_, SideEffect::Impure) => SideEffect::Impure,
@@ -614,20 +615,21 @@ fn combine(a: SideEffect, b: SideEffect) -> SideEffect {
     }
 }
 
-/// 判定表达式是否无副作用（Pure 或 AllocNoEscape 均视为可消除）。
+/// Whether the expression has no side effects (Pure or AllocNoEscape are both considered eliminable).
 pub fn is_side_effect_free(s: SideEffect) -> bool {
     s != SideEffect::Impure
 }
 
 // =========================================================================
-// DefUseBuilder — Layer 1：构建 def-use 图
+// DefUseBuilder — Layer 1: build def-use graph
 // =========================================================================
 
-/// 构建 def-use 图。遍历每个函数体，收集 ValDecl/VarDecl/Assignment 定义点
-/// 与 Ident 使用点。全局变量（顶层 VarDecl/ValDecl）的函数内赋值不注册局部定义点。
+/// Builds the def-use graph. Traverses each function body, collecting ValDecl/VarDecl/Assignment definition
+/// sites and Ident use sites. Assignments to global variables (top-level VarDecl/ValDecl) inside functions
+/// do not register local definition sites.
 pub fn build_def_use(module: &Module, arena: &AstArena) -> DefUseGraph {
     let mut graph = DefUseGraph::new();
-    // 收集全局变量名（顶层 ExprDecl 中嵌套的 VarDecl/ValDecl）
+    // Collect global variable names (VarDecl/ValDecl nested in top-level ExprDecl)
     for decl in &module.declarations {
         if let Decl::ExprDecl { stmt: Some(stmt_id), .. } = &decl.node {
             let stmt = &arena.stmt(*stmt_id).node;
@@ -639,10 +641,10 @@ pub fn build_def_use(module: &Module, arena: &AstArena) -> DefUseGraph {
     for (idx, decl) in module.declarations.iter().enumerate() {
         if let Decl::FunDecl { params, body, .. } = &decl.node {
             let func = FuncId(idx as u32);
-            // 参数作为入口活跃变量与定义点（参数默认不可变）
+            // Parameters as entry live variables and definition sites (parameters are immutable by default)
             let mut live = FxHashSet::default();
             for p in params {
-                // 参数无对应语句，用 StmtId(u32::MAX) 占位，DeadVarPass 据此跳过
+                // Parameters have no corresponding statement; use StmtId(u32::MAX) as placeholder; DeadVarPass skips based on this
                 let v = graph.add_def(p.name, StmtId(u32::MAX), func, false);
                 live.insert(v);
             }
@@ -653,7 +655,7 @@ pub fn build_def_use(module: &Module, arena: &AstArena) -> DefUseGraph {
     graph
 }
 
-/// 递归收集表达式中的 def-use。
+/// Recursively collects def-use information in an expression.
 fn collect_def_use_expr(expr_id: ExprId, arena: &AstArena, func: FuncId, graph: &mut DefUseGraph) {
     let expr = &arena.expr(expr_id).node;
     match expr {
@@ -757,7 +759,7 @@ fn collect_def_use_expr(expr_id: ExprId, arena: &AstArena, func: FuncId, graph: 
         Expr::Match { scrutinee, arms } => {
             collect_def_use_expr(*scrutinee, arena, func, graph);
             for arm in arms {
-                // 注册 pattern 中的变量绑定（如 Some(x) => x 中的 x）
+                // Register variable bindings in patterns (e.g., x in Some(x) => x)
                 collect_pattern_binds(arm.pattern, arena, func, graph);
                 if let Some(g) = arm.guard {
                     collect_def_use_expr(g, arena, func, graph);
@@ -773,8 +775,8 @@ fn collect_def_use_expr(expr_id: ExprId, arena: &AstArena, func: FuncId, graph: 
             }
         }
         Expr::Lambda { body, .. } => {
-            // lambda 参数是独立作用域，不注册到当前函数的 def-use 图；
-            // 但 lambda body 中引用外层变量需要记录为使用点（捕获）。
+            // Lambda parameters are in a separate scope and not registered in the current function's def-use graph;
+            // but references to outer variables in the lambda body need to be recorded as use sites (captures).
             let body_expr = match body {
                 LambdaBody::Block(e) | LambdaBody::Expression(e) => *e,
             };
@@ -805,7 +807,7 @@ fn collect_def_use_expr(expr_id: ExprId, arena: &AstArena, func: FuncId, graph: 
     }
 }
 
-/// 递归收集语句中的 def-use。
+/// Recursively collects def-use information in a statement.
 fn collect_def_use_stmt(stmt_id: StmtId, arena: &AstArena, func: FuncId, graph: &mut DefUseGraph) {
     let stmt = &arena.stmt(stmt_id).node;
     match stmt {
@@ -818,10 +820,10 @@ fn collect_def_use_stmt(stmt_id: StmtId, arena: &AstArena, func: FuncId, graph: 
             graph.add_def(name, stmt_id, func, true);
         }
         Stmt::Assignment { target, value } => {
-            // 先收集 value 中的使用（可能读取 target 变量的旧值，如 x = x + 1）
+            // First collect uses in value (may read the old value of target, e.g., x = x + 1)
             collect_def_use_expr(*value, arena, func, graph);
-            // 再注册新定义点（覆盖 name_to_def，使后续使用映射到新定义）
-            // 全局变量的赋值不注册局部定义点（全局变量不在函数 def-use 作用域内）
+            // Then register the new definition site (overwriting name_to_def so subsequent uses map to the new definition)
+            // Assignments to global variables do not register local definition sites (globals are not in function def-use scope)
             if let Expr::Ident(name) = &arena.expr(*target).node {
                 if !graph.global_vars.contains(*name) {
                     graph.add_def(name, stmt_id, func, true);
@@ -835,8 +837,8 @@ fn collect_def_use_stmt(stmt_id: StmtId, arena: &AstArena, func: FuncId, graph: 
             collect_def_use_expr(*value, arena, func, graph);
         }
         Stmt::CompoundAssignment { target, value, .. } => {
-            // 复合赋值 x += v：先读取旧值（use），再收集 v，再注册新定义（def）
-            // 全局变量的复合赋值不注册局部定义点
+            // Compound assignment x += v: first read old value (use), then collect v, then register new definition (def)
+            // Compound assignments to global variables do not register local definition sites
             if let Expr::Ident(name) = &arena.expr(*target).node {
                 if let Some(v) = graph.lookup(func, name) {
                     graph.add_use(v, *target, func);
@@ -878,8 +880,8 @@ fn collect_def_use_stmt(stmt_id: StmtId, arena: &AstArena, func: FuncId, graph: 
     }
 }
 
-/// 递归收集 pattern 中的变量绑定，注册为定义点。
-/// stmt 用 StmtId(u32::MAX) 占位（与参数相同），DeadVarPass 据此跳过这些。
+/// Recursively collects variable bindings in a pattern and registers them as definition sites.
+/// Uses StmtId(u32::MAX) as placeholder (same as parameters); DeadVarPass skips these based on that.
 fn collect_pattern_binds(pattern_id: PatternId, arena: &AstArena, func: FuncId, graph: &mut DefUseGraph) {
     let pat = &arena.pattern(pattern_id).node;
     match pat {
@@ -909,11 +911,11 @@ fn collect_pattern_binds(pattern_id: PatternId, arena: &AstArena, func: FuncId, 
 }
 
 // =========================================================================
-// CallGraphBuilder — Layer 1：构建调用图 + 递归检测 + 入口标记
+// CallGraphBuilder — Layer 1: build call graph + recursion detection + entry marking
 // =========================================================================
 
-/// 内建非纯函数枚举：有 I/O/并发/通信副作用。
-/// 替代字符串切片 IMPURE_BUILTINS，单一真相源为此枚举。
+/// Enum of impure built-in functions: those with I/O/concurrency/communication side effects.
+/// Replaces the string slice IMPURE_BUILTINS; this enum is the single source of truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImpureBuiltinFn {
     Async,
@@ -924,7 +926,7 @@ pub enum ImpureBuiltinFn {
 }
 
 impl ImpureBuiltinFn {
-    /// 按函数名查枚举（消除字符串切片 contains 判定）。
+    /// Looks up the enum by function name (eliminates string slice contains checks).
     #[inline]
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
@@ -938,13 +940,13 @@ impl ImpureBuiltinFn {
     }
 }
 
-/// 构建调用图。遍历所有函数（FunDecl + TypeDecl.methods），收集 Call/MethodCall 边，
-/// 标记入口原因，检测递归。方法通过 mangled 名 "Type.method" 注册到 name_to_func。
+/// Builds the call graph. Traverses all functions (FunDecl + TypeDecl.methods), collects Call/MethodCall edges,
+/// marks entry reasons, and detects recursion. Methods are registered in name_to_func via mangled name "Type.method".
 pub fn build_call_graph(module: &Module, arena: &AstArena, sema: &SemaResult) -> CallGraph {
     let module_name = module.name;
     let mut cg = CallGraph::new();
-    // 第一遍：收集所有函数名 -> FuncId
-    // FunDecl: FuncId = declarations 索引
+    // First pass: collect all function names -> FuncId
+    // FunDecl: FuncId = declarations index
     for (idx, decl) in module.declarations.iter().enumerate() {
         if let Decl::FunDecl { name, .. } = &decl.node {
             let fid = FuncId(idx as u32);
@@ -963,7 +965,7 @@ pub fn build_call_graph(module: &Module, arena: &AstArena, sema: &SemaResult) ->
                     cg.nodes.push(fid);
                     cg.method_func_ids.insert(fid);
                     cg.func_to_method_loc.insert(fid, (decl_idx, method_idx));
-                    // 注册 mangled 名 "Type.method"（与 resolve_method_mangled 一致）
+                    // Register mangled name "Type.method" (consistent with resolve_method_mangled)
                     let mangled = format!("{}.{}", type_name, method.name);
                     cg.name_to_func.insert(mangled, fid);
                     method_global_idx += 1;
@@ -971,13 +973,13 @@ pub fn build_call_graph(module: &Module, arena: &AstArena, sema: &SemaResult) ->
             }
         }
     }
-    // 第二遍：收集调用边 + 标记入口（clone nodes 避免借用冲突）
+    // Second pass: collect call edges + mark entries (clone nodes to avoid borrow conflicts)
     let method_locs: Vec<(FuncId, usize, usize)> = cg.func_to_method_loc.iter()
         .map(|(&fid, &(d, m))| (fid, d, m))
         .collect();
     let nodes = cg.nodes.clone();
     for &fid in &nodes {
-        // 判断是否方法并提取元数据：统一返回 (&str, &[Param], Option<ExprRef>, bool, Visibility, bool, &[Attribute], bool)
+        // Determine whether it is a method and extract metadata: unified return (&str, &[Param], Option<ExprRef>, bool, Visibility, bool, &[Attribute], bool)
         let meta_opt: Option<(&str, &[crate::ast::Ast::Param], Option<crate::ast::Ast::ExprRef>, bool, crate::ast::Ast::Visibility, bool, &[crate::ast::Ast::Attribute], bool)> =
             method_locs.iter().find(|(f, _, _)| *f == fid).and_then(|&(_, decl_idx, method_idx)| {
                 let decl = &module.declarations[decl_idx];
@@ -1009,7 +1011,7 @@ pub fn build_call_graph(module: &Module, arena: &AstArena, sema: &SemaResult) ->
     cg
 }
 
-/// 标记函数的可达性入口原因。
+/// Marks the reachability entry reason for a function.
 fn mark_entry_reason(
     cg: &mut CallGraph,
     func: FuncId,
@@ -1032,12 +1034,12 @@ fn mark_entry_reason(
         cg.entry_reasons.insert(func, ReachableReason::ExternAttr);
         return;
     }
-    // 类型方法 / trait 方法：名称含 '.'（mangled 名 TypeName.method）
+    // Type method / trait method: name contains '.' (mangled name TypeName.method)
     if let Some(dot) = name.rfind('.') {
         let type_name = &name[..dot];
         let method_name = &name[dot + 1..];
-        // 利用 witness_table 判定是否为 trait 方法实现：
-        // 若该类型实现了某 trait 且该方法在 witness_table 的 method_slots 中，则为 TraitMethod
+        // Use witness_table to determine if this is a trait method implementation:
+        // if the type implements a trait and the method is in the witness_table's method_slots, it is a TraitMethod
         if let Some(&type_idx) = sema.type_def_index.get(type_name) {
             let type_id = dynamic_type_id(type_idx);
             for entry in sema.witness_table.entries().iter() {
@@ -1047,7 +1049,7 @@ fn mark_entry_reason(
                 }
             }
         }
-        // 否则为普通类型方法
+        // Otherwise it is a regular type method
         cg.entry_reasons.insert(func, ReachableReason::TypeMethod);
         return;
     }
@@ -1057,7 +1059,7 @@ fn mark_entry_reason(
     }
 }
 
-/// 递归收集函数体中的调用边。
+/// Recursively collects call edges in a function body.
 fn collect_call_edges(
     expr_id: ExprId,
     arena: &AstArena,
@@ -1075,7 +1077,7 @@ fn collect_call_edges(
                     cg.recursive.insert(caller);
                 } else if let Some(&callee_id) = cg.name_to_func.get(*name) {
                     cg.add_edge(caller, callee_id);
-                    // 记录调用点 ExprId → 被调函数，供内联展开使用
+                    // Record call site ExprId -> callee function, for use by inline expansion
                     cg.call_sites.insert(expr_id, callee_id);
                 }
             }
@@ -1117,7 +1119,7 @@ fn collect_call_edges(
             collect_call_edges(*value, arena, caller, caller_name, module_name, sema, cg);
         }
         Expr::MethodCall { recv, method, args, .. } | Expr::SafeMethodCall { recv, method, args, .. } => {
-            // 通过 sema 解析方法 mangled 名 → 查 name_to_func → 添加调用边
+            // Resolve method mangled name via sema -> look up name_to_func -> add call edge
             if let Some(mangled) = resolve_method_mangled(*recv, method, module_name, sema) {
                 if mangled == caller_name {
                     cg.recursive.insert(caller);
@@ -1197,7 +1199,7 @@ fn collect_call_edges(
             }
         }
         Expr::Lambda { body, .. } => {
-            // 递归进入 lambda body：嵌套 lambda 中的调用归并到外层 caller
+            // Recurse into lambda body: calls in nested lambdas are attributed to the outer caller
             let inner = match body {
                 crate::ast::Ast::LambdaBody::Block(e) => *e,
                 crate::ast::Ast::LambdaBody::Expression(e) => *e,
@@ -1216,7 +1218,7 @@ fn collect_call_edges(
     }
 }
 
-/// 递归收集语句中的调用边。
+/// Recursively collects call edges in a statement.
 fn collect_call_edges_stmt(
     stmt_id: StmtId,
     arena: &AstArena,
@@ -1262,7 +1264,7 @@ fn collect_call_edges_stmt(
             collect_call_edges(*body, arena, caller, caller_name, module_name, sema, cg);
         }
         Stmt::LocalDecl { decl } => {
-            // 递归进入嵌套函数 body：嵌套函数中的调用归并到外层 caller
+            // Recurse into nested function body: calls in nested functions are attributed to the outer caller
             if let crate::ast::Ast::Decl::FunDecl { body, .. } = decl.as_ref() {
                 collect_call_edges(*body, arena, caller, caller_name, module_name, sema, cg);
             }
@@ -1271,13 +1273,13 @@ fn collect_call_edges_stmt(
     }
 }
 
-/// 检测直接递归与相互递归（Tarjan SCC）。
+/// Detects direct and mutual recursion (Tarjan SCC).
 fn detect_recursion(cg: &mut CallGraph) {
     let mut sccs = tarjan_scc(cg);
     sccs.retain(|s| s.len() > 1);
-    // 相互递归 SCC 中的所有函数也是递归函数，统一加入 recursive 集合。
-    // 使 cg.recursive 成为"所有递归函数"的权威来源，inline_pass 等消费者
-    // 只需检查 recursive 即可，无需分别检查 mutually_recursive。
+    // All functions in mutual recursion SCCs are also recursive functions; add them to the recursive set uniformly.
+    // This makes cg.recursive the authoritative source for "all recursive functions"; consumers like inline_pass
+    // only need to check recursive without separately checking mutually_recursive.
     for scc in &sccs {
         for &func in scc {
             cg.recursive.insert(func);
@@ -1286,7 +1288,7 @@ fn detect_recursion(cg: &mut CallGraph) {
     cg.mutually_recursive = sccs;
 }
 
-/// Tarjan 强连通分量算法。
+/// Tarjan's strongly connected components algorithm.
 fn tarjan_scc(cg: &CallGraph) -> Vec<FxHashSet<FuncId>> {
     let mut index_counter: u32 = 0;
     let mut stack: Vec<FuncId> = Vec::new();
@@ -1348,29 +1350,30 @@ fn tarjan_scc(cg: &CallGraph) -> Vec<FxHashSet<FuncId>> {
     sccs
 }
 
-/// 判断函数名是否为内建非纯函数。
+/// Whether a function name is an impure built-in function.
 pub fn is_impure_builtin(name: &str) -> bool {
     ImpureBuiltinFn::from_name(name).is_some()
 }
 
 // =========================================================================
-// PurityAnalyzer — Layer 2：纯度不动点传播
+// PurityAnalyzer — Layer 2: purity fixpoint propagation
 // =========================================================================
 
-/// 纯度分析。初始假定所有函数为纯，遍历函数体（FunDecl + Method 统一）找出直接非纯的函数
-/// （调用内建非纯函数、方法调用、select、async/throwing 等），再沿逆向调用图传播 Impure。
+/// Purity analysis. Initially assumes all functions are pure, traverses function bodies (unified FunDecl + Method)
+/// to find directly impure functions (calls to impure built-ins, method calls, select, async/throwing, etc.),
+/// then propagates Impure along the reverse call graph.
 pub fn analyze_purity(module: &Module, arena: &AstArena, cg: &CallGraph, sema: &SemaResult) -> PurityTable {
     let mut table = PurityTable::new();
     for &fid in &cg.nodes {
         table.put(fid, Purity::Pure);
     }
     let mut direct_impure: FxHashSet<FuncId> = FxHashSet::default();
-    // 统一遍历 FunDecl + Method（通过 cg.iter_funcs）
+    // Unified traversal of FunDecl + Method (via cg.iter_funcs)
     let func_metas: Vec<(FuncId, &str, crate::ast::Ast::ExprId, bool)> = cg.iter_funcs(module)
         .map(|(fid, meta)| (fid, meta.name, meta.body, meta.is_async))
         .collect();
     for (caller, name, body, is_async) in func_metas {
-        // sema 查 FuncSigInfo：async/throwing 函数一律视为非纯
+        // sema FuncSigInfo lookup: async/throwing functions are always impure
         if is_async {
             direct_impure.insert(caller);
             continue;
@@ -1402,8 +1405,8 @@ pub fn analyze_purity(module: &Module, arena: &AstArena, cg: &CallGraph, sema: &
     table
 }
 
-/// 判定函数体是否直接非纯（包含内建非纯调用、方法调用、select、spawn 等）。
-/// 通过 sema 查 FuncSigInfo：async/throwing 的外部函数（如 println）也判定为非纯。
+/// Determines whether a function body is directly impure (contains impure built-in calls, method calls, select, spawn, etc.).
+/// Uses sema FuncSigInfo: async/throwing external functions (e.g., println) are also classified as impure.
 fn is_direct_impure(body: ExprId, arena: &AstArena, self_name: &str, sema: &SemaResult) -> bool {
     fn check(expr_id: ExprId, arena: &AstArena, self_name: &str, sema: &SemaResult) -> bool {
         let expr = &arena.expr(expr_id).node;
@@ -1413,7 +1416,7 @@ fn is_direct_impure(body: ExprId, arena: &AstArena, self_name: &str, sema: &Sema
                     if is_impure_builtin(name) {
                         return true;
                     }
-                    // sema 查 FuncSigInfo：async/throwing 函数（含 stdlib 外部函数）一律非纯
+                    // sema FuncSigInfo lookup: async/throwing functions (including stdlib external functions) are always impure
                     if let Some(sig) = sema.get_func_sig(name) {
                         if sig.is_async || sig.is_throwing {
                             return true;
@@ -1514,11 +1517,11 @@ fn is_direct_impure(body: ExprId, arena: &AstArena, self_name: &str, sema: &Sema
 }
 
 // =========================================================================
-// EscapeAnalyzer — Layer 2：逃逸分析
+// EscapeAnalyzer — Layer 2: escape analysis
 // =========================================================================
 
-/// 逃逸分析。遍历每个函数体，对 ArrayLit/RecordLit/RecordExtend 分配点
-/// 判定是否逃逸。
+/// Escape analysis. Traverses each function body and determines whether
+/// ArrayLit/RecordLit/RecordExtend allocation sites escape.
 pub fn analyze_escape(
     module: &Module,
     arena: &AstArena,
@@ -1526,7 +1529,7 @@ pub fn analyze_escape(
     purity: &PurityTable,
 ) -> EscapeTable {
     let mut table = EscapeTable::new();
-    // 统一遍历 FunDecl + Method
+    // Unified traversal of FunDecl + Method
     let func_metas: Vec<(FuncId, &str, crate::ast::Ast::ExprId)> = cg.iter_funcs(module)
         .map(|(fid, meta)| (fid, meta.name, meta.body))
         .collect();
@@ -1540,12 +1543,12 @@ pub fn analyze_escape(
             }
         }
     }
-    // Lambda 逃逸分析（Bug #41 尾位置逃逸 + Bug #40 循环体捕获）
+    // Lambda escape analysis (Bug #41 tail position escape + Bug #40 loop body capture)
     analyze_lambda_escape(module, arena, &mut table);
     table
 }
 
-/// 标记所有分配点为 NoEscape（初始值）。
+/// Marks all allocation sites as NoEscape (initial value).
 fn mark_allocations(expr_id: ExprId, arena: &AstArena, table: &mut EscapeTable) {
     let expr = &arena.expr(expr_id).node;
     if matches!(expr, Expr::ArrayLit { .. } | Expr::RecordLit(_) | Expr::RecordExtend { .. }) {
@@ -1555,12 +1558,12 @@ fn mark_allocations(expr_id: ExprId, arena: &AstArena, table: &mut EscapeTable) 
     walk_children_stmts_of_expr(expr_id, arena, |s| mark_allocations_stmt(s, arena, table));
 }
 
-/// 遍历语句中的分配点。
+/// Traverses allocation sites in a statement.
 fn mark_allocations_stmt(stmt_id: StmtId, arena: &AstArena, table: &mut EscapeTable) {
     walk_children_stmt(stmt_id, arena, |e| mark_allocations(e, arena, table));
 }
 
-/// 扫描逃逸点。
+/// Scans for escape sites.
 fn scan_escapes(
     expr_id: ExprId,
     arena: &AstArena,
@@ -1593,7 +1596,7 @@ fn scan_escapes(
     walk_children_stmts_of_expr(expr_id, arena, |s| scan_escapes_stmt(s, arena, func, func_name, cg, purity, escaping));
 }
 
-/// 扫描语句中的逃逸点。
+/// Scans for escape sites in a statement.
 fn scan_escapes_stmt(
     stmt_id: StmtId,
     arena: &AstArena,
@@ -1621,7 +1624,7 @@ fn scan_escapes_stmt(
     walk_children_stmt(stmt_id, arena, |e| scan_escapes(e, arena, func, func_name, cg, purity, escaping));
 }
 
-/// 收集表达式及其子表达式中所有分配点。
+/// Collects all allocation sites in an expression and its sub-expressions.
 fn collect_all_allocs(expr_id: ExprId, arena: &AstArena, escaping: &mut FxHashSet<ExprId>) {
     let expr = &arena.expr(expr_id).node;
     if matches!(expr, Expr::ArrayLit { .. } | Expr::RecordLit(_) | Expr::RecordExtend { .. }) {
@@ -1631,12 +1634,12 @@ fn collect_all_allocs(expr_id: ExprId, arena: &AstArena, escaping: &mut FxHashSe
     walk_children_stmts_of_expr(expr_id, arena, |s| collect_all_allocs_stmt(s, arena, escaping));
 }
 
-/// 遍历语句中的分配点。
+/// Traverses allocation sites in a statement.
 fn collect_all_allocs_stmt(stmt_id: StmtId, arena: &AstArena, escaping: &mut FxHashSet<ExprId>) {
     walk_children_stmt(stmt_id, arena, |e| collect_all_allocs(e, arena, escaping));
 }
 
-/// 遍历表达式的直接子表达式。
+/// Walks the direct child expressions of an expression.
 fn walk_children_expr<F: FnMut(ExprId)>(expr_id: ExprId, arena: &AstArena, mut f: F) {
     let expr = &arena.expr(expr_id).node;
     match expr {
@@ -1690,14 +1693,14 @@ fn walk_children_expr<F: FnMut(ExprId)>(expr_id: ExprId, arena: &AstArena, mut f
     }
 }
 
-/// 遍历表达式中嵌入的语句（仅 Block）。
+/// Walks statements embedded in an expression (only Block).
 fn walk_children_stmts_of_expr<F: FnMut(StmtId)>(expr_id: ExprId, arena: &AstArena, mut f: F) {
     if let Expr::Block { stmts, .. } = &arena.expr(expr_id).node {
         for s in stmts { f(*s); }
     }
 }
 
-/// 遍历语句的子表达式（递归到表达式）。
+/// Walks the child expressions of a statement (recursing into expressions).
 fn walk_children_stmt<F: FnMut(ExprId)>(stmt_id: StmtId, arena: &AstArena, mut f: F) {
     let stmt = &arena.stmt(stmt_id).node;
     match stmt {
@@ -1715,16 +1718,16 @@ fn walk_children_stmt<F: FnMut(ExprId)>(stmt_id: StmtId, arena: &AstArena, mut f
 }
 
 // =========================================================================
-// LambdaEscape — Lambda 逃逸分析（Bug #41 尾位置逃逸 + Bug #40 循环体捕获）
+// LambdaEscape — Lambda escape analysis (Bug #41 tail position escape + Bug #40 loop body capture)
 // =========================================================================
 
-/// Lambda 逃逸分析统一入口。
+/// Unified entry point for lambda escape analysis.
 ///
-/// 对每个 FunDecl 的 body 做两遍分析：
-/// 1. 尾位置逃逸：调用 find_escaping_lambdas，标记为
+/// Performs two passes on each FunDecl's body:
+/// 1. Tail position escape: calls find_escaping_lambdas, marks as
 ///    `EscapeInfo::Escapes(EscapeKind::Lambda { loop_body_capture: false })`
-/// 2. 循环体捕获逃逸：扫描 body 中的 Lambda，检查是否捕获了循环体局部变量，
-///    标记为 `EscapeInfo::Escapes(EscapeKind::Lambda { loop_body_capture: true })`
+/// 2. Loop body capture escape: scans for Lambdas in the body, checks whether they capture
+///    loop body local variables, marks as `EscapeInfo::Escapes(EscapeKind::Lambda { loop_body_capture: true })`
 fn analyze_lambda_escape(
     module: &Module,
     arena: &AstArena,
@@ -1732,22 +1735,22 @@ fn analyze_lambda_escape(
 ) {
     for decl in &module.declarations {
         if let Decl::FunDecl { body, .. } = &decl.node {
-            // 递归分析函数 body 和所有嵌套 lambda body 的逃逸
+            // Recursively analyze function body and all nested lambda bodies for escape
             analyze_lambda_escape_recursive(*body, arena, table);
         }
     }
 }
 
-/// 对当前 body 做尾位置逃逸分析，然后递归进入所有嵌套 Lambda body。
+/// Performs tail position escape analysis on the current body, then recurses into all nested Lambda bodies.
 ///
-/// IR 的 escape_context_stack 是栈式的：编译每个 lambda 时扫描其 body
-/// 找出逃逸的嵌套 lambda。analyzer 需要对每个 lambda body 递归做同样分析。
+/// The IR's escape_context_stack is stack-based: when compiling each lambda, it scans the body
+/// to find escaping nested lambdas. The analyzer must recursively perform the same analysis for each lambda body.
 fn analyze_lambda_escape_recursive(
     expr_id: ExprId,
     arena: &AstArena,
     table: &mut EscapeTable,
 ) {
-    // Pass 1: 尾位置逃逸（当前 body 的尾位置 lambda）
+    // Pass 1: tail position escape (tail-position lambdas in the current body)
     let tail_escaping = find_escaping_lambdas(expr_id, arena);
     for lambda_id in tail_escaping {
         table.put(
@@ -1755,16 +1758,16 @@ fn analyze_lambda_escape_recursive(
             EscapeInfo::Escapes(EscapeKind::Lambda { loop_body_capture: false }),
         );
     }
-    // 递归进入所有嵌套 Lambda body，对其做同样的尾位置逃逸分析
+    // Recurse into all nested Lambda bodies to perform the same tail position escape analysis
     walk_lambdas_in_expr(expr_id, arena, &mut |lambda_body| {
         analyze_lambda_escape_recursive(lambda_body, arena, table);
     });
-    // Pass 2: 循环体捕获逃逸
+    // Pass 2: loop body capture escape
     let mut loop_body_vars_stack: Vec<FxHashSet<String>> = Vec::new();
     scan_lambda_escapes_in_expr(expr_id, arena, &mut loop_body_vars_stack, table);
 }
 
-/// 遍历表达式中的所有 Lambda，对每个 Lambda 的 body 调用回调。
+/// Walks all Lambdas in an expression, calling the callback on each Lambda's body.
 fn walk_lambdas_in_expr(
     expr_id: ExprId,
     arena: &AstArena,
@@ -1778,7 +1781,7 @@ fn walk_lambdas_in_expr(
                 LambdaBody::Block(e) | LambdaBody::Expression(e) => *e,
             };
             f(body_expr);
-            // 继续递归进入 lambda body 内部（可能有更深嵌套）
+            // Continue recursing into the lambda body (may have deeper nesting)
             walk_lambdas_in_expr(body_expr, arena, f);
         }
         Expr::Block { stmts, trailing } => {
@@ -1847,7 +1850,7 @@ fn walk_lambdas_in_expr(
     }
 }
 
-/// walk_lambdas_in_expr 的 stmt 版本。
+/// Statement version of walk_lambdas_in_expr.
 fn walk_lambdas_in_stmt(
     stmt_id: StmtId,
     arena: &AstArena,
@@ -1892,7 +1895,7 @@ fn walk_lambdas_in_stmt(
             walk_lambdas_in_expr(*body, arena, f);
         }
         Stmt::LocalDecl { decl } => {
-            // 局部函数声明：递归进入函数 body 做逃逸分析
+            // Local function declaration: recurse into function body for escape analysis
             if let Decl::FunDecl { body, .. } = &**decl {
                 f(*body);
                 walk_lambdas_in_expr(*body, arena, f);
@@ -1902,7 +1905,7 @@ fn walk_lambdas_in_stmt(
     }
 }
 
-/// 收集 ValDecl/VarDecl 中持有 Lambda 的变量名 → ExprId。
+/// Collects variable names holding Lambdas in ValDecl/VarDecl -> ExprId.
 fn collect_lambda_vars(
     expr_id: ExprId,
     arena: &AstArena,
@@ -1982,7 +1985,7 @@ fn collect_lambda_vars(
     }
 }
 
-/// 辅助：从 Stmt 中收集 lambda 变量。
+/// Helper: collects lambda variables from a Stmt.
 fn collect_lambda_vars_stmt(
     stmt_id: StmtId,
     arena: &AstArena,
@@ -1993,7 +1996,7 @@ fn collect_lambda_vars_stmt(
             if let Expr::Lambda { .. } = &arena.expr(*value).node {
                 out.insert(name.to_string(), *value);
             }
-            // 递归扫描 value（lambda body 内可能也有 lambda 变量）
+            // Recursively scan value (lambda body may also contain lambda variables)
             collect_lambda_vars(*value, arena, out);
         }
         Stmt::Assignment { value, .. } => {
@@ -2030,20 +2033,20 @@ fn collect_lambda_vars_stmt(
         Stmt::Loop { body } => {
             collect_lambda_vars(*body, arena, out);
         }
-        // Break/Continue/LocalDecl 不含 lambda 变量
+        // Break/Continue/LocalDecl do not contain lambda variables
         _ => {}
     }
 }
 
-/// 递归收集尾位置的 Lambda ExprId（包括持有 Lambda 的 Ident）。
+/// Recursively collects tail-position Lambda ExprIds (including Idents holding Lambdas).
 ///
-/// 尾位置 = 表达式的值会被作为 enclosing lambda 的返回值。
-/// - body 本身在尾位置
-/// - Block trailing 在尾位置
-/// - Return 语句值在尾位置
-/// - If 分支在尾位置（当 If 本身在尾位置时）
-/// - Match arm body 在尾位置（当 Match 本身在尾位置时）
-/// - Elvis rhs 在尾位置（当 Elvis 本身在尾位置时）
+/// Tail position = the expression's value will be used as the return value of the enclosing lambda.
+/// - The body itself is in tail position
+/// - Block trailing is in tail position
+/// - Return statement value is in tail position
+/// - If branches are in tail position (when the If itself is in tail position)
+/// - Match arm body is in tail position (when the Match itself is in tail position)
+/// - Elvis rhs is in tail position (when the Elvis itself is in tail position)
 fn collect_tail_lambdas(
     expr_id: ExprId,
     arena: &AstArena,
@@ -2053,23 +2056,23 @@ fn collect_tail_lambdas(
     let node = &arena.expr(expr_id).node;
     match node {
         Expr::Lambda { .. } => {
-            // Lambda 在尾位置 → 逃逸
+            // Lambda in tail position -> escapes
             out.insert(expr_id);
         }
         Expr::Ident(name) => {
-            // Ident 在尾位置，若持有 Lambda → 该 Lambda 逃逸
+            // Ident in tail position, if it holds a Lambda -> that Lambda escapes
             if let Some(&lambda_id) = lambda_vars.get(*name) {
                 out.insert(lambda_id);
             }
         }
         Expr::Block { stmts, trailing } => {
-            // Return 语句值在尾位置
+            // Return statement value is in tail position
             for &stmt_id in stmts {
                 if let Stmt::Return { value: Some(ret_expr) } = &arena.stmt(stmt_id).node {
                     collect_tail_lambdas(*ret_expr, arena, lambda_vars, out);
                 }
             }
-            // trailing 在尾位置
+            // trailing is in tail position
             if let Some(t) = trailing {
                 collect_tail_lambdas(*t, arena, lambda_vars, out);
             }
@@ -2086,19 +2089,19 @@ fn collect_tail_lambdas(
             }
         }
         Expr::Elvis { rhs, .. } => {
-            // Elvis rhs 在尾位置（当 lhs 为 null 时 rhs 是返回值）
+            // Elvis rhs is in tail position (when lhs is null, rhs is the return value)
             collect_tail_lambdas(*rhs, arena, lambda_vars, out);
         }
         _ => {
-            // 其他表达式不在尾位置，其子表达式也不在尾位置
+            // Other expressions are not in tail position; their sub-expressions are not either
         }
     }
 }
 
-/// 两遍扫描入口：收集尾位置逃逸的 Lambda。
+/// Two-pass scan entry point: collects tail-position escaping Lambdas.
 ///
-/// Pass 1: 收集所有 ValDecl/VarDecl 中持有 Lambda 的变量 (name → lambda ExprId)
-/// Pass 2: 递归收集尾位置的 Lambda（包括持有 Lambda 的 Ident）
+/// Pass 1: Collects all ValDecl/VarDecl variables holding Lambdas (name -> lambda ExprId)
+/// Pass 2: Recursively collects tail-position Lambdas (including Idents holding Lambdas)
 fn find_escaping_lambdas(body: ExprId, arena: &AstArena) -> FxHashSet<ExprId> {
     let mut escaping: FxHashSet<ExprId> = FxHashSet::default();
     let mut lambda_vars: FxHashMap<String, ExprId> = FxHashMap::default();
@@ -2107,10 +2110,10 @@ fn find_escaping_lambdas(body: ExprId, arena: &AstArena) -> FxHashSet<ExprId> {
     escaping
 }
 
-/// 递归收集表达式中的所有 Ident 名称（去重，保留首次出现顺序）。
+/// Recursively collects all Ident names in an expression (deduplicated, preserving first-occurrence order).
 ///
-/// 简化版自由变量分析：遍历常见 Expr 变体收集标识符引用，
-/// 由调用方排除 lambda 参数并检查外层作用域绑定。
+/// Simplified free-variable analysis: traverses common Expr variants to collect identifier references;
+/// the caller excludes lambda parameters and checks outer-scope bindings.
 fn collect_free_idents_expr(expr_id: ExprId, arena: &AstArena, names: &mut Vec<String>) {
     let spanned = arena.expr(expr_id);
     match &spanned.node {
@@ -2188,7 +2191,7 @@ fn collect_free_idents_expr(expr_id: ExprId, arena: &AstArena, names: &mut Vec<S
                 collect_free_idents_expr(arm.body, arena, names);
             }
         }
-        // 单 operand 表达式：RefOf/Deref/Propagate/NonNullAssert/Atomic/Lazy
+        // Single-operand expressions: RefOf/Deref/Propagate/NonNullAssert/Atomic/Lazy
         Expr::RefOf(inner)
         | Expr::Deref(inner)
         | Expr::Propagate(inner)
@@ -2255,12 +2258,12 @@ fn collect_free_idents_expr(expr_id: ExprId, arena: &AstArena, names: &mut Vec<S
                 }
             }
         }
-        // 常量/无子表达式变体：IntLit/FloatLit/BoolLit/CharLit/StrLit/NullLit/VoidLit
+        // Constant/no-subexpression variants: IntLit/FloatLit/BoolLit/CharLit/StrLit/NullLit/VoidLit
         _ => {}
     }
 }
 
-/// 递归收集语句中的 Ident 名称（collect_free_idents_expr 的语句版本）。
+/// Recursively collects Ident names in a statement (statement version of collect_free_idents_expr).
 fn collect_free_idents_stmt(stmt_id: StmtId, arena: &AstArena, names: &mut Vec<String>) {
     match &arena.stmt(stmt_id).node {
         Stmt::ValDecl { value, .. } | Stmt::VarDecl { value, .. } => {
@@ -2313,13 +2316,13 @@ fn collect_free_idents_stmt(stmt_id: StmtId, arena: &AstArena, names: &mut Vec<S
     }
 }
 
-/// 扫描表达式中的 Lambda，检测循环体捕获逃逸。
+/// Scans for Lambdas in an expression, detecting loop body capture escape.
 ///
-/// 维护 `loop_body_vars_stack`（循环体局部变量名栈），遇到 Lambda 时：
-/// 1. 收集 lambda 参数名（排除自身参数）
-/// 2. 用 collect_free_idents_expr 收集 lambda body 中的所有标识符
-/// 3. 排除 lambda 自身参数名后，剩下的就是自由变量
-/// 4. 检查自由变量是否有在 loop_body_vars_stack 的任一层中 → 循环体捕获逃逸
+/// Maintains `loop_body_vars_stack` (a stack of loop body local variable name sets). When encountering a Lambda:
+/// 1. Collect lambda parameter names (excluding its own parameters)
+/// 2. Use collect_free_idents_expr to collect all identifiers in the lambda body
+/// 3. Exclude the lambda's own parameter names; the remaining are free variables
+/// 4. Check whether any free variable is in any layer of loop_body_vars_stack -> loop body capture escape
 fn scan_lambda_escapes_in_expr(
     expr_id: ExprId,
     arena: &AstArena,
@@ -2329,16 +2332,16 @@ fn scan_lambda_escapes_in_expr(
     let expr = &arena.expr(expr_id).node;
     match expr {
         Expr::Lambda { params, body, .. } => {
-            // a. 收集 lambda 参数名（排除自身参数）
+            // a. Collect lambda parameter names (excluding its own parameters)
             let param_names: FxHashSet<String> = params.iter().map(|p| p.name.to_string()).collect();
-            // b. 收集 lambda body 中的所有标识符
+            // b. Collect all identifiers in the lambda body
             let body_expr = match body {
                 LambdaBody::Block(e) | LambdaBody::Expression(e) => *e,
             };
             let mut idents = Vec::new();
             collect_free_idents_expr(body_expr, arena, &mut idents);
-            // c. 排除 lambda 自身参数名 → 自由变量
-            // d. 检查自由变量是否在循环体局部变量栈中
+            // c. Exclude lambda's own parameter names -> free variables
+            // d. Check whether free variables are in the loop body local variable stack
             let captures_loop_var = idents.iter().any(|n| {
                 !param_names.contains(n) && loop_body_vars_stack.iter().any(|layer| layer.contains(n))
             });
@@ -2348,7 +2351,7 @@ fn scan_lambda_escapes_in_expr(
                     EscapeInfo::Escapes(EscapeKind::Lambda { loop_body_capture: true }),
                 );
             }
-            // 继续递归扫描 lambda body 内部的嵌套 lambda / 循环
+            // Continue recursively scanning the lambda body for nested lambdas / loops
             scan_lambda_escapes_in_expr(body_expr, arena, loop_body_vars_stack, table);
         }
         Expr::Block { stmts, trailing } => {
@@ -2370,10 +2373,10 @@ fn scan_lambda_escapes_in_expr(
     }
 }
 
-/// 扫描语句中的 Lambda，检测循环体捕获逃逸。
+/// Scans for Lambdas in a statement, detecting loop body capture escape.
 ///
-/// 进入 For/While/Loop body 时，收集 body 内所有 ValDecl/VarDecl 定义的变量名，
-/// push 到循环体局部变量栈；退出时 pop。
+/// When entering For/While/Loop body, collects all ValDecl/VarDecl variable names defined in the body,
+/// pushes them onto the loop body local variable stack; pops on exit.
 fn scan_lambda_escapes_in_stmt(
     stmt_id: StmtId,
     arena: &AstArena,
@@ -2383,9 +2386,9 @@ fn scan_lambda_escapes_in_stmt(
     let stmt = &arena.stmt(stmt_id).node;
     match stmt {
         Stmt::For { iterable, body, .. } => {
-            // 先扫描 iterable（不在循环体内）
+            // First scan iterable (not inside the loop body)
             scan_lambda_escapes_in_expr(*iterable, arena, loop_body_vars_stack, table);
-            // 收集循环体局部变量，push 到栈
+            // Collect loop body local variables, push onto stack
             let mut body_vars = FxHashSet::default();
             collect_loop_body_vars_expr(*body, arena, &mut body_vars);
             loop_body_vars_stack.push(body_vars);
@@ -2408,7 +2411,7 @@ fn scan_lambda_escapes_in_stmt(
             loop_body_vars_stack.pop();
         }
         Stmt::LocalDecl { decl } => {
-            // 局部函数声明：独立作用域，用全新的 loop_body_vars_stack 扫描
+            // Local function declaration: separate scope, scan with a fresh loop_body_vars_stack
             if let Decl::FunDecl { body, .. } = &**decl {
                 let mut fresh_stack: Vec<FxHashSet<String>> = Vec::new();
                 scan_lambda_escapes_in_expr(*body, arena, &mut fresh_stack, table);
@@ -2422,11 +2425,11 @@ fn scan_lambda_escapes_in_stmt(
     }
 }
 
-/// 收集循环体内所有 ValDecl/VarDecl 定义的变量名（不进入嵌套 lambda/函数作用域）。
+/// Collects all ValDecl/VarDecl variable names defined in a loop body (does not enter nested lambda/function scopes).
 fn collect_loop_body_vars_expr(expr_id: ExprId, arena: &AstArena, vars: &mut FxHashSet<String>) {
     let expr = &arena.expr(expr_id).node;
     match expr {
-        // 不进入嵌套 lambda 的内部作用域（lambda 有自己的参数和局部变量）
+        // Do not enter nested lambda internal scopes (lambdas have their own parameters and local variables)
         Expr::Lambda { .. } => {}
         _ => {
             walk_children_expr(expr_id, arena, |c| collect_loop_body_vars_expr(c, arena, vars));
@@ -2435,7 +2438,7 @@ fn collect_loop_body_vars_expr(expr_id: ExprId, arena: &AstArena, vars: &mut FxH
     }
 }
 
-/// collect_loop_body_vars_expr 的语句版本。
+/// Statement version of collect_loop_body_vars_expr.
 fn collect_loop_body_vars_stmt(stmt_id: StmtId, arena: &AstArena, vars: &mut FxHashSet<String>) {
     let stmt = &arena.stmt(stmt_id).node;
     match stmt {
@@ -2443,7 +2446,7 @@ fn collect_loop_body_vars_stmt(stmt_id: StmtId, arena: &AstArena, vars: &mut FxH
             vars.insert(name.to_string());
             collect_loop_body_vars_expr(*value, arena, vars);
         }
-        // 不进入嵌套函数的内部作用域
+        // Do not enter nested function internal scopes
         Stmt::LocalDecl { .. } => {}
         _ => {
             walk_children_stmt(stmt_id, arena, |e| collect_loop_body_vars_expr(e, arena, vars));
@@ -2452,55 +2455,56 @@ fn collect_loop_body_vars_stmt(stmt_id: StmtId, arena: &AstArena, vars: &mut FxH
 }
 
 // =========================================================================
-// MemoPlan — 记忆化策略（Layer 3 共享结构）
+// MemoPlan — memoization strategy (Layer 3 shared structure)
 // =========================================================================
 
-/// 记忆化候选。
+/// Memoization candidate.
 #[derive(Debug, Clone)]
 pub struct MemoCandidate {
     pub func: FuncId,
     pub strategy: MemoStrategy,
 }
 
-/// 尾递归参数变换信息：从函数体 AST 提取的 base case + 递归分支。
-/// Builder 层消费此信息构造 while_sg IR。
+/// Tail recursion parameter transformation info: base case + recursive branch extracted from the function body AST.
+/// The Builder layer consumes this info to construct while_sg IR.
 #[derive(Debug, Clone, Default)]
 pub struct TailRecInfo {
-    /// 非递归终止分支：(条件表达式, 返回值表达式)
-    /// 条件为 None 表示 else 兜底分支（无条件终止）。
+    /// Non-recursive termination branch: (condition expression, return value expression).
+    /// Condition is None for the else fallback branch (unconditional termination).
     pub base_cases: Vec<(Option<ExprId>, ExprId)>,
-    /// 递归分支：(条件表达式, 实参列表)
-    /// 条件为 None 表示 else 兜底分支（无条件递归）。
+    /// Recursive branch: (condition expression, argument list).
+    /// Condition is None for the else fallback branch (unconditional recursion).
     pub rec_branches: Vec<(Option<ExprId>, Vec<ExprId>)>,
 }
 
 impl TailRecInfo {
-    /// 是否有效：至少一个 base case 和一个 rec branch
+    /// Whether valid: at least one base case and one rec branch.
     pub fn is_valid(&self) -> bool {
         !self.base_cases.is_empty() && !self.rec_branches.is_empty()
     }
 }
 
-/// 非尾递归转迭代信息：将非尾递归函数变换为"工作栈 + while 循环 + 状态机"IR。
+/// Non-tail recursion to iteration info: transforms non-tail-recursive functions into "work stack + while loop + state machine" IR.
 ///
-/// 核心思路：函数体中的每个非尾自调用拆分为"push 续延 + push 子任务"，
-/// 调用返回后通过 state 号分派到对应续延，用 result 变量替换调用结果。
+/// Core idea: each non-tail self-call in the function body is split into "push continuation + push subtask";
+/// after the call returns, dispatch to the corresponding continuation via state number, replacing the call
+/// result with a result variable.
 ///
-/// 例如 fib(n) = if n < 2 { n } else { fib(n-1) + fib(n-2) } 变换为：
+/// For example, fib(n) = if n < 2 { n } else { fib(n-1) + fib(n-2) } is transformed to:
 /// - state 0 (INIT): if n < 2 { result = n } else { push cont(1); push task(n-1); continue }
 /// - state 1 (AFTER fib(n-1)): left = result; push cont(2, left); push task(n-2); continue
 /// - state 2 (AFTER fib(n-2)): result = saved + result
 #[derive(Debug, Clone)]
 pub struct NonTailRecInfo {
-    /// 所有非尾自调用的 ExprId（按 AST 遍历顺序）。
-    /// Builder 用此列表分配 state 号：state 0 = INIT，state N = 第 N 个调用返回后。
+    /// ExprIds of all non-tail self-calls (in AST traversal order).
+    /// The Builder uses this list to assign state numbers: state 0 = INIT, state N = after the Nth call returns.
     pub call_sites: Vec<ExprId>,
-    /// 包含所有 call_sites 的续延表达式 ExprId。
-    /// Builder 对每个 state 重新编译此表达式，用 call_result_map 替换已完成的调用。
+    /// The continuation expression ExprId containing all call_sites.
+    /// The Builder recompiles this expression for each state, replacing completed calls via call_result_map.
     pub continuation_expr: ExprId,
-    /// base case：(条件, 返回值)。条件为 None 表示 else 兜底。
+    /// base case: (condition, return value). Condition is None for else fallback.
     pub base_cases: Vec<(Option<ExprId>, ExprId)>,
-    /// 函数参数数量（用于构造栈帧）。
+    /// Number of function parameters (used to construct stack frames).
     pub param_count: usize,
 }
 
@@ -2510,43 +2514,43 @@ impl NonTailRecInfo {
     }
 }
 
-/// 记忆化策略。
+/// Memoization strategy.
 #[derive(Debug, Clone)]
 pub enum MemoStrategy {
-    /// 尾递归转循环，不缓存
+    /// Tail recursion to loop, no caching.
     TailRecToLoop { info: TailRecInfo },
-    /// 非尾递归转迭代（工作栈模拟），不缓存
+    /// Non-tail recursion to iteration (work stack simulation), no caching.
     NonTailRecToLoop { info: NonTailRecInfo },
-    /// 记忆化缓存
+    /// Memoization cache.
     Memoize { cache_key: CacheKeySpec, capacity: MemoCapacity },
-    /// 循环不变量外提
+    /// Loop invariant hoisting.
     LoopInvariantHoist { invariants: Vec<ExprId> },
 }
 
-/// 缓存键规格：参与缓存键的参数下标。
+/// Cache key specification: parameter indices participating in the cache key.
 #[derive(Debug, Clone)]
 pub struct CacheKeySpec {
     pub param_indices: Vec<u32>,
 }
 
-/// 缓存容量策略。
+/// Cache capacity strategy.
 #[derive(Debug, Clone)]
 pub enum MemoCapacity {
     Unlimited,
     LRU(usize),
 }
 
-/// 记忆化计划。
+/// Memoization plan.
 #[derive(Debug, Default)]
 pub struct MemoPlan {
     pub candidates: Vec<MemoCandidate>,
 }
 
 // =========================================================================
-// 不可达代码检测 + 常量条件死分支消除
+// Unreachable code detection + constant-condition dead branch elimination
 // =========================================================================
 
-/// 语句是否为控制流终结符（之后的语句不可达）。
+/// Whether a statement is a control flow terminator (statements after it are unreachable).
 fn is_terminator_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
     matches!(
         &arena.stmt(stmt_id).node,
@@ -2554,7 +2558,7 @@ fn is_terminator_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
     )
 }
 
-/// 递归标记块中终结符之后的所有语句为死（不可达代码）。
+/// Recursively marks all statements after a terminator in a block as dead (unreachable code).
 fn mark_unreachable(expr_id: ExprId, arena: &AstArena, report: &mut DeadCodeReport) {
     let expr = &arena.expr(expr_id).node;
     match expr {
@@ -2583,7 +2587,7 @@ fn mark_unreachable_stmt(stmt_id: StmtId, arena: &AstArena, report: &mut DeadCod
     walk_children_stmt(stmt_id, arena, |e| mark_unreachable(e, arena, report));
 }
 
-/// 递归标记表达式中的所有语句为死（用于死分支整体消除）。
+/// Recursively marks all statements in an expression as dead (used for whole dead-branch elimination).
 fn mark_all_dead(expr_id: ExprId, arena: &AstArena, report: &mut DeadCodeReport) {
     let expr = &arena.expr(expr_id).node;
     if let Expr::Block { stmts, trailing } = expr {
@@ -2603,7 +2607,7 @@ fn mark_all_dead_stmt(stmt_id: StmtId, arena: &AstArena, report: &mut DeadCodeRe
     walk_children_stmt(stmt_id, arena, |e| mark_all_dead(e, arena, report));
 }
 
-/// 求值编译时常量布尔条件。优先查 sema ExprInfo.const_val，回退到 BoolLit。
+/// Evaluates a compile-time constant boolean condition. Prefers sema ExprInfo.const_val, falls back to BoolLit.
 fn eval_const_bool(expr_id: ExprId, arena: &AstArena, module_name: &str, sema: &SemaResult) -> Option<bool> {
     if let Expr::BoolLit(b) = &arena.expr(expr_id).node {
         return Some(*b);
@@ -2617,13 +2621,13 @@ fn eval_const_bool(expr_id: ExprId, arena: &AstArena, module_name: &str, sema: &
 }
 
 // =========================================================================
-// DeadCodePass — Layer 3：死代码消除
+// DeadCodePass — Layer 3: dead code elimination
 // =========================================================================
 
-/// 死代码报告。
+/// Dead code report.
 #[derive(Debug, Default)]
 pub struct DeadCodeReport {
-    /// 可安全消除的语句
+    /// Statements that can be safely eliminated.
     pub dead_stmts: FxHashSet<StmtId>,
 }
 
@@ -2636,8 +2640,8 @@ impl DeadCodeReport {
     }
 }
 
-/// 死代码分析遍。逐函数不动点迭代：收集有效读取，标记未读且无副作用的声明。
-/// 预处理阶段标记不可达代码和常量条件死分支。
+/// Dead code analysis pass. Per-function fixpoint iteration: collects valid reads, marks unread and side-effect-free declarations.
+/// The preprocessing phase marks unreachable code and constant-condition dead branches.
 pub fn dead_code_pass(
     module: &Module,
     arena: &AstArena,
@@ -2650,20 +2654,20 @@ pub fn dead_code_pass(
 ) -> DeadCodeReport {
     let mut report = DeadCodeReport::new();
     let func_name_to_id = &cg.name_to_func;
-    // 统一遍历 FunDecl + Method
+    // Unified traversal of FunDecl + Method
     let func_metas: Vec<(FuncId, crate::ast::Ast::ExprId)> = cg.iter_funcs(module)
         .map(|(fid, meta)| (fid, meta.body))
         .collect();
     for (func, body) in func_metas {
-        // 预处理：不可达代码（return/break/continue/throw 之后）
+        // Preprocessing: unreachable code (after return/break/continue/throw)
         mark_unreachable(body, arena, &mut report);
-        // 不动点迭代：死声明 + 常量条件死分支 + 死存储
+        // Fixpoint iteration: dead declarations + constant-condition dead branches + dead stores
         analyze_function_dce(body, arena, module_name, sema, purity, escape, func_name_to_id, func, def_use, &mut report);
     }
     report
 }
 
-/// 对函数体执行不动点迭代。
+/// Performs fixpoint iteration on a function body.
 fn analyze_function_dce(
     body: ExprId,
     arena: &AstArena,
@@ -2689,7 +2693,7 @@ fn analyze_function_dce(
     }
 }
 
-/// 递归收集表达式中的有效读取（跳过已标记死声明的 init）。
+/// Recursively collects valid reads in an expression (skipping inits of already-dead declarations).
 fn collect_reads_expr(expr_id: ExprId, arena: &AstArena, report: &DeadCodeReport, reads: &mut FxHashSet<String>) {
     let expr = &arena.expr(expr_id).node;
     match expr {
@@ -2710,9 +2714,10 @@ fn collect_reads_expr(expr_id: ExprId, arena: &AstArena, report: &DeadCodeReport
             }
             collect_reads_expr(*value, arena, report, reads);
         }
-        // ── 闭包：遍历 body 收集捕获的外层变量读取 ──
-        // walk_children_expr 不遍历 Lambda，需专门处理，否则闭包捕获的变量
-        // 不被标记为"已读取"，导致其声明被误判为死代码。
+        // -- Closures: traverse body to collect captured outer variable reads --
+        // walk_children_expr does not traverse Lambda; this needs special handling, otherwise
+        // closure-captured variables would not be marked as "read", causing their declarations
+        // to be falsely classified as dead code.
         Expr::Lambda { body, .. } => {
             let body_expr = match body {
                 LambdaBody::Block(e) | LambdaBody::Expression(e) => *e,
@@ -2723,7 +2728,7 @@ fn collect_reads_expr(expr_id: ExprId, arena: &AstArena, report: &DeadCodeReport
     }
 }
 
-/// 递归收集语句中的有效读取。
+/// Recursively collects valid reads in a statement.
 fn collect_reads_stmt(stmt_id: StmtId, arena: &AstArena, report: &DeadCodeReport, reads: &mut FxHashSet<String>) {
     if report.is_dead(stmt_id) {
         return;
@@ -2743,7 +2748,7 @@ fn collect_reads_stmt(stmt_id: StmtId, arena: &AstArena, report: &DeadCodeReport
     }
 }
 
-/// 遍历表达式，标记未读且无副作用的声明为死。同时处理常量条件死分支。
+/// Traverses an expression, marking unread and side-effect-free declarations as dead. Also handles constant-condition dead branches.
 fn mark_dead_decls_expr(
     expr_id: ExprId,
     arena: &AstArena,
@@ -2767,7 +2772,7 @@ fn mark_dead_decls_expr(
                 mark_dead_decls_expr(*t, arena, module_name, sema, purity, escape, func_name_to_id, func, def_use, reads, report);
             }
         }
-        // ── 常量条件死分支：if true → else 死，if false → then 死 ──
+        // -- Constant-condition dead branches: if true -> else is dead, if false -> then is dead --
         Expr::If { cond, then_branch, else_branch } => {
             if let Some(val) = eval_const_bool(*cond, arena, module_name, sema) {
                 if !val {
@@ -2788,7 +2793,7 @@ fn mark_dead_decls_expr(
     }
 }
 
-/// 遍历语句，标记未读且无副作用的声明为死。同时处理死存储（赋值后未读即被覆盖）。
+/// Traverses a statement, marking unread and side-effect-free declarations as dead. Also handles dead stores (assignments overwritten before being read).
 fn mark_dead_decls_stmt(
     stmt_id: StmtId,
     arena: &AstArena,
@@ -2813,9 +2818,9 @@ fn mark_dead_decls_stmt(
             }
             mark_dead_decls_expr(*value, arena, module_name, sema, purity, escape, func_name_to_id, func, def_use, reads, report);
         }
-        // ── 死存储：赋值目标在函数内完全不被读取且赋值表达式无副作用 ──
-        // 注意：只用 reads 判定（而非 never_read），因为可变变量可能被闭包间接读取，
-        // 赋值创建的新定义点在 def-use 图中无使用点，但闭包调用时会读取最新值。
+        // -- Dead store: assignment target is never read within the function and the assignment expression has no side effects --
+        // Note: uses reads (not never_read) for determination, because mutable variables may be indirectly read by closures;
+        // the new definition site created by assignment has no use site in the def-use graph, but closures read the latest value when called.
         Stmt::Assignment { target, value } => {
             if let Expr::Ident(name) = &arena.expr(*target).node {
                 if !reads.contains(*name) {
@@ -2828,7 +2833,7 @@ fn mark_dead_decls_stmt(
             mark_dead_decls_expr(*value, arena, module_name, sema, purity, escape, func_name_to_id, func, def_use, reads, report);
         }
         Stmt::CompoundAssignment { target, value, .. } => {
-            // 复合赋值 x += v：若 x 在函数内完全不被读取且 v 无副作用，则整体为死存储
+            // Compound assignment x += v: if x is never read within the function and v has no side effects, the whole statement is a dead store
             if let Expr::Ident(name) = &arena.expr(*target).node {
                 if !reads.contains(*name) {
                     let se = classify_side_effect(*value, arena, module_name, sema, purity, escape, func_name_to_id);
@@ -2846,13 +2851,13 @@ fn mark_dead_decls_stmt(
 }
 
 // =========================================================================
-// DeadVarPass — Layer 3：死变量消除
+// DeadVarPass — Layer 3: dead variable elimination
 // =========================================================================
 
-/// 死变量报告。
+/// Dead variable report.
 #[derive(Debug, Default)]
 pub struct DeadVarReport {
-    /// 可消除的变量定义点
+    /// Eliminable variable definition sites.
     pub dead_vars: FxHashSet<VarId>,
 }
 
@@ -2865,9 +2870,9 @@ impl DeadVarReport {
     }
 }
 
-/// 死变量分析。基于 DefUseGraph：
-/// - 从未被读取的变量定义点为死
-/// - 死代码的声明语句对应的变量也标记为死
+/// Dead variable analysis. Based on DefUseGraph:
+/// - Variable definition sites that are never read are dead
+/// - Variables corresponding to dead code declaration statements are also marked as dead
 pub fn dead_var_pass(
     _module: &Module,
     _arena: &AstArena,
@@ -2877,18 +2882,18 @@ pub fn dead_var_pass(
     let mut report = DeadVarReport::new();
     for (i, def) in def_use.defs.iter().enumerate() {
         let vid = VarId(i as u32);
-        // 参数定义点（StmtId(u32::MAX)）跳过
+        // Skip parameter definition sites (StmtId(u32::MAX))
         if def.stmt.0 == u32::MAX {
             continue;
         }
-        // 死代码的声明语句对应的变量
+        // Variables corresponding to dead code declaration statements
         if dead_code.is_dead(def.stmt) {
             report.dead_vars.insert(vid);
             continue;
         }
-        // 从未被读取
-        // 注意：闭包捕获的可变变量，赋值创建的新定义点无使用点，
-        // 但同名变量在旧定义点有使用点（闭包读取），不应判为死。
+        // Never read
+        // Note: for closure-captured mutable variables, the new definition site created by assignment has no use site,
+        // but the same-named variable has use sites at the old definition site (closure read), so it should not be classified as dead.
         if def_use.is_never_read(vid) && !def_use.is_name_ever_read(def.func, &def.name) {
             report.dead_vars.insert(vid);
         }
@@ -2897,15 +2902,15 @@ pub fn dead_var_pass(
 }
 
 // =========================================================================
-// DeadFuncPass — Layer 3：死函数消除
+// DeadFuncPass — Layer 3: dead function elimination
 // =========================================================================
 
-/// 死函数报告。
+/// Dead function report.
 #[derive(Debug, Default)]
 pub struct DeadFuncReport {
-    /// 可消除函数
+    /// Eliminable functions.
     pub dead: FxHashSet<FuncId>,
-    /// 保留原因
+    /// Retention reasons.
     pub reachable_reasons: FxHashMap<FuncId, ReachableReason>,
 }
 
@@ -2918,7 +2923,7 @@ impl DeadFuncReport {
     }
 }
 
-/// 死函数分析。从所有入口出发沿调用图做可达性传播。
+/// Dead function analysis. Propagates reachability from all entry points along the call graph.
 pub fn dead_func_pass(cg: &CallGraph, memo: &MemoPlan) -> DeadFuncReport {
     let mut report = DeadFuncReport::new();
     let mut reachable: FxHashSet<FuncId> = FxHashSet::default();
@@ -2926,7 +2931,7 @@ pub fn dead_func_pass(cg: &CallGraph, memo: &MemoPlan) -> DeadFuncReport {
         report.reachable_reasons.insert(fid, reason.clone());
         reachable.insert(fid);
     }
-    // 记忆化候选及其调用的纯函数也保留
+    // Memoization candidates and the pure functions they call are also retained
     for cand in &memo.candidates {
         report.reachable_reasons.insert(cand.func, ReachableReason::MemoDependency);
         reachable.insert(cand.func);
@@ -2937,7 +2942,7 @@ pub fn dead_func_pass(cg: &CallGraph, memo: &MemoPlan) -> DeadFuncReport {
             }
         }
     }
-    // 工作列表：从入口沿调用图传播可达
+    // Worklist: propagate reachability from entries along the call graph
     let mut worklist: Vec<FuncId> = reachable.iter().copied().collect();
     while let Some(f) = worklist.pop() {
         if let Some(callees) = cg.edges.get(&f) {
@@ -2950,7 +2955,7 @@ pub fn dead_func_pass(cg: &CallGraph, memo: &MemoPlan) -> DeadFuncReport {
             }
         }
     }
-    // 不可达的函数为死
+    // Unreachable functions are dead
     for &fid in &cg.nodes {
         if !reachable.contains(&fid) {
             report.dead.insert(fid);
@@ -2960,15 +2965,15 @@ pub fn dead_func_pass(cg: &CallGraph, memo: &MemoPlan) -> DeadFuncReport {
 }
 
 // =========================================================================
-// MemoPass — Layer 3：记忆化策略决策
+// MemoPass — Layer 3: memoization strategy decision
 // =========================================================================
 
-/// 记忆化分析。决策策略（通用判定，无特例分支）：
-/// - 纯函数 + 递归（自/相互）：
-///   - 尾递归且 info 有效 → TailRecToLoop
-///   - 非尾递归且单调用点且无 defer 且 info 有效 → NonTailRecToLoop
-///   - 其他递归情况 → Memoize（缓存全部参数）
-/// - 纯函数 + 含循环 → LoopInvariantHoist
+/// Memoization analysis. Strategy decisions (general classification, no special-case branches):
+/// - Pure function + recursive (self/mutual):
+///   - Tail recursive and info valid -> TailRecToLoop
+///   - Non-tail recursive with single call site, no defer, and info valid -> NonTailRecToLoop
+///   - Other recursive cases -> Memoize (cache all parameters)
+/// - Pure function + contains loops -> LoopInvariantHoist
 pub fn memo_pass(
     module: &Module,
     arena: &AstArena,
@@ -2980,7 +2985,7 @@ pub fn memo_pass(
     let module_name = module.name;
     let func_name_to_id = &cg.name_to_func;
     let mut plan = MemoPlan::default();
-    // 统一遍历 FunDecl + Method（通过 cg.iter_funcs）
+    // Unified traversal of FunDecl + Method (via cg.iter_funcs)
     let func_metas: Vec<(FuncId, &str, &[crate::ast::Ast::Param], crate::ast::Ast::ExprId)> =
         cg.iter_funcs(module)
             .map(|(fid, meta)| (fid, meta.name, meta.params, meta.body))
@@ -2989,14 +2994,14 @@ pub fn memo_pass(
         if !purity.is_pure(func) {
             continue;
         }
-        // 递归函数（自递归 + 相互递归统一处理）
+        // Recursive functions (self-recursion + mutual recursion handled uniformly)
         if cg.recursive.contains(&func) {
             if is_tail_recursive(body_expr, arena, name) {
-                // TailRecToLoop 统一处理 if-else 和 match 尾递归：
-                // - if-else: cond = NOT(base_case_cond)，Gate 分派 base/rec
-                // - match: cond = Const(true)，body_sg 内部 match Gate 分派，
-                //   rec arm 的 WriteBack 设置 Continue → 循环继续，
-                //   base arm 无信号 → 循环退出（返回 body_sg 返回值）
+                // TailRecToLoop uniformly handles if-else and match tail recursion:
+                // - if-else: cond = NOT(base_case_cond), Gate dispatches base/rec
+                // - match: cond = Const(true), body_sg internally match Gate dispatches,
+                //   rec arm's WriteBack sets Continue -> loop continues,
+                //   base arm has no signal -> loop exits (returns body_sg return value)
                 let info = extract_tail_rec_info(body_expr, arena, name);
                 if info.is_valid() {
                     plan.candidates.push(MemoCandidate {
@@ -3007,8 +3012,8 @@ pub fn memo_pass(
                     plan.candidates.push(memoize_all_params(func, params));
                 }
             } else if has_non_tail_self_call(body_expr, arena, name) {
-                // NonTailRecToLoop 仅在：无 defer + info 有效 + 单调用点（无重复子问题）时适用。
-                // 其余情况（defer / info 无效 / 2+ 调用点有重复子问题）一律走 Memoize。
+                // NonTailRecToLoop only applies when: no defer + info valid + single call site (no overlapping subproblems).
+                // All other cases (defer / info invalid / 2+ call sites with overlapping subproblems) go to Memoize.
                 let info = extract_non_tail_rec_info(body_expr, arena, name, params.len());
                 let can_non_tail_loop = !has_defer(body_expr, arena)
                     && info.is_valid()
@@ -3022,17 +3027,17 @@ pub fn memo_pass(
                     plan.candidates.push(memoize_all_params(func, params));
                 }
             } else {
-                // 相互递归（无自调用）→ Memoize
+                // Mutual recursion (no self-call) -> Memoize
                 plan.candidates.push(memoize_all_params(func, params));
             }
             continue;
         }
-        // 相互递归纯函数 SCC：记忆化
+        // Mutually recursive pure function SCC: memoize
         if cg.mutually_recursive.iter().any(|scc| scc.contains(&func)) {
             plan.candidates.push(memoize_all_params(func, params));
             continue;
         }
-        // 含循环：收集不变量
+        // Contains loops: collect invariants
         let invariants = collect_loop_invariants(body_expr, arena, module_name, sema, purity, escape, func_name_to_id);
         if !invariants.is_empty() {
             plan.candidates.push(MemoCandidate {
@@ -3044,7 +3049,7 @@ pub fn memo_pass(
     plan
 }
 
-/// 构造 Memoize 候选：缓存全部参数（通用 helper，消除重复构造）。
+/// Constructs a Memoize candidate: caches all parameters (generic helper, eliminates duplicate construction).
 fn memoize_all_params(func: FuncId, params: &[crate::ast::Ast::Param]) -> MemoCandidate {
     let param_indices: Vec<u32> = (0..params.len() as u32).collect();
     MemoCandidate {
@@ -3056,15 +3061,15 @@ fn memoize_all_params(func: FuncId, params: &[crate::ast::Ast::Param]) -> MemoCa
     }
 }
 
-/// 判定函数体是否为尾递归：函数体中至少有一条路径的尾位置是对自身的调用。
-/// 支持 if-else 和 Match 尾递归，且所有自调用必须在尾位置。
-/// ack(m-1, ack(m, n-1)) 的内层 ack 是非尾位置自调用 → 拒绝。
+/// Determines whether a function body is tail-recursive: at least one path's tail position is a self-call.
+/// Supports if-else and Match tail recursion, and all self-calls must be in tail position.
+/// The inner ack in ack(m-1, ack(m, n-1)) is a non-tail-position self-call -> rejected.
 fn is_tail_recursive(body: ExprId, arena: &AstArena, self_name: &str) -> bool {
     has_tail_call(body, arena, self_name) && !has_non_tail_self_call(body, arena, self_name)
 }
 
-/// 检查表达式的尾位置是否存在对 self_name 的调用。
-/// 递归 if-else、Match arm body 和 block trailing。
+/// Checks whether a call to self_name exists in the tail position of an expression.
+/// Recurses into if-else, Match arm body, and block trailing.
 fn has_tail_call(expr_id: ExprId, arena: &AstArena, self_name: &str) -> bool {
     let expr = &arena.expr(expr_id).node;
     match expr {
@@ -3081,16 +3086,16 @@ fn has_tail_call(expr_id: ExprId, arena: &AstArena, self_name: &str) -> bool {
                 || else_branch.map_or(false, |e| has_tail_call(e, arena, self_name))
         }
         Expr::Match { arms, .. } => {
-            // 每个 arm 的 body 都是尾位置
+            // Each arm's body is in tail position
             arms.iter().any(|arm| has_tail_call(arm.body, arena, self_name))
         }
         _ => false,
     }
 }
 
-/// 检查函数体是否存在非尾位置的自调用（如 ack(m-1, ack(m, n-1)) 的内层 ack）。
-/// 非尾位置 = 作为参数、操作数、字段值等。
-/// 若存在此类调用，函数不是纯尾递归，不能安全转迭代。
+/// Checks whether the function body contains non-tail-position self-calls (e.g., the inner ack in ack(m-1, ack(m, n-1))).
+/// Non-tail position = as an argument, operand, field value, etc.
+/// If such calls exist, the function is not purely tail-recursive and cannot be safely converted to iteration.
 fn has_non_tail_self_call(body: ExprId, arena: &AstArena, self_name: &str) -> bool {
     fn is_self_call(expr_id: ExprId, arena: &AstArena, self_name: &str) -> bool {
         if let Expr::Call { callee, .. } = &arena.expr(expr_id).node {
@@ -3100,27 +3105,27 @@ fn has_non_tail_self_call(body: ExprId, arena: &AstArena, self_name: &str) -> bo
         }
         false
     }
-    /// 递归检查子表达式中是否存在非尾位置自调用。
-    /// `in_tail` 表示当前表达式是否在尾位置。
+    /// Recursively checks whether sub-expressions contain non-tail-position self-calls.
+    /// `in_tail` indicates whether the current expression is in tail position.
     fn check(expr_id: ExprId, arena: &AstArena, self_name: &str, in_tail: bool) -> bool {
         let expr = &arena.expr(expr_id).node;
         match expr {
             Expr::Call { callee, args, .. } => {
                 let is_self = is_self_call(expr_id, arena, self_name);
                 if is_self && !in_tail {
-                    // 非尾位置的自调用 → 拒绝
+                    // Non-tail-position self-call -> reject
                     return true;
                 }
                 if is_self && in_tail {
-                    // 尾位置的自调用：检查参数中是否有非尾自调用
+                    // Tail-position self-call: check whether arguments contain non-tail self-calls
                     return args.iter().any(|&a| check(a, arena, self_name, false));
                 }
-                // 非自调用：callee 和 args 都是非尾位置
+                // Non-self-call: callee and args are all non-tail position
                 check(*callee, arena, self_name, false)
                     || args.iter().any(|&a| check(a, arena, self_name, false))
             }
             Expr::Block { stmts, trailing } => {
-                // stmts 中的表达式都不是尾位置
+                // Expressions in stmts are not in tail position
                 for s in stmts {
                     if let Some(e) = stmt_tail_expr(*s, arena) {
                         if check(e, arena, self_name, false) {
@@ -3136,7 +3141,7 @@ fn has_non_tail_self_call(body: ExprId, arena: &AstArena, self_name: &str) -> bo
                     || else_branch.map_or(false, |e| check(e, arena, self_name, in_tail))
             }
             Expr::Match { scrutinee, arms, .. } => {
-                // Match 本身不阻止，但 arm body 中的非尾自调用会被检测
+                // Match itself does not block, but non-tail self-calls in arm bodies are detected
                 check(*scrutinee, arena, self_name, false)
                     || arms.iter().any(|arm| check(arm.body, arena, self_name, in_tail))
             }
@@ -3188,7 +3193,7 @@ fn has_non_tail_self_call(body: ExprId, arena: &AstArena, self_name: &str) -> bo
     check(body, arena, self_name, true)
 }
 
-/// 获取语句中的表达式（用于非尾位置自调用检查）。
+/// Extracts the expression from a statement (for non-tail-position self-call checks).
 fn stmt_tail_expr(stmt_id: crate::ast::Ast::StmtId, arena: &AstArena) -> Option<ExprId> {
     match &arena.stmt(stmt_id).node {
         crate::ast::Ast::Stmt::Expression { expr } => Some(*expr),
@@ -3202,17 +3207,18 @@ fn stmt_tail_expr(stmt_id: crate::ast::Ast::StmtId, arena: &AstArena) -> Option<
     }
 }
 
-/// 从尾递归函数体提取参数变换信息。
+/// Extracts parameter transformation info from a tail-recursive function body.
 ///
-/// 遍历函数体的控制流分支，分类为 base case（非递归终止）和 rec branch（递归调用）。
-/// 支持的 AST 结构：
+/// Traverses the control-flow branches of the function body, classifying them into
+/// base cases (non-recursive terminations) and rec branches (recursive calls).
+/// Supported AST shapes:
 /// - if cond { return base } else { return self(args) }
 /// - if cond1 { ... } else if cond2 { return self(args2) } else { return base }
 /// - match scrut { arm1 => return base, arm2 => return self(args) }
 /// - block { stmts; trailing_if_or_match }
 ///
-/// 每个 base case 记录 (条件, 返回值)；每个 rec branch 记录 (条件, 实参列表)。
-/// 条件为 None 表示 else/match wildcard 兜底分支。
+/// Each base case records (condition, return value); each rec branch records (condition, argument list).
+/// A `None` condition denotes an else/match-wildcard fallback branch.
 fn extract_tail_rec_info(
     body: ExprId,
     arena: &AstArena,
@@ -3223,8 +3229,8 @@ fn extract_tail_rec_info(
     info
 }
 
-/// 递归收集控制流分支的 base case 和 rec branch。
-/// `cond` 是当前分支的继承条件（None 表示兜底/无条件）。
+/// Recursively collects base cases and rec branches from control-flow branches.
+/// `cond` is the inherited condition of the current branch (None = fallback/unconditional).
 fn collect_tail_branches(
     expr_id: ExprId,
     arena: &AstArena,
@@ -3234,7 +3240,7 @@ fn collect_tail_branches(
 ) {
     let expr = &arena.expr(expr_id).node;
     match expr {
-        // block：优先递归 trailing；trailing 为 None 时检查末尾 Return
+        // block: recurse into trailing first; when trailing is None, check the final Return
         Expr::Block { stmts, trailing } => {
             if let Some(t) = trailing {
                 collect_tail_branches(*t, arena, self_name, cond, info);
@@ -3248,20 +3254,20 @@ fn collect_tail_branches(
                 }
             }
         }
-        // if：then 分支用 Some(cond)，else 分支用 None（兜底）
+        // if: then branch uses Some(cond), else branch uses None (fallback)
         Expr::If { cond: if_cond, then_branch, else_branch, .. } => {
             collect_tail_branches(*then_branch, arena, self_name, Some(*if_cond), info);
             if let Some(eb) = else_branch {
                 collect_tail_branches(*eb, arena, self_name, None, info);
             }
         }
-        // match：每个 arm 单独分派（模式条件无法用 ExprId 表达，用 None）
+        // match: each arm is dispatched separately (pattern conditions cannot be expressed as ExprId, use None)
         Expr::Match { arms, .. } => {
             for arm in arms {
                 collect_tail_branches(arm.body, arena, self_name, None, info);
             }
         }
-        // 尾调用：rec branch
+        // tail call: rec branch
         Expr::Call { callee, args, .. } => {
             if let Expr::Ident(name) = &arena.expr(*callee).node {
                 if *name == self_name {
@@ -3271,7 +3277,7 @@ fn collect_tail_branches(
             }
             info.base_cases.push((cond, expr_id));
         }
-        // 非尾调用表达式：base case
+        // non-tail-call expression: base case
         _ => {
             info.base_cases.push((cond, expr_id));
         }
@@ -3279,14 +3285,15 @@ fn collect_tail_branches(
 }
 
 // =========================================================================
-// 非尾递归转迭代：调用点提取 + 续延分析
+// Non-tail recursion to iteration: call-site extraction + continuation analysis
 // =========================================================================
 
-/// 从非尾递归函数体提取调用点 + 续延信息。
+/// Extracts call sites and continuation info from a non-tail-recursive function body.
 ///
-/// 遍历函数体 AST，收集所有非尾位置的自调用 ExprId。
-/// continuation_expr = body（函数体本身），因为纯函数的条件重评估结果不变，
-/// Builder 对每个 state 重新编译 body，用 call_result_map 替换已完成的调用。
+/// Traverses the function body AST, collecting all non-tail-position self-call ExprIds.
+/// continuation_expr = body (the function body itself), because re-evaluating conditions of a
+/// pure function yields the same result. The Builder recompiles the body for each state,
+/// replacing completed calls via call_result_map.
 fn extract_non_tail_rec_info(
     body: ExprId,
     arena: &AstArena,
@@ -3306,12 +3313,12 @@ fn extract_non_tail_rec_info(
     }
 }
 
-/// 递归收集非尾位置的自调用 ExprId + base case。
+/// Recursively collects non-tail-position self-call ExprIds and base cases.
 ///
-/// `in_tail` 表示当前表达式是否在尾位置。
-/// - 尾位置的自调用是尾递归（Tier A 处理），不收集
-/// - 非尾位置的自调用收集到 call_sites
-/// - 非自调用的尾位置表达式收集为 base case
+/// `in_tail` indicates whether the current expression is in tail position.
+/// - Self-calls in tail position are tail-recursive (handled by Tier A), not collected
+/// - Self-calls in non-tail position are collected into call_sites
+/// - Non-self-call expressions in tail position are collected as base cases
 fn collect_non_tail_calls(
     expr_id: ExprId,
     arena: &AstArena,
@@ -3330,12 +3337,12 @@ fn collect_non_tail_calls(
             };
             if is_self {
                 if in_tail {
-                    // 尾位置自调用：尾递归，不触发 Tier B
+                    // tail-position self-call: tail recursion, does not trigger Tier B
                     base_cases.push((None, expr_id));
                 } else {
-                    // 非尾位置自调用：收集为 call_site
+                    // non-tail-position self-call: collect as call_site
                     call_sites.push(expr_id);
-                    // 检查参数中是否有更多自调用（如 ack(m-1, ack(m, n-1)) 的内层）
+                    // Check arguments for additional self-calls (e.g., the inner call in ack(m-1, ack(m, n-1)))
                     for &a in args {
                         collect_non_tail_calls(a, arena, self_name, false, call_sites, base_cases);
                     }
@@ -3437,7 +3444,7 @@ fn collect_non_tail_calls(
     }
 }
 
-/// 判定是否为叶子表达式（无子表达式）。
+/// Determines whether the expression is a leaf (has no sub-expressions).
 fn is_leaf(expr_id: ExprId, arena: &AstArena) -> bool {
     matches!(
         &arena.expr(expr_id).node,
@@ -3447,8 +3454,10 @@ fn is_leaf(expr_id: ExprId, arena: &AstArena) -> bool {
     )
 }
 
-/// 收集循环不变量：循环内引用、仅依赖循环外定义且循环内未修改变量的纯表达式。
-/// 候选包括循环条件（While）、迭代源（For）及循环体内的纯表达式。
+/// Collects loop invariants: pure expressions referenced inside the loop that depend only on
+/// variables defined outside the loop and not modified within it.
+/// Candidates include loop conditions (While), iteration sources (For), and pure expressions
+/// inside the loop body.
 fn collect_loop_invariants(
     body: ExprId,
     arena: &AstArena,
@@ -3463,7 +3472,7 @@ fn collect_loop_invariants(
     invariants
 }
 
-/// 递归查找循环（While/Loop/For 语句），收集不变量候选。
+/// Recursively searches for loops (While/Loop/For statements), collecting invariant candidates.
 fn collect_loop_invariants_expr(
     expr_id: ExprId,
     arena: &AstArena,
@@ -3474,17 +3483,17 @@ fn collect_loop_invariants_expr(
     func_name_to_id: &FxHashMap<String, FuncId>,
     invariants: &mut Vec<ExprId>,
 ) {
-    // 遍历 Block 中的语句查找循环
+    // Traverse statements in Block to find loops
     walk_children_stmts_of_expr(expr_id, arena, |s| {
         collect_loop_invariants_stmt(s, arena, module_name, sema, purity, escape, func_name_to_id, invariants);
     });
-    // 遍历子表达式查找嵌套 Block
+    // Traverse sub-expressions to find nested Blocks
     walk_children_expr(expr_id, arena, |c| {
         collect_loop_invariants_expr(c, arena, module_name, sema, purity, escape, func_name_to_id, invariants)
     });
 }
 
-/// 遍历语句查找循环。
+/// Traverses statements to find loops.
 fn collect_loop_invariants_stmt(
     stmt_id: StmtId,
     arena: &AstArena,
@@ -3521,7 +3530,7 @@ fn collect_loop_invariants_stmt(
     }
 }
 
-/// 收集循环体内被修改的变量名集合。
+/// Collects the set of variable names modified within the loop body.
 fn collect_modified_vars(expr_id: ExprId, arena: &AstArena) -> FxHashSet<String> {
     let mut modified = FxHashSet::default();
     collect_modified_vars_inner(expr_id, arena, &mut modified);
@@ -3577,7 +3586,7 @@ fn collect_modified_vars_stmt(stmt_id: StmtId, arena: &AstArena, modified: &mut 
     }
 }
 
-/// 遍历循环体，收集所有满足不变量条件的纯表达式。
+/// Traverses the loop body, collecting all pure expressions that satisfy the invariant condition.
 fn collect_invariant_candidates(
     expr_id: ExprId,
     arena: &AstArena,
@@ -3614,7 +3623,8 @@ fn collect_invariant_candidates_stmt(
     });
 }
 
-/// 判定表达式是否为循环不变量候选：非叶子、纯、引用的变量均未被循环修改。
+/// Determines whether an expression is a loop-invariant candidate: non-leaf, pure, and
+/// all referenced variables are unmodified by the loop.
 fn try_add_invariant(
     expr_id: ExprId,
     arena: &AstArena,
@@ -3641,7 +3651,7 @@ fn try_add_invariant(
     invariants.push(expr_id);
 }
 
-/// 收集表达式中引用的所有标识符名。
+/// Collects all identifier names referenced within an expression.
 fn collect_idents(expr_id: ExprId, arena: &AstArena, refs: &mut FxHashSet<String>) {
     let expr = &arena.expr(expr_id).node;
     match expr {
@@ -3653,21 +3663,21 @@ fn collect_idents(expr_id: ExprId, arena: &AstArena, refs: &mut FxHashSet<String
 }
 
 // =========================================================================
-// DeadParamPass — 未使用参数检测
+// DeadParamPass — unused parameter detection
 // =========================================================================
 
-/// 未使用参数报告。
+/// Unused parameter report.
 #[derive(Debug, Default)]
 pub struct DeadParamReport {
-    /// (FuncId, 参数名) 列表：从未被函数体读取的参数
+    /// List of (FuncId, parameter name): parameters never read by the function body.
     pub dead_params: Vec<(FuncId, String)>,
 }
 
-/// 检测从未被函数体读取的参数。
-/// 参数在 DefUseGraph 中以 StmtId(u32::MAX) 注册，is_never_read 判定。
+/// Detects parameters that are never read by the function body.
+/// Parameters are registered in DefUseGraph with StmtId(u32::MAX); is_never_read is used for the check.
 pub fn dead_param_pass(module: &Module, def_use: &DefUseGraph, cg: &CallGraph) -> DeadParamReport {
     let mut report = DeadParamReport::default();
-    // 统一遍历 FunDecl + Method
+    // Unified traversal of FunDecl + Method
     for (func, meta) in cg.iter_funcs(module) {
         for param in meta.params {
             if let Some(vid) = def_use.lookup(func, param.name) {
@@ -3683,24 +3693,25 @@ pub fn dead_param_pass(module: &Module, def_use: &DefUseGraph, cg: &CallGraph) -
 }
 
 // =========================================================================
-// InlinePass — 内联候选分析
+// InlinePass — inline candidate analysis
 // =========================================================================
 
-/// 内联阈值：函数体 AST 节点数 <= 此值且为纯函数时建议内联。
+/// Inline threshold: functions with AST node count <= this value and pure are recommended for inlining.
 const INLINE_SIZE_THRESHOLD: usize = 15;
 
-/// 内联候选报告。
+/// Inline candidate report.
 #[derive(Debug, Default)]
 pub struct InlineReport {
-    /// 建议内联的函数列表：(FuncId, 函数体大小)
+    /// List of functions recommended for inlining: (FuncId, function body size)
     pub candidates: Vec<(FuncId, usize)>,
-    /// 调用点 ExprId → 被调函数 FuncId
-    /// IrBuilder 编译 Call 时查此表，命中则内联展开 callee body 而非 launch 子图
+    /// Call site ExprId → callee FuncId.
+    /// IrBuilder looks up this table when compiling Call; on hit, it inlines the callee body
+    /// instead of launching a sub-graph.
     pub expansions: FxHashMap<ExprId, FuncId>,
 }
 
-/// 内联候选分析：小纯函数 + 非递归 + 非 async/throwing。
-/// 产出内联建议供 IR 层决策。
+/// Inline candidate analysis: small pure functions + non-recursive + non-async/throwing.
+/// Produces inline recommendations for the IR layer to act on.
 pub fn inline_pass(
     module: &Module,
     arena: &AstArena,
@@ -3709,21 +3720,21 @@ pub fn inline_pass(
     sema: &SemaResult,
 ) -> InlineReport {
     let mut report = InlineReport::default();
-    // 第一遍：收集可内联函数集合（统一遍历 FunDecl + Method）
+    // Pass 1: collect the set of inlineable functions (unified traversal of FunDecl + Method)
     let mut inlineable: FxHashSet<FuncId> = FxHashSet::default();
     let func_metas: Vec<(FuncId, &str, crate::ast::Ast::ExprId, bool)> = cg.iter_funcs(module)
         .map(|(fid, meta)| (fid, meta.name, meta.body, meta.is_async))
         .collect();
     for (func, name, body, is_async) in func_metas {
-        // 非纯函数不内联（可能有副作用依赖）
+        // Non-pure functions are not inlined (may have side-effect dependencies)
         if !purity.is_pure(func) {
             continue;
         }
-        // 递归函数不内联（会无限展开）
+        // Recursive functions are not inlined (would expand infinitely)
         if cg.recursive.contains(&func) {
             continue;
         }
-        // async/throwing 函数不内联
+        // async/throwing functions are not inlined
         if is_async {
             continue;
         }
@@ -3732,25 +3743,25 @@ pub fn inline_pass(
                 continue;
             }
         }
-        // 入口函数（Entry/ExternC/ExternAttr）不内联
+        // Entry functions (Entry/ExternC/ExternAttr) are not inlined
         if let Some(reason) = cg.entry_reasons.get(&func) {
             if reason.is_definite() {
                 continue;
             }
         }
-        // 包含嵌套函数（Lambda/LocalDecl）的函数不内联
+        // Functions containing nested functions (Lambda/LocalDecl) are not inlined
         if has_nested_function(body, arena) {
             continue;
         }
-        // 包含 ? 传播运算符的函数不内联
+        // Functions containing the `?` propagation operator are not inlined
         if has_propagate(body, arena) {
             continue;
         }
-        // 包含 return 语句的函数不内联
+        // Functions containing return statements are not inlined
         if has_return(body, arena) {
             continue;
         }
-        // 包含 defer 语句的函数不内联
+        // Functions containing defer statements are not inlined
         if has_defer(body, arena) {
             continue;
         }
@@ -3760,7 +3771,7 @@ pub fn inline_pass(
             inlineable.insert(func);
         }
     }
-    // 第二遍：从 call_sites 中筛选调用可内联函数的调用点，产出 expansions
+    // Pass 2: filter call sites that call inlineable functions, producing expansions
     for (&expr_id, &callee) in &cg.call_sites {
         if inlineable.contains(&callee) {
             report.expansions.insert(expr_id, callee);
@@ -3769,9 +3780,10 @@ pub fn inline_pass(
     report
 }
 
-/// 检测表达式中是否包含嵌套函数（Lambda 或 LocalDecl 中的 FunDecl）。
-/// 包含嵌套函数的函数不应内联：内联展开会引入新子图，
-/// 其节点范围与外层子图 node_range 冲突，导致 prepare_frame 误标为嵌套节点永不就绪。
+/// Detects whether an expression contains nested functions (Lambda or FunDecl within LocalDecl).
+/// Functions with nested functions should not be inlined: inlining would introduce new sub-graphs
+/// whose node ranges conflict with the outer sub-graph's node_range, causing prepare_frame to
+/// mistakenly mark nested nodes as never-ready.
 fn has_nested_function(expr_id: ExprId, arena: &AstArena) -> bool {
     if matches!(arena.expr(expr_id).node, Expr::Lambda { .. }) {
         return true;
@@ -3808,9 +3820,10 @@ fn has_nested_function_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
     found
 }
 
-/// 检测表达式中是否包含 `?` 传播运算符（Expr::Propagate）。
-/// 包含 ? 的函数不应内联：compute_propagate 通过 ControlSignal::Return 实现提前返回，
-/// 该信号是函数级作用域，内联后会错误地终止调用方函数。
+/// Detects whether an expression contains the `?` propagation operator (Expr::Propagate).
+/// Functions with `?` should not be inlined: compute_propagate implements early return via
+/// ControlSignal::Return, which is function-scoped; inlining would incorrectly terminate the
+/// caller function.
 fn has_propagate(expr_id: ExprId, arena: &AstArena) -> bool {
     if matches!(arena.expr(expr_id).node, Expr::Propagate(_)) {
         return true;
@@ -3834,7 +3847,7 @@ fn has_propagate(expr_id: ExprId, arena: &AstArena) -> bool {
 fn has_propagate_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
     let stmt = &arena.stmt(stmt_id).node;
     match stmt {
-        // defer body 编译为独立子图，? 传播不影响外层函数
+        // defer body is compiled into a separate sub-graph; ? propagation does not affect the outer function
         Stmt::Defer { .. } => false,
         _ => {
             let mut found = false;
@@ -3848,10 +3861,12 @@ fn has_propagate_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
     }
 }
 
-/// 检测表达式中是否包含 defer 语句。
-/// 含 defer 的函数不可内联：defer 注册到函数子图的 defer_table，
-/// 内联后函数帧不创建，defer_table 永远不被检查（Bug #47）。
-/// Lambda body 中的 defer 不计入（has_nested_function 已排除含 lambda 的函数）。
+/// Detects whether an expression contains defer statements.
+/// Functions with defer cannot be inlined: defer registers into the function sub-graph's
+/// defer_table; after inlining the function frame is not created, so defer_table is never
+/// checked (Bug #47).
+/// Defer within lambda bodies is not counted (has_nested_function already excludes functions
+/// containing lambdas).
 fn has_defer(expr_id: ExprId, arena: &AstArena) -> bool {
     let mut found = false;
     walk_children_stmts_of_expr(expr_id, arena, |s| {
@@ -3873,8 +3888,8 @@ fn has_defer_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
     let stmt = &arena.stmt(stmt_id).node;
     match stmt {
         Stmt::Defer { .. } => true,
-        // Lambda body 中的 defer 不计入（lambda 有独立帧）
-        // has_nested_function 已排除含 lambda 的函数
+        // Defer within lambda bodies is not counted (lambdas have independent frames)
+        // has_nested_function already excludes functions containing lambdas
         _ => {
             let mut found = false;
             walk_children_stmt(stmt_id, arena, |e| {
@@ -3887,9 +3902,9 @@ fn has_defer_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
     }
 }
 
-/// 检测表达式中是否包含 return 语句（函数级作用域）。
-/// Lambda body 中的 return 不计入（scoped to lambda）。
-/// Defer body 中的 return 不计入（defer body 编译为独立子图）。
+/// Detects whether an expression contains return statements (function-scoped).
+/// Return within lambda bodies is not counted (scoped to the lambda).
+/// Return within defer bodies is not counted (defer body is compiled into a separate sub-graph).
 fn has_return(expr_id: ExprId, arena: &AstArena) -> bool {
     let mut found = false;
     walk_children_stmts_of_expr(expr_id, arena, |s| {
@@ -3911,7 +3926,7 @@ fn has_return_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
     let stmt = &arena.stmt(stmt_id).node;
     match stmt {
         Stmt::Return { .. } => true,
-        // defer body 编译为独立子图，return 不影响外层函数
+        // defer body is compiled into a separate sub-graph; return does not affect the outer function
         Stmt::Defer { .. } => false,
         _ => {
             let mut found = false;
@@ -3925,7 +3940,7 @@ fn has_return_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
     }
 }
 
-/// 递归统计表达式子树的 AST 节点数。
+/// Recursively counts the number of AST nodes in an expression subtree.
 fn count_expr_nodes(expr_id: ExprId, arena: &AstArena) -> usize {
     let mut count = 1;
     walk_children_expr(expr_id, arena, |c| {
@@ -3946,18 +3961,19 @@ fn count_stmt_nodes(stmt_id: StmtId, arena: &AstArena) -> usize {
 }
 
 // =========================================================================
-// StackAllocPass — 栈分配建议
+// StackAllocPass — stack allocation recommendations
 // =========================================================================
 
-/// 栈分配建议报告。
+/// Stack allocation recommendation report.
 #[derive(Debug, Default)]
 pub struct StackAllocReport {
-    /// 可栈分配的分配点 ExprId 列表（EscapeTable 标记为 NoEscape）
+    /// List of allocation site ExprIds eligible for stack allocation (marked NoEscape by EscapeTable)
     pub candidates: Vec<ExprId>,
 }
 
-/// 栈分配建议：EscapeTable 标记为 NoEscape 的分配可改为栈分配。
-/// 数据由 EscapeAnalyzer 产出，此处汇总上报供 IR 层使用。
+/// Stack allocation recommendations: allocations marked NoEscape by EscapeTable can be
+/// converted to stack allocations.
+/// Data is produced by EscapeAnalyzer; this pass aggregates and reports it for the IR layer.
 pub fn stack_alloc_pass(escape: &EscapeTable) -> StackAllocReport {
     let mut report = StackAllocReport::default();
     for (&expr_id, &info) in escape.map.iter() {
@@ -3969,24 +3985,25 @@ pub fn stack_alloc_pass(escape: &EscapeTable) -> StackAllocReport {
 }
 
 // =========================================================================
-// MatchExhaustivenessPass — 模式匹配完备性 + 不可达 arm 检测
+// MatchExhaustivenessPass — pattern match exhaustiveness + unreachable arm detection
 // =========================================================================
 
-/// 模式匹配分析报告。
+/// Pattern match analysis report.
 #[derive(Debug, Default)]
 pub struct MatchReport {
-    /// 非完备 match：(match 表达式 ExprId, scrutinee 类型名, 缺失的构造器名)
+    /// Non-exhaustive matches: (match expression ExprId, scrutinee type name, missing constructor names)
     pub non_exhaustive: Vec<(ExprId, String, Vec<String>)>,
-    /// 不可达 match arm：(match 表达式 ExprId, arm 索引)
+    /// Unreachable match arms: (match expression ExprId, arm index)
     pub unreachable_arms: Vec<(ExprId, usize)>,
 }
 
-/// 模式匹配分析：
-/// - 非完备检测：ADT 类型的 match 若未覆盖所有构造器且无 Wildcard → 报告缺失构造器
-/// - 不可达 arm 检测：Wildcard 之后的 arm 不可达
+/// Pattern match analysis:
+/// - Non-exhaustive detection: if a match on an ADT type does not cover all constructors and
+///   has no Wildcard, report the missing constructors
+/// - Unreachable arm detection: arms after a Wildcard are unreachable
 pub fn match_pass(module: &Module, arena: &AstArena, sema: &SemaResult, cg: &CallGraph) -> MatchReport {
     let mut report = MatchReport::default();
-    // 统一遍历 FunDecl + Method
+    // Unified traversal of FunDecl + Method
     for (_fid, meta) in cg.iter_funcs(module) {
         analyze_match_expr(meta.body, arena, module.name, sema, &mut report);
     }
@@ -3998,11 +4015,11 @@ fn analyze_match_expr(expr_id: ExprId, arena: &AstArena, module_name: &str, sema
     if let Expr::Match { scrutinee, arms } = expr {
         analyze_single_match(expr_id, *scrutinee, arms, arena, module_name, sema, report);
     }
-    // 递归子表达式
+    // Recurse into sub-expressions
     walk_children_expr(expr_id, arena, |c| {
         analyze_match_expr(c, arena, module_name, sema, report);
     });
-    // 递归 Block 中的语句
+    // Recurse into statements within Blocks
     walk_children_stmts_of_expr(expr_id, arena, |s| {
         analyze_match_stmt(s, arena, module_name, sema, report);
     });
@@ -4023,7 +4040,7 @@ fn analyze_single_match(
     sema: &SemaResult,
     report: &mut MatchReport,
 ) {
-    // 1. 不可达 arm 检测：Wildcard 之后的 arm 不可达（无 guard 的 Wildcard 终结匹配）
+    // 1. Unreachable arm detection: arms after a Wildcard are unreachable (a guardless Wildcard terminates matching)
     let mut wildcard_seen = false;
     for (i, arm) in arms.iter().enumerate() {
         let pat = &arena.pattern(arm.pattern).node;
@@ -4037,13 +4054,13 @@ fn analyze_single_match(
         }
     }
 
-    // 2. 非完备检测：scrutinee 类型为 ADT，收集所有 arm 覆盖的构造器名
+    // 2. Non-exhaustive detection: when the scrutinee type is an ADT, collect all constructor names covered by arms
     let key = module_expr_key(module_name, scrutinee.0 as u64);
     let Some(info) = sema.expr_types.get(&key) else { return };
     let Some(type_name) = info.type_name.as_deref() else { return };
     let Some(&type_idx) = sema.type_def_index.get(type_name) else { return };
     let type_def = &sema.type_defs[type_idx as usize];
-    // 仅 ADT 类型有多个构造器需要检查完备性
+    // Only ADT types with multiple constructors require exhaustiveness checking
     if type_def.kind != crate::sema::Sema::TypeDefKind::Adt {
         return;
     }
@@ -4052,7 +4069,7 @@ fn analyze_single_match(
         return;
     }
 
-    // 收集 arm 中覆盖的构造器名
+    // Collect constructor names covered by arms
     let mut covered: FxHashSet<String> = FxHashSet::default();
     let mut has_wildcard = false;
     for arm in arms {
@@ -4060,12 +4077,12 @@ fn analyze_single_match(
         collect_pattern_ctors(pat, arena, &mut covered, &mut has_wildcard);
     }
 
-    // 有 Wildcard 则视为完备（保守）
+    // With a Wildcard, conservatively treat as exhaustive
     if has_wildcard {
         return;
     }
 
-    // 找出缺失的构造器
+    // Find missing constructors
     let missing: Vec<String> = all_ctors
         .iter()
         .filter(|c| !covered.contains(**c))
@@ -4076,7 +4093,7 @@ fn analyze_single_match(
     }
 }
 
-/// 递归收集 pattern 中覆盖的构造器名。
+/// Recursively collects constructor names covered by a pattern.
 fn collect_pattern_ctors(
     pattern: &Pattern,
     arena: &AstArena,
@@ -4088,7 +4105,7 @@ fn collect_pattern_ctors(
             *has_wildcard = true;
         }
         Pattern::Literal(_) => {
-            // 字面量模式不覆盖构造器，保守视为 wildcard（可能覆盖部分值）
+            // Literal patterns do not cover constructors; conservatively treat as wildcard (may cover partial values)
             *has_wildcard = true;
         }
         Pattern::Constructor { name, patterns } => {
@@ -4105,45 +4122,45 @@ fn collect_pattern_ctors(
             collect_pattern_ctors(&arena.pattern(*right).node, arena, covered, has_wildcard);
         }
         Pattern::Guard { pattern, .. } => {
-            // 带 guard 的 pattern 不保证覆盖，保守视为可能未覆盖
+            // Patterns with guards do not guarantee coverage; conservatively treat as potentially non-covering
             collect_pattern_ctors(&arena.pattern(*pattern).node, arena, covered, has_wildcard);
         }
     }
 }
 
 // =========================================================================
-// AnalysisReport — 汇总报告 + rayon 三层并行入口
+// AnalysisReport — aggregated report + rayon three-layer parallel entry point
 // =========================================================================
 
-/// 循环分析报告（IR 构建后由 LoopAnalysis.rs 填充）。
+/// Loop analysis report (populated by LoopAnalysis.rs after IR construction).
 #[derive(Debug, Default)]
 pub struct LoopAnalysisReport {
-    /// 每个循环 body_sg 的不变量节点列表。
-    /// key = body_sg 的 SubGraphId, value = body_sg 内不变量节点的 NodeId 列表。
+    /// List of invariant nodes for each loop body_sg.
+    /// key = SubGraphId of body_sg, value = list of invariant NodeIds within body_sg.
     pub invariants: FxHashMap<crate::ir::Ir::SubGraphId, Vec<crate::ir::Ir::NodeId>>,
-    /// 可展开的循环。
-    /// key = 循环 sg 的 SubGraphId, value = 展开信息。
+    /// Unrollable loops.
+    /// key = SubGraphId of the loop sub-graph, value = unroll information.
     pub unrollable: FxHashMap<crate::ir::Ir::SubGraphId, UnrollInfo>,
 }
 
-/// 循环展开信息。
+/// Loop unrolling information.
 #[derive(Debug, Clone)]
 pub struct UnrollInfo {
-    /// 编译期已知的 trip count
+    /// Compile-time known trip count
     pub trip_count: u32,
-    /// 循环变量在 body_sg 中的绑定节点
+    /// Binding node of the loop variable within body_sg
     pub loop_var_node: crate::ir::Ir::NodeId,
-    /// 循环起始值
+    /// Loop start value
     pub start_value: i128,
-    /// 循环步进
+    /// Loop step
     pub step: i128,
-    /// body_sg 的 SubGraphId
+    /// SubGraphId of body_sg
     pub body_sg: crate::ir::Ir::SubGraphId,
-    /// Range start 的原始 ConstValue（用于保持类型一致）
+    /// Original ConstValue of the Range start (used to preserve type consistency)
     pub start_const: crate::ir::Ir::ConstValue,
 }
 
-/// 静态分析汇总报告。
+/// Aggregated static analysis report.
 #[derive(Debug)]
 pub struct AnalysisReport {
     pub def_use: DefUseGraph,
@@ -4161,27 +4178,27 @@ pub struct AnalysisReport {
     pub loop_analysis: LoopAnalysisReport,
 }
 
-/// 运行完整三层管线分析。
+/// Runs the full three-layer analysis pipeline.
 ///
-/// Layer 1：DefUseBuilder + CallGraphBuilder（rayon::join 并行，无数据依赖）
-/// Layer 2：PurityAnalyzer → EscapeAnalyzer（顺序执行，Escape 依赖 Purity）
-/// Layer 3：DeadCodePass + MemoPass 可并行；DeadVarPass 依赖 DeadCodeReport；
-///          DeadFuncPass 依赖 MemoPlan。
-/// Layer 4：DeadParam + Inline + StackAlloc + Match（可并行，依赖 Layer 1-2 产出）
+/// Layer 1: DefUseBuilder + CallGraphBuilder (rayon::join parallel, no data dependency)
+/// Layer 2: PurityAnalyzer → EscapeAnalyzer (sequential, Escape depends on Purity)
+/// Layer 3: DeadCodePass + MemoPass can run in parallel; DeadVarPass depends on DeadCodeReport;
+///          DeadFuncPass depends on MemoPlan.
+/// Layer 4: DeadParam + Inline + StackAlloc + Match (can run in parallel, depend on Layer 1-2 output)
 pub fn analyze(module: &Module, arena: &AstArena, sema: &SemaResult) -> AnalysisReport {
     let module_name = module.name;
 
-    // Layer 1：并行构建 def-use 图与调用图
+    // Layer 1: build def-use graph and call graph in parallel
     let (def_use, call_graph) = rayon::join(
         || build_def_use(module, arena),
         || build_call_graph(module, arena, sema),
     );
 
-    // Layer 2：顺序执行——EscapeAnalyzer 依赖 PurityTable
+    // Layer 2: sequential — EscapeAnalyzer depends on PurityTable
     let purity = analyze_purity(module, arena, &call_graph, sema);
     let escape = analyze_escape(module, arena, &call_graph, &purity);
 
-    // Layer 3：DeadCodePass 与 MemoPass 无互相依赖，可并行
+    // Layer 3: DeadCodePass and MemoPass have no mutual dependency, can run in parallel
     let (dead_code, memo) = rayon::join(
         || dead_code_pass(module, arena, module_name, sema, &purity, &escape, &call_graph, &def_use),
         || memo_pass(module, arena, &call_graph, &purity, &escape, sema),
@@ -4189,7 +4206,7 @@ pub fn analyze(module: &Module, arena: &AstArena, sema: &SemaResult) -> Analysis
     let dead_var = dead_var_pass(module, arena, &def_use, &dead_code);
     let dead_func = dead_func_pass(&call_graph, &memo);
 
-    // Layer 4：四个新增 pass 并行（依赖 Layer 1-2 产出）
+    // Layer 4: four new passes run in parallel (depend on Layer 1-2 output)
     let ((dead_param, inline), (stack_alloc, match_report)) = rayon::join(
         || rayon::join(
             || dead_param_pass(module, &def_use, &call_graph),
@@ -4214,16 +4231,16 @@ pub fn analyze(module: &Module, arena: &AstArena, sema: &SemaResult) -> Analysis
         inline,
         stack_alloc,
         match_report,
-        loop_analysis: LoopAnalysisReport::default(), // 由本文件 analyze_loops 在 IR 构建后填充
+        loop_analysis: LoopAnalysisReport::default(), // populated by analyze_loops in this file after IR construction
     }
 }
 
 // =========================================================================
-// 循环分析 pass（从 LoopAnalysis.rs 合并）
+// Loop analysis pass (merged from LoopAnalysis.rs)
 //
-// 产出 LoopAnalysisReport：
-// - 不变量识别：body_sg 中纯计算且输入来自循环外的节点
-// - trip count 估计：For 循环迭代器为常量 Range 时的编译期 trip count
+// Produces LoopAnalysisReport:
+// - Invariant identification: nodes in body_sg that are pure computations with inputs from outside the loop
+// - Trip count estimation: compile-time trip count when a For loop iterator is a constant Range
 // =========================================================================
 
 use crate::ir::Ir::{
@@ -4231,21 +4248,21 @@ use crate::ir::Ir::{
     CF_CALL_LAUNCH, CF_RANGE, CF_RANGE_INCLUSIVE, pure_compute_fn_set,
 };
 
-/// 最大展开 body 节点数
+/// Maximum number of body nodes to unroll
 const MAX_UNROLL_BODY_NODES: usize = 32;
-/// 最大展开 trip count
+/// Maximum trip count to unroll
 const MAX_UNROLL: u32 = 8;
 
-/// 运行循环分析，填充 LoopAnalysisReport。
+/// Runs loop analysis, populating LoopAnalysisReport.
 ///
-/// 此函数在 IR 构建后运行，直接分析 DataFlowGraph。
-/// Analyzer.rs 的 analyze() 在 IR 构建前运行（消费 AST + SemaResult），
-/// 因此 loop_analysis 需要在 IR 构建后由 main.rs 调用此函数填充。
+/// This function runs after IR construction and directly analyzes the DataFlowGraph.
+/// Analyzer.rs's analyze() runs before IR construction (consuming AST + SemaResult),
+/// so loop_analysis must be populated by main.rs calling this function after IR construction.
 pub fn analyze_loops(graph: &DataFlowGraph) -> LoopAnalysisReport {
     let mut report = LoopAnalysisReport::default();
     let pure_set = pure_compute_fn_set();
 
-    // 收集所有循环子图（loop_kind != None 且 != LoopBody）
+    // Collect all loop sub-graphs (loop_kind != None and != LoopBody)
     let loop_sgs: Vec<SubGraphId> = graph
         .subgraphs
         .iter()
@@ -4257,7 +4274,7 @@ pub fn analyze_loops(graph: &DataFlowGraph) -> LoopAnalysisReport {
     for loop_sg_id in &loop_sgs {
         let loop_sg = &graph.subgraphs[loop_sg_id.0 as usize];
 
-        // 找到对应的 body_sg（loop_kind == LoopBody 且 loop_parent_sg == loop_sg_id）
+        // Find the corresponding body_sg (loop_kind == LoopBody and loop_parent_sg == loop_sg_id)
         let body_sg_id = graph
             .subgraphs
             .iter()
@@ -4269,13 +4286,13 @@ pub fn analyze_loops(graph: &DataFlowGraph) -> LoopAnalysisReport {
 
         let Some(body_sg_id) = body_sg_id else { continue };
 
-        // ── 不变量识别 ──
+        // ── Invariant identification ──
         let invariants = find_invariants(graph, *loop_sg_id, body_sg_id, &pure_set);
         if !invariants.is_empty() {
             report.invariants.insert(body_sg_id, invariants);
         }
 
-        // ── 循环展开分析（仅 For 循环）──
+        // ── Loop unrolling analysis (For loops only) ──
         if loop_sg.loop_kind == LoopKind::For {
             if let Some(unroll_info) = analyze_unroll(graph, *loop_sg_id, body_sg_id) {
                 report.unrollable.insert(*loop_sg_id, unroll_info);
@@ -4286,7 +4303,7 @@ pub fn analyze_loops(graph: &DataFlowGraph) -> LoopAnalysisReport {
     report
 }
 
-/// 识别 body_sg 中的循环不变量节点。
+/// Identifies loop-invariant nodes within body_sg.
 fn find_invariants(
     graph: &DataFlowGraph,
     loop_sg_id: SubGraphId,
@@ -4297,7 +4314,7 @@ fn find_invariants(
     let body_sg = &graph.subgraphs[body_sg_id.0 as usize];
     let (body_start, body_end) = body_sg.node_range;
 
-    // 循环变量依赖节点（cond_node, iter_next_node）
+    // Loop-variable-dependent nodes (cond_node, iter_next_node)
     let mut loop_deps: FxHashSet<NodeId> = FxHashSet::default();
     if let Some(c) = loop_sg.cond_node {
         loop_deps.insert(c);
@@ -4306,7 +4323,7 @@ fn find_invariants(
         loop_deps.insert(n);
     }
 
-    // 修改集：body_sg 内有副作用节点写回的目标
+    // Modified set: writeback targets of side-effecting nodes within body_sg
     let mut modified: FxHashSet<NodeId> = FxHashSet::default();
     for idx in (body_start.0 as usize)..(body_end.0 as usize) {
         if let Some(Some(wt)) = graph.writeback_targets.get(idx) {
@@ -4314,10 +4331,11 @@ fn find_invariants(
         }
     }
 
-    // 预计算所有循环子图范围（loop_kind != None），用于判断节点是否在函数级。
-    // 外提目标为函数级子图，只有所有 inputs 都在函数级（不在任何循环子图内）
-    // 或已判定为不变量的节点才能安全外提——依赖循环变量的节点不会被外提，
-    // 因为外提到函数级后值不会随循环变化。
+    // Pre-compute all loop sub-graph ranges (loop_kind != None) to determine whether a node is at function level.
+    // The hoist target is the function-level sub-graph; only nodes whose inputs are all at function level
+    // (not inside any loop sub-graph) or already identified as invariants can be safely hoisted — nodes
+    // depending on loop variables will not be hoisted, because after hoisting to function level their
+    // values would no longer change with the loop.
     let loop_ranges: Vec<(u32, u32)> = graph
         .subgraphs
         .iter()
@@ -4328,7 +4346,7 @@ fn find_invariants(
         !loop_ranges.iter().any(|&(s, e)| nid.0 >= s && nid.0 < e)
     };
 
-    // 迭代判定不变量（多轮扫描直到收敛）
+    // Iteratively identify invariants (multiple scan rounds until fixpoint)
     let mut invariants: Vec<NodeId> = Vec::new();
     let mut invariant_set: FxHashSet<NodeId> = FxHashSet::default();
 
@@ -4343,7 +4361,7 @@ fn find_invariants(
 
             let node = graph.nodes[idx];
 
-            // 不能是控制流/调用/事件节点
+            // Must not be a control-flow/call/event node
             if matches!(
                 node.kind,
                 NodeKind::Gate | NodeKind::Call | NodeKind::Await | NodeKind::EventSource
@@ -4351,12 +4369,12 @@ fn find_invariants(
                 continue;
             }
 
-            // 必须是纯计算
+            // Must be a pure computation
             if !pure_set.contains(&node.compute_fn) {
                 continue;
             }
 
-            // 所有 inputs 必须在函数级或已判定的不变量
+            // All inputs must be at function level or already identified as invariants
             let inputs = graph.inputs_pool.get(node.inputs_offset, node.input_count);
             let mut all_invariant = true;
             for &input in inputs {
@@ -4381,7 +4399,7 @@ fn find_invariants(
     invariants
 }
 
-/// 分析 For 循环是否可展开。
+/// Analyzes whether a For loop can be unrolled.
 fn analyze_unroll(
     graph: &DataFlowGraph,
     loop_sg_id: SubGraphId,
@@ -4390,20 +4408,20 @@ fn analyze_unroll(
     let loop_sg = &graph.subgraphs[loop_sg_id.0 as usize];
     let body_sg = &graph.subgraphs[body_sg_id.0 as usize];
 
-    // body 节点数限制
+    // Body node count limit
     let body_size = (body_sg.node_range.1.0 - body_sg.node_range.0.0) as usize;
     if body_size > MAX_UNROLL_BODY_NODES {
         return None;
     }
 
-    // body 内不能有 break/continue/return/throw
+    // Body must not contain break/continue/return/throw
     for idx in (body_sg.node_range.0.0 as usize)..(body_sg.node_range.1.0 as usize) {
         if crate::ir::Ir::is_control_flow_compute_fn(graph.nodes[idx].compute_fn) {
             return None;
         }
     }
 
-    // 在 loop_sg 内查找 CF_RANGE / CF_RANGE_INCLUSIVE 构造节点
+    // Search for CF_RANGE / CF_RANGE_INCLUSIVE construction nodes within loop_sg
     let (loop_start, loop_end) = loop_sg.node_range;
     let mut range_node: Option<NodeId> = None;
     let mut range_inclusive = false;
@@ -4422,7 +4440,7 @@ fn analyze_unroll(
     }
     let range_node = range_node?;
 
-    // Range 的 inputs = [start, end]
+    // Range inputs = [start, end]
     let range_node_struct = graph.nodes[range_node.0 as usize];
     let range_inputs = graph.inputs_pool.get(
         range_node_struct.inputs_offset,
@@ -4461,15 +4479,15 @@ fn analyze_unroll(
         return None;
     }
 
-    // iter_next_node 必须存在且是 Call 节点（Range next 调用）
+    // iter_next_node must exist and be a Call node (Range next call)
     let iter_next = loop_sg.iter_next_node?;
     let iter_node = &graph.nodes[iter_next.0 as usize];
     if iter_node.compute_fn != CF_CALL_LAUNCH {
         return None;
     }
 
-    // body_sg 结构：param_0 = 迭代器, param_1 = 当前值（循环变量）
-    // loop_var_node = body_sg 的第二个参数节点（param_1 = 当前值）
+    // body_sg structure: param_0 = iterator, param_1 = current value (loop variable)
+    // loop_var_node = the second parameter node of body_sg (param_1 = current value)
     let loop_var_node = NodeId(body_sg.node_range.0.0 + 1);
 
     Some(UnrollInfo {
@@ -4482,7 +4500,7 @@ fn analyze_unroll(
     })
 }
 
-/// 从 ConstValue 提取 i128。
+/// Extracts an i128 from a ConstValue.
 fn const_to_i128(cv: &ConstValue) -> Option<i128> {
     use crate::ir::Ir::ConstValue::*;
     match cv {

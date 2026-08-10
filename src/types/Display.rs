@@ -1,5 +1,5 @@
 // =========================================================================
-// Display — 类型显示格式化（TypeDisplay）
+// Display — type display formatting (TypeDisplay).
 // =========================================================================
 
 use super::Tag::*;
@@ -7,8 +7,8 @@ use super::ty::*;
 use super::Arena::*;
 use std::fmt;
 
-/// `Ty` 的格式化包装器：`type_var` 跟随 `bound` 链显示最终类型，
-/// 未绑定变量显示为 `'_<idx>`。
+/// Formatting wrapper for `Ty`: a `type_var` follows the `bound` chain to display the
+/// final type; an unbound variable is displayed as `'_<idx>`.
 pub struct TypeDisplay<'a> {
     pub arena: &'a TypeArena,
     pub ty: TypeHandle,
@@ -23,7 +23,7 @@ impl fmt::Display for TypeDisplay<'_> {
             Ty::Void => f.write_str("void"),
             Ty::Never => f.write_str("!"),
             Ty::Unknown => f.write_str("?"),
-            // 内置标量 + Str/Null：直接输出静态名
+            // Builtin scalars + Str/Null: emit the static name directly.
             Ty::Bool | Ty::Char
             | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128
             | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128
@@ -110,7 +110,7 @@ impl fmt::Display for TypeDisplay<'_> {
                 }
                 f.write_str(" }")
             }
-            // 内置泛型名：Channel/Async/Lazy/Atomic/Sender/Receiver
+            // Builtin generic names: Channel/Async/Lazy/Atomic/Sender/Receiver.
             Ty::Channel(_)
             | Ty::Async(_)
             | Ty::Lazy(_)
@@ -126,7 +126,7 @@ impl fmt::Display for TypeDisplay<'_> {
     }
 }
 
-/// 格式化类型参数列表 `<T1, T2>`，空列表返回空。
+/// Format a type argument list `<T1, T2>`; returns nothing for an empty list.
 fn fmt_type_args(
     f: &mut fmt::Formatter<'_>,
     arena: &TypeArena,

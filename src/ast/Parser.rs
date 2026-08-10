@@ -1052,14 +1052,14 @@ impl<'a> Lexer<'a> {
                     self.column += 1;
                 }
                 b'u' => {
-                    // Bug #36: 支持 \uXXXX（4位十六进制）和 \u{XXXX}（花括号形式）
+                    // Bug #36: support \uXXXX (4-digit hex) and \u{XXXX} (brace form)
                     self.pos += 1;
                     self.column += 1;
                     if self.pos >= self.bytes.len() {
                         return Err(LexerError::InvalidUnicodeEscape);
                     }
                     if self.bytes[self.pos] == b'{' {
-                        // \u{XXXX} 花括号形式：1-6 位十六进制
+                        // \u{XXXX} brace form: 1-6 hex digits
                         self.pos += 1;
                         self.column += 1;
                         let mut digit_count: usize = 0;
@@ -1077,7 +1077,7 @@ impl<'a> Lexer<'a> {
                         self.pos += 1;
                         self.column += 1;
                     } else {
-                        // \uXXXX 无花括号形式：正好 4 位十六进制
+                        // \uXXXX without braces: exactly 4 hex digits
                         for _ in 0..4 {
                             if self.pos >= self.bytes.len() || !is_hex_digit(self.bytes[self.pos]) {
                                 return Err(LexerError::InvalidUnicodeEscape);
@@ -1146,14 +1146,14 @@ impl<'a> Lexer<'a> {
                         self.column += 1;
                     }
                     b'u' => {
-                        // Bug #36: 支持 \uXXXX（4位十六进制）和 \u{XXXX}（花括号形式）
+                        // Bug #36: support \uXXXX (4-digit hex) and \u{XXXX} (brace form)
                         self.pos += 1;
                         self.column += 1;
                         if self.pos >= self.bytes.len() {
                             return Err(LexerError::InvalidUnicodeEscape);
                         }
                         if self.bytes[self.pos] == b'{' {
-                            // \u{XXXX} 花括号形式：1-6 位十六进制
+                            // \u{XXXX} brace form: 1-6 hex digits
                             self.pos += 1;
                             self.column += 1;
                             let mut digit_count: usize = 0;
@@ -1171,7 +1171,7 @@ impl<'a> Lexer<'a> {
                             self.pos += 1;
                             self.column += 1;
                         } else {
-                            // \uXXXX 无花括号形式：正好 4 位十六进制
+                            // \uXXXX without braces: exactly 4 hex digits
                             for _ in 0..4 {
                                 if self.pos >= self.bytes.len() || !is_hex_digit(self.bytes[self.pos]) {
                                     return Err(LexerError::InvalidUnicodeEscape);
@@ -1209,8 +1209,8 @@ impl<'a> Lexer<'a> {
                         } else if inner == b'}' {
                             brace_depth -= 1;
                         } else if inner == b'"' {
-                            // Bug #44/#46/#54: 嵌套字符串字面量——扫描完整嵌套字符串
-                            // （含 \" 转义），避免将外层字符串的闭合引号误认为嵌套字符串开始
+                            // Bug #44/#46/#54: nested string literal — scan the complete nested string
+                            // (including \" escapes), to avoid mistaking the outer string's closing quote for the start of a nested string
                             self.pos += 1;
                             self.column += 1;
                             while self.pos < self.bytes.len() {
@@ -1707,9 +1707,10 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
 
     /// Reject parenthesized conditions in conditional statements
     ///
-    /// 仅当 `(...)` 包裹整个条件时才拒绝（C 风格 `if (cond)`）。
-    /// 若 `(...}` 只是更大表达式的一部分（如 `while (v & 1) == 0`，`)` 后跟二元
-    /// 运算符），则不拒绝——括号是子表达式的合法分组，非冗余条件包裹。
+    /// Only reject when `(...)` wraps the entire condition (C-style `if (cond)`).
+    /// If `(...)` is just part of a larger expression (e.g. `while (v & 1) == 0`, where `)`
+    /// is followed by a binary operator), do not reject — the parentheses are a legitimate
+    /// sub-expression grouping, not a redundant condition wrapper.
     fn reject_paren_condition(&mut self, kw_name: &str) -> ParseResult<()> {
         if self.check(TokenKind::LParen) && self.paren_wraps_full_condition() {
             let msg = format!("parentheses are not allowed around the {} condition", kw_name);
@@ -1719,9 +1720,10 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(())
     }
 
-    /// 当前 `(...)` 分组是否包裹了整个条件：扫描到匹配 `)`，检查其后是否为二元运算符。
-    /// 后跟二元运算符 → 括号是子表达式（如 `(v & 1) == 0`）→ 返回 false（不拒绝）。
-    /// 否则 → 括号包裹整个条件 → 返回 true（拒绝）。
+    /// Whether the current `(...)` group wraps the entire condition: scan to the matching `)`,
+    /// then check whether it is followed by a binary operator.
+    /// Followed by a binary operator → parentheses are a sub-expression (e.g. `(v & 1) == 0`) → return false (do not reject).
+    /// Otherwise → parentheses wrap the entire condition → return true (reject).
     fn paren_wraps_full_condition(&self) -> bool {
         let mut i = self.current;
         if i >= self.tokens.len() || self.tokens[i].kind != TokenKind::LParen {
@@ -1735,7 +1737,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     depth -= 1;
                     if depth == 0 {
                         let next = i + 1;
-                        // `)` 后跟二元运算符 → 括号是子表达式，非整个条件
+                        // `)` followed by a binary operator → parentheses are a sub-expression, not the entire condition
                         return next >= self.tokens.len()
                             || lookup_binary_op(self.tokens[next].kind).is_none();
                     }
@@ -2877,15 +2879,17 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     /// Single Pratt parser
     fn parse_binary(&mut self, min_prec: u8) -> ParseResult<ExprRef> {
         let mut left = self.parse_unary()?;
-        // block/if/match 表达式后，当下一个 token 是 `-`（Minus）或 `&`（Ampersand）时阻断。
-        // 因为 `;` 被当作空白跳过，`while c { ... }; -1` 等价于 `while c { ... } -1`，
-        // 若不阻断，parse_binary 会把 `-1` 当成 `{ ... } - 1`（减法），而实际意图是
-        // `-1` 作为独立的一元取负尾表达式。
-        // 同理，`{ ... } & x` 会被当成位与，而实际意图可能是 `{ ... }` 后跟 `&x`（引用）。
-        // `-` 和 `&` 是唯二既有二元形式（减法/位与）又有一元形式（取负/引用）的运算符；
-        // 其他运算符（+ * / % 等）无一元形式（`*` 跨行解引用已由 check_multiline_deref 处理），
-        // 无此歧义，不需阻断。
-        // 用户若需在 block/if/match 后做减法/位与，应使用括号：`(if c { ... }) - 1`。
+        // After a block/if/match expression, block when the next token is `-` (Minus) or `&` (Ampersand).
+        // Because `;` is treated as whitespace and skipped, `while c { ... }; -1` is equivalent to
+        // `while c { ... } -1`. Without blocking, parse_binary would treat `-1` as `{ ... } - 1`
+        // (subtraction), when the intent is `-1` as a standalone unary negation trailing expression.
+        // Similarly, `{ ... } & x` would be parsed as bitwise-and, when the intent may be `{ ... }`
+        // followed by `&x` (reference).
+        // `-` and `&` are the only two operators that have both binary (subtraction/bitwise-and) and
+        // unary (negation/reference) forms; other operators (+ * / % etc.) have no unary form (`*`
+        // cross-line deref is already handled by check_multiline_deref), so they have no ambiguity
+        // and need no blocking.
+        // To perform subtraction/bitwise-and after a block/if/match, use parentheses: `(if c { ... }) - 1`.
         if matches!(
             &self.ast.expr(left).node,
             Expr::Block { .. } | Expr::If { .. } | Expr::Match { .. }
@@ -3357,7 +3361,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         let mut literal_start: usize = 0;
         while i < content.len() {
             if bytes[i] == b'\\' {
-                // Bug #36: \uXXXX 和 \u{XXXX} 转义序列需要跳过整个序列
+                // Bug #36: \uXXXX and \u{XXXX} escape sequences must skip the entire sequence
                 if i + 1 < content.len() && bytes[i + 1] == b'u' {
                     i += 2; // skip \u
                     if i < content.len() && bytes[i] == b'{' {
@@ -3393,11 +3397,11 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     } else if bytes[i] == b'}' {
                         brace_depth -= 1;
                     } else if bytes[i] == b'\\' {
-                        // 跳过转义序列（\" \\ \n \t \r \{ \}）
+                        // Skip escape sequences (\" \\ \n \t \r \{ \})
                         i += 1;
                     } else if bytes[i] == b'"' {
-                        // Bug #54: 插值表达式中的嵌套字符串字面量——
-                        // 扫描完整嵌套字符串（含 \" 转义），确保 expr_text 包含正确的字符串字面量
+                        // Bug #54: nested string literal inside an interpolation expression —
+                        // scan the complete nested string (including \" escapes), ensuring expr_text contains the correct string literal
                         i += 1;
                         while i < content.len() {
                             if bytes[i] == b'\\' {
@@ -3411,14 +3415,14 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     i += 1;
                 }
                 let expr_text = &content[expr_start..i - 1];
-                // Bug #54: 插值表达式文本可能含外部字符串的转义序列（如 \"），
-                // 反转义后再传给 parse_interpolation_expr
+                // Bug #54: the interpolation expression text may contain escape sequences from the
+                // outer string (e.g. \"); unescape it before passing to parse_interpolation_expr.
                 let unescaped_expr = self.unescape_string(expr_text);
                 let expr = if unescaped_expr == expr_text {
                     self.parse_interpolation_expr(expr_text)?
                 } else {
-                    // unescape 产生了不同内容，需用 'a 生命周期的方式传递
-                    // 将反转义后的文本存入 arena 并解析
+                    // unescape produced different content; need a way to pass it with the 'a lifetime.
+                    // Store the unescaped text in the arena and parse it.
                     let leaked: &'a str = self.arena.alloc_str(&unescaped_expr);
                     self.parse_interpolation_expr(leaked)?
                 };
@@ -3529,11 +3533,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                         j += 2;
                     }
                     b'u' => {
-                        // Bug #36: \uXXXX（4位十六进制）或 \u{XXXX}（花括号形式）
-                        // 词法扫描 (scan_string) 已验证 hex digit 有效性，此处用 expect 断言不变量
+                        // Bug #36: \uXXXX (4-digit hex) or \u{XXXX} (brace form).
+                        // Lexical scanning (scan_string) has already validated the hex digits;
+                        // use expect here to assert the invariant.
                         j += 2; // skip \u
                         let code = if j < text.len() && bytes[j] == b'{' {
-                            // \u{XXXX} 花括号形式：1-6 位十六进制
+                            // \u{XXXX} brace form: 1-6 hex digits
                             j += 1; // skip {
                             let hex_start = j;
                             while j < text.len() && bytes[j] != b'}' {
@@ -3545,7 +3550,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                             u32::from_str_radix(hex_str, 16)
                                 .expect("scan_string validated hex digits")
                         } else {
-                            // \uXXXX 无花括号形式：正好 4 位十六进制
+                            // \uXXXX without braces: exactly 4 hex digits
                             let hex_end = std::cmp::min(j + 4, text.len());
                             let hex_str = std::str::from_utf8(&bytes[j..hex_end])
                                 .expect("scan_string validated hex digits");
@@ -3803,10 +3808,11 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         let span = token_span(&if_tok);
         self.reject_paren_condition("if")?;
         let cond = self.parse_expr()?;
-        // then_branch/else_branch 用 parse_unary 而非 parse_expr，避免贪婪消费后续二元运算符。
-        // 因为 `;` 被当作空白跳过，`if c { ... }; -1` 等价于 `if c { ... } -1`，
-        // parse_expr 会把 `-1` 当成 `{ ... } - 1`（减法），而非独立表达式。
-        // parse_unary 只解析一个 unary 表达式（如 `{ ... }` block），不消费后续 `-N`。
+        // Use parse_unary instead of parse_expr for then_branch/else_branch, to avoid greedily
+        // consuming subsequent binary operators. Because `;` is treated as whitespace and skipped,
+        // `if c { ... }; -1` is equivalent to `if c { ... } -1`; parse_expr would treat `-1` as
+        // `{ ... } - 1` (subtraction) rather than a standalone expression. parse_unary parses only
+        // a single unary expression (e.g. `{ ... }` block) and does not consume the trailing `-N`.
         let then_branch = self.parse_unary()?;
         let else_branch = if self.match_token(TokenKind::KwElse) {
             Some(self.parse_unary()?)
@@ -4224,7 +4230,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         let _ = self.expect(TokenKind::KwIn, "expected 'in'");
         self.reject_paren_condition("for")?;
         let iterable = self.parse_expr()?;
-        // body 用 parse_unary（同 parse_while_stmt，避免贪婪消费后续二元运算符）
+        // Use parse_unary for the body (same as parse_while_stmt, to avoid greedily consuming subsequent binary operators)
         let body = self.parse_unary()?;
         Ok(self.alloc_stmt(span, Stmt::For {
             name: name_tok.lexeme,
@@ -4238,17 +4244,18 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         let span = token_span(&while_tok);
         self.reject_paren_condition("while")?;
         let condition = self.parse_expr()?;
-        // body 用 parse_unary 而非 parse_expr，避免贪婪消费后续二元运算符。
-        // 因为 `;` 被当作空白跳过，`{ ... }; -1` 等价于 `{ ... } -1`，
-        // parse_expr 会把 `-1` 当成 `{ ... } - 1`（减法），而非独立表达式。
-        // parse_unary 只解析一个 unary 表达式（如 `{ ... }` block），不消费后续 `-N`。
+        // Use parse_unary instead of parse_expr for the body, to avoid greedily consuming
+        // subsequent binary operators. Because `;` is treated as whitespace and skipped,
+        // `{ ... }; -1` is equivalent to `{ ... } -1`; parse_expr would treat `-1` as
+        // `{ ... } - 1` (subtraction) rather than a standalone expression. parse_unary parses
+        // only a single unary expression (e.g. `{ ... }` block) and does not consume the trailing `-N`.
         let body = self.parse_unary()?;
         Ok(self.alloc_stmt(span, Stmt::While { condition, body }))
     }
 
     fn parse_loop_stmt(&mut self) -> ParseResult<StmtRef> {
         let loop_tok = self.previous();
-        // body 用 parse_unary（同 parse_while_stmt，避免贪婪消费后续二元运算符）
+        // Use parse_unary for the body (same as parse_while_stmt, to avoid greedily consuming subsequent binary operators)
         let body = self.parse_unary()?;
         Ok(self.alloc_stmt(token_span(&loop_tok), Stmt::Loop { body }))
     }
@@ -4501,10 +4508,11 @@ fn parse_char_value(lexeme: &str) -> u32 {
             b'\'' => b'\'' as u32,
             b'0' => 0,
             b'u' => {
-                // Bug #36: \uXXXX（4位十六进制）或 \u{XXXX}（花括号形式）
-                // 词法扫描 (scan_char) 已验证 hex digit 有效性，此处用 expect 断言不变量
+                // Bug #36: \uXXXX (4-digit hex) or \u{XXXX} (brace form).
+                // Lexical scanning (scan_char) has already validated the hex digits;
+                // use expect here to assert the invariant.
                 if content.len() > 2 && bytes[2] == b'{' {
-                    // \u{XXXX} 花括号形式
+                    // \u{XXXX} brace form
                     let close = content.find('}').expect("scan_char validated closing brace");
                     if close > 3 {
                         let hex_str = &content[3..close];
@@ -4513,7 +4521,7 @@ fn parse_char_value(lexeme: &str) -> u32 {
                         unreachable!("scan_char validated non-empty hex in braces")
                     }
                 } else if content.len() >= 6 {
-                    // \uXXXX 无花括号形式（\u + 4位十六进制）
+                    // \uXXXX without braces (\u + 4 hex digits)
                     let hex_str = &content[2..6];
                     u32::from_str_radix(hex_str, 16).expect("scan_char validated hex digits")
                 } else {
@@ -4536,11 +4544,11 @@ fn contains_interpolation(raw: &str) -> bool {
     let mut i = 1;
     while i < raw.len() - 1 {
         if bytes[i] == b'\\' {
-            // Bug #36: \uXXXX 和 \u{XXXX} 转义序列需要跳过整个序列
+            // Bug #36: \uXXXX and \u{XXXX} escape sequences must skip the entire sequence
             if i + 1 < raw.len() && bytes[i + 1] == b'u' {
                 i += 2; // skip \u
                 if i < raw.len() && bytes[i] == b'{' {
-                    // \u{XXXX} 花括号形式：跳过到 }
+                    // \u{XXXX} brace form: skip to }
                     while i < raw.len() && bytes[i] != b'}' {
                         i += 1;
                     }
@@ -4548,7 +4556,7 @@ fn contains_interpolation(raw: &str) -> bool {
                         i += 1; // skip }
                     }
                 } else {
-                    // \uXXXX 无花括号形式：跳过 4 位十六进制
+                    // \uXXXX without braces: skip 4 hex digits
                     i += 4;
                 }
                 continue;
@@ -4576,14 +4584,14 @@ fn is_hex_or_underscore(ch: u8) -> bool {
     is_digit_or_underscore(ch) || (b'a'..=b'f').contains(&ch) || (b'A'..=b'F').contains(&ch)
 }
 
-/// 前向扫描浮点字面量，分离数值部分与类型后缀。
-/// 正确处理十进制（`.`、`e`/`E` 指数）和十六进制（`0x` 前缀、`p`/`P` 指数）。
-/// 旧的后向扫描会把无后缀的科学计数法 `1e300` 的 `e300` 误判为类型后缀（Bug #20）。
+/// Forward-scans a float literal, separating the numeric part from the type suffix.
+/// Correctly handles decimal (`.` and `e`/`E` exponents) and hexadecimal (`0x` prefix, `p`/`P` exponents).
+/// The old backward scan would misidentify the `e300` in an unsuffixed scientific-notation `1e300` as a type suffix (Bug #20).
 fn split_float_suffix(raw: &str) -> (&str, Option<&str>) {
     let bytes = raw.as_bytes();
     let mut i: usize = 0;
     if bytes.len() > 2 && bytes[0] == b'0' && (bytes[1] == b'x' || bytes[1] == b'X') {
-        // 十六进制浮点：0x<hex>.<hex>p<exp>
+        // Hexadecimal float: 0x<hex>.<hex>p<exp>
         i = 2;
         while i < bytes.len() && is_hex_or_underscore(bytes[i]) {
             i += 1;
@@ -4604,7 +4612,7 @@ fn split_float_suffix(raw: &str) -> (&str, Option<&str>) {
             }
         }
     } else {
-        // 十进制浮点：[int].[frac]e[exp] 或 .[frac]e[exp]
+        // Decimal float: [int].[frac]e[exp] or .[frac]e[exp]
         while i < bytes.len() && is_digit_or_underscore(bytes[i]) {
             i += 1;
         }

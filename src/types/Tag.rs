@@ -1,15 +1,17 @@
 // =========================================================================
-// 类型判别标签（ValueTag）+ 基础结构（TypeHandle / TypeFamily / FieldType / TraitMethodSig / EnvId）
+// Type discriminator tags (ValueTag) + base structures
+// (TypeHandle / TypeFamily / FieldType / TraitMethodSig / EnvId).
 // =========================================================================
 //
-// ValueTag 从 Value.rs 移入；TypeHandle 从 sema/Sema.rs 移入（放在 Type 模块以打破循环依赖）。
+// ValueTag was moved from Value.rs; TypeHandle was moved from sema/Sema.rs (placed in
+// the Type module to break a circular dependency).
 
 use super::ty::{builtin_info_by_name, builtin_info_by_tag};
 
-// ---- ValueTag — 21 种类型标签（含 Null/Void/Ref，用于 ValueHandle 编码）----
+// ---- ValueTag — 21 type tags (including Null/Void/Ref, used for ValueHandle encoding) ----
 
-/// 类型标签：涵盖标量、Null/Void/Ref 共 21 种。
-/// `#[repr(u8)]` 保证 ABI 稳定（ValueHandle 高 8 位存储此 tag）。
+/// Type tag: covers scalars and Null/Void/Ref, 21 in total.
+/// `#[repr(u8)]` guarantees ABI stability (the high 8 bits of a ValueHandle store this tag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, num_enum::TryFromPrimitive)]
 #[repr(u8)]
 pub enum ValueTag {
@@ -43,7 +45,7 @@ impl ValueTag {
 }
 
 impl ValueTag {
-    /// 字节宽度（派生自 `BUILTIN_TABLE`，非标量返回 0）。
+    /// Byte width (derived from `BUILTIN_TABLE`; returns 0 for non-scalars).
     #[inline]
     pub fn byte_width(self) -> usize {
         builtin_info_by_tag(self).map(|i| i.byte_width as usize).unwrap_or(0)
@@ -81,10 +83,10 @@ impl ValueTag {
         self.is_int() || self.is_float()
     }
 
-    /// 类型家族（派生自 ValueTag，供 IR/Sema 层统一分派）。
+    /// Type family (derived from `ValueTag`, used by the IR/Sema layers for unified dispatch).
     ///
-    /// 调用方用 `matches!` 合并有符号/无符号整数变体即可按位宽分派，
-    /// 保持单一真相源（`TypeFamily`）。
+    /// Callers can use `matches!` to merge signed/unsigned integer variants and dispatch
+    /// by bit width, keeping a single source of truth (`TypeFamily`).
     #[inline]
     pub const fn family(self) -> TypeFamily {
         match self {
@@ -97,19 +99,19 @@ impl ValueTag {
             ValueTag::F16 | ValueTag::F32 | ValueTag::F64 | ValueTag::F128 => TypeFamily::Float,
             ValueTag::Bool => TypeFamily::Bool,
             ValueTag::Char => TypeFamily::Char,
-            ValueTag::Ref => TypeFamily::Str, // str 的 ValueTag 是 Ref
+            ValueTag::Ref => TypeFamily::Str, // the ValueTag of str is Ref
             ValueTag::Null => TypeFamily::Null,
             ValueTag::Void => TypeFamily::Void,
         }
     }
 
-    /// 类型名（派生自 `BUILTIN_TABLE`，非标量返回 "unknown"）。
+    /// Type name (derived from `BUILTIN_TABLE`; returns "unknown" for non-scalars).
     #[inline]
     pub fn name(self) -> &'static str {
         builtin_info_by_tag(self).map(|i| i.name).unwrap_or("unknown")
     }
 
-    /// 所有 18 个标量 ValueTag（派生自 `BUILTIN_TABLE`，排除 Null/Void/Ref）。
+    /// All 18 scalar ValueTags (derived from `BUILTIN_TABLE`, excluding Null/Void/Ref).
     pub fn all() -> &'static [ValueTag] {
         const SCALAR_TAGS: &[ValueTag] = &[
             ValueTag::I8, ValueTag::I16, ValueTag::I32, ValueTag::I64, ValueTag::I128,
@@ -121,13 +123,13 @@ impl ValueTag {
         SCALAR_TAGS
     }
 
-    /// 按 name 查 ValueTag（派生自 `BUILTIN_TABLE`）。
+    /// Look up a ValueTag by name (derived from `BUILTIN_TABLE`).
     #[inline]
     pub fn from_name(name: &str) -> Option<ValueTag> {
         builtin_info_by_name(name).map(|i| i.value_tag)
     }
 
-    /// 标量类型名（与 name() 相同，保留此方法名兼容旧调用方）。
+    /// Scalar type name (identical to `name()`; kept for backward compatibility with old callers).
     #[inline]
     pub fn type_name(self) -> &'static str {
         self.name()
@@ -135,110 +137,112 @@ impl ValueTag {
 }
 
 // =========================================================================
-// TypeHandle — 类型 arena 句柄（从 sema/Sema.rs 移入）
+// TypeHandle — type arena handle (moved from sema/Sema.rs).
 // =========================================================================
 
-/// 类型 arena 句柄（u32 索引到 TypeArena）。
-/// 放在 Type 模块以打破 Type↔sema 循环依赖。
+/// Type arena handle (a `u32` index into `TypeArena`).
+/// Placed in the Type module to break the Type ↔ sema circular dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeHandle(pub u32);
 
 // =========================================================================
-// TypeFamily — 所有类型的家族分类（替代字符串 family）
+// TypeFamily — family classification for all types (replaces string-based family).
 // =========================================================================
 
-/// 所有 Kuzo 类型的家族分类。
+/// Family classification for all Kuzo types.
 ///
-/// 替代现有碎片化判断：
-/// - Ir.rs 的 family: &'static str（仅标量，"i32"/"i64"/"i128"/"float"/"bool"）
-/// - Ir.rs 的 ty_name == "str"（名字特判）
-/// - Ir.rs 的 starts_with("Channel")（前缀匹配）
-/// - Inference.rs 的 name == "Throw"（名字特判）
+/// Replaces the previous fragmented checks:
+/// - `Ir.rs`'s `family: &'static str` (scalars only: "i32"/"i64"/"i128"/"float"/"bool")
+/// - `Ir.rs`'s `ty_name == "str"` (name-based special case)
+/// - `Ir.rs`'s `starts_with("Channel")` (prefix match)
+/// - `Inference.rs`'s `name == "Throw"` (name-based special case)
 ///
-/// 调用方通过 ty.family() 一次 match 完成所有分派。
+/// Callers perform all dispatch in a single `match` via `ty.family()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeFamily {
-    // ── 有符号整数（区分位宽，因 opcode 按位宽分派）──
-    /// 8/16/32 位有符号整数（i8/i16/i32）
+    // -- Signed integers (bit-width distinguished because opcodes dispatch by width) --
+    /// 8/16/32-bit signed integers (i8/i16/i32).
     SignedInt32,
-    /// 64 位有符号整数（i64/isize）
+    /// 64-bit signed integers (i64/isize).
     SignedInt64,
-    /// 128 位有符号整数（i128）
+    /// 128-bit signed integers (i128).
     SignedInt128,
 
-    // ── 无符号整数（除法/移位/比较需区分符号性）──
-    /// 8/16/32 位无符号整数（u8/u16/u32）
+    // -- Unsigned integers (division/shift/comparison need signedness distinction) --
+    /// 8/16/32-bit unsigned integers (u8/u16/u32).
     UnsignedInt32,
-    /// 64 位无符号整数（u64/usize）
+    /// 64-bit unsigned integers (u64/usize).
     UnsignedInt64,
-    /// 128 位无符号整数（u128）
+    /// 128-bit unsigned integers (u128).
     UnsignedInt128,
 
-    // ── 浮点（f16/f32/f64/f128 统一 f64 运算）──
+    // -- Floating point (f16/f32/f64/f128 unified under f64 operations) --
     Float,
 
-    // ── 非数值标量 ──
+    // -- Non-numeric scalars --
     Bool,
     Char,
 
-    // ── 非标量内置 ──
+    // -- Non-scalar builtins --
     Str, Null, Void,
 
-    // ── 内置泛型（替代 starts_with/名字特判）──
-    /// Throw<V, E>（is_ok 分派）
+    // -- Builtin generics (replace starts_with / name-based special cases) --
+    /// `Throw<V, E>` (dispatched via is_ok).
     Throw,
-    /// Channel<T>（send/recv/close 分派）
+    /// `Channel<T>` (dispatched via send/recv/close).
     Channel,
-    /// Async<T>（await 分派）
+    /// `Async<T>` (dispatched via await).
     Async,
-    /// Lazy<T>
+    /// `Lazy<T>`.
     Lazy,
-    /// Atomic<T>（swap/cas/load/store 分派）
+    /// `Atomic<T>` (dispatched via swap/cas/load/store).
     Atomic,
-    /// Sender<T>
+    /// `Sender<T>`.
     Sender,
-    /// Receiver<T>
+    /// `Receiver<T>`.
     Receiver,
-    /// Timer（事件源分派用，用户自定义类型但事件源语义内置）
+    /// Timer (used for event-source dispatch; a user-defined type with builtin event-source semantics).
     Timer,
 
-    // ── 复合 ──
+    // -- Composite --
     Array, Ref, Fn, Nullable, Trait,
 
-    // ── 用户类型 ──
+    // -- User types --
     Adt, Record, TraitObject, ModuleRef, Generic,
 
-    // ── 特殊 ──
+    // -- Special --
     Never, TypeVar, Unknown,
 }
 
 // =========================================================================
-// FieldType / TraitMethodSig / EnvId — 复合类型辅助结构
+// FieldType / TraitMethodSig / EnvId — helper structures for composite types.
 // =========================================================================
 
-/// record 字段：`name == None` 表示位置字段。
+/// Record field: `name == None` denotes a positional field.
 ///
-/// 字段类型通过 `TypeHandle` 索引 arena，避免自引用。
+/// The field type indexes the arena via `TypeHandle` to avoid self-reference.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FieldType {
     pub name: Option<Box<str>>,
     pub ty: TypeHandle,
 }
 
-/// Trait 方法签名（压平后的 sema TraitInfo 方法）。
+/// Trait method signature (flattened from sema `TraitInfo` methods).
 ///
-/// `return_type` 为返回类型的 arena 句柄（原 `&'static TypeDescriptor` 改为
-/// `TypeHandle`，避免 Type.rs 依赖 TypeDesc.rs 形成循环）。
+/// `return_type` is an arena handle for the return type (the original
+/// `&'static TypeDescriptor` was changed to `TypeHandle` to avoid a circular dependency
+/// where Type.rs would depend on TypeDesc.rs).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TraitMethodSig {
     pub name: Box<str>,
     pub param_count: u8,
     pub return_type: TypeHandle,
     pub is_async: bool,
-    /// 是否有 default 实现体（IRBuilder 据此决定是否从 AST 取 body）
+    /// Whether a default implementation body exists (IRBuilder uses this to decide
+    /// whether to take the body from the AST).
     pub has_body: bool,
 }
 
-/// 环境句柄：`EnvArena` 中的索引（从 sema/Sema.rs 移入）。
+/// Environment handle: an index into `EnvArena` (moved from sema/Sema.rs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EnvId(pub u32);

@@ -1,56 +1,56 @@
-//! Ir.rs — 数据流就绪调度执行模型的 IR 核心数据结构
+//! Ir.rs — Core IR data structures for the dataflow-ready scheduling execution model.
 //!
-//! 基于 Sema.rs 的 SemaResult 产出，定义：
-//! - Node（固定 16B，存拓扑引用，不存值）
-//! - InputsPool（独立连续输入池）
-//! - ValueTable / Frame（运行时值表，SoA 布局）
-//! - SubGraph（函数=子图）
-//! - EventSource（channel/async/timer/子图完成事件源声明）
-//! - DataFlowGraph（全局图容器）
-//! - ComputeFn（构建期绑定的计算函数索引，消除 dispatch）
+//! Produced from the `SemaResult` in Sema.rs, this module defines:
+//! - `Node` (fixed 16B, stores topological references, not values)
+//! - `InputsPool` (a standalone contiguous input pool)
+//! - `ValueTable` / `Frame` (runtime value tables, SoA layout)
+//! - `SubGraph` (function = subgraph)
+//! - `EventSource` (declarations for channel/async/timer/subgraph-completion event sources)
+//! - `DataFlowGraph` (the global graph container)
+//! - `ComputeFn` (a compute function index bound at build time, eliminating dispatch)
 //!
-//! 设计原则（见 docs/superpowers/specs/2026-07-31-dataflow-engine-design.md）：
-//! - 节点固定 16B，只存拓扑引用，output 隐含 = 节点自身 id
-//! - kind 只有 6 种，仅用于调度器就绪判定，不用于运算分派
-//! - compute_fn 是构建期按类型特化绑定的函数索引，运行时数组索引取出调用
-//! - 值表槽使用 Value.rs 的 Value enum（含标量与 Arc<HeapObj> 引用）
-//! - 独立输入池连续存储所有节点输入，缓存友好
+//! Design principles (see docs/superpowers/specs/2026-07-31-dataflow-engine-design.md):
+//! - Nodes are fixed 16B and store only topological references; the output is implicitly the node's own id.
+//! - `kind` has only 6 variants, used solely for scheduler readiness checks, not for operation dispatch.
+//! - `compute_fn` is a function index bound at build time via type specialization, looked up at runtime by array index.
+//! - Value table slots use the `Value` enum from Value.rs (scalars and `Arc<HeapObj>` references).
+//! - The standalone input pool stores all node inputs contiguously for cache friendliness.
 
 use crate::value::Value;
 use std::sync::Arc;
 
 // =========================================================================
-// 索引 newtype — 保证类型安全的句柄
+// Index newtypes — type-safe handles
 // =========================================================================
 
-/// 节点 id（全局连续，值表按此索引）
+/// Node id (globally contiguous; the value table is indexed by this).
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
 
-/// 子图 id（函数=子图）
+/// Subgraph id (function = subgraph).
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubGraphId(pub u32);
 
-/// 函数 id（与 SubGraphId 一一对应，语义别名）
+/// Function id (one-to-one with `SubGraphId`; a semantic alias).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FuncId(pub u32);
 
-/// 子图实例 id（运行时，每次调用一个实例）
+/// Subgraph instance id (runtime; one instance per invocation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubgraphInstanceId(pub u32);
 
-/// 帧 id（运行时）
+/// Frame id (runtime).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FrameId(pub u32);
 
-/// 计算函数索引（指向 COMPUTE_FN_TABLE）
+/// Compute function index (points into `COMPUTE_FN_TABLE`).
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ComputeFnId(pub u32);
 
-/// ComputeFnId 命名常量生成宏：与 build_compute_fn_table() 索引一一对应。
+/// Macro generating named `ComputeFnId` constants, corresponding one-to-one with `build_compute_fn_table()` indices.
 macro_rules! compute_fn_ids {
     ( $( $idx:literal => $name:ident ),* $(,)? ) => {
         $(
@@ -110,7 +110,7 @@ compute_fn_ids! {
     47 => CF_PROPAGATE,
     48 => CF_SEQ,
     49 => CF_WRITEBACK,
-    // i64 算术与比较（50-63）
+    // i64 arithmetic and comparison (50-63)
     50 => CF_ADD_I64,
     51 => CF_SUB_I64,
     52 => CF_MUL_I64,
@@ -125,7 +125,7 @@ compute_fn_ids! {
     61 => CF_NEG_I64,
     62 => CF_BITNOT_I32,
     63 => CF_BITNOT_I64,
-    // i128 算术与比较（64-77）
+    // i128 arithmetic and comparison (64-77)
     64 => CF_ADD_I128,
     65 => CF_SUB_I128,
     66 => CF_MUL_I128,
@@ -139,7 +139,7 @@ compute_fn_ids! {
     74 => CF_GE_I128,
     75 => CF_NEG_I128,
     76 => CF_BITNOT_I128,
-    // 整数位运算（77-91）
+    // Integer bitwise operations (77-91)
     77 => CF_BITAND_I32,
     78 => CF_BITOR_I32,
     79 => CF_BITXOR_I32,
@@ -155,7 +155,7 @@ compute_fn_ids! {
     89 => CF_SHR_I64,
     90 => CF_SHL_I128,
     91 => CF_SHR_I128,
-    // 全基本类型 compute_fn（92-259）
+    // compute_fn for all primitive types (92-259)
     // i8: 92-103
     92 => CF_ADD_I8,
     93 => CF_SUB_I8,
@@ -312,7 +312,7 @@ compute_fn_ids! {
     233 => CF_SHR_USIZE,
     234 => CF_NEG_USIZE,
     235 => CF_BITNOT_USIZE,
-    // 浮点 4 类型 × 6 运算
+    // 4 floating-point types × 6 operations
     // f16: 236-241
     236 => CF_ADD_F16,
     237 => CF_SUB_F16,
@@ -341,127 +341,127 @@ compute_fn_ids! {
     257 => CF_DIV_F128,
     258 => CF_MOD_F128,
     259 => CF_NEG_F128,
-    // 语义运算（260-265）
+    // Semantic operations (260-265)
     260 => CF_REF_EQ,
     261 => CF_REF_NEQ,
     262 => CF_CONCAT_LIST,
     263 => CF_RANGE,
     264 => CF_RANGE_INCLUSIVE,
     265 => CF_ELVIS,
-    // inline_trait / lazy 构造（266-267）
+    // inline_trait / lazy construction (266-267)
     266 => CF_TRAIT_CONSTRUCT,
     267 => CF_LAZY_CONSTRUCT,
     268 => CF_SLICE,
     269 => CF_STR_CONCAT,
-    // 全局变量读写（270-271）
+    // Global variable read/write (270-271)
     270 => CF_GLOBAL_LOAD,
     271 => CF_GLOBAL_STORE,
-    // 记录扩展 / 原子构造（272-273）
+    // Record extension / atomic construction (272-273)
     272 => CF_RECORD_EXTEND,
     273 => CF_ATOMIC_CONSTRUCT,
-    // 模式匹配（274-276）
+    // Pattern matching (274-276)
     274 => CF_PATTERN_CTOR_MATCH,
     275 => CF_PATTERN_ADT_FIELD_GET,
     276 => CF_PATTERN_STR_EQ,
-    // 通用类型转换（277-278）
+    // General type conversion (277-278)
     277 => CF_CAST_TO_STR,
     278 => CF_CAST_SCALAR,
-    // 引用语义与非空断言（279-282）
+    // Reference semantics and non-null assertion (279-282)
     279 => CF_NON_NULL_ASSERT,
     280 => CF_REF_OF,
     281 => CF_DEREF_READ,
     282 => CF_DEREF_WRITE,
-    // channel 操作（283-285）
+    // Channel operations (283-285)
     283 => CF_CHANNEL_CREATE,
     284 => CF_CHANNEL_SEND,
     285 => CF_CHANNEL_CLOSE,
-    // 偏应用构造（286）
+    // Partial application construction (286)
     286 => CF_PARTIAL_CONSTRUCT,
-    // str.bytes() → u8[]（287）
+    // str.bytes() → u8[] (287)
     287 => CF_STR_BYTES,
-    // 栈分配版构造（288-289）
+    // Stack-allocated construction (288-289)
     288 => CF_RECORD_CONSTRUCT_STACK,
     289 => CF_ARRAY_CONSTRUCT_STACK,
-    // reflect 独立 compute_fn（290-291）：从 compute_ffi_call 拆分，
-    // 避免 lazy force 逻辑与 FFI 调用耦合
+    // Standalone reflect compute_fn (290-291): split from compute_ffi_call
+    // to decouple lazy force logic from FFI calls.
     290 => CF_REFLECT_FORMAT,
     291 => CF_REFLECT_SCALAR_TO_STR,
-    // str 比较（292-297）：按 Unicode 码点序列字典序比较，
-    // 不走 i32 路径（str 无 as_i32 语义，走 i32 会恒为 0 导致结果错误）
+    // String comparison (292-297): lexicographic by Unicode code point sequence.
+    // Does not use the i32 path (str has no as_i32 semantics; the i32 path would always yield 0, producing wrong results).
     292 => CF_EQ_STR,
     293 => CF_NE_STR,
     294 => CF_LT_STR,
     295 => CF_GT_STR,
     296 => CF_LE_STR,
     297 => CF_GE_STR,
-    // 复合类型语义相等/不等（298-299）：record/adt/newtype/array/closure/throw 等
+    // Semantic equality/inequality for composite types (298-299): record/adt/newtype/array/closure/throw, etc.
     298 => CF_EQ_OBJ,
     299 => CF_NE_OBJ,
-    // bool 不等（300）：与 CF_EQ_BOOL(27) 对称，as_i32 对 bool 恒为 0 故不能走 CF_NE_I32
+    // Boolean inequality (300): symmetric with CF_EQ_BOOL(27); as_i32 on bool is always 0, so CF_NE_I32 cannot be used.
     300 => CF_NE_BOOL,
-    // 数组索引存储（301）：arr[i] = x，原地修改 Array 堆对象
+    // Array index store (301): arr[i] = x, in-place mutation of the Array heap object.
     301 => CF_ARRAY_STORE,
-    // f128 比较（302-307）：f128 经 to_f64 会丢 60 位精度，需专用 bit-pattern 比较
+    // f128 comparison (302-307): f128 via to_f64 loses 60 bits of precision, requiring dedicated bit-pattern comparison.
     302 => CF_EQ_F128,
     303 => CF_NE_F128,
     304 => CF_LT_F128,
     305 => CF_GT_F128,
     306 => CF_LE_F128,
     307 => CF_GE_F128,
-    // 记忆化缓存（308-309）：memo_check 查缓存返回 record(hit,value)，memo_store 写缓存透传值
+    // Memoization cache (308-309): memo_check queries the cache and returns record(hit, value); memo_store writes the cache and passes the value through.
     308 => CF_MEMO_CHECK,
     309 => CF_MEMO_STORE,
-    // 尾递归 WriteBack（310）：compute_writeback + 设置 Continue 信号
+    // Tail-recursion WriteBack (310): compute_writeback + sets the Continue signal.
     310 => CF_TAILREC_WRITEBACK,
-    // 控制流 compute_fn（311-313）：替代 control_signal_nodes 表，
-    // compute_fn 直接返回 NodeResult::Return/Break/Continue
+    // Control-flow compute_fn (311-313): replaces the control_signal_nodes table;
+    // compute_fn directly returns NodeResult::Return/Break/Continue.
     311 => CF_RETURN,
     312 => CF_BREAK,
     313 => CF_CONTINUE,
 }
 
 // =========================================================================
-// NodeKind — 节点种类（非 op，仅 8 种用于就绪判定）
+// NodeKind — node category (not an op; only 8 variants for readiness checks)
 // =========================================================================
 
-/// 节点种类：仅用于调度器判断"如何就绪判定"，不用于运算分派。
+/// Node category: used solely by the scheduler to determine readiness, not for operation dispatch.
 ///
-/// 与传统 IR 的 op（100+ 操作码）根本区别：kind 不参与 dispatch。
-/// 具体运算（加减乘除等）由 compute_fn 构建期绑定决定。
+/// Fundamentally different from a traditional IR op (100+ opcodes): `kind` does not participate in dispatch.
+/// The actual operation (add, subtract, multiply, divide, etc.) is determined by the build-time-bound `compute_fn`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, num_enum::TryFromPrimitive)]
 #[repr(u8)]
 pub enum NodeKind {
-    /// 纯计算：常量
+    /// Pure computation: constant.
     Const = 0,
-    /// 纯计算：二元运算（输入就绪即执行）
+    /// Pure computation: binary operation (executes when inputs are ready).
     BinOp = 1,
-    /// 纯计算：一元运算
+    /// Pure computation: unary operation.
     UnOp = 2,
-    /// 纯计算：字段访问
+    /// Pure computation: field access.
     FieldAccess = 3,
-    /// 函数调用：启动子图 + 等完成事件
+    /// Function call: launches a subgraph + waits for a completion event.
     Call = 4,
-    /// 事件源消费：等待事件（channel/async/timer）
+    /// Event source consumption: waits for an event (channel/async/timer).
     Await = 5,
-    /// 控制流：条件选择，激活选中子图
+    /// Control flow: conditional selection; activates the chosen subgraph.
     Gate = 6,
-    /// 事件源声明：不执行计算，声明外部事件接入点
+    /// Event source declaration: performs no computation; declares an external event entry point.
     EventSource = 7,
 }
 
 // =========================================================================
-// Node — 固定大小节点（只存拓扑引用，不存值）
+// Node — fixed-size node (stores only topological references, not values)
 // =========================================================================
 
-/// 数据流图节点：固定大小，只存拓扑引用。
+/// Dataflow graph node: fixed-size, stores only topological references.
 ///
-/// - `kind`：节点种类（仅就绪判定用，不参与运算分派）
-/// - `input_count`：输入数量（任意，实际输入在 InputsPool）
-/// - `inputs_offset`：在 InputsPool.data 中的起始位置
-/// - `compute_fn`：计算函数索引（构建期绑定，运行时数组索引调用）
+/// - `kind`: node category (for readiness checks only, not operation dispatch)
+/// - `input_count`: number of inputs (arbitrary; actual inputs live in InputsPool)
+/// - `inputs_offset`: start position within InputsPool.data
+/// - `compute_fn`: compute function index (bound at build time, invoked by array index at runtime)
 ///
-/// output 隐含 = 节点自身 NodeId（值表按 NodeId 索引）。
-/// 具体运算由 compute_fn 决定，调度器不关心。
+/// The output is implicitly the node's own NodeId (the value table is indexed by NodeId).
+/// The actual operation is determined by `compute_fn`; the scheduler does not care.
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 pub struct Node {
@@ -470,49 +470,50 @@ pub struct Node {
     pub inputs_offset: u32,
     pub compute_fn: ComputeFnId,
 }
-// 布局：kind(1) + input_count(1) + pad(2) + inputs_offset(4) + compute_fn(4) = 12B
-// align(16) 强制对齐 16B，size 向上取整为 16B（尾部 pad 4 字节）
+// Layout: kind(1) + input_count(1) + pad(2) + inputs_offset(4) + compute_fn(4) = 12B
+// align(16) forces 16B alignment; size is rounded up to 16B (4-byte trailing pad).
 const _: () = assert!(std::mem::size_of::<Node>() == 16);
 
 // =========================================================================
-// BatchInfo — 编译期 SIMD/并行批量化标记（per-Node，仿 tail_call_flags）
+// BatchInfo — compile-time SIMD/parallel batching marker (per-Node, modeled after tail_call_flags)
 // =========================================================================
 
-/// 批量化运算类型：映射到 Value.rs 的 SIMD/rayon 批算函数。
+/// Batching operation type: maps to the SIMD/rayon batch functions in Value.rs.
 ///
-/// 编译期由 compile_binary/compile_unary 设置，运行期 run_ready_nodes 按
-/// (ValueTag, BatchOp) 分组就绪节点，复用 Value.rs 的 batch_binop/batch_cmp/
-/// batch_unaryop 做 SIMD 向量化 + rayon 并行批算，避免逐节点 compute_fn 开销。
+/// Set at compile time by compile_binary/compile_unary. At runtime, run_ready_nodes
+/// groups ready nodes by (ValueTag, BatchOp) and reuses Value.rs's batch_binop/batch_cmp/
+/// batch_unaryop for SIMD vectorization + rayon parallel batching, avoiding per-node
+/// compute_fn overhead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BatchOp {
-    /// 二元算术/位运算（返回同类型标量）
+    /// Binary arithmetic/bitwise operation (returns a scalar of the same type).
     Bin(crate::value::BinOp),
-    /// 比较运算（返回 bool）
+    /// Comparison operation (returns bool).
     Cmp(crate::value::CmpOp),
-    /// 一元运算（返回同类型标量）
+    /// Unary operation (returns a scalar of the same type).
     Unary(crate::value::UnaryOp),
 }
 
-/// 编译期批量化信息（per-Node，按 NodeId 索引）。
+/// Compile-time batching info (per-Node, indexed by NodeId).
 ///
-/// 仅 BinOp/UnOp 且标量类型的节点有 BatchInfo；Call/Gate/Await/record/array/
-/// field 等节点为 None（不可批量化，走原有 compute_fn 顺序路径）。
+/// Only BinOp/UnOp nodes with scalar types have BatchInfo; Call/Gate/Await/record/array/
+/// field nodes are None (not batchable; they follow the existing sequential compute_fn path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BatchInfo {
-    /// 输入/输出的标量类型（决定 SIMD lane 宽度）
+    /// Input/output scalar type (determines SIMD lane width).
     pub tag: crate::value::ValueTag,
-    /// 运算类型
+    /// Operation type.
     pub op: BatchOp,
 }
 
 // =========================================================================
-// InputsPool — 独立连续输入池
+// InputsPool — standalone contiguous input pool
 // =========================================================================
 
-/// 独立输入池：连续存储所有节点的输入 NodeId。
+/// Standalone input pool: stores all node input NodeIds contiguously.
 ///
-/// 节点 N 的输入 = `data[N.inputs_offset .. N.inputs_offset + N.input_count]`。
-/// 连续存储保证缓存友好，可批量 SIMD 扫描就绪状态。
+/// Node N's inputs = `data[N.inputs_offset .. N.inputs_offset + N.input_count]`.
+/// Contiguous storage ensures cache friendliness and enables batch SIMD scanning of readiness.
 pub struct InputsPool {
     pub data: Vec<NodeId>,
 }
@@ -522,26 +523,26 @@ impl InputsPool {
         Self { data: Vec::new() }
     }
 
-    /// 推入一组输入，返回起始 offset。
+    /// Pushes a group of inputs, returns the starting offset.
     pub fn push(&mut self, inputs: &[NodeId]) -> u32 {
         let offset = self.data.len() as u32;
         self.data.extend_from_slice(inputs);
         offset
     }
 
-    /// 读取指定位置的输入切片。
+    /// Reads the input slice at the given position.
     pub fn get(&self, offset: u32, count: u8) -> &[NodeId] {
         let start = offset as usize;
         let end = start + count as usize;
         &self.data[start..end]
     }
 
-    /// 当前池长度。
+    /// Current pool length.
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
-    /// 是否为空。
+    /// Whether the pool is empty.
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
@@ -554,31 +555,34 @@ impl Default for InputsPool {
 }
 
 // =========================================================================
-// ValueTable — 值表（SoA 布局，运行时，每帧一个）
+// ValueTable — value table (SoA layout, runtime, one per frame)
 // =========================================================================
 
-/// 值表（SoA 布局）：values / ready / refcounts 分离存储。
+/// Value table (SoA layout): values / ready / refcounts stored separately.
 ///
-/// 相比 AoS（Vec<ValueSlot>），SoA 让 Value 连续排布（stride = sizeof(Value)），
-/// 消除 bool/u16 交错，提升 SIMD 批量提取的缓存密度与向量化效率。
+/// Compared to AoS (Vec<ValueSlot>), SoA keeps Value contiguous (stride = sizeof(Value)),
+/// eliminating bool/u16 interleaving and improving cache density and vectorization
+/// efficiency for SIMD batch extraction.
 ///
-/// - `values`：节点产出值（按帧内局部 NodeId 索引）
-/// - `ready`：是否已产出
-/// - `refcounts`：槽级 RC（剩余下游消费者数，0 可回收）
+/// - `values`: node output values (indexed by local NodeId within the frame)
+/// - `ready`: whether the value has been produced
+/// - `refcounts`: slot-level RC (remaining downstream consumers; 0 means reclaimable)
 ///
-/// 槽级 RC：节点产出时设 refcount = 下游数量，每个下游消费时 -1，归零可清槽。
-/// 帧级兜底：帧结束时所有未归零槽统一回收（堆对象 Arc Drop 自动 decref）。
+/// Slot-level RC: when a node produces a value, refcount is set to the downstream count;
+/// each downstream consumer decrements it by 1; when it reaches zero the slot can be cleared.
+/// Frame-level fallback: at frame end, all non-zero slots are reclaimed uniformly
+/// (heap object Arc Drop auto-decrefs).
 #[derive(Clone)]
 pub struct ValueTable {
     pub values: Vec<Value>,
-    /// 就绪位图（bitmap，每 bit 代表一个节点的就绪状态）。
-    /// 替代原 Vec<bool>，8x 压缩（N 节点：N B → N/8 B）。
+    /// Ready bitmap (each bit represents one node's readiness state).
+    /// Replaces the original Vec<bool>, 8x compression (N nodes: N B → N/8 B).
     pub ready: Vec<u8>,
     pub refcounts: Vec<u16>,
 }
 
 impl ValueTable {
-    /// 创建空表。
+    /// Creates an empty table.
     pub fn new() -> Self {
         Self {
             values: Vec::new(),
@@ -587,7 +591,7 @@ impl ValueTable {
         }
     }
 
-    /// 创建指定容量、全部未就绪的表。
+    /// Creates a table with the given capacity, all slots unready.
     pub fn with_unready(n: usize) -> Self {
         Self {
             values: vec![Value::NULL; n],
@@ -596,7 +600,7 @@ impl ValueTable {
         }
     }
 
-    /// 节点数。
+    /// Number of nodes.
     pub fn len(&self) -> usize {
         self.values.len()
     }
@@ -605,50 +609,50 @@ impl ValueTable {
         self.values.is_empty()
     }
 
-    /// 调整尺寸（新槽为未就绪）。
+    /// Resizes the table (new slots are unready).
     pub fn resize(&mut self, n: usize) {
         self.values.resize(n, Value::NULL);
         self.ready.resize((n + 7) / 8, 0);
         self.refcounts.resize(n, 0);
     }
 
-    /// 检查节点 idx 是否就绪。
+    /// Checks whether node idx is ready.
     #[inline]
     pub fn is_ready(&self, idx: usize) -> bool {
         self.ready[idx >> 3] & (1 << (idx & 7)) != 0
     }
 
-    /// 标记节点 idx 为就绪。
+    /// Marks node idx as ready.
     #[inline]
     pub fn set_ready(&mut self, idx: usize) {
         self.ready[idx >> 3] |= 1 << (idx & 7);
     }
 
-    /// 标记节点 idx 为未就绪。
+    /// Marks node idx as not ready.
     #[inline]
     pub fn clear_ready(&mut self, idx: usize) {
         self.ready[idx >> 3] &= !(1 << (idx & 7));
     }
 
-    /// 设置产出值 + 下游消费者数量（局部索引）。
+    /// Sets the output value and downstream consumer count (local index).
     pub fn set_value(&mut self, idx: usize, value: Value, consumer_count: u16) {
         self.values[idx] = value;
         self.set_ready(idx);
         self.refcounts[idx] = consumer_count;
     }
 
-    /// 获取产出值（克隆）。
+    /// Gets the output value (cloned).
     pub fn get_value(&self, idx: usize) -> Value {
         self.values[idx].clone()
     }
 
-    /// 获取产出值可变引用（用于 &self 语义直接修改底层 HeapObj）。
+    /// Gets a mutable reference to the output value (for &self semantics to directly modify the underlying HeapObj).
     pub fn get_value_mut(&mut self, idx: usize) -> Option<&mut Value> {
         self.values.get_mut(idx)
     }
 
-    /// 消费一次（下游读取）。返回 true 表示 refcount 仍 >0（未归零），
-    /// 返回 false 表示已归零可回收。
+    /// Consumes once (downstream read). Returns true if refcount is still > 0 (not zeroed);
+    /// returns false if it has reached zero and can be reclaimed.
     pub fn consume(&mut self, idx: usize) -> bool {
         if self.refcounts[idx] > 0 {
             self.refcounts[idx] -= 1;
@@ -656,19 +660,19 @@ impl ValueTable {
         self.refcounts[idx] > 0
     }
 
-    /// 是否已被所有消费者消费完（refcount 归零）。
+    /// Whether all consumers have finished consuming (refcount reached zero).
     pub fn is_consumed(&self, idx: usize) -> bool {
         self.is_ready(idx) && self.refcounts[idx] == 0
     }
 
-    /// 重置单个槽为未就绪（堆对象 Arc Drop 自动 decref）。
+    /// Resets a single slot to unready (heap object Arc Drop auto-decrefs).
     pub fn reset_slot(&mut self, idx: usize) {
         self.values[idx] = Value::NULL;
         self.clear_ready(idx);
         self.refcounts[idx] = 0;
     }
 
-    /// 重置所有槽为未就绪（堆对象 Arc Drop 自动 decref）。
+    /// Resets all slots to unready (heap object Arc Drop auto-decrefs).
     pub fn reset_all(&mut self) {
         for v in self.values.iter_mut() {
             *v = Value::NULL;
@@ -698,16 +702,16 @@ impl std::fmt::Debug for ValueTable {
 }
 
 // =========================================================================
-// ConstValue — 编译期常量原始值（IrBuilder 存储，Engine 分配 ValueHandle）
+// ConstValue — compile-time constant raw value (stored by IrBuilder; Engine allocates ValueHandle)
 // =========================================================================
 
-/// 编译期常量原始值（IrBuilder 存储，Engine 分配 ValueHandle）。
+/// Compile-time constant raw value (stored by IrBuilder; Engine allocates ValueHandle).
 ///
-/// IrBuilder 在编译 Const 节点时将原始值存入 graph.const_values[NodeId]，
-/// Engine 在帧初始化时用 ValueArena 分配 ValueHandle 并预填充到 value_table。
+/// When compiling a Const node, IrBuilder stores the raw value in graph.const_values[NodeId].
+/// At frame initialization, Engine allocates a ValueHandle via ValueArena and pre-fills the value_table.
 ///
-/// `Str` 变体存 (offset, len) 引用，指向 `DataFlowGraph.string_pool` 中的字节。
-/// 访问时通过 `to_value(&pool)` 传入 string pool 切片实时构造 KuzoStr。
+/// The `Str` variant stores an (offset, len) reference into `DataFlowGraph.string_pool`.
+/// Access via `to_value(&pool)` passes the string pool slice to construct a KuzoStr on the fly.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConstValue {
     I8(i8),
@@ -728,15 +732,15 @@ pub enum ConstValue {
     F128([u8; 16]),
     Bool(bool),
     Char(u32),
-    /// 字符串引用：(offset, len) 指向 DataFlowGraph.string_pool
+    /// String reference: (offset, len) into DataFlowGraph.string_pool.
     Str { offset: u32, len: u32 },
     Null,
     Void,
 }
 
 impl ConstValue {
-    /// 转为 Value（用于优化器/Engine 读取常量值）。
-    /// `pool` = DataFlowGraph.string_pool 的字节切片，Str 变体需要从中读取字符串。
+    /// Converts to a Value (used by the optimizer/Engine to read constant values).
+    /// `pool` = byte slice of DataFlowGraph.string_pool; the Str variant reads the string from it.
     pub fn to_value(&self, pool: &[u8]) -> crate::value::Value {
         match self {
             ConstValue::I8(v) => crate::value::Value::i8(*v),
@@ -772,7 +776,7 @@ impl ConstValue {
         }
     }
 
-    /// 从 Value 构造 ConstValue（用于 ConstFold 生成新常量）。
+    /// Constructs a ConstValue from a Value (used by ConstFold to generate new constants).
     pub fn from_value(v: &crate::value::Value) -> Option<ConstValue> {
         use crate::value::{ValueTag, Value};
         match v {
@@ -815,100 +819,100 @@ impl ConstValue {
     }
 }
 
-/// Gate 节点的分支信息。
+/// Branch info for a Gate node.
 ///
-/// Gate 节点根据条件值选择激活哪个分支子图。
-/// `condition_input` 是条件值的 NodeId（全局）。
-/// `branches` 是分支列表，每个分支携带自己的 inputs（全局 NodeId，值从父帧读取）。
-/// 不同分支可有不同数量的 inputs（对应不同 param_count 的子图）。
+/// A Gate node selects which branch subgraph to activate based on the condition value.
+/// `condition_input` is the NodeId of the condition value (global).
+/// `branches` is the list of branches, each carrying its own inputs (global NodeIds; values read from the parent frame).
+/// Different branches may have different numbers of inputs (corresponding to subgraphs with different param_counts).
 #[derive(Debug, Clone)]
 pub struct GateBranches {
-    /// 条件输入节点（全局 NodeId）
+    /// Condition input node (global NodeId).
     pub condition_input: NodeId,
-    /// 分支列表：(条件值, 子图id, 参数节点列表)
+    /// Branch list: (condition value, subgraph id, parameter node list).
     pub branches: Vec<(bool, SubGraphId, Vec<NodeId>)>,
 }
 
-/// select 表达式分支信息（按 Gate 节点 NodeId 索引到 select_infos）。
+/// select expression branch info (indexed by Gate node NodeId into select_infos).
 #[derive(Debug, Clone)]
 pub struct SelectInfo {
-    /// 每个 Receive/Timeout 分支的信息
+    /// Info for each Receive/Timeout branch.
     pub branches: Vec<SelectBranch>,
 }
 
-/// select 表达式的单个分支信息。
+/// Info for a single branch of a select expression.
 #[derive(Debug, Clone)]
 pub struct SelectBranch {
-    /// 分支子图 id（执行分支 body）
+    /// Branch subgraph id (executes the branch body).
     pub subgraph_id: SubGraphId,
-    /// 事件源类型（Channel 或 Timer）
+    /// Event source type (Channel or Timer).
     pub event_kind: EventSourceKind,
-    /// 事件源值节点（channel handle 或 timer handle 的 NodeId，全局）
+    /// Event source value node (NodeId of the channel handle or timer handle, global).
     pub event_source_node: NodeId,
 }
 
 // =========================================================================
-// ControlSignal — 控制信号（非局部跳转的统一表达）
+// ControlSignal — control signal (unified representation of non-local jumps)
 // =========================================================================
 
-/// 控制信号：非局部跳转的统一表达。
+/// Control signal: unified representation of non-local jumps.
 ///
-/// run_ready_nodes 每次循环检查此字段，非 None 则停止处理。
-/// 由控制流 compute_fn（CF_RETURN/CF_BREAK/CF_CONTINUE/CF_THROW_WRAP_ERR）
-/// 返回 NodeResult::Return/Break/Continue 触发。
+/// run_ready_nodes checks this field each loop iteration; if not None, processing stops.
+/// Triggered by control-flow compute_fn (CF_RETURN/CF_BREAK/CF_CONTINUE/CF_THROW_WRAP_ERR)
+/// returning NodeResult::Return/Break/Continue.
 #[derive(Debug, Clone, Default)]
 pub enum ControlSignal {
-    /// 无信号，正常执行
+    /// No signal; normal execution.
     #[default]
     None,
-    /// return 语句触发：子图提前返回该值
+    /// Triggered by a return statement: the subgraph returns this value early.
     Return(Value),
-    /// break 语句触发：循环跳出
+    /// Triggered by a break statement: exits the loop.
     Break,
-    /// continue 语句触发：循环下一轮
+    /// Triggered by a continue statement: proceeds to the next loop iteration.
     Continue,
 }
 
-/// 检查节点是否为控制流节点（Return/Break/Continue/Throw）。
+/// Checks whether a node is a control-flow node (Return/Break/Continue/Throw).
 ///
-/// 替代旧的 control_signal_nodes 表检查：控制流语义现在通过 compute_fn
-///（CF_RETURN/CF_BREAK/CF_CONTINUE/CF_THROW_WRAP_ERR）直接返回
-/// NodeResult::Return/Break/Continue 表达。
+/// Replaces the old control_signal_nodes table check: control-flow semantics are now
+/// expressed directly via compute_fn (CF_RETURN/CF_BREAK/CF_CONTINUE/CF_THROW_WRAP_ERR)
+/// returning NodeResult::Return/Break/Continue.
 pub fn is_control_flow_compute_fn(cf: ComputeFnId) -> bool {
     cf == CF_RETURN || cf == CF_BREAK || cf == CF_CONTINUE || cf == CF_THROW_WRAP_ERR
 }
 
 // =========================================================================
-// FrameState — 帧状态
+// FrameState — frame state
 // =========================================================================
 
-/// 帧状态。
+/// Frame state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameState {
-    /// 就绪可执行（有就绪节点）
+    /// Ready to execute (has ready nodes).
     Ready,
-    /// 正在执行
+    /// Currently executing.
     Running,
-    /// 挂起等事件（async，阶段5实现）
+    /// Suspended waiting for an event (async; implemented in phase 5).
     Suspended,
-    /// 取消中（阶段5实现）
+    /// Being cancelled (implemented in phase 5).
     Cancelling,
-    /// 完成
+    /// Completed.
     Completed,
-    /// 失败
+    /// Failed.
     Failed,
 }
 
 // =========================================================================
-// SuspendState — 帧挂起状态（偏差 2：call/await 统一挂起模型）
+// SuspendState — frame suspend state (deviation 2: unified call/await suspend model)
 // =========================================================================
 
-/// 帧挂起状态。
+/// Frame suspend state.
 ///
-/// 帧执行到 call/await 节点时挂起，等待事件恢复：
-/// - `NotSuspended`：正常运行
-/// - `WaitingSubgraph(FrameId)`：等待子图帧完成（sync call 节点用）
-/// - `WaitingEvent(NodeId)`：等待 channel/timer/async 事件（await 节点用，NodeId 是 await 节点）
+/// A frame suspends when it reaches a call/await node, waiting for an event to resume:
+/// - `NotSuspended`: running normally
+/// - `WaitingSubgraph(FrameId)`: waiting for a subgraph frame to complete (used by sync call nodes)
+/// - `WaitingEvent(NodeId)`: waiting for a channel/timer/async event (used by await nodes; NodeId is the await node)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuspendState {
     NotSuspended,
@@ -917,123 +921,124 @@ pub enum SuspendState {
 }
 
 // =========================================================================
-// RuntimeEvent — 运行时事件（子图完成等）
+// RuntimeEvent — runtime event (subgraph completion, etc.)
 // =========================================================================
 
-/// 运行时事件：驱动挂起帧恢复执行。
+/// Runtime event: drives suspended frames to resume execution.
 ///
-/// spec 4.4 on_event_arrived 统一处理所有事件源。
+/// Spec 4.4 on_event_arrived handles all event sources uniformly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeEvent {
-    /// 子图执行完成（sync call 节点等待的事件）
+    /// Subgraph execution completed (the event awaited by sync call nodes).
     SubgraphComplete(FrameId),
-    /// channel 有数据可读（await channel.recv() 等待的事件）
+    /// Channel has data available for reading (the event awaited by channel.recv()).
     ChannelReady(ChannelId),
-    /// timer 到期触发（await timer.sleep() 等待的事件）
+    /// Timer fired (the event awaited by timer.sleep()).
     TimerFired(TimerId),
-    /// async 调用完成（await async_handle.await() 等待的事件）
+    /// Async call completed (the event awaited by async_handle.await()).
     AsyncJoin(AsyncHandleId),
 }
 
 // =========================================================================
-// PendingCall — 待发起的子图调用（call 节点执行时构造）
+// PendingCall — pending subgraph call (constructed when a call node executes)
 // =========================================================================
 
-/// 待发起的子图调用。
+/// Pending subgraph call.
 ///
-/// call 节点 compute_fn 执行时构造，调度器消费后启动子图帧。
-/// - `is_async=false`：sync call，当前帧挂起等 SubgraphComplete
-/// - `is_async=true`：async call，当前帧不挂起，call 节点写 AsyncHandle + 通知下游
+/// Constructed when a call node's compute_fn executes; the scheduler consumes it and launches a subgraph frame.
+/// - `is_async=false`: sync call; the current frame suspends waiting for SubgraphComplete
+/// - `is_async=true`: async call; the current frame does not suspend; the call node writes an AsyncHandle + notifies downstream
 #[derive(Debug, Clone)]
 pub struct PendingCall {
-    /// 目标子图 id
+    /// Target subgraph id.
     pub target_sg: SubGraphId,
-    /// 调用参数（值列表）
+    /// Call arguments (value list).
     pub args: Vec<Value>,
-    /// 发起调用的节点（帧内局部 NodeId，子图完成后回写返回值）
+    /// The node that initiated the call (local NodeId within the frame; the return value is written back after subgraph completion).
     pub call_node_local: NodeId,
-    /// async call 标记：true=不挂起当前帧，返回 AsyncHandle
+    /// Async call flag: true = do not suspend the current frame; returns an AsyncHandle.
     pub is_async: bool,
-    /// 逃逸闭包调用时存储 Closure 值，用于子帧完成后回写 upvalue 到 Closure。
-    /// None = 普通函数调用或 same_function 闭包调用（无需回写）。
+    /// Stores the Closure value for escaping closure calls, used to write back upvalues to the Closure after the child frame completes.
+    /// None = ordinary function call or same_function closure call (no writeback needed).
     pub closure_val: Option<Value>,
 }
 
 // =========================================================================
-// PendingAwait — 待处理的 await 挂起（await 节点执行时构造）
+// PendingAwait — pending await suspension (constructed when an await node executes)
 // =========================================================================
 
-/// 待处理的 await 挂起。
+/// Pending await suspension.
 ///
-/// await 节点 compute_fn 执行时构造，核心循环消费后检查事件源就绪状态：
-/// 就绪→注入值继续执行，未就绪→注册 event_waiters + 帧挂起。
+/// Constructed when an await node's compute_fn executes; the core loop consumes it and
+/// checks event source readiness: ready → inject the value and continue; not ready →
+/// register event_waiters + suspend the frame.
 #[derive(Debug, Clone)]
 pub struct PendingAwait {
-    /// await 节点（帧内局部 NodeId，事件到达时回写值）
+    /// The await node (local NodeId within the frame; the value is written back when the event arrives).
     pub await_node_local: NodeId,
-    /// 事件对象值（AsyncHandle/Channel/Timer 的 Value）
+    /// Event object value (the Value of an AsyncHandle/Channel/Timer).
     pub event_obj: Value,
-    /// 事件种类（决定如何检查就绪 + 如何解析事件源 id）
+    /// Event kind (determines how to check readiness and how to resolve the event source id).
     pub event_kind: EventSourceKind,
 }
 
 // =========================================================================
-// Pending — 统一挂起动作枚举
+// Pending — unified suspend action enum
 // =========================================================================
 
-// Pending enum 已删除：副作用通过 NodeResult 返回值显式传递。
-// 保留 PendingCall/PendingAwait 结构体供 NodeResult::Call/Await 使用。
+// The Pending enum has been removed: side effects are passed explicitly via NodeResult return values.
+// The PendingCall/PendingAwait structs are retained for use by NodeResult::Call/Await.
 
 // =========================================================================
-// NodeResult — compute_fn 统一返回值（显式传递所有副作用）
+// NodeResult — unified compute_fn return value (all side effects passed explicitly)
 // =========================================================================
 
-/// compute_fn 的统一返回值。
+/// Unified return value of compute_fn.
 ///
-/// 所有副作用通过返回值显式传递，消除 frame.pending 隐式副作用。
-/// engine 热循环 match NodeResult 分派处理。
+/// All side effects are passed explicitly via the return value, eliminating the implicit
+/// side effects of frame.pending. The engine hot loop dispatches on NodeResult via match.
 #[derive(Debug, Clone)]
 pub enum NodeResult {
-    /// 正常值计算完成
+    /// Normal value computation completed.
     Value(Value),
-    /// 批量计算完成（多个节点同时产出值）
+    /// Batch computation completed (multiple nodes produce values simultaneously).
     Batch(Vec<(NodeId, Value)>),
-    /// 函数调用（同步/异步/尾调用，由 PendingCall.is_async 区分）
+    /// Function call (sync/async/tail call, distinguished by PendingCall.is_async).
     Call(PendingCall),
-    /// Await 挂起（等待 channel/timer/async 事件）
+    /// Await suspension (waiting for a channel/timer/async event).
     Await(PendingAwait),
-    /// Channel 通知（Send 操作触发 ChannelReady 唤醒等待帧）
+    /// Channel notification (a Send operation triggers ChannelReady to wake waiting frames).
     ChannelNotify(ChannelId),
-    /// 取消异步操作
+    /// Cancel an async operation.
     Cancel(AsyncHandleId),
-    /// Select 等待（Gate 无就绪分支时挂起）
+    /// Select wait (suspends when no Gate branch is ready).
     SelectWait(NodeId),
-    /// 控制流：return（值作为函数返回值）
+    /// Control flow: return (the value serves as the function return value).
     Return(Value),
-    /// 控制流：break
+    /// Control flow: break.
     Break,
-    /// 控制流：continue
+    /// Control flow: continue.
     Continue,
 }
 
 // =========================================================================
-// EvalContext — compute_fn 执行上下文（提供批处理决策支持）
+// EvalContext — compute_fn execution context (provides batching decision support)
 // =========================================================================
 
-/// compute_fn 执行上下文。
+/// compute_fn execution context.
 ///
-/// 不借用 frame 数据（避免与 &mut Frame 借用冲突）。
-/// collect_batch_candidates 通过参数接收 &Frame 访问 ready_queue。
+/// Does not borrow frame data (to avoid conflicts with &mut Frame borrows).
+/// collect_batch_candidates receives &Frame as a parameter to access ready_queue.
 pub struct EvalContext {
-    /// 子图节点起始偏移（局部 NodeId → 全局 NodeId 转换用）
+    /// Subgraph node start offset (used for local NodeId → global NodeId conversion).
     pub node_start: u32,
 }
 
 impl EvalContext {
-    /// 从当前节点之后扫描 ready_queue，收集与当前节点同类型的节点。
+    /// Scans ready_queue after the current node, collecting nodes of the same type as the current node.
     ///
-    /// compute_fn 用此方法决定是否做 SIMD 批处理。
-    /// 返回全局 NodeId 列表。
+    /// compute_fn uses this method to decide whether to do SIMD batching.
+    /// Returns a list of global NodeIds.
     pub fn collect_batch_candidates(
         &self,
         frame: &Frame,
@@ -1050,70 +1055,71 @@ impl EvalContext {
         result
     }
 
-    /// ready_queue 长度
+    /// ready_queue length.
     pub fn queue_len(&self, frame: &Frame) -> usize {
         frame.ready_queue.len()
     }
 }
 
 // =========================================================================
-// Frame — 执行帧（一次函数调用的运行时状态）
+// Frame — execution frame (runtime state of a single function call)
 // =========================================================================
 
-/// 执行帧：一次函数调用的运行时状态。
+/// Execution frame: the runtime state of a single function call.
 ///
-/// - `value_table`：按 NodeId 索引的值表（SoA 布局，每节点一个槽）
-/// - `pending_inputs`：每节点剩余未就绪输入数
-/// - `ready_queue`：就绪待执行节点队列
-/// - `state`：帧状态
-/// - `subgraph_id`：所属子图
-/// - `caller`：调用方帧+call节点（子图完成时回写返回值）
+/// - `value_table`: value table indexed by NodeId (SoA layout, one slot per node)
+/// - `pending_inputs`: remaining unready input count per node
+/// - `ready_queue`: queue of nodes ready for execution
+/// - `state`: frame state
+/// - `subgraph_id`: owning subgraph
+/// - `caller`: caller frame + call node (return value written back on subgraph completion)
 ///
-/// 帧级回收：帧结束时整个 value_table 释放，堆对象走 Arc Drop RC。
+/// Frame-level reclamation: at frame end the entire value_table is released; heap objects go through Arc Drop RC.
 pub struct Frame {
-    /// 数据流图（只读共享，compute_fn 通过 frame.graph 访问）
+    /// Dataflow graph (read-only shared; compute_fn accesses it via frame.graph).
     pub graph: std::sync::Arc<DataFlowGraph>,
-    /// 值表（SoA 布局，按帧内局部 NodeId 索引，从 0 开始）
+    /// Value table (SoA layout, indexed by local NodeId within the frame, starting from 0).
     pub value_table: ValueTable,
-    /// 每节点剩余未就绪输入数
+    /// Remaining unready input count per node.
     pub pending_inputs: Vec<u16>,
-    /// 就绪待执行节点队列
+    /// Queue of nodes ready for execution.
     pub ready_queue: std::collections::VecDeque<NodeId>,
-    /// 帧状态
+    /// Frame state.
     pub state: FrameState,
-    /// 所属子图 id
+    /// Owning subgraph id.
     pub subgraph_id: SubGraphId,
-    /// 调用方帧+call节点（None = 顶层帧）
+    /// Caller frame + call node (None = top-level frame).
     pub caller: Option<(FrameId, NodeId)>,
-    /// 帧 id
+    /// Frame id.
     pub id: FrameId,
-    /// 子图节点起始偏移（全局 NodeId = 局部 NodeId + node_offset）
+    /// Subgraph node start offset (global NodeId = local NodeId + node_offset).
     pub node_offset: u32,
-    /// 控制信号（return/break/continue 触发）
+    /// Control signal (triggered by return/break/continue).
     pub control_signal: ControlSignal,
-    /// 挂起状态（call/await 节点挂起时设置）
+    /// Suspend state (set when a call/await node suspends).
     pub suspend_state: SuspendState,
-    /// defer 栈（运行时，帧释放时 LIFO 执行）
+    /// Defer stack (runtime; executed LIFO on frame release).
     pub defer_stack: Vec<DeferEntry>,
-    /// 挂起事件（子图完成等，驱动帧恢复）
+    /// Suspend event (subgraph completion, etc.; drives frame resumption).
     pub suspend_event: Option<RuntimeEvent>,
-    /// select 中已启动的 timer（branch_idx, timer_id），Timer 分支首次检查时启动
+    /// Timers already started in select (branch_idx, timer_id); Timer branches are started on first check.
     pub select_timers: Vec<(usize, crate::ir::Ir::TimerId)>,
-    /// 指向函数根帧。同函数子图继承，跨函数调用设为 null，async 子帧设为 null。
-    /// 安全性由 Box<Frame> 地址稳定 + 同步循环单 worker 保证。
+    /// Points to the function root frame. Inherited within the same function's subgraphs;
+    /// set to null for cross-function calls and async child frames.
+    /// Safety is ensured by Box<Frame> address stability + single-worker synchronous loop.
     pub root_frame_ptr: *mut Frame,
-    /// 指向直接调用方帧（caller frame）。用于 get_value_by_global 遍历中间帧
-    /// （如循环体帧中声明的变量），弥补 root_frame_ptr 只能直达根帧的不足。
+    /// Points to the direct caller frame. Used by get_value_by_global to traverse intermediate frames
+    /// (e.g., variables declared in loop-body frames), compensating for root_frame_ptr only reaching the root frame directly.
     pub parent_frame_ptr: *mut Frame,
-    /// 通用缓存子帧 ID（循环体帧复用：while_sg/loop_sg/for_sg/tailrec 帧缓存 body_sg 子帧）。
+    /// Generic cached child frame ID (loop-body frame reuse: while_sg/loop_sg/for_sg/tailrec frames cache the body_sg child frame).
     pub cached_child_frame: Option<FrameId>,
-    /// 逃逸闭包调用时存储 Closure 值，用于子帧完成后回写 upvalue 到 Closure。
-    /// None = 普通函数调用或 same_function 闭包调用。
+    /// Stores the Closure value for escaping closure calls, used to write back upvalues to the Closure after the child frame completes.
+    /// None = ordinary function call or same_function closure call.
     pub closure_val: Option<Value>,
 }
 
 impl Frame {
-    /// 创建新帧，值表和 pending_inputs 按子图节点数初始化。
+    /// Creates a new frame; value_table and pending_inputs are initialized to the subgraph's node count.
     pub fn new(id: FrameId, subgraph_id: SubGraphId, node_count: usize, graph: std::sync::Arc<DataFlowGraph>) -> Self {
         Self {
             graph,
@@ -1137,29 +1143,30 @@ impl Frame {
         }
     }
 
-    /// 设置节点的产出值（局部 NodeId）。
+    /// Sets a node's output value (local NodeId).
     pub fn set_value(&mut self, node: NodeId, value: Value, consumer_count: u16) {
         self.value_table.set_value(node.0 as usize, value, consumer_count);
     }
 
-    /// 获取节点的产出值（局部 NodeId，克隆返回）。
+    /// Gets a node's output value (local NodeId; returns a clone).
     pub fn get_value(&self, node: NodeId) -> Value {
         self.value_table.get_value(node.0 as usize)
     }
 
-    /// 获取节点的产出值（全局 NodeId，自动转换为局部索引，克隆返回）。
-    /// compute_fn 读取输入时使用此方法（inputs_pool 存全局 NodeId）。
-    /// 越界时通过 parent_frame_ptr 遍历调用链（中间帧变量），
-    /// 再回退到 root_frame_ptr（函数根帧）。
+    /// Gets a node's output value (global NodeId; auto-converts to local index; returns a clone).
+    /// compute_fn uses this method when reading inputs (inputs_pool stores global NodeIds).
+    /// On out-of-bounds, traverses the call chain via parent_frame_ptr (intermediate-frame variables),
+    /// then falls back to root_frame_ptr (function root frame).
     pub fn get_value_by_global(&self, global_node: NodeId) -> Value {
         let local = global_node.0.wrapping_sub(self.node_offset);
         if (local as usize) < self.value_table.len() {
             if self.value_table.is_ready(local as usize) {
                 self.value_table.get_value(local as usize)
             } else if self.pending_inputs[local as usize] > 0 {
-                // 节点在当前帧范围内但永不会就绪（嵌套子图节点 pending_inputs=MAX，
-                // 或依赖嵌套节点的节点 pending_inputs>0 且永不归零）。
-                // 向上查找父帧获取值。
+                // The node is within the current frame's range but will never become ready
+                // (nested subgraph nodes have pending_inputs=MAX, or nodes depending on
+                // nested nodes have pending_inputs>0 and will never reach zero).
+                // Walk up to the parent frame to get the value.
                 if !self.parent_frame_ptr.is_null() {
                     unsafe { (*self.parent_frame_ptr).get_value_by_global(global_node) }
                 } else if !self.root_frame_ptr.is_null() {
@@ -1179,83 +1186,83 @@ impl Frame {
         }
     }
 
-    /// 检查节点是否就绪（所有输入已产出）。
+    /// Checks whether a node is ready (all inputs produced).
     pub fn is_node_ready(&self, node: NodeId) -> bool {
         self.pending_inputs[node.0 as usize] == 0
     }
 
-    /// 入就绪队列。
+    /// Enqueues a node into the ready queue.
     pub fn push_ready(&mut self, node: NodeId) {
         self.ready_queue.push_back(node);
     }
 
-    /// 弹出就绪节点。
+    /// Dequeues a ready node.
     pub fn pop_ready(&mut self) -> Option<NodeId> {
         self.ready_queue.pop_front()
     }
 }
 
 // =========================================================================
-// EventSource — 事件源（图外运行时对象，产出值注入 await 节点输入边）
+// EventSource — event source (runtime object external to the graph; its produced value is injected into await node input edges)
 // =========================================================================
 
-/// Channel id（运行时）
+/// Channel id (runtime).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChannelId(pub u64);
 
-/// Timer id（运行时）
+/// Timer id (runtime).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TimerId(pub u32);
 
-/// Async handle id（运行时，async 调用完成事件）
+/// Async handle id (runtime; async call completion event).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AsyncHandleId(pub u32);
 
-/// 事件源：图外运行时对象，产出值注入到 await 节点的输入边。
+/// Event source: a runtime object external to the graph whose produced value is injected into an await node's input edge.
 ///
-/// - await 节点的某个输入边指向 EventSource 声明节点
-/// - EventSource 声明节点在运行时绑定到具体 EventSource 实例
-/// - 事件到达时，事件源把值写到 await 节点对应输入的值表槽
+/// - One input edge of an await node points to an EventSource declaration node
+/// - The EventSource declaration node is bound to a concrete EventSource instance at runtime
+/// - When an event arrives, the event source writes the value to the value-table slot of the await node's corresponding input
 ///
-/// call 节点等"子图完成事件"，await 节点等"channel/timer/async 事件"——
-/// 两者执行引擎无差别处理，这就是 call 和 await 的统一。
+/// call nodes wait for "subgraph completion events"; await nodes wait for "channel/timer/async events" —
+/// the execution engine handles both uniformly, which is the unification of call and await.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventSource {
-    /// channel 有数据可读/可写
+    /// Channel has data available for reading/writing.
     Channel(ChannelId),
-    /// async 调用完成
+    /// Async call completed.
     AsyncJoin(AsyncHandleId),
-    /// 定时器到期
+    /// Timer expired.
     Timer(TimerId),
-    /// 子图执行完成（用于 call 节点）
+    /// Subgraph execution completed (used by call nodes).
     SubgraphComplete(SubgraphInstanceId),
 }
 
 // =========================================================================
-// DeferEntry — defer 块（帧 Drop 语义）
+// DeferEntry — defer block (frame Drop semantics)
 // =========================================================================
 
-/// defer 块定义：编译为独立子图，帧释放时按 LIFO 执行。
+/// defer block definition: compiled as an independent subgraph, executed in LIFO order on frame release.
 ///
-/// 解决 Zig 痛点：defer 挂在帧上，任何帧释放路径都执行
-/// （正常返回、错误传播、取消），统一无特例。
+/// Addresses a Zig pain point: defer is attached to the frame and executes on any frame-release path
+/// (normal return, error propagation, cancellation), uniformly with no special cases.
 #[derive(Debug, Clone)]
 pub struct DeferEntry {
-    /// defer 注册点（触发节点）
+    /// defer registration point (trigger node).
     pub trigger_node: NodeId,
-    /// defer 块体子图
+    /// defer block body subgraph.
     pub body_subgraph: SubGraphId,
-    /// 捕获的变量（注册时快照的 NodeId 列表）
+    /// Captured variables (NodeId list snapshotted at registration).
     pub captured_inputs: Vec<NodeId>,
-    /// 是否已注册到帧的 defer_stack（运行时标记，避免重复执行）
+    /// Whether it has been registered to the frame's defer_stack (runtime marker to prevent duplicate execution).
     pub registered: bool,
 }
 
 // =========================================================================
-// RecordLitInfo — 记录构造信息（RecordLit 节点用）
+// RecordLitInfo — record construction info (for RecordLit nodes)
 // =========================================================================
 
-/// 构造种类：区分 Record / ADT / Newtype，驱动 compute_record_construct 构造不同的 HeapObj。
+/// Construction kind: distinguishes Record / ADT / Newtype, driving compute_record_construct to build different HeapObjs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::TryFromPrimitive)]
 #[repr(u8)]
 pub enum RecordLitKind {
@@ -1264,11 +1271,11 @@ pub enum RecordLitKind {
     Newtype = 2,
 }
 
-/// 类型字段信息（注册到 type_scope_stack，按构造器名或类型名索引）。
+/// Type field info (registered in type_scope_stack, indexed by constructor name or type name).
 ///
-/// field_names: 构造器的字段名列表（Newtype 为空，走单独路径）
-/// type_name: 所属类型名（多构造器 ADT 的构造器名 != 类型名，需存储类型名）
-/// kind: 构造种类（Record / Adt / Newtype）
+/// field_names: the constructor's field name list (empty for Newtype, which uses a separate path)
+/// type_name: the owning type name (for multi-constructor ADTs, the constructor name != type name, so the type name must be stored)
+/// kind: construction kind (Record / Adt / Newtype)
 #[derive(Debug, Clone)]
 pub struct TypeFieldInfo {
     pub field_names: Vec<String>,
@@ -1276,11 +1283,11 @@ pub struct TypeFieldInfo {
     pub kind: RecordLitKind,
 }
 
-/// 记录构造信息（RecordLit 节点用）。
+/// Record construction info (for RecordLit nodes).
 ///
-/// RecordLit 编译为构造节点，compute_fn 从输入收集字段值构造 HeapObj。
-/// 根据 kind 构造 RecordValue / AdtValue / NewtypeValue。
-/// type_name 存所属类型名（非构造器名），constructor 存构造器名（ADT 用）。
+/// RecordLit compiles to a construction node; compute_fn collects field values from inputs to construct a HeapObj.
+/// Depending on kind, constructs RecordValue / AdtValue / NewtypeValue.
+/// type_name stores the owning type name (not the constructor name); constructor stores the constructor name (for ADTs).
 #[derive(Debug, Clone)]
 pub struct RecordLitInfo {
     pub type_name: String,
@@ -1289,230 +1296,232 @@ pub struct RecordLitInfo {
     pub kind: RecordLitKind,
 }
 
-/// 闭包构造节点的信息（按 NodeId 索引，非闭包构造节点为 None）。
+/// Closure construction node info (indexed by NodeId; None for non-closure-construction nodes).
 ///
-/// 闭包构造节点（compute_fn = 40）运行时从 closure_infos 取子图 id + arity，
-/// 合并 inputs（捕获值）构造 Closure 堆对象。
+/// A closure construction node (compute_fn = 40) retrieves the subgraph id + arity from closure_infos at runtime,
+/// merges inputs (captured values) to construct a Closure heap object.
 #[derive(Debug, Clone, Copy)]
 pub struct ClosureInfo {
-    /// 闭包子图 id
+    /// Closure subgraph id.
     pub subgraph_id: SubGraphId,
-    /// lambda 参数数（不含捕获的 upvalues）
+    /// Number of lambda parameters (excluding captured upvalues).
     pub arity: u8,
-    /// 自身引用 upvalue 的索引（递归嵌套函数用，-1 表示无自身引用）
+    /// Index of the self-reference upvalue (for recursive nested functions; -1 means no self-reference).
     pub self_upvalue_idx: i32,
 }
 
-/// 偏应用构造节点信息（compute_fn = 286）。
+/// Partial application construction node info (compute_fn = 286).
 ///
-/// compile_call 检测到实参数 < 目标函数形参数时生成 partial_construct 节点，
-/// 运行时从 partial_infos 取子图 id + bound_count，合并 inputs（已绑定参数值）
-/// 构造 HeapObj::Partial。remaining_arity 由 subgraph.param_count - bound_count 推导。
+/// When compile_call detects that the number of actual arguments < the target function's parameter count,
+/// it generates a partial_construct node. At runtime, it retrieves the subgraph id + bound_count from
+/// partial_infos, merges inputs (bound argument values) to construct a HeapObj::Partial.
+/// remaining_arity is derived from subgraph.param_count - bound_count.
 #[derive(Debug, Clone, Copy)]
 pub struct PartialInfo {
-    /// 目标函数子图 id
+    /// Target function subgraph id.
     pub subgraph_id: SubGraphId,
-    /// 已绑定参数数（= 节点 inputs 数）
+    /// Number of bound parameters (= node input count).
     pub bound_count: u8,
 }
 
-/// inline_trait 构造节点信息（按 NodeId 索引）。
+/// inline_trait construction node info (indexed by NodeId).
 ///
-/// compute_trait_construct（compute_fn=266）运行时从此信息取每个方法的
-/// 子图 id + arity + upvalue 数量，合并节点 inputs（各方法 upvalues 依次拼接）
-/// 构造多个 Closure，打包成 TraitValue 堆对象。
+/// compute_trait_construct (compute_fn=266) retrieves each method's subgraph id + arity + upvalue count
+/// from this info at runtime, merges node inputs (each method's upvalues concatenated in order) to
+/// construct multiple Closures, packed into a TraitValue heap object.
 #[derive(Debug, Clone)]
 pub struct TraitConstructInfo {
-    /// trait 名（运行时填入 TraitValue.trait_name）
+    /// Trait name (filled into TraitValue.trait_name at runtime).
     pub trait_name: String,
-    /// 方法名列表（与 methods 一一对应，填入 TraitValue.method_names）
+    /// Method name list (one-to-one with methods; filled into TraitValue.method_names).
     pub method_names: Vec<String>,
-    /// 每个方法的子图信息（与 method_names 一一对应）
+    /// Subgraph info for each method (one-to-one with method_names).
     pub methods: Vec<TraitMethodEntry>,
 }
 
-/// inline_trait 单个方法的子图信息。
+/// Subgraph info for a single inline_trait method.
 #[derive(Debug, Clone, Copy)]
 pub struct TraitMethodEntry {
     pub subgraph_id: SubGraphId,
-    pub arity: u8,         // 方法参数数（不含 upvalues）
-    pub upvalue_count: u8, // 该方法的 upvalue 数（从 inputs 中按顺序切分）
+    pub arity: u8,         // Number of method parameters (excluding upvalues)
+    pub upvalue_count: u8, // Number of upvalues for this method (split from inputs in order)
 }
 
-/// lazy 构造节点信息（按 NodeId 索引）。
+/// Lazy construction node info (indexed by NodeId).
 ///
-/// compute_lazy_construct（compute_fn=267）运行时从此信息取 thunk 子图 id，
-/// 构造 LazyValue 堆对象（thunk 未求值，首次 force 时启动子图计算并缓存）。
+/// compute_lazy_construct (compute_fn=267) retrieves the thunk subgraph id from this info at runtime,
+/// constructing a LazyValue heap object (the thunk is unevaluated; on first force, it launches the
+/// subgraph computation and caches the result).
 #[derive(Debug, Clone, Copy)]
 pub struct LazyConstructInfo {
-    /// thunk 子图 id（无参数，返回值为 lazy 表达式的值）
+    /// Thunk subgraph id (no parameters; the return value is the lazy expression's value).
     pub thunk_sg: SubGraphId,
 }
 
-/// 记录扩展节点信息（按 NodeId 索引）。
+/// Record extension node info (indexed by NodeId).
 ///
-/// compute_record_extend（compute_fn=272）运行时从此信息取更新字段名列表，
-/// 从 base RecordValue 克隆字段，按更新字段名替换/追加，构造新 RecordValue。
-/// inputs[0] = base record，inputs[1..] = 更新字段值（顺序对应 update_names）。
+/// compute_record_extend (compute_fn=272) retrieves the updated field name list from this info at runtime,
+/// clones fields from the base RecordValue, replaces/appends per the updated field names, and constructs a new RecordValue.
+/// inputs[0] = base record; inputs[1..] = updated field values (in order corresponding to update_names).
 #[derive(Debug, Clone)]
 pub struct RecordExtendInfo {
-    /// 更新字段名列表（长度 = input_count - 1，对应 inputs[1..]）
+    /// Updated field name list (length = input_count - 1; corresponds to inputs[1..]).
     pub update_names: Vec<String>,
 }
 
-/// 记忆化缓存节点元数据：memo_check / memo_store 共用。
-/// memo_check: inputs[0..param_count] = 参数值，table_index 索引缓存表
-/// memo_store: inputs[0..param_count] = 参数值, inputs[param_count] = 结果值
+/// Memoization cache node metadata: shared by memo_check / memo_store.
+/// memo_check: inputs[0..param_count] = argument values; table_index indexes the cache table
+/// memo_store: inputs[0..param_count] = argument values, inputs[param_count] = result value
 #[derive(Debug, Clone)]
 pub struct MemoInfo {
-    /// 缓存表索引（graph.memo_tables 中的位置）
+    /// Cache table index (position in graph.memo_tables).
     pub table_index: u32,
-    /// 参数个数（inputs 前 param_count 个为缓存 key 组成部分）
+    /// Number of parameters (the first param_count inputs are cache key components).
     pub param_count: u8,
 }
 
 // =========================================================================
-// EventSourceDecl — 事件源声明（静态，编译期）
+// EventSourceDecl — event source declaration (static, compile time)
 // =========================================================================
 
-/// 事件源声明：在子图中声明外部事件接入点。
+/// Event source declaration: declares an external event entry point within a subgraph.
 ///
-/// await 节点的某个输入边指向 EventSource 声明节点，
-/// 运行时绑定到具体 EventSource 实例。
+/// An input edge of an await node points to an EventSource declaration node,
+/// which is bound to a concrete EventSource instance at runtime.
 #[derive(Debug, Clone)]
 pub struct EventSourceDecl {
-    /// 声明所在节点
+    /// The node where the declaration resides.
     pub node: NodeId,
-    /// 事件源种类（运行时绑定实例）
+    /// Event source kind (runtime-bound instance).
     pub kind: EventSourceKind,
 }
 
-/// 事件源种类（静态声明，运行时绑定实例）
+/// Event source kind (static declaration; runtime-bound instance).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, num_enum::TryFromPrimitive)]
 #[repr(u8)]
 pub enum EventSourceKind {
-    /// channel 事件
+    /// Channel event.
     Channel,
-    /// async join 事件
+    /// Async join event.
     AsyncJoin,
-    /// timer 事件
+    /// Timer event.
     Timer,
-    /// 子图完成事件
+    /// Subgraph completion event.
     SubgraphComplete,
 }
 
 // =========================================================================
-// SubGraph — 函数子图（静态，编译期生成）
+// SubGraph — function subgraph (static, generated at compile time)
 // =========================================================================
 
-/// 函数子图：每个函数（含单态化实例）编译为一个 SubGraph。
+/// Function subgraph: each function (including monomorphization instances) compiles to a SubGraph.
 ///
-/// - `node_range`：节点 id 范围 [start, end)
-/// - `entry_node`：入口节点（接收参数）
-/// - `return_node`：返回节点（产出返回值）
-/// - `has_suspend`：是否有挂起点（async=true）
+/// - `node_range`: node id range [start, end)
+/// - `entry_node`: entry node (receives parameters)
+/// - `return_node`: return node (produces the return value)
+/// - `has_suspend`: whether there are suspend points (async=true)
 ///
-/// sync 函数 = 子图无挂起点，同步跑完立即产完成事件
-/// async 函数 = 子图有挂起点（await 节点连事件源）
-/// 区别仅在子图是否有 await 节点，执行引擎无差别处理。
+/// A sync function = a subgraph with no suspend points; it runs to completion and immediately produces a completion event.
+/// An async function = a subgraph with suspend points (await nodes connected to event sources).
+/// The difference is only whether the subgraph has await nodes; the execution engine handles both uniformly.
 #[derive(Debug, Clone)]
 pub struct SubGraph {
-    /// 子图 id
+    /// Subgraph id.
     pub id: SubGraphId,
-    /// 节点 id 范围 [start, end)
+    /// Node id range [start, end).
     pub node_range: (NodeId, NodeId),
-    /// 参数数（入口节点的输入数）
+    /// Number of parameters (input count of the entry node).
     pub param_count: u8,
-    /// 入口节点（接收参数）
+    /// Entry node (receives parameters).
     pub entry_node: NodeId,
-    /// 返回节点（产出返回值）
+    /// Return node (produces the return value).
     pub return_node: NodeId,
-    /// 是否有挂起点（async=true）
+    /// Whether there are suspend points (async=true).
     pub has_suspend: bool,
-    /// 声明的事件源（channel/timer 等）
+    /// Declared event sources (channel/timer, etc.).
     pub event_source_decls: Vec<EventSourceDecl>,
-    /// defer 块子图定义
+    /// Defer block subgraph definitions.
     pub defer_table: Vec<DeferEntry>,
-    /// 循环种类（普通子图=None，while_sg=While，loop_sg=Loop，for_sg=For，body_sg=LoopBody）
+    /// Loop kind (ordinary subgraph=None, while_sg=While, loop_sg=Loop, for_sg=For, body_sg=LoopBody).
     pub loop_kind: LoopKind,
-    /// body_sg 指向父循环子图（while_sg/loop_sg/for_sg）
+    /// body_sg points to the parent loop subgraph (while_sg/loop_sg/for_sg).
     pub loop_parent_sg: Option<SubGraphId>,
-    /// 循环条件节点（While/For 用，循环重置时需重置）
+    /// Loop condition node (used by While/For; must be reset on loop iteration reset).
     pub cond_node: Option<NodeId>,
-    /// 所属函数 ID（顶层函数子图=自身 SubGraphId.0，循环/分支子图=父函数的 function_id）
+    /// Owning function ID (top-level function subgraph = its own SubGraphId.0; loop/branch subgraph = parent function's function_id).
     pub function_id: u32,
-    /// For 循环迭代器推进节点（reset_loop_iteration 时重置）
+    /// For-loop iterator advance node (reset on reset_loop_iteration).
     pub iter_next_node: Option<NodeId>,
-    /// upvalue 数量（lambda 捕获变量数，含 self 递归引用）
-    /// param_count = 实际参数数 + upvalue_count
+    /// Upvalue count (number of lambda-captured variables, including self-recursive references).
+    /// param_count = actual parameter count + upvalue_count
     pub upvalue_count: u8,
-    /// 每个 upvalue 对应的外层节点 ID（用于 same_function 调用时注入当前父帧值）
+    /// Outer node ID for each upvalue (used to inject current parent-frame values during same_function calls).
     pub upvalue_outer_nodes: Vec<NodeId>,
-    /// 直接嵌套子图的 node_range 列表（构建期预计算，运行时 O(len) 查询而非全图扫描）。
-    /// 仅包含直接嵌套的子图，不含孙子图（孙子图由递归的 prepare 逻辑处理）。
+    /// List of directly nested subgraph node_ranges (precomputed at build time; O(len) query at runtime instead of full-graph scan).
+    /// Only includes directly nested subgraphs, not grandchild subgraphs (those are handled by recursive prepare logic).
     pub nested_ranges: Vec<(u32, u32)>,
-    /// 帧复用重置计划（编译期生成，替代运行时 LoopKind 分支判断）。
-    /// 仅循环子图（while_sg/loop_sg/for_sg）有此计划，普通子图为 None。
+    /// Frame-reuse reset plan (generated at compile time; replaces runtime LoopKind branch checks).
+    /// Only loop subgraphs (while_sg/loop_sg/for_sg) have this plan; ordinary subgraphs are None.
     pub reset_plan: Option<ResetPlan>,
 }
 
-/// 子图帧复用时的重置计划（编译期由 Builder 计算，存入 SubGraph）。
+/// Reset plan for subgraph frame reuse (computed at compile time by Builder, stored in SubGraph).
 ///
-/// 将 For vs While/Loop 的重置差异编码为数据，engine 不再分支判断 LoopKind。
+/// Encodes the reset differences between For vs While/Loop as data, so the engine no longer branches on LoopKind.
 #[derive(Debug, Clone, Default)]
 pub struct ResetPlan {
-    /// 重置为 pending=0 并入队的节点（For 的 iter_next_node）
+    /// Nodes to reset to pending=0 and enqueue (For's iter_next_node).
     pub reset_to_zero: Vec<NodeId>,
-    /// 重置为 pending=1 的节点（For 的 cond_node，输入来自 iter_next）
+    /// Nodes to reset to pending=1 (For's cond_node; input comes from iter_next).
     pub reset_to_one: Vec<NodeId>,
-    /// 需递归重置的条件树根节点（While/Loop 的 cond_node）
+    /// Condition tree root nodes requiring recursive reset (While/Loop's cond_node).
     pub reset_condition_tree: Vec<NodeId>,
 }
 
-/// 循环子图种类
+/// Loop subgraph kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::TryFromPrimitive)]
 #[repr(u8)]
 pub enum LoopKind {
-    /// 普通子图
+    /// Ordinary subgraph.
     None,
-    /// while_sg（含 cond + Gate）
+    /// while_sg (contains cond + Gate).
     While,
-    /// loop_sg（无 cond，靠 break 终止）
+    /// loop_sg (no cond; terminates via break).
     Loop,
-    /// for_sg（含迭代器 + cond）
+    /// for_sg (contains iterator + cond).
     For,
-    /// body_sg（循环体，不尾递归）
+    /// body_sg (loop body; no tail recursion).
     LoopBody,
-    /// 尾递归转迭代循环（cond-based Gate + Continue 信号退出机制）
-    /// WriteBack 设置 Continue → 循环继续；body_sg 无信号完成 → 命中 base case → 循环退出
+    /// Tail-recursion-to-iteration loop (cond-based Gate + Continue signal exit mechanism).
+    /// WriteBack sets Continue → loop continues; body_sg completes with no signal → base case hit → loop exits.
     TailRec,
 }
 
 // =========================================================================
-// ComputeFn — 计算函数（构建期绑定，消除 dispatch）
+// ComputeFn — compute function (bound at build time, eliminating dispatch)
 // =========================================================================
 
-/// 计算函数签名：接收帧 + 节点 id + 执行上下文，返回 NodeResult。
+/// Compute function signature: receives a frame + node id + execution context, returns a NodeResult.
 ///
-/// frame 持有 graph（Arc<DataFlowGraph>），compute_fn 通过 frame.graph 访问图数据。
-/// 构建期绑定索引（ComputeFnId），运行时通过计算函数表索引调用。
-/// 每种运算+类型组合一个特化函数，运行时无类型检查、无 op 查表。
-/// 所有副作用通过 NodeResult 返回值显式传递。
+/// The frame holds the graph (Arc<DataFlowGraph>); compute_fn accesses graph data via frame.graph.
+/// Build-time-bound index (ComputeFnId); invoked at runtime via the compute function table index.
+/// Each operation+type combination has a specialized function; at runtime there is no type checking or op table lookup.
+/// All side effects are passed explicitly via the NodeResult return value.
 pub type ComputeFn = fn(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult;
 
-/// wrapper 宏：将旧签名 `fn(&mut Frame, NodeId) -> Value` 包装为新签名
-/// `fn(&mut Frame, NodeId, &EvalContext) -> NodeResult`。
+/// Wrapper macro: wraps the old signature `fn(&mut Frame, NodeId) -> Value` into the new signature
+/// `fn(&mut Frame, NodeId, &EvalContext) -> NodeResult`.
 ///
-/// 对于有 BatchInfo 的节点（BinOp/UnOp/Cmp），通过 EvalContext 检查 ready_queue
-/// 中是否有同类型就绪节点。若有 ≥2 个（含当前节点），做 SIMD 批量计算并返回
-/// NodeResult::Batch；否则回退到单节点计算。
-/// 对于无 BatchInfo 的节点（Call/Gate/Await/record/array 等），直接走单节点路径。
+/// For nodes with BatchInfo (BinOp/UnOp/Cmp), uses EvalContext to check whether there are
+/// same-type ready nodes in ready_queue. If there are ≥2 (including the current node), performs
+/// SIMD batch computation and returns NodeResult::Batch; otherwise falls back to single-node computation.
+/// For nodes without BatchInfo (Call/Gate/Await/record/array, etc.), follows the single-node path directly.
 macro_rules! wrap_fn {
     ($f:expr) => {{
         fn wrapper(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
-            // safe_op 短路：?. 标记的节点在接收者（inputs[0]）为 null 时返回 Null，
-            // 不执行后续计算（字段访问/方法调用/intrinsic 等）。
-            // 这是数据驱动的统一短路逻辑，由编译期 set_safe_op 标记触发。
+            // safe_op short-circuit: nodes marked with ?. return Null when the receiver (inputs[0]) is null,
+            // without executing subsequent computation (field access/method call/intrinsic, etc.).
+            // This is a unified data-driven short-circuit logic, triggered by the compile-time set_safe_op flag.
             if frame.graph.safe_op_flag(node.0 as usize) {
                 let n = frame.graph.node(node.0 as usize);
                 if n.input_count > 0 {
@@ -1523,7 +1532,7 @@ macro_rules! wrap_fn {
                     }
                 }
             }
-            // SIMD 批处理决策：检查 batch_infos，若有同类型就绪节点则批量计算
+            // SIMD batch decision: check batch_infos; if there are same-type ready nodes, compute in batch
             if let Some(info) = frame.graph.batch_info(node.0 as usize) {
                 let graph = frame.graph.clone();
                 let candidates = ctx.collect_batch_candidates(frame, node, |gid| {
@@ -1548,12 +1557,13 @@ macro_rules! wrap_fn {
     }};
 }
 
-/// 计算函数表注册宏。
+/// Compute function table registration macro.
 ///
-/// 接收 `idx => fn_path` 对列表，展开为带运行时索引断言的 Vec 构造。
-/// 每项 push 后立即断言 `table.len() == idx + 1`，确保索引与实际位置一致。
-/// 若删除某项但忘记更新后续索引，断言会立即失败，防止 ComputeFnId 错位。
-/// 过渡期自动用 wrap_fn! 包装每个条目。
+/// Accepts a list of `idx => fn_path` pairs, expanding to a Vec construction with runtime index assertions.
+/// After each push, immediately asserts `table.len() == idx + 1` to ensure the index matches the actual position.
+/// If an entry is deleted but subsequent indices are not updated, the assertion fails immediately,
+/// preventing ComputeFnId misalignment.
+/// During the transition period, each entry is automatically wrapped with wrap_fn!.
 macro_rules! compute_fn_table {
     ( $( $idx:literal => $f:expr ),* $(,)? ) => {{
         let mut table: Vec<ComputeFn> = Vec::new();
@@ -1566,11 +1576,11 @@ macro_rules! compute_fn_table {
     }};
 }
 
-/// 构建真实计算函数表（引用 Engine 模块的 compute_* 函数）。
+/// Builds the real compute function table (references Engine module's compute_* functions).
 ///
-/// 索引与 ComputeFnId 一一对应，IrBuilder::build() 末尾填充到 graph.compute_fns。
-/// 使用 `compute_fn_table!` 宏：每项 `idx => fn_path` 自动生成运行时断言，
-/// 确保索引与实际位置一致——若删除某项但忘记更新后续索引，断言会立即失败。
+/// Indices correspond one-to-one with ComputeFnId; IrBuilder::build() fills them into graph.compute_fns at the end.
+/// Uses the `compute_fn_table!` macro: each `idx => fn_path` entry auto-generates a runtime assertion,
+/// ensuring the index matches the actual position — if an entry is deleted but subsequent indices are not updated, the assertion fails immediately.
 pub fn build_compute_fn_table() -> Vec<ComputeFn> {
     let mut table = compute_fn_table! {
         0   => super::Compute::noop_compute_real,
@@ -1601,7 +1611,7 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         25  => super::Compute::compute_neg_i32,
         26  => super::Compute::compute_neg_f64,
         27  => super::Compute::compute_eq_bool,
-        28  => super::Compute::noop_compute_real, // compute_throw_wrap_err — 新签名，table override
+        28  => super::Compute::noop_compute_real, // compute_throw_wrap_err — new signature, table override
         29  => super::Compute::compute_record_construct,
         30  => super::Compute::compute_record_field_get,
         31  => super::Compute::compute_array_construct,
@@ -1609,21 +1619,21 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         33  => super::Compute::compute_record_field_set,
         34  => super::Compute::compute_is_null,
         35  => super::Compute::compute_array_len,
-        36  => super::Compute::noop_compute_real, // compute_call_launch — 新签名，table override
-        37  => super::Compute::noop_compute_real, // compute_gate_launch — 新签名，table override
-        38  => super::Compute::noop_compute_real, // compute_await — 新签名，table override
-        39  => super::Compute::noop_compute_real, // compute_call_launch alias — 新签名，table override
+        36  => super::Compute::noop_compute_real, // compute_call_launch — new signature, table override
+        37  => super::Compute::noop_compute_real, // compute_gate_launch — new signature, table override
+        38  => super::Compute::noop_compute_real, // compute_await — new signature, table override
+        39  => super::Compute::noop_compute_real, // compute_call_launch alias — new signature, table override
         40  => super::Compute::compute_closure_construct,
-        41  => super::Compute::noop_compute_real, // compute_closure_call — 新签名，table override
-        42  => super::Compute::noop_compute_real, // compute_cancel_async_handle — 新签名，table override
-        43  => super::Compute::noop_compute_real, // compute_select_gate — 新签名，table override
+        41  => super::Compute::noop_compute_real, // compute_closure_call — new signature, table override
+        42  => super::Compute::noop_compute_real, // compute_cancel_async_handle — new signature, table override
+        43  => super::Compute::noop_compute_real, // compute_select_gate — new signature, table override
         44  => super::Compute::compute_throw_ok,
         45  => super::Compute::compute_throw_err,
         46  => super::Compute::compute_ffi_call,
-        47  => super::Compute::noop_compute_real, // compute_propagate — 新签名，table override
+        47  => super::Compute::noop_compute_real, // compute_propagate — new signature, table override
         48  => super::Compute::compute_seq,
-        49  => super::Compute::noop_compute_real, // compute_writeback — 新签名，table override
-        // i64 算术与比较（50-63）
+        49  => super::Compute::noop_compute_real, // compute_writeback — new signature, table override
+        // i64 arithmetic and comparison (50-63)
         50  => super::Compute::compute_add_i64,
         51  => super::Compute::compute_sub_i64,
         52  => super::Compute::compute_mul_i64,
@@ -1638,7 +1648,7 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         61  => super::Compute::compute_neg_i64,
         62  => super::Compute::compute_bitnot_i32,
         63  => super::Compute::compute_bitnot_i64,
-        // i128 算术与比较（64-77）
+        // i128 arithmetic and comparison (64-77)
         64  => super::Compute::compute_add_i128,
         65  => super::Compute::compute_sub_i128,
         66  => super::Compute::compute_mul_i128,
@@ -1652,7 +1662,7 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         74  => super::Compute::compute_ge_i128,
         75  => super::Compute::compute_neg_i128,
         76  => super::Compute::compute_bitnot_i128,
-        // 整数位运算（77-92）：BitAnd/BitOr/BitXor/Shl/Shr × i32/i64/i128
+        // Integer bitwise operations (77-92): BitAnd/BitOr/BitXor/Shl/Shr × i32/i64/i128
         77  => super::Compute::compute_bitand_i32,
         78  => super::Compute::compute_bitor_i32,
         79  => super::Compute::compute_bitxor_i32,
@@ -1668,8 +1678,8 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         89  => super::Compute::compute_shr_i64,
         90  => super::Compute::compute_shl_i128,
         91  => super::Compute::compute_shr_i128,
-        // ---- 全基本类型 compute_fn（92-259）----
-        // 整数 12 类型 × 12 运算（add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot）
+        // ---- compute_fn for all primitive types (92-259) ----
+        // 12 integer types × 12 operations (add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot)
         // i8: 92-103
         92  => super::Compute::compute_add_i8,
         93  => super::Compute::compute_sub_i8,
@@ -1826,7 +1836,7 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         233 => super::Compute::compute_shr_usize,
         234 => super::Compute::compute_neg_usize,
         235 => super::Compute::compute_bitnot_usize,
-        // 浮点 4 类型 × 6 运算（add/sub/mul/div/mod/neg）
+        // 4 floating-point types × 6 operations (add/sub/mul/div/mod/neg)
         // f16: 236-241
         236 => super::Compute::compute_add_f16,
         237 => super::Compute::compute_sub_f16,
@@ -1855,90 +1865,90 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         257 => super::Compute::compute_div_f128,
         258 => super::Compute::compute_mod_f128,
         259 => super::Compute::compute_neg_f128,
-        // 语义运算（260-265）：RefEq/RefNeq/ConcatList/Range/RangeInclusive/Elvis
+        // Semantic operations (260-265): RefEq/RefNeq/ConcatList/Range/RangeInclusive/Elvis
         260 => super::Compute::compute_ref_eq,
         261 => super::Compute::compute_ref_neq,
         262 => super::Compute::compute_concat_list,
         263 => super::Compute::compute_range,
         264 => super::Compute::compute_range_inclusive,
         265 => super::Compute::compute_elvis,
-        // inline_trait / lazy 构造（266-267）
+        // inline_trait / lazy construction (266-267)
         266 => super::Compute::compute_trait_construct,
         267 => super::Compute::compute_lazy_construct,
         268 => super::Compute::compute_slice,
         269 => super::Compute::compute_str_concat,
-        // 全局变量读写（270-271）
+        // Global variable read/write (270-271)
         270 => super::Compute::compute_global_load,
         271 => super::Compute::compute_global_store,
-        // 记录扩展 / 原子构造（272-273）
+        // Record extension / atomic construction (272-273)
         272 => super::Compute::compute_record_extend,
         273 => super::Compute::compute_atomic_construct,
-        // 模式匹配（274-276）
+        // Pattern matching (274-276)
         274 => super::Compute::compute_pattern_ctor_match,
         275 => super::Compute::compute_pattern_adt_field_get,
         276 => super::Compute::compute_pattern_str_eq,
-        // 通用类型转换（277-278）
+        // General type conversion (277-278)
         277 => super::Compute::compute_cast_to_str,
         278 => super::Compute::compute_cast_scalar,
-        // 引用语义与非空断言（279-282）
+        // Reference semantics and non-null assertion (279-282)
         279 => super::Compute::compute_non_null_assert,
         280 => super::Compute::compute_ref_of,
         281 => super::Compute::compute_deref_read,
         282 => super::Compute::compute_deref_write,
-        // channel 操作（283-285）
+        // Channel operations (283-285)
         283 => super::Compute::compute_channel_create,
-        284 => super::Compute::noop_compute_real, // compute_channel_send — 新签名，table override
+        284 => super::Compute::noop_compute_real, // compute_channel_send — new signature, table override
         285 => super::Compute::compute_channel_close,
-        // 偏应用构造（286）
+        // Partial application construction (286)
         286 => super::Compute::compute_partial_construct,
-        // str.bytes() → u8[]（287）
+        // str.bytes() → u8[] (287)
         287 => super::Compute::compute_str_bytes,
-        // 栈分配版构造（288-289）：分析器标记的不逃逸分配点使用
+        // Stack-allocated construction (288-289): uses non-escaping allocation points marked by the analyzer
         288 => super::Compute::compute_record_construct_stack,
         289 => super::Compute::compute_array_construct_stack,
-        // reflect 独立 compute_fn（290-291）：lazy force + Reflect::format_value
+        // Standalone reflect compute_fn (290-291): lazy force + Reflect::format_value
         290 => super::Compute::compute_reflect_format,
         291 => super::Compute::compute_reflect_scalar_to_str,
-        // str 比较（292-297）：按 Unicode 码点序列字典序比较
+        // String comparison (292-297): lexicographic by Unicode code point sequence
         292 => super::Compute::compute_eq_str,
         293 => super::Compute::compute_ne_str,
         294 => super::Compute::compute_lt_str,
         295 => super::Compute::compute_gt_str,
         296 => super::Compute::compute_le_str,
         297 => super::Compute::compute_ge_str,
-        // 复合类型语义相等/不等（298-299）
+        // Semantic equality/inequality for composite types (298-299)
         298 => super::Compute::compute_eq_obj,
         299 => super::Compute::compute_ne_obj,
-        // bool 不等（300）
+        // Boolean inequality (300)
         300 => super::Compute::compute_ne_bool,
-        // 数组索引存储（301）
+        // Array index store (301)
         301 => super::Compute::compute_array_store,
-        // f128 比较（302-307）
+        // f128 comparison (302-307)
         302 => super::Compute::compute_eq_f128,
         303 => super::Compute::compute_ne_f128,
         304 => super::Compute::compute_lt_f128,
         305 => super::Compute::compute_gt_f128,
         306 => super::Compute::compute_le_f128,
         307 => super::Compute::compute_ge_f128,
-        // 记忆化缓存（308-309）
+        // Memoization cache (308-309)
         308 => super::Compute::compute_memo_check,
         309 => super::Compute::compute_memo_store,
-        // 尾递归 WriteBack（310）
-        310 => super::Compute::noop_compute_real, // compute_tailrec_writeback — 新签名，table override
-        // 控制流 compute_fn（311-313）— 新签名，table override
+        // Tail-recursion WriteBack (310)
+        310 => super::Compute::noop_compute_real, // compute_tailrec_writeback — new signature, table override
+        // Control-flow compute_fn (311-313) — new signature, table override
         311 => super::Compute::noop_compute_real, // compute_return
         312 => super::Compute::noop_compute_real, // compute_break
         313 => super::Compute::noop_compute_real, // compute_continue
     };
-    // 替换 index 0 为 compute_const（不包装，直接使用新签名）
-    // Const 节点使用 CF_NOOP(0)，通过 compute_const 从 const_values 物化值
+    // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
+    // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values
     table[0] = super::Compute::compute_const;
-    // 已迁移到新签名的 compute_fn（不通过 wrap_fn! 包装，直接使用新签名）
+    // compute_fn entries migrated to the new signature (not wrapped via wrap_fn!, use the new signature directly)
     table[28] = super::Compute::compute_throw_wrap_err;
     table[36] = super::Compute::compute_call_launch;
     table[37] = super::Compute::compute_gate_launch;
     table[38] = super::Compute::compute_await;
-    table[39] = super::Compute::compute_call_launch; // CF_ASYNC_CALL_LAUNCH 别名
+    table[39] = super::Compute::compute_call_launch; // CF_ASYNC_CALL_LAUNCH alias
     table[41] = super::Compute::compute_closure_call;
     table[42] = super::Compute::compute_cancel_async_handle;
     table[43] = super::Compute::compute_select_gate;
@@ -1952,26 +1962,26 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
     table
 }
 
-/// 纯 compute_fn 集合（无副作用，可 CSE/DCE）。
+/// Set of pure compute_fn (no side effects; eligible for CSE/DCE).
 ///
-/// 包含：所有算术与比较（1-27, 50-91, 92-259）、纯读取（30/32/34/35）、
-/// 纯语义运算（260/261/265/274-276/278/279/287）、栈分配构造（288-289）。
-/// 不包含：call/gate/await（36-49）、堆分配（29/31）、mutation（33/271/282）、
-/// channel（283-285）、global_store（271）、throw（28/47）、ffi（46）。
+/// Includes: all arithmetic and comparison (1-27, 50-91, 92-259), pure reads (30/32/34/35),
+/// pure semantic operations (260/261/265/274-276/278/279/287), stack-allocated construction (288-289).
+/// Excludes: call/gate/await (36-49), heap allocation (29/31), mutation (33/271/282),
+/// channel (283-285), global_store (271), throw (28/47), ffi (46).
 pub fn pure_compute_fn_set() -> rustc_hash::FxHashSet<ComputeFnId> {
     let mut s = rustc_hash::FxHashSet::default();
-    // ── Legacy i32/f64/bool 算术与比较（1-27）──
+    // ── Legacy i32/f64/bool arithmetic and comparison (1-27) ──
     for id in 1..=27u32 { s.insert(ComputeFnId(id)); }
-    // ── i64/i128 算术比较 + 位运算（50-91）──
+    // ── i64/i128 arithmetic comparison + bitwise operations (50-91) ──
     for id in 50..=91u32 { s.insert(ComputeFnId(id)); }
-    // ── 全基本类型算术（92-259：12 整数类型×12 运算 + 4 浮点类型×6 运算）──
+    // ── All primitive type arithmetic (92-259: 12 integer types × 12 ops + 4 float types × 6 ops) ──
     for id in 92..=259u32 { s.insert(ComputeFnId(id)); }
-    // ── 纯读取与查询 ──
+    // ── Pure reads and queries ──
     s.insert(CF_RECORD_FIELD_GET); // record_field_get
     s.insert(CF_ARRAY_INDEX); // array_index
     s.insert(CF_IS_NULL); // is_null
     s.insert(CF_ARRAY_LEN); // array_len
-    // ── 纯语义运算 ──
+    // ── Pure semantic operations ──
     s.insert(CF_REF_EQ); // ref_eq
     s.insert(CF_REF_NEQ); // ref_neq
     s.insert(CF_ELVIS); // elvis
@@ -1981,51 +1991,52 @@ pub fn pure_compute_fn_set() -> rustc_hash::FxHashSet<ComputeFnId> {
     s.insert(CF_CAST_SCALAR); // cast_scalar
     s.insert(CF_NON_NULL_ASSERT); // non_null_assert
     s.insert(CF_STR_BYTES); // str_bytes
-    // ── str 比较（纯函数，可 CSE）──
+    // ── String comparison (pure functions, eligible for CSE) ──
     s.insert(CF_EQ_STR);
     s.insert(CF_NE_STR);
     s.insert(CF_LT_STR);
     s.insert(CF_GT_STR);
     s.insert(CF_LE_STR);
     s.insert(CF_GE_STR);
-    // ── 复合类型语义相等/不等（纯函数，深度比较，可 CSE）──
+    // ── Semantic equality/inequality for composite types (pure functions, deep comparison, eligible for CSE) ──
     s.insert(CF_EQ_OBJ);
     s.insert(CF_NE_OBJ);
-    // ── bool 不等（纯比较，与 CF_EQ_BOOL 对称）──
+    // ── Boolean inequality (pure comparison, symmetric with CF_EQ_BOOL) ──
     s.insert(CF_NE_BOOL);
-    // ── f128 比较（纯比较，专用 bit-pattern 路径）──
+    // ── f128 comparison (pure comparison, dedicated bit-pattern path) ──
     s.insert(CF_EQ_F128);
     s.insert(CF_NE_F128);
     s.insert(CF_LT_F128);
     s.insert(CF_GT_F128);
     s.insert(CF_LE_F128);
     s.insert(CF_GE_F128);
-    // 注意：CF_RECORD_CONSTRUCT_STACK / CF_ARRAY_CONSTRUCT_STACK 不加入 pure_set。
-    // 虽然它们无外部可观察副作用，但每次执行产生独立对象（不同内存地址）。
-    // 若被 LICM 外提或 CSE 消除，循环迭代会共享同一对象，导致状态污染。
+    // Note: CF_RECORD_CONSTRUCT_STACK / CF_ARRAY_CONSTRUCT_STACK are not added to the pure set.
+    // Although they have no externally observable side effects, each execution produces a distinct
+    // object (different memory address). If hoisted by LICM or eliminated by CSE, loop iterations
+    // would share the same object, causing state pollution.
     s
 }
 
 // =========================================================================
-// 节点元数据宏：消除 NodeId 索引字段的声明/new/add_node/setter 四件套重复
+// Node metadata macros: eliminate the 4-part declaration/new/add_node/setter boilerplate for NodeId-indexed fields
 // =========================================================================
 //
-// 中心定义宏 `node_metadata!($callback)` 列出所有按 NodeId 索引的元数据字段，
-// 通过不同 callback 宏展开为：
-//   - add_node() push（metadata_push!）   ← 自动同步
-//   - setter 方法（metadata_setters!）     ← 自动同步
-//   - struct 字段声明                      ← 手写（Rust 不允许宏在此位置展开）
-//   - new() 初始化                         ← 手写（同上）
+// The central definition macro `node_metadata!($callback)` lists all NodeId-indexed metadata fields,
+// expanded via different callback macros into:
+//   - add_node() push (metadata_push!)       ← auto-synced
+//   - setter methods (metadata_setters!)      ← auto-synced
+//   - struct field declarations               ← manual (Rust does not allow macros to expand here)
+//   - new() initialization                    ← manual (same reason)
 //
-// 三种字段类别：
+// Three field categories:
 //   opt(field, Type, setter)   → Vec<Option<Type>>, set_setter(node, v: Type)
 //   bool_flag(field, setter)   → Vec<bool>, set_setter(node) { = true }
 //   bool_val(field, setter)    → Vec<bool>, set_setter(node, v: bool) { = v }
 //
-// 新增元数据字段：在 node_metadata! 追加一行（push+setter 自动同步），
-// 再在 struct 定义和 new() 各补一行（手写）。
+// To add a new metadata field: append a line to node_metadata! (push+setter auto-sync),
+// then add a line to both the struct definition and new() (manual).
 
-/// 中心定义：所有 NodeId 索引的元数据字段。
+/// Central definition: all NodeId-indexed metadata fields.
 macro_rules! node_metadata {
     ($callback:ident) => {
         $callback! {
@@ -2096,14 +2107,14 @@ macro_rules! node_metadata {
     };
 }
 
-// 注：struct 字段声明与 new() 初始化器无法用 macro_rules! 宏化——
-// Rust 不允许宏在 struct 字段声明位置和 struct 初始化器字段位置展开。
-// 这两处必须手写（见 DataFlowGraph 定义和 new()）。新增字段时：
-//   1. 在 node_metadata! 追加一行（自动同步 push + setter）
-//   2. 在 struct 定义补一行字段
-//   3. 在 new() 补一行 Vec::new()
+// Note: struct field declarations and new() initializers cannot be macro-ified with macro_rules! —
+// Rust does not allow macros to expand at struct field declaration positions or struct initializer field positions.
+// These two places must be hand-written (see DataFlowGraph definition and new()). To add a new field:
+//   1. Append a line to node_metadata! (auto-syncs push + setter)
+//   2. Add a field line to the struct definition
+//   3. Add a Vec::new() line to new()
 
-/// 展开为 add_node() 中的 push 语句。
+/// Expands to push statements in add_node().
 macro_rules! metadata_push {
     ( $self:ident ; $( opt($f:ident, $t:ty, $_s:ident) )* ; $( bool_flag($bf:ident, $_bs:ident) )* ; $( bool_val($vf:ident, $_vs:ident) )* ) => {
         $( $self.$f.push(None); )*
@@ -2112,7 +2123,7 @@ macro_rules! metadata_push {
     };
 }
 
-/// 展开为 impl DataFlowGraph 的 setter 方法。
+/// Expands to setter methods in impl DataFlowGraph.
 macro_rules! metadata_setters {
     ( $( opt($f:ident, $t:ty, $s:ident) )* ; $( bool_flag($bf:ident, $bs:ident) )* ; $( bool_val($vf:ident, $vs:ident) )* ) => {
         $(
@@ -2133,9 +2144,9 @@ macro_rules! metadata_setters {
     };
 }
 
-/// 展开为 clone_node_metadata() 中的逐字段克隆语句。
-/// opt 字段统一用 `.clone()`（Copy 类型上的 clone 等价于拷贝），
-/// bool_flag/bool_val 为 Copy 直接赋值。
+/// Expands to per-field clone statements in clone_node_metadata().
+/// opt fields uniformly use `.clone()` (clone on Copy types is equivalent to a copy);
+/// bool_flag/bool_val are Copy and assigned directly.
 macro_rules! metadata_clone {
     ( $self:ident, $src:ident, $dst:ident ;
       $( opt($f:ident, $t:ty, $_s:ident) )* ;
@@ -2148,118 +2159,118 @@ macro_rules! metadata_clone {
 }
 
 // =========================================================================
-// DataFlowGraph — 全局图容器
+// DataFlowGraph — global graph container
 // =========================================================================
 
-/// 数据流图：全局只读容器，所有 worker 共享。
+/// Dataflow graph: a global read-only container shared by all workers.
 ///
-/// - `nodes`：所有节点（全局连续）
-/// - `inputs_pool`：所有输入（连续存储）
-/// - `subgraphs`：所有函数子图
-/// - `entry_subgraph`：程序入口子图
-/// - `downstreams`：每节点的下游列表（fan-out 统计，用于槽级 RC）
+/// - `nodes`: all nodes (globally contiguous)
+/// - `inputs_pool`: all inputs (contiguous storage)
+/// - `subgraphs`: all function subgraphs
+/// - `entry_subgraph`: program entry subgraph
+/// - `downstreams`: downstream list per node (fan-out statistics, used for slot-level RC)
 pub struct DataFlowGraph {
-    /// 所有节点（全局连续，按 NodeId 索引）
+    /// All nodes (globally contiguous, indexed by NodeId).
     pub nodes: Vec<Node>,
-    /// 独立输入池
+    /// Standalone input pool.
     pub inputs_pool: InputsPool,
-    /// 所有函数子图
+    /// All function subgraphs.
     pub subgraphs: Vec<SubGraph>,
-    /// 程序入口子图
+    /// Program entry subgraph.
     pub entry_subgraph: Option<SubGraphId>,
-    /// 计算函数表（构建期填充，运行时按 ComputeFnId 索引调用）
+    /// Compute function table (filled at build time; invoked by ComputeFnId index at runtime).
     pub compute_fns: Vec<ComputeFn>,
-    /// 每节点的下游列表（fan-out 统计，downstreams[n] = 以节点 n 为输入的下游节点列表）
+    /// Downstream list per node (fan-out statistics; downstreams[n] = list of downstream nodes that use node n as input).
     pub downstreams: Vec<Vec<NodeId>>,
-    /// 常量节点的原始值（按 NodeId 索引，非 Const 节点为 None）
+    /// Raw values for constant nodes (indexed by NodeId; None for non-Const nodes).
     pub const_values: Vec<Option<ConstValue>>,
-    /// Call 节点的目标子图（按 NodeId 索引，非 Call 节点为 None）
+    /// Target subgraph for Call nodes (indexed by NodeId; None for non-Call nodes).
     pub call_targets: Vec<Option<SubGraphId>>,
-    /// Gate 节点的分支信息（按 NodeId 索引，非 Gate 节点为 None）
+    /// Branch info for Gate nodes (indexed by NodeId; None for non-Gate nodes).
     pub gate_branches: Vec<Option<GateBranches>>,
-    /// 字段访问信息（按 NodeId 索引，存 field_idx）
+    /// Field access info (indexed by NodeId; stores field_idx).
     pub field_access_infos: Vec<Option<u16>>,
-    /// 记录构造信息（按 NodeId 索引）
+    /// Record construction info (indexed by NodeId).
     pub record_lit_infos: Vec<Option<RecordLitInfo>>,
-    /// FFI 调用节点对应的 @extern("C") 函数名（用于 compute_ffi_call 分派）
+    /// @extern("C") function name for FFI call nodes (used for compute_ffi_call dispatch).
     pub ffi_call_names: Vec<Option<String>>,
-    /// 字段赋值信息（按 NodeId 索引，存字段名，用于 compute_record_field_set）
+    /// Field assignment info (indexed by NodeId; stores field name; used by compute_record_field_set).
     pub field_set_names: Vec<Option<String>>,
-    /// vtable 动态分派 Call 节点的方法 idx（按 NodeId 索引，None=静态调用）
-    /// method_idx = 方法在 TraitDefInfo.methods 中的位置（与 TraitValue.method_values 索引一致）
+    /// Method idx for vtable dynamic dispatch Call nodes (indexed by NodeId; None = static call).
+    /// method_idx = position of the method in TraitDefInfo.methods (consistent with TraitValue.method_values index).
     pub vtable_call_methods: Vec<Option<u16>>,
-    /// Await 节点对应的 EventSource 声明节点（按 NodeId 索引，非 Await 节点为 None）
+    /// EventSource declaration node for Await nodes (indexed by NodeId; None for non-Await nodes).
     pub await_event_sources: Vec<Option<NodeId>>,
-    /// 闭包构造节点信息（按 NodeId 索引，非闭包构造节点为 None）
+    /// Closure construction node info (indexed by NodeId; None for non-closure-construction nodes).
     pub closure_infos: Vec<Option<ClosureInfo>>,
-    /// 偏应用构造节点信息（按 NodeId 索引，非 partial_construct 节点为 None）
+    /// Partial application construction node info (indexed by NodeId; None for non-partial_construct nodes).
     pub partial_infos: Vec<Option<PartialInfo>>,
-    /// 闭包调用节点的实参数（不含闭包值和 effect，用于链式偏应用判断）
+    /// Argument count for closure call nodes (excluding closure value and effect; used for chained partial application detection).
     pub closure_call_arg_counts: Vec<Option<u8>>,
-    /// select 表达式分支信息（按 NodeId 索引，非 select gate 节点为 None）
+    /// select expression branch info (indexed by NodeId; None for non-select-gate nodes).
     pub select_infos: Vec<Option<SelectInfo>>,
-    /// WriteBack 节点的目标外层 NodeId（按 NodeId 索引，非 WriteBack 节点为 None）
+    /// Target outer NodeId for WriteBack nodes (indexed by NodeId; None for non-WriteBack nodes).
     pub writeback_targets: Vec<Option<NodeId>>,
-    /// Call 节点的尾调用标记（按 NodeId 索引，true=尾调用帧复用）
+    /// Tail-call flag for Call nodes (indexed by NodeId; true = tail-call frame reuse).
     pub tail_call_flags: Vec<bool>,
-    /// 安全操作标记（按 NodeId 索引，true=inputs[0] 为 Null 时短路返回 Null）
-    /// 用于 ?.field / ?.method() / cast(x).to(T)?
+    /// Safe-operation flag (indexed by NodeId; true = short-circuit return Null when inputs[0] is Null).
+    /// Used for ?.field / ?.method() / cast(x).to(T)?
     pub safe_op_flags: Vec<bool>,
-    /// 外提/展开/内联产生的节点标记（按 NodeId 索引）
-    /// true = 由 pass 层追加的节点，需被所属函数子图的帧初始化
+    /// Flag for nodes produced by hoisting/unrolling/inlining (indexed by NodeId).
+    /// true = node appended by a pass layer; must be included in the owning function subgraph's frame initialization.
     pub hoisted_node: Vec<bool>,
-    /// hoisted 节点的归属函数子图（按 NodeId 索引，仅 hoisted_node=true 时有效）
-    /// rebuild 按函数级子图分组重排时，将 hoisted 节点排到 owner 子图范围内
+    /// Owning function subgraph for hoisted nodes (indexed by NodeId; valid only when hoisted_node=true).
+    /// During rebuild, when regrouping by function-level subgraphs, hoisted nodes are placed within the owner subgraph's range.
     pub hoisted_owners: Vec<SubGraphId>,
-    /// 编译期 SIMD/并行批量化标记（按 NodeId 索引，None=不可批量化）
+    /// Compile-time SIMD/parallel batching marker (indexed by NodeId; None = not batchable).
     pub batch_infos: Vec<Option<BatchInfo>>,
-    /// IR 编译期错误（未实现的特性、找不到函数等），build() 末尾从 IrBuilder.errors 移入
+    /// IR compile-time errors (unimplemented features, missing functions, etc.); moved from IrBuilder.errors at the end of build().
     pub ir_errors: Vec<String>,
-    /// inline_trait 构造节点信息（按 NodeId 索引，非 trait construct 节点为 None）
+    /// inline_trait construction node info (indexed by NodeId; None for non-trait-construct nodes).
     pub trait_construct_infos: Vec<Option<TraitConstructInfo>>,
-    /// lazy 构造节点信息（按 NodeId 索引，非 lazy construct 节点为 None）
+    /// lazy construction node info (indexed by NodeId; None for non-lazy-construct nodes).
     pub lazy_construct_infos: Vec<Option<LazyConstructInfo>>,
-    /// 记录扩展节点信息（按 NodeId 索引，非 record extend 节点为 None）
+    /// Record extension node info (indexed by NodeId; None for non-record-extend nodes).
     pub record_extend_infos: Vec<Option<RecordExtendInfo>>,
-    /// 切片节点的 inclusive 标志（按 NodeId 索引，true = `[start..=end]`，false = `[start..end]`）
+    /// Inclusive flag for slice nodes (indexed by NodeId; true = `[start..=end]`, false = `[start..end]`).
     pub slice_inclusive: Vec<bool>,
-    /// 全局变量运行时存储（顶层 var/val 声明，跨函数共享，不依赖帧链）
+    /// Global variable runtime storage (top-level var/val declarations; shared across functions, does not depend on frame chain).
     pub global_var_storage: Arc<Vec<std::sync::Mutex<Option<crate::value::Value>>>>,
-    /// global_load 节点的 slot index（按 NodeId 索引，非 global_load 节点为 None）
+    /// Slot index for global_load nodes (indexed by NodeId; None for non-global_load nodes).
     pub global_load_slots: Vec<Option<u32>>,
-    /// global_store 节点的 slot index（按 NodeId 索引，非 global_store 节点为 None）
+    /// Slot index for global_store nodes (indexed by NodeId; None for non-global_store nodes).
     pub global_store_slots: Vec<Option<u32>>,
-    /// 模式匹配：构造器名判别节点存储的构造器名（按 NodeId 索引）
+    /// Pattern matching: constructor name stored by constructor-name discrimination nodes (indexed by NodeId).
     pub pattern_ctor_names: Vec<Option<String>>,
-    /// 模式匹配：ADT 按位置提取字段节点的索引（按 NodeId 索引）
+    /// Pattern matching: field index for ADT positional field extraction nodes (indexed by NodeId).
     pub pattern_field_indices: Vec<Option<u16>>,
-    /// 通用 cast 节点的目标类型名（按 NodeId 索引，非 cast 节点为 None）
+    /// Target type name for general cast nodes (indexed by NodeId; None for non-cast nodes).
     pub cast_target_types: Vec<Option<String>>,
-    /// memo_check / memo_store 节点的缓存元信息（按 NodeId 索引，None=非 memo 节点）
+    /// Cache metadata for memo_check / memo_store nodes (indexed by NodeId; None = non-memo node).
     pub memo_infos: Vec<Option<MemoInfo>>,
-    /// 记忆化缓存表运行时存储（每个 memoized 函数一个 HashMap<u64, Value>）
+    /// Memoization cache table runtime storage (one HashMap<u64, Value> per memoized function).
     pub memo_tables: Arc<Vec<std::sync::Mutex<rustc_hash::FxHashMap<u64, Value>>>>,
-    /// 字符串池：ConstValue::Str { offset, len } 引用此池
-    /// 构建期由 IrBuilder 维护 intern，load 期从 .resin StringPool section 填充
+    /// String pool: ConstValue::Str { offset, len } references this pool.
+    /// Maintained by IrBuilder as intern during build; filled from the .kzo StringPool section during load.
     pub string_pool: Arc<[u8]>,
-    /// GraphMemory（加载路径）：mmap 或 owned bytes 的二进制 backing。
-    /// 构建路径为 None（直接访问 owned Vec 字段）；
-    /// 加载路径为 Some(GraphMemory)，zerocopy 表通过 accessor 方法从此 backing 读取。
-    pub mem: Option<crate::resin::Spec::GraphMemory>,
-    /// SubGraph upvalue_outer_nodes 的 CSR offset 表（加载路径）。
-    /// 每个元素 = (byte_offset_into_SgUpvalueNodes, count)。
-    /// 构建路径为空（accessor 回退到 SubGraph.upvalue_outer_nodes Vec）。
-    /// 加载路径（zerocopy）填充，SubGraph.upvalue_outer_nodes Vec 设为空。
+    /// GraphMemory (load path): binary backing of mmap or owned bytes.
+    /// Build path is None (directly accesses owned Vec fields);
+    /// Load path is Some(GraphMemory); zerocopy tables are read from this backing via accessor methods.
+    pub mem: Option<crate::solidify::Spec::GraphMemory>,
+    /// CSR offset table for SubGraph upvalue_outer_nodes (load path).
+    /// Each element = (byte_offset_into_SgUpvalueNodes, count).
+    /// Build path is empty (accessor falls back to SubGraph.upvalue_outer_nodes Vec).
+    /// Load path (zerocopy) is filled; SubGraph.upvalue_outer_nodes Vec is set to empty.
     pub sg_uv_offsets: Vec<(u32, u32)>,
-    /// SubGraph nested_ranges 的 CSR offset 表（加载路径）。
-    /// 每个元素 = (byte_offset_into_SgNestedRanges, count)。
-    /// 构建路径为空（accessor 回退到 SubGraph.nested_ranges Vec）。
-    /// 加载路径（zerocopy）填充，SubGraph.nested_ranges Vec 设为空。
+    /// CSR offset table for SubGraph nested_ranges (load path).
+    /// Each element = (byte_offset_into_SgNestedRanges, count).
+    /// Build path is empty (accessor falls back to SubGraph.nested_ranges Vec).
+    /// Load path (zerocopy) is filled; SubGraph.nested_ranges Vec is set to empty.
     pub sg_nr_offsets: Vec<(u32, u32)>,
-    /// 5 个复杂变长表的 per-Node 字节偏移表（加载路径）。
-    /// u32::MAX = None（该节点无此表数据），其他值 = section 内字节偏移。
-    /// 构建路径为空（accessor 回退到 owned Vec 字段）。
-    /// 加载路径（zerocopy）填充，owned Vec 字段设为空。
+    /// Per-Node byte offset tables for the 5 complex variable-length tables (load path).
+    /// u32::MAX = None (no data for this node in that table); other values = byte offset within the section.
+    /// Build path is empty (accessor falls back to owned Vec fields).
+    /// Load path (zerocopy) is filled; owned Vec fields are set to empty.
     pub gate_branch_offsets: Vec<u32>,
     pub record_lit_info_offsets: Vec<u32>,
     pub select_info_offsets: Vec<u32>,
@@ -2268,7 +2279,7 @@ pub struct DataFlowGraph {
 }
 
 impl DataFlowGraph {
-    /// 创建空图。
+    /// Creates an empty graph.
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
@@ -2278,7 +2289,7 @@ impl DataFlowGraph {
             compute_fns: build_compute_fn_table(),
             downstreams: Vec::new(),
             const_values: Vec::new(),
-            // 元数据字段初始化（Rust 不允许 struct 初始化器内展开宏，故手写）
+            // Metadata field initialization (Rust does not allow macro expansion inside struct initializers, so hand-written)
             call_targets: Vec::new(),
             gate_branches: Vec::new(),
             field_access_infos: Vec::new(),
@@ -2322,30 +2333,30 @@ impl DataFlowGraph {
         }
     }
 
-    /// 添加节点，返回其 NodeId。
+    /// Adds a node, returns its NodeId.
     pub fn add_node(&mut self, node: Node) -> NodeId {
         let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(node);
         self.downstreams.push(Vec::new());
         self.const_values.push(None);
-        // 元数据字段 push（由 node_metadata! 宏统一生成）
+        // Metadata field push (auto-generated by node_metadata! macro)
         node_metadata!(metadata_push, self);
         self.hoisted_owners.push(SubGraphId(u32::MAX));
         id
     }
 
-    // ---- 节点元数据 setter（由 node_metadata! 宏统一生成）----
+    // ---- Node metadata setters (auto-generated by node_metadata! macro) ----
     node_metadata!(metadata_setters);
 
-    /// 克隆源节点的所有元数据到目标节点（用于 pass 层节点克隆）。
+    /// Clones all metadata from the source node to the target node (used for pass-layer node cloning).
     pub fn clone_node_metadata(&mut self, src_idx: usize, dst_idx: usize) {
         self.const_values[dst_idx] = self.const_values[src_idx].clone();
         node_metadata!(metadata_clone, self, src_idx, dst_idx);
         self.hoisted_owners[dst_idx] = self.hoisted_owners[src_idx];
     }
 
-    /// 直接添加节点（不经过 Builder），用于 pass 层变换。
-    /// 自动同步元数据 push（与 add_node 相同）。
+    /// Directly adds a node (without going through Builder), used for pass-layer transformations.
+    /// Auto-syncs metadata push (same as add_node).
     pub fn add_node_raw(
         &mut self,
         kind: NodeKind,
@@ -2367,8 +2378,8 @@ impl DataFlowGraph {
         id
     }
 
-    /// 找到包含给定节点的函数子图（最外层，loop_kind=None 且 loop_parent_sg=None）。
-    /// 用于 pass 层确定新追加节点应归属的子图。
+    /// Finds the function subgraph containing the given node (outermost; loop_kind=None and loop_parent_sg=None).
+    /// Used by pass layers to determine which subgraph newly appended nodes should belong to.
     pub fn find_function_sg_for_node(&self, node: NodeId) -> Option<SubGraphId> {
         let mut best_sg: Option<SubGraphId> = None;
         let mut best_range_size = u32::MAX;
@@ -2382,7 +2393,7 @@ impl DataFlowGraph {
                 }
             }
         }
-        // 从最内层子图向上找到函数子图
+        // Walk up from the innermost subgraph to find the function subgraph
         if let Some(inner_sg_id) = best_sg {
             let mut cur = inner_sg_id;
             loop {
@@ -2390,7 +2401,7 @@ impl DataFlowGraph {
                 if sg.loop_kind == LoopKind::None && sg.loop_parent_sg.is_none() {
                     return Some(cur);
                 }
-                // 找包含 cur 的更外层子图
+                // Find the outer subgraph containing cur
                 let (cs, ce) = sg.node_range;
                 let mut parent: Option<SubGraphId> = None;
                 let mut parent_size = u32::MAX;
@@ -2409,15 +2420,16 @@ impl DataFlowGraph {
                 }
                 match parent {
                     Some(p) => cur = p,
-                    None => return Some(cur), // 已到最外层
+                    None => return Some(cur), // Already at the outermost level
                 }
             }
         }
         None
     }
 
-    /// 找到包含给定节点的最内层子图。
-    /// 用于 pass 层判断节点是否直接在函数级子图中（而非嵌套在 Gate 分支/循环体内）。
+    /// Finds the innermost subgraph containing the given node.
+    /// Used by pass layers to determine whether a node is directly in a function-level subgraph
+    /// (rather than nested within a Gate branch or loop body).
     pub fn find_innermost_sg_for_node(&self, node: NodeId) -> Option<SubGraphId> {
         let mut best_sg: Option<SubGraphId> = None;
         let mut best_range_size = u32::MAX;
@@ -2434,9 +2446,9 @@ impl DataFlowGraph {
         best_sg
     }
 
-    /// 找到包含给定子图的最小外层子图（immediate parent）。
-    /// 用于 LICM：不变量应外提到 loop_sg 的 immediate parent，
-    /// 而非总是提到 function sg（嵌套循环时 outer loop 的 body_sg 才是正确目标）。
+    /// Finds the smallest enclosing subgraph (immediate parent) of the given subgraph.
+    /// Used by LICM: invariants should be hoisted to the loop_sg's immediate parent,
+    /// not always to the function sg (for nested loops, the outer loop's body_sg is the correct target).
     pub fn find_immediate_parent_sg(&self, sg_id: SubGraphId) -> Option<SubGraphId> {
         let (cs, ce) = self.subgraphs[sg_id.0 as usize].node_range;
         let mut best: Option<SubGraphId> = None;
@@ -2446,7 +2458,7 @@ impl DataFlowGraph {
                 continue;
             }
             let (ps, pe) = psg.node_range;
-            // 必须严格包含 sg 的范围
+            // Must strictly contain the sg's range
             if ps.0 <= cs.0 && pe.0 >= ce.0 && (ps.0 < cs.0 || pe.0 > ce.0) {
                 let size = pe.0 - ps.0;
                 if size < best_size {
@@ -2458,47 +2470,52 @@ impl DataFlowGraph {
         best
     }
 
-    /// 扩展子图的 node_range 以包含新追加的节点，并递归扩展所有祖先子图。
-    /// 在 pass 层添加节点后调用，确保 rebuild 时新节点被包含在子图范围内，
-    /// 同时保持子图嵌套结构一致性（祖先范围必须包含后代范围）。
+    /// Extends the subgraph's `node_range` to cover newly appended nodes, and
+    /// recursively extends all ancestor subgraphs. Called after the pass layer
+    /// appends nodes so that `rebuild` sees them within the subgraph range,
+    /// while keeping the nesting structure consistent (ancestor ranges must
+    /// contain descendant ranges).
     pub fn extend_function_sg_range(&mut self, sg_id: SubGraphId, new_node_end: NodeId) {
-        // 扩展目标子图
+        // Extend the target subgraph.
         let sg = &mut self.subgraphs[sg_id.0 as usize];
         if sg.node_range.1 < new_node_end {
             sg.node_range.1 = new_node_end;
         }
-        // 递归扩展所有包含目标子图的祖先
+        // Recursively extend every ancestor that contains the target subgraph.
         let (cs, ce) = self.subgraphs[sg_id.0 as usize].node_range;
         for (idx, psg) in self.subgraphs.iter_mut().enumerate() {
             if idx == sg_id.0 as usize {
                 continue;
             }
             let (ps, pe) = psg.node_range;
-            // 如果祖先包含目标子图的范围，且新节点超出祖先范围，则扩展祖先
+            // If the ancestor contains the target subgraph's range and the new
+            // node exceeds the ancestor range, extend the ancestor.
             if ps.0 <= cs.0 && pe.0 >= ce.0 && pe.0 < new_node_end.0 {
                 psg.node_range.1 = new_node_end;
             }
         }
     }
 
-    /// 添加子图，返回其 SubGraphId。
+    /// Adds a subgraph and returns its `SubGraphId`.
     pub fn add_subgraph(&mut self, sg: SubGraph) -> SubGraphId {
         let id = SubGraphId(self.subgraphs.len() as u32);
         self.subgraphs.push(sg);
         id
     }
 
-    /// 设置程序入口子图。
+    /// Sets the program entry subgraph.
     pub fn set_entry_subgraph(&mut self, id: SubGraphId) {
         self.entry_subgraph = Some(id);
     }
 
-    /// 计算节点的元数据哈希，用于 CSE 去重键。
+    /// Computes the metadata hash of a node, used as the CSE deduplication key.
     ///
-    /// 通用方法：将所有 per-node 元数据字段哈希为 u64。
-    /// 两个 (compute_fn, inputs) 相同但元数据不同的节点不会被 CSE 合并。
-    /// 例如 pattern_adt_field_get 的 field_index 不同、pattern_ctor_match 的 ctor_name 不同。
-    /// 对不实现 Hash 的类型使用 Debug 字符串哈希。
+    /// Generic method: hashes all per-node metadata fields into a `u64`.
+    /// Two nodes with the same `(compute_fn, inputs)` but different metadata
+    /// will not be merged by CSE. For example, `pattern_adt_field_get` nodes
+    /// with different `field_index`, or `pattern_ctor_match` nodes with
+    /// different `ctor_name`. Types that do not implement `Hash` are hashed
+    /// via their `Debug` string.
     pub fn cse_metadata_hash(&self, idx: usize) -> u64 {
         use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
@@ -2543,16 +2560,17 @@ impl DataFlowGraph {
         h.finish()
     }
 
-    /// 计算所有节点的下游列表（fan-out 统计）。
+    /// Computes the downstream list (fan-out statistics) for all nodes.
     ///
-    /// 遍历每个节点的输入，把该节点注册到各输入节点的 downstreams 列表。
-    /// 用于槽级 RC：节点产出时 refcount = downstreams[n].len()。
+    /// Iterates over each node's inputs and registers that node in the
+    /// `downstreams` list of each of its input nodes. Used for slot-level RC:
+    /// on node produce, `refcount = downstreams[n].len()`.
     pub fn compute_downstreams(&mut self) {
-        // 先清空
+        // Clear first.
         for ds in &mut self.downstreams {
             ds.clear();
         }
-        // 遍历节点，注册下游关系（inputs_pool 中的输入边）
+        // Iterate over nodes and register downstream edges (input edges in inputs_pool).
         for nid in 0..self.nodes.len() {
             let node = self.nodes[nid];
             let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
@@ -2560,9 +2578,11 @@ impl DataFlowGraph {
                 self.downstreams[input.0 as usize].push(NodeId(nid as u32));
             }
         }
-        // Gate 节点的 condition_input → Gate 边（Gate 就绪依赖条件值被计算）
-        // 避免重复：如果 condition_input 已在 Gate 的 inputs 中（input_count=1 的 if/while/for/match Gate），
-        // 第一个循环已注册下游关系，跳过。仅对 condition_input 不在 inputs 中的 Gate（如 select gate）注册。
+        // Gate node's condition_input → Gate edge (Gate readiness depends on the
+        // condition value being computed). Avoid duplicates: if condition_input
+        // is already in the Gate's inputs (input_count=1 for if/while/for/match
+        // Gates), the first loop already registered the downstream edge, so skip.
+        // Only register for Gates whose condition_input is not in inputs (e.g. select gate).
         for nid in 0..self.nodes.len() {
             if let Some(gb) = &self.gate_branches[nid] {
                 let node = self.nodes[nid];
@@ -2574,35 +2594,41 @@ impl DataFlowGraph {
         }
     }
 
-    /// 晚期压缩重建：根据 dead 集与 redirect 映射重建图。
-    /// 压缩 nodes/inputs_pool，重映射所有 NodeId 引用与 per-NodeId 元数据向量。
-    /// 重建后所有 NodeId 引用更新为新连续编号。
-    /// 返回 old_to_new 映射（供外部同步 expr_node_map 等）。
+    /// Late compaction rebuild: rebuilds the graph from the `dead` set and
+    /// `redirect` map. Compacts `nodes`/`inputs_pool`, remaps all `NodeId`
+    /// references and per-NodeId metadata vectors. After rebuild, all `NodeId`
+    /// references are updated to the new contiguous numbering. Returns the
+    /// `old_to_new` map (so callers can sync `expr_node_map`, etc.).
     pub fn rebuild(
         &mut self,
         dead: &rustc_hash::FxHashSet<NodeId>,
         redirect: &rustc_hash::FxHashMap<NodeId, NodeId>,
     ) -> Vec<Option<NodeId>> {
-        // ── 递归解析重定向 ──
+        // ── Recursively resolve redirects ──
         let resolve = |id: NodeId| -> NodeId {
             let mut cur = id;
             while let Some(&next) = redirect.get(&cur) { cur = next; }
             cur
         };
 
-        // ── 1. 按函数级子图分组排列存活节点 ──
-        // pass 层（LICM/inline）追加的 hoisted 节点在 graph.nodes 末尾，不在 caller
-        // 子图的 node_range 内。如果按 0..total 顺序压缩，hoisted 节点的 new_id 在末尾，
-        // 不在 caller 的 node_range 内 → caller 帧不执行它们 → 变换无效。
+        // ── 1. Arrange live nodes grouped by function-level subgraph ──
+        // Hoisted nodes appended by the pass layer (LICM/inline) live at the end
+        // of graph.nodes, outside the caller subgraph's node_range. If we compact
+        // in 0..total order, the hoisted nodes' new_id ends up at the tail,
+        // outside the caller's node_range → the caller frame never executes them
+        // → the transformation is void.
         //
-        // 改为按函数级子图分组排列：每个函数级子图的原生存活节点 + 属于它的 hoisted
-        // 存活节点，使 hoisted 节点的 new_id 紧跟在 caller 原生节点后面，保证连续。
+        // Instead, arrange by function-level subgraph grouping: each function-level
+        // subgraph's native live nodes + the hoisted live nodes that belong to it,
+        // so hoisted nodes' new_id directly follows the caller's native nodes,
+        // keeping them contiguous.
         let total = self.nodes.len();
         let mut old_to_new: Vec<Option<NodeId>> = vec![None; total];
         let mut new_to_old: Vec<usize> = Vec::with_capacity(total);
         let mut new_nodes: Vec<Node> = Vec::with_capacity(total);
 
-        // 1a. 计算每个节点的归属函数级子图（保存副本供步骤 5 使用，避免被步骤 3b 压缩破坏）
+        // 1a. Compute the owning function-level subgraph for each node (keep a
+        // copy for step 5, since step 3b compaction would otherwise clobber it).
         let mut node_owner: Vec<u32> = vec![u32::MAX; total];
         for sg in &self.subgraphs {
             if sg.loop_kind != LoopKind::None || sg.loop_parent_sg.is_some() {
@@ -2614,16 +2640,18 @@ impl DataFlowGraph {
                 node_owner[idx] = sg.id.0;
             }
         }
-        // hoisted 节点的归属（不在任何 node_range 内，通过 hoisted_owners 确定）
+        // Ownership of hoisted nodes (not inside any node_range; determined via hoisted_owners).
         for idx in 0..total {
             if self.hoisted_node[idx] && node_owner[idx] == u32::MAX {
                 node_owner[idx] = self.hoisted_owners[idx].0;
             }
         }
-        // 保存旧索引的 node_owner 副本（步骤 5 在步骤 3b 压缩后仍需按旧索引访问）
+        // Save a copy of node_owner indexed by old indices (step 5 still needs
+        // old-index access after step 3b compaction).
         let node_owner_old = node_owner.clone();
 
-        // 1b. 收集函数级子图列表（按 node_range.0 排序，保持原有顺序）
+        // 1b. Collect the function-level subgraph list (sorted by node_range.0
+        // to preserve original order).
         let mut func_sgs: Vec<u32> = self
             .subgraphs
             .iter()
@@ -2632,13 +2660,13 @@ impl DataFlowGraph {
             .collect();
         func_sgs.sort_by_key(|&sg_id| self.subgraphs[sg_id as usize].node_range.0);
 
-        // 1c. 按函数级子图顺序分配 new_id
+        // 1c. Assign new_id in function-level subgraph order.
         for &sg_id in &func_sgs {
             let sg = &self.subgraphs[sg_id as usize];
             let start = sg.node_range.0.0 as usize;
             let end = (sg.node_range.1.0 as usize).min(total);
 
-            // 原生存活节点（含嵌套子图节点，跳过 hoisted）
+            // Native live nodes (including nested subgraph nodes; skip hoisted).
             for old_idx in start..end {
                 if self.hoisted_node[old_idx] {
                     continue;
@@ -2647,7 +2675,8 @@ impl DataFlowGraph {
                 if dead.contains(&old_id) || redirect.contains_key(&old_id) {
                     continue;
                 }
-                // 防重复：如果节点已在其他子图循环中被分配（node_range 重叠），跳过
+                // De-duplicate: if the node was already assigned in another
+                // subgraph iteration (overlapping node_range), skip.
                 if old_to_new[old_idx].is_some() {
                     continue;
                 }
@@ -2657,7 +2686,7 @@ impl DataFlowGraph {
                 new_nodes.push(self.nodes[old_idx]);
             }
 
-            // hoisted 存活节点（owner == sg_id）
+            // Hoisted live nodes (owner == sg_id).
             for old_idx in 0..total {
                 if !self.hoisted_node[old_idx] {
                     continue;
@@ -2679,7 +2708,7 @@ impl DataFlowGraph {
             }
         }
 
-        // 1d. 未归属的存活节点（不应存在，安全起见排到最后）
+        // 1d. Unowned live nodes (should not exist; placed last for safety).
         for old_idx in 0..total {
             if old_to_new[old_idx].is_some() {
                 continue;
@@ -2694,7 +2723,7 @@ impl DataFlowGraph {
             new_nodes.push(self.nodes[old_idx]);
         }
 
-        // ── 2. 重建 inputs_pool（resolve + remap）──
+        // ── 2. Rebuild inputs_pool (resolve + remap) ──
         let mut new_inputs: Vec<NodeId> = Vec::new();
         for node in &mut new_nodes {
             let old_inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
@@ -2711,14 +2740,14 @@ impl DataFlowGraph {
         self.nodes = new_nodes;
         self.inputs_pool.data = new_inputs;
 
-        // ── 3. 压缩 per-NodeId 元数据向量 ──
-        // 用 new_to_old 映射按新编号顺序收集元数据
+        // ── 3. Compact per-NodeId metadata vectors ──
+        // Collect metadata in new-index order using the new_to_old map.
         let remap_n = |id: NodeId| -> NodeId {
             let r = resolve(id);
             old_to_new[r.0 as usize].expect("rebuild: ref node not live")
         };
 
-        // 3a. 压缩 Vec<Option<T: Clone>>（无内部 NodeId）
+        // 3a. Compact Vec<Option<T: Clone>> (no interior NodeId).
         macro_rules! compress_opt {
             ($field:ident) => {{
                 let mut v: Vec<_> = Vec::with_capacity(new_to_old.len());
@@ -2749,7 +2778,7 @@ impl DataFlowGraph {
         compress_opt!(cast_target_types);
         compress_opt!(memo_infos);
 
-        // 3b. 压缩 Vec<bool>
+        // 3b. Compact Vec<bool>.
         macro_rules! compress_bool {
             ($field:ident) => {{
                 let mut v: Vec<_> = Vec::with_capacity(new_to_old.len());
@@ -2764,7 +2793,7 @@ impl DataFlowGraph {
         compress_bool!(hoisted_node);
         compress_bool!(slice_inclusive);
 
-        // 3b2. 压缩 hoisted_owners: Vec<SubGraphId>
+        // 3b2. Compact hoisted_owners: Vec<SubGraphId>.
         {
             let mut v: Vec<SubGraphId> = Vec::with_capacity(new_to_old.len());
             for &old_idx in &new_to_old {
@@ -2773,7 +2802,7 @@ impl DataFlowGraph {
             self.hoisted_owners = v;
         }
 
-        // 3c. 压缩含 NodeId 的向量
+        // 3c. Compact vectors containing NodeId.
         // await_event_sources: Vec<Option<NodeId>>
         {
             let mut v: Vec<Option<NodeId>> = Vec::with_capacity(new_to_old.len());
@@ -2790,7 +2819,7 @@ impl DataFlowGraph {
             }
             self.writeback_targets = v;
         }
-        // gate_branches: Vec<Option<GateBranches>> — 内部 NodeId 需 remap
+        // gate_branches: Vec<Option<GateBranches>> — interior NodeId needs remap.
         {
             let mut v: Vec<Option<GateBranches>> = Vec::with_capacity(new_to_old.len());
             for &old_idx in &new_to_old {
@@ -2804,7 +2833,7 @@ impl DataFlowGraph {
             }
             self.gate_branches = v;
         }
-        // select_infos: Vec<Option<SelectInfo>> — SelectBranch.event_source_node 需 remap
+        // select_infos: Vec<Option<SelectInfo>> — SelectBranch.event_source_node needs remap.
         {
             let mut v: Vec<Option<SelectInfo>> = Vec::with_capacity(new_to_old.len());
             for &old_idx in &new_to_old {
@@ -2820,7 +2849,7 @@ impl DataFlowGraph {
             self.select_infos = v;
         }
 
-        // ── 4. 重建 downstreams（含 Gate condition_input 边）──
+        // ── 4. Rebuild downstreams (including Gate condition_input edges) ──
         let n = self.nodes.len();
         self.downstreams = vec![Vec::new(); n];
         for node_idx in 0..n {
@@ -2830,7 +2859,7 @@ impl DataFlowGraph {
                 self.downstreams[input.0 as usize].push(NodeId(node_idx as u32));
             }
         }
-        // Gate condition_input → Gate 边（与 compute_downstreams 对齐）
+        // Gate condition_input → Gate edge (aligned with compute_downstreams).
         for nid in 0..n {
             if let Some(gb) = &self.gate_branches[nid] {
                 let node = self.nodes[nid];
@@ -2841,10 +2870,12 @@ impl DataFlowGraph {
             }
         }
 
-        // ── 5. 重映射 subgraphs 内的 NodeId 引用 ──
-        // node_range 通过扫描旧范围内的存活节点 + 属于该子图的 hoisted 节点重新计算。
-        // 步骤 1 已按函数级子图分组排列，hoisted 节点紧跟在原生节点后面，
-        // 因此新 node_range 自然连续（原生存活节点 new_id + hoisted 存活节点 new_id）。
+        // ── 5. Remap NodeId references inside subgraphs ──
+        // node_range is recomputed by scanning live nodes within the old range
+        // + hoisted nodes that belong to the subgraph. Step 1 already arranged
+        // nodes by function-level subgraph grouping, with hoisted nodes directly
+        // following the native nodes, so the new node_range is naturally
+        // contiguous (native live node new_id + hoisted live node new_id).
         for sg in self.subgraphs.iter_mut() {
             let old_start = sg.node_range.0.0 as usize;
             let old_end = (sg.node_range.1.0 as usize).min(total);
@@ -2852,7 +2883,7 @@ impl DataFlowGraph {
             let mut new_start: Option<u32> = None;
             let mut new_end: u32 = 0;
 
-            // 辅助：更新 new_start/new_end
+            // Helper: update new_start/new_end.
             let mut update_range = |nid: NodeId| {
                 if new_start.is_none() {
                     new_start = Some(nid.0);
@@ -2862,7 +2893,7 @@ impl DataFlowGraph {
                 }
             };
 
-            // 原生范围内的存活节点
+            // Live nodes within the native range.
             for old_idx in old_start..old_end {
                 let old_id = NodeId(old_idx as u32);
                 if dead.contains(&old_id) || redirect.contains_key(&old_id) {
@@ -2871,13 +2902,14 @@ impl DataFlowGraph {
                 update_range(old_to_new[old_idx].unwrap());
             }
 
-            // 属于该子图的 hoisted 存活节点（使用 node_owner_old，因为 self.hoisted_owners
-            // 已在步骤 3b2 被压缩为新数组，不能再用旧索引访问）
+            // Hoisted live nodes belonging to this subgraph (use node_owner_old,
+            // because self.hoisted_owners was already compacted to the new array
+            // in step 3b2 and can no longer be accessed by old index).
             for old_idx in 0..total {
                 if node_owner_old[old_idx] != sg_id.0 {
                     continue;
                 }
-                // 跳过原生范围内的节点（已在上面处理）
+                // Skip nodes within the native range (already handled above).
                 if old_idx >= old_start && old_idx < old_end {
                     continue;
                 }
@@ -2890,7 +2922,7 @@ impl DataFlowGraph {
 
             sg.node_range = match new_start {
                 Some(ns) => (NodeId(ns), NodeId(new_end)),
-                None => (NodeId(0), NodeId(0)), // 全部 dead，范围坍缩
+                None => (NodeId(0), NodeId(0)), // All dead; range collapses.
             };
             sg.entry_node = remap_n(sg.entry_node);
             sg.return_node = remap_n(sg.return_node);
@@ -2905,13 +2937,13 @@ impl DataFlowGraph {
                 entry.trigger_node = remap_n(entry.trigger_node);
                 entry.captured_inputs = entry.captured_inputs.iter().map(|&n| remap_n(n)).collect();
             }
-            // upvalue_outer_nodes: 捕获变量外层节点需重映射
+            // upvalue_outer_nodes: captured-variable outer nodes need remap.
             sg.upvalue_outer_nodes = sg.upvalue_outer_nodes.iter().map(|&n| remap_n(n)).collect();
-            // nested_ranges: 子图 node_range 需重映射
+            // nested_ranges: subgraph node_range needs remap.
             sg.nested_ranges = sg.nested_ranges.iter().map(|&(s, e)| {
                 (remap_n(NodeId(s)).0, remap_n(NodeId(e)).0)
             }).collect();
-            // reset_plan: ResetPlan 中的 NodeId 需重映射（与 cond_node/iter_next_node 同步）
+            // reset_plan: NodeIds inside ResetPlan need remap (synced with cond_node/iter_next_node).
             if let Some(ref mut plan) = sg.reset_plan {
                 plan.reset_to_zero = plan.reset_to_zero.iter().map(|&n| remap_n(n)).collect();
                 plan.reset_to_one = plan.reset_to_one.iter().map(|&n| remap_n(n)).collect();
@@ -2919,7 +2951,7 @@ impl DataFlowGraph {
             }
         }
 
-        // 验证：检查是否有悬空引用
+        // Verify: check for dangling references.
         if std::env::var("KUZO_VERIFY_GRAPH").is_ok() {
             let total = self.nodes.len();
             for (idx, node) in self.nodes.iter().enumerate() {
@@ -2947,11 +2979,14 @@ impl DataFlowGraph {
         old_to_new
     }
 
-    /// 计算所有子图的 `nested_ranges`：对每个子图，收集直接嵌套在其
-    /// `node_range` 内的子图范围。构建期调用一次，运行时 O(len) 查询替代全图扫描。
+    /// Computes `nested_ranges` for all subgraphs: for each subgraph, collects
+    /// the ranges of subgraphs directly nested within its `node_range`. Called
+    /// once at build time so runtime can query in O(len) instead of scanning
+    /// the whole graph.
     pub fn compute_nested_ranges(&mut self) {
         let subgraph_count = self.subgraphs.len();
-        // 预收集所有子图范围，避免在循环中反复借用 self.subgraphs
+        // Pre-collect all subgraph ranges to avoid repeatedly borrowing
+        // self.subgraphs inside the loop.
         let ranges: Vec<(SubGraphId, u32, u32)> = self.subgraphs.iter()
             .map(|sg| (sg.id, sg.node_range.0 .0, sg.node_range.1 .0))
             .collect();
@@ -2964,7 +2999,7 @@ impl DataFlowGraph {
                 .map(|(_, s, e)| (*s, *e))
                 .collect();
         }
-        // 避免 unused 警告
+        // Avoid unused warning.
         let _ = subgraph_count;
     }
 }
@@ -2976,29 +3011,33 @@ impl Default for DataFlowGraph {
 }
 
 // =========================================================================
-// expr_id_to_key — ExprId → expr_types 的 key 转换
+// expr_id_to_key — ExprId → expr_types key conversion
 // =========================================================================
 
-/// ExprId → expr_types 的 key（u64）。
+/// ExprId → expr_types key (`u64`).
 ///
-/// Sema 的 expr_types key 是 "AST Expr 句柄地址"，
-/// 经研究 key = ExprId.0 as u64（AstArena.exprs 下标）。
+/// Sema's expr_types key is the "AST Expr handle address"; investigation shows
+/// `key = ExprId.0 as u64` (the index into `AstArena.exprs`).
 #[inline]
 pub fn expr_id_to_key(id: crate::ast::Ast::ExprId) -> u64 {
     id.0 as u64
 }
 
 // =========================================================================
-// LoopContext — 循环上下文（continue 跳转目标 + For 循环迭代器节点）
+// LoopContext — loop context (continue jump target + For-loop iterator node)
 // =========================================================================
 
-/// 循环上下文：压入 loop_stack 供 continue/break 语义使用。
+/// Loop context: pushed onto `loop_stack` for continue/break semantics.
 ///
-/// - `sg`：递归子图 id（continue 跳转目标）
-/// - `iter_node`：For 循环 body_sg 中的迭代器参数节点（continue 需传递给尾递归；
-///   None = While/Loop，param_count=0 无需传参）
-/// body_node_start: 循环体子图的起始节点 ID，用于判断捕获变量是否定义在循环体内。
-///   循环体内定义的变量在循环体帧销毁后不可访问，捕获此类变量的闭包必须走 Cell 路径。
+/// - `sg`: recursive subgraph id (continue jump target).
+/// - `iter_node`: iterator parameter node in the For-loop's `body_sg` (continue
+///   must pass it to the tail recursion; `None` = While/Loop, param_count=0,
+///   no argument needed).
+/// - `body_node_start`: starting node id of the loop body subgraph; used to
+///   determine whether a captured variable is defined inside the loop body.
+///   Variables defined inside the loop body become inaccessible once the loop
+///   body frame is destroyed, so closures capturing such variables must take
+///   the Cell path.
 #[derive(Debug, Clone, Copy)]
 pub struct LoopContext {
     pub sg: SubGraphId,
@@ -3007,44 +3046,48 @@ pub struct LoopContext {
 }
 
 // =========================================================================
-// IrBuilder — 从 SemaResult + Module 构建 DataFlowGraph
+// IrBuilder — builds a DataFlowGraph from SemaResult + Module
 // =========================================================================
 
-/// IR 构建器：遍历 AST，生成 Node + InputsPool + SubGraph。
+/// IR builder: walks the AST and emits Node + InputsPool + SubGraph.
 ///
-/// 以函数为单位编译子图：
-/// 1. 注册所有函数为 SubGraph
+/// Compiles subgraphs on a per-function basis:
+/// 1. Register all functions as SubGraphs.
 
 // =========================================================================
-// SCALAR_META — 标量类型算术元信息（以 ValueTag 为键，name 从 Value.rs 单点派生）
+// SCALAR_META — scalar-type arithmetic metadata (keyed by ValueTag; name derived
+//               single-source from Value.rs)
 // =========================================================================
 //
-// 集中存储每个标量类型的：
-//   - arith_base:  算术 compute_fn 基址（与 compute_fn_table! 索引一致）
-//   - family:      比较运算分派族（"i32"/"i64"/"i128"/"float"/"bool"）
-//   - is_float:    是否浮点（决定位运算可用性、neg 偏移量）
+// Centralizes, for each scalar type:
+//   - arith_base:  arithmetic compute_fn base index (matches compute_fn_table! indices).
+//   - family:      comparison dispatch family ("i32"/"i64"/"i128"/"float"/"bool").
+//   - is_float:    whether floating-point (governs bitwise-op availability, neg offset).
 //
-// 类型名 ↔ ValueTag 的映射由 `Value::ValueTag::from_name`/`type_name` 单点维护，
-// 本表不再重复 name 字段。arith_base 必须与 compute_fn_table! 中的索引严格一致。
+// The type-name ↔ ValueTag mapping is maintained single-source by
+// `Value::ValueTag::from_name`/`type_name`; this table does not duplicate the
+// name field. arith_base must strictly match the indices in compute_fn_table!.
 
-/// 标量类型算术元信息。
+/// Scalar-type arithmetic metadata.
 ///
-/// `family` 为 `TypeFamily` 枚举（统一类型族，调用方用 `|` 合并整数变体按位宽分派）。
+/// `family` is the `TypeFamily` enum (a unified type family; callers combine
+/// integer variants with `|` to dispatch by bit-width).
 pub struct ScalarMeta {
     pub arith_base: u32,
     pub family: crate::types::TypeFamily,
     pub is_float: bool,
 }
 
-/// 按 ValueTag 查询算术元信息（const fn，编译期可求值）。
+/// Looks up arithmetic metadata by ValueTag (const fn, evaluable at compile time).
 ///
-/// `family` 派生自 `ValueTag::family()`（单点维护，不再手写 18 个分支）。
+/// `family` is derived from `ValueTag::family()` (single-source; no longer
+/// hand-written 18-arm match).
 pub const fn scalar_meta(tag: crate::value::ValueTag) -> Option<ScalarMeta> {
     use crate::value::ValueTag;
-    // family 由 ValueTag::family() 派生（保持单一真相源）
+    // family is derived from ValueTag::family() (single source of truth).
     let family = tag.family();
     Some(match tag {
-        // 整数 12 类型（arith_base 从 92 开始，每 12 个索引）
+        // 12 integer types (arith_base starts at 92, 12 indices each).
         ValueTag::I8    => ScalarMeta { arith_base: 92,  family, is_float: false },
         ValueTag::I16   => ScalarMeta { arith_base: 104, family, is_float: false },
         ValueTag::I32   => ScalarMeta { arith_base: 116, family, is_float: false },
@@ -3057,15 +3100,15 @@ pub const fn scalar_meta(tag: crate::value::ValueTag) -> Option<ScalarMeta> {
         ValueTag::U128  => ScalarMeta { arith_base: 200, family, is_float: false },
         ValueTag::Isize => ScalarMeta { arith_base: 212, family, is_float: false },
         ValueTag::Usize => ScalarMeta { arith_base: 224, family, is_float: false },
-        // 浮点 4 类型（arith_base 从 236 开始，每 6 个索引）
+        // 4 floating-point types (arith_base starts at 236, 6 indices each).
         ValueTag::F16   => ScalarMeta { arith_base: 236, family, is_float: true },
         ValueTag::F32   => ScalarMeta { arith_base: 242, family, is_float: true },
         ValueTag::F64   => ScalarMeta { arith_base: 248, family, is_float: true },
         ValueTag::F128  => ScalarMeta { arith_base: 254, family, is_float: true },
-        // 非算术标量类型（bool/char，无 arith_base）
+        // Non-arithmetic scalar types (bool/char, no arith_base).
         ValueTag::Bool  => ScalarMeta { arith_base: 0,   family, is_float: false },
         ValueTag::Char  => ScalarMeta { arith_base: 0,   family, is_float: false },
-        // 非标量 tag：无算术元信息
+        // Non-scalar tag: no arithmetic metadata.
         _ => return None,
     })
 }

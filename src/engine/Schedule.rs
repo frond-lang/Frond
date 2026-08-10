@@ -1,7 +1,7 @@
-//! 数据流调度核心：就绪调度自由函数、run_frame_nodes、process_frame。
+//! Dataflow scheduling core: readiness-scheduling free functions, run_frame_nodes, process_frame.
 //!
-//! SIMD 批量化已下沉到 compute_fn 内部（通过 EvalContext + do_simd_batch），
-//! engine 热循环不再有批处理特化检查。
+//! SIMD batching has been pushed down into compute_fn (via EvalContext + do_simd_batch), so the
+//! engine hot loop no longer has batching-specialization checks.
 
 use super::*;
 use crate::ir::Ir::*;
@@ -10,11 +10,11 @@ use crate::value::Value;
 use crate::ir::Compute::char_from_u32_or_nul;
 
 // =========================================================================
-// 帧操作辅助函数（纯函数，不依赖 Engine 状态）
+// Frame-operation helper functions (pure, do not depend on Engine state)
 // =========================================================================
 
-/// 将 ConstValue 转换为 Value（不使用 arena，直接构造）。
-/// `pool` = DataFlowGraph.string_pool 的字节切片，Str 变体需要从中读取字符串。
+/// Converts a ConstValue into a Value (constructed directly, without using the arena).
+/// `pool` = a byte slice of DataFlowGraph.string_pool; the Str variant reads its string from it.
 pub fn alloc_const_value(cv: ConstValue, pool: &[u8]) -> Value {
     match cv {
         ConstValue::I8(v) => Value::i8(v),
@@ -47,7 +47,8 @@ pub fn alloc_const_value(cv: ConstValue, pool: &[u8]) -> Value {
     }
 }
 
-/// 帧节点初始化：设置 node_offset + pending_inputs + 预填充 Const + Gate 入就绪队列。
+/// Frame node initialization: sets node_offset + pending_inputs + prefills Const + enqueues Gate
+/// into the ready queue.
 pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
     let sg_id = frame.subgraph_id;
     let (node_start, node_end) = graph.subgraphs[sg_id.0 as usize].node_range;
@@ -55,7 +56,7 @@ pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
     let offset = node_start.0 as usize;
     let node_end_global = node_start.0 + node_count as u32;
 
-    // 使用预计算的 nested_ranges（构建期填充），避免运行时全图扫描
+    // Use the precomputed nested_ranges (filled at build time) to avoid a runtime full-graph scan.
     let nested_ranges: &[(u32, u32)] = graph.sg_nested_ranges(sg_id.0 as usize);
 
     if super::env_flag("KUZO_DEBUG_STALL") {
@@ -67,10 +68,10 @@ pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
         nested_ranges.iter().any(|&(s, e)| global_idx >= s && global_idx < e)
     };
 
-    // 设置 node_offset
+    // Set node_offset.
     frame.node_offset = node_start.0;
 
-    // 1. 初始化 pending_inputs（select Gate→0；其他节点按实际 in-frame 输入计数）
+    // 1. Initialize pending_inputs (select Gate -> 0; other nodes count actual in-frame inputs).
     for i in 0..node_count {
         if is_nested((offset + i) as u32) {
             frame.pending_inputs[i] = PENDING_EXTERNAL;
@@ -96,7 +97,8 @@ pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
         }
     }
 
-    // 2. 0-input 节点入就绪队列（Const 节点也走此路径——compute_fn 返回值）
+    // 2. Enqueue 0-input nodes into the ready queue (Const nodes also take this path — compute_fn
+    // returns a value).
     let param_count = graph.subgraphs[sg_id.0 as usize].param_count as usize;
     for i in 0..node_count {
         if i < param_count {
@@ -111,7 +113,8 @@ pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
     }
 }
 
-/// 通知下游节点：减 pending_inputs，归零则入就绪队列（含边界检查 + 槽级 RC）。
+/// Notifies downstream nodes: decrements pending_inputs, and enqueues them when it reaches zero
+/// (with bounds checks + slot-level RC).
 pub fn notify_downstream(
     frame: &mut Frame,
     graph: &DataFlowGraph,
@@ -123,29 +126,32 @@ pub fn notify_downstream(
     let pending_len = frame.pending_inputs.len();
     for &ds_graph_id in downstreams {
         let ds_local_id = NodeId(ds_graph_id.0.wrapping_sub(node_start.0));
-        // 边界检查：跳过跨子图下游
+        // Bounds check: skip cross-subgraph downstream.
         if ds_local_id.0 as usize >= pending_len {
             continue;
         }
 
         let pidx = producer_local.0 as usize;
-        // 消费 producer 的引用计数，但不清除 ready 标记。
-        // ready 标记的语义是"此节点已产出值，不需要重新执行"。
-        // 清除 ready 会导致节点变成 pending_inputs=0 && ready=false 状态，
-        // 当上游被重新触发时，节点会被重新推入 ready_queue 并重复执行，
-        // 造成指数级爆炸（尤其影响 call/closure_call 节点）。
-        // 值保留在 value_table 中，直到帧结束（帧 drop 时自动释放）
-        // 或被 reset_node_ready/reset_node_pending 显式重置（循环体复用场景）。
+        // Consume the producer's reference count, but do not clear the ready flag.
+        // The ready flag means "this node has produced a value and need not be re-executed".
+        // Clearing ready would leave the node in a pending_inputs=0 && ready=false state; when the
+        // upstream is re-triggered the node would be re-pushed into ready_queue and executed
+        // repeatedly, causing exponential blow-up (especially for call/closure_call nodes).
+        // The value stays in the value_table until the frame ends (auto-released on frame drop)
+        // or is explicitly reset by reset_node_ready/reset_node_pending (loop-body reuse case).
         let _still_has_consumers = frame.value_table.consume(pidx);
 
-        // 跳过 PENDING_EXTERNAL 哨兵（嵌套子图节点/EventSource 节点）：
-        // 这些节点由子帧或事件驱动，不应被父帧的 notify_downstream 递减。
-        // 若递减会腐蚀哨兵（65535→65534），累计 65535 次后归零，嵌套节点被错误推入父帧执行。
+        // Skip the PENDING_EXTERNAL sentinel (nested-subgraph nodes / EventSource nodes):
+        // these nodes are driven by child frames or events and must not be decremented by the
+        // parent frame's notify_downstream. Decrementing would corrode the sentinel
+        // (65535 -> 65534); after 65535 such decrements it would hit zero and the nested node
+        // would be erroneously pushed into the parent frame for execution.
         //
-        // 只有 pending 从 >0 递减到 0 时才 push_ready。
-        // pending=0 的节点已被 prepare_frame_nodes 的 0-input 入队推入，
-        // 重复 push 会导致节点被多次执行（如 Gate 节点重复触发子帧启动，
-        // 子帧返回值覆盖、条件值未就绪时 Gate 提前执行读到 null）。
+        // Only push_ready when pending decrements from >0 to 0.
+        // A node with pending=0 has already been enqueued by prepare_frame_nodes' 0-input
+        // enqueue; pushing again would cause it to be executed multiple times (e.g. a Gate node
+        // re-triggering child-frame startup, child-frame return values overwriting each other, or
+        // a Gate executing early and reading null when the condition value is not ready).
         let pending = frame.pending_inputs[ds_local_id.0 as usize];
         if pending > 0 && pending != PENDING_EXTERNAL {
             let new_pending = pending - 1;
@@ -157,16 +163,19 @@ pub fn notify_downstream(
     }
 }
 
-/// 提取子帧返回值：优先取 control_signal 的 Return 值，否则取 return_node 值。
+/// Extracts the child frame's return value: prefers the Return value carried by control_signal,
+/// otherwise reads the return_node value.
 pub(super) fn extract_child_return(child: &Frame, graph: &DataFlowGraph) -> Value {
     match &child.control_signal {
         ControlSignal::Return(v) => v.clone(),
         ControlSignal::Break | ControlSignal::Continue => Value::VOID,
         ControlSignal::None => {
             let sg = &graph.subgraphs[child.subgraph_id.0 as usize];
-            // child.node_offset：跨函数调用 = 子图 node_range.0；
-            // 同函数分支帧 = 父函数 node_start（见 Frame.rs prepare_same_function_frame）。
-            // 使用 child.node_offset（实际值）而非 sg.node_range.0，确保两种情况都正确。
+            // child.node_offset: cross-function call = subgraph node_range.0;
+            // same-function branch frame = parent function node_start (see
+            // Frame.rs prepare_same_function_frame).
+            // Use child.node_offset (the actual value) rather than sg.node_range.0 so both cases
+            // are handled correctly.
             let return_local = NodeId(sg.return_node.0.wrapping_sub(child.node_offset));
             child.get_value(return_local)
         }
@@ -174,11 +183,11 @@ pub(super) fn extract_child_return(child: &Frame, graph: &DataFlowGraph) -> Valu
 }
 
 // =========================================================================
-// impl<S: LockStrategy> Engine<S> — 调度核心方法
+// impl<S: LockStrategy> Engine<S> — scheduling core methods
 // =========================================================================
 
 impl<S: LockStrategy> Engine<S> {
-    /// 执行帧内所有就绪节点，直到就绪队列空或帧挂起。
+    /// Executes all ready nodes in the frame until the ready queue is empty or the frame suspends.
     pub(super) fn run_frame_nodes(&self, frame: &mut Frame, fid: FrameId, queue: &QueueHandle<'_>) {
         let graph = frame.graph.clone();
 
@@ -186,25 +195,25 @@ impl<S: LockStrategy> Engine<S> {
         loop {
         iter_guard += 1;
         if iter_guard > 500000 {
-            // 超限：标记 Failed 防止 process_frame 重新入队导致活锁
-            // process_frame 的 Failed 分支会唤醒调用方或返回 NULL
+            // Over the limit: mark Failed to prevent process_frame from re-enqueuing and causing a
+            // livelock. process_frame's Failed branch wakes the caller or returns NULL.
             frame.state = FrameState::Failed;
             return;
         }
-            // 检查控制信号（return/break/continue 已触发）
+            // Check the control signal (return/break/continue already triggered).
             if !matches!(frame.control_signal, ControlSignal::None) {
                 break;
             }
-            // 检查帧是否被取消
+            // Check whether the frame has been cancelled.
             if frame.state == FrameState::Cancelling {
                 break;
             }
-            // 检查帧是否挂起
+            // Check whether the frame has suspended.
             if frame.state == FrameState::Suspended {
                 return;
             }
 
-            // POP: 弹出就绪节点（局部 id）
+            // POP: pop a ready node (local id).
             let local_id = match frame.pop_ready() {
                 Some(n) => n,
                 None => {
@@ -235,10 +244,10 @@ impl<S: LockStrategy> Engine<S> {
             let node = graph.node(graph_node_id.0 as usize);
             let ctx = EvalContext { node_start };
 
-            // COMPUTE: 统一调用 compute_fn，无特化检查
+            // COMPUTE: uniformly invoke compute_fn, with no specialization checks.
             let result = (graph.compute_fns[node.compute_fn.0 as usize])(frame, graph_node_id, &ctx);
 
-            // MATCH NodeResult: 统一副作用处理
+            // MATCH NodeResult: unified side-effect handling.
             match result {
                 NodeResult::Value(v) => {
                     let cc = graph.downstream_slice(graph_node_id.0 as usize).len() as u16;
@@ -260,7 +269,7 @@ impl<S: LockStrategy> Engine<S> {
                     }
                 }
                 NodeResult::Call(pending) => {
-                    // 尾调用图跳转
+                    // Tail-call graph jump.
                     let graph_call_id = NodeId(pending.call_node_local.0 + frame.node_offset);
                     if graph.tail_call_flag(graph_call_id.0 as usize) {
                         let caller = frame.caller;
@@ -316,7 +325,7 @@ impl<S: LockStrategy> Engine<S> {
                         continue;
                     }
 
-                    // LoopBody 帧复用
+                    // LoopBody frame reuse.
                     let target_loop_kind =
                         graph.subgraphs[pending.target_sg.0 as usize].loop_kind;
                     let child_fid = if target_loop_kind
@@ -342,7 +351,8 @@ impl<S: LockStrategy> Engine<S> {
                                     let consumer_count =
                                         graph.downstream_slice(gid).len() as u16;
                                     bf.set_value(local_id, arg.clone(), consumer_count);
-                                    // 不 push_ready：参数值已设置，notify_downstream 传播给下游
+                                    // Do not push_ready: the parameter value is already set;
+                                    // notify_downstream propagates it downstream.
                                     notify_downstream(bf, &graph, local_id, global_id, NodeId(parent_start));
                                 }
                                 bf.caller = Some((fid, pending.call_node_local));
@@ -453,7 +463,8 @@ impl<S: LockStrategy> Engine<S> {
                         Value::VOID,
                         queue,
                     );
-                    // send 成功后仍需设置节点值 + 通知下游，否则后续语句永远不就绪
+                    // After a successful send we still must set the node value + notify downstream,
+                    // otherwise subsequent statements will never become ready.
                     let consumer_count =
                         graph.downstream_slice(graph_node_id.0 as usize).len() as u16;
                     frame.set_value(local_id, Value::VOID, consumer_count);
@@ -597,12 +608,12 @@ impl<S: LockStrategy> Engine<S> {
             }
         }
 
-        // 帧挂起：不执行 defer，不标记 Completed
+        // Frame suspended: do not execute defer, do not mark Completed.
         if frame.state == FrameState::Suspended {
             return;
         }
 
-        // 帧被取消：执行 defer 清理 + 标记 Failed（spec 5.3）
+        // Frame cancelled: execute defer cleanup + mark Failed (spec 5.3).
         if frame.state == FrameState::Cancelling {
             let defer_entries: Vec<DeferEntry> = {
                 let sg_id = frame.subgraph_id;
@@ -624,7 +635,7 @@ impl<S: LockStrategy> Engine<S> {
             return;
         }
 
-        // 执行 defer（LIFO）：任何终止路径都执行 defer
+        // Execute defer (LIFO): any termination path runs defer.
         let defer_entries: Vec<DeferEntry> = {
             let sg_id = frame.subgraph_id;
             graph.subgraphs[sg_id.0 as usize].defer_table.clone()
@@ -642,44 +653,47 @@ impl<S: LockStrategy> Engine<S> {
             }
         }
 
-        // 标记帧完成
+        // Mark the frame completed.
         frame.state = FrameState::Completed;
     }
 
-    /// 处理一帧：timer 检查 + run_frame_nodes + 状态转换。
-    /// 返回 ()，结果通过 self.result.lock() 传递
+    /// Processes one frame: timer check + run_frame_nodes + state transition.
+    /// Returns (); the result is communicated via `self.result.lock()`.
     pub(super) fn process_frame(&self, fid: FrameId, queue: &QueueHandle<'_>) {
-        // 检查 timer 事件
+        // Check for timer events.
         self.check_timers(queue);
 
-        // 取出帧（保持 Box 不 unbox：堆地址在 remove/insert 周期中保持稳定，
-        // 使其他帧持有的 parent_frame_ptr/root_frame_ptr 不会悬挂）
+        // Take out the frame (keep it boxed: the heap address stays stable across the
+        // remove/insert cycle, so parent_frame_ptr/root_frame_ptr held by other frames do not
+        // dangle).
         let mut frame_box = match self.frames.lock().remove(&fid) {
             Some(b) => b,
             None => return,
         };
         let frame: &mut Frame = &mut *frame_box;
 
-        // 设置帧链指针：从 HashMap 中查找 caller 链，设置 parent_frame_ptr/root_frame_ptr。
-        // 此时所有父帧仍在 HashMap 中（Box 地址稳定）。
+        // Set up frame-chain pointers: walk the caller chain in the HashMap to set
+        // parent_frame_ptr/root_frame_ptr. All parent frames are still in the HashMap at this point
+        // (Box addresses are stable).
         self.setup_frame_chain(frame);
 
-        // 执行帧就绪节点（无锁）
+        // Execute the frame's ready nodes (lock-free).
         self.run_frame_nodes(frame, fid, queue);
 
-        // 处理帧状态
+        // Handle the frame state.
         let state = frame.state;
         let has_caller = frame.caller.is_some();
 
         match state {
             FrameState::Suspended => {
                 let event = frame.suspend_event;
-                // 检查 pending_completions（子帧先完成但父帧尚未 insert 的竞态）
-                // 使用 Vec 支持同一 caller 多个子帧并发完成（避免互相覆盖）
+                // Check pending_completions (the race where a child frame completes before the
+                // parent frame is re-inserted). Use a Vec to support concurrent completion of
+                // multiple child frames for the same caller (avoiding overwrites).
                 let completions: Vec<_> =
                     self.pending_completions.lock().remove(&fid).unwrap_or_default();
                 if !completions.is_empty() {
-                    // 有 pending completion(s)：直接消费完成事件
+                    // Pending completion(s) present: consume the completion events directly.
                     if let Some(e) = event {
                         self.event_waiters
                             .lock()
@@ -689,15 +703,18 @@ impl<S: LockStrategy> Engine<S> {
                             .lock()
                             .retain(|(_, wf)| *wf != fid);
                     }
-                    // 使用 frame.node_offset 而非 subgraph.node_range.0（同函数分支帧修正）
+                    // Use frame.node_offset rather than subgraph.node_range.0 (same-function
+                    // branch frame correction).
                     let caller_offset = NodeId(frame.node_offset);
-                    // 遍历所有 completions，逐个回写返回值 + 信号传播 + 通知下游
+                    // Walk all completions, writing back each return value + propagating the
+                    // signal + notifying downstream.
                     for (call_node, return_value, child_signal) in completions {
                         let call_graph_id = NodeId(call_node.0 + caller_offset.0);
                         let consumer_count =
                             self.graph.downstream_slice(call_graph_id.0 as usize).len() as u16;
                         frame.set_value(call_node, return_value, consumer_count);
-                        // Gate 分支子图的控制信号传播（与 complete_and_wake_caller 正常路径一致）
+                        // Gate branch subgraph control-signal propagation (consistent with the
+                        // normal path in complete_and_wake_caller).
                         let is_gate = self.graph.node(call_graph_id.0 as usize).kind
                             == crate::ir::Ir::NodeKind::Gate;
                         if is_gate && !matches!(child_signal, ControlSignal::None) {
@@ -714,20 +731,23 @@ impl<S: LockStrategy> Engine<S> {
                     frame.state = FrameState::Ready;
                     frame.suspend_state = SuspendState::NotSuspended;
                     frame.suspend_event = None;
-                    // 放回同一个 Box（地址不变）
+                    // Put back the same Box (address unchanged).
                     self.frames.lock().insert(fid, frame_box);
                     queue.push(fid);
                 } else {
-                    // 检查 pending_events（事件到达时帧不在 HashMap 的竞态兜底）
+                    // Check pending_events (race fallback for when an event arrives while the frame
+                    // is absent from the HashMap).
                     let pending_evt = self.pending_events.lock().remove(&fid);
                     if let Some((_evt, evt_val)) = pending_evt {
-                        // 有 pending event：注入事件值 + 唤醒
-                        // waiter 已在 on_event_arrived 中移除，无需重复清理
+                        // Pending event present: inject the event value + wake.
+                        // The waiter has already been removed in on_event_arrived, so no duplicate
+                        // cleanup is needed.
                         if self.apply_event_to_frame(frame, evt_val) {
                             self.frames.lock().insert(fid, frame_box);
                             queue.push(fid);
                         } else {
-                            // 帧非 WaitingEvent（状态不一致）：放回，不入队
+                            // Frame is not WaitingEvent (state inconsistency): put it back, do not
+                            // enqueue.
                             self.frames.lock().insert(fid, frame_box);
                         }
                     } else {
@@ -737,38 +757,40 @@ impl<S: LockStrategy> Engine<S> {
             }
             FrameState::Completed => {
                 if has_caller {
-                    // 区分 sync call vs async call 子帧完成
+                    // Distinguish sync-call vs async-call child-frame completion.
                     let async_id = self.async_join_runtime.lock().find_by_child(fid);
                     if let Some(async_id) = async_id {
-                        // async 子帧完成：设置 result + 触发 AsyncJoin 事件
+                        // async child frame completed: set the result + fire the AsyncJoin event.
                         let return_value =
                             extract_child_return(frame, &self.graph);
                         self.async_join_runtime
                             .lock()
                             .set_result(async_id, return_value.clone());
-                        // frame_box drop（不放回）
+                        // frame_box is dropped (not put back).
                         let woken = self.on_event_arrived(
                             RuntimeEvent::AsyncJoin(async_id),
                             return_value,
                             queue,
                         );
-                        // waiter 已被唤醒（值已通过事件注入），entry 可安全清理。
-                        // 若 woken == 0（无 waiter），entry 保留供 try_get_result 消费式读取
+                        // The waiter has been woken (value injected via the event), so the entry
+                        // can be safely cleaned up. If woken == 0 (no waiter), the entry is kept for
+                        // a consuming read by try_get_result.
                         if woken > 0 {
                             self.async_join_runtime.lock().remove_entry(async_id);
                         }
-                        // 回收 async 子帧到池
+                        // Return the async child frame to the pool.
                         self.release_frame(frame_box);
                     } else {
-                        // sync 子帧完成：清理 waiter + 回写 + 唤醒调用方
+                        // sync child frame completed: clean up the waiter + write back + wake the
+                        // caller.
                         self.event_waiters.lock().retain(|(e, _)| {
                             !matches!(e, RuntimeEvent::SubgraphComplete(c) if *c == fid)
                         });
-                        // 帧被消费：unbox 传给 complete_and_wake_caller
+                        // Frame consumed: unbox and hand to complete_and_wake_caller.
                         self.complete_and_wake_caller(*frame_box, queue);
                     }
                 } else {
-                    // 顶层帧完成：返回结果
+                    // Top-level frame completed: return the result.
                     let ret = extract_child_return(frame, &self.graph);
                     *self.result.lock() = Some(ret);
                     self.release_frame(frame_box);
@@ -776,19 +798,19 @@ impl<S: LockStrategy> Engine<S> {
             }
             FrameState::Failed => {
                 if has_caller {
-                    // Failed 子帧（cancel 后）：清理 waiter + 唤醒调用方
+                    // Failed child frame (after cancel): clean up the waiter + wake the caller.
                     self.event_waiters.lock().retain(|(e, _)| {
                         !matches!(e, RuntimeEvent::SubgraphComplete(c) if *c == fid)
                     });
                     self.complete_and_wake_caller(*frame_box, queue);
                 } else {
-                    // 顶层帧 Failed：返回 NULL
+                    // Top-level frame Failed: return NULL.
                     *self.result.lock() = Some(Value::NULL);
                     self.release_frame(frame_box);
                 }
             }
             _ => {
-                // Ready（控制信号触发但未挂起）：放回 + 重新入队
+                // Ready (control signal triggered but not suspended): put back + re-enqueue.
                 self.frames.lock().insert(fid, frame_box);
                 queue.push(fid);
             }

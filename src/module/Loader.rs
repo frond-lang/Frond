@@ -1,7 +1,7 @@
-//! 模块加载器主体：模块缓存、搜索路径、传递依赖加载。
+//! Module loader core: module cache, search paths, and transitive dependency loading.
 //!
-//! 合并 stdlib 嵌入表和文件系统两种 backend，对调用方透明。
-//! builtin 模块在 `new()` 时全量预加载。
+//! Merges the stdlib embed table and the filesystem as two backends, transparently to the caller.
+//! builtin modules are fully preloaded in `new()`.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::PathBuf;
@@ -12,23 +12,23 @@ use crate::ast::Parser::{ErrorCollector, Lexer, ParseError, Parser, Token, Token
 use super::Error::{LoadError, LoadedModule};
 use super::StdlibEmbed::{BUILTIN_FILES, STD_FILES, find};
 
-/// 统一的模块加载器
+/// The unified module loader.
 ///
-/// 合并 stdlib 嵌入表和文件系统两种 backend，对调用方透明。
-/// builtin 模块在 `new()` 时全量预加载。
+/// Merges the stdlib embed table and the filesystem as two backends, transparently to the caller.
+/// builtin modules are fully preloaded in `new()`.
 pub struct ModuleLoader {
-    /// 模块缓存：相对路径（如 "std/io/File.kz"）→ LoadedModule
+    /// Module cache: relative path (e.g. `"std/io/File.kz"`) → `LoadedModule`.
     modules: FxHashMap<String, LoadedModule>,
-    /// 用户模块的文件系统搜索路径
+    /// Filesystem search paths for user modules.
     search_paths: Vec<PathBuf>,
-    /// 加载失败记录（模块未找到 / 解析失败），按发生顺序排列
+    /// Load failure records (module not found / parse failed), in occurrence order.
     load_errors: Vec<LoadError>,
-    /// 已尝试加载但失败的路径集合，避免对同一路径重复记录错误
+    /// Set of paths already attempted but failed, to avoid recording duplicate errors for the same path.
     failed_paths: FxHashSet<String>,
 }
 
 impl ModuleLoader {
-    /// 创建新的加载器，并全量预加载 builtin 模块
+    /// Creates a new loader and fully preloads the builtin modules.
     pub fn new() -> Self {
         let mut loader = Self {
             modules: FxHashMap::default(),
@@ -40,16 +40,17 @@ impl ModuleLoader {
         loader
     }
 
-    /// 添加用户模块的文件系统搜索路径
+    /// Adds a filesystem search path for user modules.
     pub fn add_search_path(&mut self, path: impl Into<PathBuf>) {
         self.search_paths.push(path.into());
     }
 
-    /// 预加载 builtin 模块（默认可见，无需 import）
+    /// Preloads the builtin modules (visible by default, no import needed).
     ///
-    /// 遍历 BUILTIN_FILES，parse 每个 .kz 文件并缓存。
-    /// builtin 模块按依赖顺序排列（error → io → iter），保证后续 check 时依赖已就绪。
-    /// 解析失败时记录到 `load_errors`，避免错误被静默吞掉。
+    /// Iterates over `BUILTIN_FILES`, parsing and caching each `.kz` file.
+    /// builtin modules are ordered by dependency (error → io → iter), ensuring dependencies
+    /// are ready when subsequent checks run. Parse failures are recorded in `load_errors`
+    /// to avoid silently swallowing errors.
     fn preload_builtins(&mut self) {
         for (path, source) in BUILTIN_FILES {
             match parse_source(path, source) {
@@ -71,27 +72,28 @@ impl ModuleLoader {
         }
     }
 
-    /// 按模块路径段解析并加载模块
+    /// Resolves and loads a module by its path segments.
     ///
-    /// `path = ["std", "io", "File"]` → 查找 "std/io/File.kz"
-    /// 优先查缓存 → stdlib 嵌入表 → 文件系统搜索路径
+    /// `path = ["std", "io", "File"]` → looks up `"std/io/File.kz"`
+    /// Lookup order: cache → stdlib embed table → filesystem search paths
     ///
-    /// 返回已加载的 Module 引用。加载失败（模块未找到 / 解析失败）时返回 None，
-    /// 失败原因结构化记录到 `load_errors`，由调用方通过 `load_errors()` 统一报告。
+    /// Returns a reference to the loaded `Module`. On load failure (module not found /
+    /// parse failed) returns `None`; the failure reason is recorded structurally in
+    /// `load_errors` for the caller to report via `load_errors()`.
     pub fn resolve_and_load(&mut self, path: &[&str]) -> Option<&Module<'static>> {
         let path_str = module_path_to_file(path);
 
-        // 1. 检查缓存（已成功加载）
+        // 1. Check the cache (already successfully loaded)
         if self.modules.contains_key(&path_str) {
             return self.modules.get(&path_str).map(|m| &m.module);
         }
 
-        // 2. 已知失败路径：不重复记录错误，直接返回 None
+        // 2. Known-failed path: do not record a duplicate error, just return None
         if self.failed_paths.contains(&path_str) {
             return None;
         }
 
-        // 3. 查找 stdlib 嵌入表
+        // 3. Look up the stdlib embed table
         if let Some(source) = find(&path_str) {
             let path_static: &'static str = Box::leak(path_str.clone().into_boxed_str());
             match parse_source(path_static, source) {
@@ -114,7 +116,7 @@ impl ModuleLoader {
             }
         }
 
-        // 4. 查找文件系统（用户模块）
+        // 4. Look up the filesystem (user modules)
         for base in &self.search_paths {
             let full = base.join(&path_str);
             if full.exists() {
@@ -150,9 +152,9 @@ impl ModuleLoader {
             }
         }
 
-        // 4b. 目录模块检测：path 对应的不是文件而是目录（含 pack.kz）
-        // 例如 import Store → Store.kz 不存在，但 Store/pack.kz 存在。
-        // 加载 pack.kz 获取子模块声明，再加载每个子模块文件。
+        // 4b. Directory module detection: `path` refers not to a file but to a directory (containing pack.kz).
+        // e.g. `import Store` → Store.kz does not exist, but Store/pack.kz does.
+        // Load pack.kz to obtain submodule declarations, then load each submodule file.
         let dir_name = path_str.strip_suffix(".kz").unwrap_or(&path_str);
         for base in &self.search_paths {
             let pack_file = base.join(dir_name).join("pack.kz");
@@ -179,10 +181,10 @@ impl ModuleLoader {
                     return None;
                 }
             };
-            // 加载 pack 声明的每个子模块
+            // Load each submodule declared by the pack
             for sub_name in collect_pack_submodules(&pack_module) {
                 let sub_path_str = format!("{}/{}.kz", dir_name, sub_name);
-                // 子模块可能已在缓存中（如被其他路径先加载）
+                // The submodule may already be in the cache (e.g. loaded first via another path)
                 if self.modules.contains_key(&sub_path_str) {
                     continue;
                 }
@@ -204,7 +206,7 @@ impl ModuleLoader {
                     }
                 }
             }
-            // 将 pack 模块注册为目录模块代表（key 为原始 path_str，如 "Store.kz"）
+            // Register the pack module as the directory module representative (key is the original path_str, e.g. "Store.kz")
             let pack_exports = collect_exports(&pack_module);
             self.modules
                 .insert(path_str.clone(), LoadedModule {
@@ -214,13 +216,14 @@ impl ModuleLoader {
             return self.modules.get(&path_str).map(|m| &m.module);
         }
 
-        // 5. stdlib 和文件系统均未命中：检查是否为同级模块导出的类型/符号
-        // 例如 import std.time.TimeComponents → TimeComponents 是 SystemTime.kz 导出的 type，
-        // 而非独立模块文件。此时不报错，符号通过已加载的同级模块可见。
+        // 5. Neither stdlib nor the filesystem matched: check whether this is a type/symbol
+        // exported by a sibling module. For example `import std.time.TimeComponents` →
+        // TimeComponents is a type exported by SystemTime.kz, not a standalone module file.
+        // In this case no error is reported; the symbol is visible through the already-loaded sibling module.
         if let Some(symbol_name) = extract_last_segment(&path_str) {
             let parent_prefix = parent_directory(&path_str);
 
-            // 5a. 先检查已加载的同级模块
+            // 5a. First check already-loaded sibling modules
             let already_exported = self
                 .modules
                 .iter()
@@ -233,14 +236,14 @@ impl ModuleLoader {
                 return None;
             }
 
-            // 5b. 检查 stdlib 嵌入表中尚未加载的同级模块
-            // 遍历 BUILTIN_FILES 和 STD_FILES 中父目录相同的所有文件，
-            // 找到导出该符号的文件并加载它。
+            // 5b. Check sibling modules in the stdlib embed table that have not yet been loaded.
+            // Iterate over all files in BUILTIN_FILES and STD_FILES sharing the same parent directory,
+            // find the file that exports this symbol, and load it.
             for (sibling_file, _) in BUILTIN_FILES.iter().chain(STD_FILES.iter()) {
                 if !sibling_file.starts_with(&parent_prefix) || *sibling_file == path_str {
                     continue;
                 }
-                // 已加载的模块也检查导出
+                // Also check exports of already-loaded modules
                 if let Some(mod_data) = self.modules.get(*sibling_file) {
                     if mod_data.exports.contains(&symbol_name) {
                         self.failed_paths.insert(path_str);
@@ -248,7 +251,7 @@ impl ModuleLoader {
                     }
                     continue;
                 }
-                // 未加载的同级模块：加载并检查导出
+                // Unloaded sibling module: load it and check its exports
                 if let Some(source) = find(sibling_file) {
                     let sibling_static: &'static str =
                         Box::leak(sibling_file.to_string().into_boxed_str());
@@ -265,65 +268,50 @@ impl ModuleLoader {
             }
         }
 
-        // 6. 确实未找到：记录模块未找到
+        // 6. Genuinely not found: record module-not-found
         self.failed_paths.insert(path_str.clone());
         self.load_errors.push(LoadError::ModuleNotFound { path: path_str });
         None
     }
 
-    /// 获取已加载模块的导出符号列表
-    pub fn get_exports(&self, path: &[&str]) -> Option<&FxHashSet<String>> {
-        let path_str = module_path_to_file(path);
-        self.modules.get(&path_str).map(|m| &m.exports)
-    }
-
-    /// 获取已加载的 builtin 模块（按 BUILTIN_FILES 顺序）
+    /// Returns the loaded builtin modules (in `BUILTIN_FILES` order).
     pub fn builtin_modules(&self) -> impl Iterator<Item = (&str, &Module<'static>)> {
         BUILTIN_FILES.iter().filter_map(|(path, _)| {
             self.modules.get(*path).map(|m| (*path, &m.module))
         })
     }
 
-    /// 获取所有已加载模块的数量
-    pub fn loaded_count(&self) -> usize {
-        self.modules.len()
-    }
-
-    /// 判断模块是否已加载
-    pub fn is_loaded(&self, path: &[&str]) -> bool {
-        let path_str = module_path_to_file(path);
-        self.modules.contains_key(&path_str)
-    }
-
-    /// 返回所有加载失败记录（模块未找到 / 解析失败），按发生顺序排列。
+    /// Returns all load failure records (module not found / parse failed), in occurrence order.
     ///
-    /// 调用方应在 sema check 之前检查并报告这些错误，避免因模块缺失引发
-    /// 大量级联类型误报，掩盖真正的根因。
+    /// The caller should inspect and report these errors before running sema checks, to avoid
+    /// a flood of cascading type false positives caused by missing modules that would mask the
+    /// real root cause.
     pub fn load_errors(&self) -> &[LoadError] {
         &self.load_errors
     }
 
-    /// 是否存在加载失败
+    /// Returns whether any load failure has occurred.
     pub fn has_load_errors(&self) -> bool {
         !self.load_errors.is_empty()
     }
 
-    /// 递归加载 `module` 的所有传递依赖（import 的模块）。
+    /// Recursively loads all transitive dependencies (imported modules) of `module`.
     ///
-    /// 后序遍历：被依赖的模块先出现在返回值中，保证调用方按返回顺序
-    /// check 时，被依赖模块的定义已先 populate 到 SemaResult。
-    /// builtin 模块已在 `new()` 中预加载，不包含在返回值中。
+    /// Post-order traversal: depended-on modules appear earlier in the return value, so that
+    /// when the caller checks modules in the returned order, the definitions of depended-on
+    /// modules have already been populated into the `SemaResult`.
+    /// builtin modules are preloaded in `new()` and are not included in the return value.
     ///
-    /// 返回按 check 顺序排列的模块缓存 key（文件路径形式，如 `"std/io/File.kz"`）。
+    /// Returns the module cache keys (in file-path form, e.g. `"std/io/File.kz"`) ordered for checking.
     pub fn load_transitive_imports(&mut self, module: &Module<'_>) -> Vec<String> {
         let mut order: Vec<String> = Vec::new();
-        // visited：已 finalize 的模块（已登记到 order）
+        // visited: finalized modules (already registered in `order`)
         let mut visited: FxHashSet<String> = FxHashSet::default();
-        // visiting：当前栈中正在展开但未 finalize 的模块，用于检测循环依赖
-        // 循环依赖（A↔B）下，第二次遇到 (A,false) 时 visiting.contains(A) 命中，
-        // 直接跳过，避免无限展开。后序遍历对无环部分仍正确。
+        // visiting: modules currently on the stack being expanded but not yet finalized; used for cycle detection.
+        // Under a circular dependency (A↔B), the second time (A, false) is encountered, visiting.contains(A) hits
+        // and we skip it, avoiding infinite expansion. Post-order traversal remains correct for the acyclic parts.
         let mut visiting: FxHashSet<String> = FxHashSet::default();
-        // 栈元素：(模块路径段, 是否已展开收集子依赖)
+        // Stack element: (module path segments, whether child dependencies have been collected)
         let mut stack: Vec<(Vec<String>, bool)> = collect_imports(module)
             .into_iter()
             .map(|(p, _)| (p.iter().map(|s| s.to_string()).collect::<Vec<String>>(), false))
@@ -336,7 +324,7 @@ impl ModuleLoader {
                 continue;
             }
             if !expanded {
-                // 循环依赖检测：若 key 已在当前展开路径中，记录错误并跳过避免无限循环
+                // Cycle detection: if `key` is already on the current expansion path, record an error and skip to avoid infinite loops
                 if visiting.contains(&key) {
                     self.load_errors.push(LoadError::CircularImport {
                         path: key.clone(),
@@ -344,7 +332,7 @@ impl ModuleLoader {
                     continue;
                 }
                 visiting.insert(key.clone());
-                // 首次访问：先收集子依赖路径（owned），再重新入栈自己
+                // First visit: collect child dependency paths (owned), then push self back onto the stack
                 let mut child_segs_list: Vec<Vec<String>> = Vec::new();
                 if let Some(dep) = self.resolve_and_load(&path_refs) {
                     for (child_path, _) in collect_imports(dep) {
@@ -352,17 +340,17 @@ impl ModuleLoader {
                             child_path.iter().map(|s| s.to_string()).collect::<Vec<String>>(),
                         );
                     }
-                    // 目录模块：pack.kz 中声明的子模块也需加入 check 顺序
-                    // 例如 import Store → pack.kz 声明 pub pack Memory → 子模块路径 ["Store", "Memory"]
+                    // Directory module: submodules declared in pack.kz must also be added to the check order
+                    // e.g. `import Store` → pack.kz declares `pub pack Memory` → submodule path ["Store", "Memory"]
                     for sub_name in collect_pack_submodules(dep) {
                         let mut child_segs: Vec<String> = path_segments.clone();
                         child_segs.push(sub_name.to_string());
                         child_segs_list.push(child_segs);
                     }
                 }
-                // 自己重新入栈（标记 expanded），等子依赖处理完后再登记到 order
+                // Push self back onto the stack (marked expanded); register it into `order` after its children are processed
                 stack.push((path_segments, true));
-                // 子依赖入栈（LIFO 保证后序：子依赖先于自己登记到 order）
+                // Push children onto the stack (LIFO ensures post-order: children are registered into `order` before self)
                 for child_segs in child_segs_list {
                     stack.push((child_segs, false));
                 }
@@ -375,12 +363,12 @@ impl ModuleLoader {
         order
     }
 
-    /// 按缓存 key 获取已加载模块（key 为 `module_path_to_file` 的返回值，如 `"std/io/File.kz"`）。
+    /// Returns the loaded module by cache key (key is the return value of `module_path_to_file`, e.g. `"std/io/File.kz"`).
     pub fn get_module_by_key(&self, key: &str) -> Option<&Module<'static>> {
         self.modules.get(key).map(|m| &m.module)
     }
 
-    /// 返回所有已加载模块的缓存 key（文件路径形式，如 `"std/io/File.kz"`）。
+    /// Returns the cache keys of all loaded modules (in file-path form, e.g. `"std/io/File.kz"`).
     pub fn loaded_keys(&self) -> Vec<String> {
         self.modules.keys().map(|s| s.to_string()).collect()
     }
@@ -392,9 +380,9 @@ impl Default for ModuleLoader {
     }
 }
 
-// ─── 辅助函数 ──────────────────────────────────────────────────────
+// ─── Helper functions ──────────────────────────────────────────────
 
-/// 模块路径段 → 文件路径
+/// Converts module path segments to a file path.
 /// `["std", "io", "File"]` → `"std/io/File.kz"`
 fn module_path_to_file(path: &[&str]) -> String {
     let joined = path.join("/");
@@ -405,7 +393,7 @@ fn module_path_to_file(path: &[&str]) -> String {
     }
 }
 
-/// 从文件路径中提取最后一段的模块名（去掉 .kz 后缀）
+/// Extracts the last path segment as the module name (stripping the `.kz` suffix).
 /// `"std/time/TimeComponents.kz"` → `"TimeComponents"`
 fn extract_last_segment(path: &str) -> Option<String> {
     path.rsplit('/')
@@ -414,7 +402,7 @@ fn extract_last_segment(path: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// 获取文件路径的父目录前缀
+/// Returns the parent directory prefix of a file path.
 /// `"std/time/TimeComponents.kz"` → `"std/time/"`
 fn parent_directory(path: &str) -> String {
     match path.rfind('/') {
@@ -423,15 +411,16 @@ fn parent_directory(path: &str) -> String {
     }
 }
 
-/// 解析源码为 Module<'static>
+/// Parses source code into a `Module<'static>`.
 ///
-/// source 和 path 必须是 'static（stdlib 的 include_str! 或 Box::leak 的用户源码）。
-/// arena 通过 Box::leak 变为 'static，确保 Module<'static> 可安全缓存。
+/// `source` and `path` must be `'static` (stdlib's `include_str!` or user source via `Box::leak`).
+/// The arena is made `'static` via `Box::leak`, ensuring the `Module<'static>` is safe to cache.
 ///
-/// 返回 `Result`：解析成功返回 Module，致命解析错误返回 `ParseError`。
-/// 非致命解析错误（parser 已恢复）通过 stderr 输出为警告，不阻断加载。
+/// Returns a `Result`: on success the `Module`; on a fatal parse error, a `ParseError`.
+/// Non-fatal parse errors (already recovered by the parser) are emitted to stderr as warnings
+/// and do not block loading.
 fn parse_source(path: &'static str, source: &'static str) -> Result<Module<'static>, ParseError> {
-    // Box::leak arena：编译器进程内长期存活，退出时由 OS 回收
+    // Box::leak arena: lives for the duration of the compiler process; reclaimed by the OS on exit
     let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
 
     let mut lexer = Lexer::new(source);
@@ -444,7 +433,7 @@ fn parse_source(path: &'static str, source: &'static str) -> Result<Module<'stat
 
     match parser.parse_module(path) {
         Ok(module) => {
-            // 非致命 parse 错误（parser 已恢复）：输出警告，模块仍可用
+            // Non-fatal parse errors (already recovered by the parser): emit warnings; the module is still usable
             for err in parser.errors() {
                 eprintln!(
                     "Warning: parse error in {} at {}:{}: {}",
@@ -457,10 +446,10 @@ fn parse_source(path: &'static str, source: &'static str) -> Result<Module<'stat
     }
 }
 
-/// 收集模块的公开导出符号
+/// Collects the public export symbols of a module.
 ///
-/// 遍历 Module.declarations，收集所有 pub 可见性的函数/类型名称。
-/// 用于后续 import 别名注册。
+/// Iterates over `Module.declarations`, collecting the names of all `pub`-visibility
+/// functions/types. Used later for import alias registration.
 fn collect_exports(module: &Module<'_>) -> FxHashSet<String> {
     let mut exports = FxHashSet::default();
     for decl in &module.declarations {
@@ -491,12 +480,12 @@ fn collect_exports(module: &Module<'_>) -> FxHashSet<String> {
     exports
 }
 
-/// 从模块的 `pub pack <Name>` 声明中提取子模块名列表。
+/// Extracts the list of submodule names from a module's `pub pack <Name>` declarations.
 ///
-/// 目录模块的 `pack.kz` 通过 PackDecl 声明其包含的子模块。
-/// 例如 `Store/pack.kz` 中的 `pub pack Memory` → 返回 `["Memory"]`。
-/// `load_transitive_imports` 用此结果构造子模块路径（如 `["Store", "Memory"]`），
-/// 确保子模块被加入 check 顺序。
+/// A directory module's `pack.kz` declares its contained submodules via `PackDecl`.
+/// For example, `pub pack Memory` in `Store/pack.kz` → returns `["Memory"]`.
+/// `load_transitive_imports` uses this result to construct submodule paths (e.g. `["Store", "Memory"]`),
+/// ensuring submodules are added to the check order.
 fn collect_pack_submodules<'a>(module: &'a Module<'a>) -> Vec<&'a str> {
     let mut subs = Vec::new();
     for decl in &module.declarations {
@@ -511,11 +500,11 @@ fn collect_pack_submodules<'a>(module: &'a Module<'a>) -> Vec<&'a str> {
     subs
 }
 
-// ─── ImportDecl 遍历辅助 ───────────────────────────────────────────
+// ─── ImportDecl traversal helpers ──────────────────────────────────
 
-/// 遍历模块中的 ImportDecl，返回 (module_path, items) 列表
+/// Traverses the `ImportDecl`s in a module, returning a list of `(module_path, items)`.
 ///
-/// 用于编译入口在 check_module 前批量处理 import。
+/// Used by the compilation entry point to batch-process imports before `check_module`.
 pub fn collect_imports<'a>(
     module: &'a Module<'a>,
 ) -> Vec<(Vec<&'a str>, Option<&'a [ImportItem<'a>]>)> {
