@@ -1,0 +1,20 @@
+// CastError: cast builder 转换失败时的错误类型
+//
+// 用途：
+//   - cast(x).try_to(T) 在值域越界 / str 解析失败 / 产生 Inf 时返回 Throw<T, CastError>
+//   - 字段语义：
+//       msg   : 错误描述（人类可读）
+//       from  : 源类型名（如 "i64"）
+//       to    : 目标类型名（如 "i32"）
+//       value : 源值的字符串表示（如 "9999999999"）
+//
+// 作为 builtin error_newtype，自动获得 Error trait 的 message() 默认实现（读 msg 字段）。
+// type_name() override 返回 "cast error"，便于在日志中识别。
+type CastError: Err = CastError(
+    msg: str,
+    from: str,
+    to: str,
+    value: str,
+) {
+    override fun type_name(self): str { "cast error" }
+}

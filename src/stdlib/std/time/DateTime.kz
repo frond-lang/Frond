@@ -1,0 +1,164 @@
+// DateTime.kz — 日历表示 + 格式化（纯 Kuzo）
+//
+// 设计文档 §5.7：DateTime newtype + 算术 + strftime-like 格式化
+// 所有日历运算（add_days 等）委托给 Calendar 模块的纯函数
+// pad_int / digit_char 等格式化辅助全部用 Kuzo 实现——决策 S11（不引入 __format_int 原语）
+
+pub type DateTime = DateTime(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8, nanos: u32, weekday: u8, day_of_year: u16) {
+    // ─── 与 TimeComponents 转换 ────────────────────────────────────────
+
+    pub fun to_components(self): TimeComponents {
+        TimeComponents(self.year, self.month, self.day, self.hour, self.minute, self.second, self.nanos, self.weekday, self.day_of_year)
+    }
+
+    // ─── 日期算术 ─────────────────────────────────────────────────────
+
+    // 加天数（委托 Calendar.add_days，重算 weekday 与 day_of_year）
+    pub fun add_days(self, days: i64): DateTime {
+        val new_ymd = Calendar.add_days(self.year, self.month, self.day, days)
+        DateTime(new_ymd.year, new_ymd.month, new_ymd.day, self.hour, self.minute, self.second, self.nanos, Calendar.weekday_of(new_ymd.year, new_ymd.month, new_ymd.day), Calendar.day_of_year(new_ymd.year, new_ymd.month, new_ymd.day))
+    }
+
+    // 加 Duration（通过 UTC 分量往返转换，纯 Kuzo 算法）
+    // 调用 SystemTime 的纯 Kuzo 转换函数（替代原 __components_to_ns_utc / __systemtime_to_utc_components syscall）
+    pub fun add_duration(self, d: Duration): Throw<DateTime, TimeError> {
+        val comp = self.to_components()
+        val ns = std.time.SystemTime.components_to_ns_utc(comp)?
+        val new_ns = ns + d.as_nanos()
+        val new_comp = std.time.SystemTime.to_utc_components(new_ns)
+        Ok(std.time.DateTime.from_components(new_comp))
+    }
+
+    // ─── strftime-like 格式化 ─────────────────────────────────────────
+
+    // 支持占位符：%Y %m %d %H %M %S %y %j %A %a %B %b %e %%
+    pub fun format(self, pattern: str): str {
+        var result: str = ""
+        var i: usize = 0
+        while i < pattern.len() {
+            val c = pattern[i]
+            if c == '%' {
+                i = i + 1
+                if i >= pattern.len() { return result + "%" }
+                val spec = pattern[i]
+                val piece = match spec {
+                    'Y' => pad_int(cast(self.year).to(i64), 4),
+                    'm' => pad_int(cast(self.month).to(i64), 2),
+                    'd' => pad_int(cast(self.day).to(i64), 2),
+                    'H' => pad_int(cast(self.hour).to(i64), 2),
+                    'M' => pad_int(cast(self.minute).to(i64), 2),
+                    'S' => pad_int(cast(self.second).to(i64), 2),
+                    'y' => pad_int(cast(self.year % 100).to(i64), 2),
+                    'j' => pad_int(cast(self.day_of_year).to(i64), 3),
+                    'A' => weekday_name(self.weekday),
+                    'a' => weekday_abbr(self.weekday),
+                    'B' => month_name(self.month),
+                    'b' => month_abbr(self.month),
+                    'e' => if self.day < 10 {
+                        " " + pad_int(cast(self.day).to(i64), 1)
+                    } else {
+                        pad_int(cast(self.day).to(i64), 2)
+                    },
+                    '%' => "%",
+                    _ => "%" + cast(spec).to(str),
+                }
+                result = result + piece
+            } else {
+                result = result + cast(c).to(str)
+            }
+            i = i + 1
+        }
+        result
+    }
+
+    // ─── ISO 8601 ─────────────────────────────────────────────────────
+
+    pub fun to_iso8601(self): str {
+        pad_int(cast(self.year).to(i64), 4) + "-" +
+        pad_int(cast(self.month).to(i64), 2) + "-" +
+        pad_int(cast(self.day).to(i64), 2) + "T" +
+        pad_int(cast(self.hour).to(i64), 2) + ":" +
+        pad_int(cast(self.minute).to(i64), 2) + ":" +
+        pad_int(cast(self.second).to(i64), 2)
+    }
+}
+
+// ─── 顶层自由函数（无 self）────────────────────────────────────────
+
+pub fun from_components(comp: TimeComponents): DateTime {
+    DateTime(comp.year, comp.month, comp.day, comp.hour, comp.minute, comp.second, comp.nanos, comp.weekday, comp.day_of_year)
+}
+
+// ─── 格式化辅助 ───────────────────────────────────────────────────
+
+// 整数转字符串 + 零填充（纯 Kuzo 实现，决策 S11）
+pub fun pad_int(value: i64, width: usize): str {
+    val sign: str = if value < 0 { "-" } else { "" }
+    var abs_val = if value < 0 { -value } else { value }
+    var digits: str = ""
+    if abs_val == 0 {
+        digits = "0"
+    } else {
+        while abs_val > 0 {
+            digits = digit_char(abs_val % 10) + digits
+            abs_val = abs_val / 10
+        }
+    }
+    var total_len = digits.len()
+    var leading = ""
+    while total_len < width {
+        leading = leading + "0"
+        total_len = total_len + 1
+    }
+    sign + leading + digits
+}
+
+pub fun digit_char(d: i64): str {
+    match d {
+        0 => "0", 1 => "1", 2 => "2", 3 => "3", 4 => "4",
+        5 => "5", 6 => "6", 7 => "7", 8 => "8", 9 => "9",
+        _ => "?",
+    }
+}
+
+pub fun month_name(m: u8): str {
+    match m {
+        1 => "January",   2 => "February", 3 => "March",    4 => "April",
+        5 => "May",       6 => "June",     7 => "July",     8 => "August",
+        9 => "September", 10 => "October",  11 => "November", 12 => "December",
+        _ => "Unknown",
+    }
+}
+
+pub fun month_abbr(m: u8): str {
+    match m {
+        1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
+        5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
+        9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
+        _ => "???",
+    }
+}
+
+pub fun weekday_name(w: u8): str {
+    match w {
+        0 => "Sunday", 1 => "Monday", 2 => "Tuesday", 3 => "Wednesday",
+        4 => "Thursday", 5 => "Friday", 6 => "Saturday",
+        _ => "Unknown",
+    }
+}
+
+pub fun weekday_abbr(w: u8): str {
+    match w {
+        0 => "Sun", 1 => "Mon", 2 => "Tue", 3 => "Wed",
+        4 => "Thu", 5 => "Fri", 6 => "Sat",
+        _ => "???",
+    }
+}
+
+// parse 实现：解析 ISO 8601 字符串为 DateTime
+// 已知阻塞：Kuzo 引擎存在函数内调用其他函数后变量绑定错位的 bug
+// （parse_digits_at 在 parse 外直接调用返回正确值，在 parse 内调用后
+//   最终 Ok(DateTime(...)) 构造时 year/month 字段值错位）
+// 待引擎修复后补全实现，参考下方已验证逻辑：
+// pub fun parse_digits_at(s: str, pos: usize, count: usize): i64 { ... }
+// pub fun parse(s: str): Throw<DateTime, TimeError> { ... }

@@ -1,0 +1,4 @@
+// builtin net 包声明
+//
+// 暴露 Net 原语模块给所有 Kuzo 用户代码默认可见（builtin 默认全可见）。
+pub pack Raw

@@ -1,0 +1,149 @@
+// Buffered.kz — BufReader + BufWriter
+//
+// 设计文档 §4.5：缓冲 IO 包装
+// BufReader 维护 (inner File, buf u8[], pos usize, cap usize) 状态机：
+//   pos 当前读位置，cap 已填充字节长度；pos >= cap 时触发下层 read 填充。
+// BufWriter 维护 (inner File, buf u8[], pos usize) 状态机：
+//   pos 当前写位置；pos == buf.len() 时触发 flush 到下层 write。
+// 所有方法为 async，返回 Async<Throw<T, IOError>>。
+
+// ─── 类型定义 ──────────────────────────────────────────────────────
+
+pub type BufReader = BufReader(inner: File, buf: u8[], pos: usize, cap: usize) {
+    // ─── BufReader 方法 ────────────────────────────────────────────
+
+    // 读取一行（直到 '\n' 或 EOF）
+    // 返回不含 '\n' 的内容；EOF 时返回空串表示流结束
+    // 优化：用 str 累积整段切片（走 concatInPlace amortized O(n)），避免 u8[] ++ 的 O(n²)
+    pub async fun read_line(self): Async<Throw<str, IOError>> {
+        var result: str = ""
+        loop {
+            if self.pos >= self.cap {
+                self.pos = 0
+                self.buf = self.inner.read(File.DEFAULT_BUF_SIZE).await()?
+                self.cap = self.buf.len()
+                if self.cap == 0 {
+                    return Ok(result)
+                }
+            }
+            // 扫描 buf 寻找 '\n'，记录本段起点
+            val seg_start = self.pos
+            var found_newline = false
+            while self.pos < self.cap {
+                val b = self.buf[self.pos]
+                self.pos = self.pos + 1
+                if b == cast('\n').to(u8) {
+                    found_newline = true
+                    break
+                }
+            }
+            // 将本段（不含 '\n'）追加到 result
+            val seg_end = if found_newline { self.pos - 1 } else { self.pos }
+            if seg_end > seg_start {
+                result = result + cast(self.buf[seg_start..seg_end]).to(str)
+            }
+            if found_newline {
+                return Ok(result)
+            }
+        }
+    }
+
+    // 读取全部剩余字节到 u8[]
+    // 优化：用 str 累积整段切片（amortized O(n)），最后 .bytes() 转 u8[]
+    pub async fun read_to_end(self): Async<Throw<u8[], IOError>> {
+        var result: str = ""
+        loop {
+            if self.pos >= self.cap {
+                self.pos = 0
+                self.buf = self.inner.read(File.DEFAULT_BUF_SIZE).await()?
+                self.cap = self.buf.len()
+                if self.cap == 0 {
+                    return Ok(result.bytes())
+                }
+            }
+            val chunk = self.buf[self.pos..self.cap]
+            result = result + cast(chunk).to(str)
+            self.pos = self.cap
+        }
+    }
+
+    // 读取全部剩余字节并按 UTF-8 解码为 str
+    pub async fun read_to_string(self): Async<Throw<str, IOError>> {
+        val bytes = self.read_to_end().await()?
+        cast(bytes).to(str)
+    }
+
+    // 读取单字节；EOF 返回 null
+    pub async fun read_byte(self): Async<Throw<u8?, IOError>> {
+        if self.pos >= self.cap {
+            self.pos = 0
+            self.buf = self.inner.read(File.DEFAULT_BUF_SIZE).await()?
+            self.cap = self.buf.len()
+            if self.cap == 0 { return Ok(null) }
+        }
+        val b = self.buf[self.pos]
+        self.pos = self.pos + 1
+        Ok(b)
+    }
+}
+
+pub type BufWriter = BufWriter(inner: File, buf: u8[], pos: usize) {
+    // ─── BufWriter 方法 ────────────────────────────────────────────
+
+    // 写入字节序列；缓冲满时自动 flush
+    pub async fun write(self, data: u8[]): Async<Throw<void, IOError>> {
+        var i: usize = 0
+        while i < data.len() {
+            while self.pos < self.buf.len() && i < data.len() {
+                self.buf[self.pos] = data[i]
+                self.pos = self.pos + 1
+                i = i + 1
+            }
+            if self.pos == self.buf.len() {
+                self.flush().await()?
+            }
+        }
+        Ok(void)
+    }
+
+    // 写入字符串（UTF-8 字节序列）
+    pub async fun write_str(self, s: str): Async<Throw<void, IOError>> {
+        self.write(s.bytes()).await()?
+        Ok(void)
+    }
+
+    // 写入字符串并追加换行
+    pub async fun write_line(self, s: str): Async<Throw<void, IOError>> {
+        self.write_str(s).await()?
+        self.write_str("\n").await()?
+        Ok(void)
+    }
+
+    // 将缓冲区剩余字节全部写入下层 File
+    pub async fun flush(self): Async<Throw<void, IOError>> {
+        if self.pos > 0 {
+            var written: usize = 0
+            while written < self.pos {
+                val chunk = self.buf[written..self.pos]
+                val n = self.inner.write(chunk, chunk.len()).await()?
+                if n == 0 {
+                    // 写入 0 字节但仍有未写数据——避免死循环，按 BrokenPipe 处理
+                    throw IOError(BrokenPipe, "flush: write returned 0", 32, self.inner.path)
+                }
+                written = written + n
+            }
+            self.pos = 0
+        }
+        Ok(void)
+    }
+}
+
+// ─── 构造器 ────────────────────────────────────────────────────────
+
+pub fun new_reader(file: File): BufReader {
+    BufReader(file, [], 0, 0)
+}
+
+pub fun new_writer(file: File): BufWriter {
+    BufWriter(file, [0u8, ..File.DEFAULT_BUF_SIZE], 0)
+}

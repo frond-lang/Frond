@@ -1,0 +1,57 @@
+// Fs.kz — 一次性读写便捷函数
+//
+// 设计文档 §4.7：Fs 便捷 API
+// 将 File.open + read/write + close 三步组合为单次调用，
+// 适合脚本化场景；高吞吐场景请直接使用 File + Buffered。
+
+// ─── 文本 IO ──────────────────────────────────────────────────────
+
+// 一次性读取文件全部内容为 str
+pub async fun read_file(path: str): Async<Throw<str, IOError>> {
+    val f = File.open(path, File.read_only()).await()?
+    defer f.close().await()
+    val reader = Buffered.new_reader(f)
+    reader.read_to_string().await()?
+}
+
+// 一次性读取文件全部内容为 str（Path 重载）
+pub async fun read_file_path(path: Path): Async<Throw<str, IOError>> {
+    read_file(path.to_str()).await()?
+}
+
+// 一次性写入 str 到文件（覆盖已有内容）
+pub async fun write_file(path: str, content: str): Async<Throw<void, IOError>> {
+    val f = File.open(path, File.create_rw()).await()?
+    defer f.close().await()
+    val writer = Buffered.new_writer(f)
+    writer.write_str(content).await()?
+    writer.flush().await()?
+    Ok(void)
+}
+
+// 追加写入 str 到文件末尾
+pub async fun append_file(path: str, content: str): Async<Throw<void, IOError>> {
+    val f = File.open(path, File.append_mode()).await()?
+    defer f.close().await()
+    val bytes = content.bytes()
+    f.write(bytes, bytes.len()).await()?
+    Ok(void)
+}
+
+// ─── 字节 IO ──────────────────────────────────────────────────────
+
+// 一次性读取文件全部字节
+pub async fun read_file_bytes(path: str): Async<Throw<u8[], IOError>> {
+    val f = File.open(path, File.read_only()).await()?
+    defer f.close().await()
+    val reader = Buffered.new_reader(f)
+    reader.read_to_end().await()?
+}
+
+// 一次性写入字节到文件（覆盖已有内容）
+pub async fun write_file_bytes(path: str, content: u8[]): Async<Throw<void, IOError>> {
+    val f = File.open(path, File.create_rw()).await()?
+    defer f.close().await()
+    f.write(content, content.len()).await()?
+    Ok(void)
+}

@@ -1,0 +1,37 @@
+// Instant.kz — 单调时钟（同步）
+//
+// 设计文档 §5.4：Instant newtype + 单调时钟操作
+// Instant 基于 CLOCK_MONOTONIC，适合测量时间间隔（不受系统时间调整影响）。
+// 同步实现（廉价 syscall，async 化反而啰嗦）——决策 S04。
+// 跨协程传递时 i128 内部值深拷贝合法——决策 S12。
+
+pub type Instant = Instant(nanos: i128) {
+    // ─── 时间间隔 ──────────────────────────────────────────────────────
+
+    // 从 now 到 self 的时间长度
+    pub fun elapsed(self): Duration {
+        Duration(__instant_now_ns() - self.nanos)
+    }
+
+    // self 相对 earlier 的时间长度（self - earlier，可为负）
+    pub fun duration_since(self, earlier: Instant): Duration {
+        Duration(self.nanos - earlier.nanos)
+    }
+
+    // ─── 加减 Duration ─────────────────────────────────────────────────
+
+    pub fun add_duration(self, d: Duration): Instant {
+        Instant(self.nanos + d.nanos)
+    }
+
+    pub fun sub_duration(self, d: Duration): Instant {
+        Instant(self.nanos - d.nanos)
+    }
+}
+
+// ─── 当前时刻 ──────────────────────────────────────────────────────
+
+// 获取当前单调时钟时刻
+pub fun now(): Instant {
+    Instant(__instant_now_ns())
+}

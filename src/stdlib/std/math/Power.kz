@@ -1,0 +1,1197 @@
+// Math 标准库 — 幂指对数 + 数论
+//
+// 纯 Kuzo 实现，算法：Newton-Raphson（sqrt/cbrt）、Taylor + 参数缩减（exp/log）。
+// 依赖 Round.kz 的 floor/trunc/fmod/ldexp 实现。
+// 泛型函数使用 match type_name(x) 按类型分发到对应精度实现。
+
+// ─── sqrt（平方根，Newton-Raphson）───
+// g_{n+1} = (g_n + x/g_n) / 2，负数返回 NaN，0 返回 0
+// 先将 x 规范化到 [1, 4) 提取偶数指数 e，对尾数迭代后用 ldexp 还原
+
+fun sqrt_f64_impl(x: f64): f64 {
+    if x < 0.0 { return 0.0 / 0.0 }
+    if x == 0.0 { return 0.0 }
+    var e = 0
+    var m = x
+    while m >= 4.0 {
+        m = m / 4.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 4.0
+        e = e - 1
+    }
+    var g = (m + 1.0) / 2.0
+    var i = 0
+    while i < 20 {
+        g = (g + m / g) / 2.0
+        i = i + 1
+    }
+    ldexp_f64_impl(g, e)
+}
+fun sqrt_f32_impl(x: f32): f32 {
+    if x < 0.0 { return 0.0 / 0.0 }
+    if x == 0.0 { return 0.0 }
+    var e = 0
+    var m = x
+    while m >= 4.0 {
+        m = m / 4.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 4.0
+        e = e - 1
+    }
+    var g = (m + 1.0) / 2.0
+    var i = 0
+    while i < 12 {
+        g = (g + m / g) / 2.0
+        i = i + 1
+    }
+    ldexp_f32_impl(g, e)
+}
+fun sqrt_f16_impl(x: f16): f16 {
+    if x < 0.0 { return 0.0 / 0.0 }
+    if x == 0.0 { return 0.0 }
+    var e = 0
+    var m = x
+    while m >= 4.0 {
+        m = m / 4.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 4.0
+        e = e - 1
+    }
+    var g = (m + 1.0) / 2.0
+    var i = 0
+    while i < 6 {
+        g = (g + m / g) / 2.0
+        i = i + 1
+    }
+    ldexp_f16_impl(g, e)
+}
+fun sqrt_f128_impl(x: f128): f128 {
+    if x < 0.0 { return 0.0 / 0.0 }
+    if x == 0.0 { return 0.0 }
+    var e = 0
+    var m = x
+    while m >= 4.0 {
+        m = m / 4.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 4.0
+        e = e - 1
+    }
+    var g = (m + 1.0) / 2.0
+    var i = 0
+    while i < 40 {
+        g = (g + m / g) / 2.0
+        i = i + 1
+    }
+    ldexp_f128_impl(g, e)
+}
+
+pub fun sqrt<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(sqrt_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(sqrt_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(sqrt_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(sqrt_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── cbrt（立方根，Newton-Raphson）───
+// g_{n+1} = (2*g + x/(g*g)) / 3，0 返回 0
+// 取绝对值后规范化到 [1, 8) 提取指数 e，cbrt(x) = cbrt(m) * 2^e，最后恢复符号
+
+fun cbrt_f64_impl(x: f64): f64 {
+    if x == 0.0 { return 0.0 }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    var m = a
+    while m >= 8.0 {
+        m = m / 8.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 8.0
+        e = e - 1
+    }
+    var g = m
+    var i = 0
+    while i < 25 {
+        g = (2.0 * g + m / (g * g)) / 3.0
+        i = i + 1
+    }
+    val r = ldexp_f64_impl(g, e)
+    if x < 0.0 { 0.0 - r } else { r }
+}
+fun cbrt_f32_impl(x: f32): f32 {
+    if x == 0.0 { return 0.0 }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    var m = a
+    while m >= 8.0 {
+        m = m / 8.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 8.0
+        e = e - 1
+    }
+    var g = m
+    var i = 0
+    while i < 15 {
+        g = (2.0 * g + m / (g * g)) / 3.0
+        i = i + 1
+    }
+    val r = ldexp_f32_impl(g, e)
+    if x < 0.0 { 0.0 - r } else { r }
+}
+fun cbrt_f16_impl(x: f16): f16 {
+    if x == 0.0 { return 0.0 }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    var m = a
+    while m >= 8.0 {
+        m = m / 8.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 8.0
+        e = e - 1
+    }
+    var g = m
+    var i = 0
+    while i < 8 {
+        g = (2.0 * g + m / (g * g)) / 3.0
+        i = i + 1
+    }
+    val r = ldexp_f16_impl(g, e)
+    if x < 0.0 { 0.0 - r } else { r }
+}
+fun cbrt_f128_impl(x: f128): f128 {
+    if x == 0.0 { return 0.0 }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    var m = a
+    while m >= 8.0 {
+        m = m / 8.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 8.0
+        e = e - 1
+    }
+    var g = m
+    var i = 0
+    while i < 50 {
+        g = (2.0 * g + m / (g * g)) / 3.0
+        i = i + 1
+    }
+    val r = ldexp_f128_impl(g, e)
+    if x < 0.0 { 0.0 - r } else { r }
+}
+
+pub fun cbrt<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(cbrt_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(cbrt_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(cbrt_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(cbrt_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── exp（指数，Taylor + 参数缩减）───
+// x = k*ln2 + r, |r| <= ln2/2, exp(x) = 2^k * exp(r)
+// exp(r) = 1 + r + r²/2! + r³/3! + ...
+// 大 x 直接返回 Inf/0 以避免 ldexp 死循环
+
+fun exp_f64_impl(x: f64): f64 {
+    val ln2 = 0x1.62e42fefa39efp-1
+    if x == 0.0 { return 1.0 }
+    if x > 709.782712893384 { return 1.0 / 0.0 }
+    if x < -745.1332191019412 { return 0.0 }
+    val k = cast(floor_f64_impl(x / ln2 + 0.5)).to(i32)
+    val r = x - cast(k).to(f64) * ln2
+    var term = 1.0
+    var sum = 1.0
+    var i = 1
+    while i < 15 {
+        term = term * r / cast(i).to(f64)
+        sum = sum + term
+        i = i + 1
+    }
+    ldexp_f64_impl(sum, k)
+}
+fun exp_f32_impl(x: f32): f32 {
+    val ln2 = 0x1.62e42fefa39efp-1
+    if x == 0.0 { return 1.0 }
+    if x > 88.722839052 { return 1.0 / 0.0 }
+    if x < -103.972085 { return 0.0 }
+    val k = cast(floor_f32_impl(x / ln2 + 0.5)).to(i32)
+    val r = x - cast(k).to(f32) * ln2
+    var term = 1.0
+    var sum = 1.0
+    var i = 1
+    while i < 10 {
+        term = term * r / cast(i).to(f32)
+        sum = sum + term
+        i = i + 1
+    }
+    ldexp_f32_impl(sum, k)
+}
+fun exp_f16_impl(x: f16): f16 {
+    val ln2 = 0x1.63p-1f16
+    if x == 0.0 { return 1.0 }
+    if x > 11.09 { return 1.0 / 0.0 }
+    if x < -17.32 { return 0.0 }
+    val k = cast(floor_f16_impl(x / ln2 + 0.5)).to(i32)
+    val r = x - cast(k).to(f16) * ln2
+    var term = 1.0
+    var sum = 1.0
+    var i = 1
+    while i < 5 {
+        term = term * r / cast(i).to(f16)
+        sum = sum + term
+        i = i + 1
+    }
+    ldexp_f16_impl(sum, k)
+}
+fun exp_f128_impl(x: f128): f128 {
+    val ln2: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1f128
+    if x == 0.0 { return cast(1.0).to(f128) }
+    if x > 11356.523711074 { return 1.0 / 0.0 }
+    if x < -11399.0 { return cast(0.0).to(f128) }
+    val k = cast(floor_f128_impl(x / ln2 + 0.5)).to(i32)
+    val r = x - cast(k).to(f128) * ln2
+    var term: f128 = 1.0
+    var sum: f128 = 1.0
+    var i = 1
+    while i < 30 {
+        term = term * r / cast(i).to(f128)
+        sum = sum + term
+        i = i + 1
+    }
+    ldexp_f128_impl(sum, k)
+}
+
+pub fun exp<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(exp_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(exp_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(exp_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(exp_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── log（自然对数，参数缩减 + atanh 级数）───
+// 提取指数 e 使 m = x/2^e ∈ [1, 2)，log(x) = e*ln2 + log(m)
+// 令 s = (m-1)/(m+1) ∈ [0, 1/3]，log(m) = 2*(s + s³/3 + s⁵/5 + ...)
+// atanh 级数 |s|≤1/3 收敛快、无符号分支、无交替相消，精度远优于 Taylor
+// x == 0 返回 -Inf，x < 0 返回 NaN
+
+fun log_f64_impl(x: f64): f64 {
+    val ln2 = 0x1.62e42fefa39efp-1
+    if x == 0.0 { return -1.0 / 0.0 }
+    if x < 0.0 { return 0.0 / 0.0 }
+    var e = 0
+    var m = x
+    while m >= 2.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        e = e - 1
+    }
+    val s = (m - 1.0) / (m + 1.0)
+    val s2 = s * s
+    var term = s
+    var sum = s
+    var i = 3
+    while i <= 41 {
+        term = term * s2
+        sum = sum + term / cast(i).to(f64)
+        i = i + 2
+    }
+    2.0 * sum + cast(e).to(f64) * ln2
+}
+fun log_f32_impl(x: f32): f32 {
+    val ln2 = 0x1.62e42fefa39efp-1
+    if x == 0.0 { return -1.0 / 0.0 }
+    if x < 0.0 { return 0.0 / 0.0 }
+    var e = 0
+    var m = x
+    while m >= 2.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        e = e - 1
+    }
+    val s = (m - 1.0) / (m + 1.0)
+    val s2 = s * s
+    var term = s
+    var sum = s
+    var i = 3
+    while i <= 25 {
+        term = term * s2
+        sum = sum + term / cast(i).to(f32)
+        i = i + 2
+    }
+    2.0 * sum + cast(e).to(f32) * ln2
+}
+fun log_f16_impl(x: f16): f16 {
+    val ln2 = 0x1.63p-1f16
+    if x == 0.0 { return -1.0 / 0.0 }
+    if x < 0.0 { return 0.0 / 0.0 }
+    var e = 0
+    var m = x
+    while m >= 2.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        e = e - 1
+    }
+    val s = (m - 1.0) / (m + 1.0)
+    val s2 = s * s
+    var term = s
+    var sum = s
+    var i = 3
+    while i <= 13 {
+        term = term * s2
+        sum = sum + term / cast(i).to(f16)
+        i = i + 2
+    }
+    2.0 * sum + cast(e).to(f16) * ln2
+}
+fun log_f128_impl(x: f128): f128 {
+    val ln2: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1f128
+    if x == 0.0 { return -1.0 / 0.0 }
+    if x < 0.0 { return 0.0 / 0.0 }
+    var e = 0
+    var m = x
+    while m >= 2.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        e = e - 1
+    }
+    val s = (m - cast(1.0).to(f128)) / (m + cast(1.0).to(f128))
+    val s2 = s * s
+    var term: f128 = s
+    var sum: f128 = s
+    var i = 3
+    while i <= 121 {
+        term = term * s2
+        sum = sum + term / cast(i).to(f128)
+        i = i + 2
+    }
+    cast(2.0).to(f128) * sum + cast(e).to(f128) * ln2
+}
+
+pub fun log<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(log_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(log_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(log_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(log_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── pow（幂，exp(exp * log(base))）───
+// 处理 base <= 0 边界：base>0 走公式；base==0 按 exp 符号返回；base<0 返回 NaN
+
+fun pow_f64_impl(base: f64, exp: f64): f64 {
+    if base > 0.0 { return exp_f64_impl(exp * log_f64_impl(base)) }
+    if base == 0.0 {
+        if exp == 0.0 { return 1.0 }
+        if exp > 0.0 { return 0.0 }
+        return 1.0 / 0.0
+    }
+    0.0 / 0.0
+}
+fun pow_f32_impl(base: f32, exp: f32): f32 {
+    if base > 0.0 { return exp_f32_impl(exp * log_f32_impl(base)) }
+    if base == 0.0 {
+        if exp == 0.0 { return 1.0 }
+        if exp > 0.0 { return 0.0 }
+        return 1.0 / 0.0
+    }
+    0.0 / 0.0
+}
+fun pow_f16_impl(base: f16, exp: f16): f16 {
+    if base > 0.0 { return exp_f16_impl(exp * log_f16_impl(base)) }
+    if base == 0.0 {
+        if exp == 0.0 { return 1.0 }
+        if exp > 0.0 { return 0.0 }
+        return 1.0 / 0.0
+    }
+    0.0 / 0.0
+}
+fun pow_f128_impl(base: f128, exp: f128): f128 {
+    if base > 0.0 { return exp_f128_impl(exp * log_f128_impl(base)) }
+    if base == 0.0 {
+        if exp == 0.0 { return 1.0 }
+        if exp > 0.0 { return 0.0 }
+        return 1.0 / 0.0
+    }
+    0.0 / 0.0
+}
+
+pub fun pow<T>(base: T, exp: T): T {
+    match type_name(base) {
+        "f64" => cast(pow_f64_impl(cast(base).to(f64), cast(exp).to(f64))).to(T),
+        "f32" => cast(pow_f32_impl(cast(base).to(f32), cast(exp).to(f32))).to(T),
+        "f16" => cast(pow_f16_impl(cast(base).to(f16), cast(exp).to(f16))).to(T),
+        "f128" => cast(pow_f128_impl(cast(base).to(f128), cast(exp).to(f128))).to(T),
+        _ => base
+    }
+}
+
+// ─── exp2 / exp10（2^x 与 10^x）───
+// exp2(x) = exp(x * ln2)，exp10(x) = exp(x * ln10)
+
+fun exp2_f64_impl(x: f64): f64 {
+    val ln2 = 0x1.62e42fefa39efp-1
+    exp_f64_impl(x * ln2)
+}
+fun exp2_f32_impl(x: f32): f32 {
+    val ln2 = 0x1.62e42fefa39efp-1
+    exp_f32_impl(x * ln2)
+}
+fun exp2_f16_impl(x: f16): f16 {
+    val ln2 = 0x1.63p-1f16
+    exp_f16_impl(x * ln2)
+}
+fun exp2_f128_impl(x: f128): f128 {
+    val ln2: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1f128
+    exp_f128_impl(x * ln2)
+}
+
+pub fun exp2<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(exp2_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(exp2_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(exp2_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(exp2_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+fun exp10_f64_impl(x: f64): f64 {
+    val ln10 = 0x1.26bb1bbb55516p+1
+    exp_f64_impl(x * ln10)
+}
+fun exp10_f32_impl(x: f32): f32 {
+    val ln10 = 0x1.26bb1bbb55516p+1
+    exp_f32_impl(x * ln10)
+}
+fun exp10_f16_impl(x: f16): f16 {
+    val ln10 = 0x1.26cp+1f16
+    exp_f16_impl(x * ln10)
+}
+fun exp10_f128_impl(x: f128): f128 {
+    val ln10 = 0x1.26bb1bbb5551582dd9ad3a9f9f6ep+1f128
+    exp_f128_impl(x * ln10)
+}
+
+pub fun exp10<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(exp10_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(exp10_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(exp10_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(exp10_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── log2 / log10（换底公式）───
+// log2(x) = log(x) / ln2，log10(x) = log(x) / ln10
+
+fun log2_f64_impl(x: f64): f64 {
+    val ln2 = 0x1.62e42fefa39efp-1
+    log_f64_impl(x) / ln2
+}
+fun log2_f32_impl(x: f32): f32 {
+    val ln2 = 0x1.62e42fefa39efp-1
+    log_f32_impl(x) / ln2
+}
+fun log2_f16_impl(x: f16): f16 {
+    val ln2 = 0x1.63p-1f16
+    log_f16_impl(x) / ln2
+}
+fun log2_f128_impl(x: f128): f128 {
+    val ln2: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1f128
+    log_f128_impl(x) / ln2
+}
+
+pub fun log2<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(log2_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(log2_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(log2_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(log2_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+fun log10_f64_impl(x: f64): f64 {
+    val ln10 = 0x1.26bb1bbb55516p+1
+    log_f64_impl(x) / ln10
+}
+fun log10_f32_impl(x: f32): f32 {
+    val ln10 = 0x1.26bb1bbb55516p+1
+    log_f32_impl(x) / ln10
+}
+fun log10_f16_impl(x: f16): f16 {
+    val ln10 = 0x1.26cp+1f16
+    log_f16_impl(x) / ln10
+}
+fun log10_f128_impl(x: f128): f128 {
+    val ln10 = 0x1.26bb1bbb5551582dd9ad3a9f9f6ep+1f128
+    log_f128_impl(x) / ln10
+}
+
+pub fun log10<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(log10_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(log10_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(log10_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(log10_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── gcd（最大公约数，Euclidean 算法）───
+// 有符号整数先取绝对值，无符号直接计算
+
+fun gcd_i32_impl(a: i32, b: i32): i32 {
+    var x = if a < 0 { 0 - a } else { a }
+    var y = if b < 0 { 0 - b } else { b }
+    while y != 0 {
+        val t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+fun gcd_i64_impl(a: i64, b: i64): i64 {
+    var x = if a < 0 { 0 - a } else { a }
+    var y = if b < 0 { 0 - b } else { b }
+    while y != 0 {
+        val t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+fun gcd_i128_impl(a: i128, b: i128): i128 {
+    var x = if a < 0 { 0 - a } else { a }
+    var y = if b < 0 { 0 - b } else { b }
+    while y != 0 {
+        val t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+fun gcd_u32_impl(a: u32, b: u32): u32 {
+    var x = a
+    var y = b
+    while y != 0 {
+        val t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+fun gcd_u64_impl(a: u64, b: u64): u64 {
+    var x = a
+    var y = b
+    while y != 0 {
+        val t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+fun gcd_i8_impl(a: i8, b: i8): i8 {
+    var x = if a < 0 { 0 - a } else { a }
+    var y = if b < 0 { 0 - b } else { b }
+    while y != 0 {
+        val t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+fun gcd_i16_impl(a: i16, b: i16): i16 {
+    var x = if a < 0 { 0 - a } else { a }
+    var y = if b < 0 { 0 - b } else { b }
+    while y != 0 {
+        val t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+fun gcd_isize_impl(a: isize, b: isize): isize {
+    var x = if a < 0 { 0 - a } else { a }
+    var y = if b < 0 { 0 - b } else { b }
+    while y != 0 {
+        val t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+fun gcd_u8_impl(a: u8, b: u8): u8 {
+    var x = a
+    var y = b
+    while y != 0 {
+        val t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+fun gcd_u16_impl(a: u16, b: u16): u16 {
+    var x = a
+    var y = b
+    while y != 0 {
+        val t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+fun gcd_u128_impl(a: u128, b: u128): u128 {
+    var x = a
+    var y = b
+    while y != 0 {
+        val t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+fun gcd_usize_impl(a: usize, b: usize): usize {
+    var x = a
+    var y = b
+    while y != 0 {
+        val t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+
+pub fun gcd<T>(a: T, b: T): T {
+    match type_name(a) {
+        "i8" => cast(gcd_i8_impl(cast(a).to(i8), cast(b).to(i8))).to(T),
+        "i16" => cast(gcd_i16_impl(cast(a).to(i16), cast(b).to(i16))).to(T),
+        "i32" => cast(gcd_i32_impl(cast(a).to(i32), cast(b).to(i32))).to(T),
+        "i64" => cast(gcd_i64_impl(cast(a).to(i64), cast(b).to(i64))).to(T),
+        "i128" => cast(gcd_i128_impl(cast(a).to(i128), cast(b).to(i128))).to(T),
+        "isize" => cast(gcd_isize_impl(cast(a).to(isize), cast(b).to(isize))).to(T),
+        "u8" => cast(gcd_u8_impl(cast(a).to(u8), cast(b).to(u8))).to(T),
+        "u16" => cast(gcd_u16_impl(cast(a).to(u16), cast(b).to(u16))).to(T),
+        "u32" => cast(gcd_u32_impl(cast(a).to(u32), cast(b).to(u32))).to(T),
+        "u64" => cast(gcd_u64_impl(cast(a).to(u64), cast(b).to(u64))).to(T),
+        "u128" => cast(gcd_u128_impl(cast(a).to(u128), cast(b).to(u128))).to(T),
+        "usize" => cast(gcd_usize_impl(cast(a).to(usize), cast(b).to(usize))).to(T),
+        _ => a
+    }
+}
+
+// ─── lcm（最小公倍数）───
+// lcm = a/gcd(a,b)*b，a==0 || b==0 返回 0
+
+fun lcm_i32_impl(a: i32, b: i32): i32 {
+    if a == 0 || b == 0 { return 0 }
+    val g = gcd_i32_impl(a, b)
+    val q = a / g
+    q * b
+}
+fun lcm_i64_impl(a: i64, b: i64): i64 {
+    if a == 0 || b == 0 { return 0 }
+    val g = gcd_i64_impl(a, b)
+    val q = a / g
+    q * b
+}
+fun lcm_i128_impl(a: i128, b: i128): i128 {
+    if a == 0 || b == 0 { return 0 }
+    val g = gcd_i128_impl(a, b)
+    val q = a / g
+    q * b
+}
+fun lcm_u32_impl(a: u32, b: u32): u32 {
+    if a == 0 || b == 0 { return 0 }
+    val g = gcd_u32_impl(a, b)
+    val q = a / g
+    q * b
+}
+fun lcm_u64_impl(a: u64, b: u64): u64 {
+    if a == 0 || b == 0 { return 0 }
+    val g = gcd_u64_impl(a, b)
+    val q = a / g
+    q * b
+}
+fun lcm_i8_impl(a: i8, b: i8): i8 {
+    if a == 0 || b == 0 { return 0 }
+    val g = gcd_i8_impl(a, b)
+    val q = a / g
+    q * b
+}
+fun lcm_i16_impl(a: i16, b: i16): i16 {
+    if a == 0 || b == 0 { return 0 }
+    val g = gcd_i16_impl(a, b)
+    val q = a / g
+    q * b
+}
+fun lcm_isize_impl(a: isize, b: isize): isize {
+    if a == 0 || b == 0 { return 0 }
+    val g = gcd_isize_impl(a, b)
+    val q = a / g
+    q * b
+}
+fun lcm_u8_impl(a: u8, b: u8): u8 {
+    if a == 0 || b == 0 { return 0 }
+    val g = gcd_u8_impl(a, b)
+    val q = a / g
+    q * b
+}
+fun lcm_u16_impl(a: u16, b: u16): u16 {
+    if a == 0 || b == 0 { return 0 }
+    val g = gcd_u16_impl(a, b)
+    val q = a / g
+    q * b
+}
+fun lcm_u128_impl(a: u128, b: u128): u128 {
+    if a == 0 || b == 0 { return 0 }
+    val g = gcd_u128_impl(a, b)
+    val q = a / g
+    q * b
+}
+fun lcm_usize_impl(a: usize, b: usize): usize {
+    if a == 0 || b == 0 { return 0 }
+    val g = gcd_usize_impl(a, b)
+    val q = a / g
+    q * b
+}
+
+pub fun lcm<T>(a: T, b: T): T {
+    match type_name(a) {
+        "i8" => cast(lcm_i8_impl(cast(a).to(i8), cast(b).to(i8))).to(T),
+        "i16" => cast(lcm_i16_impl(cast(a).to(i16), cast(b).to(i16))).to(T),
+        "i32" => cast(lcm_i32_impl(cast(a).to(i32), cast(b).to(i32))).to(T),
+        "i64" => cast(lcm_i64_impl(cast(a).to(i64), cast(b).to(i64))).to(T),
+        "i128" => cast(lcm_i128_impl(cast(a).to(i128), cast(b).to(i128))).to(T),
+        "isize" => cast(lcm_isize_impl(cast(a).to(isize), cast(b).to(isize))).to(T),
+        "u8" => cast(lcm_u8_impl(cast(a).to(u8), cast(b).to(u8))).to(T),
+        "u16" => cast(lcm_u16_impl(cast(a).to(u16), cast(b).to(u16))).to(T),
+        "u32" => cast(lcm_u32_impl(cast(a).to(u32), cast(b).to(u32))).to(T),
+        "u64" => cast(lcm_u64_impl(cast(a).to(u64), cast(b).to(u64))).to(T),
+        "u128" => cast(lcm_u128_impl(cast(a).to(u128), cast(b).to(u128))).to(T),
+        "usize" => cast(lcm_usize_impl(cast(a).to(usize), cast(b).to(usize))).to(T),
+        _ => a
+    }
+}
+
+// ─── div_floor（向负无穷整除）───
+// q = a/b, r = a%b; 若 r!=0 且 r 与 b 异号则 q-1
+
+fun div_floor_i32_impl(a: i32, b: i32): i32 {
+    val q = a / b
+    val r = a % b
+    if r != 0 && ((r < 0) != (b < 0)) { q - 1 } else { q }
+}
+fun div_floor_i64_impl(a: i64, b: i64): i64 {
+    val q = a / b
+    val r = a % b
+    if r != 0 && ((r < 0) != (b < 0)) { q - 1 } else { q }
+}
+fun div_floor_i128_impl(a: i128, b: i128): i128 {
+    val q = a / b
+    val r = a % b
+    if r != 0 && ((r < 0) != (b < 0)) { q - 1 } else { q }
+}
+fun div_floor_u32_impl(a: u32, b: u32): u32 {
+    a / b
+}
+fun div_floor_u64_impl(a: u64, b: u64): u64 {
+    a / b
+}
+fun div_floor_i8_impl(a: i8, b: i8): i8 {
+    val q = a / b
+    val r = a % b
+    if r != 0 && ((r < 0) != (b < 0)) { q - 1 } else { q }
+}
+fun div_floor_i16_impl(a: i16, b: i16): i16 {
+    val q = a / b
+    val r = a % b
+    if r != 0 && ((r < 0) != (b < 0)) { q - 1 } else { q }
+}
+fun div_floor_isize_impl(a: isize, b: isize): isize {
+    val q = a / b
+    val r = a % b
+    if r != 0 && ((r < 0) != (b < 0)) { q - 1 } else { q }
+}
+fun div_floor_u8_impl(a: u8, b: u8): u8 {
+    a / b
+}
+fun div_floor_u16_impl(a: u16, b: u16): u16 {
+    a / b
+}
+fun div_floor_u128_impl(a: u128, b: u128): u128 {
+    a / b
+}
+fun div_floor_usize_impl(a: usize, b: usize): usize {
+    a / b
+}
+
+pub fun div_floor<T>(a: T, b: T): T {
+    match type_name(a) {
+        "i8" => cast(div_floor_i8_impl(cast(a).to(i8), cast(b).to(i8))).to(T),
+        "i16" => cast(div_floor_i16_impl(cast(a).to(i16), cast(b).to(i16))).to(T),
+        "i32" => cast(div_floor_i32_impl(cast(a).to(i32), cast(b).to(i32))).to(T),
+        "i64" => cast(div_floor_i64_impl(cast(a).to(i64), cast(b).to(i64))).to(T),
+        "i128" => cast(div_floor_i128_impl(cast(a).to(i128), cast(b).to(i128))).to(T),
+        "isize" => cast(div_floor_isize_impl(cast(a).to(isize), cast(b).to(isize))).to(T),
+        "u8" => cast(div_floor_u8_impl(cast(a).to(u8), cast(b).to(u8))).to(T),
+        "u16" => cast(div_floor_u16_impl(cast(a).to(u16), cast(b).to(u16))).to(T),
+        "u32" => cast(div_floor_u32_impl(cast(a).to(u32), cast(b).to(u32))).to(T),
+        "u64" => cast(div_floor_u64_impl(cast(a).to(u64), cast(b).to(u64))).to(T),
+        "u128" => cast(div_floor_u128_impl(cast(a).to(u128), cast(b).to(u128))).to(T),
+        "usize" => cast(div_floor_usize_impl(cast(a).to(usize), cast(b).to(usize))).to(T),
+        _ => a
+    }
+}
+
+// ─── div_ceil（向正无穷整除）───
+// q = a/b, r = a%b; 若 r!=0 且 r 与 b 同号则 q+1
+
+fun div_ceil_i32_impl(a: i32, b: i32): i32 {
+    val q = a / b
+    val r = a % b
+    if r != 0 && ((r > 0) == (b > 0)) { q + 1 } else { q }
+}
+fun div_ceil_i64_impl(a: i64, b: i64): i64 {
+    val q = a / b
+    val r = a % b
+    if r != 0 && ((r > 0) == (b > 0)) { q + 1 } else { q }
+}
+fun div_ceil_i128_impl(a: i128, b: i128): i128 {
+    val q = a / b
+    val r = a % b
+    if r != 0 && ((r > 0) == (b > 0)) { q + 1 } else { q }
+}
+fun div_ceil_u32_impl(a: u32, b: u32): u32 {
+    val q = a / b
+    val r = a % b
+    if r != 0 { q + 1 } else { q }
+}
+fun div_ceil_u64_impl(a: u64, b: u64): u64 {
+    val q = a / b
+    val r = a % b
+    if r != 0 { q + 1 } else { q }
+}
+fun div_ceil_i8_impl(a: i8, b: i8): i8 {
+    val q = a / b
+    val r = a % b
+    if r != 0 && ((r > 0) == (b > 0)) { q + 1 } else { q }
+}
+fun div_ceil_i16_impl(a: i16, b: i16): i16 {
+    val q = a / b
+    val r = a % b
+    if r != 0 && ((r > 0) == (b > 0)) { q + 1 } else { q }
+}
+fun div_ceil_isize_impl(a: isize, b: isize): isize {
+    val q = a / b
+    val r = a % b
+    if r != 0 && ((r > 0) == (b > 0)) { q + 1 } else { q }
+}
+fun div_ceil_u8_impl(a: u8, b: u8): u8 {
+    val q = a / b
+    val r = a % b
+    if r != 0 { q + 1 } else { q }
+}
+fun div_ceil_u16_impl(a: u16, b: u16): u16 {
+    val q = a / b
+    val r = a % b
+    if r != 0 { q + 1 } else { q }
+}
+fun div_ceil_u128_impl(a: u128, b: u128): u128 {
+    val q = a / b
+    val r = a % b
+    if r != 0 { q + 1 } else { q }
+}
+fun div_ceil_usize_impl(a: usize, b: usize): usize {
+    val q = a / b
+    val r = a % b
+    if r != 0 { q + 1 } else { q }
+}
+
+pub fun div_ceil<T>(a: T, b: T): T {
+    match type_name(a) {
+        "i8" => cast(div_ceil_i8_impl(cast(a).to(i8), cast(b).to(i8))).to(T),
+        "i16" => cast(div_ceil_i16_impl(cast(a).to(i16), cast(b).to(i16))).to(T),
+        "i32" => cast(div_ceil_i32_impl(cast(a).to(i32), cast(b).to(i32))).to(T),
+        "i64" => cast(div_ceil_i64_impl(cast(a).to(i64), cast(b).to(i64))).to(T),
+        "i128" => cast(div_ceil_i128_impl(cast(a).to(i128), cast(b).to(i128))).to(T),
+        "isize" => cast(div_ceil_isize_impl(cast(a).to(isize), cast(b).to(isize))).to(T),
+        "u8" => cast(div_ceil_u8_impl(cast(a).to(u8), cast(b).to(u8))).to(T),
+        "u16" => cast(div_ceil_u16_impl(cast(a).to(u16), cast(b).to(u16))).to(T),
+        "u32" => cast(div_ceil_u32_impl(cast(a).to(u32), cast(b).to(u32))).to(T),
+        "u64" => cast(div_ceil_u64_impl(cast(a).to(u64), cast(b).to(u64))).to(T),
+        "u128" => cast(div_ceil_u128_impl(cast(a).to(u128), cast(b).to(u128))).to(T),
+        "usize" => cast(div_ceil_usize_impl(cast(a).to(usize), cast(b).to(usize))).to(T),
+        _ => a
+    }
+}
+
+// ─── expm1（exp(x) - 1，x→0 高精度）───
+// |x| < 0.5: Taylor 级数 x + x²/2! + x³/3! + ... 避免相消损失
+// |x| >= 0.5: exp(x) - 1
+
+fun expm1_f64_impl(x: f64): f64 {
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    if a < 0.5 {
+        var term = x
+        var sum = x
+        var i = 2
+        while i <= 20 {
+            term = term * x / cast(i).to(f64)
+            sum = sum + term
+            i = i + 1
+        }
+        sum
+    } else {
+        exp_f64_impl(x) - 1.0
+    }
+}
+fun expm1_f32_impl(x: f32): f32 {
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    if a < 0.5 {
+        var term = x
+        var sum = x
+        var i = 2
+        while i <= 12 {
+            term = term * x / cast(i).to(f32)
+            sum = sum + term
+            i = i + 1
+        }
+        sum
+    } else {
+        exp_f32_impl(x) - 1.0
+    }
+}
+fun expm1_f16_impl(x: f16): f16 {
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    if a < 0.5 {
+        var term = x
+        var sum = x
+        var i = 2
+        while i <= 8 {
+            term = term * x / cast(i).to(f16)
+            sum = sum + term
+            i = i + 1
+        }
+        sum
+    } else {
+        exp_f16_impl(x) - 1.0
+    }
+}
+fun expm1_f128_impl(x: f128): f128 {
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    if a < 0.5 {
+        var term = x
+        var sum = x
+        var i = 2
+        while i <= 40 {
+            term = term * x / cast(i).to(f128)
+            sum = sum + term
+            i = i + 1
+        }
+        sum
+    } else {
+        exp_f128_impl(x) - 1.0
+    }
+}
+
+pub fun expm1<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(expm1_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(expm1_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(expm1_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(expm1_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── log1p（log(1+x)，x→0 高精度）───
+// |x| < 0.5: Taylor 级数 x - x²/2 + x³/3 - ... 避免相消损失
+// |x| >= 0.5: log(1+x)；x <= -1 返回 NaN
+
+fun log1p_f64_impl(x: f64): f64 {
+    if x <= -1.0 { return 0.0 / 0.0 }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    if a < 0.5 {
+        var sum = x
+        var tpow = x
+        var i = 2
+        while i <= 30 {
+            tpow = tpow * x
+            val term = tpow / cast(i).to(f64)
+            if i % 2 == 0 { sum = sum - term } else { sum = sum + term }
+            i = i + 1
+        }
+        sum
+    } else {
+        log_f64_impl(1.0 + x)
+    }
+}
+fun log1p_f32_impl(x: f32): f32 {
+    if x <= -1.0 { return 0.0 / 0.0 }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    if a < 0.5 {
+        var sum = x
+        var tpow = x
+        var i = 2
+        while i <= 20 {
+            tpow = tpow * x
+            val term = tpow / cast(i).to(f32)
+            if i % 2 == 0 { sum = sum - term } else { sum = sum + term }
+            i = i + 1
+        }
+        sum
+    } else {
+        log_f32_impl(1.0 + x)
+    }
+}
+fun log1p_f16_impl(x: f16): f16 {
+    if x <= -1.0 { return 0.0 / 0.0 }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    if a < 0.5 {
+        var sum = x
+        var tpow = x
+        var i = 2
+        while i <= 12 {
+            tpow = tpow * x
+            val term = tpow / cast(i).to(f16)
+            if i % 2 == 0 { sum = sum - term } else { sum = sum + term }
+            i = i + 1
+        }
+        sum
+    } else {
+        log_f16_impl(1.0 + x)
+    }
+}
+fun log1p_f128_impl(x: f128): f128 {
+    if x <= -1.0 { return 0.0 / 0.0 }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    if a < 0.5 {
+        var sum = x
+        var tpow = x
+        var i = 2
+        while i <= 60 {
+            tpow = tpow * x
+            val term = tpow / cast(i).to(f128)
+            if i % 2 == 0 { sum = sum - term } else { sum = sum + term }
+            i = i + 1
+        }
+        sum
+    } else {
+        log_f128_impl(1.0 + x)
+    }
+}
+
+pub fun log1p<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(log1p_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(log1p_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(log1p_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(log1p_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── hypot（sqrt(x²+y²)，避免溢出）───
+// a = max(|x|,|y|), b = min(|x|,|y|)；a==0 返回 0
+// hypot = a * sqrt(1 + (b/a)²)
+
+fun hypot_f64_impl(x: f64, y: f64): f64 {
+    var ax = if x < 0.0 { 0.0 - x } else { x }
+    var ay = if y < 0.0 { 0.0 - y } else { y }
+    var a = ax
+    var b = ay
+    if b > a {
+        a = ay
+        b = ax
+    }
+    if a == 0.0 { return 0.0 }
+    val ratio = b / a
+    a * sqrt_f64_impl(1.0 + ratio * ratio)
+}
+fun hypot_f32_impl(x: f32, y: f32): f32 {
+    var ax = if x < 0.0 { 0.0 - x } else { x }
+    var ay = if y < 0.0 { 0.0 - y } else { y }
+    var a = ax
+    var b = ay
+    if b > a {
+        a = ay
+        b = ax
+    }
+    if a == 0.0 { return 0.0 }
+    val ratio = b / a
+    a * sqrt_f32_impl(1.0 + ratio * ratio)
+}
+fun hypot_f16_impl(x: f16, y: f16): f16 {
+    var ax = if x < 0.0 { 0.0 - x } else { x }
+    var ay = if y < 0.0 { 0.0 - y } else { y }
+    var a = ax
+    var b = ay
+    if b > a {
+        a = ay
+        b = ax
+    }
+    if a == 0.0 { return 0.0 }
+    val ratio = b / a
+    a * sqrt_f16_impl(1.0 + ratio * ratio)
+}
+fun hypot_f128_impl(x: f128, y: f128): f128 {
+    var ax = if x < 0.0 { 0.0 - x } else { x }
+    var ay = if y < 0.0 { 0.0 - y } else { y }
+    var a = ax
+    var b = ay
+    if b > a {
+        a = ay
+        b = ax
+    }
+    if a == 0.0 { return 0.0 }
+    val ratio = b / a
+    a * sqrt_f128_impl(1.0 + ratio * ratio)
+}
+
+pub fun hypot<T>(x: T, y: T): T {
+    match type_name(x) {
+        "f64" => cast(hypot_f64_impl(cast(x).to(f64), cast(y).to(f64))).to(T),
+        "f32" => cast(hypot_f32_impl(cast(x).to(f32), cast(y).to(f32))).to(T),
+        "f16" => cast(hypot_f16_impl(cast(x).to(f16), cast(y).to(f16))).to(T),
+        "f128" => cast(hypot_f128_impl(cast(x).to(f128), cast(y).to(f128))).to(T),
+        _ => x
+    }
+}

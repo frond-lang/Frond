@@ -1,0 +1,176 @@
+// TcpStream.kz — TCP 流
+//
+// 设计文档 §6.3：TcpStream newtype + read/write/close。
+// 所有 IO 操作为 async，返回 Async<Throw<T, IOError>>。
+// 单次 read/write 语义（不循环阻塞，与 File.read 一致）。
+//
+// 底层 @extern("C") 原语（__net_tcp_connect_v4 / __net_tcp_close_raw 等）
+// 由 builtin/net/Raw.kz 声明。本文件定义 Kuzo wrapper 将 C 原始返回值转为 Throw。
+// async 函数体当前直接调用同步原语，等 IR/Engine 异步模型就绪后再补 spawn 语义。
+//
+// read_until 维护跨调用内部缓冲（rbuf/rpos/rcap），支持分隔符跨批量边界的正确扫描。
+// read 原语直接调 __net_tcp_read 不碰缓冲；二者缓冲隔离，混合使用需注意数据顺序。
+
+// ─── Kuzo wrapper：@extern("C") 原始返回值 → Throw ──────────────
+
+// __net_tcp_connect(ip: IpAddr, port: u16, timeout_ns: i64): Throw<i64, IOError>
+// 从 IpAddr 提取 v4 bits，调用 __net_tcp_connect_v4
+// IPv6 暂不支持，抛 NotSupported
+fun __net_tcp_connect(ip: IpAddr, port: u16, timeout_ns: i64): Throw<i64, IOError> {
+    match ip {
+        V4(v4_addr) => {
+            val fd = __net_tcp_connect_v4(v4_addr.bits, port, timeout_ns)
+            if fd < 0 {
+                throw IOError(ConnectionRefused, "tcp connect failed", 0, null)
+            }
+            Ok(fd)
+        },
+        V6(v6_addr) => {
+            val fd = __net_tcp_connect_v6(v6_addr.hi, v6_addr.lo, port, timeout_ns)
+            if fd < 0 {
+                throw IOError(ConnectionRefused, "tcp connect failed", 0, null)
+            }
+            Ok(fd)
+        },
+    }
+}
+
+// __net_tcp_close(fd: i64): Throw<void, IOError>
+// TCP/UDP 共用 close（底层都是 close(fd)）
+fun __net_tcp_close(fd: i64): Throw<void, IOError> {
+    val rc = __net_tcp_close_raw(fd)
+    if rc < 0 {
+        throw IOError(Other, "tcp close failed", 0, null)
+    }
+    Ok(void)
+}
+
+// ─── 常量 ──────────────────────────────────────────────────────────
+
+pub val DEFAULT_BUF_SIZE: usize = 8192
+
+// ─── 类型定义 ──────────────────────────────────────────────────────
+
+// TcpStream：newtype，fd 跨平台 i64 存储句柄
+// rbuf/rpos/rcap 为 read_until 的内部缓冲（懒分配），rpos 当前读位，rcap 已填充长度
+pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, rbuf: u8[], rpos: usize, rcap: usize) {
+    // 返回对端地址（构造时传入的 peer 地址）
+    pub fun peer_addr(self): SocketAddr {
+        self.peer_addr
+    }
+
+    // 从流读取数据，返回读到的字节数组（空数组 = EOF）。
+    // 单次 read 语义（不循环阻塞）。
+    // 当前直接调用同步 C 原语，等 IR/Engine 异步模型就绪后改为 spawn + channel 模式。
+    pub async fun read(self, len: usize): Async<Throw<u8[], IOError>> {
+        if self.is_closed {
+            throw IOError(InvalidInput, "stream closed", 0, null)
+        }
+        val buf: u8[] = [0u8] * len
+        val n = __net_tcp_read(self.fd, buf, len)
+        if n < 0 {
+            throw IOError(ConnectionReset, "tcp read failed", 0, null)
+        }
+        Ok(buf[0..cast(n).to(usize)])
+    }
+
+    // 向流写入数据，返回实际写入字节数。
+    pub async fun write(self, buf: u8[], len: usize): Async<Throw<usize, IOError>> {
+        if self.is_closed {
+            throw IOError(InvalidInput, "stream closed", 0, null)
+        }
+        val n = __net_tcp_write(self.fd, buf, len)
+        if n < 0 {
+            throw IOError(BrokenPipe, "tcp write failed", 0, null)
+        }
+        Ok(cast(n).to(usize))
+    }
+
+    // 关闭流。幂等：重复 close 不报错。
+    pub async fun close(self): Async<Throw<void, IOError>> {
+        if self.is_closed {
+            Ok(void)
+        } else {
+            self.is_closed = true
+            __net_tcp_close(self.fd)?
+            Ok(void)
+        }
+    }
+
+    // ─── 组合语义方法（基于 read/write 原语组合，纯 Kuzo 实现） ──────
+
+    // 写入全部字节；write 返回 0 时抛 BrokenPipe（避免死循环）
+    pub async fun write_all(self, buf: u8[], len: usize): Async<Throw<void, IOError>> {
+        if self.is_closed {
+            throw IOError(InvalidInput, "stream closed", 0, null)
+        }
+        var written: usize = 0
+        while written < len {
+            val chunk = buf[written..len]
+            val n = self.write(chunk, chunk.len()).await()?
+            if n == 0 {
+                throw IOError(BrokenPipe, "write_all: write returned 0", 32, null)
+            }
+            written = written + n
+        }
+        Ok(void)
+    }
+
+    // 读取直到遇到分隔符字节，返回包含分隔符在内的 u8[]
+    // 内部缓冲（rbuf/rpos/rcap）跨调用共享，支持分隔符跨批量边界的正确扫描：
+    //   - 先消费上次剩余缓冲 [rpos, rcap)，找到 delim 则切片返回
+    //   - 未找到则把剩余追加到 result，调 read 批量读取作为新缓冲再扫描
+    //   - EOF 时返回已累积的 result
+    // rbuf 直接引用 read 返回的数组（无需预分配）；缓冲仅 read_until 内部使用，
+    // read 原语不碰缓冲；二者混合使用会导致数据顺序错乱。
+    pub async fun read_until(self, delim: u8): Async<Throw<u8[], IOError>> {
+        if self.is_closed {
+            throw IOError(InvalidInput, "stream closed", 0, null)
+        }
+        var result: u8[] = []
+        loop {
+            // 扫描缓冲 [rpos, rcap) 查找 delim
+            var found = false
+            val seg_start = self.rpos
+            while self.rpos < self.rcap {
+                val b = self.rbuf[self.rpos]
+                self.rpos = self.rpos + 1
+                if b == delim {
+                    found = true
+                    break
+                }
+            }
+            // 把本段（不含 delim，若 found 则到 delim 前一位）追加到 result
+            val seg_end = if found { self.rpos - 1 } else { self.rpos }
+            if seg_end > seg_start {
+                result = result ++ self.rbuf[seg_start..seg_end]
+            }
+            if found {
+                return Ok(result ++ [delim])
+            }
+            // 缓冲已扫完仍未找到 delim，读下一批作为新缓冲
+            val chunk = self.read(DEFAULT_BUF_SIZE).await()?
+            if chunk.len() == 0 {
+                // EOF：返回已累积内容（可能为空）
+                return Ok(result)
+            }
+            self.rbuf = chunk
+            self.rpos = 0
+            self.rcap = chunk.len()
+        }
+    }
+}
+
+// ─── 顶层 async 函数（"静态方法"语义） ───────────────────────────
+
+// 发起 TCP 连接。timeout_ns <= 0 时无超时。
+pub async fun connect(addr: SocketAddr, timeout_ns: i64): Async<Throw<TcpStream, IOError>> {
+    val fd = __net_tcp_connect(addr.ip, addr.port, timeout_ns)?
+    Ok(TcpStream(fd, addr, false, [], 0, 0))
+}
+
+// 从 accept 返回的 fd 构造 TcpStream（服务端使用）。
+// AcceptResult.stream_fd + AcceptResult.peer_addr → TcpStream
+pub fun from_accept_fd(fd: i64, peer: SocketAddr): TcpStream {
+    TcpStream(fd, peer, false, [], 0, 0)
+}

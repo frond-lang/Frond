@@ -1,0 +1,155 @@
+// builtin/cast/Raw.kz — 类型转换 @extern("C") 原语（builtin，默认可见）
+//
+// 底层 C 位转换原语，由 cc crate 从 emit-c 生成的 .c 编译。
+// Cast.kz 的 Kuzo wrapper 通过两步中转（S→i128→T）组合这些原语。
+//
+// 转换策略：
+//   - 整数 → 整数：经 i128 中转（widen S→i128，narrow i128→T）
+//   - char → u8：直接截断（char 内部为 u32 码点）
+//   - char → str：UTF-8 编码码点为字符串
+//   - [u8] → str：字节数组转字符串（假设合法 UTF-8）
+
+@c_include("stdint.h")
+
+// ─── widening: 整数 → i128 ─────────────────────────────────────────
+// 所有整数类型无损拓宽到 i128（i128 本身除外，identity 无需函数）
+
+@extern("C")
+fun __cast_i8_to_i128(x: i8): i128 #{
+    return (__int128_t)x;
+}#
+
+@extern("C")
+fun __cast_i16_to_i128(x: i16): i128 #{
+    return (__int128_t)x;
+}#
+
+@extern("C")
+fun __cast_i32_to_i128(x: i32): i128 #{
+    return (__int128_t)x;
+}#
+
+@extern("C")
+fun __cast_i64_to_i128(x: i64): i128 #{
+    return (__int128_t)x;
+}#
+
+@extern("C")
+fun __cast_u8_to_i128(x: u8): i128 #{
+    return (__int128_t)x;
+}#
+
+@extern("C")
+fun __cast_u16_to_i128(x: u16): i128 #{
+    return (__int128_t)x;
+}#
+
+@extern("C")
+fun __cast_u32_to_i128(x: u32): i128 #{
+    return (__int128_t)x;
+}#
+
+@extern("C")
+fun __cast_u64_to_i128(x: u64): i128 #{
+    return (__int128_t)x;
+}#
+
+@extern("C")
+fun __cast_usize_to_i128(x: usize): i128 #{
+    return (__int128_t)x;
+}#
+
+// ─── narrowing: i128 → 整数（wrapping） ────────────────────────────
+// 截断高位，保留低位（C 的默认 cast 语义）
+
+@extern("C")
+fun __cast_i128_to_i8(x: i128): i8 #{
+    return (int8_t)x;
+}#
+
+@extern("C")
+fun __cast_i128_to_i16(x: i128): i16 #{
+    return (int16_t)x;
+}#
+
+@extern("C")
+fun __cast_i128_to_i32(x: i128): i32 #{
+    return (int32_t)x;
+}#
+
+@extern("C")
+fun __cast_i128_to_i64(x: i128): i64 #{
+    return (int64_t)x;
+}#
+
+@extern("C")
+fun __cast_i128_to_u8(x: i128): u8 #{
+    return (uint8_t)x;
+}#
+
+@extern("C")
+fun __cast_i128_to_u16(x: i128): u16 #{
+    return (uint16_t)x;
+}#
+
+@extern("C")
+fun __cast_i128_to_u32(x: i128): u32 #{
+    return (uint32_t)x;
+}#
+
+@extern("C")
+fun __cast_i128_to_u64(x: i128): u64 #{
+    return (uint64_t)x;
+}#
+
+@extern("C")
+fun __cast_i128_to_usize(x: i128): usize #{
+    return (size_t)x;
+}#
+
+// ─── special: char 转换 ────────────────────────────────────────────
+
+@extern("C")
+fun __cast_char_to_u8(x: char): u8 #{
+    return (uint8_t)x;
+}#
+
+@extern("C")
+fun __cast_char_to_str(x: char): str #{
+    // UTF-8 编码码点：1-4 字节
+    // 使用 thread-local 静态缓冲区，避免悬垂指针
+    static __thread char buf[4];
+    int len = 0;
+    uint32_t cp = (uint32_t)x;
+    if (cp <= 0x7F) {
+        buf[0] = (char)cp;
+        len = 1;
+    } else if (cp <= 0x7FF) {
+        buf[0] = (char)(0xC0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3F));
+        len = 2;
+    } else if (cp <= 0xFFFF) {
+        buf[0] = (char)(0xE0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (char)(0x80 | (cp & 0x3F));
+        len = 3;
+    } else {
+        buf[0] = (char)(0xF0 | (cp >> 18));
+        buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[3] = (char)(0x80 | (cp & 0x3F));
+        len = 4;
+    }
+    *out_data = buf;
+    *out_len = (size_t)len;
+}#
+
+// ─── special: [u8] → str ───────────────────────────────────────────
+
+@extern("C")
+fun __cast_bytes_to_str(buf: u8[]): str #{
+    // 直接将字节数组作为字符串内容（假设合法 UTF-8）
+    // out_data 指向输入缓冲区，生命周期绑定到输入 &[u8]
+    *out_data = (const char*)buf_data;
+    *out_len = buf_len;
+}#

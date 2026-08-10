@@ -1,0 +1,151 @@
+// Calendar.kz — 日历算法（纯 Kuzo 实现）
+//
+// 设计文档 §5.6：闰年/月份天数/儒略日/星期，全部用 Kuzo 编写
+// 采用 Howard Hinnant 儒略日算法（参考 std::chrono::year_month_day 实现）
+// 因为 Kuzo 内建 `/` 为截断除法（向 0 取整），而儒略日算法需要 floor 除法（向 -∞ 取整），
+// 故提供 floor_div / floor_mod 辅助函数
+
+// ─── Floor 除法（向负无穷取整） ────────────────────────────────────
+
+// Kuzo 内建 `/` 是截断除法（向 0 取整），floor 除法需要根据余数符号修正
+pub fun floor_div(a: i64, b: i64): i64 {
+    val q = a / b
+    val r = a % b
+    if r != 0 && (r < 0) != (b < 0) {
+        q - 1
+    } else {
+        q
+    }
+}
+
+pub fun floor_mod(a: i64, b: i64): i64 {
+    val r = a % b
+    if r != 0 && (r < 0) != (b < 0) {
+        r + b
+    } else {
+        r
+    }
+}
+
+// i128 版本（时间分量转换用，ns 精度算术）
+pub fun floor_div_i128(a: i128, b: i128): i128 {
+    val q = a / b
+    val r = a % b
+    if r != 0 && (r < 0) != (b < 0) {
+        q - 1
+    } else {
+        q
+    }
+}
+
+pub fun floor_mod_i128(a: i128, b: i128): i128 {
+    val r = a % b
+    if r != 0 && (r < 0) != (b < 0) {
+        r + b
+    } else {
+        r
+    }
+}
+
+// ─── 闰年/月份天数 ────────────────────────────────────────────────
+
+pub fun is_leap_year(year: i32): bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+pub fun days_in_month(year: i32, month: u8): u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => if is_leap_year(year) { 29 } else { 28 },
+        _ => 0,
+    }
+}
+
+pub fun day_of_year(year: i32, month: u8, day: u8): u16 {
+    var total: u16 = 0
+    var m: u8 = 1
+    while m < month {
+        total = total + cast(days_in_month(year, m)).to(u16)
+        m = m + 1
+    }
+    total + cast(day).to(u16)
+}
+
+// ─── 儒略日（Howard Hinnant 算法） ────────────────────────────────
+
+// 公历日期 → 儒略日（自公元前 4713 年 1 月 1 日起的连续天数）
+// 算法参考：http://howardhinnant.github.io/date_algorithms.html
+pub fun to_julian_day(year: i32, month: u8, day: u8): i64 {
+    var y = year
+    var m = cast(month).to(i32)
+    if m <= 2 {
+        y = y - 1
+        m = m + 12
+    }
+    val era = if y >= 0 { y } else { y - 399 }
+    val era_div = floor_div(cast(era).to(i64), 400)
+    val yoe = cast(era).to(i64) - era_div * 400
+    val doy = floor_div(cast(153 * (m - 3) + 2).to(i64), 5) + cast(day).to(i64) - 1
+    val doe = yoe * 365 + floor_div(yoe, 4) - floor_div(yoe, 100) + doy
+    era_div * 146097 + doe + 1721120
+}
+
+// 儒略日 → 公历日期（返回 year/month/day 的 record）
+pub fun from_julian_day(jd: i64): (year: i32, month: u8, day: u8) {
+    val z = jd - 1721120
+    val era = floor_div(if z >= 0 { z } else { z - 146096 }, 146097)
+    val doe = z - era * 146097
+    val yoe = floor_div(doe - floor_div(doe, 1460) + floor_div(doe, 36524) - floor_div(doe, 146096), 365)
+    val y = cast(yoe).to(i32) + cast(era).to(i32) * 400
+    val doy = doe - (365 * yoe + floor_div(yoe, 4) - floor_div(yoe, 100))
+    val mp = floor_div(5 * doy + 2, 153)
+    val d = cast(doy - floor_div(153 * mp + 2, 5) + 1).to(u8)
+    val m = cast(if mp < 10 { mp + 3 } else { mp - 9 }).to(u8)
+    val final_year = if m <= 2 { y + 1 } else { y }
+    return (year: final_year, month: m, day: d)
+}
+
+// ─── Epoch 相关（自 1970-01-01 的天数，纯 Kuzo 算法） ──────────────
+//
+// 替代原 syscall/time.zig 中的 daysFromCivil + std.time.epoch 实现。
+// days_from_civil 与 Howard Hinnant 算法一致；civil_from_days 为其逆运算。
+// 1970-01-01 的儒略日 = 2440588（Julian Day Number）。
+
+pub val EPOCH_JULIAN_DAY: i64 = 2440588
+
+// 公历日期 → 自 1970-01-01 的天数（可为负，表示 1970 年前）
+pub fun days_from_civil(year: i32, month: u8, day: u8): i64 {
+    to_julian_day(year, month, day) - EPOCH_JULIAN_DAY
+}
+
+// 自 1970-01-01 的天数 → 公历日期
+pub fun civil_from_days(days: i64): (year: i32, month: u8, day: u8) {
+    from_julian_day(days + EPOCH_JULIAN_DAY)
+}
+
+// 自 1970-01-01 的天数 → 星期（0=周日，1970-01-01 是周四）
+pub fun weekday_from_days(days: i64): u8 {
+    cast(floor_mod(days + 4, 7)).to(u8)
+}
+
+// ─── 星期 ─────────────────────────────────────────────────────────
+
+// 公历日期 → 星期（0=周日, 1=周一, ..., 6=周六）
+pub fun weekday_of(year: i32, month: u8, day: u8): u8 {
+    val jd = to_julian_day(year, month, day)
+    cast(floor_mod(jd + 1, 7)).to(u8)
+}
+
+// ─── 日期算术 ─────────────────────────────────────────────────────
+
+// 日期加减天数，返回新日期
+pub fun add_days(year: i32, month: u8, day: u8, days: i64): (year: i32, month: u8, day: u8) {
+    val jd = to_julian_day(year, month, day) + days
+    from_julian_day(jd)
+}
+
+// 两个日期之间的天数（y2/m2/d2 - y1/m1/d1）
+pub fun days_between(y1: i32, m1: u8, d1: u8, y2: i32, m2: u8, d2: u8): i64 {
+    to_julian_day(y2, m2, d2) - to_julian_day(y1, m1, d1)
+}

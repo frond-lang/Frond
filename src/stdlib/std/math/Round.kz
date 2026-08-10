@@ -1,0 +1,543 @@
+// Math 标准库 — 舍入取整
+//
+// 包含: floor/ceil/round/trunc/fabs/copysign/fmod/ldexp
+// 纯 Kuzo 实现，无 FFI 依赖。
+// 泛型函数使用 match type_name(x) 按类型分发到对应精度实现。
+
+// ─── trunc（向零截断）───
+// 利用 cast 到整数再转回来实现截断
+
+fun trunc_f64_impl(x: f64): f64 {
+    cast(cast(x).to(i64)).to(f64)
+}
+fun trunc_f32_impl(x: f32): f32 {
+    cast(cast(x).to(i64)).to(f32)
+}
+fun trunc_f16_impl(x: f16): f16 {
+    cast(cast(x).to(i16)).to(f16)
+}
+fun trunc_f128_impl(x: f128): f128 {
+    cast(cast(x).to(i128)).to(f128)
+}
+
+pub fun trunc<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(trunc_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(trunc_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(trunc_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(trunc_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── floor（向负无穷取整）───
+
+fun floor_f64_impl(x: f64): f64 {
+    val t = trunc_f64_impl(x)
+    if x < 0.0 && x != t { t - 1.0 } else { t }
+}
+fun floor_f32_impl(x: f32): f32 {
+    val t = trunc_f32_impl(x)
+    if x < 0.0 && x != t { t - 1.0 } else { t }
+}
+fun floor_f16_impl(x: f16): f16 {
+    val t = trunc_f16_impl(x)
+    if x < 0.0 && x != t { t - 1.0 } else { t }
+}
+fun floor_f128_impl(x: f128): f128 {
+    val t = trunc_f128_impl(x)
+    if x < 0.0 && x != t { t - 1.0 } else { t }
+}
+
+pub fun floor<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(floor_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(floor_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(floor_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(floor_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── ceil（向正无穷取整）───
+
+fun ceil_f64_impl(x: f64): f64 {
+    val t = trunc_f64_impl(x)
+    if x > 0.0 && x != t { t + 1.0 } else { t }
+}
+fun ceil_f32_impl(x: f32): f32 {
+    val t = trunc_f32_impl(x)
+    if x > 0.0 && x != t { t + 1.0 } else { t }
+}
+fun ceil_f16_impl(x: f16): f16 {
+    val t = trunc_f16_impl(x)
+    if x > 0.0 && x != t { t + 1.0 } else { t }
+}
+fun ceil_f128_impl(x: f128): f128 {
+    val t = trunc_f128_impl(x)
+    if x > 0.0 && x != t { t + 1.0 } else { t }
+}
+
+pub fun ceil<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(ceil_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(ceil_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(ceil_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(ceil_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── round（四舍五入到最近整数）───
+
+fun round_f64_impl(x: f64): f64 {
+    val t = trunc_f64_impl(x)
+    val frac = x - t
+    if frac > 0.5 { t + 1.0 }
+    else if frac < -0.5 { t - 1.0 }
+    else { t }
+}
+fun round_f32_impl(x: f32): f32 {
+    val t = trunc_f32_impl(x)
+    val frac = x - t
+    if frac > 0.5 { t + 1.0 }
+    else if frac < -0.5 { t - 1.0 }
+    else { t }
+}
+fun round_f16_impl(x: f16): f16 {
+    val t = trunc_f16_impl(x)
+    val frac = x - t
+    if frac > 0.5 { t + 1.0 }
+    else if frac < -0.5 { t - 1.0 }
+    else { t }
+}
+fun round_f128_impl(x: f128): f128 {
+    val t = trunc_f128_impl(x)
+    val frac = x - t
+    if frac > 0.5 { t + 1.0 }
+    else if frac < -0.5 { t - 1.0 }
+    else { t }
+}
+
+pub fun round<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(round_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(round_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(round_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(round_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── fabs（绝对值，浮点专用）───
+
+pub fun fabs<T>(x: T): T {
+    match type_name(x) {
+        "f64" => if cast(x).to(f64) < 0.0 { cast(0.0 - cast(x).to(f64)).to(T) } else { x },
+        "f32" => if cast(x).to(f32) < 0.0 { cast(0.0 - cast(x).to(f32)).to(T) } else { x },
+        "f16" => if cast(x).to(f16) < 0.0 { cast(0.0 - cast(x).to(f16)).to(T) } else { x },
+        "f128" => if cast(x).to(f128) < 0.0 { cast(0.0 - cast(x).to(f128)).to(T) } else { x },
+        _ => x
+    }
+}
+
+// ─── copysign（取 y 的符号赋给 x）───
+
+pub fun copysign<T>(x: T, y: T): T {
+    match type_name(x) {
+        "f64" => {
+            val xv = cast(x).to(f64)
+            val yv = cast(y).to(f64)
+            if (yv < 0.0) != (xv < 0.0) { cast(0.0 - xv).to(T) } else { x }
+        },
+        "f32" => {
+            val xv = cast(x).to(f32)
+            val yv = cast(y).to(f32)
+            if (yv < 0.0) != (xv < 0.0) { cast(0.0 - xv).to(T) } else { x }
+        },
+        "f16" => {
+            val xv = cast(x).to(f16)
+            val yv = cast(y).to(f16)
+            if (yv < 0.0) != (xv < 0.0) { cast(0.0 - xv).to(T) } else { x }
+        },
+        "f128" => {
+            val xv = cast(x).to(f128)
+            val yv = cast(y).to(f128)
+            if (yv < 0.0) != (xv < 0.0) { cast(0.0 - xv).to(T) } else { x }
+        },
+        _ => x
+    }
+}
+
+// ─── fmod（浮点取模，结果与 x 同号）───
+
+fun fmod_f64_impl(x: f64, y: f64): f64 {
+    if y == 0.0 { return 0.0 / 0.0 }
+    val quotient = x / y
+    val truncated = trunc_f64_impl(quotient)
+    x - truncated * y
+}
+fun fmod_f32_impl(x: f32, y: f32): f32 {
+    if y == 0.0 { return 0.0 / 0.0 }
+    val quotient = x / y
+    val truncated = trunc_f32_impl(quotient)
+    x - truncated * y
+}
+fun fmod_f16_impl(x: f16, y: f16): f16 {
+    if y == 0.0 { return 0.0 / 0.0 }
+    val quotient = x / y
+    val truncated = trunc_f16_impl(quotient)
+    x - truncated * y
+}
+fun fmod_f128_impl(x: f128, y: f128): f128 {
+    if y == 0.0 { return 0.0 / 0.0 }
+    val quotient = x / y
+    val truncated = trunc_f128_impl(quotient)
+    x - truncated * y
+}
+
+pub fun fmod<T>(x: T, y: T): T {
+    match type_name(x) {
+        "f64" => cast(fmod_f64_impl(cast(x).to(f64), cast(y).to(f64))).to(T),
+        "f32" => cast(fmod_f32_impl(cast(x).to(f32), cast(y).to(f32))).to(T),
+        "f16" => cast(fmod_f16_impl(cast(x).to(f16), cast(y).to(f16))).to(T),
+        "f128" => cast(fmod_f128_impl(cast(x).to(f128), cast(y).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── ldexp（x * 2^exp）───
+// 通过重复乘 2 实现
+
+fun ldexp_f64_impl(x: f64, exp: i32): f64 {
+    var result = x
+    var n = exp
+    while n > 0 {
+        result = result * 2.0
+        n = n - 1
+    }
+    while n < 0 {
+        result = result / 2.0
+        n = n + 1
+    }
+    result
+}
+fun ldexp_f32_impl(x: f32, exp: i32): f32 {
+    var result = x
+    var n = exp
+    while n > 0 {
+        result = result * 2.0
+        n = n - 1
+    }
+    while n < 0 {
+        result = result / 2.0
+        n = n + 1
+    }
+    result
+}
+fun ldexp_f16_impl(x: f16, exp: i32): f16 {
+    var result = x
+    var n = exp
+    while n > 0 {
+        result = result * 2.0
+        n = n - 1
+    }
+    while n < 0 {
+        result = result / 2.0
+        n = n + 1
+    }
+    result
+}
+fun ldexp_f128_impl(x: f128, exp: i32): f128 {
+    var result = x
+    var n = exp
+    while n > 0 {
+        result = result * 2.0
+        n = n - 1
+    }
+    while n < 0 {
+        result = result / 2.0
+        n = n + 1
+    }
+    result
+}
+
+pub fun ldexp<T>(x: T, exp: i32): T {
+    match type_name(x) {
+        "f64" => cast(ldexp_f64_impl(cast(x).to(f64), exp)).to(T),
+        "f32" => cast(ldexp_f32_impl(cast(x).to(f32), exp)).to(T),
+        "f16" => cast(ldexp_f16_impl(cast(x).to(f16), exp)).to(T),
+        "f128" => cast(ldexp_f128_impl(cast(x).to(f128), exp)).to(T),
+        _ => x
+    }
+}
+
+// ─── frexp（分解为尾数 m∈[0.5,1) 和指数 e，x = m * 2^e）───
+// x==0 → m=0,e=0；NaN/Inf 原样返回 m=x,e=0
+// Kuzo 无元组，拆为 frexp_mantissa 与 frexp_exponent 两个函数
+
+fun frexp_f64_mantissa_impl(x: f64): f64 {
+    if x == 0.0 { return 0.0 }
+    if x != x { return x }
+    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return x }
+    var m = if x < 0.0 { 0.0 - x } else { x }
+    while m >= 1.0 { m = m / 2.0 }
+    while m < 0.5 { m = m * 2.0 }
+    if x < 0.0 { 0.0 - m } else { m }
+}
+fun frexp_f64_exponent_impl(x: f64): i32 {
+    if x == 0.0 { return 0 }
+    if x != x { return 0 }
+    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return 0 }
+    var m = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    while m >= 1.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 0.5 {
+        m = m * 2.0
+        e = e - 1
+    }
+    e
+}
+fun frexp_f32_mantissa_impl(x: f32): f32 {
+    if x == 0.0 { return 0.0 }
+    if x != x { return x }
+    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return x }
+    var m = if x < 0.0 { 0.0 - x } else { x }
+    while m >= 1.0 { m = m / 2.0 }
+    while m < 0.5 { m = m * 2.0 }
+    if x < 0.0 { 0.0 - m } else { m }
+}
+fun frexp_f32_exponent_impl(x: f32): i32 {
+    if x == 0.0 { return 0 }
+    if x != x { return 0 }
+    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return 0 }
+    var m = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    while m >= 1.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 0.5 {
+        m = m * 2.0
+        e = e - 1
+    }
+    e
+}
+fun frexp_f16_mantissa_impl(x: f16): f16 {
+    if x == 0.0 { return 0.0 }
+    if x != x { return x }
+    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return x }
+    var m = if x < 0.0 { 0.0 - x } else { x }
+    while m >= 1.0 { m = m / 2.0 }
+    while m < 0.5 { m = m * 2.0 }
+    if x < 0.0 { 0.0 - m } else { m }
+}
+fun frexp_f16_exponent_impl(x: f16): i32 {
+    if x == 0.0 { return 0 }
+    if x != x { return 0 }
+    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return 0 }
+    var m = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    while m >= 1.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 0.5 {
+        m = m * 2.0
+        e = e - 1
+    }
+    e
+}
+fun frexp_f128_mantissa_impl(x: f128): f128 {
+    if x == 0.0 { return 0.0 }
+    if x != x { return x }
+    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return x }
+    var m = if x < 0.0 { 0.0 - x } else { x }
+    while m >= 1.0 { m = m / 2.0 }
+    while m < 0.5 { m = m * 2.0 }
+    if x < 0.0 { 0.0 - m } else { m }
+}
+fun frexp_f128_exponent_impl(x: f128): i32 {
+    if x == 0.0 { return 0 }
+    if x != x { return 0 }
+    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return 0 }
+    var m = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    while m >= 1.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 0.5 {
+        m = m * 2.0
+        e = e - 1
+    }
+    e
+}
+
+pub fun frexp_mantissa<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(frexp_f64_mantissa_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(frexp_f32_mantissa_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(frexp_f16_mantissa_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(frexp_f128_mantissa_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+pub fun frexp_exponent<T>(x: T): i32 {
+    match type_name(x) {
+        "f64" => frexp_f64_exponent_impl(cast(x).to(f64)),
+        "f32" => frexp_f32_exponent_impl(cast(x).to(f32)),
+        "f16" => frexp_f16_exponent_impl(cast(x).to(f16)),
+        "f128" => frexp_f128_exponent_impl(cast(x).to(f128)),
+        _ => 0
+    }
+}
+
+// ─── modf（分离整数和小数部分，符号均与 x 相同）───
+// integral = trunc(x)；fractional = x - trunc(x)
+
+fun modf_f64_integral_impl(x: f64): f64 { trunc_f64_impl(x) }
+fun modf_f64_fractional_impl(x: f64): f64 { x - trunc_f64_impl(x) }
+fun modf_f32_integral_impl(x: f32): f32 { trunc_f32_impl(x) }
+fun modf_f32_fractional_impl(x: f32): f32 { x - trunc_f32_impl(x) }
+fun modf_f16_integral_impl(x: f16): f16 { trunc_f16_impl(x) }
+fun modf_f16_fractional_impl(x: f16): f16 { x - trunc_f16_impl(x) }
+fun modf_f128_integral_impl(x: f128): f128 { trunc_f128_impl(x) }
+fun modf_f128_fractional_impl(x: f128): f128 { x - trunc_f128_impl(x) }
+
+pub fun modf_integral<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(modf_f64_integral_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(modf_f32_integral_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(modf_f16_integral_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(modf_f128_integral_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+pub fun modf_fractional<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(modf_f64_fractional_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(modf_f32_fractional_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(modf_f16_fractional_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(modf_f128_fractional_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── ilogb（以 2 为底的指数，整数返回）───
+// x = m * 2^e, m∈[1,2)，返回 e；x==0 返回 0（简化）；NaN/Inf 返回 0
+
+fun ilogb_f64_impl(x: f64): i32 {
+    if x == 0.0 { return 0 }
+    if x != x { return 0 }
+    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return 0 }
+    var m = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    while m >= 2.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        e = e - 1
+    }
+    e
+}
+fun ilogb_f32_impl(x: f32): i32 {
+    if x == 0.0 { return 0 }
+    if x != x { return 0 }
+    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return 0 }
+    var m = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    while m >= 2.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        e = e - 1
+    }
+    e
+}
+fun ilogb_f16_impl(x: f16): i32 {
+    if x == 0.0 { return 0 }
+    if x != x { return 0 }
+    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return 0 }
+    var m = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    while m >= 2.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        e = e - 1
+    }
+    e
+}
+fun ilogb_f128_impl(x: f128): i32 {
+    if x == 0.0 { return 0 }
+    if x != x { return 0 }
+    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return 0 }
+    var m = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    while m >= 2.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        e = e - 1
+    }
+    e
+}
+
+pub fun ilogb<T>(x: T): i32 {
+    match type_name(x) {
+        "f64" => ilogb_f64_impl(cast(x).to(f64)),
+        "f32" => ilogb_f32_impl(cast(x).to(f32)),
+        "f16" => ilogb_f16_impl(cast(x).to(f16)),
+        "f128" => ilogb_f128_impl(cast(x).to(f128)),
+        _ => 0
+    }
+}
+
+// ─── logb（以 2 为底的指数，浮点返回）───
+// logb(x) = cast(ilogb(x)).to(T)
+
+fun logb_f64_impl(x: f64): f64 { cast(ilogb_f64_impl(x)).to(f64) }
+fun logb_f32_impl(x: f32): f32 { cast(ilogb_f32_impl(x)).to(f32) }
+fun logb_f16_impl(x: f16): f16 { cast(ilogb_f16_impl(x)).to(f16) }
+fun logb_f128_impl(x: f128): f128 { cast(ilogb_f128_impl(x)).to(f128) }
+
+pub fun logb<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(logb_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(logb_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(logb_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(logb_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── scalbn（x * 2^n，与 ldexp 同语义，数学函数命名）───
+
+fun scalbn_f64_impl(x: f64, n: i32): f64 { ldexp_f64_impl(x, n) }
+fun scalbn_f32_impl(x: f32, n: i32): f32 { ldexp_f32_impl(x, n) }
+fun scalbn_f16_impl(x: f16, n: i32): f16 { ldexp_f16_impl(x, n) }
+fun scalbn_f128_impl(x: f128, n: i32): f128 { ldexp_f128_impl(x, n) }
+
+pub fun scalbn<T>(x: T, n: i32): T {
+    match type_name(x) {
+        "f64" => cast(scalbn_f64_impl(cast(x).to(f64), n)).to(T),
+        "f32" => cast(scalbn_f32_impl(cast(x).to(f32), n)).to(T),
+        "f16" => cast(scalbn_f16_impl(cast(x).to(f16), n)).to(T),
+        "f128" => cast(scalbn_f128_impl(cast(x).to(f128), n)).to(T),
+        _ => x
+    }
+}

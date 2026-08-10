@@ -1,0 +1,53 @@
+// builtin/str/Raw.kz — 字符串 UTF-8 解码 @extern("C") 原语（builtin，默认可见）
+//
+// 提供 UTF-8 逐字符解码能力，供 builtin/iter/Iterator.kz 的 StringIterator 使用。
+// 底层 C 位解码，由 cc crate 从 emit-c 生成的 .c 编译。
+//
+// 原语：
+//   __str_utf8_decode_at(s, offset)   → i64（码点，-1=结束/无效）
+//   __str_utf8_char_len_at(s, offset) → usize（该位置字符字节长度 1-4，0=超出范围）
+
+@c_include("stdint.h")
+
+// 在字符串 s 的字节偏移 offset 处解码一个 UTF-8 字符，返回 Unicode 码点。
+// 返回 -1 表示 offset 超出范围或遇到无效 UTF-8 序列。
+@extern("C")
+fun __str_utf8_decode_at(s: str, offset: usize): i64 #{
+    if (offset >= s_len) return -1;
+    unsigned char c = (unsigned char)s_data[offset];
+    uint32_t cp;
+    if (c < 0x80) {
+        cp = c;
+    } else if ((c & 0xE0) == 0xC0) {
+        if (offset + 1 >= s_len) return -1;
+        cp = ((uint32_t)(c & 0x1F) << 6)
+           | ((uint32_t)(s_data[offset + 1] & 0x3F));
+    } else if ((c & 0xF0) == 0xE0) {
+        if (offset + 2 >= s_len) return -1;
+        cp = ((uint32_t)(c & 0x0F) << 12)
+           | ((uint32_t)(s_data[offset + 1] & 0x3F) << 6)
+           | ((uint32_t)(s_data[offset + 2] & 0x3F));
+    } else if ((c & 0xF8) == 0xF0) {
+        if (offset + 3 >= s_len) return -1;
+        cp = ((uint32_t)(c & 0x07) << 18)
+           | ((uint32_t)(s_data[offset + 1] & 0x3F) << 12)
+           | ((uint32_t)(s_data[offset + 2] & 0x3F) << 6)
+           | ((uint32_t)(s_data[offset + 3] & 0x3F));
+    } else {
+        return -1;
+    }
+    return (int64_t)cp;
+}#
+
+// 返回字符串 s 在字节偏移 offset 处的 UTF-8 字符字节长度（1-4）。
+// 返回 0 表示 offset 超出范围。无效 UTF-8 首字节按 1 处理。
+@extern("C")
+fun __str_utf8_char_len_at(s: str, offset: usize): usize #{
+    if (offset >= s_len) return 0;
+    unsigned char c = (unsigned char)s_data[offset];
+    if (c < 0x80) return 1;
+    else if ((c & 0xE0) == 0xC0) return 2;
+    else if ((c & 0xF0) == 0xE0) return 3;
+    else if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}#

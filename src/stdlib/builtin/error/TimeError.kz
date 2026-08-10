@@ -1,0 +1,27 @@
+// TimeError: 时间操作失败时的错误类型
+//
+// 用途：
+//   - __components_to_ns_utc 在日期时间字段越界时返回 Throw<_, TimeError>
+//   - DateTime.parse 解析失败时返回 Throw<_, TimeError>
+//   - 字段语义：
+//       kind  : 错误分类（穷举 ADT）
+//       msg   : 错误描述（人类可读）
+//       value : 触发错误的输入值字符串表示（如 "month=13"）
+//
+// 作为 builtin error_newtype，自动获得 Error trait 的 message() 默认实现（读 msg 字段）。
+// type_name() override 返回 "time error"，便于在日志中识别。
+type TimeError: Err = TimeError(
+    kind: TimeErrorKind,
+    msg: str,
+    value: str,
+) {
+    override fun type_name(self): str { "time error" }
+}
+
+// Time 错误分类（穷举 ADT）
+type TimeErrorKind =
+    | InvalidDateTime    // 日期时间字段越界（如 month=13、day=32）
+    | InvalidFormat       // 格式字符串语法错误
+    | ParseFailed         // 字符串解析失败
+    | OutOfRange          // 数值超出 i128 范围（如远古纪元）
+    | TimezoneNotFound   // 时区名未找到（预留，首批无时区支持）

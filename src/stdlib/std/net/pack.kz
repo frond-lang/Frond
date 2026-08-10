@@ -1,0 +1,8 @@
+// std/net 包声明
+//
+// 暴露 Net 子模块给用户代码：import std.net.TcpStream 等可访问公开符号。
+pub pack Addr
+pub pack TcpListener
+pub pack TcpStream
+pub pack UdpSocket
+pub pack Dns

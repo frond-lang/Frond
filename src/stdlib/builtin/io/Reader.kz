@@ -1,0 +1,12 @@
+// Reader trait: 字节读取抽象
+//
+// 实现者提供 read 的 async IO 语义：
+// - read(&self, len) 读取最多 len 字节，返回 u8[]；空数组表示 EOF
+// - read_byte(&self) 读取单个字节，返回 u8?；null 表示 EOF
+trait Reader {
+    // 核心读取方法：返回最多 len 字节，空数组 = EOF
+    async fun read(&self, len: usize): Async<Throw<u8[], IOError>>
+
+    // 读取单个字节，EOF 返回 null
+    async fun read_byte(&self): Async<Throw<u8?, IOError>>
+}

@@ -1,0 +1,64 @@
+// IOError: IO 操作失败时的错误类型
+//
+// 用途：
+//   - syscall/io.zig 中 __file_* / __dir_* 原语在宿主 syscall 失败时构造
+//   - 字段语义：
+//       kind   : 错误分类（穷举 ADT，用于 match 处理）
+//       msg    : 错误描述（人类可读）
+//       os_err : 宿主原始 errno（0 表示无 OS 错误码，> 0 对应 errno）
+//       path   : 关联的文件/目录路径（stdin/stdout 等无路径场景为 null）
+//
+// 作为 builtin error_newtype，自动获得 Error trait 的 message() 默认实现（读 msg 字段）。
+// type_name() override 返回 "io error"，便于在日志中识别。
+type IOError: Err = IOError(
+    kind: IOErrorKind,
+    msg: str,
+    os_err: i32,
+    path: str?,
+) {
+    override fun type_name(self): str { "io error" }
+}
+
+// IO 错误分类（穷举 ADT）
+// errno 映射规则（Zig 层 syscall/util.zig 维护）：
+//   ENOENT        → NotFound
+//   EACCES/EPERM  → PermissionDenied
+//   EEXIST        → AlreadyExists
+//   EBUSY/EAGAIN  → Busy
+//   EINVAL        → InvalidInput
+//   EPIPE         → BrokenPipe
+//   EINTR         → Interrupted
+//   ENOMEM        → OutOfMemory
+//   ECONNREFUSED  → ConnectionRefused
+//   ECONNRESET    → ConnectionReset
+//   ECONNABORTED  → ConnectionAborted
+//   ENOTCONN      → NotConnected
+//   EADDRINUSE    → AddrInUse
+//   EADDRNOTAVAIL → AddrNotAvailable
+//   ETIMEDOUT     → TimedOut
+//   EHOSTUNREACH  → HostUnreachable
+//   ENETUNREACH   → NetworkUnreachable
+//   ENETDOWN      → NetworkDown
+//   其他          → Other（保留 errno 到 os_err 字段）
+type IOErrorKind =
+    | NotFound            // 文件/目录不存在
+    | PermissionDenied    // 权限不足
+    | AlreadyExists       // 已存在（创建时）
+    | Busy                // 资源忙（临时）
+    | InvalidInput        // 参数非法（如路径格式错误）
+    | UnexpectedEof       // 读到 EOF 但需要更多数据
+    | BrokenPipe          // 写已关闭的管道
+    | OutOfMemory         // 内存不足（映射自宿主）
+    | Interrupted         // 被信号中断（应重试）
+    | Other               // 未分类（查 os_err）
+    // ── Net 错误 ──
+    | ConnectionRefused      // 连接被拒绝（ECONNREFUSED）
+    | ConnectionReset        // 连接被对端重置（ECONNRESET）
+    | ConnectionAborted      // 连接被中止（ECONNABORTED）
+    | NotConnected           // 未连接（ENOTCONN）
+    | AddrInUse              // 地址已占用（EADDRINUSE）
+    | AddrNotAvailable       // 地址不可用（EADDRNOTAVAIL）
+    | TimedOut               // 操作超时（ETIMEDOUT 或 Future cancel）
+    | HostUnreachable        // 主机不可达（EHOSTUNREACH）
+    | NetworkUnreachable     // 网络不可达（ENETUNREACH）
+    | NetworkDown            // 网络子系统故障（ENETDOWN）

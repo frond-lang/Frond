@@ -1,0 +1,617 @@
+// Math 标准库 — 通用函数 + 常量 + NaN/Inf
+//
+// 纯 Kuzo 实现，零 FFI 依赖。
+// NaN/Inf 利用 IEEE 754 浮点除零语义构造。
+// 泛型函数使用 match type_name(x) 按类型分发到对应精度实现。
+
+// ─── f64 常量（十六进制浮点字面量，IEEE 754 精确位模式）───
+pub val PI: f64      = 0x1.921fb54442d18p+1
+pub val E: f64       = 0x1.5bf0a8b145769p+1
+pub val LN2: f64     = 0x1.62e42fefa39efp-1
+pub val LN10: f64    = 0x1.26bb1bbb55516p+1
+pub val SQRT2: f64   = 0x1.6a09e667f3bcdp+0
+pub val LOG2E: f64   = 0x1.71547652b82fep+0
+pub val LOG10E: f64  = 0x1.bcb7b1526e50ep-2
+
+// ─── f32 常量 ───
+pub val PI_F32: f32    = 0x1.921fb6p+1f32
+pub val E_F32: f32     = 0x1.5bf0a8p+1f32
+pub val LN2_F32: f32   = 0x1.62e43p-1f32
+
+// ─── f128 高精度常量（十六进制浮点字面量，IEEE 754 binary128 精确位模式）───
+pub val PI_F128: f128  = 0x1.921fb54442d18469898cc51701b8p+1f128
+pub val E_F128: f128   = 0x1.5bf0a8b1457695355fb8ac404e7ap+1f128
+pub val LN2_F128: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1f128
+
+// ─── f16 常量 ───
+pub val PI_F16: f16    = 0x1.92p+1f16
+pub val E_F16: f16     = 0x1.5cp+1f16
+
+// ─── NaN/Inf 构造（纯 Kuzo 语义，利用 IEEE 754 浮点除零）───
+// 0.0/0.0 = NaN, 1.0/0.0 = +Inf, -1.0/0.0 = -Inf
+
+pub fun nan_f64(): f64       { 0.0 / 0.0 }
+pub fun inf_f64(): f64       { 1.0 / 0.0 }
+pub fun neg_inf_f64(): f64   { -1.0 / 0.0 }
+
+pub fun nan_f32(): f32       { 0.0 / 0.0 }
+pub fun inf_f32(): f32       { 1.0 / 0.0 }
+pub fun neg_inf_f32(): f32   { -1.0 / 0.0 }
+
+pub fun nan_f16(): f16       { 0.0 / 0.0 }
+pub fun inf_f16(): f16       { 1.0 / 0.0 }
+pub fun neg_inf_f16(): f16   { -1.0 / 0.0 }
+
+pub fun nan_f128(): f128     { 0.0 / 0.0 }
+pub fun inf_f128(): f128     { 1.0 / 0.0 }
+pub fun neg_inf_f128(): f128 { -1.0 / 0.0 }
+
+// ─── NaN/Inf 检测（利用 IEEE 754: NaN != NaN）───
+
+pub fun is_nan_f64(x: f64): bool { x != x }
+pub fun is_inf_f64(x: f64): bool { x == 1.0 / 0.0 || x == -1.0 / 0.0 }
+
+pub fun is_nan_f32(x: f32): bool { x != x }
+pub fun is_inf_f32(x: f32): bool { x == 1.0 / 0.0 || x == -1.0 / 0.0 }
+
+pub fun is_nan_f16(x: f16): bool { x != x }
+pub fun is_inf_f16(x: f16): bool { x == 1.0 / 0.0 || x == -1.0 / 0.0 }
+
+pub fun is_nan_f128(x: f128): bool { x != x }
+pub fun is_inf_f128(x: f128): bool { x == 1.0 / 0.0 || x == -1.0 / 0.0 }
+
+// ─── abs（泛型，按类型分发；无符号为 no-op）───
+
+fun abs_i8_impl(x: i8): i8 { if x < 0 { 0 - x } else { x } }
+fun abs_i16_impl(x: i16): i16 { if x < 0 { 0 - x } else { x } }
+fun abs_i32_impl(x: i32): i32 { if x < 0 { 0 - x } else { x } }
+fun abs_i64_impl(x: i64): i64 { if x < 0 { 0 - x } else { x } }
+fun abs_i128_impl(x: i128): i128 { if x < 0 { 0 - x } else { x } }
+fun abs_isize_impl(x: isize): isize { if x < 0 { 0 - x } else { x } }
+fun abs_f16_impl(x: f16): f16 { if x < 0.0 { 0.0 - x } else { x } }
+fun abs_f32_impl(x: f32): f32 { if x < 0.0 { 0.0 - x } else { x } }
+fun abs_f64_impl(x: f64): f64 { if x < 0.0 { 0.0 - x } else { x } }
+fun abs_f128_impl(x: f128): f128 { if x < 0.0 { 0.0 - x } else { x } }
+
+pub fun abs<T>(x: T): T {
+    match type_name(x) {
+        "i8" => cast(abs_i8_impl(cast(x).to(i8))).to(T),
+        "i16" => cast(abs_i16_impl(cast(x).to(i16))).to(T),
+        "i32" => cast(abs_i32_impl(cast(x).to(i32))).to(T),
+        "i64" => cast(abs_i64_impl(cast(x).to(i64))).to(T),
+        "i128" => cast(abs_i128_impl(cast(x).to(i128))).to(T),
+        "isize" => cast(abs_isize_impl(cast(x).to(isize))).to(T),
+        "f16" => cast(abs_f16_impl(cast(x).to(f16))).to(T),
+        "f32" => cast(abs_f32_impl(cast(x).to(f32))).to(T),
+        "f64" => cast(abs_f64_impl(cast(x).to(f64))).to(T),
+        "f128" => cast(abs_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── min/max（泛型，直接比较）───
+
+pub fun min<T>(a: T, b: T): T {
+    if a < b { a } else { b }
+}
+
+pub fun max<T>(a: T, b: T): T {
+    if a > b { a } else { b }
+}
+
+// ─── clamp（泛型，x 限制在 [lo, hi] 范围内）───
+
+pub fun clamp<T>(x: T, lo: T, hi: T): T {
+    if x < lo { lo } else if x > hi { hi } else { x }
+}
+
+// ─── sign（泛型，返回 -1/0/1 同类型）───
+
+pub fun sign<T>(x: T): T {
+    match type_name(x) {
+        "i8" => if cast(x).to(i8) > 0 { cast(1).to(T) } else if cast(x).to(i8) < 0 { cast(0 - 1).to(T) } else { cast(0).to(T) },
+        "i16" => if cast(x).to(i16) > 0 { cast(1).to(T) } else if cast(x).to(i16) < 0 { cast(0 - 1).to(T) } else { cast(0).to(T) },
+        "i32" => if cast(x).to(i32) > 0 { cast(1).to(T) } else if cast(x).to(i32) < 0 { cast(0 - 1).to(T) } else { cast(0).to(T) },
+        "i64" => if cast(x).to(i64) > 0 { cast(1).to(T) } else if cast(x).to(i64) < 0 { cast(0 - 1).to(T) } else { cast(0).to(T) },
+        "i128" => if cast(x).to(i128) > 0 { cast(1).to(T) } else if cast(x).to(i128) < 0 { cast(0 - 1).to(T) } else { cast(0).to(T) },
+        "isize" => if cast(x).to(isize) > 0 { cast(1).to(T) } else if cast(x).to(isize) < 0 { cast(0 - 1).to(T) } else { cast(0).to(T) },
+        "f32" => if cast(x).to(f32) > 0.0 { cast(1.0).to(T) } else if cast(x).to(f32) < 0.0 { cast(0.0 - 1.0).to(T) } else { cast(0.0).to(T) },
+        "f64" => if cast(x).to(f64) > 0.0 { cast(1.0).to(T) } else if cast(x).to(f64) < 0.0 { cast(0.0 - 1.0).to(T) } else { cast(0.0).to(T) },
+        "f16" => if cast(x).to(f16) > 0.0 { cast(1.0).to(T) } else if cast(x).to(f16) < 0.0 { cast(0.0 - 1.0).to(T) } else { cast(0.0).to(T) },
+        "f128" => if cast(x).to(f128) > 0.0 { cast(1.0).to(T) } else if cast(x).to(f128) < 0.0 { cast(0.0 - 1.0).to(T) } else { cast(0.0).to(T) },
+        "u8" => x,
+        "u16" => x,
+        "u32" => x,
+        "u64" => x,
+        "u128" => x,
+        "usize" => x,
+        _ => x
+    }
+}
+
+// ─── 浮点分类检测 ───
+
+// isfinite: NaN/Inf → false，其余 → true（整数恒为 true）
+pub fun isfinite<T>(x: T): bool {
+    match type_name(x) {
+        "f64" => {
+            val v = cast(x).to(f64)
+            !is_nan_f64(v) && !is_inf_f64(v)
+        },
+        "f32" => {
+            val v = cast(x).to(f32)
+            !is_nan_f32(v) && !is_inf_f32(v)
+        },
+        "f16" => {
+            val v = cast(x).to(f16)
+            !is_nan_f16(v) && !is_inf_f16(v)
+        },
+        "f128" => {
+            val v = cast(x).to(f128)
+            !is_nan_f128(v) && !is_inf_f128(v)
+        },
+        _ => true
+    }
+}
+
+// signbit: 负数或 -0.0 → true，其余 → false
+fun signbit_f64_impl(x: f64): bool {
+    x < 0.0 || (x == 0.0 && (1.0 / x) < 0.0)
+}
+fun signbit_f32_impl(x: f32): bool {
+    x < 0.0 || (x == 0.0 && (1.0 / x) < 0.0)
+}
+fun signbit_f16_impl(x: f16): bool {
+    x < 0.0 || (x == 0.0 && (1.0 / x) < 0.0)
+}
+fun signbit_f128_impl(x: f128): bool {
+    x < 0.0 || (x == 0.0 && (1.0 / x) < 0.0)
+}
+
+pub fun signbit<T>(x: T): bool {
+    match type_name(x) {
+        "f64" => signbit_f64_impl(cast(x).to(f64)),
+        "f32" => signbit_f32_impl(cast(x).to(f32)),
+        "f16" => signbit_f16_impl(cast(x).to(f16)),
+        "f128" => signbit_f128_impl(cast(x).to(f128)),
+        "i8" => cast(x).to(i8) < 0,
+        "i16" => cast(x).to(i16) < 0,
+        "i32" => cast(x).to(i32) < 0,
+        "i64" => cast(x).to(i64) < 0,
+        "i128" => cast(x).to(i128) < 0,
+        "isize" => cast(x).to(isize) < 0,
+        _ => false
+    }
+}
+
+// isnormal: 非零、有限、且指数在正常范围内（非 subnormal）
+// 算法：提取指数 e 使 |x|/2^e ∈ [1,2)，检查 e 是否在正常范围内
+fun isnormal_f64_impl(x: f64): bool {
+    if is_nan_f64(x) || is_inf_f64(x) { return false }
+    if x == 0.0 { return false }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    while a >= 2.0 {
+        a = a / 2.0
+        e = e + 1
+    }
+    while a < 1.0 {
+        a = a * 2.0
+        e = e - 1
+    }
+    e >= -1022 && e <= 1023
+}
+fun isnormal_f32_impl(x: f32): bool {
+    if is_nan_f32(x) || is_inf_f32(x) { return false }
+    if x == 0.0 { return false }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    while a >= 2.0 {
+        a = a / 2.0
+        e = e + 1
+    }
+    while a < 1.0 {
+        a = a * 2.0
+        e = e - 1
+    }
+    e >= -126 && e <= 127
+}
+fun isnormal_f16_impl(x: f16): bool {
+    if is_nan_f16(x) || is_inf_f16(x) { return false }
+    if x == 0.0 { return false }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    while a >= 2.0 {
+        a = a / 2.0
+        e = e + 1
+    }
+    while a < 1.0 {
+        a = a * 2.0
+        e = e - 1
+    }
+    e >= -14 && e <= 15
+}
+fun isnormal_f128_impl(x: f128): bool {
+    if is_nan_f128(x) || is_inf_f128(x) { return false }
+    if x == 0.0 { return false }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    var e = 0
+    while a >= 2.0 {
+        a = a / 2.0
+        e = e + 1
+    }
+    while a < 1.0 {
+        a = a * 2.0
+        e = e - 1
+    }
+    e >= -16382 && e <= 16383
+}
+
+pub fun isnormal<T>(x: T): bool {
+    match type_name(x) {
+        "f64" => isnormal_f64_impl(cast(x).to(f64)),
+        "f32" => isnormal_f32_impl(cast(x).to(f32)),
+        "f16" => isnormal_f16_impl(cast(x).to(f16)),
+        "f128" => isnormal_f128_impl(cast(x).to(f128)),
+        _ => x != cast(0).to(T)
+    }
+}
+
+// ─── wrapping 算术（Kuzo 整数运算已使用 wrapping 语义，此处提供显式 API）───
+
+pub fun wrapping_add<T>(a: T, b: T): T { a + b }
+pub fun wrapping_sub<T>(a: T, b: T): T { a - b }
+pub fun wrapping_mul<T>(a: T, b: T): T { a * b }
+
+// ─── 整数位工具 ───
+// 按位宽（8/16/32/64/128）提供实现，有符号类型经 cast 到无符号后复用
+
+// is_power_of_two: x > 0 且仅有一位为 1
+fun is_pow2_8_impl(x: u8): bool { x != 0 && (x & (x - 1)) == 0 }
+fun is_pow2_16_impl(x: u16): bool { x != 0 && (x & (x - 1)) == 0 }
+fun is_pow2_32_impl(x: u32): bool { x != 0 && (x & (x - 1)) == 0 }
+fun is_pow2_64_impl(x: u64): bool { x != 0 && (x & (x - 1)) == 0 }
+fun is_pow2_128_impl(x: u128): bool { x != 0 && (x & (x - 1)) == 0 }
+
+pub fun is_power_of_two<T>(x: T): bool {
+    match type_name(x) {
+        "i8" => is_pow2_8_impl(cast(x).to(u8)),
+        "u8" => is_pow2_8_impl(cast(x).to(u8)),
+        "i16" => is_pow2_16_impl(cast(x).to(u16)),
+        "u16" => is_pow2_16_impl(cast(x).to(u16)),
+        "i32" => is_pow2_32_impl(cast(x).to(u32)),
+        "u32" => is_pow2_32_impl(cast(x).to(u32)),
+        "i64" => is_pow2_64_impl(cast(x).to(u64)),
+        "u64" => is_pow2_64_impl(cast(x).to(u64)),
+        "i128" => is_pow2_128_impl(cast(x).to(u128)),
+        "u128" => is_pow2_128_impl(cast(x).to(u128)),
+        "isize" => is_pow2_64_impl(cast(x).to(u64)),
+        "usize" => is_pow2_64_impl(cast(x).to(u64)),
+        _ => false
+    }
+}
+
+// count_ones: Brian Kernighan 算法，清除最低位直到归零
+fun count_ones_8_impl(x: u8): u8 {
+    var c = 0
+    var v = x
+    while v != 0 {
+        v = v & (v - 1)
+        c = c + 1
+    }
+    c
+}
+fun count_ones_16_impl(x: u16): u16 {
+    var c = 0
+    var v = x
+    while v != 0 {
+        v = v & (v - 1)
+        c = c + 1
+    }
+    c
+}
+fun count_ones_32_impl(x: u32): u32 {
+    var c = 0
+    var v = x
+    while v != 0 {
+        v = v & (v - 1)
+        c = c + 1
+    }
+    c
+}
+fun count_ones_64_impl(x: u64): u64 {
+    var c = 0
+    var v = x
+    while v != 0 {
+        v = v & (v - 1)
+        c = c + 1
+    }
+    c
+}
+fun count_ones_128_impl(x: u128): u128 {
+    var c = 0
+    var v = x
+    while v != 0 {
+        v = v & (v - 1)
+        c = c + 1
+    }
+    c
+}
+
+pub fun count_ones<T>(x: T): T {
+    match type_name(x) {
+        "i8" => cast(count_ones_8_impl(cast(x).to(u8))).to(T),
+        "u8" => cast(count_ones_8_impl(cast(x).to(u8))).to(T),
+        "i16" => cast(count_ones_16_impl(cast(x).to(u16))).to(T),
+        "u16" => cast(count_ones_16_impl(cast(x).to(u16))).to(T),
+        "i32" => cast(count_ones_32_impl(cast(x).to(u32))).to(T),
+        "u32" => cast(count_ones_32_impl(cast(x).to(u32))).to(T),
+        "i64" => cast(count_ones_64_impl(cast(x).to(u64))).to(T),
+        "u64" => cast(count_ones_64_impl(cast(x).to(u64))).to(T),
+        "i128" => cast(count_ones_128_impl(cast(x).to(u128))).to(T),
+        "u128" => cast(count_ones_128_impl(cast(x).to(u128))).to(T),
+        "isize" => cast(count_ones_64_impl(cast(x).to(u64))).to(T),
+        "usize" => cast(count_ones_64_impl(cast(x).to(u64))).to(T),
+        _ => cast(0).to(T)
+    }
+}
+
+// leading_zeros: 从 MSB 扫描连续 0 位
+fun leading_zeros_8_impl(x: u8): u8 {
+    if x == 0 { return 8 }
+    var c = 0
+    var v = x
+    while v < 128 {
+        v = v << 1
+        c = c + 1
+    }
+    c
+}
+fun leading_zeros_16_impl(x: u16): u16 {
+    if x == 0 { return 16 }
+    var c = 0
+    var v = x
+    while v < 32768 {
+        v = v << 1
+        c = c + 1
+    }
+    c
+}
+fun leading_zeros_32_impl(x: u32): u32 {
+    if x == 0 { return 32 }
+    var c = 0
+    var v = x
+    while v < (1u32 << 31) {
+        v = v << 1
+        c = c + 1
+    }
+    c
+}
+fun leading_zeros_64_impl(x: u64): u64 {
+    if x == 0 { return 64 }
+    var c = 0
+    var v = x
+    while v < (1u64 << 63) {
+        v = v << 1
+        c = c + 1
+    }
+    c
+}
+fun leading_zeros_128_impl(x: u128): u128 {
+    if x == 0 { return 128 }
+    var c = 0
+    var v = x
+    while v < (1u128 << 127) {
+        v = v << 1
+        c = c + 1
+    }
+    c
+}
+
+pub fun leading_zeros<T>(x: T): T {
+    match type_name(x) {
+        "i8" => cast(leading_zeros_8_impl(cast(x).to(u8))).to(T),
+        "u8" => cast(leading_zeros_8_impl(cast(x).to(u8))).to(T),
+        "i16" => cast(leading_zeros_16_impl(cast(x).to(u16))).to(T),
+        "u16" => cast(leading_zeros_16_impl(cast(x).to(u16))).to(T),
+        "i32" => cast(leading_zeros_32_impl(cast(x).to(u32))).to(T),
+        "u32" => cast(leading_zeros_32_impl(cast(x).to(u32))).to(T),
+        "i64" => cast(leading_zeros_64_impl(cast(x).to(u64))).to(T),
+        "u64" => cast(leading_zeros_64_impl(cast(x).to(u64))).to(T),
+        "i128" => cast(leading_zeros_128_impl(cast(x).to(u128))).to(T),
+        "u128" => cast(leading_zeros_128_impl(cast(x).to(u128))).to(T),
+        "isize" => cast(leading_zeros_64_impl(cast(x).to(u64))).to(T),
+        "usize" => cast(leading_zeros_64_impl(cast(x).to(u64))).to(T),
+        _ => cast(0).to(T)
+    }
+}
+
+// trailing_zeros: 从 LSB 扫描连续 0 位
+fun trailing_zeros_8_impl(x: u8): u8 {
+    if x == 0 { return 8 }
+    var c = 0
+    var v = x
+    while (v & 1) == 0 {
+        v = v >> 1
+        c = c + 1
+    }
+    c
+}
+fun trailing_zeros_16_impl(x: u16): u16 {
+    if x == 0 { return 16 }
+    var c = 0
+    var v = x
+    while (v & 1) == 0 {
+        v = v >> 1
+        c = c + 1
+    }
+    c
+}
+fun trailing_zeros_32_impl(x: u32): u32 {
+    if x == 0 { return 32 }
+    var c = 0
+    var v = x
+    while (v & 1) == 0 {
+        v = v >> 1
+        c = c + 1
+    }
+    c
+}
+fun trailing_zeros_64_impl(x: u64): u64 {
+    if x == 0 { return 64 }
+    var c = 0
+    var v = x
+    while (v & 1) == 0 {
+        v = v >> 1
+        c = c + 1
+    }
+    c
+}
+fun trailing_zeros_128_impl(x: u128): u128 {
+    if x == 0 { return 128 }
+    var c = 0
+    var v = x
+    while (v & 1) == 0 {
+        v = v >> 1
+        c = c + 1
+    }
+    c
+}
+
+pub fun trailing_zeros<T>(x: T): T {
+    match type_name(x) {
+        "i8" => cast(trailing_zeros_8_impl(cast(x).to(u8))).to(T),
+        "u8" => cast(trailing_zeros_8_impl(cast(x).to(u8))).to(T),
+        "i16" => cast(trailing_zeros_16_impl(cast(x).to(u16))).to(T),
+        "u16" => cast(trailing_zeros_16_impl(cast(x).to(u16))).to(T),
+        "i32" => cast(trailing_zeros_32_impl(cast(x).to(u32))).to(T),
+        "u32" => cast(trailing_zeros_32_impl(cast(x).to(u32))).to(T),
+        "i64" => cast(trailing_zeros_64_impl(cast(x).to(u64))).to(T),
+        "u64" => cast(trailing_zeros_64_impl(cast(x).to(u64))).to(T),
+        "i128" => cast(trailing_zeros_128_impl(cast(x).to(u128))).to(T),
+        "u128" => cast(trailing_zeros_128_impl(cast(x).to(u128))).to(T),
+        "isize" => cast(trailing_zeros_64_impl(cast(x).to(u64))).to(T),
+        "usize" => cast(trailing_zeros_64_impl(cast(x).to(u64))).to(T),
+        _ => cast(0).to(T)
+    }
+}
+
+// next_power_of_two: 位填充法，v |= v>>1|2|4|... 后 +1
+fun next_pow2_8_impl(x: u8): u8 {
+    if x <= 1 { return 1 }
+    var v = x - 1
+    v = v | (v >> 1)
+    v = v | (v >> 2)
+    v = v | (v >> 4)
+    v + 1
+}
+fun next_pow2_16_impl(x: u16): u16 {
+    if x <= 1 { return 1 }
+    var v = x - 1
+    v = v | (v >> 1)
+    v = v | (v >> 2)
+    v = v | (v >> 4)
+    v = v | (v >> 8)
+    v + 1
+}
+fun next_pow2_32_impl(x: u32): u32 {
+    if x <= 1 { return 1 }
+    var v = x - 1
+    v = v | (v >> 1)
+    v = v | (v >> 2)
+    v = v | (v >> 4)
+    v = v | (v >> 8)
+    v = v | (v >> 16)
+    v + 1
+}
+fun next_pow2_64_impl(x: u64): u64 {
+    if x <= 1 { return 1 }
+    var v = x - 1
+    v = v | (v >> 1)
+    v = v | (v >> 2)
+    v = v | (v >> 4)
+    v = v | (v >> 8)
+    v = v | (v >> 16)
+    v = v | (v >> 32)
+    v + 1
+}
+fun next_pow2_128_impl(x: u128): u128 {
+    if x <= 1 { return 1 }
+    var v = x - 1
+    v = v | (v >> 1)
+    v = v | (v >> 2)
+    v = v | (v >> 4)
+    v = v | (v >> 8)
+    v = v | (v >> 16)
+    v = v | (v >> 32)
+    v = v | (v >> 64)
+    v + 1
+}
+
+pub fun next_power_of_two<T>(x: T): T {
+    match type_name(x) {
+        "i8" => cast(next_pow2_8_impl(cast(x).to(u8))).to(T),
+        "u8" => cast(next_pow2_8_impl(cast(x).to(u8))).to(T),
+        "i16" => cast(next_pow2_16_impl(cast(x).to(u16))).to(T),
+        "u16" => cast(next_pow2_16_impl(cast(x).to(u16))).to(T),
+        "i32" => cast(next_pow2_32_impl(cast(x).to(u32))).to(T),
+        "u32" => cast(next_pow2_32_impl(cast(x).to(u32))).to(T),
+        "i64" => cast(next_pow2_64_impl(cast(x).to(u64))).to(T),
+        "u64" => cast(next_pow2_64_impl(cast(x).to(u64))).to(T),
+        "i128" => cast(next_pow2_128_impl(cast(x).to(u128))).to(T),
+        "u128" => cast(next_pow2_128_impl(cast(x).to(u128))).to(T),
+        "isize" => cast(next_pow2_64_impl(cast(x).to(u64))).to(T),
+        "usize" => cast(next_pow2_64_impl(cast(x).to(u64))).to(T),
+        _ => x
+    }
+}
+
+// rotate_left: (x << n) | (x >> (bits - n))，wrapping 移位自动处理 n >= bits
+fun rotate_left_8_impl(x: u8, n: u8): u8 { (x << n) | (x >> (8 - n)) }
+fun rotate_left_16_impl(x: u16, n: u16): u16 { (x << n) | (x >> (16 - n)) }
+fun rotate_left_32_impl(x: u32, n: u32): u32 { (x << n) | (x >> (32 - n)) }
+fun rotate_left_64_impl(x: u64, n: u64): u64 { (x << n) | (x >> (64 - n)) }
+fun rotate_left_128_impl(x: u128, n: u128): u128 { (x << n) | (x >> (128 - n)) }
+
+pub fun rotate_left<T>(x: T, n: T): T {
+    match type_name(x) {
+        "i8" => cast(rotate_left_8_impl(cast(x).to(u8), cast(n).to(u8))).to(T),
+        "u8" => cast(rotate_left_8_impl(cast(x).to(u8), cast(n).to(u8))).to(T),
+        "i16" => cast(rotate_left_16_impl(cast(x).to(u16), cast(n).to(u16))).to(T),
+        "u16" => cast(rotate_left_16_impl(cast(x).to(u16), cast(n).to(u16))).to(T),
+        "i32" => cast(rotate_left_32_impl(cast(x).to(u32), cast(n).to(u32))).to(T),
+        "u32" => cast(rotate_left_32_impl(cast(x).to(u32), cast(n).to(u32))).to(T),
+        "i64" => cast(rotate_left_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
+        "u64" => cast(rotate_left_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
+        "i128" => cast(rotate_left_128_impl(cast(x).to(u128), cast(n).to(u128))).to(T),
+        "u128" => cast(rotate_left_128_impl(cast(x).to(u128), cast(n).to(u128))).to(T),
+        "isize" => cast(rotate_left_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
+        "usize" => cast(rotate_left_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
+        _ => x
+    }
+}
+
+// rotate_right: (x >> n) | (x << (bits - n))
+fun rotate_right_8_impl(x: u8, n: u8): u8 { (x >> n) | (x << (8 - n)) }
+fun rotate_right_16_impl(x: u16, n: u16): u16 { (x >> n) | (x << (16 - n)) }
+fun rotate_right_32_impl(x: u32, n: u32): u32 { (x >> n) | (x << (32 - n)) }
+fun rotate_right_64_impl(x: u64, n: u64): u64 { (x >> n) | (x << (64 - n)) }
+fun rotate_right_128_impl(x: u128, n: u128): u128 { (x >> n) | (x << (128 - n)) }
+
+pub fun rotate_right<T>(x: T, n: T): T {
+    match type_name(x) {
+        "i8" => cast(rotate_right_8_impl(cast(x).to(u8), cast(n).to(u8))).to(T),
+        "u8" => cast(rotate_right_8_impl(cast(x).to(u8), cast(n).to(u8))).to(T),
+        "i16" => cast(rotate_right_16_impl(cast(x).to(u16), cast(n).to(u16))).to(T),
+        "u16" => cast(rotate_right_16_impl(cast(x).to(u16), cast(n).to(u16))).to(T),
+        "i32" => cast(rotate_right_32_impl(cast(x).to(u32), cast(n).to(u32))).to(T),
+        "u32" => cast(rotate_right_32_impl(cast(x).to(u32), cast(n).to(u32))).to(T),
+        "i64" => cast(rotate_right_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
+        "u64" => cast(rotate_right_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
+        "i128" => cast(rotate_right_128_impl(cast(x).to(u128), cast(n).to(u128))).to(T),
+        "u128" => cast(rotate_right_128_impl(cast(x).to(u128), cast(n).to(u128))).to(T),
+        "isize" => cast(rotate_right_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
+        "usize" => cast(rotate_right_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
+        _ => x
+    }
+}

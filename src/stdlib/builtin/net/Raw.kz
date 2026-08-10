@@ -1,0 +1,353 @@
+// builtin/net/Raw.kz — Net 原语 @extern("C") 声明（builtin，默认可见）
+//
+// 底层 POSIX/Windows 网络能力，由 cc crate 从 emit-c 生成的 .c 编译。
+//
+// 设计说明：
+// - IpAddr/Ipv6Addr 等 record 类型由 Kuzo 侧 wrapper 拆解为标量后调用本层。
+// - 例如 __net_tcp_connect_v4 接收 u32 ip_bits，由 std/net/TcpStream.kz 中的
+//   connect wrapper 从 IpAddr.V4(Ipv4Addr(bits)) 中提取 bits 后传入。
+// - 超时参数 timeout_ns: i64，<0 表示无限等待。
+
+@c_include("sys/socket.h")
+@c_include("netinet/in.h")
+@c_include("arpa/inet.h")
+@c_include("unistd.h")
+@c_include("string.h")
+@extern("C")
+fun __net_tcp_connect_v4(ip_bits: u32, port: u16, timeout_ns: i64): i64 #{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(ip_bits);
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return (int64_t)fd;
+}#
+
+@c_include("sys/socket.h")
+@c_include("netinet/in.h")
+@c_include("unistd.h")
+@extern("C")
+fun __net_tcp_listen_v4(ip_bits: u32, port: u16, reuse_addr: bool): i64 #{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (reuse_addr) {
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(ip_bits);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 128) < 0) {
+        close(fd);
+        return -1;
+    }
+    return (int64_t)fd;
+}#
+
+@c_include("sys/socket.h")
+@c_include("netinet/in.h")
+@c_include("unistd.h")
+@extern("C")
+fun __net_tcp_accept(fd: i64): i64 #{
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    int client_fd = accept((int)fd, (struct sockaddr*)&addr, &addr_len);
+    return (int64_t)client_fd;
+}#
+
+@c_include("sys/socket.h")
+@c_include("unistd.h")
+@extern("C")
+fun __net_tcp_read(fd: i64, buf: u8[], len: usize): i64 #{
+    ssize_t n = recv((int)fd, buf_data, buf_len, 0);
+    return (int64_t)n;
+}#
+
+@c_include("sys/socket.h")
+@c_include("unistd.h")
+@extern("C")
+fun __net_tcp_write(fd: i64, buf: u8[], len: usize): i64 #{
+    ssize_t n = send((int)fd, buf_data, buf_len, 0);
+    return (int64_t)n;
+}#
+
+@c_include("sys/socket.h")
+@c_include("unistd.h")
+@extern("C")
+fun __net_tcp_close_raw(fd: i64): i32 #{
+    return close((int)fd);
+}#
+
+@c_include("sys/socket.h")
+@c_include("netinet/in.h")
+@c_include("unistd.h")
+@extern("C")
+fun __net_udp_bind_v4(ip_bits: u32, port: u16, reuse_addr: bool): i64 #{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    if (reuse_addr) {
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(ip_bits);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return (int64_t)fd;
+}#
+
+@c_include("sys/socket.h")
+@c_include("netinet/in.h")
+@c_include("unistd.h")
+@extern("C")
+fun __net_udp_send_to_v4(fd: i64, ip_bits: u32, port: u16, buf: u8[], len: usize): i64 #{
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(ip_bits);
+    ssize_t n = sendto((int)fd, buf_data, buf_len, 0, (struct sockaddr*)&addr, sizeof(addr));
+    return (int64_t)n;
+}#
+
+@c_include("sys/socket.h")
+@c_include("netinet/in.h")
+@c_include("unistd.h")
+@extern("C")
+fun __net_udp_recv_from_v4(fd: i64, buf: u8[], len: usize): i64 #{
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    ssize_t n = recvfrom((int)fd, buf_data, buf_len, 0, (struct sockaddr*)&addr, &addr_len);
+    return (int64_t)n;
+}#
+
+// ─── DNS 解析（out-buffer 模式）──────────────────────────────────
+//
+// 底层标量能力下沉：C 层用 getaddrinfo 解析主机名，将数字地址填入 out_buf。
+// 上层运行时 builtin（__net_resolve）调用本原语后，从 buffer 组装 IpAddr[] 堆对象。
+//
+// out_buf 布局：每个条目 17 字节
+//   [0..16)  地址（family=4 时前 4 字节有效，family=6 时全 16 字节有效）
+//   [16]     family（4=IPv4, 6=IPv6）
+//
+// 返回值：
+//   >=0  实际解析到的地址数
+//   -1   解析失败（域名不存在 / 网络错误）
+//   -2   out_buf 容量不足（需要 max_count*17 字节）
+@c_include("sys/types.h")
+@c_include("netdb.h")
+@c_include("netinet/in.h")
+@c_include("string.h")
+@extern("C")
+fun __net_resolve_into(host: str, out_buf: u8[], max_count: usize): i64 #{
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res;
+    int err = getaddrinfo(host_data, NULL, &hints, &res);
+    if (err != 0) return -1;
+    size_t count = 0;
+    for (struct addrinfo* p = res; p != NULL; p = p->ai_next) {
+        if (count >= max_count) break;
+        if (count * 17 + 17 > out_buf_len) { freeaddrinfo(res); return -2; }
+        if (p->ai_family == AF_INET) {
+            struct sockaddr_in* sa = (struct sockaddr_in*)p->ai_addr;
+            uint32_t addr = sa->sin_addr.s_addr;
+            memcpy(out_buf_data + count * 17, &addr, 4);
+            out_buf_data[count * 17 + 16] = 4;
+            count++;
+        } else if (p->ai_family == AF_INET6) {
+            struct sockaddr_in6* sa = (struct sockaddr_in6*)p->ai_addr;
+            memcpy(out_buf_data + count * 17, &sa->sin6_addr.s6_addr, 16);
+            out_buf_data[count * 17 + 16] = 6;
+            count++;
+        }
+    }
+    freeaddrinfo(res);
+    return (int64_t)count;
+}#
+
+// ─── IPv6 TCP/UDP 原语 ───────────────────────────────────────────
+//
+// Ipv6Addr 在 Kuzo 侧用 (hi: u64, lo: u64) 大端存储。
+// C 侧 struct in6_addr 是 16 字节数组，本层负责 hi/lo → in6_addr 组装：
+//   bytes[0..8)  = hi 大端
+//   bytes[8..16) = lo 大端
+
+@c_include("sys/socket.h")
+@c_include("netinet/in.h")
+@c_include("unistd.h")
+@c_include("string.h")
+@extern("C")
+fun __net_tcp_connect_v6(ip_hi: u64, ip_lo: u64, port: u16, timeout_ns: i64): i64 #{
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in6 addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons(port);
+    addr.sin6_addr.s6_addr[0] = (uint8_t)(ip_hi >> 56);
+    addr.sin6_addr.s6_addr[1] = (uint8_t)(ip_hi >> 48);
+    addr.sin6_addr.s6_addr[2] = (uint8_t)(ip_hi >> 40);
+    addr.sin6_addr.s6_addr[3] = (uint8_t)(ip_hi >> 32);
+    addr.sin6_addr.s6_addr[4] = (uint8_t)(ip_hi >> 24);
+    addr.sin6_addr.s6_addr[5] = (uint8_t)(ip_hi >> 16);
+    addr.sin6_addr.s6_addr[6] = (uint8_t)(ip_hi >> 8);
+    addr.sin6_addr.s6_addr[7] = (uint8_t)(ip_hi);
+    addr.sin6_addr.s6_addr[8] = (uint8_t)(ip_lo >> 56);
+    addr.sin6_addr.s6_addr[9] = (uint8_t)(ip_lo >> 48);
+    addr.sin6_addr.s6_addr[10] = (uint8_t)(ip_lo >> 40);
+    addr.sin6_addr.s6_addr[11] = (uint8_t)(ip_lo >> 32);
+    addr.sin6_addr.s6_addr[12] = (uint8_t)(ip_lo >> 24);
+    addr.sin6_addr.s6_addr[13] = (uint8_t)(ip_lo >> 16);
+    addr.sin6_addr.s6_addr[14] = (uint8_t)(ip_lo >> 8);
+    addr.sin6_addr.s6_addr[15] = (uint8_t)(ip_lo);
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return (int64_t)fd;
+}#
+
+@c_include("sys/socket.h")
+@c_include("netinet/in.h")
+@c_include("unistd.h")
+@c_include("string.h")
+@extern("C")
+fun __net_tcp_listen_v6(ip_hi: u64, ip_lo: u64, port: u16, reuse_addr: bool): i64 #{
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (reuse_addr) {
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    }
+    struct sockaddr_in6 addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons(port);
+    addr.sin6_addr.s6_addr[0] = (uint8_t)(ip_hi >> 56);
+    addr.sin6_addr.s6_addr[1] = (uint8_t)(ip_hi >> 48);
+    addr.sin6_addr.s6_addr[2] = (uint8_t)(ip_hi >> 40);
+    addr.sin6_addr.s6_addr[3] = (uint8_t)(ip_hi >> 32);
+    addr.sin6_addr.s6_addr[4] = (uint8_t)(ip_hi >> 24);
+    addr.sin6_addr.s6_addr[5] = (uint8_t)(ip_hi >> 16);
+    addr.sin6_addr.s6_addr[6] = (uint8_t)(ip_hi >> 8);
+    addr.sin6_addr.s6_addr[7] = (uint8_t)(ip_hi);
+    addr.sin6_addr.s6_addr[8] = (uint8_t)(ip_lo >> 56);
+    addr.sin6_addr.s6_addr[9] = (uint8_t)(ip_lo >> 48);
+    addr.sin6_addr.s6_addr[10] = (uint8_t)(ip_lo >> 40);
+    addr.sin6_addr.s6_addr[11] = (uint8_t)(ip_lo >> 32);
+    addr.sin6_addr.s6_addr[12] = (uint8_t)(ip_lo >> 24);
+    addr.sin6_addr.s6_addr[13] = (uint8_t)(ip_lo >> 16);
+    addr.sin6_addr.s6_addr[14] = (uint8_t)(ip_lo >> 8);
+    addr.sin6_addr.s6_addr[15] = (uint8_t)(ip_lo);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 128) < 0) {
+        close(fd);
+        return -1;
+    }
+    return (int64_t)fd;
+}#
+
+// __net_tcp_accept 通用（v4/v6 共用），read/write/close 也通用，无需 v6 版本
+
+@c_include("sys/socket.h")
+@c_include("netinet/in.h")
+@c_include("unistd.h")
+@c_include("string.h")
+@extern("C")
+fun __net_udp_bind_v6(ip_hi: u64, ip_lo: u64, port: u16, reuse_addr: bool): i64 #{
+    int fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    if (reuse_addr) {
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    }
+    struct sockaddr_in6 addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons(port);
+    addr.sin6_addr.s6_addr[0] = (uint8_t)(ip_hi >> 56);
+    addr.sin6_addr.s6_addr[1] = (uint8_t)(ip_hi >> 48);
+    addr.sin6_addr.s6_addr[2] = (uint8_t)(ip_hi >> 40);
+    addr.sin6_addr.s6_addr[3] = (uint8_t)(ip_hi >> 32);
+    addr.sin6_addr.s6_addr[4] = (uint8_t)(ip_hi >> 24);
+    addr.sin6_addr.s6_addr[5] = (uint8_t)(ip_hi >> 16);
+    addr.sin6_addr.s6_addr[6] = (uint8_t)(ip_hi >> 8);
+    addr.sin6_addr.s6_addr[7] = (uint8_t)(ip_hi);
+    addr.sin6_addr.s6_addr[8] = (uint8_t)(ip_lo >> 56);
+    addr.sin6_addr.s6_addr[9] = (uint8_t)(ip_lo >> 48);
+    addr.sin6_addr.s6_addr[10] = (uint8_t)(ip_lo >> 40);
+    addr.sin6_addr.s6_addr[11] = (uint8_t)(ip_lo >> 32);
+    addr.sin6_addr.s6_addr[12] = (uint8_t)(ip_lo >> 24);
+    addr.sin6_addr.s6_addr[13] = (uint8_t)(ip_lo >> 16);
+    addr.sin6_addr.s6_addr[14] = (uint8_t)(ip_lo >> 8);
+    addr.sin6_addr.s6_addr[15] = (uint8_t)(ip_lo);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return (int64_t)fd;
+}#
+
+@c_include("sys/socket.h")
+@c_include("netinet/in.h")
+@c_include("unistd.h")
+@c_include("string.h")
+@extern("C")
+fun __net_udp_send_to_v6(fd: i64, ip_hi: u64, ip_lo: u64, port: u16, buf: u8[], len: usize): i64 #{
+    struct sockaddr_in6 addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons(port);
+    addr.sin6_addr.s6_addr[0] = (uint8_t)(ip_hi >> 56);
+    addr.sin6_addr.s6_addr[1] = (uint8_t)(ip_hi >> 48);
+    addr.sin6_addr.s6_addr[2] = (uint8_t)(ip_hi >> 40);
+    addr.sin6_addr.s6_addr[3] = (uint8_t)(ip_hi >> 32);
+    addr.sin6_addr.s6_addr[4] = (uint8_t)(ip_hi >> 24);
+    addr.sin6_addr.s6_addr[5] = (uint8_t)(ip_hi >> 16);
+    addr.sin6_addr.s6_addr[6] = (uint8_t)(ip_hi >> 8);
+    addr.sin6_addr.s6_addr[7] = (uint8_t)(ip_hi);
+    addr.sin6_addr.s6_addr[8] = (uint8_t)(ip_lo >> 56);
+    addr.sin6_addr.s6_addr[9] = (uint8_t)(ip_lo >> 48);
+    addr.sin6_addr.s6_addr[10] = (uint8_t)(ip_lo >> 40);
+    addr.sin6_addr.s6_addr[11] = (uint8_t)(ip_lo >> 32);
+    addr.sin6_addr.s6_addr[12] = (uint8_t)(ip_lo >> 24);
+    addr.sin6_addr.s6_addr[13] = (uint8_t)(ip_lo >> 16);
+    addr.sin6_addr.s6_addr[14] = (uint8_t)(ip_lo >> 8);
+    addr.sin6_addr.s6_addr[15] = (uint8_t)(ip_lo);
+    ssize_t n = sendto((int)fd, buf_data, buf_len, 0, (struct sockaddr*)&addr, sizeof(addr));
+    return (int64_t)n;
+}#
+
+@c_include("sys/socket.h")
+@c_include("netinet/in.h")
+@c_include("unistd.h")
+@extern("C")
+fun __net_udp_recv_from_v6(fd: i64, buf: u8[], len: usize): i64 #{
+    struct sockaddr_in6 addr;
+    socklen_t addr_len = sizeof(addr);
+    ssize_t n = recvfrom((int)fd, buf_data, buf_len, 0, (struct sockaddr*)&addr, &addr_len);
+    return (int64_t)n;
+}#

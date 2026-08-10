@@ -1,0 +1,146 @@
+// Addr.kz — IpAddr/Ipv4Addr/Ipv6Addr/SocketAddr 地址类型
+//
+// 设计文档 §6.2：网络地址类型与构造器/访问器。
+// 标量位存储（零浪费）：Ipv4Addr=u32, Ipv6Addr=hi/lo u64。
+// 类型采用 newtype/ADT 形式，以便 syscall 层通过
+// Value.makeRecordWithNames(type_name="Ipv4Addr"/"Ipv6Addr"/"IpAddr", ...)
+// 构造的值能在 Kuzo 端被识别。
+//
+// 方法分派暂不支持，使用模块函数调用语法（参考 std_instant/Main.kz）：
+//   std.net.Addr.v4_loopback()
+//   std.net.Addr.v4_octet(addr, 0u8)
+
+// ─── 类型定义 ──────────────────────────────────────────────────────
+
+// Ipv4Addr：newtype，fields = [__tag=0, bits=u32]（网络字节序大端）
+pub type Ipv4Addr = Ipv4Addr(bits: u32) {
+    // ─── Ipv4Addr 访问器 ──────────────────────────────────────────────
+
+    pub fun v4_octet(self, i: u8): u8 {
+        val idx = u32(i)
+        val shift = (3u32 - idx) * 8u32
+        u8((self.bits >> shift) & 0xFFu32)
+    }
+
+    pub fun v4_bits(self): u32 {
+        self.bits
+    }
+
+    pub fun v4_is_loopback(self): bool {
+        v4_octet(self, 0u8) == 127u8
+    }
+
+    pub fun v4_is_unspecified(self): bool {
+        self.bits == 0u32
+    }
+}
+
+// Ipv6Addr：newtype，fields = [__tag=0, hi=u64, lo=u64]（hi/lo 各 8 字节大端）
+pub type Ipv6Addr = Ipv6Addr(hi: u64, lo: u64) {
+    // ─── Ipv6Addr 访问器 ──────────────────────────────────────────────
+
+    pub fun v6_segment(self, i: u8): u16 {
+        val idx = u64(i)
+        val word = if idx < 4u64 { self.hi } else { self.lo }
+        val shift = (3u64 - (idx % 4u64)) * 16u64
+        u16((word >> shift) & 0xFFFFu64)
+    }
+
+    pub fun v6_hi(self): u64 {
+        self.hi
+    }
+
+    pub fun v6_lo(self): u64 {
+        self.lo
+    }
+
+    pub fun v6_is_loopback(self): bool {
+        self.hi == 0u64 && self.lo == 1u64
+    }
+
+    pub fun v6_is_unspecified(self): bool {
+        self.hi == 0u64 && self.lo == 0u64
+    }
+}
+
+// IpAddr：ADT，V4(__tag=0, addr=Ipv4Addr) | V6(__tag=1, addr=Ipv6Addr)
+pub type IpAddr = | V4(Ipv4Addr) | V6(Ipv6Addr) {
+    pub fun ip_is_v4(self): bool {
+        match self {
+            V4(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fun ip_is_v6(self): bool {
+        match self {
+            V6(_) => true,
+            _ => false,
+        }
+    }
+}
+
+// SocketAddr：newtype，fields = [__tag=0, ip=IpAddr, port=u16]
+pub type SocketAddr = SocketAddr(ip: IpAddr, port: u16) {
+    pub fun socket_ip(self): IpAddr {
+        self.ip
+    }
+
+    pub fun socket_port(self): u16 {
+        self.port
+    }
+}
+
+// ─── Ipv4Addr 构造器 ──────────────────────────────────────────────
+
+pub fun v4_from_octets(a: u8, b: u8, c: u8, d: u8): Ipv4Addr {
+    Ipv4Addr((u32(a) << 24u32) | (u32(b) << 16u32) | (u32(c) << 8u32) | u32(d))
+}
+
+pub fun v4_from_bits(bits: u32): Ipv4Addr {
+    Ipv4Addr(bits)
+}
+
+pub fun v4_loopback(): Ipv4Addr {
+    v4_from_octets(127u8, 0u8, 0u8, 1u8)
+}
+
+pub fun v4_unspecified(): Ipv4Addr {
+    v4_from_bits(0u32)
+}
+
+// ─── Ipv6Addr 构造器 ──────────────────────────────────────────────
+
+pub fun v6_from_segments(w0: u16, w1: u16, w2: u16, w3: u16, w4: u16, w5: u16, w6: u16, w7: u16): Ipv6Addr {
+    val hi = (u64(w0) << 48u64) | (u64(w1) << 32u64) | (u64(w2) << 16u64) | u64(w3)
+    val lo = (u64(w4) << 48u64) | (u64(w5) << 32u64) | (u64(w6) << 16u64) | u64(w7)
+    Ipv6Addr(hi, lo)
+}
+
+pub fun v6_from_bits(hi: u64, lo: u64): Ipv6Addr {
+    Ipv6Addr(hi, lo)
+}
+
+pub fun v6_loopback(): Ipv6Addr {
+    v6_from_bits(0u64, 1u64)
+}
+
+pub fun v6_unspecified(): Ipv6Addr {
+    v6_from_bits(0u64, 0u64)
+}
+
+// ─── IpAddr 构造器与判断 ──────────────────────────────────────────
+
+pub fun ip_from_v4(addr: Ipv4Addr): IpAddr {
+    V4(addr)
+}
+
+pub fun ip_from_v6(addr: Ipv6Addr): IpAddr {
+    V6(addr)
+}
+
+// ─── SocketAddr ───────────────────────────────────────────────────
+
+pub fun socket_from(ip: IpAddr, port: u16): SocketAddr {
+    SocketAddr(ip, port)
+}

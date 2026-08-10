@@ -1,0 +1,73 @@
+// builtin/cast/Cast.kz — 类型转换 Kuzo wrapper（builtin，默认可见）
+//
+// cast(x).to(T) 在 parser 层降级为普通 Call: __cast_to<T>(x)
+// sema 推断源类型 S 后，解析为 __cast_S_to_T(x) 函数调用
+//
+// 原语定义在 builtin/cast/Raw.kz（@extern("C")），本文件组合原语实现两步中转：
+//   整数 → 整数：经 i128 中转（widen S→i128，narrow i128→T）
+//   char → u8/str、[u8] → str：直接调用 Raw.kz 中的专用原语
+
+// ─── Kuzo wrappers: 源 → i128 → 目标（两步中转） ────────────────────
+// 每对 (S, T) 组合 widen + narrow，sema 通过 mangled name 查找
+
+// i64 → *
+pub fun __cast_i64_to_i32(x: i64): i32 {
+    __cast_i128_to_i32(__cast_i64_to_i128(x))
+}
+pub fun __cast_i64_to_u8(x: i64): u8 {
+    __cast_i128_to_u8(__cast_i64_to_i128(x))
+}
+pub fun __cast_i64_to_u16(x: i64): u16 {
+    __cast_i128_to_u16(__cast_i64_to_i128(x))
+}
+pub fun __cast_i64_to_u32(x: i64): u32 {
+    __cast_i128_to_u32(__cast_i64_to_i128(x))
+}
+pub fun __cast_i64_to_usize(x: i64): usize {
+    __cast_i128_to_usize(__cast_i64_to_i128(x))
+}
+
+// i32 → *
+pub fun __cast_i32_to_i64(x: i32): i64 {
+    __cast_i128_to_i64(__cast_i32_to_i128(x))
+}
+pub fun __cast_i32_to_u8(x: i32): u8 {
+    __cast_i128_to_u8(__cast_i32_to_i128(x))
+}
+pub fun __cast_i32_to_u16(x: i32): u16 {
+    __cast_i128_to_u16(__cast_i32_to_i128(x))
+}
+pub fun __cast_i32_to_usize(x: i32): usize {
+    __cast_i128_to_usize(__cast_i32_to_i128(x))
+}
+
+// u8 → *
+pub fun __cast_u8_to_i32(x: u8): i32 {
+    __cast_i128_to_i32(__cast_u8_to_i128(x))
+}
+pub fun __cast_u8_to_i64(x: u8): i64 {
+    __cast_i128_to_i64(__cast_u8_to_i128(x))
+}
+pub fun __cast_u8_to_u16(x: u8): u16 {
+    __cast_i128_to_u16(__cast_u8_to_i128(x))
+}
+
+// u16 → *
+pub fun __cast_u16_to_i64(x: u16): i64 {
+    __cast_i128_to_i64(__cast_u16_to_i128(x))
+}
+
+// u32 → *
+pub fun __cast_u32_to_i64(x: u32): i64 {
+    __cast_i128_to_i64(__cast_u32_to_i128(x))
+}
+
+// u64 → *
+pub fun __cast_u64_to_i64(x: u64): i64 {
+    __cast_i128_to_i64(__cast_u64_to_i128(x))
+}
+
+// usize → *
+pub fun __cast_usize_to_i64(x: usize): i64 {
+    __cast_i128_to_i64(__cast_usize_to_i128(x))
+}

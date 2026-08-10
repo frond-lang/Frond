@@ -1,0 +1,373 @@
+// builtin/io/Raw.kz — IO 原语 @extern("C") 声明（builtin，默认可见）
+//
+// 底层 POSIX/Windows IO 能力，由 cc crate 从 emit-c 生成的 .c 编译。
+// 跨平台逻辑通过 #if 条件编译在 C body 中实现。
+// 供 builtin/io/Console.kz 和 std/io/*.kz 的 wrapper 调用。
+
+@c_include("fcntl.h")
+@c_include("sys/stat.h")
+@c_include("unistd.h")
+@c_include("stdio.h")
+@c_include("string.h")
+@extern("C")
+fun __file_open_raw(path: str, flags: i32, mode: i32): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        int posix_flags = 0;
+        if (flags & 1) posix_flags |= _O_RDONLY;
+        if (flags & 2) posix_flags |= _O_WRONLY;
+        if ((flags & 1) && (flags & 2)) posix_flags |= _O_RDWR;
+        if (flags & 4) posix_flags |= _O_CREAT;
+        if (flags & 8) posix_flags |= _O_TRUNC;
+        if (flags & 16) posix_flags |= _O_APPEND;
+        return _open(path_data, posix_flags | _O_BINARY, mode);
+    #else
+        int posix_flags = 0;
+        if (flags & 1) posix_flags |= O_RDONLY;
+        if (flags & 2) posix_flags |= O_WRONLY;
+        if ((flags & 1) && (flags & 2)) posix_flags |= O_RDWR;
+        if (flags & 4) posix_flags |= O_CREAT;
+        if (flags & 8) posix_flags |= O_TRUNC;
+        if (flags & 16) posix_flags |= O_APPEND;
+        return open(path_data, posix_flags, mode);
+    #endif
+}#
+
+@c_include("unistd.h")
+@extern("C")
+fun __file_close_raw(fd: i64): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        return _close((int)fd);
+    #else
+        return close((int)fd);
+    #endif
+}#
+
+@c_include("unistd.h")
+@extern("C")
+fun __file_read_into(fd: i64, buf: u8[], len: usize): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        return _read((int)fd, buf_data, (unsigned int)buf_len);
+    #else
+        return read((int)fd, buf_data, buf_len);
+    #endif
+}#
+
+@c_include("unistd.h")
+@extern("C")
+fun __file_write(fd: i64, buf: u8[], len: usize): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        return _write((int)fd, buf_data, (unsigned int)buf_len);
+    #else
+        return write((int)fd, buf_data, buf_len);
+    #endif
+}#
+
+@c_include("unistd.h")
+@extern("C")
+fun __file_seek_raw(fd: i64, offset: i64, whence: i32): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        int origin = whence == 0 ? FILE_BEGIN : (whence == 1 ? FILE_CURRENT : FILE_END);
+        LONG high = (LONG)(offset >> 32);
+        DWORD low = SetFilePointer((HANDLE)(intptr_t)fd, (LONG)(offset & 0xFFFFFFFF), &high, origin);
+        if (low == INVALID_SET_FILE_POINTER) return -1;
+        return ((int64_t)high << 32) | (int64_t)low;
+    #else
+        int posix_whence = whence == 0 ? SEEK_SET : (whence == 1 ? SEEK_CUR : SEEK_END);
+        return lseek((int)fd, offset, posix_whence);
+    #endif
+}#
+
+@c_include("unistd.h")
+@extern("C")
+fun __file_remove_raw(path: str): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        return _unlink(path_data);
+    #else
+        return unlink(path_data);
+    #endif
+}#
+
+@c_include("stdio.h")
+@extern("C")
+fun __file_rename_raw(old: str, new: str): i32 #{
+    return rename(old_data, new_data);
+}#
+
+@c_include("unistd.h")
+@extern("C")
+fun __stdout_write_raw(s: str): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD written;
+        if (!WriteFile(h, s_data, (DWORD)s_len, &written, NULL)) return -1;
+        return 0;
+    #else
+        ssize_t n = write(STDOUT_FILENO, s_data, s_len);
+        return n < 0 ? -1 : 0;
+    #endif
+}#
+
+@c_include("unistd.h")
+@extern("C")
+fun __stderr_write_raw(s: str): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+        DWORD written;
+        if (!WriteFile(h, s_data, (DWORD)s_len, &written, NULL)) return -1;
+        return 0;
+    #else
+        ssize_t n = write(STDERR_FILENO, s_data, s_len);
+        return n < 0 ? -1 : 0;
+    #endif
+}#
+
+// 读一行到 buffer，返回读取字节数（>=0 成功，1 EOF，-1 错误）
+// buf_data/buf_len 由 u8[] marshal 自动提供
+@c_include("unistd.h")
+@extern("C")
+fun __stdin_readln_into(buf: u8[]): i64 #{
+    size_t total = 0;
+    char ch;
+    ssize_t n;
+    while (total < buf_len) {
+        n = read(STDIN_FILENO, &ch, 1);
+        if (n < 0) return -1;
+        if (n == 0) return total == 0 ? 1 : (int64_t)total;
+        if (ch == '\n') return (int64_t)total;
+        buf_data[total++] = ch;
+    }
+    return (int64_t)total;
+}#
+
+@c_include("sys/stat.h")
+@extern("C")
+fun __dir_create_raw(path: str, recursive: bool): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        if (recursive) {
+            char buf[4096];
+            size_t len = path_len < sizeof(buf)-1 ? path_len : sizeof(buf)-1;
+            memcpy(buf, path_data, len);
+            buf[len] = 0;
+            for (char* p = buf+1; *p; p++) {
+                if (*p == '/' || *p == '\\') { *p = 0; _mkdir(buf); *p = '/'; }
+            }
+            return _mkdir(buf);
+        }
+        return _mkdir(path_data);
+    #else
+        if (recursive) {
+            char buf[4096];
+            size_t len = path_len < sizeof(buf)-1 ? path_len : sizeof(buf)-1;
+            memcpy(buf, path_data, len);
+            buf[len] = 0;
+            for (char* p = buf+1; *p; p++) {
+                if (*p == '/') { *p = 0; mkdir(buf, 0755); *p = '/'; }
+            }
+            return mkdir(buf, 0755);
+        }
+        return mkdir(path_data, 0755);
+    #endif
+}#
+
+@c_include("unistd.h")
+@extern("C")
+fun __dir_remove_raw(path: str, recursive: bool): i32 #{
+    (void)recursive;
+    #if defined(_WIN32) || defined(_WIN64)
+        return _rmdir(path_data);
+    #else
+        return rmdir(path_data);
+    #endif
+}#
+
+// ─── chmod ───────────────────────────────────────────────────────
+
+@c_include("sys/stat.h")
+@extern("C")
+fun __file_chmod_raw(path: str, mode: i32): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        return _chmod(path_data, mode);
+    #else
+        return chmod(path_data, mode);
+    #endif
+}#
+
+// ─── stat/fstat：通过 u8[] out-buffer 返回结构化数据 ───────────────
+//
+// buf 布局（28 字节，native endian）：
+//   [0..8)   size     u64
+//   [8..16)  mtime_ns i64（POSIX 秒→纳秒换算）
+//   [16..24) ctime_ns i64
+//   [24..28) kind     i32（0=file, 1=dir, 2=symlink, 3=other）
+//
+// 返回 0=成功，-1=失败
+
+@c_include("sys/stat.h")
+@extern("C")
+fun __file_stat_into(path: str, buf: u8[]): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        struct _stat64 st;
+        if (_stat64(path_data, &st) < 0) return -1;
+        uint64_t size = (uint64_t)st.st_size;
+        int64_t mtime = (int64_t)st.st_mtime * 1000000000LL;
+        int64_t ctime = (int64_t)st.st_ctime * 1000000000LL;
+        int32_t kind = (st.st_mode & _S_IFREG) ? 0 : (st.st_mode & _S_IFDIR) ? 1 : 3;
+        memcpy(buf_data, &size, 8);
+        memcpy(buf_data + 8, &mtime, 8);
+        memcpy(buf_data + 16, &ctime, 8);
+        memcpy(buf_data + 24, &kind, 4);
+        return 0;
+    #elif defined(__APPLE__)
+        struct stat st;
+        if (stat(path_data, &st) < 0) return -1;
+        uint64_t size = (uint64_t)st.st_size;
+        int64_t mtime = (int64_t)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
+        int64_t ctime = (int64_t)st.st_ctimespec.tv_sec * 1000000000LL + st.st_ctimespec.tv_nsec;
+        int32_t kind = S_ISREG(st.st_mode) ? 0 : S_ISDIR(st.st_mode) ? 1 : S_ISLNK(st.st_mode) ? 2 : 3;
+        memcpy(buf_data, &size, 8);
+        memcpy(buf_data + 8, &mtime, 8);
+        memcpy(buf_data + 16, &ctime, 8);
+        memcpy(buf_data + 24, &kind, 4);
+        return 0;
+    #else
+        struct stat st;
+        if (stat(path_data, &st) < 0) return -1;
+        uint64_t size = (uint64_t)st.st_size;
+        int64_t mtime = (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+        int64_t ctime = (int64_t)st.st_ctim.tv_sec * 1000000000LL + st.st_ctim.tv_nsec;
+        int32_t kind = S_ISREG(st.st_mode) ? 0 : S_ISDIR(st.st_mode) ? 1 : S_ISLNK(st.st_mode) ? 2 : 3;
+        memcpy(buf_data, &size, 8);
+        memcpy(buf_data + 8, &mtime, 8);
+        memcpy(buf_data + 16, &ctime, 8);
+        memcpy(buf_data + 24, &kind, 4);
+        return 0;
+    #endif
+}#
+
+@c_include("sys/stat.h")
+@extern("C")
+fun __file_fstat_into(fd: i64, buf: u8[]): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        struct _stat64 st;
+        if (_fstat64((int)fd, &st) < 0) return -1;
+        uint64_t size = (uint64_t)st.st_size;
+        int64_t mtime = (int64_t)st.st_mtime * 1000000000LL;
+        int64_t ctime = (int64_t)st.st_ctime * 1000000000LL;
+        int32_t kind = (st.st_mode & _S_IFREG) ? 0 : (st.st_mode & _S_IFDIR) ? 1 : 3;
+        memcpy(buf_data, &size, 8);
+        memcpy(buf_data + 8, &mtime, 8);
+        memcpy(buf_data + 16, &ctime, 8);
+        memcpy(buf_data + 24, &kind, 4);
+        return 0;
+    #elif defined(__APPLE__)
+        struct stat st;
+        if (fstat((int)fd, &st) < 0) return -1;
+        uint64_t size = (uint64_t)st.st_size;
+        int64_t mtime = (int64_t)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
+        int64_t ctime = (int64_t)st.st_ctimespec.tv_sec * 1000000000LL + st.st_ctimespec.tv_nsec;
+        int32_t kind = S_ISREG(st.st_mode) ? 0 : S_ISDIR(st.st_mode) ? 1 : S_ISLNK(st.st_mode) ? 2 : 3;
+        memcpy(buf_data, &size, 8);
+        memcpy(buf_data + 8, &mtime, 8);
+        memcpy(buf_data + 16, &ctime, 8);
+        memcpy(buf_data + 24, &kind, 4);
+        return 0;
+    #else
+        struct stat st;
+        if (fstat((int)fd, &st) < 0) return -1;
+        uint64_t size = (uint64_t)st.st_size;
+        int64_t mtime = (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+        int64_t ctime = (int64_t)st.st_ctim.tv_sec * 1000000000LL + st.st_ctim.tv_nsec;
+        int32_t kind = S_ISREG(st.st_mode) ? 0 : S_ISDIR(st.st_mode) ? 1 : S_ISLNK(st.st_mode) ? 2 : 3;
+        memcpy(buf_data, &size, 8);
+        memcpy(buf_data + 8, &mtime, 8);
+        memcpy(buf_data + 16, &ctime, 8);
+        memcpy(buf_data + 24, &kind, 4);
+        return 0;
+    #endif
+}#
+
+// ─── 目录列举（out-buffer 模式）──────────────────────────────────
+//
+// 底层标量能力下沉：C 层遍历目录，将条目名与 kind 填入三个 out-buffer。
+// 上层运行时 builtin（__dir_list）调用本原语后，从 buffer 组装 DirEntry[] 堆对象。
+//
+// 三个 out-buffer 协同：
+//   names_buf     连续存储所有条目名字节（无分隔符，靠 name_offsets 定界）
+//   name_offsets  每条目 4 字节 u32 LE，相对 names_buf 起始的偏移
+//   kinds_buf     每条目 1 字节 kind（0=file, 1=dir, 2=symlink, 3=other）
+//
+// 返回值：
+//   >=0  实际条目数（已跳过 "." 和 ".."）
+//   -1   错误（路径不存在 / 无权限）
+//   -2   某个 buffer 容量不足
+//   -3   max_count 不足（条目数超过上限）
+@c_include("string.h")
+@extern("C")
+fun __dir_list_into(path: str, names_buf: u8[], name_offsets: u8[], kinds_buf: u8[], max_count: usize): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        WIN32_FIND_DATAA fd;
+        char pattern[4096];
+        size_t plen = path_len < sizeof(pattern) - 3 ? path_len : sizeof(pattern) - 3;
+        memcpy(pattern, path_data, plen);
+        pattern[plen] = '\\';
+        pattern[plen + 1] = '*';
+        pattern[plen + 2] = 0;
+        HANDLE h = FindFirstFileA(pattern, &fd);
+        if (h == INVALID_HANDLE_VALUE) return -1;
+        size_t count = 0;
+        size_t names_pos = 0;
+        do {
+            if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+            if (count >= max_count) { FindClose(h); return -3; }
+            size_t nlen = strlen(fd.cFileName);
+            if (names_pos + nlen > names_buf_len) { FindClose(h); return -2; }
+            if ((count + 1) * 4 > name_offsets_len) { FindClose(h); return -2; }
+            if (count >= kinds_buf_len) { FindClose(h); return -2; }
+            memcpy(names_buf_data + names_pos, fd.cFileName, nlen);
+            uint32_t off = (uint32_t)names_pos;
+            memcpy(name_offsets_data + count * 4, &off, 4);
+            uint8_t kind = 0;
+            DWORD attr = fd.dwFileAttributes;
+            if (attr & FILE_ATTRIBUTE_DIRECTORY) kind = 1;
+            else if (attr & FILE_ATTRIBUTE_REPARSE_POINT) kind = 2;
+            else kind = 0;
+            kinds_buf_data[count] = kind;
+            names_pos += nlen;
+            count++;
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+        return (int64_t)count;
+    #else
+        #if defined(__APPLE__) || defined(__linux__) || defined(__unix__)
+            #include <dirent.h>
+        #endif
+        DIR* d = opendir(path_data);
+        if (!d) return -1;
+        size_t count = 0;
+        size_t names_pos = 0;
+        struct dirent* e;
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+            if (count >= max_count) { closedir(d); return -3; }
+            size_t nlen = strlen(e->d_name);
+            if (names_pos + nlen > names_buf_len) { closedir(d); return -2; }
+            if ((count + 1) * 4 > name_offsets_len) { closedir(d); return -2; }
+            if (count >= kinds_buf_len) { closedir(d); return -2; }
+            memcpy(names_buf_data + names_pos, e->d_name, nlen);
+            uint32_t off = (uint32_t)names_pos;
+            memcpy(name_offsets_data + count * 4, &off, 4);
+            uint8_t kind = 3;
+            switch (e->d_type) {
+                case DT_REG: kind = 0; break;
+                case DT_DIR: kind = 1; break;
+                case DT_LNK: kind = 2; break;
+                default: kind = 3; break;
+            }
+            kinds_buf_data[count] = kind;
+            names_pos += nlen;
+            count++;
+        }
+        closedir(d);
+        return (int64_t)count;
+    #endif
+}#

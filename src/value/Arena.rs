@@ -1,0 +1,2325 @@
+// =========================================================================
+// Arena — Bucket + ValueArena + ValueTrait + 相等性 + 深克隆
+// =========================================================================
+
+use std::cell::RefCell;
+use rustc_hash::FxHashMap;
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
+use rayon::prelude::*;
+use wide::{i32x4, i64x4, CmpEq};
+
+pub use crate::types::ValueTag;
+
+use super::value::*;
+use super::ops::SIMD_LANES;
+use super::ops::PARALLEL_THRESHOLD;
+use super::ops::par_chunk_size;
+
+// =========================================================================
+// 第三部分：Bucket<T> + ValueArena（全分桶 SoA 存储）
+// =========================================================================
+
+/// 类型分桶：连续存储同类型值 + 并行引用计数 + 空闲列表回收。
+struct Bucket<T: Clone> {
+    data: Vec<T>,
+    refcounts: Vec<u32>,
+    free_list: Vec<u32>,
+}
+
+impl<T: Clone> Bucket<T> {
+    fn new() -> Self {
+        Self { data: Vec::new(), refcounts: Vec::new(), free_list: Vec::new() }
+    }
+
+    fn alloc(&mut self, val: T) -> u32 {
+        if let Some(idx) = self.free_list.pop() {
+            self.data[idx as usize] = val;
+            self.refcounts[idx as usize] = 1;
+            idx
+        } else {
+            let idx = self.data.len() as u32;
+            self.data.push(val);
+            self.refcounts.push(1);
+            idx
+        }
+    }
+
+    #[inline]
+    fn get(&self, idx: u32) -> &T {
+        &self.data[idx as usize]
+    }
+
+    #[inline]
+    fn get_mut(&mut self, idx: u32) -> &mut T {
+        &mut self.data[idx as usize]
+    }
+
+    /// 当前已分配槽位数（含空闲未回收），用于 FFI 边界校验 handle 合法性
+    #[inline]
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn inc_ref(&mut self, idx: u32) {
+        self.refcounts[idx as usize] += 1;
+    }
+
+    fn dec_ref(&mut self, idx: u32) -> bool {
+        let rc = &mut self.refcounts[idx as usize];
+        *rc = rc.saturating_sub(1);
+        if *rc == 0 {
+            self.free_list.push(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn _refcount(&self, idx: u32) -> u32 {
+        self.refcounts[idx as usize]
+    }
+
+    /// 清空该桶的所有数据、引用计数与空闲列表，回收内存。
+    fn reset(&mut self) {
+        self.data.clear();
+        self.refcounts.clear();
+        self.free_list.clear();
+    }
+}
+
+/// Value 的统一存储：按类型分桶（SoA），每种标量类型独立连续存储。
+/// 堆对象（HeapObj）用 Arc，存于 ref_bucket。
+pub struct ValueArena {
+    char_bucket: Bucket<u32>,
+    i8_bucket: Bucket<i8>,
+    i16_bucket: Bucket<i16>,
+    i32_bucket: Bucket<i32>,
+    i64_bucket: Bucket<i64>,
+    u8_bucket: Bucket<u8>,
+    u16_bucket: Bucket<u16>,
+    u32_bucket: Bucket<u32>,
+    u64_bucket: Bucket<u64>,
+    isz_bucket: Bucket<isize>,
+    usz_bucket: Bucket<usize>,
+    i128_bucket: Bucket<[u64; 2]>,
+    u128_bucket: Bucket<[u64; 2]>,
+    f16_bucket: Bucket<u16>,
+    f32_bucket: Bucket<f32>,
+    f64_bucket: Bucket<f64>,
+    f128_bucket: Bucket<[u64; 2]>,
+    ref_bucket: Bucket<Arc<HeapObj>>,
+}
+
+macro_rules! impl_scalar_bucket_methods {
+    ($($tag:ident => $alloc:ident / $get:ident : $ty:ty, $bucket:ident);* $(;)?) => {
+        impl ValueArena {
+            $(
+                #[inline]
+                pub fn $alloc(&mut self, v: $ty) -> ValueHandle {
+                    let idx = self.$bucket.alloc(v);
+                    ValueHandle::new(ValueTag::$tag, idx as usize)
+                }
+                #[inline]
+                pub fn $get(&self, h: ValueHandle) -> $ty {
+                    *self.$bucket.get(h.index() as u32)
+                }
+            )*
+        }
+    };
+}
+
+impl_scalar_bucket_methods! {
+    Char => alloc_char / get_char : u32, char_bucket;
+    I8 => alloc_i8 / get_i8 : i8, i8_bucket;
+    I16 => alloc_i16 / get_i16 : i16, i16_bucket;
+    I32 => alloc_i32 / get_i32 : i32, i32_bucket;
+    I64 => alloc_i64 / get_i64 : i64, i64_bucket;
+    U8 => alloc_u8 / get_u8 : u8, u8_bucket;
+    U16 => alloc_u16 / get_u16 : u16, u16_bucket;
+    U32 => alloc_u32 / get_u32 : u32, u32_bucket;
+    U64 => alloc_u64 / get_u64 : u64, u64_bucket;
+    Isize => alloc_isize / get_isize : isize, isz_bucket;
+    Usize => alloc_usize / get_usize : usize, usz_bucket;
+    F16 => alloc_f16 / get_f16 : u16, f16_bucket;
+    F32 => alloc_f32 / get_f32 : f32, f32_bucket;
+    F64 => alloc_f64 / get_f64 : f64, f64_bucket;
+}
+
+impl ValueArena {
+    // ─── 全局 arena 访问（供 extern "C" 反射原语使用）──────────────
+    // Kuzo 是单线程编译器，thread_local 足够。
+    thread_local! {
+        static GLOBAL_ARENA: RefCell<ValueArena> = RefCell::new(ValueArena::new());
+    }
+
+    /// 全局 arena 只读访问
+    pub fn with_global<R>(f: impl FnOnce(&ValueArena) -> R) -> R {
+        Self::GLOBAL_ARENA.with(|cell| f(&cell.borrow()))
+    }
+
+    /// 全局 arena 可变访问
+    pub fn with_global_mut<R>(f: impl FnOnce(&mut ValueArena) -> R) -> R {
+        Self::GLOBAL_ARENA.with(|cell| f(&mut cell.borrow_mut()))
+    }
+
+    /// 从 ValueHandle 查全局 arena 拿 HeapObj（反射原语核心路径）
+    /// 返回 Arc clone，避免 thread_local borrow 跨函数返回的生命周期问题。
+    pub fn get_global_obj(handle: ValueHandle) -> Option<Arc<HeapObj>> {
+        if handle.tag() != ValueTag::Ref {
+            return None;
+        }
+        Some(Self::with_global(|arena| arena.get_ref(handle).clone()))
+    }
+
+    /// 校验 handle 是否指向 arena 中合法槽位（FFI 边界防御）。
+    /// 标量按 tag 查对应分桶 index 范围；Null/Void/Bool 为单例恒有效。
+    /// 用于 extern "C" 反射原语入口，防止 C 侧脏 handle 导致越界 panic。
+    pub fn is_valid_handle(handle: ValueHandle) -> bool {
+        Self::with_global(|arena| arena.is_valid_handle_inner(handle))
+    }
+
+    pub(crate) fn is_valid_handle_inner(&self, h: ValueHandle) -> bool {
+        let idx = h.index();
+        match h.tag() {
+            ValueTag::Null | ValueTag::Void | ValueTag::Bool => true,
+            ValueTag::Char => idx < self.char_bucket.len(),
+            ValueTag::I8 => idx < self.i8_bucket.len(),
+            ValueTag::I16 => idx < self.i16_bucket.len(),
+            ValueTag::I32 => idx < self.i32_bucket.len(),
+            ValueTag::I64 => idx < self.i64_bucket.len(),
+            ValueTag::U8 => idx < self.u8_bucket.len(),
+            ValueTag::U16 => idx < self.u16_bucket.len(),
+            ValueTag::U32 => idx < self.u32_bucket.len(),
+            ValueTag::U64 => idx < self.u64_bucket.len(),
+            ValueTag::Isize => idx < self.isz_bucket.len(),
+            ValueTag::Usize => idx < self.usz_bucket.len(),
+            ValueTag::I128 => idx < self.i128_bucket.len(),
+            ValueTag::U128 => idx < self.u128_bucket.len(),
+            ValueTag::F16 => idx < self.f16_bucket.len(),
+            ValueTag::F32 => idx < self.f32_bucket.len(),
+            ValueTag::F64 => idx < self.f64_bucket.len(),
+            ValueTag::F128 => idx < self.f128_bucket.len(),
+            ValueTag::Ref => idx < self.ref_bucket.len(),
+        }
+    }
+
+    pub fn new() -> Self {
+        Self {
+            char_bucket: Bucket::new(),
+            i8_bucket: Bucket::new(),
+            i16_bucket: Bucket::new(),
+            i32_bucket: Bucket::new(),
+            i64_bucket: Bucket::new(),
+            u8_bucket: Bucket::new(),
+            u16_bucket: Bucket::new(),
+            u32_bucket: Bucket::new(),
+            u64_bucket: Bucket::new(),
+            isz_bucket: Bucket::new(),
+            usz_bucket: Bucket::new(),
+            i128_bucket: Bucket::new(),
+            u128_bucket: Bucket::new(),
+            f16_bucket: Bucket::new(),
+            f32_bucket: Bucket::new(),
+            f64_bucket: Bucket::new(),
+            f128_bucket: Bucket::new(),
+            ref_bucket: Bucket::new(),
+        }
+    }
+
+    /// 重置 arena，清空所有分桶并回收内存。
+    /// 用于反射操作后的批量清理，避免反射原语 alloc 后无人 dec_ref 导致内存堆积。
+    pub fn reset(&mut self) {
+        self.char_bucket.reset();
+        self.i8_bucket.reset();
+        self.i16_bucket.reset();
+        self.i32_bucket.reset();
+        self.i64_bucket.reset();
+        self.u8_bucket.reset();
+        self.u16_bucket.reset();
+        self.u32_bucket.reset();
+        self.u64_bucket.reset();
+        self.isz_bucket.reset();
+        self.usz_bucket.reset();
+        self.i128_bucket.reset();
+        self.u128_bucket.reset();
+        self.f16_bucket.reset();
+        self.f32_bucket.reset();
+        self.f64_bucket.reset();
+        self.f128_bucket.reset();
+        self.ref_bucket.reset();
+    }
+
+    #[inline]
+    pub fn alloc_i128(&mut self, v: i128) -> ValueHandle {
+        let idx = self.i128_bucket.alloc([(v as u128 & 0xFFFF_FFFF_FFFF_FFFF) as u64, ((v as u128) >> 64) as u64]);
+        ValueHandle::new(ValueTag::I128, idx as usize)
+    }
+    #[inline]
+    pub fn get_i128(&self, h: ValueHandle) -> i128 {
+        let [lo, hi] = *self.i128_bucket.get(h.index() as u32);
+        ((hi as i128) << 64) | (lo as i128)
+    }
+
+    #[inline]
+    pub fn alloc_u128(&mut self, v: u128) -> ValueHandle {
+        let idx = self.u128_bucket.alloc([(v & 0xFFFF_FFFF_FFFF_FFFF) as u64, (v >> 64) as u64]);
+        ValueHandle::new(ValueTag::U128, idx as usize)
+    }
+    #[inline]
+    pub fn get_u128(&self, h: ValueHandle) -> u128 {
+        let [lo, hi] = *self.u128_bucket.get(h.index() as u32);
+        ((hi as u128) << 64) | (lo as u128)
+    }
+
+    #[inline]
+    pub fn alloc_f128(&mut self, v: F128) -> ValueHandle {
+        let bits = u128::from_le_bytes(v.0);
+        let idx = self.f128_bucket.alloc([(bits & 0xFFFF_FFFF_FFFF_FFFF) as u64, (bits >> 64) as u64]);
+        ValueHandle::new(ValueTag::F128, idx as usize)
+    }
+    #[inline]
+    pub fn get_f128(&self, h: ValueHandle) -> F128 {
+        let [lo, hi] = *self.f128_bucket.get(h.index() as u32);
+        F128(((hi as u128) << 64 | lo as u128).to_le_bytes())
+    }
+
+    // ---- 堆对象分配 ----
+    #[inline]
+    pub fn alloc_ref(&mut self, obj: HeapObj) -> ValueHandle {
+        let idx = self.ref_bucket.alloc(Arc::new(obj));
+        ValueHandle::new(ValueTag::Ref, idx as usize)
+    }
+    #[inline]
+    pub fn alloc_ref_rc(&mut self, r: Arc<HeapObj>) -> ValueHandle {
+        let idx = self.ref_bucket.alloc(r);
+        ValueHandle::new(ValueTag::Ref, idx as usize)
+    }
+    #[inline]
+    pub fn get_ref(&self, h: ValueHandle) -> &Arc<HeapObj> {
+        self.ref_bucket.get(h.index() as u32)
+    }
+
+    // ---- Bool 单例 ----
+    #[inline]
+    pub fn bool_val(v: bool) -> ValueHandle {
+        if v { ValueHandle::TRUE } else { ValueHandle::FALSE }
+    }
+    #[inline]
+    pub fn get_bool(&self, h: ValueHandle) -> bool {
+        h.index() == 1
+    }
+
+    // ---- Null/Void 单例 ----
+    #[inline]
+    pub fn null(&self) -> ValueHandle {
+        ValueHandle::NULL
+    }
+    #[inline]
+    pub fn void(&self) -> ValueHandle {
+        ValueHandle::VOID
+    }
+
+    // ---- Value ↔ ValueHandle 转换（反射 FFI 边界用）----
+    // 反射原语接收 u32 (ValueHandle raw)，但 HeapObj 字段已迁移为 Value。
+    // alloc_value 将 Value 字段转回 ValueHandle 供 FFI 返回；
+    // get_value 将入口 ValueHandle 转为 Value 供内部递归处理。
+
+    /// 将 Value 转换为 ValueHandle（反射 FFI 边界：Value 字段 → ValueHandle raw u32）。
+    /// 标量按 tag 分桶分配，Bool/Null/Void 走单例，Ref 走 ref_bucket。
+    pub fn alloc_value(&mut self, v: &Value) -> ValueHandle {
+        match v {
+            Value::Null => ValueHandle::NULL,
+            Value::Void => ValueHandle::VOID,
+            Value::Scalar(sv, tag) => unsafe {
+                match tag {
+                    ValueTag::Bool => if sv.bool_val { ValueHandle::TRUE } else { ValueHandle::FALSE },
+                    ValueTag::Char => self.alloc_char(sv.char_val),
+                    ValueTag::I8 => self.alloc_i8(sv.i8_val),
+                    ValueTag::I16 => self.alloc_i16(sv.i16_val),
+                    ValueTag::I32 => self.alloc_i32(sv.i32_val),
+                    ValueTag::I64 => self.alloc_i64(sv.i64_val),
+                    ValueTag::U8 => self.alloc_u8(sv.u8_val),
+                    ValueTag::U16 => self.alloc_u16(sv.u16_val),
+                    ValueTag::U32 => self.alloc_u32(sv.u32_val),
+                    ValueTag::U64 => self.alloc_u64(sv.u64_val),
+                    ValueTag::Isize => self.alloc_isize(sv.isize_val),
+                    ValueTag::Usize => self.alloc_usize(sv.usize_val),
+                    ValueTag::I128 => self.alloc_i128(i128::from_ne_bytes(std::mem::transmute(sv.i128_val))),
+                    ValueTag::U128 => self.alloc_u128(u128::from_ne_bytes(std::mem::transmute(sv.u128_val))),
+                    ValueTag::F16 => self.alloc_f16(sv.f16_val),
+                    ValueTag::F32 => self.alloc_f32(sv.f32_val),
+                    ValueTag::F64 => self.alloc_f64(sv.f64_val),
+                    ValueTag::F128 => self.alloc_f128(F128(std::mem::transmute(sv.f128_val))),
+                    _ => unreachable!("non-scalar tag {:?} in ScalarValue", tag),
+                }
+            },
+            Value::Ref(r) => self.alloc_ref_rc(r.clone()),
+        }
+    }
+
+    /// 将 ValueHandle 转换为 Value（反射 FFI 边界：入口 handle → Value 供递归处理）。
+    pub fn get_value(&self, h: ValueHandle) -> Value {
+        match h.tag() {
+            ValueTag::Null => Value::Null,
+            ValueTag::Void => Value::Void,
+            ValueTag::Bool => Value::bool_val(self.get_bool(h)),
+            ValueTag::Char => Value::char_val(unsafe { char::from_u32_unchecked(self.get_char(h)) }),
+            ValueTag::I8 => Value::i8(self.get_i8(h)),
+            ValueTag::I16 => Value::i16(self.get_i16(h)),
+            ValueTag::I32 => Value::i32(self.get_i32(h)),
+            ValueTag::I64 => Value::i64(self.get_i64(h)),
+            ValueTag::U8 => Value::u8(self.get_u8(h)),
+            ValueTag::U16 => Value::u16(self.get_u16(h)),
+            ValueTag::U32 => Value::u32(self.get_u32(h)),
+            ValueTag::U64 => Value::u64(self.get_u64(h)),
+            ValueTag::Isize => Value::isize_val(self.get_isize(h)),
+            ValueTag::Usize => Value::usize_val(self.get_usize(h)),
+            ValueTag::I128 => Value::i128(self.get_i128(h)),
+            ValueTag::U128 => Value::u128(self.get_u128(h)),
+            ValueTag::F16 => Value::f16(F16(self.get_f16(h))),
+            ValueTag::F32 => Value::f32(self.get_f32(h)),
+            ValueTag::F64 => Value::f64(self.get_f64(h)),
+            ValueTag::F128 => Value::f128(self.get_f128(h)),
+            ValueTag::Ref => Value::Ref(self.get_ref(h).clone()),
+        }
+    }
+
+    // ---- 堆对象快捷构造器 ----
+    pub fn alloc_str(&mut self, s: impl Into<String>) -> ValueHandle {
+        self.alloc_ref(HeapObj::Str(KuzoStr::new(s)))
+    }
+    pub fn alloc_str_from(&mut self, s: &str) -> ValueHandle {
+        self.alloc_ref(HeapObj::Str(KuzoStr::from_rust_str(s)))
+    }
+    pub fn alloc_array(&mut self, arr: ArrayValue) -> ValueHandle {
+        self.alloc_ref(HeapObj::Array(arr))
+    }
+    pub fn alloc_record(&mut self, r: RecordValue) -> ValueHandle {
+        self.alloc_ref(HeapObj::Record(r))
+    }
+
+    /// 就地修改记录字段（通过 Arc::make_mut，refcount==1 时零拷贝）。
+    /// field_name 为字段名，在 record.field_names 中查找索引。
+    pub fn set_record_field_by_name(
+        &mut self,
+        handle: ValueHandle,
+        field_name: &str,
+        new_value: Value,
+    ) {
+        let rc = self.ref_bucket.get_mut(handle.index() as u32);
+        if let HeapObj::Record(ref mut r) = Arc::make_mut(rc) {
+            for (i, name) in r.field_names.iter().enumerate() {
+                if name.as_deref() == Some(field_name) {
+                    if i < r.fields.len() {
+                        r.fields[i] = new_value;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    pub fn alloc_adt(&mut self, a: AdtValue) -> ValueHandle {
+        self.alloc_ref(HeapObj::Adt(a))
+    }
+    pub fn alloc_newtype(&mut self, type_name: impl Into<String>, inner: ValueHandle) -> ValueHandle {
+        self.alloc_ref(HeapObj::Newtype(NewtypeValue { type_name: type_name.into(), inner }))
+    }
+    pub fn alloc_cell(&mut self, val: Value) -> ValueHandle {
+        self.alloc_ref(HeapObj::Cell(Cell::new(val)))
+    }
+    pub fn alloc_range(&mut self, start: i64, end: i64, inclusive: bool) -> ValueHandle {
+        self.alloc_ref(HeapObj::Range(Range::new(start, end, inclusive)))
+    }
+    pub fn alloc_closure(&mut self, c: Closure) -> ValueHandle {
+        self.alloc_ref(HeapObj::Closure(c))
+    }
+    pub fn alloc_partial(&mut self, p: PartialApplication) -> ValueHandle {
+        self.alloc_ref(HeapObj::Partial(p))
+    }
+    pub fn alloc_builtin(&mut self, fn_ptr: BuiltinFn, name: impl Into<String>) -> ValueHandle {
+        self.alloc_ref(HeapObj::Builtin(Builtin { fn_ptr, name: name.into() }))
+    }
+    pub fn alloc_trait_val(&mut self, t: TraitValue) -> ValueHandle {
+        self.alloc_ref(HeapObj::TraitVal(t))
+    }
+    pub fn alloc_lazy(&mut self, l: LazyValue) -> ValueHandle {
+        self.alloc_ref(HeapObj::LazyVal(l))
+    }
+    pub fn alloc_error_val(&mut self, type_name: impl Into<String>, message: impl Into<String>, is_error_subtype: bool) -> ValueHandle {
+        self.alloc_ref(HeapObj::ErrorVal(ErrorValue {
+            type_name: type_name.into(),
+            message: message.into(),
+            is_error_subtype,
+        }))
+    }
+    pub fn alloc_throw_ok(&mut self, val: Value) -> ValueHandle {
+        self.alloc_ref(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Ok(val) }))
+    }
+    pub fn alloc_throw_err(&mut self, err_val: Value) -> ValueHandle {
+        self.alloc_ref(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(err_val) }))
+    }
+    pub fn alloc_atomic(&mut self, val: Value) -> ValueHandle {
+        self.alloc_ref(HeapObj::AtomicVal(AtomicValue::new(val)))
+    }
+    pub fn alloc_async_handle(&mut self) -> ValueHandle {
+        self.alloc_ref(HeapObj::AsyncVal(AsyncHandle::new()))
+    }
+    pub fn alloc_channel(&mut self, capacity: usize) -> ValueHandle {
+        self.alloc_ref(HeapObj::ChannelVal(Arc::new(ChannelValue::new(capacity))))
+    }
+    pub fn alloc_sender(&mut self, channel: Arc<ChannelValue>) -> ValueHandle {
+        self.alloc_ref(HeapObj::SenderVal(SenderValue { channel }))
+    }
+    pub fn alloc_receiver(&mut self, channel: Arc<ChannelValue>) -> ValueHandle {
+        self.alloc_ref(HeapObj::ReceiverVal(ReceiverValue { channel }))
+    }
+
+    /// 从 i64 按 tag 构造对应整数
+    pub fn int_from_i64(&mut self, tag: ValueTag, v: i64) -> ValueHandle {
+        match tag {
+            ValueTag::I8 => self.alloc_i8(v as i8),
+            ValueTag::I16 => self.alloc_i16(v as i16),
+            ValueTag::I32 => self.alloc_i32(v as i32),
+            ValueTag::I64 => self.alloc_i64(v),
+            ValueTag::I128 => self.alloc_i128(v as i128),
+            ValueTag::U8 => self.alloc_u8(v as u8),
+            ValueTag::U16 => self.alloc_u16(v as u16),
+            ValueTag::U32 => self.alloc_u32(v as u32),
+            ValueTag::U64 => self.alloc_u64(v as u64),
+            ValueTag::U128 => self.alloc_u128(v as u128),
+            ValueTag::Isize => self.alloc_isize(v as isize),
+            ValueTag::Usize => self.alloc_usize(v as usize),
+            _ => self.alloc_i64(v),
+        }
+    }
+
+    // ---- 引用计数 ----
+    pub fn inc_ref(&mut self, h: ValueHandle) {
+        match h.tag() {
+            ValueTag::Null | ValueTag::Void | ValueTag::Bool => {}
+            ValueTag::Char => self.char_bucket.inc_ref(h.index() as u32),
+            ValueTag::I8 => self.i8_bucket.inc_ref(h.index() as u32),
+            ValueTag::I16 => self.i16_bucket.inc_ref(h.index() as u32),
+            ValueTag::I32 => self.i32_bucket.inc_ref(h.index() as u32),
+            ValueTag::I64 => self.i64_bucket.inc_ref(h.index() as u32),
+            ValueTag::I128 => self.i128_bucket.inc_ref(h.index() as u32),
+            ValueTag::U8 => self.u8_bucket.inc_ref(h.index() as u32),
+            ValueTag::U16 => self.u16_bucket.inc_ref(h.index() as u32),
+            ValueTag::U32 => self.u32_bucket.inc_ref(h.index() as u32),
+            ValueTag::U64 => self.u64_bucket.inc_ref(h.index() as u32),
+            ValueTag::U128 => self.u128_bucket.inc_ref(h.index() as u32),
+            ValueTag::Isize => self.isz_bucket.inc_ref(h.index() as u32),
+            ValueTag::Usize => self.usz_bucket.inc_ref(h.index() as u32),
+            ValueTag::F16 => self.f16_bucket.inc_ref(h.index() as u32),
+            ValueTag::F32 => self.f32_bucket.inc_ref(h.index() as u32),
+            ValueTag::F64 => self.f64_bucket.inc_ref(h.index() as u32),
+            ValueTag::F128 => self.f128_bucket.inc_ref(h.index() as u32),
+            ValueTag::Ref => self.ref_bucket.inc_ref(h.index() as u32),
+        }
+    }
+    pub fn dec_ref(&mut self, h: ValueHandle) {
+        match h.tag() {
+            ValueTag::Null | ValueTag::Void | ValueTag::Bool => {}
+            ValueTag::Char => { self.char_bucket.dec_ref(h.index() as u32); }
+            ValueTag::I8 => { self.i8_bucket.dec_ref(h.index() as u32); }
+            ValueTag::I16 => { self.i16_bucket.dec_ref(h.index() as u32); }
+            ValueTag::I32 => { self.i32_bucket.dec_ref(h.index() as u32); }
+            ValueTag::I64 => { self.i64_bucket.dec_ref(h.index() as u32); }
+            ValueTag::I128 => { self.i128_bucket.dec_ref(h.index() as u32); }
+            ValueTag::U8 => { self.u8_bucket.dec_ref(h.index() as u32); }
+            ValueTag::U16 => { self.u16_bucket.dec_ref(h.index() as u32); }
+            ValueTag::U32 => { self.u32_bucket.dec_ref(h.index() as u32); }
+            ValueTag::U64 => { self.u64_bucket.dec_ref(h.index() as u32); }
+            ValueTag::U128 => { self.u128_bucket.dec_ref(h.index() as u32); }
+            ValueTag::Isize => { self.isz_bucket.dec_ref(h.index() as u32); }
+            ValueTag::Usize => { self.usz_bucket.dec_ref(h.index() as u32); }
+            ValueTag::F16 => { self.f16_bucket.dec_ref(h.index() as u32); }
+            ValueTag::F32 => { self.f32_bucket.dec_ref(h.index() as u32); }
+            ValueTag::F64 => { self.f64_bucket.dec_ref(h.index() as u32); }
+            ValueTag::F128 => { self.f128_bucket.dec_ref(h.index() as u32); }
+            ValueTag::Ref => { self.ref_bucket.dec_ref(h.index() as u32); }
+        }
+    }
+
+    /// 为数组填充 SoA 快路径（当元素同类型标量时）。
+    /// 元素已迁移为 Value，直接用 Value 自带的标量访问器读取，无需经过 arena bucket。
+    pub fn optimize_array_soa(&mut self, arr: &mut ArrayValue) {
+        if arr.elements.is_empty() { return; }
+        // 取首元素标量 tag，全部元素必须同 tag 才能启用 SoA
+        let tag = match arr.elements[0].scalar_tag() {
+            Some(t) => t,
+            None => return,
+        };
+        if !arr.elements.iter().all(|h| h.scalar_tag() == Some(tag)) {
+            return;
+        }
+        arr.scalar_soa = Some(match tag {
+            ValueTag::I8 => ScalarSoA::I8(arr.elements.iter().map(|h| h.as_i8()).collect()),
+            ValueTag::I16 => ScalarSoA::I16(arr.elements.iter().map(|h| h.as_i16()).collect()),
+            ValueTag::I32 => ScalarSoA::I32(arr.elements.iter().map(|h| h.as_i32()).collect()),
+            ValueTag::I64 => ScalarSoA::I64(arr.elements.iter().map(|h| h.as_i64()).collect()),
+            ValueTag::U8 => ScalarSoA::U8(arr.elements.iter().map(|h| h.as_u8()).collect()),
+            ValueTag::U16 => ScalarSoA::U16(arr.elements.iter().map(|h| h.as_u16()).collect()),
+            ValueTag::U32 => ScalarSoA::U32(arr.elements.iter().map(|h| h.as_u32()).collect()),
+            ValueTag::U64 => ScalarSoA::U64(arr.elements.iter().map(|h| h.as_u64()).collect()),
+            ValueTag::Bool => ScalarSoA::Bool(arr.elements.iter().map(|h| h.as_bool()).collect()),
+            ValueTag::Char => ScalarSoA::Char(arr.elements.iter().map(|h| h.as_char() as u32).collect()),
+            ValueTag::F32 => ScalarSoA::F32(arr.elements.iter().map(|h| h.as_f32()).collect()),
+            ValueTag::F64 => ScalarSoA::F64(arr.elements.iter().map(|h| h.as_f64()).collect()),
+            ValueTag::I128 => ScalarSoA::I128(arr.elements.iter().map(|h| h.as_i128()).collect()),
+            ValueTag::U128 => ScalarSoA::U128(arr.elements.iter().map(|h| h.as_u128()).collect()),
+            ValueTag::Isize => ScalarSoA::Isize(arr.elements.iter().map(|h| h.as_isize()).collect()),
+            ValueTag::Usize => ScalarSoA::Usize(arr.elements.iter().map(|h| h.as_usize()).collect()),
+            // F16/F128 直接读 union bit pattern，不走 f64 中转（保持 NaN bit 精确性）
+            ValueTag::F16 => ScalarSoA::F16(arr.elements.iter().map(|h| {
+                let Value::Scalar(sv, _) = h else { unreachable!("tag checked above") };
+                unsafe { sv.f16_val }
+            }).collect()),
+            ValueTag::F128 => ScalarSoA::F128(arr.elements.iter().map(|h| {
+                let Value::Scalar(sv, _) = h else { unreachable!("tag checked above") };
+                unsafe { F128(std::mem::transmute(sv.f128_val)) }
+            }).collect()),
+            _ => return,
+        });
+    }
+
+    /// 格式化值为字符串（Display 语义）
+    pub fn format_value(&self, h: ValueHandle) -> String {
+        self.display_value(h).to_string()
+    }
+
+    /// 返回一个实现 Display 的包装器
+    pub fn display_value<'a>(&'a self, h: ValueHandle) -> ValueDisplay<'a> {
+        ValueDisplay { arena: self, handle: h }
+    }
+
+    /// 返回一个实现 Debug 的包装器
+    pub fn debug_value<'a>(&'a self, h: ValueHandle) -> ValueDebug<'a> {
+        ValueDebug { arena: self, handle: h }
+    }
+}
+
+impl Default for ValueArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Display 包装器：通过 arena 格式化值
+pub struct ValueDisplay<'a> {
+    arena: &'a ValueArena,
+    handle: ValueHandle,
+}
+
+impl<'a> fmt::Display for ValueDisplay<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        arena_display(self.arena, self.handle, f)
+    }
+}
+
+/// Debug 包装器：通过 arena 格式化值
+pub struct ValueDebug<'a> {
+    arena: &'a ValueArena,
+    handle: ValueHandle,
+}
+
+impl<'a> fmt::Debug for ValueDebug<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        arena_debug(self.arena, self.handle, f)
+    }
+}
+
+fn arena_display(arena: &ValueArena, h: ValueHandle, f: &mut fmt::Formatter) -> fmt::Result {
+    match h.tag() {
+        ValueTag::Null => write!(f, "null"),
+        ValueTag::Void => write!(f, "()"),
+        ValueTag::Bool => write!(f, "{}", arena.get_bool(h)),
+        ValueTag::Char => write!(f, "{}", Char::from_codepoint_unchecked(arena.get_char(h))),
+        ValueTag::I8 => write!(f, "{}", arena.get_i8(h)),
+        ValueTag::I16 => write!(f, "{}", arena.get_i16(h)),
+        ValueTag::I32 => write!(f, "{}", arena.get_i32(h)),
+        ValueTag::I64 => write!(f, "{}", arena.get_i64(h)),
+        ValueTag::I128 => write!(f, "{}", arena.get_i128(h)),
+        ValueTag::U8 => write!(f, "{}", arena.get_u8(h)),
+        ValueTag::U16 => write!(f, "{}", arena.get_u16(h)),
+        ValueTag::U32 => write!(f, "{}", arena.get_u32(h)),
+        ValueTag::U64 => write!(f, "{}", arena.get_u64(h)),
+        ValueTag::U128 => write!(f, "{}", arena.get_u128(h)),
+        ValueTag::Isize => write!(f, "{}", arena.get_isize(h)),
+        ValueTag::Usize => write!(f, "{}", arena.get_usize(h)),
+        ValueTag::F16 => write!(f, "{}", F16(arena.get_f16(h)).to_f32()),
+        ValueTag::F32 => write!(f, "{}", arena.get_f32(h)),
+        ValueTag::F64 => write!(f, "{}", arena.get_f64(h)),
+        ValueTag::F128 => write!(f, "{}", arena.get_f128(h).to_f64()),
+        ValueTag::Ref => match arena.get_ref(h).as_ref() {
+            HeapObj::Str(s) => write!(f, "{}", s),
+            other => write!(f, "{:?}", other),
+        },
+    }
+}
+
+fn arena_debug(arena: &ValueArena, h: ValueHandle, f: &mut fmt::Formatter) -> fmt::Result {
+    match h.tag() {
+        ValueTag::Null => write!(f, "null"),
+        ValueTag::Void => write!(f, "()"),
+        ValueTag::Bool => write!(f, "{}", arena.get_bool(h)),
+        ValueTag::Char => write!(f, "'{}'", Char::from_codepoint_unchecked(arena.get_char(h))),
+        ValueTag::I8 => write!(f, "{}i8", arena.get_i8(h)),
+        ValueTag::I16 => write!(f, "{}i16", arena.get_i16(h)),
+        ValueTag::I32 => write!(f, "{}", arena.get_i32(h)),
+        ValueTag::I64 => write!(f, "{}i64", arena.get_i64(h)),
+        ValueTag::I128 => write!(f, "{}i128", arena.get_i128(h)),
+        ValueTag::U8 => write!(f, "{}u8", arena.get_u8(h)),
+        ValueTag::U16 => write!(f, "{}u16", arena.get_u16(h)),
+        ValueTag::U32 => write!(f, "{}u32", arena.get_u32(h)),
+        ValueTag::U64 => write!(f, "{}u64", arena.get_u64(h)),
+        ValueTag::U128 => write!(f, "{}u128", arena.get_u128(h)),
+        ValueTag::Isize => write!(f, "{}isize", arena.get_isize(h)),
+        ValueTag::Usize => write!(f, "{}usize", arena.get_usize(h)),
+        ValueTag::F16 => write!(f, "{:?}", F16(arena.get_f16(h))),
+        ValueTag::F32 => write!(f, "{}f32", arena.get_f32(h)),
+        ValueTag::F64 => write!(f, "{}", arena.get_f64(h)),
+        ValueTag::F128 => write!(f, "{:?}", arena.get_f128(h)),
+        ValueTag::Ref => write!(f, "{:?}", arena.get_ref(h).as_ref()),
+    }
+}
+
+// =========================================================================
+// ValueTrait —— 对外统一接口（方法携带 &ValueArena）
+// =========================================================================
+
+/// Kuzo 统一值 trait：所有值类型的对外接口。
+pub trait ValueTrait: Sized + Clone + Copy + PartialEq + Eq + Hash {
+    // ---- 谓词（仅看 tag，不需要 arena）----
+    fn is_null(&self) -> bool;
+    fn is_void(&self) -> bool;
+    fn is_bool(&self) -> bool;
+    fn is_char(&self) -> bool;
+    fn is_int(&self) -> bool;
+    fn is_float(&self) -> bool;
+    fn is_numeric(&self) -> bool;
+    fn is_scalar(&self) -> bool;
+    fn is_ref(&self) -> bool;
+    fn requires_release(&self) -> bool;
+
+    // ---- 堆谓词（需要 arena 解引用 HeapObj）----
+    fn is_string(&self, arena: &ValueArena) -> bool;
+    fn is_array(&self, arena: &ValueArena) -> bool;
+    fn is_record(&self, arena: &ValueArena) -> bool;
+    fn is_adt(&self, arena: &ValueArena) -> bool;
+    fn is_closure(&self, arena: &ValueArena) -> bool;
+    fn is_callable(&self, arena: &ValueArena) -> bool;
+
+    // ---- 类型信息 ----
+    fn type_name(&self, arena: &ValueArena) -> &'static str;
+    fn scalar_tag(&self) -> Option<ValueTag>;
+
+    // ---- 标量访问器（需要 arena 取值）----
+    fn as_bool(&self, arena: &ValueArena) -> Option<bool>;
+    fn as_i8(&self, arena: &ValueArena) -> Option<i8>;
+    fn as_i16(&self, arena: &ValueArena) -> Option<i16>;
+    fn as_i32(&self, arena: &ValueArena) -> Option<i32>;
+    fn as_i64(&self, arena: &ValueArena) -> Option<i64>;
+    fn as_i128(&self, arena: &ValueArena) -> Option<i128>;
+    fn as_u8(&self, arena: &ValueArena) -> Option<u8>;
+    fn as_u16(&self, arena: &ValueArena) -> Option<u16>;
+    fn as_u32(&self, arena: &ValueArena) -> Option<u32>;
+    fn as_u64(&self, arena: &ValueArena) -> Option<u64>;
+    fn as_u128(&self, arena: &ValueArena) -> Option<u128>;
+    fn as_isize(&self, arena: &ValueArena) -> Option<isize>;
+    fn as_usize(&self, arena: &ValueArena) -> Option<usize>;
+    fn as_f32(&self, arena: &ValueArena) -> Option<f32>;
+    fn as_f64(&self, arena: &ValueArena) -> Option<f64>;
+    fn as_char(&self, arena: &ValueArena) -> Option<Char>;
+    fn as_f16(&self, arena: &ValueArena) -> Option<F16>;
+    fn as_f128(&self, arena: &ValueArena) -> Option<F128>;
+
+    // ---- 堆访问器 ----
+    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a KuzoStr>;
+    fn as_array<'a>(&self, arena: &'a ValueArena) -> Option<&'a ArrayValue>;
+    fn as_record<'a>(&self, arena: &'a ValueArena) -> Option<&'a RecordValue>;
+    fn as_adt<'a>(&self, arena: &'a ValueArena) -> Option<&'a AdtValue>;
+    fn as_newtype<'a>(&self, arena: &'a ValueArena) -> Option<&'a NewtypeValue>;
+    fn as_cell<'a>(&self, arena: &'a ValueArena) -> Option<&'a Cell>;
+    fn as_range<'a>(&self, arena: &'a ValueArena) -> Option<&'a Range>;
+    fn as_closure<'a>(&self, arena: &'a ValueArena) -> Option<&'a Closure>;
+    fn as_partial<'a>(&self, arena: &'a ValueArena) -> Option<&'a PartialApplication>;
+    fn as_builtin<'a>(&self, arena: &'a ValueArena) -> Option<&'a Builtin>;
+    fn as_trait_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a TraitValue>;
+    fn as_lazy<'a>(&self, arena: &'a ValueArena) -> Option<&'a LazyValue>;
+    fn as_error_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a ErrorValue>;
+    fn as_throw_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a ThrowValue>;
+    fn as_atomic<'a>(&self, arena: &'a ValueArena) -> Option<&'a AtomicValue>;
+    fn as_async_handle<'a>(&self, arena: &'a ValueArena) -> Option<&'a AsyncHandle>;
+    fn as_channel<'a>(&self, arena: &'a ValueArena) -> Option<&'a ChannelValue>;
+    fn as_sender<'a>(&self, arena: &'a ValueArena) -> Option<&'a SenderValue>;
+    fn as_receiver<'a>(&self, arena: &'a ValueArena) -> Option<&'a ReceiverValue>;
+    fn as_ref<'a>(&self, arena: &'a ValueArena) -> Option<&'a HeapRef>;
+    fn ref_kind(&self, arena: &ValueArena) -> Option<RefKind>;
+
+    // ---- 数值提升 ----
+    fn as_int_i64(&self, arena: &ValueArena) -> Option<i64>;
+    fn as_int_i128(&self, arena: &ValueArena) -> Option<i128>;
+    fn as_float_f64(&self, arena: &ValueArena) -> Option<f64>;
+
+    // ---- 相等与深克隆 ----
+    fn equals(&self, other: &Self, arena: &ValueArena) -> bool;
+    fn deep_clone(&self, arena: &mut ValueArena) -> Self;
+}
+
+// =========================================================================
+// =========================================================================
+// ValueHandle —— ValueTrait 实现（通过 ValueArena 访问桶内数据）
+// =========================================================================
+
+impl ValueTrait for ValueHandle {
+    // ---- 谓词（仅看 tag，不需要 arena）----
+    #[inline]
+    fn is_null(&self) -> bool {
+        self.tag() == ValueTag::Null
+    }
+    #[inline]
+    fn is_void(&self) -> bool {
+        self.tag() == ValueTag::Void
+    }
+    #[inline]
+    fn is_bool(&self) -> bool {
+        self.tag() == ValueTag::Bool
+    }
+    #[inline]
+    fn is_char(&self) -> bool {
+        self.tag() == ValueTag::Char
+    }
+    #[inline]
+    fn is_int(&self) -> bool {
+        self.tag().is_int()
+    }
+    #[inline]
+    fn is_float(&self) -> bool {
+        self.tag().is_float()
+    }
+    #[inline]
+    fn is_numeric(&self) -> bool {
+        self.tag().is_numeric()
+    }
+    #[inline]
+    fn is_scalar(&self) -> bool {
+        self.tag().is_scalar()
+    }
+    #[inline]
+    fn is_ref(&self) -> bool {
+        self.tag() == ValueTag::Ref
+    }
+    #[inline]
+    fn requires_release(&self) -> bool {
+        !matches!(self.tag(), ValueTag::Null | ValueTag::Void | ValueTag::Bool)
+    }
+
+    // ---- 堆谓词（需要 arena 解引用 HeapObj）----
+    #[inline]
+    fn is_string(&self, arena: &ValueArena) -> bool {
+        matches!(arena.heap_obj_opt(*self), Some(HeapObj::Str(_)))
+    }
+    #[inline]
+    fn is_array(&self, arena: &ValueArena) -> bool {
+        matches!(arena.heap_obj_opt(*self), Some(HeapObj::Array(_)))
+    }
+    #[inline]
+    fn is_record(&self, arena: &ValueArena) -> bool {
+        matches!(arena.heap_obj_opt(*self), Some(HeapObj::Record(_)))
+    }
+    #[inline]
+    fn is_adt(&self, arena: &ValueArena) -> bool {
+        matches!(arena.heap_obj_opt(*self), Some(HeapObj::Adt(_)))
+    }
+    #[inline]
+    fn is_closure(&self, arena: &ValueArena) -> bool {
+        matches!(arena.heap_obj_opt(*self), Some(HeapObj::Closure(_)))
+    }
+    #[inline]
+    fn is_callable(&self, arena: &ValueArena) -> bool {
+        matches!(
+            arena.heap_obj_opt(*self),
+            Some(HeapObj::Closure(_) | HeapObj::Builtin(_) | HeapObj::Partial(_))
+        )
+    }
+
+    // ---- 类型信息 ----
+    fn type_name(&self, arena: &ValueArena) -> &'static str {
+        match self.tag() {
+            ValueTag::Null => "null",
+            ValueTag::Void => "void",
+            ValueTag::Ref => arena.get_ref(*self).type_name(),
+            t => t.name(),
+        }
+    }
+    #[inline]
+    fn scalar_tag(&self) -> Option<ValueTag> {
+        let t = self.tag();
+        if t.is_scalar() {
+            Some(t)
+        } else {
+            None
+        }
+    }
+
+    // ---- 标量访问器（需要 arena 取值）----
+    #[inline]
+    fn as_bool(&self, arena: &ValueArena) -> Option<bool> {
+        if self.tag() == ValueTag::Bool {
+            Some(arena.get_bool(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_i8(&self, arena: &ValueArena) -> Option<i8> {
+        if self.tag() == ValueTag::I8 {
+            Some(arena.get_i8(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_i16(&self, arena: &ValueArena) -> Option<i16> {
+        if self.tag() == ValueTag::I16 {
+            Some(arena.get_i16(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_i32(&self, arena: &ValueArena) -> Option<i32> {
+        if self.tag() == ValueTag::I32 {
+            Some(arena.get_i32(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_i64(&self, arena: &ValueArena) -> Option<i64> {
+        if self.tag() == ValueTag::I64 {
+            Some(arena.get_i64(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_i128(&self, arena: &ValueArena) -> Option<i128> {
+        if self.tag() == ValueTag::I128 {
+            Some(arena.get_i128(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_u8(&self, arena: &ValueArena) -> Option<u8> {
+        if self.tag() == ValueTag::U8 {
+            Some(arena.get_u8(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_u16(&self, arena: &ValueArena) -> Option<u16> {
+        if self.tag() == ValueTag::U16 {
+            Some(arena.get_u16(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_u32(&self, arena: &ValueArena) -> Option<u32> {
+        if self.tag() == ValueTag::U32 {
+            Some(arena.get_u32(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_u64(&self, arena: &ValueArena) -> Option<u64> {
+        if self.tag() == ValueTag::U64 {
+            Some(arena.get_u64(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_u128(&self, arena: &ValueArena) -> Option<u128> {
+        if self.tag() == ValueTag::U128 {
+            Some(arena.get_u128(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_isize(&self, arena: &ValueArena) -> Option<isize> {
+        if self.tag() == ValueTag::Isize {
+            Some(arena.get_isize(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_usize(&self, arena: &ValueArena) -> Option<usize> {
+        if self.tag() == ValueTag::Usize {
+            Some(arena.get_usize(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_f32(&self, arena: &ValueArena) -> Option<f32> {
+        if self.tag() == ValueTag::F32 {
+            Some(arena.get_f32(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_f64(&self, arena: &ValueArena) -> Option<f64> {
+        if self.tag() == ValueTag::F64 {
+            Some(arena.get_f64(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_char(&self, arena: &ValueArena) -> Option<Char> {
+        if self.tag() == ValueTag::Char {
+            Some(Char::from_codepoint_unchecked(arena.get_char(*self)))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_f16(&self, arena: &ValueArena) -> Option<F16> {
+        if self.tag() == ValueTag::F16 {
+            Some(F16(arena.get_f16(*self)))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn as_f128(&self, arena: &ValueArena) -> Option<F128> {
+        if self.tag() == ValueTag::F128 {
+            Some(arena.get_f128(*self))
+        } else {
+            None
+        }
+    }
+
+    // ---- 堆访问器 ----
+    #[inline]
+    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a KuzoStr> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_array<'a>(&self, arena: &'a ValueArena) -> Option<&'a ArrayValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_record<'a>(&self, arena: &'a ValueArena) -> Option<&'a RecordValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Record(r) => Some(r),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_adt<'a>(&self, arena: &'a ValueArena) -> Option<&'a AdtValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Adt(a) => Some(a),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_newtype<'a>(&self, arena: &'a ValueArena) -> Option<&'a NewtypeValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Newtype(n) => Some(n),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_cell<'a>(&self, arena: &'a ValueArena) -> Option<&'a Cell> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Cell(c) => Some(c),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_range<'a>(&self, arena: &'a ValueArena) -> Option<&'a Range> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Range(r) => Some(r),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_closure<'a>(&self, arena: &'a ValueArena) -> Option<&'a Closure> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Closure(c) => Some(c),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_partial<'a>(&self, arena: &'a ValueArena) -> Option<&'a PartialApplication> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Partial(p) => Some(p),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_builtin<'a>(&self, arena: &'a ValueArena) -> Option<&'a Builtin> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::Builtin(b) => Some(b),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_trait_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a TraitValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::TraitVal(t) => Some(t),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_lazy<'a>(&self, arena: &'a ValueArena) -> Option<&'a LazyValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::LazyVal(l) => Some(l),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_error_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a ErrorValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::ErrorVal(e) => Some(e),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_throw_val<'a>(&self, arena: &'a ValueArena) -> Option<&'a ThrowValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::ThrowVal(t) => Some(t),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_atomic<'a>(&self, arena: &'a ValueArena) -> Option<&'a AtomicValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::AtomicVal(a) => Some(a),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_async_handle<'a>(&self, arena: &'a ValueArena) -> Option<&'a AsyncHandle> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::AsyncVal(a) => Some(a),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_channel<'a>(&self, arena: &'a ValueArena) -> Option<&'a ChannelValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::ChannelVal(c) => Some(c.as_ref()),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_sender<'a>(&self, arena: &'a ValueArena) -> Option<&'a SenderValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::SenderVal(s) => Some(s),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_receiver<'a>(&self, arena: &'a ValueArena) -> Option<&'a ReceiverValue> {
+        match arena.heap_obj_opt(*self)? {
+            HeapObj::ReceiverVal(r) => Some(r),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn as_ref<'a>(&self, arena: &'a ValueArena) -> Option<&'a HeapRef> {
+        if self.tag() == ValueTag::Ref {
+            Some(arena.get_ref(*self))
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn ref_kind(&self, arena: &ValueArena) -> Option<RefKind> {
+        arena.heap_obj_opt(*self).map(|o| o.ref_kind())
+    }
+
+    // ---- 数值提升 ----
+    fn as_int_i64(&self, arena: &ValueArena) -> Option<i64> {
+        match self.tag() {
+            ValueTag::I8 => Some(arena.get_i8(*self) as i64),
+            ValueTag::I16 => Some(arena.get_i16(*self) as i64),
+            ValueTag::I32 => Some(arena.get_i32(*self) as i64),
+            ValueTag::I64 => Some(arena.get_i64(*self)),
+            ValueTag::I128 => Some(arena.get_i128(*self) as i64),
+            ValueTag::U8 => Some(arena.get_u8(*self) as i64),
+            ValueTag::U16 => Some(arena.get_u16(*self) as i64),
+            ValueTag::U32 => Some(arena.get_u32(*self) as i64),
+            ValueTag::U64 => Some(arena.get_u64(*self) as i64),
+            ValueTag::U128 => Some(arena.get_u128(*self) as i64),
+            ValueTag::Isize => Some(arena.get_isize(*self) as i64),
+            ValueTag::Usize => Some(arena.get_usize(*self) as i64),
+            _ => None,
+        }
+    }
+    fn as_int_i128(&self, arena: &ValueArena) -> Option<i128> {
+        match self.tag() {
+            ValueTag::I8 => Some(arena.get_i8(*self) as i128),
+            ValueTag::I16 => Some(arena.get_i16(*self) as i128),
+            ValueTag::I32 => Some(arena.get_i32(*self) as i128),
+            ValueTag::I64 => Some(arena.get_i64(*self) as i128),
+            ValueTag::I128 => Some(arena.get_i128(*self)),
+            ValueTag::U8 => Some(arena.get_u8(*self) as i128),
+            ValueTag::U16 => Some(arena.get_u16(*self) as i128),
+            ValueTag::U32 => Some(arena.get_u32(*self) as i128),
+            ValueTag::U64 => Some(arena.get_u64(*self) as i128),
+            ValueTag::U128 => Some(arena.get_u128(*self) as i128),
+            ValueTag::Isize => Some(arena.get_isize(*self) as i128),
+            ValueTag::Usize => Some(arena.get_usize(*self) as i128),
+            _ => None,
+        }
+    }
+    fn as_float_f64(&self, arena: &ValueArena) -> Option<f64> {
+        match self.tag() {
+            ValueTag::F16 => Some(F16(arena.get_f16(*self)).to_f64()),
+            ValueTag::F32 => Some(arena.get_f32(*self) as f64),
+            ValueTag::F64 => Some(arena.get_f64(*self)),
+            ValueTag::F128 => Some(arena.get_f128(*self).to_f64()),
+            _ => None,
+        }
+    }
+
+    // ---- 相等与深克隆 ----
+    fn equals(&self, other: &Self, arena: &ValueArena) -> bool {
+        if self.tag() != other.tag() {
+            return false;
+        }
+        match self.tag() {
+            ValueTag::Null | ValueTag::Void => true,
+            ValueTag::Bool => arena.get_bool(*self) == arena.get_bool(*other),
+            ValueTag::Char => arena.get_char(*self) == arena.get_char(*other),
+            ValueTag::I8 => arena.get_i8(*self) == arena.get_i8(*other),
+            ValueTag::I16 => arena.get_i16(*self) == arena.get_i16(*other),
+            ValueTag::I32 => arena.get_i32(*self) == arena.get_i32(*other),
+            ValueTag::I64 => arena.get_i64(*self) == arena.get_i64(*other),
+            ValueTag::I128 => arena.get_i128(*self) == arena.get_i128(*other),
+            ValueTag::U8 => arena.get_u8(*self) == arena.get_u8(*other),
+            ValueTag::U16 => arena.get_u16(*self) == arena.get_u16(*other),
+            ValueTag::U32 => arena.get_u32(*self) == arena.get_u32(*other),
+            ValueTag::U64 => arena.get_u64(*self) == arena.get_u64(*other),
+            ValueTag::U128 => arena.get_u128(*self) == arena.get_u128(*other),
+            ValueTag::Isize => arena.get_isize(*self) == arena.get_isize(*other),
+            ValueTag::Usize => arena.get_usize(*self) == arena.get_usize(*other),
+            ValueTag::F16 => arena.get_f16(*self) == arena.get_f16(*other),
+            ValueTag::F32 => {
+                arena.get_f32(*self).to_bits() == arena.get_f32(*other).to_bits()
+            }
+            ValueTag::F64 => {
+                arena.get_f64(*self).to_bits() == arena.get_f64(*other).to_bits()
+            }
+            ValueTag::F128 => arena.get_f128(*self) == arena.get_f128(*other),
+            ValueTag::Ref => {
+                let a = arena.get_ref(*self);
+                let b = arena.get_ref(*other);
+                Arc::ptr_eq(a, b) || heap_equals(a, b, arena)
+            }
+        }
+    }
+
+    fn deep_clone(&self, arena: &mut ValueArena) -> Self {
+        let mut cache = DeepCloneCache { handle: FxHashMap::default(), value: FxHashMap::default() };
+        deep_clone_handle(*self, arena, &mut cache)
+    }
+}
+
+// =========================================================================
+// 堆对象深比较与深克隆（带 ptr_eq 缓存以共享子图）
+// =========================================================================
+
+// -------------------- SoA SIMD 快路径 --------------------
+
+/// 尝试用 SIMD 批量比较两个 SoA 数组。
+/// 仅当双方 SoA 类型相同时生效，返回 `Some(bool)`。
+/// 类型不匹配时返回 `None`，由调用方回退到逐元素路径。
+fn try_simd_soa_equals(a: &ScalarSoA, b: &ScalarSoA) -> Option<bool> {
+    match (a, b) {
+        (ScalarSoA::I32(va), ScalarSoA::I32(vb)) => Some(simd_eq_i32(va, vb)),
+        (ScalarSoA::I64(va), ScalarSoA::I64(vb)) => Some(simd_eq_i64(va, vb)),
+        (ScalarSoA::F32(va), ScalarSoA::F32(vb)) => Some(simd_eq_f32_bits(va, vb)),
+        (ScalarSoA::F64(va), ScalarSoA::F64(vb)) => Some(simd_eq_f64_bits(va, vb)),
+        // 其余类型用普通 slice 比较（Rust slice PartialEq 已优化）
+        (ScalarSoA::I8(va), ScalarSoA::I8(vb)) => Some(va == vb),
+        (ScalarSoA::I16(va), ScalarSoA::I16(vb)) => Some(va == vb),
+        (ScalarSoA::U8(va), ScalarSoA::U8(vb)) => Some(va == vb),
+        (ScalarSoA::U16(va), ScalarSoA::U16(vb)) => Some(va == vb),
+        (ScalarSoA::U32(va), ScalarSoA::U32(vb)) => Some(va == vb),
+        (ScalarSoA::U64(va), ScalarSoA::U64(vb)) => Some(va == vb),
+        (ScalarSoA::Bool(va), ScalarSoA::Bool(vb)) => Some(va == vb),
+        (ScalarSoA::Char(va), ScalarSoA::Char(vb)) => Some(va == vb),
+        (ScalarSoA::I128(va), ScalarSoA::I128(vb)) => Some(va == vb),
+        (ScalarSoA::U128(va), ScalarSoA::U128(vb)) => Some(va == vb),
+        (ScalarSoA::Isize(va), ScalarSoA::Isize(vb)) => Some(va == vb),
+        (ScalarSoA::Usize(va), ScalarSoA::Usize(vb)) => Some(va == vb),
+        // F16/F128 按 bit pattern 比较（与 F32/F64 的 to_bits() 语义一致，NaN == NaN 为 true）
+        (ScalarSoA::F16(va), ScalarSoA::F16(vb)) => Some(va == vb),
+        (ScalarSoA::F128(va), ScalarSoA::F128(vb)) => Some(va == vb),
+        _ => None, // 类型不匹配，回退
+    }
+}
+
+#[inline]
+fn simd_eq_i32(a: &[i32], b: &[i32]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let n = a.len();
+    if n == 0 {
+        return true;
+    }
+    if n >= PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        return a.par_chunks(chunk)
+            .zip(b.par_chunks(chunk))
+            .all(|(ca, cb)| simd_eq_i32_chunk(ca, cb));
+    }
+    simd_eq_i32_chunk(a, b)
+}
+
+#[inline]
+fn simd_eq_i32_chunk(a: &[i32], b: &[i32]) -> bool {
+    let n = a.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    for (ca, cb) in a[..simd_len]
+        .chunks_exact(SIMD_LANES)
+        .zip(b[..simd_len].chunks_exact(SIMD_LANES))
+    {
+        let va = i32x4::new(ca.try_into().unwrap());
+        let vb = i32x4::new(cb.try_into().unwrap());
+        let mask = va.cmp_eq(vb);
+        let arr = mask.to_array();
+        if arr.contains(&0) {
+            return false;
+        }
+    }
+    a[simd_len..]
+        .iter()
+        .zip(&b[simd_len..])
+        .all(|(&x, &y)| x == y)
+}
+
+#[inline]
+fn simd_eq_i64(a: &[i64], b: &[i64]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let n = a.len();
+    if n == 0 {
+        return true;
+    }
+    if n >= PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        return a.par_chunks(chunk)
+            .zip(b.par_chunks(chunk))
+            .all(|(ca, cb)| simd_eq_i64_chunk(ca, cb));
+    }
+    simd_eq_i64_chunk(a, b)
+}
+
+#[inline]
+fn simd_eq_i64_chunk(a: &[i64], b: &[i64]) -> bool {
+    let n = a.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    for (ca, cb) in a[..simd_len]
+        .chunks_exact(SIMD_LANES)
+        .zip(b[..simd_len].chunks_exact(SIMD_LANES))
+    {
+        let va = i64x4::new(ca.try_into().unwrap());
+        let vb = i64x4::new(cb.try_into().unwrap());
+        let mask = va.cmp_eq(vb);
+        let arr = mask.to_array();
+        if arr.contains(&0) {
+            return false;
+        }
+    }
+    a[simd_len..]
+        .iter()
+        .zip(&b[simd_len..])
+        .all(|(&x, &y)| x == y)
+}
+
+/// f32 按位比较（避免 NaN 不等问题）。
+#[inline]
+fn simd_eq_f32_bits(a: &[f32], b: &[f32]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let n = a.len();
+    if n == 0 {
+        return true;
+    }
+    if n >= PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        return a.par_chunks(chunk)
+            .zip(b.par_chunks(chunk))
+            .all(|(ca, cb)| simd_eq_f32_bits_chunk(ca, cb));
+    }
+    simd_eq_f32_bits_chunk(a, b)
+}
+
+#[inline]
+fn simd_eq_f32_bits_chunk(a: &[f32], b: &[f32]) -> bool {
+    let n = a.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    for (ca, cb) in a[..simd_len]
+        .chunks_exact(SIMD_LANES)
+        .zip(b[..simd_len].chunks_exact(SIMD_LANES))
+    {
+        let va = i32x4::new([
+            ca[0].to_bits() as i32,
+            ca[1].to_bits() as i32,
+            ca[2].to_bits() as i32,
+            ca[3].to_bits() as i32,
+        ]);
+        let vb = i32x4::new([
+            cb[0].to_bits() as i32,
+            cb[1].to_bits() as i32,
+            cb[2].to_bits() as i32,
+            cb[3].to_bits() as i32,
+        ]);
+        let mask = va.cmp_eq(vb);
+        let arr = mask.to_array();
+        if arr.contains(&0) {
+            return false;
+        }
+    }
+    a[simd_len..]
+        .iter()
+        .zip(&b[simd_len..])
+        .all(|(&x, &y)| x.to_bits() == y.to_bits())
+}
+
+/// f64 按位比较（避免 NaN 不等问题）。
+#[inline]
+fn simd_eq_f64_bits(a: &[f64], b: &[f64]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let n = a.len();
+    if n == 0 {
+        return true;
+    }
+    if n >= PARALLEL_THRESHOLD {
+        let chunk = par_chunk_size(n);
+        return a.par_chunks(chunk)
+            .zip(b.par_chunks(chunk))
+            .all(|(ca, cb)| simd_eq_f64_bits_chunk(ca, cb));
+    }
+    simd_eq_f64_bits_chunk(a, b)
+}
+
+#[inline]
+fn simd_eq_f64_bits_chunk(a: &[f64], b: &[f64]) -> bool {
+    let n = a.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    for (ca, cb) in a[..simd_len]
+        .chunks_exact(SIMD_LANES)
+        .zip(b[..simd_len].chunks_exact(SIMD_LANES))
+    {
+        let va = i64x4::new([
+            ca[0].to_bits() as i64,
+            ca[1].to_bits() as i64,
+            ca[2].to_bits() as i64,
+            ca[3].to_bits() as i64,
+        ]);
+        let vb = i64x4::new([
+            cb[0].to_bits() as i64,
+            cb[1].to_bits() as i64,
+            cb[2].to_bits() as i64,
+            cb[3].to_bits() as i64,
+        ]);
+        let mask = va.cmp_eq(vb);
+        let arr = mask.to_array();
+        if arr.contains(&0) {
+            return false;
+        }
+    }
+    a[simd_len..]
+        .iter()
+        .zip(&b[simd_len..])
+        .all(|(&x, &y)| x.to_bits() == y.to_bits())
+}
+
+// -------------------- SoA SIMD 批量哈希 --------------------
+
+/// 用 SIMD 批量哈希 SoA 数据。
+/// 对 I32/I64/F32/F64 走 SIMD 累积，其余类型回退到逐元素哈希。
+pub fn simd_hash_soa<H: Hasher>(soa: &ScalarSoA, state: &mut H) {
+    match soa {
+        ScalarSoA::I32(v) => simd_hash_i32(v, state),
+        ScalarSoA::I64(v) => simd_hash_i64(v, state),
+        ScalarSoA::F32(v) => simd_hash_f32(v, state),
+        ScalarSoA::F64(v) => simd_hash_f64(v, state),
+        ScalarSoA::I8(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::I16(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::U8(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::U16(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::U32(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::U64(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::Bool(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::Char(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::I128(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::U128(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::Isize(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::Usize(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::F16(v) => v.iter().for_each(|x| x.hash(state)),
+        ScalarSoA::F128(v) => v.iter().for_each(|x| x.hash(state)),
+    }
+}
+
+fn simd_hash_i32<H: Hasher>(v: &[i32], state: &mut H) {
+    let n = v.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    let mut acc = i32x4::splat(0);
+    for chunk in v[..simd_len].chunks_exact(SIMD_LANES) {
+        let c = i32x4::new(chunk.try_into().unwrap());
+        acc = (acc << 1) ^ c;
+    }
+    for x in acc.to_array() {
+        x.hash(state);
+    }
+    for &x in &v[simd_len..] {
+        x.hash(state);
+    }
+}
+
+fn simd_hash_i64<H: Hasher>(v: &[i64], state: &mut H) {
+    let n = v.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    let mut acc = i64x4::splat(0);
+    for chunk in v[..simd_len].chunks_exact(SIMD_LANES) {
+        let c = i64x4::new(chunk.try_into().unwrap());
+        acc = (acc << 1) ^ c;
+    }
+    for x in acc.to_array() {
+        x.hash(state);
+    }
+    for &x in &v[simd_len..] {
+        x.hash(state);
+    }
+}
+
+fn simd_hash_f32<H: Hasher>(v: &[f32], state: &mut H) {
+    let n = v.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    let mut acc = i32x4::splat(0);
+    for chunk in v[..simd_len].chunks_exact(SIMD_LANES) {
+        let c = i32x4::new([
+            chunk[0].to_bits() as i32,
+            chunk[1].to_bits() as i32,
+            chunk[2].to_bits() as i32,
+            chunk[3].to_bits() as i32,
+        ]);
+        acc = (acc << 1) ^ c;
+    }
+    for x in acc.to_array() {
+        x.hash(state);
+    }
+    for &x in &v[simd_len..] {
+        x.to_bits().hash(state);
+    }
+}
+
+fn simd_hash_f64<H: Hasher>(v: &[f64], state: &mut H) {
+    let n = v.len();
+    let simd_len = (n / SIMD_LANES) * SIMD_LANES;
+    let mut acc = i64x4::splat(0);
+    for chunk in v[..simd_len].chunks_exact(SIMD_LANES) {
+        let c = i64x4::new([
+            chunk[0].to_bits() as i64,
+            chunk[1].to_bits() as i64,
+            chunk[2].to_bits() as i64,
+            chunk[3].to_bits() as i64,
+        ]);
+        acc = (acc << 1) ^ c;
+    }
+    for x in acc.to_array() {
+        x.hash(state);
+    }
+    for &x in &v[simd_len..] {
+        x.to_bits().hash(state);
+    }
+}
+
+// -------------------- SoA deep_clone 快路径 --------------------
+
+/// SoA 快路径深克隆：标量为 Copy，直接用 Value 构造器内联重建，无需经过 arena bucket。
+fn simd_soa_deep_clone(soa: &ScalarSoA) -> Vec<Value> {
+    match soa {
+        ScalarSoA::I32(v) => v.iter().map(|&x| Value::i32(x)).collect(),
+        ScalarSoA::I64(v) => v.iter().map(|&x| Value::i64(x)).collect(),
+        ScalarSoA::F32(v) => v.iter().map(|&x| Value::f32(x)).collect(),
+        ScalarSoA::F64(v) => v.iter().map(|&x| Value::f64(x)).collect(),
+        ScalarSoA::I8(v) => v.iter().map(|&x| Value::i8(x)).collect(),
+        ScalarSoA::I16(v) => v.iter().map(|&x| Value::i16(x)).collect(),
+        ScalarSoA::U8(v) => v.iter().map(|&x| Value::u8(x)).collect(),
+        ScalarSoA::U16(v) => v.iter().map(|&x| Value::u16(x)).collect(),
+        ScalarSoA::U32(v) => v.iter().map(|&x| Value::u32(x)).collect(),
+        ScalarSoA::U64(v) => v.iter().map(|&x| Value::u64(x)).collect(),
+        ScalarSoA::Bool(v) => v.iter().map(|&x| Value::bool_val(x)).collect(),
+        ScalarSoA::Char(v) => v.iter().map(|&x| Value::char_val(char::from_u32(x).unwrap_or('\0'))).collect(),
+        ScalarSoA::I128(v) => v.iter().map(|&x| Value::i128(x)).collect(),
+        ScalarSoA::U128(v) => v.iter().map(|&x| Value::u128(x)).collect(),
+        ScalarSoA::Isize(v) => v.iter().map(|&x| Value::isize_val(x)).collect(),
+        ScalarSoA::Usize(v) => v.iter().map(|&x| Value::usize_val(x)).collect(),
+        ScalarSoA::F16(v) => v.iter().map(|&x| Value::f16(F16(x))).collect(),
+        ScalarSoA::F128(v) => v.iter().map(|&x| Value::f128(x)).collect(),
+    }
+}
+
+pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
+    match (a, b) {
+        (HeapObj::Str(x), HeapObj::Str(y)) => x.equals(y),
+        (HeapObj::Array(x), HeapObj::Array(y)) => {
+            if x.fixed_size != y.fixed_size || x.elements.len() != y.elements.len() {
+                return false;
+            }
+            // SoA SIMD 快路径：双方都有 scalar_soa 且同类型
+            if let (Some(sa), Some(sb)) = (&x.scalar_soa, &y.scalar_soa) {
+                if let Some(result) = try_simd_soa_equals(sa, sb) {
+                    return result;
+                }
+            }
+            // 回退：逐元素比较（元素为 Value）
+            x.elements
+                .iter()
+                .zip(&y.elements)
+                .all(|(p, q)| value_equals_with_arena(p, q, arena))
+        }
+        (HeapObj::Record(x), HeapObj::Record(y)) => {
+            x.type_name == y.type_name
+                && x.field_names == y.field_names
+                && x.fields.len() == y.fields.len()
+                && x.fields.iter().zip(&y.fields).all(|(p, q)| value_equals_with_arena(p, q, arena))
+        }
+        (HeapObj::Adt(x), HeapObj::Adt(y)) => {
+            x.type_name == y.type_name
+                && x.constructor == y.constructor
+                && x.fields.len() == y.fields.len()
+                && x
+                    .fields
+                    .iter()
+                    .zip(&y.fields)
+                    .all(|(xf, yf)| value_equals_with_arena(&xf.value, &yf.value, arena))
+        }
+        (HeapObj::Newtype(x), HeapObj::Newtype(y)) => {
+            x.type_name == y.type_name && x.inner.equals(&y.inner, arena)
+        }
+        (HeapObj::Cell(x), HeapObj::Cell(y)) => {
+            let xb = x.inner.lock().clone();
+            let yb = y.inner.lock().clone();
+            value_equals_with_arena(&xb, &yb, arena)
+        }
+        (HeapObj::Range(x), HeapObj::Range(y)) => {
+            x.start == y.start && x.end == y.end && x.inclusive == y.inclusive
+        }
+        (HeapObj::ErrorVal(x), HeapObj::ErrorVal(y)) => {
+            x.type_name == y.type_name
+                && x.message == y.message
+                && x.is_error_subtype == y.is_error_subtype
+        }
+        (HeapObj::ThrowVal(x), HeapObj::ThrowVal(y)) => match (&x.payload, &y.payload) {
+            (ThrowPayload::Ok(a), ThrowPayload::Ok(b)) => value_equals_with_arena(a, b, arena),
+            (ThrowPayload::Err(a), ThrowPayload::Err(b)) => value_equals_with_arena(a, b, arena),
+            _ => false,
+        },
+        (HeapObj::Closure(x), HeapObj::Closure(y)) => {
+            x.func_id == y.func_id
+                && x.arity == y.arity
+                && x.upvalues.len() == y.upvalues.len()
+                && x
+                    .upvalues
+                    .iter()
+                    .zip(&y.upvalues)
+                    .all(|(p, q)| value_equals_with_arena(p, q, arena))
+        }
+        (HeapObj::Builtin(x), HeapObj::Builtin(y)) => {
+            (x.fn_ptr as usize) == (y.fn_ptr as usize) && x.name == y.name
+        }
+        (HeapObj::Partial(x), HeapObj::Partial(y)) => {
+            x.func_id == y.func_id
+                && x.remaining_arity == y.remaining_arity
+                && x.upvalues.len() == y.upvalues.len()
+                && x.bound_args.len() == y.bound_args.len()
+                && x.upvalues.iter().zip(&y.upvalues).all(|(p, q)| value_equals_with_arena(p, q, arena))
+                && x.bound_args.iter().zip(&y.bound_args).all(|(p, q)| value_equals_with_arena(p, q, arena))
+        }
+        (HeapObj::TraitVal(x), HeapObj::TraitVal(y)) => {
+            x.trait_name == y.trait_name
+                && x.method_names == y.method_names
+                && x.method_values.len() == y.method_values.len()
+                && x.method_values.iter().zip(&y.method_values).all(|(p, q)| value_equals_with_arena(p, q, arena))
+                && match (&x.data, &y.data) {
+                    (Some(a), Some(b)) => value_equals_with_arena(a, b, arena),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        (HeapObj::LazyVal(x), HeapObj::LazyVal(y)) => {
+            // 已 force 的惰性值比较缓存结果；未 force 的按 thunk 闭包比较
+            let xf = x.forced.load(std::sync::atomic::Ordering::Relaxed);
+            let yf = y.forced.load(std::sync::atomic::Ordering::Relaxed);
+            if xf && yf {
+                let xc = x.cached.lock().unwrap_or_else(|e| e.into_inner());
+                let yc = y.cached.lock().unwrap_or_else(|e| e.into_inner());
+                match (&*xc, &*yc) {
+                    (Some(a), Some(b)) => value_equals_with_arena(a, b, arena),
+                    (None, None) => true,
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        }
+        (HeapObj::AtomicVal(x), HeapObj::AtomicVal(y)) => {
+            let xv = x.load();
+            let yv = y.load();
+            value_equals_with_arena(&xv, &yv, arena)
+        }
+        // AsyncVal：每个 AsyncHandle 代表独立的异步操作，两个不同实例永不相等
+        // （同一实例的相等性由上层 Arc::ptr_eq 保证）
+        (HeapObj::AsyncVal(_), HeapObj::AsyncVal(_)) => false,
+        // Arc 包装的共享资源：按指针身份比较（语义正确——同一通道才相等）
+        (HeapObj::ChannelVal(x), HeapObj::ChannelVal(y)) => std::sync::Arc::ptr_eq(x, y),
+        (HeapObj::SenderVal(x), HeapObj::SenderVal(y)) => std::sync::Arc::ptr_eq(&x.channel, &y.channel),
+        (HeapObj::ReceiverVal(x), HeapObj::ReceiverVal(y)) => std::sync::Arc::ptr_eq(&x.channel, &y.channel),
+        (HeapObj::CoroutineFrame, HeapObj::CoroutineFrame) => false,
+        // 不同 HeapObj 变体之间永不相等
+        _ => false,
+    }
+}
+
+/// Value 语义相等（用于 HeapObj 字段比较）。
+/// 标量按 tag + bit 比较；Ref 走 heap_equals 递归；Null/Void 按判别。
+pub fn value_equals(a: &Value, b: &Value) -> bool {
+    value_equals_with_arena(a, b, &ValueArena::default())
+}
+
+/// Value 语义相等（带 ValueArena，用于 ValueHandle 比较）。
+pub fn value_equals_with_arena(a: &Value, b: &Value, arena: &ValueArena) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) | (Value::Void, Value::Void) => true,
+        (Value::Scalar(av, at), Value::Scalar(bv, bt)) => {
+            if at != bt {
+                return false;
+            }
+            // 按 tag 比较 union 字段 bit pattern。
+            // 注意：match arm 体以 unsafe{} 开头时，Rust 将其解析为「表达式块」并视作整条 arm 体，
+            // 后续 `==` 会被当作下一条 arm 的模式。必须用括号包裹比较表达式。
+            match at {
+                ValueTag::Bool => (unsafe { av.bool_val } == unsafe { bv.bool_val }),
+                ValueTag::Char => (unsafe { av.char_val } == unsafe { bv.char_val }),
+                ValueTag::I8 => (unsafe { av.i8_val } == unsafe { bv.i8_val }),
+                ValueTag::I16 => (unsafe { av.i16_val } == unsafe { bv.i16_val }),
+                ValueTag::I32 => (unsafe { av.i32_val } == unsafe { bv.i32_val }),
+                ValueTag::I64 => (unsafe { av.i64_val } == unsafe { bv.i64_val }),
+                ValueTag::I128 => (unsafe { av.i128_val } == unsafe { bv.i128_val }),
+                ValueTag::U8 => (unsafe { av.u8_val } == unsafe { bv.u8_val }),
+                ValueTag::U16 => (unsafe { av.u16_val } == unsafe { bv.u16_val }),
+                ValueTag::U32 => (unsafe { av.u32_val } == unsafe { bv.u32_val }),
+                ValueTag::U64 => (unsafe { av.u64_val } == unsafe { bv.u64_val }),
+                ValueTag::U128 => (unsafe { av.u128_val } == unsafe { bv.u128_val }),
+                ValueTag::Isize => (unsafe { av.isize_val } == unsafe { bv.isize_val }),
+                ValueTag::Usize => (unsafe { av.usize_val } == unsafe { bv.usize_val }),
+                ValueTag::F16 => (unsafe { av.f16_val } == unsafe { bv.f16_val }),
+                ValueTag::F32 => unsafe { av.f32_val }.to_bits() == unsafe { bv.f32_val }.to_bits(),
+                ValueTag::F64 => unsafe { av.f64_val }.to_bits() == unsafe { bv.f64_val }.to_bits(),
+                ValueTag::F128 => (unsafe { av.f128_val } == unsafe { bv.f128_val }),
+                _ => unreachable!("non-scalar tag in ScalarValue"),
+            }
+        }
+        (Value::Ref(ax), Value::Ref(bx)) => heap_equals(ax.as_ref(), bx.as_ref(), arena),
+        _ => false,
+    }
+}
+
+/// 深克隆缓存：Value 路径与 ValueHandle 路径各自维护 ptr→结果缓存，
+/// 避免环引用（如 Cell）导致无限递归。两条路径的缓存相互独立，
+/// 因为 HeapObj 字段处于部分迁移状态（部分为 Value，部分仍为 ValueHandle）。
+struct DeepCloneCache {
+    handle: FxHashMap<*const HeapObj, ValueHandle>,
+    value: FxHashMap<*const HeapObj, Value>,
+}
+
+/// Value 路径深克隆：标量/空值直接 clone（廉价），Ref 递归克隆 HeapObj。
+fn deep_clone_value(v: &Value, arena: &mut ValueArena, cache: &mut DeepCloneCache) -> Value {
+    match v {
+        Value::Null | Value::Void | Value::Scalar(_, _) => v.clone(),
+        Value::Ref(rc) => {
+            let key = Arc::as_ptr(rc);
+            if let Some(cached) = cache.value.get(&key) {
+                return cached.clone();
+            }
+            let new_obj = deep_clone_heap(rc.as_ref(), arena, cache);
+            let new_v = Value::Ref(Arc::new(new_obj));
+            cache.value.insert(key, new_v.clone());
+            new_v
+        }
+    }
+}
+
+fn deep_clone_handle(
+    h: ValueHandle,
+    arena: &mut ValueArena,
+    cache: &mut DeepCloneCache,
+) -> ValueHandle {
+    match h.tag() {
+        ValueTag::Null => ValueHandle::NULL,
+        ValueTag::Void => ValueHandle::VOID,
+        ValueTag::Bool => ValueArena::bool_val(arena.get_bool(h)),
+        ValueTag::Char => arena.alloc_char(arena.get_char(h)),
+        ValueTag::I8 => arena.alloc_i8(arena.get_i8(h)),
+        ValueTag::I16 => arena.alloc_i16(arena.get_i16(h)),
+        ValueTag::I32 => arena.alloc_i32(arena.get_i32(h)),
+        ValueTag::I64 => arena.alloc_i64(arena.get_i64(h)),
+        ValueTag::I128 => arena.alloc_i128(arena.get_i128(h)),
+        ValueTag::U8 => arena.alloc_u8(arena.get_u8(h)),
+        ValueTag::U16 => arena.alloc_u16(arena.get_u16(h)),
+        ValueTag::U32 => arena.alloc_u32(arena.get_u32(h)),
+        ValueTag::U64 => arena.alloc_u64(arena.get_u64(h)),
+        ValueTag::U128 => arena.alloc_u128(arena.get_u128(h)),
+        ValueTag::Isize => arena.alloc_isize(arena.get_isize(h)),
+        ValueTag::Usize => arena.alloc_usize(arena.get_usize(h)),
+        ValueTag::F16 => arena.alloc_f16(arena.get_f16(h)),
+        ValueTag::F32 => arena.alloc_f32(arena.get_f32(h)),
+        ValueTag::F64 => arena.alloc_f64(arena.get_f64(h)),
+        ValueTag::F128 => arena.alloc_f128(arena.get_f128(h)),
+        ValueTag::Ref => {
+            let rc = arena.get_ref(h).clone();
+            let key = Arc::as_ptr(&rc);
+            if let Some(&cached) = cache.handle.get(&key) {
+                return cached;
+            }
+            let new_obj = deep_clone_heap(&rc, arena, cache);
+            let new_h = arena.alloc_ref_rc(Arc::new(new_obj));
+            cache.handle.insert(key, new_h);
+            new_h
+        }
+    }
+}
+
+fn deep_clone_heap(
+    obj: &HeapObj,
+    arena: &mut ValueArena,
+    cache: &mut DeepCloneCache,
+) -> HeapObj {
+    match obj {
+        HeapObj::Str(s) => HeapObj::Str(s.clone()),
+        HeapObj::Array(a) => {
+            // SoA 快路径：标量是 Copy 的，直接 clone SoA，元素用 Value 重建
+            if let Some(soa) = &a.scalar_soa {
+                let elems: Vec<Value> = simd_soa_deep_clone(soa);
+                return HeapObj::Array(ArrayValue {
+                    elements: elems,
+                    fixed_size: a.fixed_size,
+                    elem_is_ref: a.elem_is_ref,
+                    scalar_soa: Some(soa.clone()),
+                });
+            }
+            // 回退：逐元素 deep_clone（元素为 Value）
+            let elems: Vec<Value> = a
+                .elements
+                .iter()
+                .map(|e| deep_clone_value(e, arena, cache))
+                .collect();
+            HeapObj::Array(ArrayValue {
+                elements: elems,
+                fixed_size: a.fixed_size,
+                elem_is_ref: a.elem_is_ref,
+                scalar_soa: a.scalar_soa.clone(),
+            })
+        }
+        HeapObj::Record(r) => {
+            // fields 已迁移为 Value
+            let fields: Vec<Value> = r
+                .fields
+                .iter()
+                .map(|e| deep_clone_value(e, arena, cache))
+                .collect();
+            HeapObj::Record(RecordValue {
+                type_name: r.type_name.clone(),
+                fields,
+                field_names: r.field_names.clone(),
+                field_ref_bits: r.field_ref_bits,
+            })
+        }
+        HeapObj::Adt(a) => {
+            // AdtField.value 已迁移为 Value
+            let fields: Vec<AdtField> = a
+                .fields
+                .iter()
+                .map(|f| AdtField {
+                    name: f.name.clone(),
+                    value: deep_clone_value(&f.value, arena, cache),
+                })
+                .collect();
+            HeapObj::Adt(AdtValue {
+                type_name: a.type_name.clone(),
+                constructor: a.constructor.clone(),
+                fields,
+                field_ref_bits: a.field_ref_bits,
+            })
+        }
+        HeapObj::Newtype(n) => HeapObj::Newtype(NewtypeValue {
+            type_name: n.type_name.clone(),
+            // inner 仍为 ValueHandle
+            inner: deep_clone_handle(n.inner, arena, cache),
+        }),
+        HeapObj::Cell(c) => {
+            let inner = c.inner.lock().clone();
+            HeapObj::Cell(Cell::new(deep_clone_value(&inner, arena, cache)))
+        }
+        HeapObj::Range(r) => HeapObj::Range(r.clone()),
+        HeapObj::Closure(c) => {
+            // upvalues 已迁移为 Value，bound_args 仍为 ValueHandle
+            let upvalues: Vec<Value> = c
+                .upvalues
+                .iter()
+                .map(|e| deep_clone_value(e, arena, cache))
+                .collect();
+            let bound_args: Vec<ValueHandle> = c
+                .bound_args
+                .iter()
+                .map(|e| deep_clone_handle(*e, arena, cache))
+                .collect();
+            HeapObj::Closure(Closure {
+                func_id: c.func_id,
+                arity: c.arity,
+                upvalues,
+                bound_args,
+                self_upvalue_idx: c.self_upvalue_idx,
+                upvalue_ref_bits: c.upvalue_ref_bits,
+                cell_upvalues: c.cell_upvalues,
+            })
+        }
+        HeapObj::Partial(p) => {
+            let upvalues: Vec<Value> = p
+                .upvalues
+                .iter()
+                .map(|v| deep_clone_value(v, arena, cache))
+                .collect();
+            let bound_args: Vec<Value> = p
+                .bound_args
+                .iter()
+                .map(|v| deep_clone_value(v, arena, cache))
+                .collect();
+            HeapObj::Partial(PartialApplication {
+                func_id: p.func_id,
+                upvalues,
+                bound_args,
+                remaining_arity: p.remaining_arity,
+                self_upvalue_idx: p.self_upvalue_idx,
+            })
+        }
+        HeapObj::ThrowVal(t) => match &t.payload {
+            // ThrowPayload::Ok/Err 均持有 Value，递归深拷贝
+            ThrowPayload::Ok(v) => HeapObj::ThrowVal(ThrowValue {
+                payload: ThrowPayload::Ok(deep_clone_value(v, arena, cache)),
+            }),
+            ThrowPayload::Err(v) => HeapObj::ThrowVal(ThrowValue {
+                payload: ThrowPayload::Err(deep_clone_value(v, arena, cache)),
+            }),
+        },
+        HeapObj::Builtin(b) => HeapObj::Builtin(b.clone()),
+        HeapObj::TraitVal(t) => HeapObj::TraitVal(t.clone()),
+        HeapObj::LazyVal(l) => HeapObj::LazyVal(l.clone()),
+        HeapObj::ErrorVal(e) => HeapObj::ErrorVal(e.clone()),
+        // AtomicValue.data 为 Value，递归深拷贝
+        HeapObj::AtomicVal(a) => HeapObj::AtomicVal(AtomicValue::new(deep_clone_value(&a.load(), arena, cache))),
+        HeapObj::AsyncVal(a) => HeapObj::AsyncVal(a.clone()),
+        HeapObj::ChannelVal(c) => HeapObj::ChannelVal(c.clone()),
+        HeapObj::SenderVal(s) => HeapObj::SenderVal(s.clone()),
+        HeapObj::ReceiverVal(r) => HeapObj::ReceiverVal(r.clone()),
+        HeapObj::CoroutineFrame => HeapObj::CoroutineFrame,
+    }
+}
+
+// =========================================================================
+// ValueArena 便捷构造器（镜像旧 ValueHandle 构造器 API）+ 格式化/哈希辅助
+// =========================================================================
+
+impl ValueArena {
+    /// 若句柄为 Ref，返回对应堆对象引用；否则返回 None。
+    #[inline]
+    pub fn heap_obj_opt(&self, h: ValueHandle) -> Option<&HeapObj> {
+        if h.tag() == ValueTag::Ref {
+            Some(self.get_ref(h).as_ref())
+        } else {
+            None
+        }
+    }
+
+    // ---- 单例便捷构造器（无分配）----
+    // null()/void() 由既有 impl ValueArena 提供（已改为 &self）。
+    #[inline]
+    pub fn bool(&self, v: bool) -> ValueHandle {
+        Self::bool_val(v)
+    }
+
+    // ---- 标量分配便捷别名 ----
+    #[inline]
+    pub fn i8(&mut self, v: i8) -> ValueHandle {
+        self.alloc_i8(v)
+    }
+    #[inline]
+    pub fn i16(&mut self, v: i16) -> ValueHandle {
+        self.alloc_i16(v)
+    }
+    #[inline]
+    pub fn i32(&mut self, v: i32) -> ValueHandle {
+        self.alloc_i32(v)
+    }
+    #[inline]
+    pub fn i64(&mut self, v: i64) -> ValueHandle {
+        self.alloc_i64(v)
+    }
+    #[inline]
+    pub fn i128(&mut self, v: i128) -> ValueHandle {
+        self.alloc_i128(v)
+    }
+    #[inline]
+    pub fn u8(&mut self, v: u8) -> ValueHandle {
+        self.alloc_u8(v)
+    }
+    #[inline]
+    pub fn u16(&mut self, v: u16) -> ValueHandle {
+        self.alloc_u16(v)
+    }
+    #[inline]
+    pub fn u32(&mut self, v: u32) -> ValueHandle {
+        self.alloc_u32(v)
+    }
+    #[inline]
+    pub fn u64(&mut self, v: u64) -> ValueHandle {
+        self.alloc_u64(v)
+    }
+    #[inline]
+    pub fn u128(&mut self, v: u128) -> ValueHandle {
+        self.alloc_u128(v)
+    }
+    #[inline]
+    pub fn isize(&mut self, v: isize) -> ValueHandle {
+        self.alloc_isize(v)
+    }
+    #[inline]
+    pub fn usize(&mut self, v: usize) -> ValueHandle {
+        self.alloc_usize(v)
+    }
+    #[inline]
+    pub fn f16(&mut self, v: F16) -> ValueHandle {
+        self.alloc_f16(v.0)
+    }
+    #[inline]
+    pub fn f32(&mut self, v: f32) -> ValueHandle {
+        self.alloc_f32(v)
+    }
+    #[inline]
+    pub fn f64(&mut self, v: f64) -> ValueHandle {
+        self.alloc_f64(v)
+    }
+    #[inline]
+    pub fn f128(&mut self, v: F128) -> ValueHandle {
+        self.alloc_f128(v)
+    }
+    #[inline]
+    pub fn char(&mut self, c: Char) -> ValueHandle {
+        self.alloc_char(c.codepoint)
+    }
+    #[inline]
+    pub fn from_rust_char(&mut self, c: char) -> ValueHandle {
+        self.alloc_char(c as u32)
+    }
+
+    // ---- 堆对象便捷构造器 ----
+    pub fn str(&mut self, s: impl Into<String>) -> ValueHandle {
+        self.alloc_ref(HeapObj::Str(KuzoStr::new(s)))
+    }
+    pub fn str_from(&mut self, s: &str) -> ValueHandle {
+        self.alloc_ref(HeapObj::Str(KuzoStr::from_rust_str(s)))
+    }
+    pub fn from_kuzo_str(&mut self, s: KuzoStr) -> ValueHandle {
+        self.alloc_ref(HeapObj::Str(s))
+    }
+    pub fn heap(&mut self, obj: HeapObj) -> ValueHandle {
+        self.alloc_ref(obj)
+    }
+    pub fn from_ref(&mut self, r: HeapRef) -> ValueHandle {
+        self.alloc_ref_rc(r)
+    }
+    pub fn array(&mut self, elements: Vec<Value>) -> ValueHandle {
+        self.alloc_ref(HeapObj::Array(ArrayValue::new(elements)))
+    }
+    pub fn array_fixed(&mut self, elements: Vec<Value>, size: u64) -> ValueHandle {
+        self.alloc_ref(HeapObj::Array(ArrayValue::new_fixed(elements, size)))
+    }
+    pub fn record(
+        &mut self,
+        type_name: impl Into<String>,
+        fields: Vec<Value>,
+        field_names: Vec<Option<String>>,
+    ) -> ValueHandle {
+        self.alloc_ref(HeapObj::Record(RecordValue::new(
+            type_name.into(),
+            fields,
+            field_names,
+        )))
+    }
+    pub fn adt(
+        &mut self,
+        type_name: impl Into<String>,
+        constructor: impl Into<String>,
+        fields: Vec<AdtField>,
+    ) -> ValueHandle {
+        self.alloc_ref(HeapObj::Adt(AdtValue::new(
+            type_name.into(),
+            constructor.into(),
+            fields,
+        )))
+    }
+    pub fn newtype(&mut self, type_name: impl Into<String>, inner: ValueHandle) -> ValueHandle {
+        self.alloc_ref(HeapObj::Newtype(NewtypeValue {
+            type_name: type_name.into(),
+            inner,
+        }))
+    }
+    pub fn cell(&mut self, val: Value) -> ValueHandle {
+        self.alloc_ref(HeapObj::Cell(Cell::new(val)))
+    }
+    pub fn range(&mut self, start: i64, end: i64, inclusive: bool) -> ValueHandle {
+        self.alloc_ref(HeapObj::Range(Range::new(start, end, inclusive)))
+    }
+    pub fn closure(&mut self, c: Closure) -> ValueHandle {
+        self.alloc_ref(HeapObj::Closure(c))
+    }
+    pub fn partial(&mut self, p: PartialApplication) -> ValueHandle {
+        self.alloc_ref(HeapObj::Partial(p))
+    }
+    pub fn builtin(&mut self, fn_ptr: BuiltinFn, name: impl Into<String>) -> ValueHandle {
+        self.alloc_ref(HeapObj::Builtin(Builtin {
+            fn_ptr,
+            name: name.into(),
+        }))
+    }
+    pub fn trait_val(&mut self, t: TraitValue) -> ValueHandle {
+        self.alloc_ref(HeapObj::TraitVal(t))
+    }
+    pub fn lazy(&mut self, l: LazyValue) -> ValueHandle {
+        self.alloc_ref(HeapObj::LazyVal(l))
+    }
+    pub fn error_val(
+        &mut self,
+        type_name: impl Into<String>,
+        message: impl Into<String>,
+        is_error_subtype: bool,
+    ) -> ValueHandle {
+        self.alloc_ref(HeapObj::ErrorVal(ErrorValue {
+            type_name: type_name.into(),
+            message: message.into(),
+            is_error_subtype,
+        }))
+    }
+    pub fn throw_ok(&mut self, val: Value) -> ValueHandle {
+        self.alloc_ref(HeapObj::ThrowVal(ThrowValue {
+            payload: ThrowPayload::Ok(val),
+        }))
+    }
+    pub fn throw_err(&mut self, err_val: Value) -> ValueHandle {
+        self.alloc_ref(HeapObj::ThrowVal(ThrowValue {
+            payload: ThrowPayload::Err(err_val),
+        }))
+    }
+    pub fn atomic(&mut self, val: Value) -> ValueHandle {
+        self.alloc_ref(HeapObj::AtomicVal(AtomicValue::new(val)))
+    }
+    pub fn async_handle(&mut self) -> ValueHandle {
+        self.alloc_ref(HeapObj::AsyncVal(AsyncHandle::new()))
+    }
+    pub fn channel(&mut self, capacity: usize) -> ValueHandle {
+        self.alloc_ref(HeapObj::ChannelVal(Arc::new(ChannelValue::new(capacity))))
+    }
+    pub fn sender(&mut self, channel: Arc<ChannelValue>) -> ValueHandle {
+        self.alloc_ref(HeapObj::SenderVal(SenderValue { channel }))
+    }
+    pub fn receiver(&mut self, channel: Arc<ChannelValue>) -> ValueHandle {
+        self.alloc_ref(HeapObj::ReceiverVal(ReceiverValue { channel }))
+    }
+
+    // ---- 格式化包装器 ----
+    pub fn display(&self, h: ValueHandle) -> ValueDisplay<'_> {
+        ValueDisplay { arena: self, handle: h }
+    }
+    pub fn debug(&self, h: ValueHandle) -> ValueDebug<'_> {
+        ValueDebug { arena: self, handle: h }
+    }
+
+    // ---- 按值哈希 ----
+    pub fn hash_value<H: Hasher>(&self, h: ValueHandle, state: &mut H) {
+        match h.tag() {
+            ValueTag::Null => 0u8.hash(state),
+            ValueTag::Void => 1u8.hash(state),
+            ValueTag::Bool => {
+                2u8.hash(state);
+                self.get_bool(h).hash(state)
+            }
+            ValueTag::Char => {
+                3u8.hash(state);
+                self.get_char(h).hash(state)
+            }
+            ValueTag::I8 => {
+                4u8.hash(state);
+                self.get_i8(h).hash(state)
+            }
+            ValueTag::I16 => {
+                5u8.hash(state);
+                self.get_i16(h).hash(state)
+            }
+            ValueTag::I32 => {
+                6u8.hash(state);
+                self.get_i32(h).hash(state)
+            }
+            ValueTag::I64 => {
+                7u8.hash(state);
+                self.get_i64(h).hash(state)
+            }
+            ValueTag::I128 => {
+                8u8.hash(state);
+                self.get_i128(h).hash(state)
+            }
+            ValueTag::U8 => {
+                9u8.hash(state);
+                self.get_u8(h).hash(state)
+            }
+            ValueTag::U16 => {
+                10u8.hash(state);
+                self.get_u16(h).hash(state)
+            }
+            ValueTag::U32 => {
+                11u8.hash(state);
+                self.get_u32(h).hash(state)
+            }
+            ValueTag::U64 => {
+                12u8.hash(state);
+                self.get_u64(h).hash(state)
+            }
+            ValueTag::U128 => {
+                13u8.hash(state);
+                self.get_u128(h).hash(state)
+            }
+            ValueTag::Isize => {
+                14u8.hash(state);
+                self.get_isize(h).hash(state)
+            }
+            ValueTag::Usize => {
+                15u8.hash(state);
+                self.get_usize(h).hash(state)
+            }
+            ValueTag::F16 => {
+                16u8.hash(state);
+                self.get_f16(h).hash(state)
+            }
+            ValueTag::F32 => {
+                17u8.hash(state);
+                self.get_f32(h).to_bits().hash(state)
+            }
+            ValueTag::F64 => {
+                18u8.hash(state);
+                self.get_f64(h).to_bits().hash(state)
+            }
+            ValueTag::F128 => {
+                19u8.hash(state);
+                self.get_f128(h).hash(state)
+            }
+            ValueTag::Ref => {
+                20u8.hash(state);
+                self.get_ref(h).hash(state);
+            }
+        }
+    }
+}
+
+// `read_int_as!` 按 tag 从字节读取整数并提升为 i128 / u128。
+// 整数类型（含 Isize/Usize）经符号扩展后转目标类型，非整数 tag 回退 0。
+// 有符号源在转 u128 时经 i128 中转，以保留与原逐臂代码一致的语义。
+macro_rules! read_int_as {
+    ($tag:expr, $bytes:expr, i128) => {
+        match $tag {
+            ValueTag::I8    => $bytes.first().copied().unwrap_or(0) as i8 as i128,
+            ValueTag::U8    => $bytes.first().copied().unwrap_or(0) as u8 as i128,
+            ValueTag::I16   => read_i16_le($bytes) as i128,
+            ValueTag::U16   => read_u16_le($bytes) as i128,
+            ValueTag::I32   => read_i32_le($bytes) as i128,
+            ValueTag::U32   => read_u32_le($bytes) as i128,
+            ValueTag::I64   => read_i64_le($bytes) as i128,
+            ValueTag::U64   => read_u64_le($bytes) as i128,
+            ValueTag::I128  => read_i128_le($bytes),
+            ValueTag::U128  => read_u128_le($bytes) as i128,
+            ValueTag::Isize => read_i64_le($bytes) as isize as i128,
+            ValueTag::Usize => read_u64_le($bytes) as usize as i128,
+            _ => 0,
+        }
+    };
+    ($tag:expr, $bytes:expr, u128) => {
+        match $tag {
+            ValueTag::I8    => $bytes.first().copied().unwrap_or(0) as i8 as i128 as u128,
+            ValueTag::U8    => $bytes.first().copied().unwrap_or(0) as u8 as u128,
+            ValueTag::I16   => read_i16_le($bytes) as i128 as u128,
+            ValueTag::U16   => read_u16_le($bytes) as u128,
+            ValueTag::I32   => read_i32_le($bytes) as i128 as u128,
+            ValueTag::U32   => read_u32_le($bytes) as u128,
+            ValueTag::I64   => read_i64_le($bytes) as i128 as u128,
+            ValueTag::U64   => read_u64_le($bytes) as u128,
+            ValueTag::I128  => read_i128_le($bytes) as u128,
+            ValueTag::U128  => read_u128_le($bytes),
+            ValueTag::Isize => read_i64_le($bytes) as isize as i128 as u128,
+            ValueTag::Usize => read_u64_le($bytes) as usize as u128,
+            _ => 0,
+        }
+    };
+}
+
+// `write_int_bytes!` 按 dst_tag 将整数（i128 或 u128）写入目标字节缓冲，
+// 复用既有 write_*_le 辅助函数以保持与原逐臂代码一致的截断/填充语义。
+macro_rules! write_int_bytes {
+    ($val:expr, $tag:expr, $dst:expr) => {
+        match $tag {
+            ValueTag::I8    => write_i8($val as i8, $dst),
+            ValueTag::U8    => write_u8($val as u8, $dst),
+            ValueTag::I16   => write_i16_le($val as i16, $dst),
+            ValueTag::U16   => write_u16_le($val as u16, $dst),
+            ValueTag::I32   => write_i32_le($val as i32, $dst),
+            ValueTag::U32   => write_u32_le($val as u32, $dst),
+            ValueTag::I64   => write_i64_le($val as i64, $dst),
+            ValueTag::U64   => write_u64_le($val as u64, $dst),
+            ValueTag::I128  => write_i128_le($val as i128, $dst),
+            ValueTag::U128  => write_u128_le($val as u128, $dst),
+            ValueTag::Isize => write_i64_le($val as isize as i64, $dst),
+            ValueTag::Usize => write_u64_le($val as usize as u64, $dst),
+            _ => {}
+        }
+    };
+}
+

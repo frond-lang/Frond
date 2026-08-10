@@ -1,0 +1,33 @@
+[package]
+name = "kuzo"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+bumpalo = { version = "3", features = ["collections"] }
+wide = "0.7"
+rayon = "1"
+crossbeam-deque = "0.8"
+parking_lot = "0.12"
+rustc-hash = "2.1"
+hashbrown = "0.17"
+clap = { version = "4.6", features = ["derive"] }
+pastey = "0.2"
+num_enum = "0.7"
+strum = { version = "0.26", features = ["derive"] }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+memmap2 = "0.9"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[build-dependencies]
+cc = { version = "1.0", features = ["parallel"] }
+
+[[bin]]
+name = "kuzo"
+path = "src/main.rs"
+
+[lib]
+name = "kuzo"
+path = "src/lib.rs"

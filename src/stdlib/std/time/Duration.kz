@@ -1,0 +1,82 @@
+// Duration.kz — 时间长度（纳秒精度）
+//
+// 设计文档 §5.3：Duration newtype + 算子
+// 内部存储 nanos: i128，可表达约 ±10^11 秒（3000+ 年）
+// Instant / SystemTime / DateTime 之间的差值都用 Duration 表示
+
+pub type Duration = Duration(nanos: i128) {
+    // ─── 转换器（转换为各时间单位） ───────────────────────────────────
+
+    pub fun as_secs(self): i64 {
+        cast(self.nanos / 1_000_000_000).to(i64)
+    }
+
+    pub fun as_millis(self): i64 {
+        cast(self.nanos / 1_000_000).to(i64)
+    }
+
+    pub fun as_micros(self): i64 {
+        cast(self.nanos / 1_000).to(i64)
+    }
+
+    pub fun as_nanos(self): i128 {
+        self.nanos
+    }
+
+    // 纳秒部分（不足 1 秒的部分），0..999_999_999
+    pub fun subsec_nanos(self): u32 {
+        cast(self.nanos % 1_000_000_000).to(u32)
+    }
+
+    // ─── 算子 ──────────────────────────────────────────────────────────
+
+    pub fun add(self, other: Duration): Duration {
+        Duration(self.nanos + other.nanos)
+    }
+
+    pub fun sub(self, other: Duration): Duration {
+        Duration(self.nanos - other.nanos)
+    }
+
+    pub fun mul(self, factor: i64): Duration {
+        Duration(self.nanos * cast(factor).to(i128))
+    }
+
+    pub fun div(self, factor: i64): Duration {
+        Duration(self.nanos / cast(factor).to(i128))
+    }
+
+    pub fun is_zero(self): bool {
+        self.nanos == 0
+    }
+}
+
+// ─── 构造器（从各时间单位） ───────────────────────────────────────
+
+pub fun from_secs(s: i64): Duration {
+    Duration(cast(s).to(i128) * 1_000_000_000)
+}
+
+pub fun from_millis(ms: i64): Duration {
+    Duration(cast(ms).to(i128) * 1_000_000)
+}
+
+pub fun from_micros(us: i64): Duration {
+    Duration(cast(us).to(i128) * 1_000)
+}
+
+pub fun from_nanos(ns: i64): Duration {
+    Duration(cast(ns).to(i128))
+}
+
+pub fun from_mins(m: i64): Duration {
+    Duration(cast(m).to(i128) * 60_000_000_000i128)
+}
+
+pub fun from_hours(h: i64): Duration {
+    Duration(cast(h).to(i128) * 3_600_000_000_000i128)
+}
+
+pub fun from_days(d: i64): Duration {
+    Duration(cast(d).to(i128) * 86_400_000_000_000i128)
+}

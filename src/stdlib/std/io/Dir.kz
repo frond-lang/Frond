@@ -1,0 +1,146 @@
+// Dir.kz — 目录列表/创建/删除/遍历
+//
+// 设计文档 §4.6：Dir 便捷 API
+// 所有操作为 async，返回 Async<Throw<T, IOError>>。
+// DirEntry 通过 __dir_list syscall 返回，kind 字段为 FileKind ADT。
+
+// ─── 类型定义 ──────────────────────────────────────────────────────
+
+// 目录条目（name + kind），与 syscall/io.zig dir_list 返回结构对齐
+pub type DirEntry = DirEntry(name: str, kind: FileKind)
+
+// ─── Kuzo wrapper：@extern("C") 原始返回值 → Throw ──────────────
+
+// __dir_create(path: str, recursive: bool): Throw<void, IOError>
+fun __dir_create(path: str, recursive: bool): Throw<void, IOError> {
+    val rc = __dir_create_raw(path, recursive)
+    if rc < 0 {
+        throw IOError(NotFound, "dir create failed", 0, path)
+    }
+    Ok(void)
+}
+
+// __dir_remove(path: str, recursive: bool): Throw<void, IOError>
+fun __dir_remove(path: str, recursive: bool): Throw<void, IOError> {
+    val rc = __dir_remove_raw(path, recursive)
+    if rc < 0 {
+        throw IOError(NotFound, "dir remove failed", 0, path)
+    }
+    Ok(void)
+}
+
+// __dir_list(path: str): Throw<DirEntry[], IOError>
+// 通过 __dir_list_into 填充三个 out-buffer，然后组装 DirEntry[]
+// 缓冲区大小：256 条目上限，8KB 名字空间，1KB 偏移空间
+fun __dir_list(path: str): Throw<DirEntry[], IOError> {
+    val max_count: usize = 256
+    var names_buf: u8[] = []
+    var name_offsets: u8[] = []
+    var kinds_buf: u8[] = []
+    var i: usize = 0
+    while i < 8192 {
+        names_buf = names_buf ++ [0u8]
+        i = i + 1
+    }
+    i = 0
+    while i < 1024 {
+        name_offsets = name_offsets ++ [0u8]
+        i = i + 1
+    }
+    i = 0
+    while i < 256 {
+        kinds_buf = kinds_buf ++ [0u8]
+        i = i + 1
+    }
+    val count = __dir_list_into(path, names_buf, name_offsets, kinds_buf, max_count)
+    if count < 0 {
+        throw IOError(NotFound, "dir list failed", 0, path)
+    }
+    // 解析 buffer 组装 DirEntry[]
+    var entries: DirEntry[] = []
+    var idx: usize = 0
+    while idx < cast(count).to(usize) {
+        // 读取 kind（1 字节，offset = idx）
+        val kind_int = cast(kinds_buf[idx]).to(i32)
+        val kind = __kind_from_int(kind_int)
+        // 读取 name 起始偏移（u32 LE，offset = idx * 4）
+        val off_base = idx * 4
+        val name_start = cast(__read_i32_le(name_offsets, off_base)).to(usize)
+        // 读取下一个条目的起始偏移（或 buffer 末尾）作为 name 结束
+        val name_end = if idx + 1 < cast(count).to(usize) {
+            cast(__read_i32_le(name_offsets, off_base + 4)).to(usize)
+        } else {
+            // 最后一个条目：扫描到第一个 0 字节
+            var end_pos = name_start
+            while end_pos < names_buf.len() && names_buf[end_pos] != 0u8 {
+                end_pos = end_pos + 1
+            }
+            end_pos
+        }
+        val name = if name_end > name_start {
+            names_buf[name_start..name_end]
+        } else {
+            ""
+        }
+        entries = entries ++ [DirEntry(name, kind)]
+        idx = idx + 1
+    }
+    Ok(entries)
+}
+
+// ─── 目录操作（async） ────────────────────────────────────────────
+
+// 列出目录直系子条目
+pub async fun list(path: str): Async<Throw<DirEntry[], IOError>> {
+    __dir_list(path)?
+}
+
+// 列出目录直系子条目（Path 重载）
+pub async fun list_path(path: Path): Async<Throw<DirEntry[], IOError>> {
+    __dir_list(path.to_str())?
+}
+
+// 创建目录
+// recursive=true 时递归创建父目录（类似 mkdir -p）
+pub async fun create(path: str, recursive: bool): Async<Throw<void, IOError>> {
+    __dir_create(path, recursive)?
+    Ok(void)
+}
+
+// 创建目录（Path 重载）
+pub async fun create_path(path: Path, recursive: bool): Async<Throw<void, IOError>> {
+    __dir_create(path.to_str(), recursive)?
+    Ok(void)
+}
+
+// 删除目录
+// recursive=true 时递归删除子目录与文件（类似 rm -r）
+pub async fun remove(path: str, recursive: bool): Async<Throw<void, IOError>> {
+    __dir_remove(path, recursive)?
+    Ok(void)
+}
+
+// 递归遍历目录树（深度优先），返回所有条目（含子目录中的条目）
+// 优化：本级条目先收集到局部数组（小数组 ++ 开销小），子目录结果批量拼接，
+// 避免对累积的大 result 反复 ++ 导致 O(n²)
+pub async fun walk(path: str): Async<Throw<DirEntry[], IOError>> {
+    val entries = __dir_list(path)?
+    // 本级所有条目一次性入 result（entries 已是数组，直接用作初始值）
+    var result: DirEntry[] = entries
+    // 收集子目录路径，统一递归后批量拼接
+    var sub_paths: str[] = []
+    for e in entries.iter() {
+        match e.kind {
+            Directory => {
+                sub_paths = sub_paths ++ [path + "/" + e.name]
+            },
+            _ => {},
+        }
+    }
+    // 逐个递归子目录，每次批量拼接结果
+    for sp in sub_paths.iter() {
+        val sub_entries = walk(sp).await()?
+        result = result ++ sub_entries
+    }
+    Ok(result)
+}

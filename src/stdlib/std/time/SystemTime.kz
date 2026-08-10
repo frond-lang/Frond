@@ -1,0 +1,150 @@
+// SystemTime.kz — 堆时钟（同步）+ TimeComponents
+//
+// 设计文档 §5.2 + §5.5：SystemTime newtype + TimeComponents record
+// SystemTime 基于 CLOCK_REALTIME（Unix epoch 纳秒），适合获取墙钟时间。
+// 同步实现——决策 S04。
+// TimeComponents 为 9 字段 record，syscall 层通过 makeRecordWithNames 构造。
+
+// ─── TimeComponents（syscall 层与 Kuzo 层共享的 record 类型） ──────
+// 字段顺序与 syscall/time.zig makeTimeComponents 一一对应：
+//   year, month, day, hour, minute, second, nanos, weekday, day_of_year
+
+pub type TimeComponents = TimeComponents(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8, nanos: u32, weekday: u8, day_of_year: u16)
+
+// ─── SystemTime ────────────────────────────────────────────────────
+
+pub type SystemTime = SystemTime(nanos: i128) {
+    // ─── 加减 Duration ─────────────────────────────────────────────────
+
+    pub fun add_duration(self, d: Duration): SystemTime {
+        SystemTime(self.nanos + d.nanos)
+    }
+
+    pub fun sub_duration(self, d: Duration): SystemTime {
+        SystemTime(self.nanos - d.nanos)
+    }
+
+    // self 相对 earlier 的时间长度
+    pub fun duration_since(self, earlier: SystemTime): Duration {
+        Duration(self.nanos - earlier.nanos)
+    }
+
+    // ─── 与 DateTime 转换 ──────────────────────────────────────────────
+
+    // 转换为本地时区的 DateTime
+    pub fun to_local(self): DateTime {
+        val comp = to_local_components(self.nanos)
+        DateTime.from_components(comp)
+    }
+
+    // 转换为 UTC 的 DateTime
+    pub fun to_utc(self): DateTime {
+        val comp = to_utc_components(self.nanos)
+        DateTime.from_components(comp)
+    }
+
+    // ─── 比较 ──────────────────────────────────────────────────────────
+
+    pub fun is_before(self, other: SystemTime): bool {
+        self.nanos < other.nanos
+    }
+
+    pub fun is_after(self, other: SystemTime): bool {
+        self.nanos > other.nanos
+    }
+}
+
+// Unix 纪元（1970-01-01 00:00:00 UTC）
+pub val UNIX_EPOCH: SystemTime = SystemTime(0)
+
+// 获取当前墙钟时间
+pub fun now(): SystemTime {
+    SystemTime(__systemtime_now_ns())
+}
+
+// ─── 纯 Kuzo 时间分量转换（替代原 syscall 实现） ─────────────────
+//
+// 原 __systemtime_to_utc_components / __systemtime_to_local_components /
+// __components_to_ns_utc 三个 syscall 已下沉为纯 Kuzo 算法（调用 Calendar
+// 的 days_from_civil / civil_from_days / weekday_from_days），遵循 syscall
+// 最小化原则——纯算法不依赖宿主能力，不应占用 syscall 槽位。
+//
+// 算法：Howard Hinnant days_from_civil + 日内秒数分解，与原 Zig 实现等价。
+// 支持负 ns（1970 年前），用 floor 除法保证语义正确。
+
+// i128 纳秒 → UTC TimeComponents（纯 Kuzo 算法）
+pub fun to_utc_components(ns: i128): TimeComponents {
+    val ns_per_sec: i128 = cast(1_000_000_000).to(i128)
+    val secs_per_day: i128 = cast(86400).to(i128)
+
+    val total_sec = Calendar.floor_div_i128(ns, ns_per_sec)
+    val sub_ns = Calendar.floor_mod_i128(ns, ns_per_sec)
+    val days_i128 = Calendar.floor_div_i128(total_sec, secs_per_day)
+    val secs_of_day = Calendar.floor_mod_i128(total_sec, secs_per_day)
+
+    val days = cast(days_i128).to(i64)
+    val ymd = Calendar.civil_from_days(days)
+    val weekday = Calendar.weekday_from_days(days)
+    val doy = Calendar.day_of_year(ymd.year, ymd.month, ymd.day)
+
+    val hour = secs_of_day / cast(3600).to(i128)
+    val minute = (secs_of_day % cast(3600).to(i128)) / cast(60).to(i128)
+    val second = secs_of_day % cast(60).to(i128)
+
+    TimeComponents(
+        ymd.year,
+        ymd.month,
+        ymd.day,
+        cast(hour).to(u8),
+        cast(minute).to(u8),
+        cast(second).to(u8),
+        cast(sub_ns).to(u32),
+        weekday,
+        doy,
+    )
+}
+
+// i128 纳秒 → 本地 TimeComponents（UTC + 本地时区偏移）
+// 仅 __localtime_offset_minutes 保留为 syscall（依赖 libc/kernel32）
+pub fun to_local_components(ns: i128): TimeComponents {
+    val offset_min = __localtime_offset_minutes()
+    val offset_ns = cast(offset_min).to(i128) * cast(60_000_000_000i128).to(i128)
+    to_utc_components(ns + offset_ns)
+}
+
+// TimeComponents → i128 纳秒（UTC），验证字段合法性
+// 纯 Kuzo 算法 + 字段校验，与原 syscall components_to_ns_utc 行为一致
+pub fun components_to_ns_utc(comp: TimeComponents): Throw<i128, TimeError> {
+    if comp.month < 1 || comp.month > 12 {
+        throw TimeError(InvalidDateTime, "month out of range", "")
+    }
+    val max_day = Calendar.days_in_month(comp.year, comp.month)
+    if comp.day < 1 || comp.day > max_day {
+        throw TimeError(InvalidDateTime, "day out of range", "")
+    }
+    if comp.hour > 23 || comp.minute > 59 || comp.second > 59 {
+        throw TimeError(InvalidDateTime, "time field out of range", "")
+    }
+    if comp.nanos >= 1_000_000_000 {
+        throw TimeError(InvalidDateTime, "nanos >= 1e9", "")
+    }
+
+    val days = Calendar.days_from_civil(comp.year, comp.month, comp.day)
+    val epoch_secs = cast(days).to(i128) * cast(86400).to(i128) +
+        cast(comp.hour).to(i128) * cast(3600).to(i128) +
+        cast(comp.minute).to(i128) * cast(60).to(i128) +
+        cast(comp.second).to(i128)
+    if epoch_secs < 0 {
+        throw TimeError(OutOfRange, "before 1970", "")
+    }
+    val ns = epoch_secs * cast(1_000_000_000).to(i128) + cast(comp.nanos).to(i128)
+    Ok(ns)
+}
+
+// 从 UTC DateTime 构造 SystemTime（验证字段合法性）
+// 失败时返回 TimeError（字段越界 / 时间超出 1970 年后范围）
+pub fun from_datetime_utc(dt: DateTime): Throw<SystemTime, TimeError> {
+    val comp = dt.to_components()
+    val ns = components_to_ns_utc(comp)?
+    SystemTime(ns)
+}

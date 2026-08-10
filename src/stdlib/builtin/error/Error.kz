@@ -1,0 +1,5 @@
+// Error: 通用错误类型
+//
+// 用于 throw Error("msg") 语法，构造匿名错误实例
+type Error: Err = Error(msg: str) {
+}

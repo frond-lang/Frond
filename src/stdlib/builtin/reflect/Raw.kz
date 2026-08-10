@@ -1,0 +1,71 @@
+// builtin/reflect/Raw.kz — 反射 @extern("C") 原语（builtin，默认可见）
+//
+// 全部原语接收 Value (ValueHandle, u32)，实现在 Rust 侧 extern "C" fn，
+// 直接 match HeapObj 读取已携带的类型信息。
+//
+// 无 type_table、无 type_id 注入、无查表。零元数据内存，零额外开销。
+//
+// 反射数据流：
+//   1. Value 系统自描述（RecordValue.type_name 等字段已自带类型信息）
+//   2. Raw.kz：@extern("C") 声明，C ABI 调用约定
+//   3. Reflect.rs：Rust extern "C" fn 实现，match HeapObj 返回反射信息
+//
+// 内存布局约定：
+//   - Value (ValueHandle) 是 u32，C ABI 直接传 uint32_t
+//   - C 侧不需理解 HeapObj 布局，只存 u32
+//   - str 返回用 out 参数模式（C 无法直接返回 fat pointer）
+//
+// 注：body 为空，实现在 Rust 侧 #[no_mangle] extern "C" fn。
+// Raw.kz 不参与 emit-c（不在 build.rs EXTERN_KUZO_FILES）。
+
+@extern("C")
+fun __reflect_kind(v: Value): u8 #{
+}#
+
+@extern("C")
+fun __reflect_type_name(v: Value): str #{
+}#
+
+@extern("C")
+fun __reflect_size(v: Value): u8 #{
+}#
+
+@extern("C")
+fun __reflect_field_count(v: Value): u16 #{
+}#
+
+@extern("C")
+fun __reflect_field_name(v: Value, i: u16): str #{
+}#
+
+@extern("C")
+fun __reflect_field_value(v: Value, i: u16): Value #{
+}#
+
+@extern("C")
+fun __reflect_array_len(v: Value): usize #{
+}#
+
+@extern("C")
+fun __reflect_adt_constructor(v: Value): str #{
+}#
+
+@extern("C")
+fun __reflect_scalar_to_str(v: Value): str #{
+}#
+
+@extern("C")
+fun __reflect_format(v: Value): str #{
+}#
+
+@extern("C")
+fun __reflect_kind_str(v: Value): str #{
+}#
+
+@extern("C")
+fun __reflect_layout_size(v: Value): u32 #{
+}#
+
+@extern("C")
+fun __reflect_layout_alignment(v: Value): u32 #{
+}#

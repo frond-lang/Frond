@@ -1,0 +1,10 @@
+// builtin io 包声明
+//
+// 暴露 IO 模块给所有 Kuzo 用户代码默认可见（builtin 默认全可见）。
+// Raw: @extern("C") IO 原语
+// Reader/Writer: IO trait
+// Console: print/println/eprint/eprintln/scan/scanln
+pub pack Raw
+pub pack Reader
+pub pack Writer
+pub pack Console

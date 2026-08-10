@@ -1,0 +1,605 @@
+// Math 标准库 — 三角双曲
+//
+// 纯 Kuzo 实现，算法：Taylor 级数 + 参数缩减。
+// 依赖 Round.kz 的 fmod 实现，Power.kz 的 exp/log/sqrt 实现。
+// 泛型函数使用 match type_name(x) 按类型分发到对应精度实现。
+
+// ─── sin（正弦，参数缩减 + Taylor）───
+// r = fmod(x, 2π)，缩减到 [-π,π]；sin(r) = r - r³/3! + r⁵/5! - ...
+
+fun sin_f64_impl(x: f64): f64 {
+    val two_pi = 0x1.921fb54442d18p+2
+    val pi = 0x1.921fb54442d18p+1
+    var r = fmod_f64_impl(x, two_pi)
+    if r > pi { r = r - two_pi }
+    if r < 0.0 - pi { r = r + two_pi }
+    val r2 = r * r
+    var term = r
+    var sum = term
+    var f1 = 2
+    var f2 = 3
+    while f2 <= 29 {
+        term = (0.0 - term * r2) / cast(f1).to(f64) / cast(f2).to(f64)
+        sum = sum + term
+        f1 = f1 + 2
+        f2 = f2 + 2
+    }
+    sum
+}
+fun sin_f32_impl(x: f32): f32 {
+    val two_pi: f32 = 0x1.921fb6p+2f32
+    val pi: f32 = 0x1.921fb6p+1f32
+    var r = fmod_f32_impl(x, two_pi)
+    if r > pi { r = r - two_pi }
+    if r < 0.0 - pi { r = r + two_pi }
+    val r2 = r * r
+    var term = r
+    var sum = term
+    var f1 = 2
+    var f2 = 3
+    while f2 <= 19 {
+        term = (0.0 - term * r2) / cast(f1).to(f32) / cast(f2).to(f32)
+        sum = sum + term
+        f1 = f1 + 2
+        f2 = f2 + 2
+    }
+    sum
+}
+fun sin_f16_impl(x: f16): f16 {
+    val two_pi: f16 = 0x1.92p+2f16
+    val pi: f16 = 0x1.92p+1f16
+    var r = fmod_f16_impl(x, two_pi)
+    if r > pi { r = r - two_pi }
+    if r < 0.0 - pi { r = r + two_pi }
+    val r2 = r * r
+    var term = r
+    var sum = term
+    var f1 = 2
+    var f2 = 3
+    while f2 <= 9 {
+        term = (0.0 - term * r2) / cast(f1).to(f16) / cast(f2).to(f16)
+        sum = sum + term
+        f1 = f1 + 2
+        f2 = f2 + 2
+    }
+    sum
+}
+fun sin_f128_impl(x: f128): f128 {
+    val two_pi = 0x1.921fb54442d18469898cc51701b8p+2f128
+    val pi = 0x1.921fb54442d18469898cc51701b8p+1f128
+    var r = fmod_f128_impl(x, two_pi)
+    if r > pi { r = r - two_pi }
+    if r < 0.0 - pi { r = r + two_pi }
+    val r2 = r * r
+    var term = r
+    var sum = term
+    var f1 = 2
+    var f2 = 3
+    while f2 <= 59 {
+        term = (0.0 - term * r2) / cast(f1).to(f128) / cast(f2).to(f128)
+        sum = sum + term
+        f1 = f1 + 2
+        f2 = f2 + 2
+    }
+    sum
+}
+
+pub fun sin<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(sin_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(sin_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(sin_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(sin_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── cos（余弦，cos(x) = sin(x + π/2)）───
+
+fun cos_f64_impl(x: f64): f64 {
+    val pi_half = 0x1.921fb54442d18p+0
+    sin_f64_impl(x + pi_half)
+}
+fun cos_f32_impl(x: f32): f32 {
+    val pi_half: f32 = 0x1.921fb6p+0f32
+    sin_f32_impl(x + pi_half)
+}
+fun cos_f16_impl(x: f16): f16 {
+    val pi_half: f16 = 0x1.92p+0f16
+    sin_f16_impl(x + pi_half)
+}
+fun cos_f128_impl(x: f128): f128 {
+    val pi_half = 0x1.921fb54442d18469898cc51701b8p+0f128
+    sin_f128_impl(x + pi_half)
+}
+
+pub fun cos<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(cos_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(cos_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(cos_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(cos_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── tan（正切，sin(x)/cos(x)，cos==0 返回 Inf）───
+
+fun tan_f64_impl(x: f64): f64 {
+    val s = sin_f64_impl(x)
+    val c = cos_f64_impl(x)
+    if c == 0.0 { return 1.0 / 0.0 }
+    s / c
+}
+fun tan_f32_impl(x: f32): f32 {
+    val s = sin_f32_impl(x)
+    val c = cos_f32_impl(x)
+    if c == 0.0 { return 1.0 / 0.0 }
+    s / c
+}
+fun tan_f16_impl(x: f16): f16 {
+    val s = sin_f16_impl(x)
+    val c = cos_f16_impl(x)
+    if c == 0.0 { return 1.0 / 0.0 }
+    s / c
+}
+fun tan_f128_impl(x: f128): f128 {
+    val s = sin_f128_impl(x)
+    val c = cos_f128_impl(x)
+    if c == 0.0 { return 1.0 / 0.0 }
+    s / c
+}
+
+pub fun tan<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(tan_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(tan_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(tan_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(tan_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── sinh（双曲正弦，(exp(x) - exp(-x)) / 2）───
+
+fun sinh_f64_impl(x: f64): f64 {
+    val ex = exp_f64_impl(x)
+    val enx = exp_f64_impl(0.0 - x)
+    val diff = ex - enx
+    diff / 2.0
+}
+fun sinh_f32_impl(x: f32): f32 {
+    val ex = exp_f32_impl(x)
+    val enx = exp_f32_impl(0.0 - x)
+    val diff = ex - enx
+    diff / 2.0
+}
+fun sinh_f16_impl(x: f16): f16 {
+    val ex = exp_f16_impl(x)
+    val enx = exp_f16_impl(0.0 - x)
+    val diff = ex - enx
+    diff / 2.0
+}
+fun sinh_f128_impl(x: f128): f128 {
+    val ex = exp_f128_impl(x)
+    val enx = exp_f128_impl(0.0 - x)
+    val diff = ex - enx
+    diff / 2.0
+}
+
+pub fun sinh<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(sinh_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(sinh_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(sinh_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(sinh_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── cosh（双曲余弦，(exp(x) + exp(-x)) / 2）───
+
+fun cosh_f64_impl(x: f64): f64 {
+    val ex = exp_f64_impl(x)
+    val enx = exp_f64_impl(0.0 - x)
+    val sum = ex + enx
+    sum / 2.0
+}
+fun cosh_f32_impl(x: f32): f32 {
+    val ex = exp_f32_impl(x)
+    val enx = exp_f32_impl(0.0 - x)
+    val sum = ex + enx
+    sum / 2.0
+}
+fun cosh_f16_impl(x: f16): f16 {
+    val ex = exp_f16_impl(x)
+    val enx = exp_f16_impl(0.0 - x)
+    val sum = ex + enx
+    sum / 2.0
+}
+fun cosh_f128_impl(x: f128): f128 {
+    val ex = exp_f128_impl(x)
+    val enx = exp_f128_impl(0.0 - x)
+    val sum = ex + enx
+    sum / 2.0
+}
+
+pub fun cosh<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(cosh_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(cosh_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(cosh_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(cosh_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── tanh（双曲正切，(exp(x) - exp(-x)) / (exp(x) + exp(-x))）───
+
+fun tanh_f64_impl(x: f64): f64 {
+    val ex = exp_f64_impl(x)
+    val enx = exp_f64_impl(0.0 - x)
+    val diff = ex - enx
+    val sum = ex + enx
+    diff / sum
+}
+fun tanh_f32_impl(x: f32): f32 {
+    val ex = exp_f32_impl(x)
+    val enx = exp_f32_impl(0.0 - x)
+    val diff = ex - enx
+    val sum = ex + enx
+    diff / sum
+}
+fun tanh_f16_impl(x: f16): f16 {
+    val ex = exp_f16_impl(x)
+    val enx = exp_f16_impl(0.0 - x)
+    val diff = ex - enx
+    val sum = ex + enx
+    diff / sum
+}
+fun tanh_f128_impl(x: f128): f128 {
+    val ex = exp_f128_impl(x)
+    val enx = exp_f128_impl(0.0 - x)
+    val diff = ex - enx
+    val sum = ex + enx
+    diff / sum
+}
+
+pub fun tanh<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(tanh_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(tanh_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(tanh_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(tanh_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── atan（反正切，多项式逼近）───
+// |x|<=1: atan(x) = x - x³/3 + x⁵/5 - ...
+// |x|>1:  atan(x) = ±(π/2 - atan(1/|x|))
+
+fun atan_f64_impl(x: f64): f64 {
+    val pi_half = 0x1.921fb54442d18p+0
+    if x == 0.0 { return 0.0 }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    var inv = 0
+    if a > 1.0 {
+        inv = 1
+        a = 1.0 / a
+    }
+    val x2 = a * a
+    var term = a
+    var sum = term
+    var d = 3
+    while d <= 39 {
+        term = term * x2
+        val t = term / cast(d).to(f64)
+        if d % 4 == 3 { sum = sum - t } else { sum = sum + t }
+        d = d + 2
+    }
+    var result = sum
+    if inv == 1 { result = pi_half - sum }
+    if x < 0.0 { result = 0.0 - result }
+    result
+}
+fun atan_f32_impl(x: f32): f32 {
+    val pi_half: f32 = 0x1.921fb6p+0f32
+    if x == 0.0 { return 0.0 }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    var inv = 0
+    if a > 1.0 {
+        inv = 1
+        a = 1.0 / a
+    }
+    val x2 = a * a
+    var term = a
+    var sum = term
+    var d = 3
+    while d <= 29 {
+        term = term * x2
+        val t = term / cast(d).to(f32)
+        if d % 4 == 3 { sum = sum - t } else { sum = sum + t }
+        d = d + 2
+    }
+    var result = sum
+    if inv == 1 { result = pi_half - sum }
+    if x < 0.0 { result = 0.0 - result }
+    result
+}
+fun atan_f16_impl(x: f16): f16 {
+    val pi_half: f16 = 0x1.92p+0f16
+    if x == 0.0 { return 0.0 }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    var inv = 0
+    if a > 1.0 {
+        inv = 1
+        a = 1.0 / a
+    }
+    val x2 = a * a
+    var term = a
+    var sum = term
+    var d = 3
+    while d <= 15 {
+        term = term * x2
+        val t = term / cast(d).to(f16)
+        if d % 4 == 3 { sum = sum - t } else { sum = sum + t }
+        d = d + 2
+    }
+    var result = sum
+    if inv == 1 { result = pi_half - sum }
+    if x < 0.0 { result = 0.0 - result }
+    result
+}
+fun atan_f128_impl(x: f128): f128 {
+    val pi_half = 0x1.921fb54442d18469898cc51701b8p+0f128
+    if x == 0.0 { return 0.0 }
+    var a = if x < 0.0 { 0.0 - x } else { x }
+    var inv = 0
+    if a > 1.0 {
+        inv = 1
+        a = 1.0 / a
+    }
+    val x2 = a * a
+    var term = a
+    var sum = term
+    var d = 3
+    while d <= 79 {
+        term = term * x2
+        val t = term / cast(d).to(f128)
+        if d % 4 == 3 { sum = sum - t } else { sum = sum + t }
+        d = d + 2
+    }
+    var result = sum
+    if inv == 1 { result = pi_half - sum }
+    if x < 0.0 { result = 0.0 - result }
+    result
+}
+
+pub fun atan<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(atan_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(atan_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(atan_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(atan_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── asin（反正弦，atan(x / sqrt(1-x²))）───
+// |x|>1 返回 NaN，x==±1 返回 ±π/2
+
+fun asin_f64_impl(x: f64): f64 {
+    val pi_half = 0x1.921fb54442d18p+0
+    if x > 1.0 || x < 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x == 1.0 { return pi_half }
+    if x == 0.0 - 1.0 { return 0.0 - pi_half }
+    atan_f64_impl(x / sqrt_f64_impl(1.0 - x * x))
+}
+fun asin_f32_impl(x: f32): f32 {
+    val pi_half: f32 = 0x1.921fb6p+0f32
+    if x > 1.0 || x < 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x == 1.0 { return pi_half }
+    if x == 0.0 - 1.0 { return 0.0 - pi_half }
+    atan_f32_impl(x / sqrt_f32_impl(1.0 - x * x))
+}
+fun asin_f16_impl(x: f16): f16 {
+    val pi_half: f16 = 0x1.92p+0f16
+    if x > 1.0 || x < 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x == 1.0 { return pi_half }
+    if x == 0.0 - 1.0 { return 0.0 - pi_half }
+    atan_f16_impl(x / sqrt_f16_impl(1.0 - x * x))
+}
+fun asin_f128_impl(x: f128): f128 {
+    val pi_half = 0x1.921fb54442d18469898cc51701b8p+0f128
+    if x > 1.0 || x < 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x == 1.0 { return pi_half }
+    if x == 0.0 - 1.0 { return 0.0 - pi_half }
+    atan_f128_impl(x / sqrt_f128_impl(1.0 - x * x))
+}
+
+pub fun asin<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(asin_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(asin_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(asin_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(asin_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── acos（反余弦，π/2 - asin(x)）───
+
+fun acos_f64_impl(x: f64): f64 {
+    val pi_half = 0x1.921fb54442d18p+0
+    pi_half - asin_f64_impl(x)
+}
+fun acos_f32_impl(x: f32): f32 {
+    val pi_half: f32 = 0x1.921fb6p+0f32
+    pi_half - asin_f32_impl(x)
+}
+fun acos_f16_impl(x: f16): f16 {
+    val pi_half: f16 = 0x1.92p+0f16
+    pi_half - asin_f16_impl(x)
+}
+fun acos_f128_impl(x: f128): f128 {
+    val pi_half = 0x1.921fb54442d18469898cc51701b8p+0f128
+    pi_half - asin_f128_impl(x)
+}
+
+pub fun acos<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(acos_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(acos_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(acos_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(acos_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── atan2（四象限反正切）───
+// x>0: atan(y/x)；x<0: y>=0 → atan(y/x)+π, y<0 → atan(y/x)-π；x==0: y>0 → π/2, y<0 → -π/2, y==0 → 0
+
+fun atan2_f64_impl(y: f64, x: f64): f64 {
+    val pi = 0x1.921fb54442d18p+1
+    val pi_half = 0x1.921fb54442d18p+0
+    if x > 0.0 { return atan_f64_impl(y / x) }
+    if x < 0.0 {
+        if y >= 0.0 { return atan_f64_impl(y / x) + pi }
+        return atan_f64_impl(y / x) - pi
+    }
+    if y > 0.0 { return pi_half }
+    if y < 0.0 { return 0.0 - pi_half }
+    0.0
+}
+fun atan2_f32_impl(y: f32, x: f32): f32 {
+    val pi: f32 = 0x1.921fb6p+1f32
+    val pi_half: f32 = 0x1.921fb6p+0f32
+    if x > 0.0 { return atan_f32_impl(y / x) }
+    if x < 0.0 {
+        if y >= 0.0 { return atan_f32_impl(y / x) + pi }
+        return atan_f32_impl(y / x) - pi
+    }
+    if y > 0.0 { return pi_half }
+    if y < 0.0 { return 0.0 - pi_half }
+    0.0
+}
+fun atan2_f16_impl(y: f16, x: f16): f16 {
+    val pi: f16 = 0x1.92p+1f16
+    val pi_half: f16 = 0x1.92p+0f16
+    if x > 0.0 { return atan_f16_impl(y / x) }
+    if x < 0.0 {
+        if y >= 0.0 { return atan_f16_impl(y / x) + pi }
+        return atan_f16_impl(y / x) - pi
+    }
+    if y > 0.0 { return pi_half }
+    if y < 0.0 { return 0.0 - pi_half }
+    0.0
+}
+fun atan2_f128_impl(y: f128, x: f128): f128 {
+    val pi = 0x1.921fb54442d18469898cc51701b8p+1f128
+    val pi_half = 0x1.921fb54442d18469898cc51701b8p+0f128
+    if x > 0.0 { return atan_f128_impl(y / x) }
+    if x < 0.0 {
+        if y >= 0.0 { return atan_f128_impl(y / x) + pi }
+        return atan_f128_impl(y / x) - pi
+    }
+    if y > 0.0 { return pi_half }
+    if y < 0.0 { return 0.0 - pi_half }
+    0.0
+}
+
+pub fun atan2<T>(y: T, x: T): T {
+    match type_name(x) {
+        "f64" => cast(atan2_f64_impl(cast(y).to(f64), cast(x).to(f64))).to(T),
+        "f32" => cast(atan2_f32_impl(cast(y).to(f32), cast(x).to(f32))).to(T),
+        "f16" => cast(atan2_f16_impl(cast(y).to(f16), cast(x).to(f16))).to(T),
+        "f128" => cast(atan2_f128_impl(cast(y).to(f128), cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── asinh（反双曲正弦，log(x + sqrt(x² + 1))）───
+
+fun asinh_f64_impl(x: f64): f64 {
+    log_f64_impl(x + sqrt_f64_impl(x * x + 1.0))
+}
+fun asinh_f32_impl(x: f32): f32 {
+    log_f32_impl(x + sqrt_f32_impl(x * x + 1.0))
+}
+fun asinh_f16_impl(x: f16): f16 {
+    log_f16_impl(x + sqrt_f16_impl(x * x + 1.0))
+}
+fun asinh_f128_impl(x: f128): f128 {
+    log_f128_impl(x + sqrt_f128_impl(x * x + 1.0))
+}
+
+pub fun asinh<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(asinh_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(asinh_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(asinh_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(asinh_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── acosh（反双曲余弦，log(x + sqrt(x² - 1))）───
+// x<1 返回 NaN
+
+fun acosh_f64_impl(x: f64): f64 {
+    if x < 1.0 { return 0.0 / 0.0 }
+    log_f64_impl(x + sqrt_f64_impl(x * x - 1.0))
+}
+fun acosh_f32_impl(x: f32): f32 {
+    if x < 1.0 { return 0.0 / 0.0 }
+    log_f32_impl(x + sqrt_f32_impl(x * x - 1.0))
+}
+fun acosh_f16_impl(x: f16): f16 {
+    if x < 1.0 { return 0.0 / 0.0 }
+    log_f16_impl(x + sqrt_f16_impl(x * x - 1.0))
+}
+fun acosh_f128_impl(x: f128): f128 {
+    if x < 1.0 { return 0.0 / 0.0 }
+    log_f128_impl(x + sqrt_f128_impl(x * x - 1.0))
+}
+
+pub fun acosh<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(acosh_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(acosh_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(acosh_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(acosh_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}
+
+// ─── atanh（反双曲正切，0.5 * log((1+x)/(1-x))）───
+// |x|>=1 返回 NaN
+
+fun atanh_f64_impl(x: f64): f64 {
+    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0 / 0.0 }
+    0.5 * log_f64_impl((1.0 + x) / (1.0 - x))
+}
+fun atanh_f32_impl(x: f32): f32 {
+    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0 / 0.0 }
+    0.5 * log_f32_impl((1.0 + x) / (1.0 - x))
+}
+fun atanh_f16_impl(x: f16): f16 {
+    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0 / 0.0 }
+    0.5 * log_f16_impl((1.0 + x) / (1.0 - x))
+}
+fun atanh_f128_impl(x: f128): f128 {
+    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0 / 0.0 }
+    0.5 * log_f128_impl((1.0 + x) / (1.0 - x))
+}
+
+pub fun atanh<T>(x: T): T {
+    match type_name(x) {
+        "f64" => cast(atanh_f64_impl(cast(x).to(f64))).to(T),
+        "f32" => cast(atanh_f32_impl(cast(x).to(f32))).to(T),
+        "f16" => cast(atanh_f16_impl(cast(x).to(f16))).to(T),
+        "f128" => cast(atanh_f128_impl(cast(x).to(f128))).to(T),
+        _ => x
+    }
+}

@@ -1,0 +1,373 @@
+// File.kz — FileHandle + OpenMode + Stat + SeekFrom + FileKind
+//
+// 设计文档 §4.2-§4.3：File 模块核心类型与 FileHandle 状态机
+// 所有 IO 操作为 async，返回 Async<Throw<T, IOError>>（Instant/SystemTime 同步除外）
+//
+// 类型采用 newtype 形式（type Name = Name(...)），以便 syscall 层通过
+// Value.makeRecordWithNames(type_name="Name", ...) 构造的值能在 Kuzo 端被识别。
+//
+// 底层 @extern("C") 原语（__file_open_raw / __file_close / __file_read_into 等）
+// 由 builtin/io/Raw.kz 声明。本文件定义 Kuzo wrapper 将 C 原始返回值转为 Throw。
+// async 函数体当前直接调用同步原语，等 IR/Engine 异步模型就绪后再补 spawn 语义。
+
+// ─── 顶层常量（POSIX flags） ───────────────────────────────────────
+
+pub val DEFAULT_BUF_SIZE: usize = 8192
+pub val DEFAULT_FILE_MODE: i32 = 0o644
+
+// OpenMode 语义位域（平台无关，由 syscall 层翻译为宿主 POSIX/Win32 标志）
+// 与 io.zig file_open 的位解析保持一致：bit0=read, bit1=write, bit2=create,
+// bit3=truncate, bit4=append
+pub val OPEN_READ: i32 = 1
+pub val OPEN_WRITE: i32 = 2
+pub val OPEN_CREATE: i32 = 4
+pub val OPEN_TRUNCATE: i32 = 8
+pub val OPEN_APPEND: i32 = 16
+
+// ─── 类型定义 ──────────────────────────────────────────────────────
+
+// OpenMode：文件打开模式（newtype record，可被顶层构造器函数构造）
+pub type OpenMode = OpenMode(read: bool, write: bool, create: bool, truncate: bool, append: bool)
+
+// SeekFrom：seek 起点位置（ADT，携带 i64 偏移）
+pub type SeekFrom =
+    | Set(i64)
+    | Current(i64)
+    | End(i64)
+
+// FileKind：文件种类（ADT 无字段变体）
+// syscall 层根据 stat.st_mode & S_IFMT 构造对应变体
+pub type FileKind =
+    | File
+    | Directory
+    | Symlink
+    | Other
+
+// Stat：文件元数据（newtype record，syscall 层用 type_name="Stat" 构造）
+pub type Stat = Stat(size: u64, mtime_ns: i64, ctime_ns: i64, kind: FileKind)
+
+// File：文件句柄（newtype record，公开导出）
+// fd 用 i64 跨平台存储（POSIX i32 扩展，Windows HANDLE 转整数）
+pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
+    // ─── 实例方法（self : File） ───────────────────────────
+
+    pub async fun close(self): Async<Throw<void, IOError>> {
+        if self.is_closed {
+            Ok(void)
+        } else {
+            self.is_closed = true
+            __file_close(self.fd)?
+            Ok(void)
+        }
+    }
+
+    // 从文件读取数据，返回读到的字节数组（空数组 = EOF）。
+    // 单次 read 语义（不循环阻塞，兼容管道/交互式 IO）。
+    // 不再接受 buf 参数就地填充：async fun 参数会被 orbit worker 深拷贝，
+    // 就地修改 buf 对调用方不可见。改为返回新分配的 u8[] 数组。
+    // 当前直接调用同步 C 原语，等 IR/Engine 异步模型就绪后改为 spawn + channel 模式。
+    pub async fun read(self, len: usize): Async<Throw<u8[], IOError>> {
+        if self.is_closed {
+            throw IOError(InvalidInput, "file closed", 0, self.path)
+        }
+        val buf: u8[] = [0u8] * len
+        val n = __file_read_into(self.fd, buf, len)
+        if n < 0 {
+            throw IOError(Other, "file read failed", 0, self.path)
+        }
+        Ok(buf[0..cast(n).to(usize)])
+    }
+
+    pub async fun write(self, buf: u8[], len: usize): Async<Throw<usize, IOError>> {
+        if self.is_closed {
+            throw IOError(InvalidInput, "file closed", 0, self.path)
+        }
+        val n = __file_write(self.fd, buf, len)
+        if n < 0 {
+            throw IOError(Other, "file write failed", 0, self.path)
+        }
+        Ok(cast(n).to(usize))
+    }
+
+    pub async fun seek(self, from: SeekFrom): Async<Throw<i64, IOError>> {
+        if self.is_closed {
+            throw IOError(InvalidInput, "file closed", 0, self.path)
+        }
+        val offset = match from {
+            Set(off) => off,
+            Current(off) => off,
+            End(off) => off,
+        }
+        val whence = match from {
+            Set(_) => 0,
+            Current(_) => 1,
+            End(_) => 2,
+        }
+        __file_seek(self.fd, offset, whence)?
+    }
+
+    // tell 用 seek(Current(0)) 组合实现（原 __file_tell syscall 已删除——可由 seek 推导）
+    // 保留为 std 方法以提供「获取当前位置」的语义抽象，避免用户手写 Current(0)
+    pub async fun tell(self): Async<Throw<i64, IOError>> {
+        val pos: SeekFrom = Current(0i64)
+        self.seek(pos).await()?
+    }
+
+    pub async fun stat(self): Async<Throw<Stat, IOError>> {
+        if self.is_closed {
+            throw IOError(InvalidInput, "file closed", 0, self.path)
+        }
+        __file_fstat(self.fd)?
+    }
+
+    // ─── 组合语义方法（基于 read/write 原语组合，纯 Kuzo 实现） ──────
+
+    // 精确读取 len 字节，返回 u8[]；EOF 不足时抛 UnexpectedEof
+    // 用 str 累积切片（amortized O(n)），避免 u8[] ++ 的 O(n²)
+    pub async fun read_exact(self, len: usize): Async<Throw<u8[], IOError>> {
+        if self.is_closed {
+            throw IOError(InvalidInput, "file closed", 0, self.path)
+        }
+        var result: str = ""
+        var total: usize = 0
+        while total < len {
+            val remaining = len - total
+            val chunk = self.read(remaining).await()?
+            if chunk.len() == 0 {
+                throw IOError(UnexpectedEof, "read_exact: unexpected EOF", 0, self.path)
+            }
+            result = result + cast(chunk).to(str)
+            total = total + chunk.len()
+        }
+        Ok(result.bytes())
+    }
+
+    // 写入全部字节；write 返回 0 时抛 BrokenPipe（避免死循环）
+    pub async fun write_all(self, buf: u8[], len: usize): Async<Throw<void, IOError>> {
+        if self.is_closed {
+            throw IOError(InvalidInput, "file closed", 0, self.path)
+        }
+        var written: usize = 0
+        while written < len {
+            val chunk = buf[written..len]
+            val n = self.write(chunk, chunk.len()).await()?
+            if n == 0 {
+                throw IOError(BrokenPipe, "write_all: write returned 0", 32, self.path)
+            }
+            written = written + n
+        }
+        Ok(void)
+    }
+
+    // 复制全部内容到 dst，返回已复制字节数
+    pub async fun copy_to(self, dst: File): Async<Throw<usize, IOError>> {
+        if self.is_closed {
+            throw IOError(InvalidInput, "source file closed", 0, self.path)
+        }
+        if dst.is_closed {
+            throw IOError(InvalidInput, "destination file closed", 0, dst.path)
+        }
+        var copied: usize = 0
+        loop {
+            val chunk = self.read(DEFAULT_BUF_SIZE).await()?
+            if chunk.len() == 0 {
+                return Ok(copied)
+            }
+            dst.write_all(chunk, chunk.len()).await()?
+            copied = copied + chunk.len()
+        }
+    }
+}
+
+// ─── OpenMode 顶层构造器 ───────────────────────────────────────────
+
+pub fun read_only(): OpenMode {
+    OpenMode(true, false, false, false, false)
+}
+
+pub fun write_only(): OpenMode {
+    OpenMode(false, true, false, false, false)
+}
+
+pub fun read_write(): OpenMode {
+    OpenMode(true, true, false, false, false)
+}
+
+pub fun create_rw(): OpenMode {
+    OpenMode(true, true, true, false, false)
+}
+
+pub fun append_mode(): OpenMode {
+    OpenMode(false, true, true, false, true)
+}
+
+// ─── flags 计算（OpenMode → POSIX flags） ─────────────────────────
+
+pub fun __compute_flags(mode: OpenMode): i32 {
+    var flags: i32 = 0
+    if mode.read { flags = flags | OPEN_READ }
+    if mode.write { flags = flags | OPEN_WRITE }
+    if mode.create { flags = flags | OPEN_CREATE }
+    if mode.truncate { flags = flags | OPEN_TRUNCATE }
+    if mode.append { flags = flags | OPEN_APPEND }
+    flags
+}
+
+// ─── Kuzo wrapper：@extern("C") 原始返回值 → Throw ──────────────
+
+// __file_open_raw(path: str, flags: i32, mode: i32): i64 → Throw<i64, IOError>
+// fd < 0 = 打开失败
+fun __file_open(path: str, flags: i32, mode: i32): Throw<i64, IOError> {
+    val fd = __file_open_raw(path, flags, mode)
+    if fd < 0 {
+        throw IOError(NotFound, "file open failed", 0, path)
+    }
+    Ok(fd)
+}
+
+// __file_close(fd: i64): i32 → Throw<void, IOError>
+fun __file_close(fd: i64): Throw<void, IOError> {
+    val rc = __file_close_raw(fd)
+    if rc < 0 {
+        throw IOError(Other, "file close failed", 0, null)
+    }
+    Ok(void)
+}
+
+// __file_seek(fd: i64, offset: i64, whence: i32): i64 → Throw<i64, IOError>
+fun __file_seek(fd: i64, offset: i64, whence: i32): Throw<i64, IOError> {
+    val pos = __file_seek_raw(fd, offset, whence)
+    if pos < 0 {
+        throw IOError(Other, "file seek failed", 0, null)
+    }
+    Ok(pos)
+}
+
+// __file_remove(path: str): i32 → Throw<void, IOError>
+fun __file_remove(path: str): Throw<void, IOError> {
+    val rc = __file_remove_raw(path)
+    if rc < 0 {
+        throw IOError(NotFound, "file remove failed", 0, path)
+    }
+    Ok(void)
+}
+
+// __file_rename(old: str, new: str): i32 → Throw<void, IOError>
+fun __file_rename(old: str, new: str): Throw<void, IOError> {
+    val rc = __file_rename_raw(old, new)
+    if rc < 0 {
+        throw IOError(Other, "file rename failed", 0, old)
+    }
+    Ok(void)
+}
+
+// __file_chmod(path: str, mode: i32): i32 → Throw<void, IOError>
+fun __file_chmod(path: str, mode: i32): Throw<void, IOError> {
+    val rc = __file_chmod_raw(path, mode)
+    if rc < 0 {
+        throw IOError(PermissionDenied, "file chmod failed", 0, path)
+    }
+    Ok(void)
+}
+
+// ─── stat 解析辅助：从 u8[] buffer 读取 LE 整数 ──────────────────
+
+// buf 布局（28 字节，native endian）：
+//   [0..8)  size     u64
+//   [8..16) mtime_ns i64
+//   [16..24) ctime_ns i64
+//   [24..28) kind     i32（0=file, 1=dir, 2=symlink, 3=other）
+
+fun __read_u64_le(buf: u8[], offset: usize): u64 {
+    u64(buf[offset])
+        | (u64(buf[offset + 1]) << 8u64)
+        | (u64(buf[offset + 2]) << 16u64)
+        | (u64(buf[offset + 3]) << 24u64)
+        | (u64(buf[offset + 4]) << 32u64)
+        | (u64(buf[offset + 5]) << 40u64)
+        | (u64(buf[offset + 6]) << 48u64)
+        | (u64(buf[offset + 7]) << 56u64)
+}
+
+fun __read_i64_le(buf: u8[], offset: usize): i64 {
+    cast(__read_u64_le(buf, offset)).to(i64)
+}
+
+fun __read_i32_le(buf: u8[], offset: usize): i32 {
+    cast(u32(buf[offset])
+        | (u32(buf[offset + 1]) << 8u32)
+        | (u32(buf[offset + 2]) << 16u32)
+        | (u32(buf[offset + 3]) << 24u32)).to(i32)
+}
+
+fun __kind_from_int(kind_int: i32): FileKind {
+    match kind_int {
+        0 => File,
+        1 => Directory,
+        2 => Symlink,
+        _ => Other,
+    }
+}
+
+// __file_stat(path: str): Throw<Stat, IOError>
+// 通过 @extern("C") __file_stat_into 填充 28 字节 buffer，然后解析
+fun __file_stat(path: str): Throw<Stat, IOError> {
+    val buf: u8[] = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8]
+    val rc = __file_stat_into(path, buf)
+    if rc < 0 {
+        throw IOError(NotFound, "file stat failed", 0, path)
+    }
+    val size = __read_u64_le(buf, 0)
+    val mtime = __read_i64_le(buf, 8)
+    val ctime = __read_i64_le(buf, 16)
+    val kind = __kind_from_int(__read_i32_le(buf, 24))
+    Ok(Stat(size, mtime, ctime, kind))
+}
+
+// __file_fstat(fd: i64): Throw<Stat, IOError>
+fun __file_fstat(fd: i64): Throw<Stat, IOError> {
+    val buf: u8[] = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8]
+    val rc = __file_fstat_into(fd, buf)
+    if rc < 0 {
+        throw IOError(Other, "file fstat failed", 0, null)
+    }
+    val size = __read_u64_le(buf, 0)
+    val mtime = __read_i64_le(buf, 8)
+    val ctime = __read_i64_le(buf, 16)
+    val kind = __kind_from_int(__read_i32_le(buf, 24))
+    Ok(Stat(size, mtime, ctime, kind))
+}
+
+// ─── 顶层 async 函数（"静态方法"语义） ───────────────────────────
+
+// async 函数体内通过 ? 传播 Throw 错误，成功则返回 T（自动包装为 Async<Throw<T, E>>）
+// 见设计文档 §4.3
+
+pub async fun open(path: str, mode: OpenMode): Async<Throw<File, IOError>> {
+    val flags = __compute_flags(mode)
+    val fd = __file_open(path, flags, DEFAULT_FILE_MODE)?
+    Ok(File(fd, path, mode, false))
+}
+
+// stat_of 保留为 path-based syscall（原 __file_stat 保留）
+// 原因：Dir.cwd().statFile(path) 与 open()+fstat(fd) 不是等价能力——
+// path-based stat 不打开文件，对目录/权限受限文件/符号链接语义不同，
+// 是独立的宿主能力，不能由 open+fstat+close 组合推导。
+pub async fun stat_of(path: str): Async<Throw<Stat, IOError>> {
+    Ok(__file_stat(path)?)
+}
+
+pub async fun remove(path: str): Async<Throw<void, IOError>> {
+    __file_remove(path)?
+    Ok(void)
+}
+
+pub async fun rename(old: str, new: str): Async<Throw<void, IOError>> {
+    __file_rename(old, new)?
+    Ok(void)
+}
+
+pub async fun chmod(path: str, mode: i32): Async<Throw<void, IOError>> {
+    __file_chmod(path, mode)?
+    Ok(void)
+}
