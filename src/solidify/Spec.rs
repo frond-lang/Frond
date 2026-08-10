@@ -166,6 +166,7 @@ pub enum SectionKind {
     FfiCallNames = 30,
     FieldSetNames = 31,
     PatternCtorNames = 32,
+    PatternTypeNames = 34,
     CastTargetTypes = 33,
     // per-Node fixed-width composite tables (category D)
     ClosureInfos = 40,

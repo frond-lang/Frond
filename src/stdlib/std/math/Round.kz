@@ -178,19 +178,19 @@ fun fmod_f64_impl(x: f64, y: f64): f64 {
     x - truncated * y
 }
 fun fmod_f32_impl(x: f32, y: f32): f32 {
-    if y == 0.0 { return 0.0 / 0.0 }
+    if y == 0.0 { return 0.0f32 / 0.0f32 }
     val quotient = x / y
     val truncated = trunc_f32_impl(quotient)
     x - truncated * y
 }
 fun fmod_f16_impl(x: f16, y: f16): f16 {
-    if y == 0.0 { return 0.0 / 0.0 }
+    if y == 0.0 { return 0.0f16 / 0.0f16 }
     val quotient = x / y
     val truncated = trunc_f16_impl(quotient)
     x - truncated * y
 }
 fun fmod_f128_impl(x: f128, y: f128): f128 {
-    if y == 0.0 { return 0.0 / 0.0 }
+    if y == 0.0 { return 0.0f128 / 0.0f128 }
     val quotient = x / y
     val truncated = trunc_f128_impl(quotient)
     x - truncated * y

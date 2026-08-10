@@ -222,6 +222,152 @@ fn type_contains_any_unresolved(
     }
 }
 
+// =========================================================================
+// Usefulness algorithm (Maranget) — pattern matrix exhaustiveness checking
+// =========================================================================
+
+/// Constructor identifier used by the usefulness algorithm.
+#[derive(Clone, PartialEq)]
+enum PatCtor {
+    Adt(Box<str>),
+    Bool(bool),
+    Int(Box<str>),
+    Float(Box<str>),
+    Char(u32),
+    Str(Box<str>),
+    Null,
+}
+
+/// Normalized pattern (arena-independent) for the usefulness algorithm.
+/// Or-patterns are expanded into multiple alternatives during normalization.
+#[derive(Clone)]
+enum NormPat {
+    Wild,
+    Ctor(PatCtor, Vec<NormPat>),
+}
+
+/// Unwrap an inline `Pattern::Guard` to retrieve the inner pattern.
+fn unwrap_guard_pat(ast: &AstArena<'_>, pat: PatternRef) -> PatternRef {
+    match &ast.pattern(pat).node {
+        Pattern::Guard { pattern, .. } => *pattern,
+        _ => pat,
+    }
+}
+
+/// Normalize an AST pattern into one or more `NormPat` alternatives.
+/// Or-patterns expand to multiple alternatives; sub-pattern or-patterns produce
+/// the cartesian product of alternatives.
+fn normalize_pattern(ast: &AstArena<'_>, pat: PatternRef) -> Vec<NormPat> {
+    match &ast.pattern(pat).node {
+        Pattern::Wildcard => vec![NormPat::Wild],
+        Pattern::Variable { name } => {
+            if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                vec![NormPat::Ctor(PatCtor::Adt(name.to_string().into_boxed_str()), Vec::new())]
+            } else {
+                vec![NormPat::Wild]
+            }
+        }
+        Pattern::Constructor { name, patterns } => {
+            let ctor = PatCtor::Adt(name.to_string().into_boxed_str());
+            // Cartesian product of sub-pattern alternatives.
+            let mut alternatives: Vec<Vec<NormPat>> = vec![Vec::new()];
+            for &sub_pat in patterns.iter() {
+                let sub_alts = normalize_pattern(ast, sub_pat);
+                let mut next = Vec::new();
+                for existing in &alternatives {
+                    for sub_alt in &sub_alts {
+                        let mut combined = existing.clone();
+                        combined.push(sub_alt.clone());
+                        next.push(combined);
+                    }
+                }
+                alternatives = next;
+            }
+            alternatives.into_iter()
+                .map(|subs| NormPat::Ctor(ctor.clone(), subs))
+                .collect()
+        }
+        Pattern::Literal(lit) => {
+            let c = match lit {
+                PatternLiteral::Bool(b) => PatCtor::Bool(*b),
+                PatternLiteral::Int(s) => PatCtor::Int(s.to_string().into_boxed_str()),
+                PatternLiteral::Float(s) => PatCtor::Float(s.to_string().into_boxed_str()),
+                PatternLiteral::Char(c) => PatCtor::Char(*c),
+                PatternLiteral::String(s) => PatCtor::Str(s.to_string().into_boxed_str()),
+                PatternLiteral::Null => PatCtor::Null,
+            };
+            vec![NormPat::Ctor(c, Vec::new())]
+        }
+        // Record patterns always match the single record constructor; treat as catch-all
+        // (field sub-pattern exhaustiveness is not tracked — conservative but safe).
+        Pattern::Record { .. } => vec![NormPat::Wild],
+        Pattern::OrPattern { left, right } => {
+            let mut result = normalize_pattern(ast, *left);
+            result.extend(normalize_pattern(ast, *right));
+            result
+        }
+        Pattern::Guard { pattern, .. } => normalize_pattern(ast, *pattern),
+    }
+}
+
+/// Specialize a pattern matrix with respect to a constructor `target` of arity `arity`.
+///
+/// For each row: wildcard → expand to `arity` wildcards + remaining columns;
+/// matching constructor → extract subpatterns (padded/truncated to `arity`) + remaining;
+/// non-matching constructor → drop the row.
+fn specialize_matrix(
+    matrix: &[Vec<NormPat>],
+    col_types: &[TypeHandle],
+    target: &PatCtor,
+    arity: usize,
+    field_types: &[TypeHandle],
+) -> (Vec<Vec<NormPat>>, Vec<TypeHandle>) {
+    let mut new_matrix = Vec::new();
+    for row in matrix {
+        if row.is_empty() {
+            continue;
+        }
+        match &row[0] {
+            NormPat::Wild => {
+                let mut new_row = vec![NormPat::Wild; arity];
+                new_row.extend(row[1..].iter().cloned());
+                new_matrix.push(new_row);
+            }
+            NormPat::Ctor(c, sub) if c == target => {
+                let mut new_row = sub.clone();
+                if new_row.len() > arity {
+                    new_row.truncate(arity);
+                }
+                while new_row.len() < arity {
+                    new_row.push(NormPat::Wild);
+                }
+                new_row.extend(row[1..].iter().cloned());
+                new_matrix.push(new_row);
+            }
+            _ => {} // different constructor: drop row
+        }
+    }
+    let mut new_col_types = field_types.to_vec();
+    new_col_types.extend(col_types[1..].iter().copied());
+    (new_matrix, new_col_types)
+}
+
+/// Default matrix: keep only wildcard rows, dropping the first column.
+fn default_matrix(
+    matrix: &[Vec<NormPat>],
+    col_types: &[TypeHandle],
+) -> (Vec<Vec<NormPat>>, Vec<TypeHandle>) {
+    let mut new_matrix = Vec::new();
+    for row in matrix {
+        if row.is_empty() {
+            new_matrix.push(Vec::new());
+        } else if matches!(row[0], NormPat::Wild) {
+            new_matrix.push(row[1..].to_vec());
+        }
+    }
+    (new_matrix, col_types[1..].to_vec())
+}
+
 impl<'a> InferContext<'a> {
     pub fn new(arena: &'a mut TypeArena, sema_result: &'a mut SemaResult) -> Self {
         InferContext {
@@ -690,7 +836,7 @@ impl<'a> InferContext<'a> {
 
         // Clone the constructor info first, to avoid the &CtorDefInfo borrow blocking later &mut self calls.
         let ctor_info: Option<CtorInfoSnapshot> =
-            self.find_ctor_def(ctor_name).map(|c| {
+            self.find_ctor_def(ctor_name, expected_ty).map(|c| {
                 (
                     c.type_name.clone(),
                     c.is_newtype,
@@ -754,8 +900,365 @@ impl<'a> InferContext<'a> {
     }
 
     /// Looks up a constructor definition by name from sema_result.
-    fn find_ctor_def(&self, ctor_name: &str) -> Option<&CtorDefInfo> {
-        self.sema_result.get_ctor_def(ctor_name)
+    /// When multiple types define the same constructor name, uses `expected_ty`
+    /// to disambiguate (type-oriented pattern constructor resolution).
+    fn find_ctor_def(&self, ctor_name: &str, expected_ty: TypeHandle) -> Option<&CtorDefInfo> {
+        let candidates = self.sema_result.get_ctor_defs(ctor_name);
+        if candidates.len() <= 1 {
+            return candidates.into_iter().next();
+        }
+        // 类型导向消歧：根据 expected_ty 的 Adt type_name 选择
+        let exp_resolved = self.arena.resolve(expected_ty);
+        if let Ty::Adt(_) = self.arena.get(exp_resolved) {
+            let (exp_type_name, _) = self.arena.adt_parts(exp_resolved);
+            let matches: Vec<_> = candidates.iter()
+                .filter(|c| c.type_name.as_ref() == exp_type_name)
+                .collect();
+            if matches.len() == 1 {
+                return Some(matches[0]);
+            }
+        }
+        // 回退到第一个候选（保持向后兼容）
+        candidates.into_iter().next()
+    }
+
+    // ── Usefulness algorithm (Maranget) for match exhaustiveness checking ──
+
+    /// Convert a `TypeRepr` to a `TypeHandle`, substituting type parameters with
+    /// the actual type arguments from the scrutinee type (for generic ADTs).
+    fn ctor_field_type(
+        &mut self,
+        repr: &TypeRepr,
+        params: &[Box<str>],
+        args: &[TypeHandle],
+    ) -> TypeHandle {
+        if let TypeRepr::Named(name) = repr {
+            if let Some(idx) = params.iter().position(|p| p.as_ref() == name.as_ref()) {
+                if idx < args.len() {
+                    return args[idx];
+                }
+            }
+        }
+        self.type_repr_to_handle(repr)
+    }
+
+    /// Get the arity and field types of a constructor, given the column type
+    /// (used to disambiguate same-named constructors across types and to substitute
+    /// generic type parameters).
+    fn ctor_arity_and_fields(
+        &mut self,
+        col_type: TypeHandle,
+        ctor: &PatCtor,
+    ) -> (usize, Vec<TypeHandle>) {
+        // Throw<T, E> builtin: Ok has arity 1 (field = value_type),
+        // Error (or any registered error-variant constructor) has arity 1
+        // (field = error_type). These constructors are NOT registered as
+        // CtorDefInfo (see refine_constructor_pattern), so they need explicit
+        // handling to avoid arity-0 fallback that loses sub-pattern information.
+        if let PatCtor::Adt(name) = ctor {
+            let resolved = self.arena.resolve(col_type);
+            if let Ty::Throw(_) = self.arena.get(resolved) {
+                let (value_type, error_type) = self.arena.throw_parts(resolved);
+                let field_ty = if name.as_ref() == "Ok" { value_type } else { error_type };
+                return (1, vec![field_ty]);
+            }
+        }
+
+        // Phase 1: collect data via immutable borrows (all cloned to release borrows).
+        let collected: Option<(Box<[TypeRepr]>, Box<[Box<str>]>, Vec<TypeHandle>)> = match ctor {
+            PatCtor::Adt(name) => {
+                let resolved = self.arena.resolve(col_type);
+                match self.arena.get(resolved) {
+                    Ty::Adt(_) => {
+                        let (type_name, type_args) = self.arena.adt_parts(resolved);
+                        self.sema_result.get_type_def(type_name).and_then(|td| {
+                            td.constructors.iter()
+                                .find(|c| c.name.as_ref() == name.as_ref())
+                                .map(|c| {
+                                    (c.field_type_reprs.clone(), td.type_params.clone(), type_args.to_vec())
+                                })
+                        })
+                    }
+                    _ => self.sema_result.get_ctor_def(name).map(|c| {
+                        (c.field_type_reprs.clone(), Box::new([]) as Box<[Box<str>]>, Vec::new())
+                    }),
+                }
+            }
+            _ => None,
+        };
+
+        // Phase 2: convert field type reprs to handles (mutable borrow).
+        match collected {
+            Some((reprs, params, args)) => {
+                let field_types: Vec<TypeHandle> = reprs.iter()
+                    .map(|r| self.ctor_field_type(r, &params, &args))
+                    .collect();
+                (field_types.len(), field_types)
+            }
+            None => (0, Vec::new()),
+        }
+    }
+
+    /// Return all constructors of a type if it has a finite (complete) signature.
+    /// Returns `None` for types with infinite value spaces (int, float, char, str,
+    /// nullable, etc.).
+    fn type_all_ctors(&self, col_type: TypeHandle) -> Option<Vec<PatCtor>> {
+        let resolved = self.arena.resolve(col_type);
+        match self.arena.get(resolved) {
+            Ty::Adt(_) => {
+                let (type_name, _) = self.arena.adt_parts(resolved);
+                let type_def = self.sema_result.get_type_def(type_name)?;
+                if type_def.constructors.is_empty() {
+                    return None;
+                }
+                Some(type_def.constructors.iter()
+                    .map(|c| PatCtor::Adt(c.name.clone()))
+                    .collect())
+            }
+            Ty::Bool => Some(vec![PatCtor::Bool(true), PatCtor::Bool(false)]),
+            _ => None,
+        }
+    }
+
+    /// Core usefulness check: is `query` useful w.r.t. `matrix`?
+    /// Implements Maranget's algorithm U(M, q).
+    fn is_useful(
+        &mut self,
+        matrix: &[Vec<NormPat>],
+        col_types: &[TypeHandle],
+        query: &[NormPat],
+        depth: usize,
+    ) -> bool {
+        // Base case: no columns → useful iff the matrix has no rows.
+        if query.is_empty() {
+            return matrix.is_empty();
+        }
+        if col_types.is_empty() {
+            return false; // defensive: no type info
+        }
+        // Safety valve: prevent exponential blowup on pathological nesting.
+        if depth > 48 {
+            return false;
+        }
+
+        let col_type = col_types[0];
+        match &query[0] {
+            NormPat::Wild => {
+                // Collect distinct constructors appearing in the first column.
+                let mut seen: Vec<PatCtor> = Vec::new();
+                for row in matrix {
+                    if !row.is_empty() {
+                        if let NormPat::Ctor(c, _) = &row[0] {
+                            if !seen.contains(c) {
+                                seen.push(c.clone());
+                            }
+                        }
+                    }
+                }
+
+                if seen.is_empty() {
+                    // No constructors in column → check default matrix.
+                    let (dm, dt) = default_matrix(matrix, col_types);
+                    return self.is_useful(&dm, &dt, &query[1..], depth + 1);
+                }
+
+                // Try each seen constructor: if any makes the query useful, done.
+                for ctor in &seen {
+                    let (arity, field_types) = self.ctor_arity_and_fields(col_type, ctor);
+                    let (sm, st) = specialize_matrix(matrix, col_types, ctor, arity, &field_types);
+                    let mut sq = vec![NormPat::Wild; arity];
+                    sq.extend(query[1..].iter().cloned());
+                    if self.is_useful(&sm, &st, &sq, depth + 1) {
+                        return true;
+                    }
+                }
+
+                // All seen constructors failed; check if the signature is complete.
+                let is_complete = self.type_all_ctors(col_type)
+                    .map(|all| all.iter().all(|c| seen.contains(c)))
+                    .unwrap_or(false);
+                if is_complete {
+                    return false;
+                }
+                // Incomplete signature → wildcard is useful via the default matrix.
+                let (dm, dt) = default_matrix(matrix, col_types);
+                self.is_useful(&dm, &dt, &query[1..], depth + 1)
+            }
+            NormPat::Ctor(target, sub) => {
+                let (arity, field_types) = self.ctor_arity_and_fields(col_type, target);
+                let (sm, st) = specialize_matrix(matrix, col_types, target, arity, &field_types);
+                let mut sq = sub.clone();
+                if sq.len() > arity {
+                    sq.truncate(arity);
+                }
+                while sq.len() < arity {
+                    sq.push(NormPat::Wild);
+                }
+                sq.extend(query[1..].iter().cloned());
+                self.is_useful(&sm, &st, &sq, depth + 1)
+            }
+        }
+    }
+
+    /// Generate a human-readable witness for a non-exhaustive match (what's missing).
+    fn witness(
+        &mut self,
+        matrix: &[Vec<NormPat>],
+        col_types: &[TypeHandle],
+        depth: usize,
+    ) -> String {
+        if col_types.is_empty() || depth > 8 {
+            return String::new();
+        }
+        let col_type = col_types[0];
+        let resolved = self.arena.resolve(col_type);
+        let ty = self.arena.get(resolved);
+
+        let seen: Vec<PatCtor> = matrix.iter()
+            .filter_map(|r| {
+                if !r.is_empty() {
+                    if let NormPat::Ctor(c, _) = &r[0] { Some(c.clone()) } else { None }
+                } else { None }
+            })
+            .collect();
+        let has_wild = matrix.iter().any(|r| !r.is_empty() && matches!(r[0], NormPat::Wild));
+
+        match ty {
+            Ty::Adt(_) => {
+                let (type_name, _) = self.arena.adt_parts(resolved);
+                // Collect constructor names (cloned to release the borrow).
+                let ctor_names: Vec<Box<str>> = self.sema_result.get_type_def(type_name)
+                    .map(|td| td.constructors.iter().map(|c| c.name.clone()).collect())
+                    .unwrap_or_default();
+
+                // Check for missing top-level constructors.
+                let missing: Vec<&str> = ctor_names.iter()
+                    .map(|n| n.as_ref())
+                    .filter(|n| !seen.iter().any(|c| matches!(c, PatCtor::Adt(a) if a.as_ref() == *n)))
+                    .collect();
+                if !missing.is_empty() {
+                    return format!(": missing {}", missing.join(", "));
+                }
+
+                // All top-level constructors present but nested issue; recurse.
+                for name in &ctor_names {
+                    let pc = PatCtor::Adt(name.clone());
+                    if seen.contains(&pc) {
+                        let (arity, ft) = self.ctor_arity_and_fields(col_type, &pc);
+                        let (sm, st) = specialize_matrix(matrix, col_types, &pc, arity, &ft);
+                        let q = vec![NormPat::Wild; arity];
+                        if self.is_useful(&sm, &st, &q, 0) {
+                            return format!(": `{}` not exhaustive{}", name,
+                                self.witness(&sm, &st, depth + 1));
+                        }
+                    }
+                }
+                String::new()
+            }
+            Ty::Bool => {
+                if !seen.iter().any(|c| matches!(c, PatCtor::Bool(true))) {
+                    ": missing `true`".to_string()
+                } else if !seen.iter().any(|c| matches!(c, PatCtor::Bool(false))) {
+                    ": missing `false`".to_string()
+                } else {
+                    String::new()
+                }
+            }
+            _ => {
+                if !has_wild {
+                    ": missing catch-all `_`".to_string()
+                } else {
+                    String::new()
+                }
+            }
+        }
+    }
+
+    /// Check match exhaustiveness using the usefulness algorithm (Maranget).
+    ///
+    /// Reports a non-exhaustive error if any value of the scrutinee type is not
+    /// covered by the (unguarded) match arms. Also warns on unreachable arms.
+    fn check_match_exhaustive(
+        &mut self,
+        ast: &AstArena<'_>,
+        scrutinee: crate::ast::Ast::ExprId,
+        scrutinee_ty: TypeHandle,
+        arms: &[crate::ast::Ast::MatchArm],
+    ) {
+        let col_types = vec![scrutinee_ty];
+
+        // An arm is "guarded" if it has an arm-level guard OR an inline Pattern::Guard.
+        // Guarded arms do not guarantee coverage (the guard may fail) and do not make
+        // subsequent arms unreachable.
+        let is_arm_guarded = |arm: &crate::ast::Ast::MatchArm| -> bool {
+            arm.guard.is_some() || matches!(ast.pattern(arm.pattern).node, Pattern::Guard { .. })
+        };
+
+        // ── Exhaustiveness check ──
+        // Build matrix from unguarded arms only (guarded arms don't guarantee coverage).
+        let exhaust_matrix: Vec<Vec<NormPat>> = arms.iter()
+            .filter(|arm| !is_arm_guarded(arm))
+            .flat_map(|arm| {
+                let pat = unwrap_guard_pat(ast, arm.pattern);
+                normalize_pattern(ast, pat).into_iter().map(|p| vec![p])
+            })
+            .collect();
+
+        // Only report non-exhaustive for types with finite constructor sets (ADT, Bool).
+        // For infinite types (int, str, char, ...), preserve existing lenient behavior.
+        let resolved = self.arena.resolve(scrutinee_ty);
+        let is_finite = matches!(self.arena.get(resolved), Ty::Adt(_) | Ty::Bool);
+
+        if is_finite && self.is_useful(&exhaust_matrix, &col_types, &[NormPat::Wild], 0) {
+            let span = ast.expr(scrutinee).span;
+            let witness = self.witness(&exhaust_matrix, &col_types, 0);
+            self.add_error_at(
+                &format!("non-exhaustive match{}", witness),
+                span.line,
+                span.column,
+            );
+        }
+
+        // ── Unreachable arm detection ──
+        // Arm i is unreachable iff its pattern is not useful given the matrix of
+        // previous *unguarded* arms (guarded arms don't block subsequent arms).
+        let mut prev_matrix: Vec<Vec<NormPat>> = Vec::new();
+        for arm in arms.iter() {
+            let pat = unwrap_guard_pat(ast, arm.pattern);
+            let alternatives = normalize_pattern(ast, pat);
+
+            let any_useful = alternatives.iter()
+                .any(|alt| self.is_useful(&prev_matrix, &col_types, &[alt.clone()], 0));
+
+            if !any_useful && !alternatives.is_empty() {
+                let span = ast.pattern(arm.pattern).span;
+                self.add_warning_at("unreachable match arm", span.line, span.column);
+            }
+
+            // Add this arm's patterns to the previous matrix (only if unguarded).
+            if !is_arm_guarded(arm) {
+                for alt in alternatives {
+                    prev_matrix.push(vec![alt]);
+                }
+            }
+        }
+    }
+
+    /// Check if `Type.Ctor` is a qualified constructor access.
+    /// Returns `Some((type_name, field_type_reprs))` when `type_name` is a
+    /// registered type and `ctor_name` is one of its constructors.
+    fn check_qualified_ctor(
+        &self,
+        type_name: &str,
+        ctor_name: &str,
+    ) -> Option<(Box<str>, Box<[TypeRepr]>)> {
+        let &type_idx = self.sema_result.type_def_index.get(type_name)?;
+        let type_def = &self.sema_result.type_defs[type_idx as usize];
+        let ctor = type_def
+            .constructors
+            .iter()
+            .find(|c| c.name.as_ref() == ctor_name)?;
+        Some((ctor.type_name.clone(), ctor.field_type_reprs.clone()))
     }
 }
 
@@ -1189,16 +1692,9 @@ impl<'a> InferContext<'a> {
             return self.try_widen_unify(r1, inner);
         }
 
-        // Try widening between numeric types.
-        if c1.is_numeric() && c2.is_numeric() {
-            if can_coerce_numeric(self.arena, r1, r2) {
-                return Ok(r1);
-            }
-            if can_coerce_numeric(self.arena, r2, r1) {
-                return Ok(r2);
-            }
-            return Err(UnifyError::TypeMismatch);
-        }
+        // Bug #60 (方案 A 全严): 移除 numeric widening — 不同 numeric 类型之间
+        // 不再隐式提升，必须显式 cast。strict unify 已在上面尝试过并失败，
+        // numeric 类型对会 fall through 到 match 的 _ 分支返回 TypeMismatch。
 
         match (c1, c2) {
             (Ty::Nullable(_), _) => match c2 {
@@ -1207,16 +1703,7 @@ impl<'a> InferContext<'a> {
                     let i2 = self.arena.resolve(self.arena.nullable_inner(r2));
                     match self.arena.unify(i1, i2) {
                         Ok(_) => Ok(r1),
-                        Err(_) => {
-                            if self.arena.get(i1).is_numeric()
-                                && self.arena.get(i2).is_numeric()
-                                && can_coerce_numeric(self.arena, i1, i2)
-                            {
-                                Ok(r1)
-                            } else {
-                                Err(UnifyError::TypeMismatch)
-                            }
-                        }
+                        Err(_) => Err(UnifyError::TypeMismatch),
                     }
                 }
                 Ty::Void => Ok(r1), // void can be treated as the "empty" value of a nullable.
@@ -1225,18 +1712,7 @@ impl<'a> InferContext<'a> {
                     let inner1_ty = self.arena.nullable_inner(r1);
                     match self.arena.unify(inner1_ty, r2) {
                         Ok(_) => Ok(r1),
-                        Err(_) => {
-                            let i1 = self.arena.resolve(inner1_ty);
-                            let r2r = self.arena.resolve(r2);
-                            if self.arena.get(i1).is_numeric()
-                                && self.arena.get(r2r).is_numeric()
-                                && can_coerce_numeric(self.arena, i1, r2r)
-                            {
-                                Ok(r1)
-                            } else {
-                                Err(UnifyError::TypeMismatch)
-                            }
-                        }
+                        Err(_) => Err(UnifyError::TypeMismatch),
                     }
                 }
             },
@@ -1252,18 +1728,11 @@ impl<'a> InferContext<'a> {
                     match self.arena.unify(v1, v2) {
                         Ok(_) => Ok(r1),
                         Err(_) => {
+                            // 递归 try_widen_unify 处理 Nullable/Throw 等结构兼容，
+                            // 但不再做 numeric widening（方案 A 全严）。
                             match self.try_widen_unify(v1, v2) {
                                 Ok(_) => Ok(r1),
-                                Err(_) => {
-                                    if self.arena.get(v1).is_numeric()
-                                        && self.arena.get(v2).is_numeric()
-                                        && can_coerce_numeric(self.arena, v1, v2)
-                                    {
-                                        Ok(r1)
-                                    } else {
-                                        Err(UnifyError::TypeMismatch)
-                                    }
-                                }
+                                Err(_) => Err(UnifyError::TypeMismatch),
                             }
                         }
                     }
@@ -1274,18 +1743,7 @@ impl<'a> InferContext<'a> {
                     let (vt1_ty, _) = self.arena.throw_parts(r1);
                     match self.arena.unify(vt1_ty, r2) {
                         Ok(_) => Ok(r1),
-                        Err(_) => {
-                            let v1 = self.arena.resolve(vt1_ty);
-                            let r2r = self.arena.resolve(r2);
-                            if self.arena.get(v1).is_numeric()
-                                && self.arena.get(r2r).is_numeric()
-                                && can_coerce_numeric(self.arena, v1, r2r)
-                            {
-                                Ok(r1)
-                            } else {
-                                Err(UnifyError::TypeMismatch)
-                            }
-                        }
+                        Err(_) => Err(UnifyError::TypeMismatch),
                     }
                 }
             },
@@ -1848,7 +2306,92 @@ impl<'a> InferContext<'a> {
                     }
                 }
 
-                let callee_ty = self.infer_expr(*callee, ast, env, None);
+                // ── 构造器多映射消歧 ──
+                // 当 callee 是 Ident 且对应多个同名构造器时，按优先级消歧：
+                //   1. 类型导向：expected_ty 是 Adt 时，按 type_name 选择
+                //   2. 参数个数：当类型导向失败（expected 是 TypeVar 或未提供）时，
+                //      按参数个数选择唯一匹配的构造器
+                let callee_ty = if let Expr::Ident(name) = &ast.expr(*callee).node {
+                    let ctors = self.sema_result.get_ctor_defs(name);
+                    if ctors.len() > 1 {
+                        let selected: Option<(Box<str>, Box<[TypeRepr]>)> = {
+                            let mut found: Option<&CtorDefInfo> = None;
+                            // 1. 类型导向消歧
+                            if let Some(exp) = expected {
+                                let exp_resolved = self.arena.resolve(exp);
+                                if let Ty::Adt(_) = self.arena.get(exp_resolved) {
+                                    let (exp_type_name, _) = self.arena.adt_parts(exp_resolved);
+                                    let matches: Vec<_> = ctors.iter()
+                                        .filter(|c| c.type_name.as_ref() == exp_type_name)
+                                        .collect();
+                                    if matches.len() == 1 {
+                                        found = Some(matches[0]);
+                                    }
+                                }
+                            }
+                            // 2. 参数个数消歧（类型导向失败时的 fallback）
+                            if found.is_none() {
+                                let arity_matches: Vec<_> = ctors.iter()
+                                    .filter(|c| c.field_type_reprs.len() == args.len())
+                                    .collect();
+                                if arity_matches.len() == 1 {
+                                    found = Some(arity_matches[0]);
+                                }
+                            }
+                            found.map(|c| (c.type_name.clone(), c.field_type_reprs.clone()))
+                        };
+                        match selected {
+                            Some((type_name, field_type_reprs)) => {
+                                let param_types: Vec<TypeHandle> = field_type_reprs
+                                    .iter()
+                                    .map(|r| self.type_repr_to_handle(r))
+                                    .collect();
+                                let ret_ty = self.arena.make_adt(type_name, Box::new([]));
+                                if param_types.is_empty() {
+                                    ret_ty
+                                } else {
+                                    self.arena.make_fn(param_types.into_boxed_slice(), ret_ty)
+                                }
+                            }
+                            None => {
+                                let span = ast.expr(expr).span;
+                                let type_names: Vec<&str> = ctors.iter()
+                                    .map(|c| c.type_name.as_ref())
+                                    .collect();
+                                self.add_error_at(
+                                    &format!(
+                                        "ambiguous constructor '{}': defined by types [{}]; use Type.{} to disambiguate or provide a type context",
+                                        name,
+                                        type_names.join(", "),
+                                        name,
+                                    ),
+                                    span.line,
+                                    span.column,
+                                );
+                                self.arena.fresh_type_var()
+                            }
+                        }
+                    } else if ctors.len() == 1
+                        && args.is_empty()
+                        && ctors[0].field_type_reprs.is_empty()
+                    {
+                        // Bug #69: Zero-arg constructor called with `()` syntax.
+                        // Zero-arg constructors are registered as values (ADT type), not
+                        // function types, so `Unit()` is equivalent to the bare value `Unit`.
+                        let ret_ty = self.arena.make_adt(
+                            ctors[0].type_name.clone(),
+                            Box::new([]),
+                        );
+                        if let Some(exp) = expected {
+                            self.unify_or_constrain(ret_ty, exp);
+                        }
+                        ret_ty
+                    } else {
+                        self.infer_expr(*callee, ast, env, None)
+                    }
+                } else {
+                    self.infer_expr(*callee, ast, env, None)
+                };
                 let resolved_callee = self.arena.resolve(callee_ty);
 
                 // Instantiation mode: skip HM unify (types were already checked in the sema HM stage);
@@ -1963,6 +2506,55 @@ impl<'a> InferContext<'a> {
             // ── Method calls ──
             Expr::MethodCall { recv, method, args, .. }
             | Expr::SafeMethodCall { recv, method, args, .. } => {
+                // 限定名语法：Type.Ctor(args)（有参数构造器限定名调用）
+                if let Expr::Ident(type_name) = &ast.expr(*recv).node {
+                    if let Some((ctor_type_name, field_type_reprs)) =
+                        self.check_qualified_ctor(type_name, method)
+                    {
+                        if !field_type_reprs.is_empty() {
+                            // 有参数构造器：构建函数类型并走调用推断
+                            let param_types: Vec<TypeHandle> = field_type_reprs
+                                .iter()
+                                .map(|r| self.type_repr_to_handle(r))
+                                .collect();
+                            let ret_ty = self.arena.make_adt(ctor_type_name, Box::new([]));
+                            let fn_ty = self.arena.make_fn(
+                                param_types.into_boxed_slice(),
+                                ret_ty,
+                            );
+                            let (params, return_type) = self.arena.fn_parts(fn_ty);
+                            let params: Vec<TypeHandle> = params.to_vec();
+                            if params.len() == args.len() {
+                                for (&param_ty, &arg) in params.iter().zip(args.iter()) {
+                                    let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
+                                    self.unify_or_constrain(param_ty, arg_ty);
+                                }
+                            }
+                            if let Some(exp) = expected {
+                                self.unify_or_constrain(return_type, exp);
+                            }
+                            // 标记 recv 为 module-func-recv（IR 编译时跳过 recv）
+                            let recv_key = crate::sema::Sema::module_expr_key(
+                                &self.current_module_name,
+                                recv.0 as u64,
+                            );
+                            self.sema_result.module_func_recv_exprs.insert(recv_key);
+                            return return_type;
+                        }
+                        // 零参数构造器在 MethodCall 中：报错
+                        let span = ast.expr(expr).span;
+                        self.add_error_at(
+                            &format!(
+                                "constructor '{}' of type '{}' takes no arguments; use {}.{} syntax",
+                                method, type_name, type_name, method
+                            ),
+                            span.line,
+                            span.column,
+                        );
+                        return self.arena.fresh_type_var();
+                    }
+                }
+
                 let recv_ty = self.infer_expr(*recv, ast, env, None);
 
                 // Path 0a: ModuleRef recv → module-path function call.
@@ -2152,6 +2744,29 @@ impl<'a> InferContext<'a> {
 
             // ── Field access ──
             Expr::FieldAccess { recv, field } => {
+                // 限定名语法：Type.Ctor（零参数构造器限定名访问）
+                if let Expr::Ident(type_name) = &ast.expr(*recv).node {
+                    if let Some((ctor_type_name, field_type_reprs)) =
+                        self.check_qualified_ctor(type_name, field)
+                    {
+                        if field_type_reprs.is_empty() {
+                            // 零参数构造器：返回 Adt(type_name)
+                            return self.arena.make_adt(ctor_type_name, Box::new([]));
+                        }
+                        // 有参数构造器在 FieldAccess 中：报错
+                        let span = ast.expr(expr).span;
+                        self.add_error_at(
+                            &format!(
+                                "constructor '{}' of type '{}' requires arguments; use {}('{}') syntax",
+                                field, type_name, field, type_name
+                            ),
+                            span.line,
+                            span.column,
+                        );
+                        return self.arena.fresh_type_var();
+                    }
+                }
+
                 let recv_ty = self.infer_expr(*recv, ast, env, None);
                 // Detect a ModuleRef receiver: cross-module constant access such as Math.PI.
                 // On hit, record recv's expr key → mangled name (module_path.field) into
@@ -2545,6 +3160,12 @@ impl<'a> InferContext<'a> {
                 if let Some(exp) = expected {
                     self.unify_or_constrain(result_ty, exp);
                 }
+
+                // ── Exhaustiveness check ──
+                // A match is exhaustive if it has a wildcard `_` or variable-binding arm
+                // (without guard). For ADT scrutinees, check that all constructors are covered.
+                self.check_match_exhaustive(ast, *scrutinee, resolved_scrutinee, arms);
+
                 result_ty
             }
 
@@ -3157,6 +3778,24 @@ impl<'a> InferContext<'a> {
 
     // ── infer_stmt ──
 
+    /// Bug #61: 渲染类型注解字符串 — 如果注解是命名类型且是别名，保留别名名。
+    fn display_type_annotation(
+        &self,
+        ta: AstTypeRef,
+        ast: &AstArena<'_>,
+        annot_ty: TypeHandle,
+    ) -> String {
+        let type_node = &ast.ty(ta).node;
+        if let crate::ast::Ast::TypeNode::Named { name } = type_node {
+            if let Some(td) = self.sema_result.get_type_def(name) {
+                if td.kind == TypeDefKind::Alias {
+                    return (*name).to_string();
+                }
+            }
+        }
+        format!("{}", self.arena.display(annot_ty))
+    }
+
     /// Shared logic for ValDecl and VarDecl: type-check the annotation and value,
     /// detect mutability-changing shadowing (Bug #76), and define the binding.
     fn check_local_decl(
@@ -3182,7 +3821,8 @@ impl<'a> InferContext<'a> {
         let bind_ty = if let Some(ta) = type_annotation {
             let annot_ty = self.type_from_ast(ta, ast);
             if self.try_widen_unify(annot_ty, val_ty).is_err() {
-                let annot_str = format!("{}", self.arena.display(annot_ty));
+                // Bug #61: 如果类型注解是命名类型且是别名，保留别名名而非展开底层类型。
+                let annot_str = self.display_type_annotation(ta, ast, annot_ty);
                 let val_str = format!("{}", self.arena.display(val_ty));
                 let span = ast.ty(ta).span;
                 self.add_error_at(
@@ -3452,6 +4092,13 @@ impl<'a> InferContext<'a> {
                 if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
                     let sub_pats: Vec<PatternRef> = Vec::new();
                     self.refine_constructor_pattern(name, &sub_pats, expected_ty, ast, env);
+                    // Store disambiguation result for the IR builder (same-named constructors).
+                    if let Some(ctor) = self.find_ctor_def(name, expected_ty) {
+                        self.sema_result.pattern_ctor_types.insert(
+                            (self.current_module_name.clone(), pat.0),
+                            ctor.type_name.clone(),
+                        );
+                    }
                 } else {
                     self.env.define(env, name, expected_ty);
                 }
@@ -3474,6 +4121,13 @@ impl<'a> InferContext<'a> {
                         };
                         self.infer_pattern(sub_pat, ast, sub_ty, env);
                     }
+                }
+                // Store disambiguation result for the IR builder (same-named constructors).
+                if let Some(ctor) = self.find_ctor_def(name, expected_ty) {
+                    self.sema_result.pattern_ctor_types.insert(
+                        (self.current_module_name.clone(), pat.0),
+                        ctor.type_name.clone(),
+                    );
                 }
             }
             Pattern::Record { fields } => {
@@ -3707,8 +4361,10 @@ impl<'a> InferContext<'a> {
         // 1b. Check for cyclic type aliases (Bug #80).
         self.check_alias_cycles();
 
-        // 1c. Check for duplicate constructor names across types (Bug #81).
-        self.check_duplicate_constructors();
+        // 1c. Duplicate constructor names across types are now allowed at the
+        // definition level (disambiguated by type context or `Type.Ctor`).
+        // Ambiguity is reported only at use sites when disambiguation fails
+        // (see infer_call). (Bug #81.)
 
         // 1d. Check for duplicate named fields within a constructor (Bug #82).
         self.check_duplicate_ctor_fields();
@@ -4218,54 +4874,6 @@ impl<'a> InferContext<'a> {
         }
     }
 
-    /// Check for duplicate constructor names across different types (Bug #81).
-    ///
-    /// Constructor names are globally registered in root_env via `redefine`, so a
-    /// later type defining the same constructor name silently overwrites the earlier
-    /// binding. This check reports the conflict at definition time rather than
-    /// leaving the user to discover it as a confusing "type annotation mismatch"
-    /// when using the shadowed constructor.
-    fn check_duplicate_constructors(&mut self) {
-        use std::collections::{HashMap, HashSet};
-        // Map from constructor name → first type_name that defined it.
-        let mut first_def: HashMap<String, String> = HashMap::new();
-        // Set of constructor names already reported (avoids duplicate errors across
-        // modules, since type_defs is cumulative).
-        let mut reported: HashSet<String> = self.sema_result.errors.iter()
-            .filter_map(|e| {
-                e.message.as_ref().strip_prefix("duplicate constructor: ").and_then(|s| {
-                    s.split(" already defined").next().map(String::from)
-                })
-            })
-            .collect();
-        // Collect errors first to avoid borrow conflict (iterating type_defs is
-        // an immutable borrow; add_error is mutable).
-        let mut new_errors: Vec<String> = Vec::new();
-        for i in 0..self.sema_result.type_defs.len() {
-            let td = &self.sema_result.type_defs[i];
-            for ctor in td.constructors.iter() {
-                let ctor_name = ctor.name.to_string();
-                if reported.contains(&ctor_name) {
-                    continue;
-                }
-                if let Some(prev_type) = first_def.get(&ctor_name) {
-                    if prev_type.as_str() != td.name.as_ref() {
-                        new_errors.push(format!(
-                            "duplicate constructor: {} already defined for type {}",
-                            ctor_name, prev_type
-                        ));
-                        reported.insert(ctor_name);
-                    }
-                } else {
-                    first_def.insert(ctor_name, td.name.to_string());
-                }
-            }
-        }
-        for msg in new_errors {
-            self.sema_result.add_error(crate::sema::Sema::SemaError::new(&msg, 0, 0));
-        }
-    }
-
     /// Check for duplicate named fields within a single constructor (Bug #82).
     ///
     /// ADT/record constructors may have positional (unnamed) fields, which are
@@ -4382,6 +4990,7 @@ impl<'a> InferContext<'a> {
                 let prev_return = self.expected_return;
                 self.expected_return = Some(ret_ty);
                 // Infer the function body.
+                eprintln!("DEBUG check_decl: inferring body of function '{}'", *name);
                 let body_ty = self.infer_expr(*body, ast, fn_env, self.expected_return);
                 // Restore.
                 self.expected_return = prev_return;
@@ -4411,7 +5020,7 @@ impl<'a> InferContext<'a> {
             Decl::TypeDecl { name, type_params, def, methods, .. } => {
                 // Register the nested type definition into sema_result (so constructor calls are
                 // recognized during type checking).
-                ast_type_decl_to_type_def(self.arena, self.sema_result, *name, type_params, def, ast);
+                ast_type_decl_to_type_def(self.arena, self.sema_result, *name, type_params, def, ast, decl_span, &self.current_module_name);
                 // Type parameter bindings (including kind registration): so references to the
                 // generic parameter T inside the type block can be resolved from
                 // type_binding_stack.

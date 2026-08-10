@@ -134,19 +134,19 @@ fun tan_f64_impl(x: f64): f64 {
 fun tan_f32_impl(x: f32): f32 {
     val s = sin_f32_impl(x)
     val c = cos_f32_impl(x)
-    if c == 0.0 { return 1.0 / 0.0 }
+    if c == 0.0 { return 1.0f32 / 0.0f32 }
     s / c
 }
 fun tan_f16_impl(x: f16): f16 {
     val s = sin_f16_impl(x)
     val c = cos_f16_impl(x)
-    if c == 0.0 { return 1.0 / 0.0 }
+    if c == 0.0 { return 1.0f16 / 0.0f16 }
     s / c
 }
 fun tan_f128_impl(x: f128): f128 {
     val s = sin_f128_impl(x)
     val c = cos_f128_impl(x)
-    if c == 0.0 { return 1.0 / 0.0 }
+    if c == 0.0 { return 1.0f128 / 0.0f128 }
     s / c
 }
 
@@ -398,21 +398,21 @@ fun asin_f64_impl(x: f64): f64 {
 }
 fun asin_f32_impl(x: f32): f32 {
     val pi_half: f32 = 0x1.921fb6p+0f32
-    if x > 1.0 || x < 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x > 1.0 || x < 0.0 - 1.0 { return 0.0f32 / 0.0f32 }
     if x == 1.0 { return pi_half }
     if x == 0.0 - 1.0 { return 0.0 - pi_half }
     atan_f32_impl(x / sqrt_f32_impl(1.0 - x * x))
 }
 fun asin_f16_impl(x: f16): f16 {
     val pi_half: f16 = 0x1.92p+0f16
-    if x > 1.0 || x < 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x > 1.0 || x < 0.0 - 1.0 { return 0.0f16 / 0.0f16 }
     if x == 1.0 { return pi_half }
     if x == 0.0 - 1.0 { return 0.0 - pi_half }
     atan_f16_impl(x / sqrt_f16_impl(1.0 - x * x))
 }
 fun asin_f128_impl(x: f128): f128 {
     val pi_half = 0x1.921fb54442d18469898cc51701b8p+0f128
-    if x > 1.0 || x < 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x > 1.0 || x < 0.0 - 1.0 { return 0.0f128 / 0.0f128 }
     if x == 1.0 { return pi_half }
     if x == 0.0 - 1.0 { return 0.0 - pi_half }
     atan_f128_impl(x / sqrt_f128_impl(1.0 - x * x))
@@ -552,15 +552,15 @@ fun acosh_f64_impl(x: f64): f64 {
     log_f64_impl(x + sqrt_f64_impl(x * x - 1.0))
 }
 fun acosh_f32_impl(x: f32): f32 {
-    if x < 1.0 { return 0.0 / 0.0 }
+    if x < 1.0 { return 0.0f32 / 0.0f32 }
     log_f32_impl(x + sqrt_f32_impl(x * x - 1.0))
 }
 fun acosh_f16_impl(x: f16): f16 {
-    if x < 1.0 { return 0.0 / 0.0 }
+    if x < 1.0 { return 0.0f16 / 0.0f16 }
     log_f16_impl(x + sqrt_f16_impl(x * x - 1.0))
 }
 fun acosh_f128_impl(x: f128): f128 {
-    if x < 1.0 { return 0.0 / 0.0 }
+    if x < 1.0 { return 0.0f128 / 0.0f128 }
     log_f128_impl(x + sqrt_f128_impl(x * x - 1.0))
 }
 
@@ -582,15 +582,15 @@ fun atanh_f64_impl(x: f64): f64 {
     0.5 * log_f64_impl((1.0 + x) / (1.0 - x))
 }
 fun atanh_f32_impl(x: f32): f32 {
-    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0f32 / 0.0f32 }
     0.5 * log_f32_impl((1.0 + x) / (1.0 - x))
 }
 fun atanh_f16_impl(x: f16): f16 {
-    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0f16 / 0.0f16 }
     0.5 * log_f16_impl((1.0 + x) / (1.0 - x))
 }
 fun atanh_f128_impl(x: f128): f128 {
-    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0f128 / 0.0f128 }
     0.5 * log_f128_impl((1.0 + x) / (1.0 - x))
 }
 

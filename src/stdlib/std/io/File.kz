@@ -37,12 +37,13 @@ pub type SeekFrom =
 
 // FileKind：文件种类（ADT 无字段变体）
 // syscall 层根据 stat.st_mode & S_IFMT 构造对应变体
-// 变体名避免与 File Record 构造器和 IOErrorKind.Other 冲突（Bug #81）
+// File/Other 与 File Record 构造器和 IOErrorKind.Other 同名，
+// 通过限定名语法（FileKind.File / FileKind.Other）或类型导向消歧
 pub type FileKind =
-    | Regular
+    | File
     | Directory
     | Symlink
-    | Special
+    | Other
 
 // Stat：文件元数据（newtype record，syscall 层用 type_name="Stat" 构造）
 pub type Stat = Stat(size: u64, mtime_ns: i64, ctime_ns: i64, kind: FileKind)
@@ -303,10 +304,10 @@ fun __read_i32_le(buf: u8[], offset: usize): i32 {
 
 fun __kind_from_int(kind_int: i32): FileKind {
     match kind_int {
-        0 => Regular,
-        1 => Directory,
-        2 => Symlink,
-        _ => Special,
+        0 => FileKind.File,
+        1 => FileKind.Directory,
+        2 => FileKind.Symlink,
+        _ => FileKind.Other,
     }
 }
 

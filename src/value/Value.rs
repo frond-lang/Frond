@@ -1972,6 +1972,20 @@ impl AtomicValue {
     pub fn swap(&self, val: Value) -> Value {
         std::mem::replace(&mut *self.data.lock().unwrap_or_else(|e| e.into_inner()), val)
     }
+    /// Compare-and-exchange: if the current value equals `expected`, replace it with
+    /// `new` and return true; otherwise return false (leaving the value unchanged).
+    ///
+    /// Uses semantic value equality (`value_equals`) rather than reference equality,
+    /// so atomic semantics apply to the logical value, not the heap identity.
+    pub fn compare_exchange(&self, expected: &Value, new: Value) -> bool {
+        let mut guard = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::value::value_equals(&*guard, expected) {
+            *guard = new;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Clone for AtomicValue {

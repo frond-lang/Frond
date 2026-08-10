@@ -30,7 +30,7 @@ fun sqrt_f64_impl(x: f64): f64 {
     ldexp_f64_impl(g, e)
 }
 fun sqrt_f32_impl(x: f32): f32 {
-    if x < 0.0 { return 0.0 / 0.0 }
+    if x < 0.0 { return 0.0f32 / 0.0f32 }
     if x == 0.0 { return 0.0 }
     var e = 0
     var m = x
@@ -51,7 +51,7 @@ fun sqrt_f32_impl(x: f32): f32 {
     ldexp_f32_impl(g, e)
 }
 fun sqrt_f16_impl(x: f16): f16 {
-    if x < 0.0 { return 0.0 / 0.0 }
+    if x < 0.0 { return 0.0f16 / 0.0f16 }
     if x == 0.0 { return 0.0 }
     var e = 0
     var m = x
@@ -72,7 +72,7 @@ fun sqrt_f16_impl(x: f16): f16 {
     ldexp_f16_impl(g, e)
 }
 fun sqrt_f128_impl(x: f128): f128 {
-    if x < 0.0 { return 0.0 / 0.0 }
+    if x < 0.0 { return 0.0f128 / 0.0f128 }
     if x == 0.0 { return 0.0 }
     var e = 0
     var m = x
@@ -231,7 +231,7 @@ fun exp_f64_impl(x: f64): f64 {
 fun exp_f32_impl(x: f32): f32 {
     val ln2: f32 = 0x1.62e42fefa39efp-1
     if x == 0.0 { return 1.0 }
-    if x > 88.722839052 { return 1.0 / 0.0 }
+    if x > 88.722839052 { return 1.0f32 / 0.0f32 }
     if x < -103.972085 { return 0.0 }
     val k = cast(floor_f32_impl(x / ln2 + 0.5)).to(i32)
     val r = x - cast(k).to(f32) * ln2
@@ -248,7 +248,7 @@ fun exp_f32_impl(x: f32): f32 {
 fun exp_f16_impl(x: f16): f16 {
     val ln2 = 0x1.63p-1f16
     if x == 0.0 { return 1.0 }
-    if x > 11.09 { return 1.0 / 0.0 }
+    if x > 11.09 { return 1.0f16 / 0.0f16 }
     if x < -17.32 { return 0.0 }
     val k = cast(floor_f16_impl(x / ln2 + 0.5)).to(i32)
     val r = x - cast(k).to(f16) * ln2
@@ -265,7 +265,7 @@ fun exp_f16_impl(x: f16): f16 {
 fun exp_f128_impl(x: f128): f128 {
     val ln2: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1f128
     if x == 0.0 { return cast(1.0).to(f128) }
-    if x > 11356.523711074 { return 1.0 / 0.0 }
+    if x > 11356.523711074 { return 1.0f128 / 0.0f128 }
     if x < -11399.0 { return cast(0.0).to(f128) }
     val k = cast(floor_f128_impl(x / ln2 + 0.5)).to(i32)
     val r = x - cast(k).to(f128) * ln2
@@ -324,8 +324,8 @@ fun log_f64_impl(x: f64): f64 {
 }
 fun log_f32_impl(x: f32): f32 {
     val ln2 = 0x1.62e42fefa39efp-1
-    if x == 0.0 { return -1.0 / 0.0 }
-    if x < 0.0 { return 0.0 / 0.0 }
+    if x == 0.0 { return -1.0f32 / 0.0f32 }
+    if x < 0.0 { return 0.0f32 / 0.0f32 }
     var e = 0
     var m = x
     while m >= 2.0 {
@@ -350,8 +350,8 @@ fun log_f32_impl(x: f32): f32 {
 }
 fun log_f16_impl(x: f16): f16 {
     val ln2 = 0x1.63p-1f16
-    if x == 0.0 { return -1.0 / 0.0 }
-    if x < 0.0 { return 0.0 / 0.0 }
+    if x == 0.0 { return -1.0f16 / 0.0f16 }
+    if x < 0.0 { return 0.0f16 / 0.0f16 }
     var e = 0
     var m = x
     while m >= 2.0 {
@@ -376,8 +376,8 @@ fun log_f16_impl(x: f16): f16 {
 }
 fun log_f128_impl(x: f128): f128 {
     val ln2: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1f128
-    if x == 0.0 { return -1.0 / 0.0 }
-    if x < 0.0 { return 0.0 / 0.0 }
+    if x == 0.0 { return -1.0f128 / 0.0f128 }
+    if x < 0.0 { return 0.0f128 / 0.0f128 }
     var e = 0
     var m = x
     while m >= 2.0 {
@@ -428,7 +428,7 @@ fun pow_f32_impl(base: f32, exp: f32): f32 {
     if base == 0.0 {
         if exp == 0.0 { return 1.0 }
         if exp > 0.0 { return 0.0 }
-        return 1.0 / 0.0
+        return 1.0f32 / 0.0f32
     }
     0.0 / 0.0
 }
@@ -437,7 +437,7 @@ fun pow_f16_impl(base: f16, exp: f16): f16 {
     if base == 0.0 {
         if exp == 0.0 { return 1.0 }
         if exp > 0.0 { return 0.0 }
-        return 1.0 / 0.0
+        return 1.0f16 / 0.0f16
     }
     0.0 / 0.0
 }
@@ -446,7 +446,7 @@ fun pow_f128_impl(base: f128, exp: f128): f128 {
     if base == 0.0 {
         if exp == 0.0 { return 1.0 }
         if exp > 0.0 { return 0.0 }
-        return 1.0 / 0.0
+        return 1.0f128 / 0.0f128
     }
     0.0 / 0.0
 }
@@ -1065,7 +1065,7 @@ fun log1p_f64_impl(x: f64): f64 {
     }
 }
 fun log1p_f32_impl(x: f32): f32 {
-    if x <= -1.0 { return 0.0 / 0.0 }
+    if x <= -1.0 { return 0.0f32 / 0.0f32 }
     var a = if x < 0.0 { 0.0 - x } else { x }
     if a < 0.5 {
         var sum = x
@@ -1083,7 +1083,7 @@ fun log1p_f32_impl(x: f32): f32 {
     }
 }
 fun log1p_f16_impl(x: f16): f16 {
-    if x <= -1.0 { return 0.0 / 0.0 }
+    if x <= -1.0 { return 0.0f16 / 0.0f16 }
     var a = if x < 0.0 { 0.0 - x } else { x }
     if a < 0.5 {
         var sum = x
@@ -1101,7 +1101,7 @@ fun log1p_f16_impl(x: f16): f16 {
     }
 }
 fun log1p_f128_impl(x: f128): f128 {
-    if x <= -1.0 { return 0.0 / 0.0 }
+    if x <= -1.0 { return 0.0f128 / 0.0f128 }
     var a = if x < 0.0 { 0.0 - x } else { x }
     if a < 0.5 {
         var sum = x

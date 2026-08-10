@@ -81,6 +81,11 @@ pub struct IrBuilder<'a> {
     /// inherited by `Block` trailing expressions and by `If`/`Match` branches;
     /// set to `false` for arguments, conditions, and assignment right-hand sides.
     pub in_tail_position: bool,
+    /// Bug #66: Whether the current `compile_block` call is the function body's top-level block.
+    /// Set to `true` at `compile_function_body` entry; reset to `false` by the first `compile_block`
+    /// call (the function body itself). Nested blocks see `false`, so only they extract
+    /// block-scoped defers — function-level defers stay in `defer_table` for function-exit execution.
+    pub in_function_top_block: bool,
     /// Tail-recursion-to-iteration context: when `Some`, `compile_call` intercepts self-calls
     /// as `WriteBack + Call(while_sg)`.
     /// `None` = not compiling a tail-recursion-to-iteration body.
@@ -249,6 +254,7 @@ impl<'a> IrBuilder<'a> {
             current_sg_start: 0,
             current_effect: None,
             in_tail_position: false,
+            in_function_top_block: false,
             tail_rec_ctx: None,
             non_tail_rec_ctx: None,
             current_type_args: Vec::new(),
@@ -1268,6 +1274,39 @@ impl<'a> IrBuilder<'a> {
             compute_fn: CF_NOOP,
         });
         self.graph.const_values[node.0 as usize] = Some(ConstValue::Void);
+        let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
+        self.graph.add_subgraph(SubGraph {
+            id: sg_id,
+            node_range: (node, NodeId(node.0 + 1)),
+            param_count: 0,
+            entry_node: node,
+            return_node: node,
+            has_suspend: false,
+            event_source_decls: Vec::new(),
+            defer_table: Vec::new(),
+            loop_kind: LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: self.current_function_id,
+            iter_next_node: None,
+            upvalue_count: 0,
+            upvalue_outer_nodes: Vec::new(),
+            nested_ranges: Vec::new(),
+            reset_plan: None,
+        });
+        sg_id
+    }
+
+    /// Compile a panic subgraph (used as match fallback when no arm matches).
+    /// The single node uses CF_MATCH_FALLBACK which panics at runtime.
+    fn compile_panic_subgraph(&mut self) -> SubGraphId {
+        let inputs_offset = self.graph.inputs_pool.push(&[]);
+        let node = self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 0,
+            inputs_offset,
+            compute_fn: CF_MATCH_FALLBACK,
+        });
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
             id: sg_id,
@@ -2518,6 +2557,11 @@ impl<'a> IrBuilder<'a> {
     ) -> NodeId {
         let prev_tail = self.in_tail_position;
         self.in_tail_position = !is_void_fn;
+        // Bug #66: Mark that the next compile_block call is the function body's top-level block.
+        // compile_block reads and resets this flag so that only nested blocks extract
+        // block-scoped defers; function-level defers stay in defer_table for function-exit execution.
+        let prev_top_block = self.in_function_top_block;
+        self.in_function_top_block = true;
         // Unified memo-strategy query (memo_pass already makes the unique decision; mutually
         // exclusive).
         let strategy = self.lookup_memo_strategy(name, self_type);
@@ -2547,6 +2591,7 @@ impl<'a> IrBuilder<'a> {
             }
         };
         self.in_tail_position = prev_tail;
+        self.in_function_top_block = prev_top_block;
         r
     }
 
@@ -3763,10 +3808,11 @@ impl<'a> IrBuilder<'a> {
             // If the last arm is an exhaustive match (e.g. _), cond_node is true with no extra cost.
             let pattern_node = ad.cond_node;
 
-            // false branch: if there is a pending_else (from i+1), use it and pass in the current frame's scrutinee
+            // false branch: if there is a pending_else (from i+1), use it and pass in the current frame's scrutinee.
+            // If there is no else (non-exhaustive match), use a panic subgraph as runtime safety net.
             let (false_sg, false_inputs) = match pending_else_sg {
                 Some(else_sg) => (else_sg, vec![ad.scrutinee_in_frame]),
-                None => (self.compile_void_subgraph(), Vec::new()),
+                None => (self.compile_panic_subgraph(), Vec::new()),
             };
 
             // The Gate depends on pattern_node (the condition value) and the effect before this arm was compiled (prior side effects).
@@ -3877,13 +3923,17 @@ impl<'a> IrBuilder<'a> {
         pattern_id: crate::ast::Ast::PatternId,
     ) -> NodeId {
         let pattern = self.current_module().arena.pattern(pattern_id);
+        let module_name = self.current_module().name.to_string();
         match &pattern.node {
             crate::ast::Ast::Pattern::Wildcard => self.compile_bool_const(true),
             crate::ast::Ast::Pattern::Variable { name } => {
                 // Nullary ADT constructors (e.g. JNull, Nil) cannot be distinguished from variables at parse time;
                 // disambiguate via sema's ctor_def_index: if it is a known constructor, compile as Constructor
                 if self.sema.ctor_def_index.contains_key(*name) {
-                    self.compile_pattern_constructor(scrutinee_node, name, &[])
+                    let type_name = self.sema.pattern_ctor_types
+                        .get(&(module_name.clone(), pattern_id.0))
+                        .map(|s| s.as_ref());
+                    self.compile_pattern_constructor(scrutinee_node, name, &[], type_name)
                 } else {
                     self.bind_var(name, scrutinee_node);
                     self.compile_bool_const(true)
@@ -3893,7 +3943,10 @@ impl<'a> IrBuilder<'a> {
                 self.compile_pattern_literal_match(scrutinee_node, pl)
             }
             crate::ast::Ast::Pattern::Constructor { name, patterns } => {
-                self.compile_pattern_constructor(scrutinee_node, name, patterns)
+                let type_name = self.sema.pattern_ctor_types
+                    .get(&(module_name, pattern_id.0))
+                    .map(|s| s.as_ref());
+                self.compile_pattern_constructor(scrutinee_node, name, patterns, type_name)
             }
             crate::ast::Ast::Pattern::Record { fields } => {
                 self.compile_pattern_record(scrutinee_node, fields)
@@ -4015,6 +4068,7 @@ impl<'a> IrBuilder<'a> {
         scrutinee_node: NodeId,
         name: &str,
         patterns: &[crate::ast::Ast::PatternRef],
+        type_name: Option<&str>,
     ) -> NodeId {
         // Constructor-name discriminant node
         let ctor_match_off = self.graph.inputs_pool.push(&[scrutinee_node]);
@@ -4025,6 +4079,14 @@ impl<'a> IrBuilder<'a> {
             compute_fn: CF_PATTERN_CTOR_MATCH, // pattern_ctor_match
         });
         self.graph.set_pattern_ctor_name(ctor_match_node, name.to_string());
+        // Record the constructor's owning type name for runtime disambiguation
+        // (same-named constructors across different types, e.g. FileKind.File vs File).
+        // Prefer the sema-disambiguated type_name; fall back to get_ctor_def.
+        if let Some(tn) = type_name {
+            self.graph.set_pattern_type_name(ctor_match_node, tn.to_string());
+        } else if let Some(ctor_def) = self.sema.get_ctor_def(name) {
+            self.graph.set_pattern_type_name(ctor_match_node, ctor_def.type_name.to_string());
+        }
 
         // Recursively process sub-patterns: extract fields + discriminate
         let mut result = ctor_match_node;
@@ -5372,6 +5434,41 @@ impl<'a> IrBuilder<'a> {
         self.lookup_type_fields(constructor_name)
     }
 
+    /// Check if `Type.Ctor` is a qualified constructor access (IR-side).
+    /// Returns `(type_name, ctor_name, field_names, kind, is_nullary)` for
+    /// constructing the IR node.
+    fn check_qualified_ctor_ir(
+        &self,
+        type_name: &str,
+        ctor_name: &str,
+    ) -> Option<(String, String, Vec<Option<String>>, RecordLitKind, bool)> {
+        let &type_idx = self.sema.type_def_index.get(type_name)?;
+        let type_def = &self.sema.type_defs[type_idx as usize];
+        let ctor = type_def
+            .constructors
+            .iter()
+            .find(|c| c.name.as_ref() == ctor_name)?;
+        let field_names: Vec<Option<String>> = ctor
+            .field_names
+            .iter()
+            .map(|n| n.as_deref().map(String::from))
+            .collect();
+        let is_nullary = ctor.field_type_reprs.is_empty();
+        let kind = match type_def.kind {
+            crate::sema::Sema::TypeDefKind::Adt => RecordLitKind::Adt,
+            crate::sema::Sema::TypeDefKind::Record => RecordLitKind::Record,
+            crate::sema::Sema::TypeDefKind::Newtype => RecordLitKind::Newtype,
+            crate::sema::Sema::TypeDefKind::Alias => RecordLitKind::Record,
+        };
+        Some((
+            ctor.type_name.to_string(),
+            ctor.name.to_string(),
+            field_names,
+            kind,
+            is_nullary,
+        ))
+    }
+
     /// Check whether a function name is an @extern("C") function (has extern_c_body).
     fn is_extern_c_func(&self, name: &str) -> bool {
         let modules: Vec<&crate::ast::Ast::Module<'_>> =
@@ -5401,6 +5498,34 @@ impl<'a> IrBuilder<'a> {
         method: &str,
         args: &[crate::ast::Ast::ExprId],
     ) -> NodeId {
+        // 限定名构造器：Type.Ctor(args)（有参数构造器）
+        if let crate::ast::Ast::Expr::Ident(type_name) = &self.current_module().arena.expr(recv).node {
+            if let Some((ctor_type_name, ctor_name, field_names, kind, is_nullary)) =
+                self.check_qualified_ctor_ir(type_name, method)
+            {
+                if !is_nullary {
+                    let mut inputs = Vec::with_capacity(args.len());
+                    for &arg in args {
+                        inputs.push(self.compile_subexpr(arg));
+                    }
+                    let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                    let node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: inputs.len() as u8,
+                        inputs_offset,
+                        compute_fn: CF_RECORD_CONSTRUCT,
+                    });
+                    self.graph.set_record_lit_info(node, RecordLitInfo {
+                        type_name: ctor_type_name,
+                        field_names,
+                        constructor: ctor_name,
+                        kind,
+                    });
+                    return node;
+                }
+            }
+        }
+
         let recv_node = self.compile_subexpr(recv);
 
         // -- intrinsic lowering --
@@ -5609,6 +5734,20 @@ impl<'a> IrBuilder<'a> {
                     compute_fn: ComputeFnId(idx),
                 }))
             }
+            // compare_exchange(expected, new): ternary op, inputs = [recv, expected, new]
+            IntrinsicKind::TriOp(idx) => {
+                let mut inputs = vec![recv_node];
+                for &arg in args {
+                    inputs.push(self.compile_subexpr(arg));
+                }
+                let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                Some(self.graph.add_node(Node {
+                    kind: NodeKind::TriOp,
+                    input_count: inputs.len() as u8,
+                    inputs_offset,
+                    compute_fn: ComputeFnId(idx),
+                }))
+            }
             _ => None, // argument mismatch; fall through to the Call node path
         }
     }
@@ -5767,6 +5906,30 @@ impl<'a> IrBuilder<'a> {
         recv: crate::ast::Ast::ExprId,
         field: &str,
     ) -> NodeId {
+        // 限定名构造器：Type.Ctor（零参数构造器）
+        if let crate::ast::Ast::Expr::Ident(type_name) = &self.current_module().arena.expr(recv).node {
+            if let Some((ctor_type_name, ctor_name, field_names, kind, is_nullary)) =
+                self.check_qualified_ctor_ir(type_name, field)
+            {
+                if is_nullary {
+                    let inputs_offset = self.graph.inputs_pool.push(&[]);
+                    let node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: 0,
+                        inputs_offset,
+                        compute_fn: CF_RECORD_CONSTRUCT,
+                    });
+                    self.graph.set_record_lit_info(node, RecordLitInfo {
+                        type_name: ctor_type_name,
+                        field_names,
+                        constructor: ctor_name,
+                        kind,
+                    });
+                    return node;
+                }
+            }
+        }
+
         // Cross-module constant access (Math.PI): sema has recorded the recv's expr key → mangled
         // name in module_const_recv_exprs. On a hit, skip recv compilation and look up the mangled
         // name in global_var_slots to emit compile_global_load, sharing the local global var path.
@@ -5969,11 +6132,23 @@ impl<'a> IrBuilder<'a> {
     ) -> NodeId {
         self.enter_scope();
         let prev_effect = self.current_effect;
+        // Bug #66: If this is the function body's top-level block, do NOT extract defers —
+        // they must stay in defer_table for function-exit execution. Only nested blocks
+        // extract block-scoped defers. The flag is set by compile_function_body and reset
+        // here so that nested blocks within the function body see `false`.
+        let is_function_top_block = self.in_function_top_block;
+        self.in_function_top_block = false;
         // Initialize last_effect to prev_effect so the block's first statement depends on prior effects
         // (e.g. the store nodes of global var initialization in the entry function), ensuring that
         // load/call inside the block run only after prior side effects complete.
         let mut last_effect: Option<NodeId> = prev_effect;
         self.current_effect = None;
+        // Bug #66: Record the defer_table length at block entry so we can extract
+        // block-scoped defers and run them at block exit (LIFO).
+        let defer_mark = self
+            .current_function_sg
+            .map(|sg| self.graph.subgraphs[sg.0 as usize].defer_table.len())
+            .unwrap_or(0);
         for &stmt_id in stmts {
             // Set current_effect so subsequent effect nodes (e.g. WriteBack) depend on the prior effect
             self.current_effect = last_effect;
@@ -6000,9 +6175,65 @@ impl<'a> IrBuilder<'a> {
             }
             None => last_effect.unwrap_or_else(|| self.compile_void_const()),
         };
+        // Bug #66: Block-scoped defer cleanup — extract defers registered inside this block
+        // and generate LIFO cleanup Call nodes after the block result. This ensures defers
+        // declared inside `{ ... }` execute when the block exits, not when the function exits.
+        // The extracted defers are removed from the function-level defer_table to prevent
+        // double execution at function exit.
+        // Skip for function body top-level block: those defers must stay in defer_table for
+        // function-exit execution (run_defers_sync / process_frame).
+        let (result, _defer_effect) = if is_function_top_block {
+            (result, None)
+        } else {
+            self.compile_block_defer_cleanup(defer_mark, result)
+        };
+        // defer cleanup effects are chained into `result` via CF_SEQ inside
+        // compile_block_defer_cleanup, so they flow to consumers through the block's
+        // return value. No separate last_effect update is needed (current_effect is
+        // restored to prev_effect below).
         self.current_effect = prev_effect;
         self.exit_scope();
         result
+    }
+
+    /// Bug #66: Extract block-scoped defers registered after `defer_mark` and generate
+    /// LIFO cleanup Call nodes. The defers are removed from the function-level defer_table.
+    /// The cleanup nodes are chained after `result` via CF_SEQ, preserving the result value.
+    /// Returns (result_node, cleanup_effect) where cleanup_effect is the last defer Call node
+    /// (to be used as last_effect for subsequent statements).
+    fn compile_block_defer_cleanup(
+        &mut self,
+        defer_mark: usize,
+        result: NodeId,
+    ) -> (NodeId, Option<NodeId>) {
+        let cur_sg = match self.current_function_sg {
+            Some(sg) => sg,
+            None => return (result, None), // No function subgraph — nothing to do
+        };
+        let defer_table = &mut self.graph.subgraphs[cur_sg.0 as usize].defer_table;
+        if defer_table.len() <= defer_mark {
+            return (result, None); // No new defers in this block
+        }
+        // Extract block-scoped defers (drain entries after defer_mark).
+        let block_defers: Vec<crate::ir::Ir::DeferEntry> =
+            defer_table.drain(defer_mark..).collect();
+        // Generate LIFO cleanup: each defer body is called via make_call with its captured inputs.
+        // The cleanup is chained after the block result via CF_SEQ, preserving the result value.
+        // CF_SEQ returns the value of its last input, so we chain: SEQ(result, defer1) -> SEQ(that, defer2) -> ...
+        // The final SEQ node returns the last defer's value, but the block result is preserved
+        // through the SEQ chain's first input (data dependency).
+        let mut cleanup_chain = result;
+        let mut last_defer_call: Option<NodeId> = None;
+        for entry in block_defers.iter().rev() {
+            let call_node = self.make_call(entry.body_subgraph, &entry.captured_inputs);
+            cleanup_chain = self.chain_effects(Some(cleanup_chain), call_node);
+            last_defer_call = Some(call_node);
+        }
+        // Return the block result (preserved through SEQ chain) and the last defer call as effect.
+        // Note: cleanup_chain is the final SEQ node; its value is the last defer's return value,
+        // but subsequent statements use it as an effect dependency, not as a data value.
+        // The block's actual result value flows through the SEQ chain's first input (result).
+        (cleanup_chain, last_defer_call)
     }
 
     /// Compile a statement, returning an effect node (to be sequentially linked into the block result node).

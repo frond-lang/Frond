@@ -200,6 +200,7 @@ impl DataFlowGraph {
     accessor_str!(ffi_call_name, ffi_call_names, FfiCallNames);
     accessor_str!(field_set_name, field_set_names, FieldSetNames);
     accessor_str!(pattern_ctor_name, pattern_ctor_names, PatternCtorNames);
+    accessor_str!(pattern_type_name, pattern_type_names, PatternTypeNames);
     accessor_str!(cast_target_type, cast_target_types, CastTargetTypes);
 
     // ---- Category D: fixed-width composite tables (zerocopy, validity byte + fields) ----

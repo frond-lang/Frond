@@ -1795,25 +1795,27 @@ pub fn compute_array_construct_stack(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 /// compute_fn: array indexing (fetches an element from an ArrayValue by i32 index).
-/// Returns a `ThrowVal(Err)` error value on out-of-bounds access, which
-/// propagates up to the top level.
+/// Panics on out-of-bounds or negative index (Rust-style bounds checking).
 pub fn compute_array_index(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let recv_val = frame.get_value_by_global(inputs[0]);
-    let idx = frame.get_value_by_global(inputs[1]).as_i32() as usize;
-    let make_err = |msg: &str| make_error_throw("IndexError", msg);
+    let idx_raw = frame.get_value_by_global(inputs[1]).as_i32();
+    if idx_raw < 0 {
+        panic!("index {} out of bounds (negative index)", idx_raw);
+    }
+    let idx = idx_raw as usize;
     match recv_val.heap_obj() {
         Some(crate::value::HeapObj::Array(arr)) => {
             arr.get(idx).cloned().unwrap_or_else(|| {
-                make_err(&format!("index {} out of bounds (len {})", idx, arr.len()))
+                panic!("index {} out of bounds (len {})", idx, arr.len())
             })
         }
         Some(crate::value::HeapObj::Str(s)) => {
             s.char_at(idx).map(|c| Value::char_val(c)).unwrap_or_else(|| {
-                make_err(&format!("index {} out of bounds (len {})", idx, s.codepoint_count()))
+                panic!("index {} out of bounds (len {})", idx, s.codepoint_count())
             })
         }
-        _ => make_err("index on non-indexable type"),
+        _ => panic!("index on non-indexable type"),
     }
 }
 
@@ -2080,6 +2082,61 @@ pub fn compute_atomic_construct(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(HeapObj::AtomicVal(AtomicValue::new(val)))
 }
 
+/// compute_fn (idx 315): atomic load.
+///
+/// Input: the Atomic<T> reference. Returns a clone of the inner value.
+pub fn compute_atomic_load(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let recv = frame.get_value_by_global(inputs[0]);
+    match recv.heap_obj() {
+        Some(crate::value::HeapObj::AtomicVal(a)) => a.load(),
+        _ => Value::VOID,
+    }
+}
+
+/// compute_fn (idx 316): atomic store.
+///
+/// Inputs: [Atomic<T>, new_value]. Stores `new_value` into the atomic and returns void.
+pub fn compute_atomic_store(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let recv = frame.get_value_by_global(inputs[0]);
+    let new_val = frame.get_value_by_global(inputs[1]);
+    if let Some(crate::value::HeapObj::AtomicVal(a)) = recv.heap_obj() {
+        a.store(new_val);
+    }
+    Value::VOID
+}
+
+/// compute_fn (idx 317): atomic swap.
+///
+/// Inputs: [Atomic<T>, new_value]. Replaces the inner value with `new_value` and
+/// returns the previous value.
+pub fn compute_atomic_swap(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let recv = frame.get_value_by_global(inputs[0]);
+    let new_val = frame.get_value_by_global(inputs[1]);
+    match recv.heap_obj() {
+        Some(crate::value::HeapObj::AtomicVal(a)) => a.swap(new_val),
+        _ => Value::VOID,
+    }
+}
+
+/// compute_fn (idx 318): atomic compare-and-exchange.
+///
+/// Inputs: [Atomic<T>, expected, new]. If the current value equals `expected`,
+/// replaces it with `new` and returns true; otherwise returns false.
+pub fn compute_atomic_compare_exchange(frame: &mut Frame, node: NodeId) -> Value {
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let recv = frame.get_value_by_global(inputs[0]);
+    let expected = frame.get_value_by_global(inputs[1]);
+    let new_val = frame.get_value_by_global(inputs[2]);
+    let ok = match recv.heap_obj() {
+        Some(crate::value::HeapObj::AtomicVal(a)) => a.compare_exchange(&expected, new_val),
+        _ => false,
+    };
+    Value::bool_val(ok)
+}
+
 /// compute_fn: pattern match — constructor name discrimination (idx 274).
 ///
 /// Input: scrutinee. Metadata: constructor name (`graph.pattern_ctor_names`).
@@ -2092,8 +2149,14 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId) -> Value {
     let val = frame.get_value_by_global(inputs[0]);
     let ctor_name = graph.pattern_ctor_name(node.0 as usize)
         .expect("pattern ctor match node has no ctor name");
+    let type_name = graph.pattern_type_name(node.0 as usize);
     let matched = match val.heap_obj() {
-        Some(crate::value::HeapObj::Adt(a)) => a.constructor == ctor_name,
+        // ADT: check both constructor name and owning type name (when available) to
+        // disambiguate same-named constructors across different types.
+        Some(crate::value::HeapObj::Adt(a)) => {
+            a.constructor == ctor_name
+                && type_name.map_or(true, |tn| a.type_name == tn)
+        }
         Some(crate::value::HeapObj::Record(r)) => r.type_name == ctor_name,
         // Newtype: constructor name == type name; match `NewtypeValue.type_name`.
         Some(crate::value::HeapObj::Newtype(n)) => n.type_name == ctor_name,
@@ -3291,15 +3354,16 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 let consumer_count = graph.downstream_slice(graph_node_id.0 as usize).len() as u16;
                 frame.set_value(pending.call_node_local, child_result.clone(), consumer_count);
 
-                // Propagate throw.
-                let is_throw_err = matches!(
-                    child_result.heap_obj(),
-                    Some(crate::value::HeapObj::ThrowVal(t)) if matches!(t.payload, crate::value::ThrowPayload::Err(_))
-                );
-                if is_throw_err {
-                    frame.control_signal = ControlSignal::Return(child_result);
-                    continue;
-                }
+                // Bug #65: do NOT unconditionally propagate ThrowVal(Err) as a Return
+                // signal here. A function call returning a Throw value is *data* that
+                // should flow to downstream consumers (match / let / `?`). Only the `?`
+                // operator (compute_propagate) and `throw` statements convert Throw
+                // errors into control-flow Returns. Propagating here made the caller
+                // exit immediately after any throwing callee, even when the caller
+                // handled the error with a match — so code after the call site was
+                // silently skipped.
+                // Control-flow propagation for Gate branches / loop frames is handled
+                // below (consistent with the async path in Subgraph.rs).
 
                 // Propagate the Gate branch control signal.
                 let is_gate = graph.node(graph_node_id.0 as usize).kind == NodeKind::Gate;
@@ -3577,6 +3641,14 @@ pub fn compute_break(_frame: &mut Frame, _node: NodeId, _ctx: &EvalContext) -> N
 /// Replaces the old `control_signal_nodes[SignalKind::Continue]` table lookup.
 pub fn compute_continue(_frame: &mut Frame, _node: NodeId, _ctx: &EvalContext) -> NodeResult {
     NodeResult::Continue
+}
+
+/// compute_fn (idx 314): match fallback — panics when no match arm matches.
+/// This is a runtime safety net; sema's exhaustiveness check should prevent
+/// reaching this node for ADT matches. For non-ADT matches without a catch-all,
+/// this serves as the unconditional panic.
+pub fn compute_match_fallback(_frame: &mut Frame, _node: NodeId, _ctx: &EvalContext) -> NodeResult {
+    panic!("non-exhaustive match: no arm matched at runtime");
 }
 
 /// compute_fn (idx 48): sequence node — waits for all inputs to be ready, then returns

@@ -418,6 +418,12 @@ compute_fn_ids! {
     311 => CF_RETURN,
     312 => CF_BREAK,
     313 => CF_CONTINUE,
+    314 => CF_MATCH_FALLBACK,
+    // Atomic operations (315-318): load/store/swap/compare_exchange on Atomic<T>.
+    315 => CF_ATOMIC_LOAD,
+    316 => CF_ATOMIC_STORE,
+    317 => CF_ATOMIC_SWAP,
+    318 => CF_ATOMIC_COMPARE_EXCHANGE,
 }
 
 // =========================================================================
@@ -435,18 +441,20 @@ pub enum NodeKind {
     Const = 0,
     /// Pure computation: binary operation (executes when inputs are ready).
     BinOp = 1,
+    /// Pure computation: ternary operation (recv + 2 args, e.g. atomic compare_exchange).
+    TriOp = 2,
     /// Pure computation: unary operation.
-    UnOp = 2,
+    UnOp = 3,
     /// Pure computation: field access.
-    FieldAccess = 3,
+    FieldAccess = 4,
     /// Function call: launches a subgraph + waits for a completion event.
-    Call = 4,
+    Call = 5,
     /// Event source consumption: waits for an event (channel/async/timer).
-    Await = 5,
+    Await = 6,
     /// Control flow: conditional selection; activates the chosen subgraph.
-    Gate = 6,
+    Gate = 7,
     /// Event source declaration: performs no computation; declares an external event entry point.
-    EventSource = 7,
+    EventSource = 8,
 }
 
 // =========================================================================
@@ -1935,10 +1943,16 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         309 => super::Compute::compute_memo_store,
         // Tail-recursion WriteBack (310)
         310 => super::Compute::noop_compute_real, // compute_tailrec_writeback — new signature, table override
-        // Control-flow compute_fn (311-313) — new signature, table override
+        // Control-flow compute_fn (311-314) — new signature, table override
         311 => super::Compute::noop_compute_real, // compute_return
         312 => super::Compute::noop_compute_real, // compute_break
         313 => super::Compute::noop_compute_real, // compute_continue
+        314 => super::Compute::noop_compute_real, // compute_match_fallback
+        // Atomic operations (315-318): load/store/swap/compare_exchange on Atomic<T>
+        315 => super::Compute::compute_atomic_load,
+        316 => super::Compute::compute_atomic_store,
+        317 => super::Compute::compute_atomic_swap,
+        318 => super::Compute::compute_atomic_compare_exchange,
     };
     // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
     // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values
@@ -1958,6 +1972,7 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
     table[311] = super::Compute::compute_return;
     table[312] = super::Compute::compute_break;
     table[313] = super::Compute::compute_continue;
+    table[314] = super::Compute::compute_match_fallback;
     table[49] = super::Compute::compute_writeback;
     table
 }
@@ -2060,6 +2075,7 @@ macro_rules! node_metadata {
             opt(global_load_slots, u32, set_global_load_slot)
             opt(global_store_slots, u32, set_global_store_slot)
             opt(pattern_ctor_names, String, set_pattern_ctor_name)
+            opt(pattern_type_names, String, set_pattern_type_name)
             opt(pattern_field_indices, u16, set_pattern_field_index)
             opt(cast_target_types, String, set_cast_target_type)
             opt(memo_infos, MemoInfo, set_memo_info)
@@ -2094,6 +2110,7 @@ macro_rules! node_metadata {
             opt(global_load_slots, u32, set_global_load_slot)
             opt(global_store_slots, u32, set_global_store_slot)
             opt(pattern_ctor_names, String, set_pattern_ctor_name)
+            opt(pattern_type_names, String, set_pattern_type_name)
             opt(pattern_field_indices, u16, set_pattern_field_index)
             opt(cast_target_types, String, set_cast_target_type)
             opt(memo_infos, MemoInfo, set_memo_info)
@@ -2242,6 +2259,10 @@ pub struct DataFlowGraph {
     pub global_store_slots: Vec<Option<u32>>,
     /// Pattern matching: constructor name stored by constructor-name discrimination nodes (indexed by NodeId).
     pub pattern_ctor_names: Vec<Option<String>>,
+    /// Pattern matching: type name of the constructor's owning type (indexed by NodeId).
+    /// Used together with `pattern_ctor_names` to disambiguate same-named constructors
+    /// across different types (e.g. `FileKind.File` vs `File`).
+    pub pattern_type_names: Vec<Option<String>>,
     /// Pattern matching: field index for ADT positional field extraction nodes (indexed by NodeId).
     pub pattern_field_indices: Vec<Option<u16>>,
     /// Target type name for general cast nodes (indexed by NodeId; None for non-cast nodes).
@@ -2315,6 +2336,7 @@ impl DataFlowGraph {
             global_load_slots: Vec::new(),
             global_store_slots: Vec::new(),
             pattern_ctor_names: Vec::new(),
+            pattern_type_names: Vec::new(),
             pattern_field_indices: Vec::new(),
             cast_target_types: Vec::new(),
             ir_errors: Vec::new(),
@@ -2550,6 +2572,7 @@ impl DataFlowGraph {
         hash_opt!(global_load_slots);
         hash_opt!(global_store_slots);
         hash_opt!(pattern_ctor_names);
+        hash_opt!(pattern_type_names);
         hash_opt!(pattern_field_indices);
         hash_opt!(cast_target_types);
 
@@ -2774,6 +2797,7 @@ impl DataFlowGraph {
         compress_opt!(global_load_slots);
         compress_opt!(global_store_slots);
         compress_opt!(pattern_ctor_names);
+        compress_opt!(pattern_type_names);
         compress_opt!(pattern_field_indices);
         compress_opt!(cast_target_types);
         compress_opt!(memo_infos);

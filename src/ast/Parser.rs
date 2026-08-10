@@ -2166,6 +2166,16 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                         return Ok(def);
                     }
                     self.current = saved;
+                } else {
+                    // Bug #69: Empty parens `Name()` — try single-constructor ADT.
+                    // Without this, `type Unit = Unit()` falls through to the alias path
+                    // (parsing `Unit()` as a type expression), and the constructor is never
+                    // registered.
+                    self.current = saved;
+                    if let Some(def) = self.try_parse_single_ctor_adt() {
+                        return Ok(def);
+                    }
+                    self.current = saved;
                 }
             }
             self.current = saved;
@@ -2793,7 +2803,33 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     /// Parse a primary type: named/generic, with suffix array `[N]`
     fn parse_primary_type(&mut self) -> ParseResult<TypeRef> {
         if self.check(TokenKind::LParen) {
-            return self.parse_record_type();
+            // Bug #68: 支持 `(type)` 括号包裹的类型表达式（如 `((i32) -> i32)[]`）。
+            // 当括号内不是 record 字段模式（`identifier :`）时，解析为括号包裹的类型。
+            if self.is_paren_record_type() {
+                return self.parse_record_type();
+            }
+            // 括号包裹的类型表达式：(T)
+            let span = token_span(&self.peek());
+            self.advance(); // '('
+            let inner = self.parse_type()?;
+            let _ = self.expect(TokenKind::RParen, "expected ')'");
+            let mut ty = inner;
+            // Suffix array type T[N]
+            while self.match_token(TokenKind::LBracket) {
+                let mut size: Option<u64> = None;
+                if !self.check(TokenKind::RBracket) {
+                    let size_tok = self.expect(TokenKind::IntLiteral, "expected array size")?;
+                    size = Some(parse_u64(size_tok.lexeme).ok_or_else(|| {
+                        self.report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")
+                    })?);
+                }
+                let _ = self.expect(TokenKind::RBracket, "expected ']'");
+                ty = self.alloc_type(span, TypeNode::Array {
+                    element_type: ty,
+                    size,
+                });
+            }
+            return Ok(ty);
         }
         let name_tok = self.expect(TokenKind::Identifier, "expected type name")?;
         let span = token_span(&name_tok);
@@ -2832,6 +2868,28 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             });
         }
         Ok(ty)
+    }
+
+    /// Lookahead: 判断括号内是否是 record 字段模式（`identifier :`）。
+    /// 用于区分 `(field: Type, ...)` record 类型和 `(T)` 括号包裹的类型表达式。
+    fn is_paren_record_type(&self) -> bool {
+        let mut i = self.current;
+        if i >= self.tokens.len() || self.tokens[i].kind != TokenKind::LParen {
+            return false;
+        }
+        i += 1; // skip '('
+        // 空括号 `()` 不是 record 类型（是空 record 或空类型）
+        if i >= self.tokens.len() || self.tokens[i].kind == TokenKind::RParen {
+            return false;
+        }
+        // 检查 `identifier :` 模式
+        if self.tokens[i].kind == TokenKind::Identifier {
+            let next = i + 1;
+            if next < self.tokens.len() && self.tokens[next].kind == TokenKind::Colon {
+                return true;
+            }
+        }
+        false
     }
 
     /// Parse a record type: `(field: Type, ...)`
@@ -3415,6 +3473,16 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     i += 1;
                 }
                 let expr_text = &content[expr_start..i - 1];
+                // Bug #70: Empty interpolation `{}` — report a clear error instead of
+                // silently failing inside parse_interpolation_expr (which truncates errors).
+                if expr_text.trim().is_empty() {
+                    let span = token_span(&tok);
+                    return Err(ParseError {
+                        line: span.line,
+                        column: span.column + i as u32,
+                        message: "empty interpolation expression in string literal; use {{}} for literal braces".to_string(),
+                    });
+                }
                 // Bug #54: the interpolation expression text may contain escape sequences from the
                 // outer string (e.g. \"); unescape it before passing to parse_interpolation_expr.
                 let unescaped_expr = self.unescape_string(expr_text);

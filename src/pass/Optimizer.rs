@@ -585,7 +585,7 @@ pub fn pass_dce(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &Fx
         if live.contains(&id) { continue; }
         if !ctx.is_live(id) { continue; }
         let is_pure_calc = match node.kind {
-            NodeKind::BinOp | NodeKind::UnOp | NodeKind::FieldAccess => {
+            NodeKind::BinOp | NodeKind::TriOp | NodeKind::UnOp | NodeKind::FieldAccess => {
                 pure_set.contains(&node.compute_fn)
             }
             NodeKind::Const | NodeKind::Call | NodeKind::Gate
@@ -1591,7 +1591,7 @@ fn collect_inline_candidates(graph: &DataFlowGraph) -> Vec<InlineCandidate> {
             let cn = &graph.nodes[cidx];
             if !matches!(
                 cn.kind,
-                NodeKind::Const | NodeKind::BinOp | NodeKind::UnOp | NodeKind::FieldAccess
+                NodeKind::Const | NodeKind::BinOp | NodeKind::TriOp | NodeKind::UnOp | NodeKind::FieldAccess
             ) {
                 safe_body = false;
                 break;

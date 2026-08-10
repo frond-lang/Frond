@@ -8,7 +8,7 @@ use super::Arena::*;
 use std::fmt;
 
 /// Formatting wrapper for `Ty`: a `type_var` follows the `bound` chain to display the
-/// final type; an unbound variable is displayed as `'_<idx>`.
+/// final type; an unbound variable is displayed as `'_` (hiding the internal index).
 pub struct TypeDisplay<'a> {
     pub arena: &'a TypeArena,
     pub ty: TypeHandle,
@@ -19,7 +19,7 @@ impl fmt::Display for TypeDisplay<'_> {
         let resolved = self.arena.resolve(self.ty);
         let t = self.arena.get(resolved);
         match t {
-            Ty::TypeVar(idx) => write!(f, "'_{}", idx),
+            Ty::TypeVar(_) => f.write_str("'_"),
             Ty::Void => f.write_str("void"),
             Ty::Never => f.write_str("!"),
             Ty::Unknown => f.write_str("?"),

@@ -18,7 +18,7 @@
 //! (`TypeRef`, referenced only by the GADT backtrack field of `CtorDefInfo`).
 
 use crate::ast::Ast::{
-    AstArena, Decl, TypeNode, TypeRef as AstTypeRef,
+    AstArena, Decl, TypeNode, TypeRef as AstTypeRef, Span,
 };
 use crate::types::{
     FIRST_DYNAMIC_TYPE_ID, type_def_index_of,
@@ -256,6 +256,10 @@ pub struct CtorDefInfo {
     /// composite types such as Array, Nullable, and Ref).
     /// Length matches `field_names`.
     pub field_type_reprs: Box<[TypeRepr]>,
+    /// Source span of the type declaration that defines this constructor.
+    pub def_span: Span,
+    /// Module path of the type declaration that defines this constructor.
+    pub def_module: Box<str>,
 }
 
 /// Signature info for a type's methods, indexed by `method_idx` (the position in
@@ -295,6 +299,9 @@ pub enum IntrinsicKind {
     ChannelAwait,
     /// Binary operation (recv + 1 argument): send(value) → `compute_fn(idx)`.
     BinOp(u32),
+    /// Ternary operation (recv + 2 arguments): atomic.compare_exchange(expected, new) →
+    /// `compute_fn(idx)`.
+    TriOp(u32),
 }
 
 /// Replaces the legacy `func_sigs` mangled-name ("TypeName.method") registration,
@@ -506,6 +513,11 @@ pub struct SemaError {
     pub message: Box<str>,
     pub line: u32,
     pub column: u32,
+    /// Optional file path override: when set, diagnostics print this path instead
+    /// of the module-check loop's path. Used by cross-module checks (e.g.
+    /// `check_duplicate_constructors`) where the warning originates from a
+    /// different module than the one currently being checked.
+    pub file_path: Option<Box<str>>,
 }
 
 impl SemaError {
@@ -514,6 +526,17 @@ impl SemaError {
             message: message.into(),
             line,
             column,
+            file_path: None,
+        }
+    }
+
+    /// Create a `SemaError` with an explicit file path override.
+    pub fn new_with_path(message: &str, file_path: &str, line: u32, column: u32) -> Self {
+        SemaError {
+            message: message.into(),
+            line,
+            column,
+            file_path: Some(file_path.into()),
         }
     }
 }
@@ -551,8 +574,10 @@ pub struct SemaResult {
     pub func_sig_index: FxHashMap<String, u16>,
     /// Coroutine metadata table.
     pub coroutine_metas: Vec<CoroutineMeta>,
-    /// Constructor name → (type_def_index << 16 | ctor_index).
-    pub ctor_def_index: FxHashMap<String, u32>,
+    /// Constructor name → list of (type_def_index << 16 | ctor_index).
+    /// Supports multiple types having same-named constructors (e.g. `FileKind.File`
+    /// and `type File`); disambiguation is done by type context or qualified names.
+    pub ctor_def_index: FxHashMap<String, Vec<u32>>,
     /// Import alias table: short name → alias target.
     pub import_aliases: FxHashMap<String, AliasTarget>,
     /// Monomorphization instance table.
@@ -604,6 +629,10 @@ pub struct SemaResult {
     /// global-variable access and preventing the module name from being compiled
     /// into a zombie Const node.
     pub module_const_recv_exprs: FxHashMap<u64, String>,
+    /// Pattern constructor disambiguation results: (module_name, pattern_id) → type_name.
+    /// Stored by sema when multiple types share the same constructor name; the IR
+    /// builder queries this to set `pattern_type_names` for runtime disambiguation.
+    pub pattern_ctor_types: FxHashMap<(String, u32), Box<str>>,
 }
 
 impl Default for SemaResult {
@@ -666,6 +695,7 @@ impl SemaResult {
             witness_table: WitnessTable::new(),
             module_func_recv_exprs: FxHashSet::default(),
             module_const_recv_exprs: FxHashMap::default(),
+            pattern_ctor_types: FxHashMap::default(),
         }
     }
 
@@ -716,13 +746,10 @@ impl SemaResult {
     /// automatically populating `field_id_map` as well.
     ///
     /// Returns `false` on a type-name conflict (same-named types cannot be
-    /// redefined). On a constructor-name conflict, the conflicting constructor is
-    /// skipped (not registered in `ctor_def_index`), but the remaining
-    /// constructors and the type definition itself are still registered,
-    /// returning `true`. This handles cases where type names and constructor
-    /// names share a namespace (e.g. `File` is both a newtype type name and a
-    /// `FileKind` ADT variant name), ensuring non-conflicting variants (e.g.
-    /// `Directory`) are still registered normally.
+    /// redefined). Constructor names are allowed to conflict across different
+    /// types: all matching constructors are registered in `ctor_def_index`
+    /// (multi-map), and disambiguation is deferred to type-context resolution
+    /// or qualified-name syntax (`Type.Ctor`).
     pub fn put_type_def(&mut self, def: TypeDefInfo) -> bool {
         // u16 index overflow check (aligned with register in TypeDesc.rs).
         assert!(
@@ -734,16 +761,15 @@ impl SemaResult {
         if self.type_def_index.contains_key(def.name.as_ref()) {
             return false;
         }
-        // Constructor-name conflict: skip that constructor and continue with the
-        // rest.
         self.populate_field_ids(&def);
+        // Register all constructors (same-named constructors across different
+        // types are appended to the multi-map entry).
         for (ci, ctor) in def.constructors.iter().enumerate() {
-            if self.ctor_def_index.contains_key(ctor.name.as_ref()) {
-                continue;
-            }
             let packed_idx: u32 = ((idx as u32) << 16) | (ci as u32);
             self.ctor_def_index
-                .insert(ctor.name.to_string(), packed_idx);
+                .entry(ctor.name.to_string())
+                .or_default()
+                .push(packed_idx);
         }
         self.type_def_index.insert(def.name.to_string(), idx);
         self.type_defs.push(def);
@@ -819,12 +845,34 @@ impl SemaResult {
     }
 
     /// Look up a constructor definition by constructor name.
+    /// Returns the first match when multiple types share the same constructor
+    /// name; use `get_ctor_defs` for disambiguation.
     pub fn get_ctor_def(&self, name: &str) -> Option<&CtorDefInfo> {
-        let packed_idx = *self.ctor_def_index.get(name)?;
-        let type_idx = (packed_idx >> 16) as u16;
-        let ctor_idx = (packed_idx & 0xFFFF) as u16;
+        let packed_idx = self.ctor_def_index.get(name)?.first()?;
+        let type_idx = (*packed_idx >> 16) as u16;
+        let ctor_idx = (*packed_idx & 0xFFFF) as u16;
         let def = self.type_defs.get(type_idx as usize)?;
         def.constructors.get(ctor_idx as usize)
+    }
+
+    /// Look up all constructor definitions matching a constructor name.
+    /// Returns an empty slice when no match is found; returns multiple entries
+    /// when different types share the same constructor name (e.g. `FileKind.File`
+    /// and `type File`).
+    pub fn get_ctor_defs(&self, name: &str) -> Vec<&CtorDefInfo> {
+        match self.ctor_def_index.get(name) {
+            Some(indices) => indices
+                .iter()
+                .filter_map(|&packed_idx| {
+                    let type_idx = (packed_idx >> 16) as u16;
+                    let ctor_idx = (packed_idx & 0xFFFF) as u16;
+                    self.type_defs
+                        .get(type_idx as usize)
+                        .and_then(|def| def.constructors.get(ctor_idx as usize))
+                })
+                .collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Resolve a record/ADT field type descriptor.
@@ -1035,10 +1083,10 @@ define_builtin_types! {
             sig("close", vec![TypeRepr::SelfType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
         ],
         "Atomic" : ["T"] = [
-            sig("swap", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("T".into())), None),
-            sig("cas", vec![TypeRepr::SelfType, TypeRepr::Named("T".into()), TypeRepr::Named("T".into())], Some(TypeRepr::Named("bool".into())), None),
-            sig("load", vec![TypeRepr::SelfType], Some(TypeRepr::Named("T".into())), None),
-            sig("store", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), None),
+            sig("swap", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::BinOp(317))),
+            sig("compare_exchange", vec![TypeRepr::SelfType, TypeRepr::Named("T".into()), TypeRepr::Named("T".into())], Some(TypeRepr::Named("bool".into())), Some(IntrinsicKind::TriOp(318))),
+            sig("load", vec![TypeRepr::SelfType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::UnOp(315))),
+            sig("store", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(316))),
         ],
         "Async" : ["T"] = [
             sig("status", vec![TypeRepr::SelfType], Some(TypeRepr::Named("str".into())), None),
@@ -1443,13 +1491,14 @@ pub fn populate_sema_result_from_ast<'a>(
     sema_result: &mut SemaResult,
     decl: &'a crate::ast::Ast::Spanned<Decl<'a>>,
     ast: &AstArena<'a>,
+    module_name: &str,
 ) -> bool {
     match &decl.node {
         Decl::FunDecl { name, type_params, params, return_type, is_async, .. } => {
             ast_fun_decl_to_func_sig(arena, sema_result, name, type_params, params, *return_type, *is_async, ast)
         }
         Decl::TypeDecl { name, type_params, def, methods, .. } => {
-            ast_type_decl_to_type_def(arena, sema_result, name, type_params, def, ast);
+            ast_type_decl_to_type_def(arena, sema_result, name, type_params, def, ast, decl.span, module_name);
             // Register methods inside the type block into
             // TypeDefInfo.methods (indexed by method_idx).
             for method in methods.iter() {
@@ -1476,7 +1525,7 @@ pub fn populate_module<'a>(
 ) -> bool {
     let mut ok = true;
     for decl in &module.declarations {
-        if !populate_sema_result_from_ast(arena, sema_result, decl, &module.arena) {
+        if !populate_sema_result_from_ast(arena, sema_result, decl, &module.arena, module.name) {
             ok = false;
         }
     }
@@ -1706,6 +1755,8 @@ pub(crate) fn ast_type_decl_to_type_def<'a>(
     type_params: &[crate::ast::Ast::TypeParam<'a>],
     def: &AstTypeDef<'a>,
     ast: &AstArena<'a>,
+    def_span: Span,
+    def_module: &str,
 ) -> bool {
     let name: Box<str> = name.into();
     let type_params: Box<[Box<str>]> = type_params.iter().map(|tp| tp.name.into()).collect();
@@ -1714,12 +1765,12 @@ pub(crate) fn ast_type_decl_to_type_def<'a>(
         AstTypeDef::Adt { constructors: ctor_defs } => {
             let ctors: Vec<CtorDefInfo> = ctor_defs
                 .iter()
-                .map(|c| constructor_def_to_ctor_info(arena, c, name.as_ref(), ast, sema_result))
+                .map(|c| constructor_def_to_ctor_info(arena, c, name.as_ref(), ast, sema_result, def_span, def_module))
                 .collect();
             (TypeDefKind::Adt, ctors, None, None)
         }
         AstTypeDef::Record { fields } => {
-            let ctor = record_fields_to_ctor_info(arena, fields, name.as_ref(), ast, sema_result);
+            let ctor = record_fields_to_ctor_info(arena, fields, name.as_ref(), ast, sema_result, def_span, def_module);
             (TypeDefKind::Record, vec![ctor], None, None)
         }
         AstTypeDef::Alias { target } => {
@@ -1745,6 +1796,8 @@ pub(crate) fn ast_type_decl_to_type_def<'a>(
                 return_type_name: None,
                 return_type_node: None,
                 field_type_reprs: Box::new([target_repr]),
+                def_span,
+                def_module: def_module.into(),
             };
             (
                 TypeDefKind::Newtype,
@@ -1933,6 +1986,8 @@ fn constructor_def_to_ctor_info<'a>(
     type_name: &str,
     ast: &AstArena<'a>,
     sema_result: &mut SemaResult,
+    def_span: Span,
+    def_module: &str,
 ) -> CtorDefInfo {
     let mut field_names: Vec<Option<Box<str>>> = Vec::with_capacity(c.fields.len());
     let mut field_types: Vec<TypeHandle> = Vec::with_capacity(c.fields.len());
@@ -1954,6 +2009,8 @@ fn constructor_def_to_ctor_info<'a>(
         return_type_name: None,
         return_type_node: c.return_type,
         field_type_reprs: field_type_reprs.into_boxed_slice(),
+        def_span,
+        def_module: def_module.into(),
     }
 }
 
@@ -1965,6 +2022,8 @@ fn record_fields_to_ctor_info<'a>(
     type_name: &str,
     ast: &AstArena<'a>,
     sema_result: &mut SemaResult,
+    def_span: Span,
+    def_module: &str,
 ) -> CtorDefInfo {
     let mut field_names: Vec<Option<Box<str>>> = Vec::with_capacity(fields.len());
     let mut field_types: Vec<TypeHandle> = Vec::with_capacity(fields.len());
@@ -1986,6 +2045,8 @@ fn record_fields_to_ctor_info<'a>(
         return_type_name: None,
         return_type_node: None,
         field_type_reprs: field_type_reprs.into_boxed_slice(),
+        def_span,
+        def_module: def_module.into(),
     }
 }
 

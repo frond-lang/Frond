@@ -274,6 +274,7 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
     ser_str_table!(sections, n, graph, ffi_call_names, FfiCallNames, string_pool);
     ser_str_table!(sections, n, graph, field_set_names, FieldSetNames, string_pool);
     ser_str_table!(sections, n, graph, pattern_ctor_names, PatternCtorNames, string_pool);
+    ser_str_table!(sections, n, graph, pattern_type_names, PatternTypeNames, string_pool);
     ser_str_table!(sections, n, graph, cast_target_types, CastTargetTypes, string_pool);
 
     // ---- per-Node fixed-width composite tables (category D) ----
@@ -787,6 +788,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     let ffi_call_names = read_str_vec(SectionKind::FfiCallNames);
     let field_set_names = read_str_vec(SectionKind::FieldSetNames);
     let pattern_ctor_names = read_str_vec(SectionKind::PatternCtorNames);
+    let pattern_type_names = read_str_vec(SectionKind::PatternTypeNames);
     let cast_target_types = read_str_vec(SectionKind::CastTargetTypes);
 
     // ---- per-Node fixed-width composite tables (category D) ----
@@ -1105,6 +1107,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         global_load_slots,
         global_store_slots,
         pattern_ctor_names,
+        pattern_type_names,
         pattern_field_indices,
         cast_target_types,
         memo_infos,
@@ -1399,6 +1402,7 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         global_load_slots: Vec::new(),
         global_store_slots: Vec::new(),
         pattern_ctor_names: Vec::new(),
+        pattern_type_names: Vec::new(),
         pattern_field_indices: Vec::new(),
         cast_target_types: Vec::new(),
         memo_infos: Vec::new(),
@@ -1748,6 +1752,7 @@ mod round_trip_tests {
             None, None, None, None, None,
             Some("Some".to_string()),
         ];
+        let pattern_type_names: Vec<Option<String>> = vec![None; 16];
         let cast_target_types = vec![
             None, None, None, None, None, None, None, None, None, None,
             None, None, None,
@@ -1876,6 +1881,7 @@ mod round_trip_tests {
             global_load_slots,
             global_store_slots,
             pattern_ctor_names,
+            pattern_type_names,
             pattern_field_indices,
             cast_target_types,
             memo_infos,
@@ -1981,6 +1987,7 @@ mod round_trip_tests {
         assert_eq!(a.ffi_call_names, b.ffi_call_names, "{}: ffi_call_names", ctx);
         assert_eq!(a.field_set_names, b.field_set_names, "{}: field_set_names", ctx);
         assert_eq!(a.pattern_ctor_names, b.pattern_ctor_names, "{}: pattern_ctor_names", ctx);
+        assert_eq!(a.pattern_type_names, b.pattern_type_names, "{}: pattern_type_names", ctx);
         assert_eq!(a.cast_target_types, b.cast_target_types, "{}: cast_target_types", ctx);
 
         // ---- Category D tables ----
@@ -2281,6 +2288,7 @@ mod round_trip_tests {
                 global_load_slots: vec![None],
                 global_store_slots: vec![None],
                 pattern_ctor_names: vec![None],
+                pattern_type_names: vec![None],
                 pattern_field_indices: vec![None],
                 cast_target_types: vec![None],
                 memo_infos: vec![None],
@@ -2374,6 +2382,7 @@ mod round_trip_tests {
                 global_load_slots: vec![None],
                 global_store_slots: vec![None],
                 pattern_ctor_names: vec![None],
+                pattern_type_names: vec![None],
                 pattern_field_indices: vec![None],
                 cast_target_types: vec![None],
                 memo_infos: vec![None],
@@ -2455,6 +2464,7 @@ mod round_trip_tests {
             global_load_slots: vec![],
             global_store_slots: vec![],
             pattern_ctor_names: vec![],
+            pattern_type_names: vec![],
             pattern_field_indices: vec![],
             cast_target_types: vec![],
             memo_infos: vec![],
@@ -2526,6 +2536,7 @@ mod round_trip_tests {
                     global_load_slots: vec![None; n],
                     global_store_slots: vec![None; n],
                     pattern_ctor_names: vec![None; n],
+                    pattern_type_names: vec![None; n],
                     pattern_field_indices: vec![None; n],
                     cast_target_types: vec![None; n],
                     memo_infos: vec![None; n],

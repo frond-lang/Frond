@@ -583,7 +583,8 @@ fn run_sema_pipeline(
             eprintln!("{}:{}:{}: {}", path, err.line, err.column, err.message);
         }
         for warn in &ctx.sema_result.warnings[prev_warn_len..] {
-            eprintln!("{}:{}:{}: warning: {}", path, warn.line, warn.column, warn.message);
+            let wp = warn.file_path.as_deref().map(|s| s as &str).unwrap_or(path);
+            eprintln!("{}:{}:{}: warning: {}", wp, warn.line, warn.column, warn.message);
         }
         prev_err_len = ctx.sema_result.errors.len();
         prev_warn_len = ctx.sema_result.warnings.len();
@@ -595,7 +596,8 @@ fn run_sema_pipeline(
                 eprintln!("{}:{}:{}: {}", key, err.line, err.column, err.message);
             }
             for warn in &ctx.sema_result.warnings[prev_warn_len..] {
-                eprintln!("{}:{}:{}: warning: {}", key, warn.line, warn.column, warn.message);
+                let wp = warn.file_path.as_deref().map(|s| s as &str).unwrap_or(key);
+                eprintln!("{}:{}:{}: warning: {}", wp, warn.line, warn.column, warn.message);
             }
             prev_err_len = ctx.sema_result.errors.len();
             prev_warn_len = ctx.sema_result.warnings.len();
@@ -608,7 +610,8 @@ fn run_sema_pipeline(
                 eprintln!("{}:{}:{}: {}", k, err.line, err.column, err.message);
             }
             for warn in &ctx.sema_result.warnings[prev_warn_len..] {
-                eprintln!("{}:{}:{}: warning: {}", k, warn.line, warn.column, warn.message);
+                let wp = warn.file_path.as_deref().map(|s| s as &str).unwrap_or(k);
+                eprintln!("{}:{}:{}: warning: {}", wp, warn.line, warn.column, warn.message);
             }
             prev_err_len = ctx.sema_result.errors.len();
             prev_warn_len = ctx.sema_result.warnings.len();
@@ -619,7 +622,8 @@ fn run_sema_pipeline(
         eprintln!("{}:{}:{}: {}", entry_filename, err.line, err.column, err.message);
     }
     for warn in &ctx.sema_result.warnings[prev_warn_len..] {
-        eprintln!("{}:{}:{}: warning: {}", entry_filename, warn.line, warn.column, warn.message);
+        let wp = warn.file_path.as_deref().map(|s| s as &str).unwrap_or(entry_filename);
+        eprintln!("{}:{}:{}: warning: {}", wp, warn.line, warn.column, warn.message);
     }
 
     if !ctx.sema_result.errors.is_empty() {

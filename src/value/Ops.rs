@@ -171,8 +171,14 @@ macro_rules! impl_bitops {
                 fn bit_or(self, other: Self) -> Self { self | other }
                 fn bit_xor(self, other: Self) -> Self { self ^ other }
                 fn bit_not(self) -> Self { !self }
-                fn shl(self, amount: u32) -> Self { self.wrapping_shl(amount) }
-                fn shr(self, amount: u32) -> Self { self.wrapping_shr(amount) }
+                fn shl(self, amount: u32) -> Self {
+                    if amount >= Self::BITS { panic!("shift amount out of range: {} >= {} bits", amount, Self::BITS) }
+                    self.wrapping_shl(amount)
+                }
+                fn shr(self, amount: u32) -> Self {
+                    if amount >= Self::BITS { panic!("shift amount out of range: {} >= {} bits", amount, Self::BITS) }
+                    self.wrapping_shr(amount)
+                }
             }
         )*
     };
@@ -881,8 +887,14 @@ fn binop_i32_scalar(a: i32, b: i32, op: BinOp) -> i32 {
         BinOp::Band => a & b,
         BinOp::Bor => a | b,
         BinOp::Bxor => a ^ b,
-        BinOp::Shl => a.wrapping_shl(b as u32),
-        BinOp::Shr => a.wrapping_shr(b as u32),
+        BinOp::Shl => {
+            if b < 0 || b as u32 >= i32::BITS { panic!("shift amount out of range: {} >= {} bits", b, i32::BITS) }
+            a.wrapping_shl(b as u32)
+        }
+        BinOp::Shr => {
+            if b < 0 || b as u32 >= i32::BITS { panic!("shift amount out of range: {} >= {} bits", b, i32::BITS) }
+            a.wrapping_shr(b as u32)
+        }
     }
 }
 
@@ -956,8 +968,14 @@ fn binop_i64_scalar(a: i64, b: i64, op: BinOp) -> i64 {
         BinOp::Band => a & b,
         BinOp::Bor => a | b,
         BinOp::Bxor => a ^ b,
-        BinOp::Shl => a.wrapping_shl(b as u32),
-        BinOp::Shr => a.wrapping_shr(b as u32),
+        BinOp::Shl => {
+            if b < 0 || b as u32 >= i64::BITS { panic!("shift amount out of range: {} >= {} bits", b, i64::BITS) }
+            a.wrapping_shl(b as u32)
+        }
+        BinOp::Shr => {
+            if b < 0 || b as u32 >= i64::BITS { panic!("shift amount out of range: {} >= {} bits", b, i64::BITS) }
+            a.wrapping_shr(b as u32)
+        }
     }
 }
 
@@ -1126,8 +1144,14 @@ macro_rules! impl_simd_int_binop {
                 BinOp::Band => a & b,
                 BinOp::Bor => a | b,
                 BinOp::Bxor => a ^ b,
-                BinOp::Shl => a.wrapping_shl(b as u32),
-                BinOp::Shr => a.wrapping_shr(b as u32),
+                BinOp::Shl => {
+                    if b < 0 || b as u32 >= <$ty>::BITS { panic!("shift amount out of range: {} >= {} bits", b, <$ty>::BITS) }
+                    a.wrapping_shl(b as u32)
+                }
+                BinOp::Shr => {
+                    if b < 0 || b as u32 >= <$ty>::BITS { panic!("shift amount out of range: {} >= {} bits", b, <$ty>::BITS) }
+                    a.wrapping_shr(b as u32)
+                }
             }
         }
 
@@ -1201,8 +1225,14 @@ macro_rules! impl_simd_int_binop_no_mul {
                 BinOp::Band => a & b,
                 BinOp::Bor => a | b,
                 BinOp::Bxor => a ^ b,
-                BinOp::Shl => a.wrapping_shl(b as u32),
-                BinOp::Shr => a.wrapping_shr(b as u32),
+                BinOp::Shl => {
+                    if b < 0 || b as u32 >= <$ty>::BITS { panic!("shift amount out of range: {} >= {} bits", b, <$ty>::BITS) }
+                    a.wrapping_shl(b as u32)
+                }
+                BinOp::Shr => {
+                    if b < 0 || b as u32 >= <$ty>::BITS { panic!("shift amount out of range: {} >= {} bits", b, <$ty>::BITS) }
+                    a.wrapping_shr(b as u32)
+                }
             }
         }
 
@@ -1431,8 +1461,18 @@ macro_rules! impl_arith_int {
             #[inline] pub fn [<arith_bitand_$ty>](a: $rust, b: $rust) -> $rust { a & b }
             #[inline] pub fn [<arith_bitor_$ty>](a: $rust, b: $rust) -> $rust { a | b }
             #[inline] pub fn [<arith_bitxor_$ty>](a: $rust, b: $rust) -> $rust { a ^ b }
-            #[inline] pub fn [<arith_shl_$ty>](a: $rust, shift: i32) -> $rust { a.wrapping_shl(shift as u32) }
-            #[inline] pub fn [<arith_shr_$ty>](a: $rust, shift: i32) -> $rust { a.wrapping_shr(shift as u32) }
+            #[inline] pub fn [<arith_shl_$ty>](a: $rust, shift: i32) -> $rust {
+                if shift < 0 || shift as u32 >= <$rust>::BITS {
+                    panic!("shift amount out of range: {} >= {} bits", shift, <$rust>::BITS)
+                }
+                a.wrapping_shl(shift as u32)
+            }
+            #[inline] pub fn [<arith_shr_$ty>](a: $rust, shift: i32) -> $rust {
+                if shift < 0 || shift as u32 >= <$rust>::BITS {
+                    panic!("shift amount out of range: {} >= {} bits", shift, <$rust>::BITS)
+                }
+                a.wrapping_shr(shift as u32)
+            }
             #[inline] pub fn [<arith_neg_$ty>](a: $rust) -> $rust {
                 if cfg!(debug_assertions) { a.checked_neg().expect("integer overflow in negation") } else { a.wrapping_neg() }
             }

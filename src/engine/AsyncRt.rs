@@ -323,8 +323,9 @@ impl<S: LockStrategy> Engine<S> {
     }
 
     /// Injects the event value into the waiting frame and wakes it (sets Ready + pushes to the
-    /// ready queue + notifies downstream). For select frames, re-pushes the gate node (no value
-    /// injected); for ordinary await frames, injects the event value. Returns true on successful
+    /// ready queue + notifies downstream). For select frames and channel-await frames, re-pushes
+    /// the await node (no value injected) so compute_await re-executes and reads the actual channel
+    /// data; for other ordinary await frames, injects the event value. Returns true on successful
     /// handling, false if the frame is not in the WaitingEvent state (already woken by another
     /// event). Shared by on_event_arrived and the pending_events consumption in process_frame.
     pub(super) fn apply_event_to_frame(&self, frame: &mut Frame, value: Value) -> bool {
@@ -337,7 +338,15 @@ impl<S: LockStrategy> Engine<S> {
 
         // select frame (gate node has SelectInfo): re-push the gate node, do not inject a value.
         let is_select = self.graph.has_select_info(await_graph_id.0 as usize);
-        if is_select {
+        // Channel await: the ChannelReady event carries VOID (not the recv'd value).
+        // Re-push the await node so compute_await re-executes ChannelSource::resolve,
+        // which calls ch.recv() to obtain the actual value. If the channel is empty
+        // (data consumed by another waiter), the frame re-suspends and re-registers.
+        let is_channel_await = matches!(
+            frame.suspend_event,
+            Some(RuntimeEvent::ChannelReady(_))
+        );
+        if is_select || is_channel_await {
             frame.state = FrameState::Ready;
             frame.suspend_state = SuspendState::NotSuspended;
             frame.suspend_event = None;

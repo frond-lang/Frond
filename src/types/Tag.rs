@@ -195,7 +195,7 @@ pub enum TypeFamily {
     Async,
     /// `Lazy<T>`.
     Lazy,
-    /// `Atomic<T>` (dispatched via swap/cas/load/store).
+    /// `Atomic<T>` (dispatched via swap/compare_exchange/load/store).
     Atomic,
     /// `Sender<T>`.
     Sender,
