@@ -424,6 +424,8 @@ compute_fn_ids! {
     316 => CF_ATOMIC_STORE,
     317 => CF_ATOMIC_SWAP,
     318 => CF_ATOMIC_COMPARE_EXCHANGE,
+    319 => CF_STR_MULTI_CONCAT,
+    320 => CF_STR_ARRAY_JOIN,
 }
 
 // =========================================================================
@@ -1953,6 +1955,10 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         316 => super::Compute::compute_atomic_store,
         317 => super::Compute::compute_atomic_swap,
         318 => super::Compute::compute_atomic_compare_exchange,
+        // Multi-input string concat (319): one-shot O(n) concat for string interpolation
+        319 => super::Compute::compute_str_multi_concat,
+        // Array join (320): str[] + sep → str, one-shot O(n) concat
+        320 => super::Compute::compute_str_array_join,
     };
     // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
     // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values

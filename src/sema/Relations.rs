@@ -520,7 +520,7 @@ pub fn check_type_node(
                 ));
             }
         }
-        TypeNode::SelfType => {}
+        TypeNode::ThisType => {}
         TypeNode::Generic { name, args } => {
             if !is_type_param(name, type_param_names) {
                 let arity = arity_of_type_name(sema_result, name);

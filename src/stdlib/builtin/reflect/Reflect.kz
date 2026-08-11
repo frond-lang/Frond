@@ -11,7 +11,7 @@
 //   val tn = type_name(x)         // 任意值 → 类型名 (str)
 //   val info = typeof(Point)      // 类型 → TypeInfo record（编译期反射）
 //   val info = typeof(T)          // 泛型参数 → TypeInfo（单态化后查表）
-//   val info = typeof(Self)       // trait default 中 → TypeInfo
+//   val info = typeof(This)       // trait default 中 → TypeInfo
 //   val info = typeof(T?)         // nullable → TypeInfo（kind="Nullable"）
 
 // ─── 类型反射类型定义 ─────────────────────────────────────────────
@@ -42,39 +42,39 @@ type TypeInfo = TypeInfo(
 // ─── Reflect 内建类型：包装 Value ──────────────────────────────
 type Reflect = Reflect(inner: Value) {
     // ─── 类型元信息方法 ───────────────────────────────────────────
-    pub fun kind(self): u8 {
-        __reflect_kind(self.inner)
+    pub fun kind(): u8 {
+        __reflect_kind(inner)
     }
 
-    pub fun type_name(self): str {
-        __reflect_type_name(self.inner)
+    pub fun type_name(): str {
+        __reflect_type_name(inner)
     }
 
-    pub fun size(self): u8 {
-        __reflect_size(self.inner)
+    pub fun size(): u8 {
+        __reflect_size(inner)
     }
 
-    pub fun field_count(self): u16 {
-        __reflect_field_count(self.inner)
+    pub fun field_count(): u16 {
+        __reflect_field_count(inner)
     }
 
     // ─── 字段元信息方法 ───────────────────────────────────────────
-    pub fun field_name(self, index: u16): str {
-        __reflect_field_name(self.inner, index)
+    pub fun field_name(index: u16): str {
+        __reflect_field_name(inner, index)
     }
 
-    pub fun field_value(self, index: u16): Reflect {
-        Reflect(__reflect_field_value(self.inner, index))
+    pub fun field_value(index: u16): Reflect {
+        Reflect(__reflect_field_value(inner, index))
     }
 
     // ─── 数组长度 ─────────────────────────────────────────────────
-    pub fun array_len(self): usize {
-        __reflect_array_len(self.inner)
+    pub fun array_len(): usize {
+        __reflect_array_len(inner)
     }
 
     // ─── ADT 构造器名 ─────────────────────────────────────────────
-    pub fun adt_constructor(self): str {
-        __reflect_adt_constructor(self.inner)
+    pub fun adt_constructor(): str {
+        __reflect_adt_constructor(inner)
     }
 }
 

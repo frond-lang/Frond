@@ -172,12 +172,11 @@ macro_rules! impl_bitops {
                 fn bit_xor(self, other: Self) -> Self { self ^ other }
                 fn bit_not(self) -> Self { !self }
                 fn shl(self, amount: u32) -> Self {
-                    if amount >= Self::BITS { panic!("shift amount out of range: {} >= {} bits", amount, Self::BITS) }
-                    self.wrapping_shl(amount)
+                    // SIMD 批处理路径：shift 越界返回原值（wrapping 语义），单节点路径返回 Throw
+                    if amount >= Self::BITS { self } else { self.wrapping_shl(amount) }
                 }
                 fn shr(self, amount: u32) -> Self {
-                    if amount >= Self::BITS { panic!("shift amount out of range: {} >= {} bits", amount, Self::BITS) }
-                    self.wrapping_shr(amount)
+                    if amount >= Self::BITS { self } else { self.wrapping_shr(amount) }
                 }
             }
         )*
@@ -638,34 +637,15 @@ where
 #[inline]
 fn binop_scalar_t<T: Num + BitOps>(a: T, b: T, op: BinOp) -> T {
     match op {
-        // Bug #75: debug mode panics on integer overflow; release mode wraps.
-        // Float checked_* always returns Some, so expect never panics for floats.
-        BinOp::Add => {
-            if cfg!(debug_assertions) {
-                a.checked_add(b).expect("integer overflow in addition")
-            } else {
-                a.wrapping_add(b)
-            }
-        }
-        BinOp::Sub => {
-            if cfg!(debug_assertions) {
-                a.checked_sub(b).expect("integer overflow in subtraction")
-            } else {
-                a.wrapping_sub(b)
-            }
-        }
-        BinOp::Mul => {
-            if cfg!(debug_assertions) {
-                a.checked_mul(b).expect("integer overflow in multiplication")
-            } else {
-                a.wrapping_mul(b)
-            }
-        }
-        // Division-by-zero semantics match scalar arith_div/arith_mod:
-        //   - Integer checked_div/checked_rem return None on divide-by-zero → expect panics
-        //   - Float checked_div/checked_rem always return Some (Kuzo Num impl delegates to native /, yielding inf/nan) → expect never panics
-        BinOp::Div => a.checked_div(b).expect("integer divide by zero"),
-        BinOp::Mod => a.checked_rem(b).expect("integer modulo by zero"),
+        // Bug #75: 统一 wrapping 语义（与 Bug #22 一致）。
+        // 整数 wrapping_add/sub/mul 回绕；浮点 wrapping_* 等价于 native + - *（Num trait 实现）。
+        BinOp::Add => a.wrapping_add(b),
+        BinOp::Sub => a.wrapping_sub(b),
+        BinOp::Mul => a.wrapping_mul(b),
+        // SIMD 批处理路径：除零返回 0（wrapping 语义），单节点路径返回 Throw。
+        // 浮点 checked_div/checked_rem 始终返回 Some（native / 产生 inf/nan），不触发 panic。
+        BinOp::Div => a.checked_div(b).unwrap_or_else(T::zero),
+        BinOp::Mod => a.checked_rem(b).unwrap_or_else(T::zero),
         BinOp::Band => a.bit_and(b),
         BinOp::Bor => a.bit_or(b),
         BinOp::Bxor => a.bit_xor(b),
@@ -680,13 +660,8 @@ where T: Num + BitOps {
     let n = dst.len().min(a.len());
     for i in 0..n {
         dst[i] = match op {
-            UnaryOp::Neg => {
-                if cfg!(debug_assertions) {
-                    a[i].neg().expect("integer overflow in negation")
-                } else {
-                    a[i].wrapping_neg()
-                }
-            }
+            // Bug #75: 统一 wrapping 语义（与 Bug #22 一致）。
+            UnaryOp::Neg => a[i].wrapping_neg(),
             UnaryOp::Abs => a[i].abs(),
             UnaryOp::Bnot => a[i].bit_not(),
         };
@@ -881,20 +856,14 @@ fn binop_i32_scalar(a: i32, b: i32, op: BinOp) -> i32 {
         BinOp::Add => a.wrapping_add(b),
         BinOp::Sub => a.wrapping_sub(b),
         BinOp::Mul => a.wrapping_mul(b),
-        // Integer divide-by-zero panics directly (no fallback)
-        BinOp::Div => a / b,
-        BinOp::Mod => a % b,
+        // SIMD 批处理路径：除零返回 0（wrapping 语义），单节点路径返回 Throw
+        BinOp::Div => if b == 0 { 0 } else { a.wrapping_div(b) },
+        BinOp::Mod => if b == 0 { 0 } else { a.wrapping_rem(b) },
         BinOp::Band => a & b,
         BinOp::Bor => a | b,
         BinOp::Bxor => a ^ b,
-        BinOp::Shl => {
-            if b < 0 || b as u32 >= i32::BITS { panic!("shift amount out of range: {} >= {} bits", b, i32::BITS) }
-            a.wrapping_shl(b as u32)
-        }
-        BinOp::Shr => {
-            if b < 0 || b as u32 >= i32::BITS { panic!("shift amount out of range: {} >= {} bits", b, i32::BITS) }
-            a.wrapping_shr(b as u32)
-        }
+        BinOp::Shl => if b < 0 || b as u32 >= i32::BITS { a } else { a.wrapping_shl(b as u32) },
+        BinOp::Shr => if b < 0 || b as u32 >= i32::BITS { a } else { a.wrapping_shr(b as u32) },
     }
 }
 
@@ -963,19 +932,14 @@ fn binop_i64_scalar(a: i64, b: i64, op: BinOp) -> i64 {
         BinOp::Add => a.wrapping_add(b),
         BinOp::Sub => a.wrapping_sub(b),
         BinOp::Mul => a.wrapping_mul(b),
-        BinOp::Div => a / b,
-        BinOp::Mod => a % b,
+        // SIMD 批处理路径：除零返回 0（wrapping 语义），单节点路径返回 Throw
+        BinOp::Div => if b == 0 { 0 } else { a.wrapping_div(b) },
+        BinOp::Mod => if b == 0 { 0 } else { a.wrapping_rem(b) },
         BinOp::Band => a & b,
         BinOp::Bor => a | b,
         BinOp::Bxor => a ^ b,
-        BinOp::Shl => {
-            if b < 0 || b as u32 >= i64::BITS { panic!("shift amount out of range: {} >= {} bits", b, i64::BITS) }
-            a.wrapping_shl(b as u32)
-        }
-        BinOp::Shr => {
-            if b < 0 || b as u32 >= i64::BITS { panic!("shift amount out of range: {} >= {} bits", b, i64::BITS) }
-            a.wrapping_shr(b as u32)
-        }
+        BinOp::Shl => if b < 0 || b as u32 >= i64::BITS { a } else { a.wrapping_shl(b as u32) },
+        BinOp::Shr => if b < 0 || b as u32 >= i64::BITS { a } else { a.wrapping_shr(b as u32) },
     }
 }
 
@@ -1139,19 +1103,14 @@ macro_rules! impl_simd_int_binop {
                 BinOp::Add => a.wrapping_add(b),
                 BinOp::Sub => a.wrapping_sub(b),
                 BinOp::Mul => a.wrapping_mul(b),
-                BinOp::Div => a / b,
-                BinOp::Mod => a % b,
+                // SIMD 批处理路径：除零返回 0（wrapping 语义），单节点路径返回 Throw
+                BinOp::Div => if b == 0 { 0 } else { a.wrapping_div(b) },
+                BinOp::Mod => if b == 0 { 0 } else { a.wrapping_rem(b) },
                 BinOp::Band => a & b,
                 BinOp::Bor => a | b,
                 BinOp::Bxor => a ^ b,
-                BinOp::Shl => {
-                    if b < 0 || b as u32 >= <$ty>::BITS { panic!("shift amount out of range: {} >= {} bits", b, <$ty>::BITS) }
-                    a.wrapping_shl(b as u32)
-                }
-                BinOp::Shr => {
-                    if b < 0 || b as u32 >= <$ty>::BITS { panic!("shift amount out of range: {} >= {} bits", b, <$ty>::BITS) }
-                    a.wrapping_shr(b as u32)
-                }
+                BinOp::Shl => if (b as i64) < 0 || b as u32 >= <$ty>::BITS { a } else { a.wrapping_shl(b as u32) },
+                BinOp::Shr => if (b as i64) < 0 || b as u32 >= <$ty>::BITS { a } else { a.wrapping_shr(b as u32) },
             }
         }
 
@@ -1220,19 +1179,14 @@ macro_rules! impl_simd_int_binop_no_mul {
                 BinOp::Add => a.wrapping_add(b),
                 BinOp::Sub => a.wrapping_sub(b),
                 BinOp::Mul => a.wrapping_mul(b),
-                BinOp::Div => a / b,
-                BinOp::Mod => a % b,
+                // SIMD 批处理路径：除零返回 0（wrapping 语义），单节点路径返回 Throw
+                BinOp::Div => if b == 0 { 0 } else { a.wrapping_div(b) },
+                BinOp::Mod => if b == 0 { 0 } else { a.wrapping_rem(b) },
                 BinOp::Band => a & b,
                 BinOp::Bor => a | b,
                 BinOp::Bxor => a ^ b,
-                BinOp::Shl => {
-                    if b < 0 || b as u32 >= <$ty>::BITS { panic!("shift amount out of range: {} >= {} bits", b, <$ty>::BITS) }
-                    a.wrapping_shl(b as u32)
-                }
-                BinOp::Shr => {
-                    if b < 0 || b as u32 >= <$ty>::BITS { panic!("shift amount out of range: {} >= {} bits", b, <$ty>::BITS) }
-                    a.wrapping_shr(b as u32)
-                }
+                BinOp::Shl => if (b as i64) < 0 || b as u32 >= <$ty>::BITS { a } else { a.wrapping_shl(b as u32) },
+                BinOp::Shr => if (b as i64) < 0 || b as u32 >= <$ty>::BITS { a } else { a.wrapping_shr(b as u32) },
             }
         }
 
@@ -1436,7 +1390,7 @@ impl_simd_unsigned_cmp!(u64, u64x4, 4);
 // =========================================================================
 //
 // Generates pure arithmetic functions for all integer/float types. Semantics strictly match the compute_fn macro in Engine.rs:
-//   - Integer add/sub/mul/neg: debug mode panics on overflow; release mode wraps (Bug #75)
+//   - Integer add/sub/mul/neg: wrapping 语义（与 Bug #22 一致；Bug #75 统一为 wrapping，无 debug/release 分支）
 //   - Integer div/mod: divide-by-zero panics (no silent fallback)
 //   - Integer shl/shr: shift amount is i32 (matching Engine.rs reading as_i32), cast to u32 then wrapping
 //   - Float div: native division (divide-by-zero yields inf/nan)
@@ -1447,35 +1401,23 @@ impl_simd_unsigned_cmp!(u64, u64x4, 4);
 macro_rules! impl_arith_int {
     ($ty:ident, $rust:ty) => {
         paste! {
-            #[inline] pub fn [<arith_add_$ty>](a: $rust, b: $rust) -> $rust {
-                if cfg!(debug_assertions) { a.checked_add(b).expect("integer overflow in addition") } else { a.wrapping_add(b) }
-            }
-            #[inline] pub fn [<arith_sub_$ty>](a: $rust, b: $rust) -> $rust {
-                if cfg!(debug_assertions) { a.checked_sub(b).expect("integer overflow in subtraction") } else { a.wrapping_sub(b) }
-            }
-            #[inline] pub fn [<arith_mul_$ty>](a: $rust, b: $rust) -> $rust {
-                if cfg!(debug_assertions) { a.checked_mul(b).expect("integer overflow in multiplication") } else { a.wrapping_mul(b) }
-            }
-            #[inline] pub fn [<arith_div_$ty>](a: $rust, b: $rust) -> $rust { if b == 0 { panic!("integer divide by zero") } else { a.wrapping_div(b) } }
-            #[inline] pub fn [<arith_mod_$ty>](a: $rust, b: $rust) -> $rust { if b == 0 { panic!("integer modulo by zero") } else { a.wrapping_rem(b) } }
+            #[inline] pub fn [<arith_add_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_add(b) }
+            #[inline] pub fn [<arith_sub_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_sub(b) }
+            #[inline] pub fn [<arith_mul_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_mul(b) }
+            /// 除零返回 None，由调用方转为 Throw 错误值传播（与 compute_str_concat 一致）。
+            #[inline] pub fn [<arith_div_$ty>](a: $rust, b: $rust) -> Option<$rust> { if b == 0 { None } else { Some(a.wrapping_div(b)) } }
+            #[inline] pub fn [<arith_mod_$ty>](a: $rust, b: $rust) -> Option<$rust> { if b == 0 { None } else { Some(a.wrapping_rem(b)) } }
             #[inline] pub fn [<arith_bitand_$ty>](a: $rust, b: $rust) -> $rust { a & b }
             #[inline] pub fn [<arith_bitor_$ty>](a: $rust, b: $rust) -> $rust { a | b }
             #[inline] pub fn [<arith_bitxor_$ty>](a: $rust, b: $rust) -> $rust { a ^ b }
-            #[inline] pub fn [<arith_shl_$ty>](a: $rust, shift: i32) -> $rust {
-                if shift < 0 || shift as u32 >= <$rust>::BITS {
-                    panic!("shift amount out of range: {} >= {} bits", shift, <$rust>::BITS)
-                }
-                a.wrapping_shl(shift as u32)
+            /// shift 越界（负数或 ≥ 类型位宽）返回 None，由调用方转为 Throw 错误值。
+            #[inline] pub fn [<arith_shl_$ty>](a: $rust, shift: i32) -> Option<$rust> {
+                if shift < 0 || shift as u32 >= <$rust>::BITS { None } else { Some(a.wrapping_shl(shift as u32)) }
             }
-            #[inline] pub fn [<arith_shr_$ty>](a: $rust, shift: i32) -> $rust {
-                if shift < 0 || shift as u32 >= <$rust>::BITS {
-                    panic!("shift amount out of range: {} >= {} bits", shift, <$rust>::BITS)
-                }
-                a.wrapping_shr(shift as u32)
+            #[inline] pub fn [<arith_shr_$ty>](a: $rust, shift: i32) -> Option<$rust> {
+                if shift < 0 || shift as u32 >= <$rust>::BITS { None } else { Some(a.wrapping_shr(shift as u32)) }
             }
-            #[inline] pub fn [<arith_neg_$ty>](a: $rust) -> $rust {
-                if cfg!(debug_assertions) { a.checked_neg().expect("integer overflow in negation") } else { a.wrapping_neg() }
-            }
+            #[inline] pub fn [<arith_neg_$ty>](a: $rust) -> $rust { a.wrapping_neg() }
             #[inline] pub fn [<arith_bitnot_$ty>](a: $rust) -> $rust { !a }
         }
     };

@@ -108,13 +108,17 @@ pub struct InstantiationCtx {
     pub in_progress: FxHashMap<u64, u32>,
 }
 
-/// type_binding_stack and self_binding_stack push/pop as impl/trait/fn blocks are entered and exited.
+/// type_binding_stack and this_binding_stack push/pop as impl/trait/fn blocks are entered and exited.
 /// env is the local variable environment (EnvArena); expected_return drives reverse inference of the return type.
 pub struct InferContext<'a> {
     pub arena: &'a mut TypeArena,
     pub sema_result: &'a mut SemaResult,
     pub type_binding_stack: TypeBindingStack,
-    pub self_binding_stack: SelfBindingStack,
+    pub this_binding_stack: ThisBindingStack,
+    /// Pending implicit-this access marker, set by Ident/Call fallback when a bare
+    /// identifier/call resolves to an instance field/method. Consumed by infer_expr
+    /// after store_expr_info to update the staged ExprInfo.
+    pub pending_implicit_this: Option<(ExprId, crate::sema::Sema::ImplicitThisAccess)>,
     pub env: EnvArena,
     /// Expected return type of the current function (used for reverse inference of throw expressions, etc.).
     pub expected_return: Option<TypeHandle>,
@@ -164,6 +168,10 @@ pub struct InferContext<'a> {
     /// Tracks local binding mutability per environment scope: (env_id, name) → is_mutable.
     /// Used to detect val→var / var→val mutability-changing shadowing (Bug #76).
     pub local_mutability: FxHashMap<(u32, String), bool>,
+    /// Name of the trait whose default methods are currently being inferred (None outside trait blocks).
+    /// Used by lookup_method_type to resolve bare method calls (implicit this) inside trait default
+    /// methods, where current_this_type() is a rigid TypeVar that has no method table of its own.
+    pub current_trait_name: Option<Box<str>>,
 }
 
 /// Checks whether a type references any unresolved TypeVar (in unresolved_set).
@@ -374,7 +382,8 @@ impl<'a> InferContext<'a> {
             arena,
             sema_result,
             type_binding_stack: TypeBindingStack::new(),
-            self_binding_stack: SelfBindingStack::new(),
+            this_binding_stack: ThisBindingStack::new(),
+            pending_implicit_this: None,
             env: EnvArena::new(),
             expected_return: None,
             solver: ConstraintSolver::new(),
@@ -388,6 +397,41 @@ impl<'a> InferContext<'a> {
             ctor_module_envs: FxHashMap::default(),
             instantiation_ctx: None,
             local_mutability: FxHashMap::default(),
+            current_trait_name: None,
+        }
+    }
+
+    /// Construct from existing TypeArena and SemaResult (for incremental recheck).
+    /// Preserves global state (witness_table) from previous run.
+    /// Unlike `new()`, this clones the witness_table from sema_result to preserve
+    /// clean modules' witness entries.
+    pub fn from_existing(
+        arena: &'a mut TypeArena,
+        sema_result: &'a mut SemaResult,
+    ) -> Self {
+        // Clone witness_table before moving sema_result into the struct to avoid
+        // a simultaneous mutable + immutable borrow conflict.
+        let witness_table = sema_result.witness_table.clone();
+        InferContext {
+            arena,
+            sema_result,
+            type_binding_stack: TypeBindingStack::new(),
+            this_binding_stack: ThisBindingStack::new(),
+            pending_implicit_this: None,
+            env: EnvArena::new(),
+            expected_return: None,
+            solver: ConstraintSolver::new(),
+            flow_ctx: FlowContext::new(),
+            witness_table,
+            module_envs: FxHashMap::default(),
+            current_module_logical_path: None,
+            current_module_env: None,
+            current_module_name: String::new(),
+            type_trace: Vec::new(),
+            ctor_module_envs: FxHashMap::default(),
+            instantiation_ctx: None,
+            local_mutability: FxHashMap::default(),
+            current_trait_name: None,
         }
     }
 
@@ -477,26 +521,26 @@ impl<'a> InferContext<'a> {
 
     /// Enters a type block: binds Self to a concrete type.
     /// `self_ty` should be in `Adt { name, type_args }` form, where type_args reference vars in the TypeBindingStack.
-    pub fn push_self_type(&mut self, self_ty: TypeHandle) {
-        self.self_binding_stack.push(self_ty);
+    pub fn push_this_type(&mut self, self_ty: TypeHandle) {
+        self.this_binding_stack.push(self_ty);
     }
 
     /// Enters a trait default method: binds Self to a fresh_rigid_var (to be solved by unification at impl time).
     /// Using a rigid var marks Self as a template parameter and is automatically excluded from diagnostics (only unbound non-rigid TypeVars are reported as errors).
-    pub fn push_self_type_var(&mut self) -> TypeHandle {
+    pub fn push_this_type_var(&mut self) -> TypeHandle {
         let var = self.arena.fresh_rigid_var();
-        self.self_binding_stack.push(var);
+        self.this_binding_stack.push(var);
         var
     }
 
     /// Leaves a type/trait block: pops the Self binding.
-    pub fn pop_self_type(&mut self) {
-        self.self_binding_stack.pop();
+    pub fn pop_this_type(&mut self) {
+        self.this_binding_stack.pop();
     }
 
     /// Current Self type (top of stack).
-    pub fn current_self_type(&self) -> Option<TypeHandle> {
-        self.self_binding_stack.current()
+    pub fn current_this_type(&self) -> Option<TypeHandle> {
+        self.this_binding_stack.current()
     }
 
     // ── Error recording ──
@@ -518,16 +562,16 @@ impl<'a> InferContext<'a> {
 
     // ── self parameter resolution (phase3b) ──
 
-    /// Determines whether a parameter's type_annotation is SelfType (or RefType<SelfType>).
+    /// Determines whether a parameter's type_annotation is ThisType (or RefType<ThisType>).
     ///
-    /// The parser auto-fills a SelfType annotation for `self`/`&self` parameters of methods inside type/trait blocks;
+    /// The parser auto-fills a ThisType annotation for `self`/`&self` parameters of methods inside type/trait blocks;
     /// Sema uses this type node to detect a self parameter, rather than relying on the parameter name.
-    fn is_self_param(&self, type_annotation: Option<AstTypeRef>, ast: &AstArena<'_>) -> bool {
+    fn is_this_param(&self, type_annotation: Option<AstTypeRef>, ast: &AstArena<'_>) -> bool {
         match type_annotation {
             Some(ta) => match &ast.ty(ta).node {
-                crate::ast::Ast::TypeNode::SelfType => true,
+                crate::ast::Ast::TypeNode::ThisType => true,
                 crate::ast::Ast::TypeNode::RefType { inner } => {
-                    matches!(ast.ty(*inner).node, crate::ast::Ast::TypeNode::SelfType)
+                    matches!(ast.ty(*inner).node, crate::ast::Ast::TypeNode::ThisType)
                 }
                 _ => false,
             },
@@ -538,8 +582,8 @@ impl<'a> InferContext<'a> {
     /// Infers the type of a self parameter.
     ///
     /// **Semantic rules (Rust port, intentionally refined)**:
-    /// - `self` may only appear in methods inside type/trait blocks (SelfBindingStack must be non-empty).
-    /// - `self` parameters disallow type annotations (the parser auto-fills SelfType or RefType<SelfType>).
+    /// - `self` may only appear in methods inside type/trait blocks (ThisBindingStack must be non-empty).
+    /// - `self` parameters disallow type annotations (the parser auto-fills ThisType or RefType<ThisType>).
     /// - A top-level fun with a self parameter → error.
     /// - A self parameter with an explicit `: Type` annotation → error.
     ///
@@ -547,12 +591,12 @@ impl<'a> InferContext<'a> {
     /// - `self` (no annotation, inside a type block) → the scope type.
     /// - `&self` (no annotation, inside a type block) → `Ref<scope type>`.
     /// - Illegal usage → reports an error and returns a fresh_type_var (error recovery).
-    pub fn infer_self_param(
+    pub fn infer_this_param(
         &mut self,
         type_annotation: Option<AstTypeRef>,
         ast: &AstArena<'_>,
     ) -> TypeHandle {
-        let self_ty = match self.current_self_type() {
+        let self_ty = match self.current_this_type() {
             Some(ty) => ty,
             None => {
                 // Get the span from type_annotation if present, otherwise no location info.
@@ -563,7 +607,7 @@ impl<'a> InferContext<'a> {
                     })
                     .unwrap_or((0, 0));
                 self.add_error_at(
-                    "self parameter requires enclosing type or trait block",
+                    "this parameter requires enclosing type or trait block",
                     line,
                     column,
                 );
@@ -572,7 +616,7 @@ impl<'a> InferContext<'a> {
         };
 
         // Check the type annotation: self parameters disallow explicit annotations.
-        // The parser auto-fills SelfType for `self` (no `:`) and RefType<SelfType> for `&self`.
+        // The parser auto-fills ThisType for `self` (no `:`) and RefType<ThisType> for `&self`.
         // A user-written `self: Foo` goes through parse_param's `:` branch, where type_annotation is the user's type.
         match type_annotation {
             None => {
@@ -583,17 +627,17 @@ impl<'a> InferContext<'a> {
                 let tn = &ast.ty(ta).node;
                 let span = ast.ty(ta).span;
                 match tn {
-                    // `self` (parser auto-fills SelfType) → return the scope type.
-                    TypeNode::SelfType => self_ty,
-                    // `&self` (parser auto-fills RefType<SelfType>) → return Ref<scope type>.
+                    // `self` (parser auto-fills ThisType) → return the scope type.
+                    TypeNode::ThisType => self_ty,
+                    // `&self` (parser auto-fills RefType<ThisType>) → return Ref<scope type>.
                     TypeNode::RefType { inner } => {
-                        if matches!(ast.ty(*inner).node, TypeNode::SelfType) {
+                        if matches!(ast.ty(*inner).node, TypeNode::ThisType) {
 
                             self.arena.make_ref(self_ty, false)
                         } else {
                             // `&self: &Foo` with an explicit reference annotation written by the user → error.
                             self.add_error_at(
-                                "self parameter does not allow explicit type annotation",
+                                "this parameter does not allow explicit type annotation",
                                 span.line,
                                 span.column,
                             );
@@ -603,7 +647,7 @@ impl<'a> InferContext<'a> {
                     // `self: Foo` with an explicit annotation written by the user → error.
                     _ => {
                         self.add_error_at(
-                            "self parameter does not allow explicit type annotation",
+                            "this parameter does not allow explicit type annotation",
                             span.line,
                             span.column,
                         );
@@ -1253,7 +1297,7 @@ impl<'a> InferContext<'a> {
         ctor_name: &str,
     ) -> Option<(Box<str>, Box<[TypeRepr]>)> {
         let &type_idx = self.sema_result.type_def_index.get(type_name)?;
-        let type_def = &self.sema_result.type_defs[type_idx as usize];
+        let type_def = &self.sema_result.type_defs[&type_idx];
         let ctor = type_def
             .constructors
             .iter()
@@ -1342,7 +1386,7 @@ impl<'a> InferContext<'a> {
 
     /// Resolves an AST TypeNode to a TypeHandle (full version, with a type-parameter map).
     ///
-    /// Handles all TypeNode variants: Named, SelfType, Generic, Nullable, RefType, RawPtr,
+    /// Handles all TypeNode variants: Named, ThisType, Generic, Nullable, RefType, RawPtr,
     /// Function, Record, Array, KindAnnotated. Builtin scalars go through from_scalar_name;
     /// the generic Throw is special-cased into a Throw type; other builtin generics become Generic;
     /// user-defined ADTs become Adt; traits become Trait.
@@ -1359,11 +1403,11 @@ impl<'a> InferContext<'a> {
                 let mut visiting = FxHashSet::default();
                 self.resolve_name_to_type(name, type_param_map, &mut visiting)
             }
-            TypeNode::SelfType => match self.current_self_type() {
+            TypeNode::ThisType => match self.current_this_type() {
                 Some(ty) => ty,
                 None => {
                     let span = ast.ty(type_ref).span;
-                    self.add_error_at("Self type can only be used within type or trait methods", span.line, span.column);
+                    self.add_error_at("This type can only be used within type or trait methods", span.line, span.column);
                     self.arena.make(Ty::Void)
                 }
             },
@@ -1642,6 +1686,25 @@ impl<'a> InferContext<'a> {
         // Instantiation mode: skip HM constraint solving (types were already checked in the sema HM stage).
         if self.instantiation_ctx.is_some() {
             return;
+        }
+        // Lazy<T> subsumption: Lazy<T> auto-unwraps to T when the context expects T.
+        // This makes `lazy(1i32) + 3i32` type-check (Lazy<i32> unwraps to i32).
+        {
+            let InferContext { arena, .. } = self;
+            let ra = arena.resolve(t1);
+            let rb = arena.resolve(t2);
+            let a_is_lazy = matches!(arena.get(ra), Ty::Lazy(_));
+            let b_is_lazy = matches!(arena.get(rb), Ty::Lazy(_));
+            if a_is_lazy && !b_is_lazy {
+                let inner = arena.lazy_value(ra);
+                self.unify_or_constrain(inner, t2);
+                return;
+            }
+            if b_is_lazy && !a_is_lazy {
+                let inner = arena.lazy_value(rb);
+                self.unify_or_constrain(t1, inner);
+                return;
+            }
         }
         // Record candidate before unify so finalize_solution can detect ambiguity when
         // the same TypeVar is required to bind to multiple distinct concrete types
@@ -2013,15 +2076,7 @@ impl<'a> InferContext<'a> {
         let is_raw_ref = matches!(ct, Ty::Ref(_)) && self.arena.ref_parts(resolved).1;
 
         let is_trait_object = matches!(ct, Ty::TraitObject(_));
-        let info = ExprInfo {
-            ty: resolved,
-            const_val: None,
-            expr_id: expr.0 as u64,
-            type_name: type_name.map(|s| s.into_boxed_str()),
-            is_trait_object,
-            is_ref_type: is_ref,
-            is_raw_ref,
-        };
+
         let key = if let Some(ref ictx) = self.instantiation_ctx {
             // Instantiation mode: compute the key with the instance's module name; write to the instance-local staging table + global resolved_types.
             module_expr_key(&ictx.module_name, expr.0 as u64)
@@ -2030,11 +2085,43 @@ impl<'a> InferContext<'a> {
             module_expr_key(&self.current_module_name, expr.0 as u64)
         };
 
+        // In instantiation mode, the original HM pass may have set `implicit_this`
+        // on the ExprInfo (marking bare identifiers/calls that resolve to implicit
+        // `this` field/method access). The instantiation pass re-infers types with
+        // concrete type_args but does NOT set up `this_binding_stack`, so
+        // `pending_implicit_this` is never set. Preserve the original marker by
+        // copying it from the pre-existing ExprInfo.
+        let implicit_this = if self.instantiation_ctx.is_some() {
+            self.sema_result
+                .expr_types
+                .get(&key)
+                .and_then(|info| info.implicit_this.clone())
+        } else {
+            None
+        };
+
+        let info = ExprInfo {
+            ty: resolved,
+            const_val: None,
+            expr_id: expr.0 as u64,
+            type_name: type_name.map(|s| s.into_boxed_str()),
+            is_trait_object,
+            is_ref_type: is_ref,
+            is_raw_ref,
+            implicit_this,
+        };
+
         if let Some(ref mut ictx) = self.instantiation_ctx {
             ictx.local_expr_types.insert(key, info);
             self.sema_result.resolved_types.insert(key, resolved);
         } else {
             self.sema_result.put_expr(key, info);
+            // Record module ownership for incremental purge (expr_types key).
+            let mod_name = self.current_module_name.clone();
+            self.sema_result.module_ownership.expr_type_keys
+                .entry(mod_name)
+                .or_default()
+                .insert(key);
         }
     }
 
@@ -2051,6 +2138,22 @@ impl<'a> InferContext<'a> {
     ) -> TypeHandle {
         let ty = self.infer_expr_inner(expr, ast, env, expected);
         self.store_expr_info(expr, ty);
+        // Flush pending implicit-this marker into the staged ExprInfo.
+        if let Some((eid, access)) = self.pending_implicit_this.take() {
+            let key = if let Some(ref ictx) = self.instantiation_ctx {
+                module_expr_key(&ictx.module_name, eid.0 as u64)
+            } else {
+                module_expr_key(&self.current_module_name, eid.0 as u64)
+            };
+            let info = if let Some(ref mut ictx) = self.instantiation_ctx {
+                ictx.local_expr_types.get_mut(&key)
+            } else {
+                self.sema_result.expr_types.get_mut(&key)
+            };
+            if let Some(info) = info {
+                info.implicit_this = Some(access);
+            }
+        }
         // Diagnostic trace: only record (TypeHandle, Span) when KUZO_SEMA_TRACE is enabled.
         if std::env::var("KUZO_SEMA_TRACE").is_ok() {
             let span = ast.expr(expr).span;
@@ -2117,8 +2220,53 @@ impl<'a> InferContext<'a> {
                 if let Some(narrowed_ty) = self.flow_ctx.lookup_narrowed(name) {
                     return narrowed_ty;
                 }
-                if let Some(scheme) = self.env.lookup(env, name) {
-                    return self.freshen_type(scheme);
+                // Resolution order inside a method body (current_this_type non-empty):
+                //   1. lookup_local  — local variables and parameters only (no parent traversal)
+                //   2. For concrete types: try_implicit_this_field — fields before methods
+                //      (prevents same-named methods in the parent env from shadowing fields)
+                //   3. env.lookup    — full chain (methods, top-level functions)
+                //   4. For trait default methods (TypeVar): try_implicit_this_field — permissive
+                //      fallback for fields that can't be verified at trait definition time
+                let this_ty_opt = self.current_this_type();
+                if let Some(this_ty) = this_ty_opt {
+                    // 1. Local variables and parameters only.
+                    if let Some(scheme) = self.env.lookup_local(env, name) {
+                        return self.freshen_type(scheme);
+                    }
+                    let is_typevar = matches!(
+                        self.arena.get(self.arena.resolve(this_ty)),
+                        Ty::TypeVar(_)
+                    );
+                    // 2. Concrete types: fields take precedence over same-named methods.
+                    if !is_typevar {
+                        if let Some(field_ty) = self.try_implicit_this_field(this_ty, name) {
+                            self.pending_implicit_this = Some((
+                                expr,
+                                crate::sema::Sema::ImplicitThisAccess::Field((*name).to_string().into_boxed_str()),
+                            ));
+                            return field_ty;
+                        }
+                    }
+                    // 3. Full lookup (methods registered in parent env, top-level functions).
+                    if let Some(scheme) = self.env.lookup(env, name) {
+                        return self.freshen_type(scheme);
+                    }
+                    // 4. Trait default methods: permissive field fallback (TypeVar can't
+                    //    verify field existence; deferred to monomorphization).
+                    if is_typevar {
+                        if let Some(field_ty) = self.try_implicit_this_field(this_ty, name) {
+                            self.pending_implicit_this = Some((
+                                expr,
+                                crate::sema::Sema::ImplicitThisAccess::Field((*name).to_string().into_boxed_str()),
+                            ));
+                            return field_ty;
+                        }
+                    }
+                } else {
+                    // Outside methods: full env lookup.
+                    if let Some(scheme) = self.env.lookup(env, name) {
+                        return self.freshen_type(scheme);
+                    }
                 }
                 // Instantiation mode: the temporary InferContext's env does not contain module-level declarations;
                 // query sema_result instead (already resolved in the HM stage).
@@ -2157,10 +2305,28 @@ impl<'a> InferContext<'a> {
                 let left_is_lit = Self::expr_is_literal(ast, *lhs);
                 let right_is_lit = Self::expr_is_literal(ast, *rhs);
                 let bin_span = ast.expr(expr).span;
+                // Lazy<T> subsumption: unwrap Lazy to inner type for binary operations.
+                // `lazy(1i32) + 3i32` treats the left operand as i32.
+                let left_unwrapped = {
+                    let rl = self.arena.resolve(left_ty);
+                    if matches!(self.arena.get(rl), Ty::Lazy(_)) {
+                        self.arena.lazy_value(rl)
+                    } else {
+                        left_ty
+                    }
+                };
+                let right_unwrapped = {
+                    let rr = self.arena.resolve(right_ty);
+                    if matches!(self.arena.get(rr), Ty::Lazy(_)) {
+                        self.arena.lazy_value(rr)
+                    } else {
+                        right_ty
+                    }
+                };
                 match op {
                     BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
-                        let rl = self.arena.resolve(left_ty);
-                        let rr = self.arena.resolve(right_ty);
+                        let rl = self.arena.resolve(left_unwrapped);
+                        let rr = self.arena.resolve(right_unwrapped);
                         if self.arena.get(rl).is_numeric() && self.arena.get(rr).is_numeric() {
                             // Bug #73/#74: strict numeric type checking.
                             // - Bare literals (no suffix) can be promoted freely.
@@ -2171,65 +2337,65 @@ impl<'a> InferContext<'a> {
                             // literal promotion rules are inlined into peer_type_binary.
                             return peer_type_binary(
                                 self.arena,
-                                left_ty,
-                                right_ty,
+                                left_unwrapped,
+                                right_unwrapped,
                                 left_is_lit,
                                 right_is_lit,
                             );
                         }
-                        self.unify_or_constrain(left_ty, right_ty);
-                        left_ty
+                        self.unify_or_constrain(left_unwrapped, right_unwrapped);
+                        left_unwrapped
                     }
                     BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::RefEq | BinaryOp::RefNeq
                     | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
-                        let rl = self.arena.resolve(left_ty);
-                        let rr = self.arena.resolve(right_ty);
+                        let rl = self.arena.resolve(left_unwrapped);
+                        let rr = self.arena.resolve(right_unwrapped);
                         if self.arena.get(rl).is_numeric() && self.arena.get(rr).is_numeric() {
                             // Bug #73/#74: same strict checking for comparison ops.
                             self.check_numeric_binop_compat(ast, *lhs, *rhs, rl, rr, bin_span);
                             // v2 convergence: comparison ops use peer_type_binary to unify operand types.
                             let _ = peer_type_binary(
                                 self.arena,
-                                left_ty,
-                                right_ty,
+                                left_unwrapped,
+                                right_unwrapped,
                                 left_is_lit,
                                 right_is_lit,
                             );
                         } else {
-                            self.unify_or_constrain(left_ty, right_ty);
+                            self.unify_or_constrain(left_unwrapped, right_unwrapped);
                         }
                         self.make_builtin(Ty::Bool)
                     }
                     BinaryOp::And | BinaryOp::Or => {
                         let bool_ty = self.make_builtin(Ty::Bool);
-                        self.unify_or_constrain(left_ty, bool_ty);
-                        self.unify_or_constrain(right_ty, bool_ty);
+                        self.unify_or_constrain(left_unwrapped, bool_ty);
+                        self.unify_or_constrain(right_unwrapped, bool_ty);
                         bool_ty
                     }
                     BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
                     | BinaryOp::Shl | BinaryOp::Shr => {
-                        self.unify_or_constrain(left_ty, right_ty);
-                        left_ty
+                        self.unify_or_constrain(left_unwrapped, right_unwrapped);
+                        left_unwrapped
                     }
                     BinaryOp::ConcatList => {
                         // Array concatenation a ++ b: left and right element types must match; the result reuses the left operand's element type.
                         // Avoids creating an orphan fresh_type_var (res_elem would have no constraint to the inputs).
                         let left_elem = self.arena.fresh_type_var();
                         let left_arr = self.arena.make_array(left_elem, None);
-                        self.unify_or_constrain(left_ty, left_arr);
+                        self.unify_or_constrain(left_unwrapped, left_arr);
                         let right_arr = self.arena.make_array(left_elem, None);
-                        self.unify_or_constrain(right_ty, right_arr);
+                        self.unify_or_constrain(right_unwrapped, right_arr);
                         self.arena.make_array(left_elem, None)
                     }
                     BinaryOp::Range | BinaryOp::RangeInclusive => {
                         // Range expressions a..b / a..=b return a RangeIterator type
                         // (Range is itself an iterator; For loops statically dispatch through RangeIterator.next).
                         let i64_ty = self.make_builtin(Ty::I64);
-                        if let Err(e) = self.try_widen_unify(i64_ty, left_ty) {
+                        if let Err(e) = self.try_widen_unify(i64_ty, left_unwrapped) {
                             self.add_error(&format!("range operand must be integer: {}", e));
                         }
                         let i64_ty = self.make_builtin(Ty::I64);
-                        if let Err(e) = self.try_widen_unify(i64_ty, right_ty) {
+                        if let Err(e) = self.try_widen_unify(i64_ty, right_unwrapped) {
                             self.add_error(&format!("range operand must be integer: {}", e));
                         }
                         self.arena.make_generic(
@@ -2387,6 +2553,33 @@ impl<'a> InferContext<'a> {
                         }
                         ret_ty
                     } else {
+                        // [Implicit this] Try resolving as this.method(args) before
+                        // falling through to infer_expr (which would report undefined).
+                        if let Some(this_ty) = self.current_this_type() {
+                            if let Some(fn_ty) = self.lookup_method_type(this_ty, name) {
+                                let inst_fn = self.instantiate_fn_type(fn_ty);
+                                if let Ty::Fn(_) = self.arena.get(inst_fn) {
+                                    let (params, return_type) = self.arena.fn_parts(inst_fn);
+                                    let params: Vec<TypeHandle> = params.to_vec();
+                                    // Skip params[0] (this), match args with params[1..].
+                                    let n = params.len().min(args.len() + 1);
+                                    for i in 1..n {
+                                        let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
+                                        self.unify_or_constrain(params[i], arg_ty);
+                                    }
+                                    // Store callee's ExprInfo so that pending_implicit_this
+                                    // (flushed in infer_expr) can attach the implicit_this marker.
+                                    // Without this, the marker is lost because we bypass
+                                    // infer_expr(callee) on this fast path.
+                                    self.store_expr_info(*callee, fn_ty);
+                                    self.pending_implicit_this = Some((
+                                        *callee,
+                                        crate::sema::Sema::ImplicitThisAccess::Method((*name).to_string().into_boxed_str()),
+                                    ));
+                                    return return_type;
+                                }
+                            }
+                        }
                         self.infer_expr(*callee, ast, env, None)
                     }
                 } else {
@@ -3367,7 +3560,7 @@ impl<'a> InferContext<'a> {
         return_type_repr: Option<TypeRepr>,
         _recv_ty: TypeHandle,
     ) -> TypeHandle {
-        // SelfType is resolved by type_repr_to_handle via current_self_type();
+        // ThisType is resolved by type_repr_to_handle via current_this_type();
         // the caller (lookup_method_type) has already pushed recv_ty as self_type.
         let params: Vec<TypeHandle> = param_type_reprs
             .iter()
@@ -3390,7 +3583,7 @@ impl<'a> InferContext<'a> {
                 let mut visiting = FxHashSet::default();
                 self.resolve_name_to_type(name.as_ref(), &empty_map, &mut visiting)
             }
-            TypeRepr::SelfType => match self.current_self_type() {
+            TypeRepr::ThisType => match self.current_this_type() {
                 Some(ty) => ty,
                 None => self.arena.fresh_type_var(),
             },
@@ -3474,9 +3667,9 @@ impl<'a> InferContext<'a> {
         }
 
         // Push recv_ty as the Self type so that, inside build_fn_type_from_sig,
-        // type_repr_to_handle(SelfType) resolves to the receiver type correctly,
+        // type_repr_to_handle(ThisType) resolves to the receiver type correctly,
         // without special-casing the first parameter by position.
-        self.push_self_type(resolved);
+        self.push_this_type(resolved);
 
         // Generic type-parameter binding: bind the type definition's type-parameter names (e.g. "T") to the concrete
         // type arguments in the receiver type, so that T in a method signature (e.g. `pub fun next(&self): T?`)
@@ -3532,7 +3725,7 @@ impl<'a> InferContext<'a> {
         if pushed_bindings {
             self.pop_type_bindings();
         }
-        self.pop_self_type();
+        self.pop_this_type();
         result
     }
 
@@ -3558,6 +3751,25 @@ impl<'a> InferContext<'a> {
                     }
                 }
             }
+            Ty::TypeVar(idx) => {
+                // Inside a trait default method, current_this_type() is a rigid TypeVar
+                // representing the (unknown) implementing type. Method lookup must consult
+                // the current trait's method signatures rather than the receiver's (nonexistent)
+                // method table. This enables bare `method()` calls inside trait default bodies.
+                if self.arena.type_vars[idx as usize].is_rigid {
+                    if let Some(ref trait_name) = self.current_trait_name {
+                        if let Some(td) = self.sema_result.get_trait_def(trait_name) {
+                            if let Some(sig) = td.methods.iter().find(|m| m.name.as_ref() == method) {
+                                let params: Vec<TypeHandle> = (0..sig.param_count)
+                                    .map(|i| if i == 0 { resolved } else { self.arena.fresh_type_var() })
+                                    .collect();
+                                let return_type = sig.return_type;
+                                return Some(self.arena.make_fn(params.into_boxed_slice(), return_type));
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -3580,7 +3792,7 @@ impl<'a> InferContext<'a> {
                 .get(name.as_str())
                 .map(|&idx| dynamic_type_id(idx));
             if let Some(tid) = type_id {
-                for entry in self.witness_table.entries().iter() {
+                for entry in self.witness_table.entries() {
                     if entry.type_id != tid {
                         continue;
                     }
@@ -3588,7 +3800,7 @@ impl<'a> InferContext<'a> {
                     // Extract owned data to release the sema_result borrow.
                     let sig_data: Option<(Vec<TypeRepr>, Option<TypeRepr>)> =
                         if let Some(&type_idx) = self.sema_result.type_def_index.get(name.as_str()) {
-                            self.sema_result.type_defs[type_idx as usize]
+                            self.sema_result.type_defs[&type_idx]
                                 .methods
                                 .iter()
                                 .find(|m| m.name.as_ref() == method)
@@ -3650,7 +3862,7 @@ impl<'a> InferContext<'a> {
         if let Some(ref name) = type_name {
             let sig_data: Option<(Vec<TypeRepr>, Option<TypeRepr>)> =
                 if let Some(&type_idx) = self.sema_result.type_def_index.get(name.as_str()) {
-                    self.sema_result.type_defs[type_idx as usize]
+                    self.sema_result.type_defs[&type_idx]
                         .methods
                         .iter()
                         .find(|m| m.name.as_ref() == method)
@@ -3664,6 +3876,48 @@ impl<'a> InferContext<'a> {
         }
 
         None
+    }
+
+    /// Try resolving `name` as an instance field of `this_ty` (implicit this).
+    /// Returns the field type on success, None on failure (no error reported).
+    /// Used by the Ident fallback when lexical lookup fails inside a method body.
+    fn try_implicit_this_field(
+        &mut self,
+        this_ty: TypeHandle,
+        name: &str,
+    ) -> Option<TypeHandle> {
+        let resolved = self.arena.resolve(this_ty);
+        // Ref auto-deref: field access on &T forwards to T.
+        let inner = match self.arena.get(resolved) {
+            Ty::Ref(_) => self.arena.ref_parts(resolved).0,
+            _ => resolved,
+        };
+        // Inside a trait default method, this_ty is a rigid TypeVar.
+        // We can't verify field existence at trait definition time (the implementing
+        // type provides the fields). Be permissive: treat the bare identifier as an
+        // implicit this field access and return a fresh_type_var, matching the old
+        // behavior where self.field on a TypeVar silently returned a fresh_type_var.
+        // Field resolution is deferred to monomorphization specialization.
+        if let Ty::TypeVar(_) = self.arena.get(inner) {
+            return Some(self.arena.fresh_type_var());
+        }
+        let type_name = self.arena.type_name(inner)?.to_string();
+        let field_id = self.sema_result.lookup_field_id(&type_name, name)?;
+        // Look up the constructor from the TYPE definition (not ctor_def_index,
+        // which can return a wrong constructor when multiple types share the same
+        // constructor name, e.g. FileKind.File vs type File = File(...)).
+        let def = self.sema_result.get_type_def(&type_name)?;
+        let kind = def.kind;
+        let repr = {
+            let ctor = def.constructors.iter()
+                .find(|c| c.field_names.iter().any(|fname| fname.as_deref() == Some(name)))?;
+            let idx = match kind {
+                TypeDefKind::Record => field_id as usize,
+                _ => (field_id as usize).saturating_sub(1),
+            };
+            ctor.field_type_reprs.get(idx).cloned()?
+        };
+        Some(self.type_repr_to_handle(&repr))
     }
 
     /// Looks up the field type for an object type.
@@ -3701,16 +3955,20 @@ impl<'a> InferContext<'a> {
         let type_name = self.arena.type_name(resolved).map(|s| s.to_string());
         if let Some(name) = type_name {
             if let Some(field_id) = self.sema_result.lookup_field_id(&name, field) {
-                if let Some(ctor) = self.sema_result.get_ctor_def(&name) {
-                    let idx = match self.sema_result.get_type_def(&name) {
-                        Some(def) if def.kind == TypeDefKind::Record => field_id as usize,
+                // Look up the constructor from the TYPE definition (not ctor_def_index,
+                // which can return a wrong constructor when multiple types share the same
+                // constructor name, e.g. FileKind.File vs type File = File(...)).
+                if let Some(def) = self.sema_result.get_type_def(&name) {
+                    let kind = def.kind;
+                    let idx = match kind {
+                        TypeDefKind::Record => field_id as usize,
                         _ => (field_id as usize).saturating_sub(1),
                     };
-                    // Use field_type_reprs via type_repr_to_handle to fully resolve the field type,
-                    // correctly handling arrays (T[]), Nullable, Ref, and other compound types,
-                    // overcoming the limitation that field_type_names only stores the top-level name.
-                    // Clone the TypeRepr first to release the immutable borrow of sema_result, then call the mutable method.
-                    if let Some(repr) = ctor.field_type_reprs.get(idx).cloned() {
+                    // Find the constructor that actually has this field.
+                    if let Some(repr) = def.constructors.iter()
+                        .find(|c| c.field_names.iter().any(|fname| fname.as_deref() == Some(field)))
+                        .and_then(|ctor| ctor.field_type_reprs.get(idx).cloned())
+                    {
                         return self.type_repr_to_handle(&repr);
                     }
                     return self.arena.fresh_type_var();
@@ -4371,6 +4629,7 @@ impl<'a> InferContext<'a> {
 
         // 2. Reset state (do not reset env; preserve the shared root_env).
         self.reset_state();
+        self.reset_per_module_state();
         // Snapshot current type_vars/types length: arena is shared across modules and not reset;
         // diagnostics only count the TypeVars newly added by this module.
         let type_vars_baseline = self.arena.type_vars_len();
@@ -4540,11 +4799,18 @@ impl<'a> InferContext<'a> {
     pub fn reset_state(&mut self) {
         self.expected_return = None;
         self.type_binding_stack = TypeBindingStack::new();
-        self.self_binding_stack = SelfBindingStack::new();
+        self.this_binding_stack = ThisBindingStack::new();
         self.solver.reset();
         self.flow_ctx.reset();
         self.type_trace.clear();
         // witness_table is not reset (accumulates across modules, supports multi-module trait impls).
+    }
+
+    /// Reset per-module state that reset_state misses.
+    /// Called before incremental recheck of a module.
+    pub fn reset_per_module_state(&mut self) {
+        self.local_mutability.clear();
+        self.instantiation_ctx = None;
     }
 
     /// Processes ImportDecls in the module:
@@ -4639,6 +4905,12 @@ impl<'a> InferContext<'a> {
                 }
                 self.witness_table
                     .register(&trait_name, tid, &type_name, slots);
+                // Record module ownership for incremental purge (witness key).
+                let mod_name = self.current_module_name.clone();
+                self.sema_result.module_ownership.witness_keys
+                    .entry(mod_name)
+                    .or_default()
+                    .insert((trait_name.clone().into_boxed_str(), tid));
             }
         }
     }
@@ -4685,11 +4957,11 @@ impl<'a> InferContext<'a> {
         for decl in module.declarations.iter() {
             match &decl.node {
                 Decl::FunDecl { name, type_params, params, return_type, is_async, .. } => {
-                    // Top-level functions disallow a self parameter (detected via the SelfType
+                    // Top-level functions disallow a self parameter (detected via the ThisType
                     // type node, not by parameter name).
-                    if !params.is_empty() && self.is_self_param(params[0].type_annotation, &module.arena) {
+                    if !params.is_empty() && self.is_this_param(params[0].type_annotation, &module.arena) {
                         self.add_error_at(
-                            "self parameter is not allowed in top-level function",
+                            "this parameter is not allowed in top-level function",
                             decl.span.line,
                             decl.span.column,
                         );
@@ -4829,8 +5101,8 @@ impl<'a> InferContext<'a> {
             })
             .collect();
         let mut reported: HashSet<String> = existing;
-        for i in 0..self.sema_result.type_defs.len() {
-            let td = &self.sema_result.type_defs[i];
+        let mut cycles_to_report: Vec<String> = Vec::new();
+        for td in self.sema_result.type_defs.values() {
             if td.kind != crate::sema::Sema::TypeDefKind::Alias {
                 continue;
             }
@@ -4851,10 +5123,7 @@ impl<'a> InferContext<'a> {
                                 .unwrap_or(0);
                             let cycle_path = chain[cycle_start..].join(" -> ");
                             if reported.insert(cycle_path.clone()) {
-                                self.sema_result.add_error(crate::sema::Sema::SemaError::new(
-                                    &format!("cyclic type alias: {}", cycle_path),
-                                    0, 0,
-                                ));
+                                cycles_to_report.push(cycle_path);
                             }
                             break;
                         }
@@ -4871,6 +5140,12 @@ impl<'a> InferContext<'a> {
                     }
                 }
             }
+        }
+        for cycle_path in cycles_to_report {
+            self.sema_result.add_error(crate::sema::Sema::SemaError::new(
+                &format!("cyclic type alias: {}", cycle_path),
+                0, 0,
+            ));
         }
     }
 
@@ -4894,8 +5169,7 @@ impl<'a> InferContext<'a> {
             })
             .collect();
         let mut new_errors: Vec<String> = Vec::new();
-        for i in 0..self.sema_result.type_defs.len() {
-            let td = &self.sema_result.type_defs[i];
+        for td in self.sema_result.type_defs.values() {
             for ctor in td.constructors.iter() {
                 let mut seen: HashSet<String> = HashSet::new();
                 for fname_opt in ctor.field_names.iter() {
@@ -4929,11 +5203,11 @@ impl<'a> InferContext<'a> {
     fn check_decl(&mut self, decl: &Decl<'_>, decl_span: crate::ast::Ast::Span, ast: &AstArena<'_>, env: EnvId) {
         match decl {
             Decl::FunDecl { name, type_params, params, return_type, body, extern_c_body, is_async, .. } => {
-                // Top-level functions disallow a self parameter (detected via the SelfType type
+                // Top-level functions disallow a self parameter (detected via the ThisType type
                 // node, not by parameter name; self is only allowed inside type/trait block methods).
-                if !params.is_empty() && self.is_self_param(params[0].type_annotation, ast) {
+                if !params.is_empty() && self.is_this_param(params[0].type_annotation, ast) {
                     self.add_error_at(
-                        "self parameter is not allowed in top-level function",
+                        "this parameter is not allowed in top-level function",
                         decl_span.line,
                         decl_span.column,
                     );
@@ -5077,13 +5351,13 @@ impl<'a> InferContext<'a> {
                     crate::ast::Ast::TypeDef::Alias { .. } | crate::ast::Ast::TypeDef::Newtype { .. } => {}
                 }
                 // Type method checking.
-                self.push_self_type(self_ty);
+                self.push_this_type(self_ty);
                 // First register all methods as functions into env (supports bare-name method
                 // call syntax `method(recv, args)`), then check method bodies (avoids
                 // forward-reference issues).
                 for method in methods.iter() {
                     let m_param_types: Vec<TypeHandle> = method.params.iter().map(|p| {
-                        if self.is_self_param(p.type_annotation, ast) {
+                        if self.is_this_param(p.type_annotation, ast) {
                             self_ty
                         } else {
                             match p.type_annotation {
@@ -5109,8 +5383,8 @@ impl<'a> InferContext<'a> {
                     if let Some(body) = method.body {
                         let method_env = self.env.child(env);
                         for param in method.params.iter() {
-                            let param_ty = if self.is_self_param(param.type_annotation, ast) {
-                                self.infer_self_param(param.type_annotation, ast)
+                            let param_ty = if self.is_this_param(param.type_annotation, ast) {
+                                self.infer_this_param(param.type_annotation, ast)
                             } else {
                                 match param.type_annotation {
                                     Some(ta) => self.type_from_ast(ta, ast),
@@ -5146,7 +5420,7 @@ impl<'a> InferContext<'a> {
                         }
                     }
                 }
-                self.pop_self_type();
+                self.pop_this_type();
                 if !type_params.is_empty() {
                     self.pop_type_bindings();
                 }
@@ -5165,13 +5439,14 @@ impl<'a> InferContext<'a> {
                         }).collect::<Vec<_>>(),
                     );
                 }
-                let self_var = self.push_self_type_var();
+                let self_var = self.push_this_type_var();
+                self.current_trait_name = Some((*name).to_string().into_boxed_str());
                 for method in methods.iter() {
                     if let Some(body) = method.body {
                         let method_env = self.env.child(env);
                         for param in method.params.iter() {
-                            let param_ty = if self.is_self_param(param.type_annotation, ast) {
-                                self.infer_self_param(param.type_annotation, ast)
+                            let param_ty = if self.is_this_param(param.type_annotation, ast) {
+                                self.infer_this_param(param.type_annotation, ast)
                             } else {
                                 match param.type_annotation {
                                     Some(ta) => self.type_from_ast(ta, ast),
@@ -5207,7 +5482,8 @@ impl<'a> InferContext<'a> {
                         }
                     }
                 }
-                self.pop_self_type();
+                self.pop_this_type();
+                self.current_trait_name = None;
                 if !type_params.is_empty() {
                     self.pop_type_bindings();
                 }

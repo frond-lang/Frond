@@ -7,47 +7,47 @@
 pub type Duration = Duration(nanos: i128) {
     // ─── 转换器（转换为各时间单位） ───────────────────────────────────
 
-    pub fun as_secs(self): i64 {
-        cast(self.nanos / 1_000_000_000).to(i64)
+    pub fun as_secs(): i64 {
+        cast(nanos / 1_000_000_000).to(i64)
     }
 
-    pub fun as_millis(self): i64 {
-        cast(self.nanos / 1_000_000).to(i64)
+    pub fun as_millis(): i64 {
+        cast(nanos / 1_000_000).to(i64)
     }
 
-    pub fun as_micros(self): i64 {
-        cast(self.nanos / 1_000).to(i64)
+    pub fun as_micros(): i64 {
+        cast(nanos / 1_000).to(i64)
     }
 
-    pub fun as_nanos(self): i128 {
-        self.nanos
+    pub fun as_nanos(): i128 {
+        nanos
     }
 
     // 纳秒部分（不足 1 秒的部分），0..999_999_999
-    pub fun subsec_nanos(self): u32 {
-        cast(self.nanos % 1_000_000_000).to(u32)
+    pub fun subsec_nanos(): u32 {
+        cast(nanos % 1_000_000_000).to(u32)
     }
 
     // ─── 算子 ──────────────────────────────────────────────────────────
 
-    pub fun add(self, other: Duration): Duration {
-        Duration(self.nanos + other.nanos)
+    pub fun add(other: Duration): Duration {
+        Duration(nanos + other.nanos)
     }
 
-    pub fun sub(self, other: Duration): Duration {
-        Duration(self.nanos - other.nanos)
+    pub fun sub(other: Duration): Duration {
+        Duration(nanos - other.nanos)
     }
 
-    pub fun mul(self, factor: i64): Duration {
-        Duration(self.nanos * cast(factor).to(i128))
+    pub fun mul(factor: i64): Duration {
+        Duration(nanos * cast(factor).to(i128))
     }
 
-    pub fun div(self, factor: i64): Duration {
-        Duration(self.nanos / cast(factor).to(i128))
+    pub fun div(factor: i64): Duration {
+        Duration(nanos / cast(factor).to(i128))
     }
 
-    pub fun is_zero(self): bool {
-        self.nanos == 0
+    pub fun is_zero(): bool {
+        nanos == 0
     }
 }
 

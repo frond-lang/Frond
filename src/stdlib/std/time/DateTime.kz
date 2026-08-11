@@ -7,22 +7,22 @@
 pub type DateTime = DateTime(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8, nanos: u32, weekday: u8, day_of_year: u16) {
     // ─── 与 TimeComponents 转换 ────────────────────────────────────────
 
-    pub fun to_components(self): TimeComponents {
-        TimeComponents(self.year, self.month, self.day, self.hour, self.minute, self.second, self.nanos, self.weekday, self.day_of_year)
+    pub fun to_components(): TimeComponents {
+        TimeComponents(year, month, day, hour, minute, second, nanos, weekday, day_of_year)
     }
 
     // ─── 日期算术 ─────────────────────────────────────────────────────
 
     // 加天数（委托 Calendar.add_days，重算 weekday 与 day_of_year）
-    pub fun add_days(self, days: i64): DateTime {
-        val new_ymd = Calendar.add_days(self.year, self.month, self.day, days)
-        DateTime(new_ymd.year, new_ymd.month, new_ymd.day, self.hour, self.minute, self.second, self.nanos, Calendar.weekday_of(new_ymd.year, new_ymd.month, new_ymd.day), Calendar.day_of_year(new_ymd.year, new_ymd.month, new_ymd.day))
+    pub fun add_days(days: i64): DateTime {
+        val new_ymd = Calendar.add_days(year, month, day, days)
+        DateTime(new_ymd.year, new_ymd.month, new_ymd.day, hour, minute, second, nanos, Calendar.weekday_of(new_ymd.year, new_ymd.month, new_ymd.day), Calendar.day_of_year(new_ymd.year, new_ymd.month, new_ymd.day))
     }
 
     // 加 Duration（通过 UTC 分量往返转换，纯 Kuzo 算法）
     // 调用 SystemTime 的纯 Kuzo 转换函数（替代原 __components_to_ns_utc / __systemtime_to_utc_components syscall）
-    pub fun add_duration(self, d: Duration): Throw<DateTime, TimeError> {
-        val comp = self.to_components()
+    pub fun add_duration(d: Duration): Throw<DateTime, TimeError> {
+        val comp = to_components()
         val ns = std.time.SystemTime.components_to_ns_utc(comp)?
         val new_ns = ns + d.as_nanos()
         val new_comp = std.time.SystemTime.to_utc_components(new_ns)
@@ -32,58 +32,62 @@ pub type DateTime = DateTime(year: i32, month: u8, day: u8, hour: u8, minute: u8
     // ─── strftime-like 格式化 ─────────────────────────────────────────
 
     // 支持占位符：%Y %m %d %H %M %S %y %j %A %a %B %b %e %%
-    pub fun format(self, pattern: str): str {
-        var result: str = ""
+    // 使用数组收集片段 + __str_array_join 一次性 O(n) 拼接，避免循环 result = result + piece 的 O(n²)
+    pub fun format(pattern: str): str {
+        var pieces: str[] = []
         var i: usize = 0
         while i < pattern.len() {
             val c = pattern[i]
             if c == '%' {
                 i = i + 1
-                if i >= pattern.len() { return result + "%" }
+                if i >= pattern.len() {
+                    pieces = pieces ++ ["%"]
+                    break
+                }
                 val spec = pattern[i]
                 val piece = match spec {
-                    'Y' => pad_int(cast(self.year).to(i64), 4),
-                    'm' => pad_int(cast(self.month).to(i64), 2),
-                    'd' => pad_int(cast(self.day).to(i64), 2),
-                    'H' => pad_int(cast(self.hour).to(i64), 2),
-                    'M' => pad_int(cast(self.minute).to(i64), 2),
-                    'S' => pad_int(cast(self.second).to(i64), 2),
-                    'y' => pad_int(cast(self.year % 100).to(i64), 2),
-                    'j' => pad_int(cast(self.day_of_year).to(i64), 3),
-                    'A' => weekday_name(self.weekday),
-                    'a' => weekday_abbr(self.weekday),
-                    'B' => month_name(self.month),
-                    'b' => month_abbr(self.month),
-                    'e' => if self.day < 10 {
-                        " " + pad_int(cast(self.day).to(i64), 1)
+                    'Y' => pad_int(cast(year).to(i64), 4),
+                    'm' => pad_int(cast(month).to(i64), 2),
+                    'd' => pad_int(cast(day).to(i64), 2),
+                    'H' => pad_int(cast(hour).to(i64), 2),
+                    'M' => pad_int(cast(minute).to(i64), 2),
+                    'S' => pad_int(cast(second).to(i64), 2),
+                    'y' => pad_int(cast(year % 100).to(i64), 2),
+                    'j' => pad_int(cast(day_of_year).to(i64), 3),
+                    'A' => weekday_name(weekday),
+                    'a' => weekday_abbr(weekday),
+                    'B' => month_name(month),
+                    'b' => month_abbr(month),
+                    'e' => if day < 10 {
+                        " " + pad_int(cast(day).to(i64), 1)
                     } else {
-                        pad_int(cast(self.day).to(i64), 2)
+                        pad_int(cast(day).to(i64), 2)
                     },
                     '%' => "%",
                     _ => "%" + cast(spec).to(str),
                 }
-                result = result + piece
+                pieces = pieces ++ [piece]
             } else {
-                result = result + cast(c).to(str)
+                pieces = pieces ++ [cast(c).to(str)]
             }
             i = i + 1
         }
-        result
+        __str_array_join(pieces, "")
     }
 
     // ─── ISO 8601 ─────────────────────────────────────────────────────
 
-    pub fun to_iso8601(self): str {
-        pad_int(cast(self.year).to(i64), 4) + "-" +
-        pad_int(cast(self.month).to(i64), 2) + "-" +
-        pad_int(cast(self.day).to(i64), 2) + "T" +
-        pad_int(cast(self.hour).to(i64), 2) + ":" +
-        pad_int(cast(self.minute).to(i64), 2) + ":" +
-        pad_int(cast(self.second).to(i64), 2)
+    pub fun to_iso8601(): str {
+        pad_int(cast(year).to(i64), 4) + "-" +
+        pad_int(cast(month).to(i64), 2) + "-" +
+        pad_int(cast(day).to(i64), 2) + "T" +
+        pad_int(cast(hour).to(i64), 2) + ":" +
+        pad_int(cast(minute).to(i64), 2) + ":" +
+        pad_int(cast(second).to(i64), 2)
     }
 }
 
-// ─── 顶层自由函数（无 self）────────────────────────────────────────
+// ─── 顶层自由函数（无 this）────────────────────────────────────────
 
 pub fun from_components(comp: TimeComponents): DateTime {
     DateTime(comp.year, comp.month, comp.day, comp.hour, comp.minute, comp.second, comp.nanos, comp.weekday, comp.day_of_year)

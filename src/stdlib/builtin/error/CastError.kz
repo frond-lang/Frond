@@ -16,5 +16,5 @@ type CastError: Err = CastError(
     to: str,
     value: str,
 ) {
-    override fun type_name(self): str { "cast error" }
+    override fun type_name(): str { "cast error" }
 }

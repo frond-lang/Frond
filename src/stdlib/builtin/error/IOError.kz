@@ -16,7 +16,7 @@ type IOError: Err = IOError(
     os_err: i32,
     path: str?,
 ) {
-    override fun type_name(self): str { "io error" }
+    override fun type_name(): str { "io error" }
 }
 
 // IO 错误分类（穷举 ADT）

@@ -451,6 +451,11 @@ fn get_or_create_instance<'a>(
     // 6. Write to the instance table and cache.
     sema_result.monomorph_instances.push(instance);
     sema_result.monomorph_index.insert(cache_key, instance_id);
+    // Record module ownership for incremental purge (monomorph index).
+    sema_result.module_ownership.monomorph_indices
+        .entry(module_name.to_string())
+        .or_default()
+        .insert(instance_id);
     instance_id
 }
 
@@ -1035,7 +1040,13 @@ pub fn collect_monomorph_instances<'a>(
                         expr_types: FxHashMap::default(),
                         field_accesses: FxHashMap::default(),
                     };
+                    let mono_idx = instance.instance_id;
                     sema_result.monomorph_instances.push(instance);
+                    // Record module ownership for incremental purge (monomorph index).
+                    sema_result.module_ownership.monomorph_indices
+                        .entry(module.name.to_string())
+                        .or_default()
+                        .insert(mono_idx);
 
                     // Non-generic function: walk the function body to collect
                     // generic call sites.
@@ -1240,12 +1251,11 @@ pub fn collect_trait_default_instances<'a>(
             let impl_entries: Vec<(u16, String)> = sema_result
                 .witness_table
                 .entries()
-                .iter()
                 .filter(|e| e.trait_name.as_ref() == *name)
                 .filter_map(|e| {
                     // type_id → type_name (reverse-lookup in type_defs).
-                    sema_result.type_defs.iter().enumerate()
-                        .find(|(i, _)| crate::types::dynamic_type_id(*i as u16) == e.type_id)
+                    sema_result.type_defs.iter()
+                        .find(|(i, _)| crate::types::dynamic_type_id(**i) == e.type_id)
                         .map(|(_, td)| (e.type_id, td.name.to_string()))
                 })
                 .collect();

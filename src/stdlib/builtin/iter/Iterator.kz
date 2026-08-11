@@ -6,7 +6,7 @@
 //   StringIterator   — 字符串迭代器，next() 返回 i64?（Unicode 码点）
 //
 // 用户自定义类型 implement Iterator 后可被 For 循环使用：
-//   type MyRange: (Iterator<i32>) = MyRange(lo: i32, hi: i32) { pub fun next(&self): i32? { ... } }
+//   type MyRange: (Iterator<i32>) = MyRange(lo: i32, hi: i32) { pub fun &next(): i32? { ... } }
 //   for x in MyRange(1, 10) { ... }  // 静态分派，零开销
 //
 // 用法：
@@ -16,18 +16,18 @@
 // ---- Iterator trait ----
 trait Iterator<T> {
     // 返回下一个元素，null 表示耗尽
-    // &self 按引用接收者（迭代器有可变状态，next 修改 pos）
-    fun next(&self): T?
+    // &next 按引用接收者（迭代器有可变状态，next 修改 pos）
+    fun &next(): T?
 }
 
 // ---- 数组迭代器 ----
 type ArrayIter<T>: (Iterator<T>) = ArrayIter(data: T[], pos: usize) {
-    pub fun next(&self): T? {
-        if self.pos >= self.data.len() {
+    pub fun &next(): T? {
+        if pos >= data.len() {
             return null
         }
-        val v = self.data[self.pos]
-        self.pos = self.pos + 1
+        val v = data[pos]
+        pos = pos + 1
         return v
     }
 }
@@ -38,14 +38,14 @@ pub fun iter<T>(arr: T[]): ArrayIter<T> {
 
 // ---- 范围迭代器 ----
 type RangeIterator: (Iterator<i64>) = RangeIterator(current: i64, end: i64, inclusive: bool) {
-    pub fun next(&self): i64? {
-        if self.inclusive {
-            if self.current > self.end { return null }
+    pub fun &next(): i64? {
+        if inclusive {
+            if current > end { return null }
         } else {
-            if self.current >= self.end { return null }
+            if current >= end { return null }
         }
-        val v = self.current
-        self.current = self.current + 1
+        val v = current
+        current = current + 1
         return v
     }
 }
@@ -59,16 +59,16 @@ pub fun range_iter(start: i64, end: i64, inclusive: bool): RangeIterator {
 // UTF-8 解码由 builtin/str/Raw.kz 的 @extern("C") 原语提供。
 // pos 是字节偏移（非码点索引），终止条件通过 char_len==0 检测（offset 越界时返回 0）。
 type StringIterator: (Iterator<i64>) = StringIterator(data: str, pos: usize) {
-    pub fun next(&self): i64? {
-        val len = __str_utf8_char_len_at(self.data, self.pos)
+    pub fun &next(): i64? {
+        val len = __str_utf8_char_len_at(data, pos)
         if len == 0 {
             return null
         }
-        val cp = __str_utf8_decode_at(self.data, self.pos)
+        val cp = __str_utf8_decode_at(data, pos)
         if cp < 0 {
             return null
         }
-        self.pos = self.pos + len
+        pos = pos + len
         return cp
     }
 }

@@ -185,6 +185,16 @@ pub enum ConstVal {
 // SemaResult helper structures.
 // =========================================================================
 
+/// Records that a bare identifier or call resolved to an implicit `this` access.
+/// IR consumes this to generate FieldAccess/MethodCall nodes with the this receiver.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImplicitThisAccess {
+    /// Bare identifier resolved to instance field: `field` → `this.field`
+    Field(Box<str>),
+    /// Bare call resolved to instance method: `method(args)` → `this.method(args)`
+    Method(Box<str>),
+}
+
 /// Semantic information for a single expression.
 #[derive(Debug, Clone)]
 pub struct ExprInfo {
@@ -207,6 +217,9 @@ pub struct ExprInfo {
     /// Distinguishes `&T` (false) from `*T` (true); meaningful only when
     /// `is_ref_type == true`.
     pub is_raw_ref: bool,
+    /// When a bare identifier/call resolves to an implicit `this` field/method,
+    /// records the target name. IR consumes this to emit FieldAccess/MethodCall.
+    pub implicit_this: Option<ImplicitThisAccess>,
 }
 
 impl ExprInfo {
@@ -221,6 +234,7 @@ impl ExprInfo {
             is_trait_object: false,
             is_ref_type: false,
             is_raw_ref: false,
+            implicit_this: None,
         }
     }
 }
@@ -272,7 +286,7 @@ pub struct CtorDefInfo {
 #[derive(Debug, Clone)]
 pub enum TypeRepr {
     Named(Box<str>),
-    SelfType,
+    ThisType,
     Generic(Box<str>, Box<[TypeRepr]>),
     Nullable(Box<TypeRepr>),
     Ref(Box<TypeRepr>),
@@ -542,6 +556,32 @@ impl SemaError {
 }
 
 // =========================================================================
+// ModuleOwnership — module → global table indices owned by that module.
+// =========================================================================
+
+/// Module → global table indices owned by that module.
+/// Used to drain old entries during incremental recheck.
+#[derive(Default, Clone)]
+pub struct ModuleOwnership {
+    /// type_defs u16 indices owned by each module
+    pub type_def_indices: FxHashMap<String, FxHashSet<u16>>,
+    /// func_sigs u16 indices owned by each module
+    pub func_sig_indices: FxHashMap<String, FxHashSet<u16>>,
+    /// trait_defs u16 indices owned by each module
+    pub trait_def_indices: FxHashMap<String, FxHashSet<u16>>,
+    /// witness_table (trait_name, type_id) pairs owned by each module
+    pub witness_keys: FxHashMap<String, FxHashSet<(Box<str>, u16)>>,
+    /// import_aliases keys owned by each module
+    pub alias_keys: FxHashMap<String, FxHashSet<String>>,
+    /// monomorph_instances u32 indices owned by each module
+    pub monomorph_indices: FxHashMap<String, FxHashSet<u32>>,
+    /// field_id_map keys (type_name\x00field_name) owned by each module
+    pub field_id_keys: FxHashMap<String, FxHashSet<String>>,
+    /// expr_types u64 keys owned by each module (reverse map for purge)
+    pub expr_type_keys: FxHashMap<String, FxHashSet<u64>>,
+}
+
+// =========================================================================
 // SemaResult — graph-construction metadata produced by sema.
 // =========================================================================
 
@@ -561,15 +601,23 @@ pub struct SemaResult {
     /// Whether any error occurred.
     pub has_error: bool,
     /// Type definition table (replaces IRBuilder's type_table + ctor_table).
-    pub type_defs: Vec<TypeDefInfo>,
+    /// Keyed by a u16 index that never recycles; entries are truly removed on
+    /// `purge_module` (no stale holes).
+    pub type_defs: FxHashMap<u16, TypeDefInfo>,
+    /// u16 index allocator for `type_defs` (never recycles).
+    pub next_type_def_id: u16,
     /// Type name → index into `type_defs`.
     pub type_def_index: FxHashMap<String, u16>,
     /// Trait definition table.
-    pub trait_defs: Vec<TraitDefInfo>,
+    pub trait_defs: FxHashMap<u16, TraitDefInfo>,
+    /// u16 index allocator for `trait_defs` (never recycles).
+    pub next_trait_def_id: u16,
     /// Trait name → index into `trait_defs`.
     pub trait_def_index: FxHashMap<String, u16>,
     /// Function signature table.
-    pub func_sigs: Vec<FuncSigInfo>,
+    pub func_sigs: FxHashMap<u16, FuncSigInfo>,
+    /// u16 index allocator for `func_sigs` (never recycles).
+    pub next_func_sig_id: u16,
     /// Function name → index into `func_sigs`.
     pub func_sig_index: FxHashMap<String, u16>,
     /// Coroutine metadata table.
@@ -633,6 +681,8 @@ pub struct SemaResult {
     /// Stored by sema when multiple types share the same constructor name; the IR
     /// builder queries this to set `pattern_type_names` for runtime disambiguation.
     pub pattern_ctor_types: FxHashMap<(String, u32), Box<str>>,
+    /// Phase 2: module-origin index for incremental purge
+    pub module_ownership: ModuleOwnership,
 }
 
 impl Default for SemaResult {
@@ -644,24 +694,30 @@ impl Default for SemaResult {
 
 /// Generates the standard "table + index + put/get" trio of registration
 /// functions. `$put`/`$get` are the method names, `$field` is the table field
-/// name, `$index` is the index field name, and `$ty` is the element type.
+/// name, `$index` is the index field name, `$ty` is the element type, and
+/// `$next_id` is the u16 allocator field (never recycles).
 macro_rules! define_table_registry {
-    ($put:ident, $get:ident, $field:ident, $index:ident, $ty:ty) => {
+    ($put:ident, $get:ident, $field:ident, $index:ident, $ty:ty, $next_id:ident) => {
         /// Insert an element and register its index; returns `false` on a duplicate
-        /// name.
+        /// name. The u16 index is allocated from `$next_id` and never recycles.
         pub fn $put(&mut self, def: $ty) -> bool {
             if self.$index.contains_key(def.name.as_ref()) {
                 return false;
             }
-            let idx: u16 = self.$field.len() as u16;
+            assert!(
+                self.$next_id < u16::MAX,
+                concat!(stringify!($field), " index overflow: too many entries"),
+            );
+            let idx = self.$next_id;
+            self.$next_id += 1;
             self.$index.insert(def.name.to_string(), idx);
-            self.$field.push(def);
+            self.$field.insert(idx, def);
             true
         }
         /// Look up an element by name.
         pub fn $get(&self, name: &str) -> Option<&$ty> {
             let idx = *self.$index.get(name)?;
-            self.$field.get(idx as usize)
+            self.$field.get(&idx)
         }
     };
 }
@@ -673,11 +729,14 @@ impl SemaResult {
             errors: Vec::new(),
             warnings: Vec::new(),
             has_error: false,
-            type_defs: Vec::new(),
+            type_defs: FxHashMap::default(),
+            next_type_def_id: 0,
             type_def_index: FxHashMap::default(),
-            trait_defs: Vec::new(),
+            trait_defs: FxHashMap::default(),
+            next_trait_def_id: 0,
             trait_def_index: FxHashMap::default(),
-            func_sigs: Vec::new(),
+            func_sigs: FxHashMap::default(),
+            next_func_sig_id: 0,
             func_sig_index: FxHashMap::default(),
             coroutine_metas: Vec::new(),
             ctor_def_index: FxHashMap::default(),
@@ -696,6 +755,7 @@ impl SemaResult {
             module_func_recv_exprs: FxHashSet::default(),
             module_const_recv_exprs: FxHashMap::default(),
             pattern_ctor_types: FxHashMap::default(),
+            module_ownership: ModuleOwnership::default(),
         }
     }
 
@@ -714,11 +774,16 @@ impl SemaResult {
     // ── Import aliases ──
 
     /// Register an import alias; returns `false` on a duplicate short name.
-    pub fn put_import_alias(&mut self, short_name: &str, target: AliasTarget) -> bool {
+    pub fn put_import_alias(&mut self, short_name: &str, target: AliasTarget, module_name: &str) -> bool {
         if self.import_aliases.contains_key(short_name) {
             return false;
         }
         self.import_aliases.insert(short_name.to_string(), target);
+        // Record module ownership for incremental purge (import_aliases key).
+        self.module_ownership.alias_keys
+            .entry(module_name.to_string())
+            .or_default()
+            .insert(short_name.to_string());
         true
     }
 
@@ -750,18 +815,19 @@ impl SemaResult {
     /// types: all matching constructors are registered in `ctor_def_index`
     /// (multi-map), and disambiguation is deferred to type-context resolution
     /// or qualified-name syntax (`Type.Ctor`).
-    pub fn put_type_def(&mut self, def: TypeDefInfo) -> bool {
-        // u16 index overflow check (aligned with register in TypeDesc.rs).
-        assert!(
-            self.type_defs.len() < u16::MAX as usize,
-            "type_def index overflow: too many type definitions"
-        );
-        let idx: u16 = self.type_defs.len() as u16;
+    pub fn put_type_def(&mut self, def: TypeDefInfo, module_name: &str) -> bool {
         // Type-name conflict: reject (same-named types cannot be redefined).
         if self.type_def_index.contains_key(def.name.as_ref()) {
             return false;
         }
-        self.populate_field_ids(&def);
+        // u16 index overflow check (aligned with register in TypeDesc.rs).
+        assert!(
+            self.next_type_def_id < u16::MAX,
+            "type_def index overflow: too many type definitions"
+        );
+        let idx = self.next_type_def_id;
+        self.next_type_def_id += 1;
+        self.populate_field_ids(&def, module_name);
         // Register all constructors (same-named constructors across different
         // types are appended to the multi-map entry).
         for (ci, ctor) in def.constructors.iter().enumerate() {
@@ -772,7 +838,12 @@ impl SemaResult {
                 .push(packed_idx);
         }
         self.type_def_index.insert(def.name.to_string(), idx);
-        self.type_defs.push(def);
+        // Record module ownership for incremental purge (type_def index).
+        self.module_ownership.type_def_indices
+            .entry(module_name.to_string())
+            .or_default()
+            .insert(idx);
+        self.type_defs.insert(idx, def);
         true
     }
 
@@ -780,38 +851,38 @@ impl SemaResult {
     /// - adt/newtype/error_newtype: `__tag=0`, fields start at 1.
     /// - record: fields in declaration order, 0..N-1.
     /// - alias: no fields.
-    fn populate_field_ids(&mut self, def: &TypeDefInfo) {
+    fn populate_field_ids(&mut self, def: &TypeDefInfo, module_name: &str) {
         match def.kind {
             TypeDefKind::Adt => {
                 for ctor in def.constructors.iter() {
                     for (fi, fname) in ctor.field_names.iter().enumerate() {
                         if let Some(name) = fname {
                             let field_id = (fi + 1) as u16;
-                            self.put_field_id(&def.name, name, field_id);
+                            self.put_field_id(&def.name, name, field_id, module_name);
                         }
                     }
                 }
-                self.put_field_id(&def.name, "__tag", 0);
+                self.put_field_id(&def.name, "__tag", 0, module_name);
             }
             TypeDefKind::Newtype => {
                 for (fi, fname) in def.constructors.iter().flat_map(|c| c.field_names.iter()).enumerate() {
                     let field_id = (fi + 1) as u16;
                     match fname {
-                        Some(name) => self.put_field_id(&def.name, name, field_id),
+                        Some(name) => self.put_field_id(&def.name, name, field_id, module_name),
                         None => {
                             let positional = format!("_{}", fi);
-                            self.put_field_id(&def.name, &positional, field_id);
+                            self.put_field_id(&def.name, &positional, field_id, module_name);
                         }
                     }
                 }
-                self.put_field_id(&def.name, "__tag", 0);
+                self.put_field_id(&def.name, "__tag", 0, module_name);
             }
             TypeDefKind::Record => {
                 if let Some(ctor) = def.constructors.first() {
                     for (fi, fname) in ctor.field_names.iter().enumerate() {
                         if let Some(name) = fname {
                             let field_id = fi as u16;
-                            self.put_field_id(&def.name, name, field_id);
+                            self.put_field_id(&def.name, name, field_id, module_name);
                         }
                     }
                 }
@@ -826,9 +897,14 @@ impl SemaResult {
     }
 
     /// Build the `field_id_map` key and insert it (overwrites if already present).
-    fn put_field_id(&mut self, type_name: &str, field_name: &str, field_id: u16) {
+    fn put_field_id(&mut self, type_name: &str, field_name: &str, field_id: u16, module_name: &str) {
         let key = Self::make_field_key(type_name, field_name);
-        self.field_id_map.insert(key, field_id);
+        self.field_id_map.insert(key.clone(), field_id);
+        // Record module ownership for incremental purge (field_id_map key).
+        self.module_ownership.field_id_keys
+            .entry(module_name.to_string())
+            .or_default()
+            .insert(key);
     }
 
     /// Look up a field_id (returns `None` if not found).
@@ -841,7 +917,7 @@ impl SemaResult {
     /// Look up a type definition by name.
     pub fn get_type_def(&self, name: &str) -> Option<&TypeDefInfo> {
         let idx = *self.type_def_index.get(name)?;
-        self.type_defs.get(idx as usize)
+        self.type_defs.get(&idx)
     }
 
     /// Look up a constructor definition by constructor name.
@@ -851,7 +927,7 @@ impl SemaResult {
         let packed_idx = self.ctor_def_index.get(name)?.first()?;
         let type_idx = (*packed_idx >> 16) as u16;
         let ctor_idx = (*packed_idx & 0xFFFF) as u16;
-        let def = self.type_defs.get(type_idx as usize)?;
+        let def = self.type_defs.get(&type_idx)?;
         def.constructors.get(ctor_idx as usize)
     }
 
@@ -867,7 +943,7 @@ impl SemaResult {
                     let type_idx = (packed_idx >> 16) as u16;
                     let ctor_idx = (packed_idx & 0xFFFF) as u16;
                     self.type_defs
-                        .get(type_idx as usize)
+                        .get(&type_idx)
                         .and_then(|def| def.constructors.get(ctor_idx as usize))
                 })
                 .collect(),
@@ -895,10 +971,32 @@ impl SemaResult {
     }
 
     // ── Trait definitions ──
-    define_table_registry!(put_trait_def, get_trait_def, trait_defs, trait_def_index, TraitDefInfo);
+    define_table_registry!(put_trait_def, get_trait_def, trait_defs, trait_def_index, TraitDefInfo, next_trait_def_id);
 
     // ── Function signatures ──
-    define_table_registry!(put_func_sig, get_func_sig, func_sigs, func_sig_index, FuncSigInfo);
+    define_table_registry!(put_func_sig, get_func_sig, func_sigs, func_sig_index, FuncSigInfo, next_func_sig_id);
+
+    /// Record that a func_sig belongs to a module (for incremental purge).
+    /// Looks up the current index by name; call after a successful `put_func_sig`.
+    pub fn record_func_sig_owner(&mut self, name: &str, module_name: &str) {
+        if let Some(&idx) = self.func_sig_index.get(name) {
+            self.module_ownership.func_sig_indices
+                .entry(module_name.to_string())
+                .or_default()
+                .insert(idx);
+        }
+    }
+
+    /// Record that a trait_def belongs to a module (for incremental purge).
+    /// Looks up the current index by name; call after a successful `put_trait_def`.
+    pub fn record_trait_def_owner(&mut self, name: &str, module_name: &str) {
+        if let Some(&idx) = self.trait_def_index.get(name) {
+            self.module_ownership.trait_def_indices
+                .entry(module_name.to_string())
+                .or_default()
+                .insert(idx);
+        }
+    }
 
     // ── Method signatures (Ty-driven) ──
 
@@ -910,7 +1008,7 @@ impl SemaResult {
     /// (it may be a trait default method; consult the witness_table).
     pub fn lookup_method_idx(&self, type_name: &str, method_name: &str) -> Option<u16> {
         let &type_idx = self.type_def_index.get(type_name)?;
-        let type_def = &self.type_defs[type_idx as usize];
+        let type_def = &self.type_defs[&type_idx];
         type_def
             .methods
             .iter()
@@ -923,8 +1021,8 @@ impl SemaResult {
         if type_id < FIRST_DYNAMIC_TYPE_ID {
             return None;
         }
-        let type_idx = type_def_index_of(type_id) as usize;
-        let type_def = self.type_defs.get(type_idx)?;
+        let type_idx = type_def_index_of(type_id);
+        let type_def = self.type_defs.get(&type_idx)?;
         type_def.methods.get(method_idx as usize)
     }
 
@@ -938,6 +1036,95 @@ impl SemaResult {
     /// Look up coroutine metadata by `func_idx`.
     pub fn get_coroutine_meta_by_func_idx(&self, func_idx: u16) -> Option<&CoroutineMeta> {
         self.coroutine_metas.iter().find(|m| m.func_idx == func_idx)
+    }
+
+    // ── Incremental purge ──
+
+    /// Purge all sema products for a module (prepare for incremental recheck).
+    /// Removes expr_types, resolved_types, type_defs entries, func_sigs entries,
+    /// trait_defs entries, witness_table entries, import_aliases, field_id_map entries.
+    /// type_defs/func_sigs/trait_defs are truly removed from their HashMaps (the
+    /// u16 index allocator never recycles, so freed indices are simply never reused).
+    pub fn purge_module(&mut self, module_name: &str) {
+        // === Category A: u64-key tables ===
+        // Use expr_type_keys reverse map to find which keys to remove
+        if let Some(keys) = self.module_ownership.expr_type_keys.remove(module_name) {
+            for k in &keys {
+                self.expr_types.remove(k);
+                self.resolved_types.remove(k);
+                self.field_accesses.remove(k);
+                self.method_dispatches.remove(k);
+                self.reflect_metas.remove(k);
+                self.call_instantiations.remove(k);
+                self.module_func_recv_exprs.remove(k);
+                self.module_const_recv_exprs.remove(k);
+            }
+        }
+        // pattern_ctor_types: key is (String, u32), filter by module name
+        self.pattern_ctor_types.retain(|(m, _), _| m.as_str() != module_name);
+
+        // === Category B: global definition tables ===
+        // Truly remove entries from both the index HashMap and the value HashMap.
+        // Freed u16 indices are never reused (the allocator is monotonic).
+
+        // type_defs
+        if let Some(indices) = self.module_ownership.type_def_indices.remove(module_name) {
+            for idx in indices {
+                if let Some(def) = self.type_defs.remove(&idx) {
+                    self.type_def_index.remove(def.name.as_ref());
+                    // Remove constructor entries from ctor_def_index
+                    for ctor in &def.constructors {
+                        if let Some(vec) = self.ctor_def_index.get_mut(ctor.name.as_ref()) {
+                            vec.retain(|&packed| (packed >> 16) as u16 != idx);
+                            if vec.is_empty() {
+                                self.ctor_def_index.remove(ctor.name.as_ref());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // func_sigs
+        if let Some(indices) = self.module_ownership.func_sig_indices.remove(module_name) {
+            for idx in indices {
+                if let Some(sig) = self.func_sigs.remove(&idx) {
+                    self.func_sig_index.remove(sig.name.as_ref());
+                }
+            }
+        }
+
+        // trait_defs
+        if let Some(indices) = self.module_ownership.trait_def_indices.remove(module_name) {
+            for idx in indices {
+                if let Some(def) = self.trait_defs.remove(&idx) {
+                    self.trait_def_index.remove(def.name.as_ref());
+                }
+            }
+        }
+
+        // field_id_map
+        if let Some(keys) = self.module_ownership.field_id_keys.remove(module_name) {
+            for k in keys {
+                self.field_id_map.remove(&k);
+            }
+        }
+
+        // === Category C: cross-module accumulated ===
+        // witness_table
+        if let Some(keys) = self.module_ownership.witness_keys.remove(module_name) {
+            for (trait_name, type_id) in keys {
+                self.witness_table.remove(&trait_name, type_id);
+            }
+        }
+        // import_aliases
+        if let Some(keys) = self.module_ownership.alias_keys.remove(module_name) {
+            for k in keys {
+                self.import_aliases.remove(&k);
+            }
+        }
+        // monomorph_instances: leave stale entries (Vec, indexed by hash, won't be looked up)
+        // monomorph_index: also leave (stale entries harmless)
     }
 }
 
@@ -1005,7 +1192,7 @@ macro_rules! define_builtin_types {
         /// eliminating the match-branch special casing in `lookup_builtin_method`.
         ///
         /// Within method signatures:
-        /// - param_type_reprs[0] = SelfType (the `self` parameter, matching user
+        /// - param_type_reprs[0] = ThisType (the `self` parameter, matching user
         ///   type blocks).
         /// - Generic parameters use Named("T")/Named("E"), resolved via
         ///   `type_binding_stack`.
@@ -1057,7 +1244,7 @@ macro_rules! define_builtin_types {
                     target_type: None,
                     methods: methods.into_boxed_slice(),
                 };
-                sema_result.put_type_def(def);
+                sema_result.put_type_def(def, "");
             }
 
             // ── generic group: enters BUILTIN_GENERIC_TYPES + method registration ──
@@ -1075,46 +1262,46 @@ macro_rules! define_builtin_types {
 define_builtin_types! {
     generic {
         "Throw" : ["T", "E"] = [
-            sig("is_ok", vec![TypeRepr::SelfType], Some(TypeRepr::Named("bool".into())), None),
+            sig("is_ok", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), None),
         ],
         "Channel" : ["T"] = [
-            sig("send", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(284))),
-            sig("recv", vec![TypeRepr::SelfType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::ChannelAwait)),
-            sig("close", vec![TypeRepr::SelfType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
+            sig("send", vec![TypeRepr::ThisType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(284))),
+            sig("recv", vec![TypeRepr::ThisType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::ChannelAwait)),
+            sig("close", vec![TypeRepr::ThisType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
         ],
         "Atomic" : ["T"] = [
-            sig("swap", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::BinOp(317))),
-            sig("compare_exchange", vec![TypeRepr::SelfType, TypeRepr::Named("T".into()), TypeRepr::Named("T".into())], Some(TypeRepr::Named("bool".into())), Some(IntrinsicKind::TriOp(318))),
-            sig("load", vec![TypeRepr::SelfType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::UnOp(315))),
-            sig("store", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(316))),
+            sig("swap", vec![TypeRepr::ThisType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::BinOp(317))),
+            sig("compare_exchange", vec![TypeRepr::ThisType, TypeRepr::Named("T".into()), TypeRepr::Named("T".into())], Some(TypeRepr::Named("bool".into())), Some(IntrinsicKind::TriOp(318))),
+            sig("load", vec![TypeRepr::ThisType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::UnOp(315))),
+            sig("store", vec![TypeRepr::ThisType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(316))),
         ],
         "Async" : ["T"] = [
-            sig("status", vec![TypeRepr::SelfType], Some(TypeRepr::Named("str".into())), None),
-            sig("await", vec![TypeRepr::SelfType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::Await)),
-            sig("cancel", vec![TypeRepr::SelfType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(42))),
+            sig("status", vec![TypeRepr::ThisType], Some(TypeRepr::Named("str".into())), None),
+            sig("await", vec![TypeRepr::ThisType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::Await)),
+            sig("cancel", vec![TypeRepr::ThisType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(42))),
         ],
         "Sender" : ["T"] = [
-            sig("send", vec![TypeRepr::SelfType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(284))),
-            sig("close", vec![TypeRepr::SelfType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
+            sig("send", vec![TypeRepr::ThisType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(284))),
+            sig("close", vec![TypeRepr::ThisType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
         ],
         "Receiver" : ["T"] = [
-            sig("recv", vec![TypeRepr::SelfType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::ChannelAwait)),
-            sig("close", vec![TypeRepr::SelfType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
+            sig("recv", vec![TypeRepr::ThisType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::ChannelAwait)),
+            sig("close", vec![TypeRepr::ThisType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
         ],
         "Lazy" : ["T"] = [],
     }
     nongeneric {
         "array" : ["T"] = [
-            sig("len", vec![TypeRepr::SelfType], Some(TypeRepr::Named("usize".into())), Some(IntrinsicKind::UnOp(35))),
-            sig("is_empty", vec![TypeRepr::SelfType], Some(TypeRepr::Named("bool".into())), None),
+            sig("len", vec![TypeRepr::ThisType], Some(TypeRepr::Named("usize".into())), Some(IntrinsicKind::UnOp(35))),
+            sig("is_empty", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), None),
         ],
         "str" : [] = [
-            sig("len", vec![TypeRepr::SelfType], Some(TypeRepr::Named("usize".into())), Some(IntrinsicKind::UnOp(35))),
-            sig("is_empty", vec![TypeRepr::SelfType], Some(TypeRepr::Named("bool".into())), None),
-            sig("bytes", vec![TypeRepr::SelfType], Some(TypeRepr::Array(Box::new(TypeRepr::Named("u8".into())), None)), Some(IntrinsicKind::UnOp(287))),
+            sig("len", vec![TypeRepr::ThisType], Some(TypeRepr::Named("usize".into())), Some(IntrinsicKind::UnOp(35))),
+            sig("is_empty", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), None),
+            sig("bytes", vec![TypeRepr::ThisType], Some(TypeRepr::Array(Box::new(TypeRepr::Named("u8".into())), None)), Some(IntrinsicKind::UnOp(287))),
         ],
         "nullable" : ["T"] = [
-            sig("is_null", vec![TypeRepr::SelfType], Some(TypeRepr::Named("bool".into())), None),
+            sig("is_null", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), None),
         ],
     }
 }
@@ -1301,13 +1488,13 @@ pub fn resolve_type_node_resolved<'a>(
             arena.make_fn(Vec::<TypeHandle>::new().into_boxed_slice(), ret)
         }
         TypeNode::Array { .. } => arena.make_adt("array".into(), Box::new([])),
-        TypeNode::SelfType => {
+        TypeNode::ThisType => {
             for &ta in type_args {
-                if type_handle_name_matches(arena, ta, "Self") {
+                if type_handle_name_matches(arena, ta, "This") {
                     return Some(ta);
                 }
             }
-            arena.make_adt("Self".into(), Box::new([]))
+            arena.make_adt("This".into(), Box::new([]))
         }
         TypeNode::KindAnnotated { inner, .. } => {
             return resolve_type_node_resolved(arena, Some(*inner), type_args, ast, sema_result);
@@ -1335,9 +1522,9 @@ pub fn resolve_type_node_resolved<'a>(
 //
 // Binding-stack architecture:
 // - TypeBindingStack: generic parameter name → TypeHandle (rigid var).
-// - SelfBindingStack: Self → TypeHandle (scope type).
+// - ThisBindingStack: Self → TypeHandle (scope type).
 // The two stacks push/pop in lockstep: entering an `impl Type<T>` block pushes T
-// onto TypeBindingStack and Type<T> onto SelfBindingStack; both are popped on
+// onto TypeBindingStack and Type<T> onto ThisBindingStack; both are popped on
 // exit.
 // =========================================================================
 
@@ -1426,11 +1613,11 @@ impl TypeBindingStack {
 /// push a `fresh_type_var` when entering `trait Foo<T> { default methods }`;
 /// pop on exit. `lookup` returns the top of the stack (inner bindings first).
 #[derive(Debug, Default)]
-pub struct SelfBindingStack {
+pub struct ThisBindingStack {
     stack: Vec<TypeHandle>,
 }
 
-impl SelfBindingStack {
+impl ThisBindingStack {
     pub fn new() -> Self {
         Self::default()
     }
@@ -1495,7 +1682,12 @@ pub fn populate_sema_result_from_ast<'a>(
 ) -> bool {
     match &decl.node {
         Decl::FunDecl { name, type_params, params, return_type, is_async, .. } => {
-            ast_fun_decl_to_func_sig(arena, sema_result, name, type_params, params, *return_type, *is_async, ast)
+            if ast_fun_decl_to_func_sig(arena, sema_result, name, type_params, params, *return_type, *is_async, ast) {
+                sema_result.record_func_sig_owner(name, module_name);
+                true
+            } else {
+                false
+            }
         }
         Decl::TypeDecl { name, type_params, def, methods, .. } => {
             ast_type_decl_to_type_def(arena, sema_result, name, type_params, def, ast, decl.span, module_name);
@@ -1507,7 +1699,12 @@ pub fn populate_sema_result_from_ast<'a>(
             true
         }
         Decl::TraitDecl { name, methods, .. } => {
-            ast_trait_decl_to_trait_def(arena, sema_result, name, methods, ast)
+            if ast_trait_decl_to_trait_def(arena, sema_result, name, methods, ast) {
+                sema_result.record_trait_def_owner(name, module_name);
+                true
+            } else {
+                false
+            }
         }
         _ => true, // ImportDecl/PackDecl/ExprDecl skipped
     }
@@ -1651,10 +1848,11 @@ fn ast_method_to_func_sig<'a>(
 ) -> bool {
     let sig = build_method_sig_info(arena, sema_result, method, ast);
     if let Some(&type_idx) = sema_result.type_def_index.get(type_name) {
-        let type_def = &mut sema_result.type_defs[type_idx as usize];
-        let mut methods_vec: Vec<MethodSigInfo> = type_def.methods.to_vec();
-        methods_vec.push(sig);
-        type_def.methods = methods_vec.into_boxed_slice();
+        if let Some(type_def) = sema_result.type_defs.get_mut(&type_idx) {
+            let mut methods_vec: Vec<MethodSigInfo> = type_def.methods.to_vec();
+            methods_vec.push(sig);
+            type_def.methods = methods_vec.into_boxed_slice();
+        }
         true
     } else {
         false
@@ -1818,7 +2016,7 @@ pub(crate) fn ast_type_decl_to_type_def<'a>(
         methods: Box::new([]),
     };
 
-    sema_result.put_type_def(type_def)
+    sema_result.put_type_def(type_def, def_module)
 }
 
 // ── Helper functions ──
@@ -1859,7 +2057,7 @@ fn resolve_param_type<'a>(
 /// scalar channel-width computation and projects Ref/Array down to Adt(name);
 /// this function preserves structure and is the general concretization entry
 /// point. The inference phase (which needs the `type_binding_stack`/
-/// `self_binding_stack` context) uses `InferContext::type_from_ast_with_params`;
+/// `this_binding_stack` context) uses `InferContext::type_from_ast_with_params`;
 /// since that context cannot be provided by this free function, they are separate
 /// phase entry points.
 pub(crate) fn concretize_type<'a>(
@@ -1908,13 +2106,13 @@ pub(crate) fn concretize_type<'a>(
             let elem = concretize_type(arena, *element_type, type_args, ast, sema_result);
             arena.make_array(elem, *size)
         }
-        TypeNode::SelfType => {
+        TypeNode::ThisType => {
             for &ta in type_args {
-                if arena.get(ta).name() == "Self" {
+                if arena.get(ta).name() == "This" {
                     return ta;
                 }
             }
-            arena.make_adt("Self".into(), Box::new([]))
+            arena.make_adt("This".into(), Box::new([]))
         }
         TypeNode::KindAnnotated { inner, .. } => {
             concretize_type(arena, *inner, type_args, ast, sema_result)
@@ -1937,7 +2135,7 @@ fn is_throw_type(tn: &TypeNode) -> bool {
 fn type_node_to_repr<'a>(tn: &TypeNode<'a>, ast: &AstArena<'a>) -> TypeRepr {
     match tn {
         TypeNode::Named { name } => TypeRepr::Named((*name).into()),
-        TypeNode::SelfType => TypeRepr::SelfType,
+        TypeNode::ThisType => TypeRepr::ThisType,
         TypeNode::Generic { name, args } => {
             let repr_args: Vec<TypeRepr> = args
                 .iter()
@@ -2062,8 +2260,9 @@ fn record_fields_to_ctor_info<'a>(
 //
 // Data structures:
 // - WitnessEntry { trait_name, type_id, method_slots }
-// - WitnessTable uses Vec<WitnessEntry> + FxHashMap<(trait_name, type_id), idx>
-//   for indexing.
+// - WitnessTable uses FxHashMap<u32, WitnessEntry> (never-recycling u32 allocator)
+//   + FxHashMap<(trait_name, type_id), u32> for indexing. Hard delete on purge
+//   (no stale holes), consistent with type_defs/func_sigs/trait_defs.
 //
 // Dispatch flow:
 // 1. Infer the receiver type → resolve → obtain type_id (scalars have one
@@ -2092,10 +2291,18 @@ pub struct WitnessEntry {
 ///
 /// Indexed by (trait_name, type_id) to reach a `WitnessEntry`, then by
 /// `method_name` to reach a method slot.
+///
+/// Uses `FxHashMap<u32, WitnessEntry>` with a never-recycling u32 allocator
+/// (consistent with `type_defs`/`func_sigs`/`trait_defs`). `remove` performs a
+/// true hard delete — no stale holes left in the table.
 #[derive(Default, Clone)]
 pub struct WitnessTable {
-    entries: Vec<WitnessEntry>,
-    /// Index: (trait_name, type_id) → index into `entries`.
+    /// Entry storage: entry_id → WitnessEntry. Freed ids are never reused.
+    entries: FxHashMap<u32, WitnessEntry>,
+    /// Monotonic entry-id allocator (never recycles, so stale indices are never
+    /// accidentally reused after a purge).
+    next_entry_id: u32,
+    /// Index: (trait_name, type_id) → entry_id into `entries`.
     index: FxHashMap<(Box<str>, u16), u32>,
 }
 
@@ -2107,7 +2314,8 @@ impl WitnessTable {
     /// Register a trait implementation.
     ///
     /// If (trait_name, type_id) already exists, the old implementation is
-    /// overwritten (redefinition is allowed).
+    /// overwritten (redefinition is allowed) at the same entry_id — no new id is
+    /// allocated.
     pub fn register(
         &mut self,
         trait_name: &str,
@@ -2116,23 +2324,24 @@ impl WitnessTable {
         method_slots: FxHashMap<Box<str>, u16>,
     ) {
         let key = (trait_name.into(), type_id);
-        if let Some(&idx) = self.index.get(&key) {
-            // Overwrite the existing implementation.
-            self.entries[idx as usize] = WitnessEntry {
-                trait_name: trait_name.into(),
-                type_id,
-                method_slots,
-                type_name: type_name.into(),
-            };
-        } else {
-            let idx = self.entries.len() as u32;
-            self.entries.push(WitnessEntry {
+        if let Some(&id) = self.index.get(&key) {
+            // Overwrite the existing implementation at the same entry_id.
+            self.entries.insert(id, WitnessEntry {
                 trait_name: trait_name.into(),
                 type_id,
                 method_slots,
                 type_name: type_name.into(),
             });
-            self.index.insert(key, idx);
+        } else {
+            let id = self.next_entry_id;
+            self.next_entry_id += 1;
+            self.entries.insert(id, WitnessEntry {
+                trait_name: trait_name.into(),
+                type_id,
+                method_slots,
+                type_name: type_name.into(),
+            });
+            self.index.insert(key, id);
         }
     }
 
@@ -2154,8 +2363,8 @@ impl WitnessTable {
         method_name: &str,
     ) -> Option<u16> {
         let key = (trait_name.into(), type_id);
-        let &idx = self.index.get(&key)?;
-        let entry = &self.entries[idx as usize];
+        let &id = self.index.get(&key)?;
+        let entry = self.entries.get(&id)?;
         entry.method_slots.get(method_name).copied()
     }
 
@@ -2163,19 +2372,23 @@ impl WitnessTable {
     pub fn trait_methods(&self, trait_name: &str, type_id: u16) -> Vec<&str> {
         let key = (trait_name.into(), type_id);
         match self.index.get(&key) {
-            Some(&idx) => self.entries[idx as usize]
-                .method_slots
-                .keys()
-                .map(|k| k.as_ref())
-                .collect(),
+            Some(&id) => self.entries.get(&id).map(|e| {
+                e.method_slots
+                    .keys()
+                    .map(|k| k.as_ref())
+                    .collect()
+            }).unwrap_or_default(),
             None => Vec::new(),
         }
     }
 
     /// Get all entries (for reflection / diagnostics).
+    ///
+    /// Returns an iterator over `&WitnessEntry`. Callers should iterate directly
+    /// (no `.iter()` needed).
     #[inline]
-    pub fn entries(&self) -> &[WitnessEntry] {
-        &self.entries
+    pub fn entries(&self) -> std::collections::hash_map::Values<'_, u32, WitnessEntry> {
+        self.entries.values()
     }
 
     /// Number of entries.
@@ -2188,5 +2401,19 @@ impl WitnessTable {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Remove a witness entry by (trait_name, type_id).
+    /// Used during incremental sema purge.
+    ///
+    /// Performs a true hard delete: removes the key from `index` and the entry
+    /// from `entries`. The freed entry_id is never reused (the allocator is
+    /// monotonic), so no stale references can accidentally resolve to a different
+    /// trait implementation after a purge.
+    pub fn remove(&mut self, trait_name: &str, type_id: u16) {
+        let key: (Box<str>, u16) = (trait_name.into(), type_id);
+        if let Some(id) = self.index.remove(&key) {
+            self.entries.remove(&id);
+        }
     }
 }

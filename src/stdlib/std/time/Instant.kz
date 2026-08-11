@@ -8,24 +8,24 @@
 pub type Instant = Instant(nanos: i128) {
     // ─── 时间间隔 ──────────────────────────────────────────────────────
 
-    // 从 now 到 self 的时间长度
-    pub fun elapsed(self): Duration {
-        Duration(__instant_now_ns() - self.nanos)
+    // 从 now 到 this 的时间长度
+    pub fun elapsed(): Duration {
+        Duration(__instant_now_ns() - nanos)
     }
 
-    // self 相对 earlier 的时间长度（self - earlier，可为负）
-    pub fun duration_since(self, earlier: Instant): Duration {
-        Duration(self.nanos - earlier.nanos)
+    // this 相对 earlier 的时间长度（this - earlier，可为负）
+    pub fun duration_since(earlier: Instant): Duration {
+        Duration(nanos - earlier.nanos)
     }
 
     // ─── 加减 Duration ─────────────────────────────────────────────────
 
-    pub fun add_duration(self, d: Duration): Instant {
-        Instant(self.nanos + d.nanos)
+    pub fun add_duration(d: Duration): Instant {
+        Instant(nanos + d.nanos)
     }
 
-    pub fun sub_duration(self, d: Duration): Instant {
-        Instant(self.nanos - d.nanos)
+    pub fun sub_duration(d: Duration): Instant {
+        Instant(nanos - d.nanos)
     }
 }
 

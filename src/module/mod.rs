@@ -8,10 +8,12 @@
 //!
 //! ## Lifetime strategy
 //!
-//! stdlib sources are `&'static str` (via `include_str!`), while user module sources are
-//! converted to `&'static str` through `Box::leak`. The bump arena is likewise made `&'static`
-//! via `Box::leak`, so every `Module<'static>` produced by parsing is safe to cache.
-//! Memory is reclaimed by the OS when the compiler process exits, with no leak risk.
+//! `LoadedModule` owns the bump arena (`Box<Bump>`) and source string (`Box<str>`) that back
+//! each `Module<'static>`. The `'static` lifetime on `module` is a soundness fiction maintained
+//! by struct field drop order (reverse declaration): `module` is dropped before `_arena` and
+//! `_source`, so arena-allocated data is never accessed after free. `Module` has no custom
+//! `Drop`, so dropping it only frees `Vec` buffers (on the regular heap) and drops `&str`
+//! references (no-ops). Memory is fully reclaimed when a `LoadedModule` is dropped or replaced.
 //!
 //! ## Module path conventions
 //!

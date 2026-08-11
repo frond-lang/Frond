@@ -1,12 +1,12 @@
 // Writer trait: 字节写入抽象
 //
 // 实现者提供 write 的 async IO 语义：
-// - write(&self, buf, len) 写入 buf 前 len 字节，返回实际写入字节数
-// - write_all(&self, buf, len) 写入全部字节，返回 void
+// - &write(buf, len) 写入 buf 前 len 字节，返回实际写入字节数
+// - &write_all(buf, len) 写入全部字节，返回 void
 trait Writer {
     // 核心写入方法：返回实际写入字节数
-    async fun write(&self, buf: u8[], len: usize): Async<Throw<usize, IOError>>
+    async fun &write(buf: u8[], len: usize): Async<Throw<usize, IOError>>
 
     // 写入全部字节；write 返回 0 时抛 BrokenPipe
-    async fun write_all(&self, buf: u8[], len: usize): Async<Throw<void, IOError>>
+    async fun &write_all(buf: u8[], len: usize): Async<Throw<void, IOError>>
 }

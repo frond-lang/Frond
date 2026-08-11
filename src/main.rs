@@ -1,4 +1,5 @@
 //! kuzo CLI — project-based subcommand set
+//! (implicit this rebuild)
 //!
 //! Subcommands:
 //!   kuzo init [name]               Scaffold a new project (creates kuzo.toml + src/Main.kz)
@@ -18,15 +19,16 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 
-use kuzo::ast::Ast::{Module, Printer};
+use kuzo::ast::Ast::Printer;
 use kuzo::ast::Parser::{ErrorCollector, Lexer, Parser as KuzoParser, Token, TokenCollector};
 use kuzo::engine::EngineRef;
 use kuzo::pass::Analyzer;
 use kuzo::ir::Builder::IrBuilder;
-use kuzo::module::ModuleLoader;
-use kuzo::module::Error::LoadError;
-use kuzo::sema::Sema::{populate_module, SemaResult, TypeArena};
-use kuzo::sema::Inference::InferContext;
+use kuzo::tooling::common::Pipeline;
+use kuzo::tooling::fmt::Engine::{format as fmt_source, FmtConfig};
+use kuzo::tooling::lint::{lint_file, LintConfig};
+use kuzo::tooling::lint::Report;
+use kuzo::tooling::lsp::Server::LspServer;
 
 /// Kuzo language Rust implementation CLI.
 #[derive(Parser)]
@@ -78,6 +80,33 @@ enum Commands {
         #[arg(short = 'v', long = "verbose")]
         verbose: bool,
     },
+    /// Format source code.
+    Fmt {
+        /// File or directory to format (default: src/ directory).
+        path: Option<String>,
+        /// Check formatting without modifying files (exit 1 if unformatted).
+        #[arg(long = "check")]
+        check: bool,
+        /// Read from stdin, write to stdout.
+        #[arg(long = "stdin")]
+        stdin: bool,
+    },
+    /// Lint source code.
+    Lint {
+        /// File to lint (default: src/ directory).
+        path: Option<String>,
+        /// Output format: human (default) or json.
+        #[arg(long = "format", value_name = "FORMAT")]
+        format: Option<String>,
+        /// Treat warnings as errors (exit 1).
+        #[arg(long = "deny")]
+        deny: Option<String>,
+        /// Read from stdin.
+        #[arg(long = "stdin")]
+        stdin: bool,
+    },
+    /// Start LSP server (reads from stdin, writes to stdout).
+    Lsp,
 }
 
 /// Stage options for the debug subcommand.
@@ -105,6 +134,9 @@ fn main() {
         Commands::Run { file, opt_level } => cmd_run(file, opt_level),
         Commands::Debug { file, stage } => cmd_debug(file, stage),
         Commands::Inspect { file, verbose } => cmd_inspect(&file, verbose),
+        Commands::Fmt { path, check, stdin } => cmd_fmt(path, check, stdin),
+        Commands::Lint { path, format, deny, stdin } => cmd_lint(path, format, deny, stdin),
+        Commands::Lsp => cmd_lsp(),
     }
 }
 
@@ -434,213 +466,13 @@ fn debug_emit_ffi(source: &str) {
     }
 }
 
-// ==================== Shared pipeline (debug_check / cmd_run) ====================
-
-/// Parses the entry module. The arena must remain valid for the lifetime of the returned `Module`.
-fn parse_entry_module<'a>(arena: &'a bumpalo::Bump, source: &'a str, filename: &'a str) -> Module<'a> {
-    let mut lexer = Lexer::new(source);
-    let mut sink = TokenCollector::new();
-    lexer.tokenize_into(&mut sink);
-    let tokens: Vec<Token<'_>> = sink.into_tokens();
-    let tokens_ref = arena.alloc_slice_copy(&tokens);
-    let mut parser = KuzoParser::new(tokens_ref, arena, ErrorCollector::new());
-
-    let module = match parser.parse_module(filename) {
-        Ok(m) => m,
-        Err(err) => {
-            eprintln!("{}:{}:{}: parse error: {}", filename, err.line, err.column, err.message);
-            process::exit(1);
-        }
-    };
-    for err in parser.errors() {
-        eprintln!("Warning: {}:{}:{}: {}", filename, err.line, err.column, err.message);
-    }
-    module
-}
-
-/// Loads all modules (builtin + std + user dependencies), returning (loader, std_keys, dep_keys).
-/// The directory containing the entry file is added as a search path to resolve user modules (e.g. Math/Geometry.kz).
-fn load_all_modules(
-    entry_module: &Module,
-    entry_path: &str,
-) -> (ModuleLoader, Vec<String>, Vec<String>) {
-    let mut loader = ModuleLoader::new();
-    if let Some(src_dir) = std::path::Path::new(entry_path).parent() {
-        loader.add_search_path(src_dir);
-    }
-    let dep_keys = loader.load_transitive_imports(entry_module);
-
-    let std_keys: Vec<String> = kuzo::module::STD_FILES
-        .iter()
-        .map(|(p, _)| p.to_string())
-        .collect();
-    for key in &std_keys {
-        let parts: Vec<&str> = key.strip_suffix(".kz").unwrap().split('/').collect();
-        let _ = loader.resolve_and_load(&parts);
-    }
-
-    if loader.has_load_errors() {
-        for err in loader.load_errors() {
-            match err {
-                LoadError::ModuleNotFound { path } => {
-                    eprintln!("error: module not found: {}", path);
-                }
-                LoadError::ParseFailed { path, line, column, message } => {
-                    eprintln!("error: parse failed in {} at {}:{}: {}", path, line, column, message);
-                }
-                LoadError::CircularImport { path } => {
-                    eprintln!("error: circular import detected: {}", path);
-                }
-            }
-        }
-        process::exit(1);
-    }
-    (loader, std_keys, dep_keys)
-}
-
-/// Runs the full Sema pipeline: register builtin types → predeclare all modules → check each module.
-/// Any type error in any module is printed and exits with exit(1). Returns (type_arena, sema_result) on success.
-fn run_sema_pipeline(
-    loader: &ModuleLoader,
-    std_keys: &[String],
-    dep_keys: &[String],
-    entry_module: &Module,
-    entry_filename: &str,
-) -> (TypeArena, SemaResult) {
-    let mut type_arena = TypeArena::new();
-    let mut sema_result = SemaResult::new();
-    let mut ctx = InferContext::new(&mut type_arena, &mut sema_result);
-
-    ctx.reset_state();
-    let root_env = ctx.env.root();
-    ctx.register_builtins(root_env);
-
-    let module_logical_paths: Vec<String> = loader
-        .loaded_keys()
-        .iter()
-        .filter_map(|k| k.strip_suffix(".kz").map(|s| s.replace('/', ".")))
-        .collect();
-    ctx.register_module_aliases(root_env, &module_logical_paths);
-
-    // predeclare: register all module functions and type constructors into root_env first,
-    // to resolve cross-module forward references. check_module_with_env will predeclare again internally (idempotent).
-    for (_, m) in loader.builtin_modules() {
-        ctx.predeclare_declarations(m, root_env);
-    }
-    for key in std_keys {
-        if let Some(m) = loader.get_module_by_key(key) {
-            ctx.predeclare_declarations(m, root_env);
-        }
-    }
-    for k in dep_keys {
-        if let Some(m) = loader.get_module_by_key(k) {
-            ctx.predeclare_declarations(m, root_env);
-        }
-    }
-
-    let mut prev_err_len = 0usize;
-    let mut prev_warn_len = 0usize;
-
-    // populate: fill in the definition tables (type method signatures, etc.) for all modules before checking,
-    // to resolve cross-module method lookup failures caused by module check ordering.
-    // check_module_with_env will call it again internally (idempotent; put_type_def rejects duplicates).
-    for (_, m) in loader.builtin_modules() {
-        populate_module(ctx.arena, ctx.sema_result, m);
-    }
-    for key in std_keys {
-        if let Some(m) = loader.get_module_by_key(key) {
-            populate_module(ctx.arena, ctx.sema_result, m);
-        }
-    }
-    for k in dep_keys {
-        if let Some(m) = loader.get_module_by_key(k) {
-            populate_module(ctx.arena, ctx.sema_result, m);
-        }
-    }
-    populate_module(ctx.arena, ctx.sema_result, entry_module);
-
-    // Build the all_modules list: used for cross-module monomorphization (generic calls need access to the callee module's arena).
-    let mut all_modules: Vec<&Module> = Vec::new();
-    for (_, m) in loader.builtin_modules() {
-        all_modules.push(m);
-    }
-    for key in std_keys {
-        if let Some(m) = loader.get_module_by_key(key) {
-            all_modules.push(m);
-        }
-    }
-    for k in dep_keys {
-        if let Some(m) = loader.get_module_by_key(k) {
-            all_modules.push(m);
-        }
-    }
-    all_modules.push(entry_module);
-
-    // check: builtin → std → dep → entry
-    for (path, m) in loader.builtin_modules() {
-        ctx.check_module_with_env(m, root_env, &all_modules);
-        for err in &ctx.sema_result.errors[prev_err_len..] {
-            eprintln!("{}:{}:{}: {}", path, err.line, err.column, err.message);
-        }
-        for warn in &ctx.sema_result.warnings[prev_warn_len..] {
-            let wp = warn.file_path.as_deref().map(|s| s as &str).unwrap_or(path);
-            eprintln!("{}:{}:{}: warning: {}", wp, warn.line, warn.column, warn.message);
-        }
-        prev_err_len = ctx.sema_result.errors.len();
-        prev_warn_len = ctx.sema_result.warnings.len();
-    }
-    for key in std_keys {
-        if let Some(m) = loader.get_module_by_key(key) {
-            ctx.check_module_with_env(m, root_env, &all_modules);
-            for err in &ctx.sema_result.errors[prev_err_len..] {
-                eprintln!("{}:{}:{}: {}", key, err.line, err.column, err.message);
-            }
-            for warn in &ctx.sema_result.warnings[prev_warn_len..] {
-                let wp = warn.file_path.as_deref().map(|s| s as &str).unwrap_or(key);
-                eprintln!("{}:{}:{}: warning: {}", wp, warn.line, warn.column, warn.message);
-            }
-            prev_err_len = ctx.sema_result.errors.len();
-            prev_warn_len = ctx.sema_result.warnings.len();
-        }
-    }
-    for k in dep_keys {
-        if let Some(m) = loader.get_module_by_key(k) {
-            ctx.check_module_with_env(m, root_env, &all_modules);
-            for err in &ctx.sema_result.errors[prev_err_len..] {
-                eprintln!("{}:{}:{}: {}", k, err.line, err.column, err.message);
-            }
-            for warn in &ctx.sema_result.warnings[prev_warn_len..] {
-                let wp = warn.file_path.as_deref().map(|s| s as &str).unwrap_or(k);
-                eprintln!("{}:{}:{}: warning: {}", wp, warn.line, warn.column, warn.message);
-            }
-            prev_err_len = ctx.sema_result.errors.len();
-            prev_warn_len = ctx.sema_result.warnings.len();
-        }
-    }
-    ctx.check_module_with_env(entry_module, root_env, &all_modules);
-    for err in &ctx.sema_result.errors[prev_err_len..] {
-        eprintln!("{}:{}:{}: {}", entry_filename, err.line, err.column, err.message);
-    }
-    for warn in &ctx.sema_result.warnings[prev_warn_len..] {
-        let wp = warn.file_path.as_deref().map(|s| s as &str).unwrap_or(entry_filename);
-        eprintln!("{}:{}:{}: warning: {}", wp, warn.line, warn.column, warn.message);
-    }
-
-    if !ctx.sema_result.errors.is_empty() {
-        process::exit(1);
-    }
-    // ctx borrows type_arena and sema_result; dropping it here returns ownership of both to the caller.
-    drop(ctx);
-    (type_arena, sema_result)
-}
-
 /// Type check only.
 fn debug_check(source: &str, filename: &str) {
     let arena = bumpalo::Bump::new();
-    let entry_module = parse_entry_module(&arena, source, filename);
-    let (loader, std_keys, dep_keys) = load_all_modules(&entry_module, filename);
+    let entry_module = Pipeline::parse_entry_module_or_exit(&arena, source, filename);
+    let (loader, std_keys, dep_keys) = Pipeline::load_all_modules_or_exit(&entry_module, filename);
     let (_type_arena, _sema_result) =
-        run_sema_pipeline(&loader, &std_keys, &dep_keys, &entry_module, filename);
+        Pipeline::run_sema_pipeline_or_exit(&loader, &std_keys, &dep_keys, &entry_module, filename);
     println!("ok: {} (no type errors)", filename);
 }
 
@@ -660,7 +492,7 @@ fn compile_graph(entry_path: &str, opt_level: kuzo::pass::Optimizer::OptLevel, d
 
     // 1. Parse
     let arena = bumpalo::Bump::new();
-    let entry_module = parse_entry_module(&arena, &source, entry_path);
+    let entry_module = Pipeline::parse_entry_module_or_exit(&arena, &source, entry_path);
 
     if debug {
         eprintln!("  AST: {} declarations", entry_module.declarations.len());
@@ -668,7 +500,7 @@ fn compile_graph(entry_path: &str, opt_level: kuzo::pass::Optimizer::OptLevel, d
     }
 
     // 2. Module loading
-    let (loader, std_keys, dep_keys) = load_all_modules(&entry_module, entry_path);
+    let (loader, std_keys, dep_keys) = Pipeline::load_all_modules_or_exit(&entry_module, entry_path);
 
     if debug {
         let builtin_count = loader.builtin_modules().count();
@@ -679,7 +511,7 @@ fn compile_graph(entry_path: &str, opt_level: kuzo::pass::Optimizer::OptLevel, d
 
     // 3. Sema check (shared pipeline; any module type error is printed and exits)
     let (type_arena, sema_result) =
-        run_sema_pipeline(&loader, &std_keys, &dep_keys, &entry_module, entry_path);
+        Pipeline::run_sema_pipeline_or_exit(&loader, &std_keys, &dep_keys, &entry_module, entry_path);
 
     if debug {
         eprintln!("  Sema: OK (no type errors)");
@@ -938,6 +770,190 @@ fn cmd_inspect(file: &str, verbose: bool) {
             process::exit(1);
         }
     }
+}
+
+// ==================== fmt subcommand ====================
+
+fn cmd_fmt(path: Option<String>, check: bool, stdin: bool) {
+    let config = FmtConfig::default();
+
+    if stdin {
+        let mut source = String::new();
+        if io::stdin().read_to_string(&mut source).is_err() {
+            eprintln!("error: failed to read from stdin");
+            process::exit(1);
+        }
+        let formatted = fmt_source(&source, &config);
+        print!("{}", formatted);
+        return;
+    }
+
+    // find_project_root() returns the project root *directory* (containing kuzo.toml),
+    // so join "src" directly to get the default format target.
+    let target = path.unwrap_or_else(|| {
+        find_project_root()
+            .map(|p| {
+                std::path::Path::new(&p)
+                    .join("src")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "src".to_string())
+    });
+
+    let target_path = std::path::Path::new(&target);
+    let ok = if target_path.is_file() {
+        format_file(target_path, &config, check)
+    } else if target_path.is_dir() {
+        format_dir(target_path, &config, check)
+    } else {
+        eprintln!("error: path not found: {}", target);
+        process::exit(1);
+    };
+
+    if check && !ok {
+        process::exit(1);
+    }
+}
+
+fn format_file(path: &std::path::Path, config: &FmtConfig, check: bool) -> bool {
+    let source = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {}", path.display(), e);
+            return false;
+        }
+    };
+    let formatted = fmt_source(&source, config);
+    if check {
+        if source != formatted {
+            eprintln!("would reformat: {}", path.display());
+            return false;
+        }
+        true
+    } else {
+        if source != formatted {
+            if fs::write(path, &formatted).is_err() {
+                eprintln!("error: cannot write {}", path.display());
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn format_dir(dir: &std::path::Path, config: &FmtConfig, check: bool) -> bool {
+    let mut all_ok = true;
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: cannot read directory {}: {}", dir.display(), e);
+            return false;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            all_ok &= format_dir(&path, config, check);
+        } else if path.extension().map(|e| e == "kz").unwrap_or(false) {
+            all_ok &= format_file(&path, config, check);
+        }
+    }
+    all_ok
+}
+
+// ==================== lint subcommand ====================
+
+fn cmd_lint(path: Option<String>, format: Option<String>, deny: Option<String>, stdin: bool) {
+    let config = LintConfig::default();
+    let format_str = format.as_deref().unwrap_or("human");
+
+    let (diagnostics, _source_file) = if stdin {
+        let mut source = String::new();
+        if io::stdin().read_to_string(&mut source).is_err() {
+            eprintln!("error: failed to read from stdin");
+            process::exit(1);
+        }
+        let diags = lint_file_string("<stdin>", &source, &config);
+        (diags, "<stdin>".to_string())
+    } else {
+        // find_project_root() returns the project root directory (containing kuzo.toml),
+        // so join "src" directly to get the default lint target (same as fmt).
+        let target = path.unwrap_or_else(|| {
+            find_project_root()
+                .map(|p| {
+                    std::path::Path::new(&p)
+                        .join("src")
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .unwrap_or_else(|| "src".to_string())
+        });
+        let target_path = std::path::Path::new(&target);
+        let all_diags = if target_path.is_file() {
+            lint_file(&target, &config)
+        } else if target_path.is_dir() {
+            lint_dir(&target, &config)
+        } else {
+            eprintln!("error: path not found: {}", target);
+            process::exit(1);
+        };
+        (all_diags, target)
+    };
+
+    // Output
+    match format_str {
+        "json" => println!("{}", Report::format_json(&diagnostics)),
+        _ => print!("{}", Report::format_human(&diagnostics)),
+    }
+
+    // Exit code: 1 if any Error (or Warning when --deny warning)
+    let has_error = diagnostics.iter().any(|d| match d.severity {
+        kuzo::tooling::common::Diagnostic::Severity::Error => true,
+        kuzo::tooling::common::Diagnostic::Severity::Warning => deny.as_deref() == Some("warning"),
+        kuzo::tooling::common::Diagnostic::Severity::Advice => false,
+    });
+    if has_error {
+        process::exit(1);
+    }
+}
+
+fn lint_dir(dir: &str, config: &LintConfig) -> Vec<kuzo::tooling::common::Diagnostic::Diagnostic> {
+    let mut all = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return all,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            all.extend(lint_dir(&path.to_string_lossy(), config));
+        } else if path.extension().map(|e| e == "kz").unwrap_or(false) {
+            all.extend(lint_file(&path.to_string_lossy(), config));
+        }
+    }
+    all
+}
+
+/// Lint a source string directly (for --stdin).
+fn lint_file_string(filename: &str, source: &str, config: &LintConfig) -> Vec<kuzo::tooling::common::Diagnostic::Diagnostic> {
+    // Write to a temp file, then lint it
+    let temp_path = format!("/tmp/kuzo_lint_{}.kz", std::process::id());
+    let _ = fs::write(&temp_path, source);
+    let result = lint_file(&temp_path, config);
+    let _ = fs::remove_file(&temp_path);
+    // Fix source_file in diagnostics
+    result.into_iter().map(|mut d| {
+        d.source_file = filename.to_string();
+        d
+    }).collect()
+}
+
+// ==================== lsp subcommand ====================
+
+fn cmd_lsp() {
+    let server = LspServer::new();
+    server.run(); // never returns
 }
 
 // ==================== Common utilities ====================

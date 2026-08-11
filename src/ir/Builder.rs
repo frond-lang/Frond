@@ -102,6 +102,10 @@ pub struct IrBuilder<'a> {
     /// ID of the monomorphization instance currently being compiled (`None` = non-generic function).
     /// Used as an index into `sema.monomorph_instances` to look up instance-local `expr_types`.
     pub current_instance_id: Option<u32>,
+    /// The owning type (name, type_id) of the method currently being compiled.
+    /// Used by `compile_method_call` to dispatch implicit-this method calls (where `recv`
+    /// is the callee Ident, not the receiver — the receiver is `this`).
+    pub current_method_type: Option<(Box<str>, u16)>,
     /// Compile-time error list (unimplemented features, missing functions, etc.; inspectable
     /// after compilation).
     pub errors: Vec<String>,
@@ -259,6 +263,7 @@ impl<'a> IrBuilder<'a> {
             non_tail_rec_ctx: None,
             current_type_args: Vec::new(),
             current_instance_id: None,
+            current_method_type: None,
             errors: Vec::new(),
             global_var_slots: rustc_hash::FxHashMap::default(),
             top_level_var_decls: Vec::new(),
@@ -584,38 +589,53 @@ impl<'a> IrBuilder<'a> {
                         None => node_id,
                     }
                 }
-                None => match self.lookup_global_var(name) {
-                    Some(slot) => self.compile_global_load(slot),
-                    None => {
-                        // Nullary ADT / type constructor detection: when an Ident is neither a
-                        // local nor a global variable, check whether it is a nullary constructor
-                        // (e.g. `Lt`/`Leaf`/`Red`) and compile it as a nullary construct node.
-                        // Parameterized constructors (non-empty `field_names`) are not handled
-                        // here (they go through the `Call` path with arguments).
-                        // A newtype always has an inner value, so it can never be nullary.
-                        let tf_info = self.lookup_constructor_field_names(name)
-                            .or_else(|| self.lookup_type_field_names(name));
-                        match tf_info {
-                            Some(info) if info.field_names.is_empty() && info.kind != RecordLitKind::Newtype => {
-                                let inputs_offset = self.graph.inputs_pool.push(&[]);
-                                let node = self.graph.add_node(Node {
-                                    kind: NodeKind::BinOp,
-                                    input_count: 0,
-                                    inputs_offset,
-                                    compute_fn: CF_RECORD_CONSTRUCT, // record_construct
-                                });
-                                self.graph.set_record_lit_info(node, RecordLitInfo {
-                                    type_name: info.type_name.clone(),
-                                    field_names: Vec::new(),
-                                    constructor: name.to_string(),
-                                    kind: info.kind,
-                                });
-                                node
+                None => {
+                    // Implicit this: bare identifier resolved to an instance field by sema.
+                    // Sema marks such accesses on `ExprInfo.implicit_this`; synthesize an explicit
+                    // `this.<field>` FieldAccess node. The method variant is handled in the Call
+                    // branch (it needs the argument list).
+                    if let Some(access) = self.expr_implicit_this(expr_id).cloned() {
+                        if let crate::sema::Sema::ImplicitThisAccess::Field(field) = access {
+                            let this_node = self
+                                .lookup_var("this")
+                                .expect("this binding must exist in method body");
+                            return self.build_implicit_field_access(this_node, &field);
+                        }
+                        // Method variant handled in Call branch.
+                    }
+                    match self.lookup_global_var(name) {
+                        Some(slot) => self.compile_global_load(slot),
+                        None => {
+                            // Nullary ADT / type constructor detection: when an Ident is neither a
+                            // local nor a global variable, check whether it is a nullary constructor
+                            // (e.g. `Lt`/`Leaf`/`Red`) and compile it as a nullary construct node.
+                            // Parameterized constructors (non-empty `field_names`) are not handled
+                            // here (they go through the `Call` path with arguments).
+                            // A newtype always has an inner value, so it can never be nullary.
+                            let tf_info = self.lookup_constructor_field_names(name)
+                                .or_else(|| self.lookup_type_field_names(name));
+                            match tf_info {
+                                Some(info) if info.field_names.is_empty() && info.kind != RecordLitKind::Newtype => {
+                                    let inputs_offset = self.graph.inputs_pool.push(&[]);
+                                    let node = self.graph.add_node(Node {
+                                        kind: NodeKind::BinOp,
+                                        input_count: 0,
+                                        inputs_offset,
+                                        compute_fn: CF_RECORD_CONSTRUCT, // record_construct
+                                    });
+                                    self.graph.set_record_lit_info(node, RecordLitInfo {
+                                        type_name: info.type_name.clone(),
+                                        field_names: Vec::new(),
+                                        constructor: name.to_string(),
+                                        kind: info.kind,
+                                    });
+                                    node
+                                }
+                                _ => self.compile_const(),
                             }
-                            _ => self.compile_const(),
                         }
                     }
-                },
+                }
             },
 
             // Binary operations
@@ -632,10 +652,21 @@ impl<'a> IrBuilder<'a> {
                         return self.compile_cast_call(*name, args, type_args.as_deref());
                     }
                 }
+                // Implicit this: bare call resolved to an instance method by sema.
+                // Sema marks the callee Ident with `implicit_this = Method(name)`; synthesize an
+                // explicit `this.method(args)` dispatch using the already-bound `this` node.
+                if let Some(access) = self.expr_implicit_this(*callee).cloned() {
+                    if let crate::sema::Sema::ImplicitThisAccess::Method(method) = access {
+                        let this_node = self
+                            .lookup_var("this")
+                            .expect("this binding must exist in method body");
+                        return self.compile_method_call(expr_id, *callee, &method, args, Some(this_node));
+                    }
+                }
                 self.compile_call(expr_id, *callee, args)
             }
             crate::ast::Ast::Expr::MethodCall { recv, method, args, .. } => {
-                self.compile_method_call(expr_id, *recv, method, args)
+                self.compile_method_call(expr_id, *recv, method, args, None)
             }
 
             // Field access
@@ -692,6 +723,23 @@ impl<'a> IrBuilder<'a> {
                 let target_expr = &self.current_module().arena.expr(*target).node;
                 match target_expr {
                     crate::ast::Ast::Expr::Ident(name) => {
+                        // Implicit-this field assignment: `field = value` inside a method body
+                        // resolves to `this.field = value`. Without this, the bare name would
+                        // create a local binding instead of mutating the instance field.
+                        if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) = self.expr_implicit_this(*target).cloned() {
+                            let this_node = self
+                                .lookup_var("this")
+                                .expect("this binding must exist in method body");
+                            let off = self.graph.inputs_pool.push(&[this_node, val_node]);
+                            let set_node = self.graph.add_node(Node {
+                                kind: NodeKind::BinOp,
+                                input_count: 2,
+                                inputs_offset: off,
+                                compute_fn: CF_RECORD_FIELD_SET,
+                            });
+                            self.graph.set_field_set_name(set_node, field.to_string());
+                            return self.compile_void_const();
+                        }
                         let captured_source = self.captured_scopes.iter().rev()
                             .find_map(|scope| scope.iter()
                                 .find(|(n, _)| n.as_str() == *name)
@@ -766,6 +814,39 @@ impl<'a> IrBuilder<'a> {
                 let bin_compute = self.compound_assign_op_to_compute_fn(*op, *target);
                 match target_expr {
                     crate::ast::Ast::Expr::Ident(name) => {
+                        // Implicit-this field compound assignment: `field op= value` inside a
+                        // method body resolves to `this.field op= value`.
+                        if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) = self.expr_implicit_this(*target).cloned() {
+                            let this_node = self
+                                .lookup_var("this")
+                                .expect("this binding must exist in method body");
+                            // Read the current field value.
+                            let get_off = self.graph.inputs_pool.push(&[this_node]);
+                            let get_node = self.graph.add_node(Node {
+                                kind: NodeKind::FieldAccess,
+                                input_count: 1,
+                                inputs_offset: get_off,
+                                compute_fn: CF_RECORD_FIELD_GET,
+                            });
+                            // Operation.
+                            let bin_off = self.graph.inputs_pool.push(&[get_node, val_node]);
+                            let result_node = self.graph.add_node(Node {
+                                kind: NodeKind::BinOp,
+                                input_count: 2,
+                                inputs_offset: bin_off,
+                                compute_fn: bin_compute,
+                            });
+                            // Write back.
+                            let set_off = self.graph.inputs_pool.push(&[this_node, result_node]);
+                            let set_node = self.graph.add_node(Node {
+                                kind: NodeKind::BinOp,
+                                input_count: 2,
+                                inputs_offset: set_off,
+                                compute_fn: CF_RECORD_FIELD_SET,
+                            });
+                            self.graph.set_field_set_name(set_node, field.to_string());
+                            return result_node;
+                        }
                         let cur_node = self
                             .lookup_var(name)
                             .unwrap_or_else(|| self.compile_placeholder());
@@ -935,7 +1016,7 @@ impl<'a> IrBuilder<'a> {
 
             // Safe method call `recv?.method(args)`: compiled as a normal method call + safe flag.
             crate::ast::Ast::Expr::SafeMethodCall { recv, method, args, .. } => {
-                let node = self.compile_method_call(expr_id, *recv, method, args);
+                let node = self.compile_method_call(expr_id, *recv, method, args, None);
                 self.graph.set_safe_op(node);
                 node
             }
@@ -4271,18 +4352,14 @@ impl<'a> IrBuilder<'a> {
             return nodes[0];
         }
 
-        // Chained concat: ((part0 concat part1) concat part2) ...
-        let mut result = nodes[0];
-        for &next in &nodes[1..] {
-            let inputs_offset = self.graph.inputs_pool.push(&[result, next]);
-            result = self.graph.add_node(Node {
-                kind: NodeKind::BinOp,
-                input_count: 2,
-                inputs_offset,
-                compute_fn: CF_STR_CONCAT, // compute_str_concat
-            });
-        }
-        result
+        // Multi-input one-shot concat: O(n) 一次性拼接，替代链式 O(n²) concat
+        let inputs_offset = self.graph.inputs_pool.push(&nodes);
+        self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: nodes.len() as u8,
+            inputs_offset,
+            compute_fn: CF_STR_MULTI_CONCAT,
+        })
     }
 
     /// Convert any value node to a string node via compute_reflect_format (idx 290).
@@ -4319,12 +4396,12 @@ impl<'a> IrBuilder<'a> {
     /// sema's TraitDefaultInstance.type_name to get self's concrete implementation type.
     fn expr_type_name(&self, expr_id: crate::ast::Ast::ExprId) -> Option<&str> {
         // self in a specialized trait default method version: consume sema's TraitDefaultInstance.type_name.
-        // When sema infers a trait default method body, self is the abstract SelfType; the specialized
+        // When sema infers a trait default method body, self is the abstract ThisType; the specialized
         // instance records the concrete implementation type name.
         // The IR indexes sema output via current_trait_default_idx; it does not hold the type-name string.
         if let Some(idx) = self.current_trait_default_idx {
             if let crate::ast::Ast::Expr::Ident(name) = &self.module.arena.expr(expr_id).node {
-                if *name == "self" {
+                if *name == "this" {
                     if let Some(inst) = self.sema.trait_default_instances.get(idx) {
                         return Some(inst.type_name.as_ref());
                     }
@@ -4355,6 +4432,29 @@ impl<'a> IrBuilder<'a> {
             );
         }
         None
+    }
+
+    /// Look up the implicit-this access kind for an expression (set by sema).
+    ///
+    /// Sema records on `ExprInfo.implicit_this` whether a bare identifier/call inside a method
+    /// body resolved to an instance field or method (i.e. an implicit `this.` access). The IR
+    /// builder consumes this marker to synthesize the explicit `this`-based access nodes.
+    fn expr_implicit_this(
+        &self,
+        expr_id: crate::ast::Ast::ExprId,
+    ) -> Option<&crate::sema::Sema::ImplicitThisAccess> {
+        let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr_id.0 as u64);
+        if let Some(inst_id) = self.current_instance_id {
+            if let Some(inst) = self.sema.monomorph_instances.get(inst_id as usize) {
+                if let Some(info) = inst.expr_types.get(&key) {
+                    return info.implicit_this.as_ref();
+                }
+            }
+        }
+        self.sema
+            .expr_types
+            .get(&key)
+            .and_then(|info| info.implicit_this.as_ref())
     }
 
     /// Checked version of `expr_type_name`: the sema contract guarantees ExprInfo is registered.
@@ -5443,7 +5543,7 @@ impl<'a> IrBuilder<'a> {
         ctor_name: &str,
     ) -> Option<(String, String, Vec<Option<String>>, RecordLitKind, bool)> {
         let &type_idx = self.sema.type_def_index.get(type_name)?;
-        let type_def = &self.sema.type_defs[type_idx as usize];
+        let type_def = &self.sema.type_defs[&type_idx];
         let ctor = type_def
             .constructors
             .iter()
@@ -5497,6 +5597,7 @@ impl<'a> IrBuilder<'a> {
         recv: crate::ast::Ast::ExprId,
         method: &str,
         args: &[crate::ast::Ast::ExprId],
+        recv_node_override: Option<NodeId>,
     ) -> NodeId {
         // 限定名构造器：Type.Ctor(args)（有参数构造器）
         if let crate::ast::Ast::Expr::Ident(type_name) = &self.current_module().arena.expr(recv).node {
@@ -5526,7 +5627,12 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        let recv_node = self.compile_subexpr(recv);
+        // When the caller supplies a pre-compiled receiver node (e.g. implicit-this method
+        // calls where `this` is already bound), skip re-compiling the recv expression.
+        let recv_node = match recv_node_override {
+            Some(n) => n,
+            None => self.compile_subexpr(recv),
+        };
 
         // -- intrinsic lowering --
         // First look up the language-level intrinsic flag in sema method_dispatches (await/recv);
@@ -5626,20 +5732,30 @@ impl<'a> IrBuilder<'a> {
             }
 
             // Path 2: type's own method / trait method override
-            if let Some(type_name) = self.expr_type_name(recv) {
-                if let Some(type_id) = self.expr_type_id(recv) {
-                    if let Some(method_idx) = self.sema.lookup_method_idx(type_name, method) {
-                        if let Some(&target_sg) = self.method_subgraphs.get(&(type_id, method_idx)) {
-                            self.graph.set_call_target(call_node, target_sg);
-                            return call_node;
-                        }
+            // When recv_node_override is set (implicit-this call), the callee ExprId does not carry
+            // the receiver's type info; use current_method_type (set by the enclosing method compile).
+            let recv_type: Option<(&str, u16)> = if recv_node_override.is_some() {
+                self.current_method_type.as_ref().map(|(n, id)| (n.as_ref(), *id))
+            } else {
+                self.expr_type_name(recv).zip(self.expr_type_id(recv))
+            };
+            if let Some((type_name, type_id)) = recv_type {
+                if let Some(method_idx) = self.sema.lookup_method_idx(type_name, method) {
+                    if let Some(&target_sg) = self.method_subgraphs.get(&(type_id, method_idx)) {
+                        self.graph.set_call_target(call_node, target_sg);
+                        return call_node;
                     }
                 }
             }
 
             // Path 3: trait default method (type does not override; fall back to the monomorphized specialized version of the trait default impl)
-            if let Some(type_id) = self.expr_type_id(recv) {
-                for trait_def in &self.sema.trait_defs {
+            let path3_type_id = if recv_node_override.is_some() {
+                self.current_method_type.as_ref().map(|(_, id)| *id)
+            } else {
+                self.expr_type_id(recv)
+            };
+            if let Some(type_id) = path3_type_id {
+                for trait_def in self.sema.trait_defs.values() {
                     if !self.type_implements_trait(type_id, &trait_def.name) {
                         continue;
                     }
@@ -5754,7 +5870,7 @@ impl<'a> IrBuilder<'a> {
 
     /// Check whether a type implements a specified trait (queries any method slot via witness_table).
     fn type_implements_trait(&self, type_id: u16, trait_name: &str) -> bool {
-        for entry in self.sema.witness_table.entries().iter() {
+        for entry in self.sema.witness_table.entries() {
             if entry.trait_name.as_ref() == trait_name && entry.type_id == type_id {
                 return true;
             }
@@ -5772,7 +5888,7 @@ impl<'a> IrBuilder<'a> {
                 return self
                     .sema
                     .trait_defs
-                    .iter()
+                    .values()
                     .any(|td| td.name.as_ref() == tn.as_ref());
             }
         }
@@ -5788,7 +5904,7 @@ impl<'a> IrBuilder<'a> {
         // self in a specialized trait default method version: consume sema's TraitDefaultInstance.type_name
         if let Some(idx) = self.current_trait_default_idx {
             if let crate::ast::Ast::Expr::Ident(name) = &self.module.arena.expr(expr).node {
-                if *name == "self" {
+                if *name == "this" {
                     if let Some(inst) = self.sema.trait_default_instances.get(idx) {
                         return self
                             .sema
@@ -5952,6 +6068,33 @@ impl<'a> IrBuilder<'a> {
         });
         // Uniformly store the field name as the runtime lookup key:
         // Record/Adt both resolve via find_field(name) by name, no compile-time field_idx needed
+        self.graph.set_field_set_name(node, field.to_string());
+        node
+    }
+
+    /// Build a FieldAccess node for an implicit-this field read.
+    ///
+    /// When a bare identifier inside a method body resolves to an instance field (recorded by
+    /// sema on `ExprInfo.implicit_this`), the IR synthesizes `this.<field>`. The receiver node is
+    /// the `this` binding already compiled for the method body; this helper mirrors
+    /// `compile_field_access` but skips recv re-compilation and qualified-ctor/global-const
+    /// detection (neither applies to an implicit `this` receiver).
+    fn build_implicit_field_access(&mut self, this_node: NodeId, field: &str) -> NodeId {
+        // Chain with `current_effect` to mirror the explicit `this.<field>` path:
+        // `compile_expr` for `Ident("this")` chains the bound `this` node through
+        // `current_effect` (line 588), ensuring the field read executes only after
+        // prior side effects (e.g. a prior `pos = pos + 1` WriteBack) complete.
+        // Without this chain, an implicit field read could observe a stale value
+        // before an in-flight assignment updates the instance field, breaking
+        // iterator-style mutation (e.g. `next()` reading `pos` after `pos = pos + 1`).
+        let this_node = self.chain_effects(self.current_effect, this_node);
+        let inputs_offset = self.graph.inputs_pool.push(&[this_node]);
+        let node = self.graph.add_node(Node {
+            kind: NodeKind::FieldAccess,
+            input_count: 1,
+            inputs_offset,
+            compute_fn: CF_RECORD_FIELD_GET, // record_field_get
+        });
         self.graph.set_field_set_name(node, field.to_string());
         node
     }
@@ -6296,6 +6439,22 @@ impl<'a> IrBuilder<'a> {
                     return Some(store_node);
                 }
                 if let crate::ast::Ast::Expr::Ident(name) = target_expr {
+                    // Implicit-this field assignment: `field = value` inside a method body
+                    // resolves to `this.field = value`.
+                    if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) = self.expr_implicit_this(*target).cloned() {
+                        let this_node = self
+                            .lookup_var("this")
+                            .expect("this binding must exist in method body");
+                        let off = self.graph.inputs_pool.push(&[this_node, val_node]);
+                        let set_node = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: 2,
+                            inputs_offset: off,
+                            compute_fn: CF_RECORD_FIELD_SET,
+                        });
+                        self.graph.set_field_set_name(set_node, field.to_string());
+                        return Some(set_node);
+                    }
                     // Check whether this is a lambda-captured variable: captured_scopes records, per lambda
                     // layer, the captured variable names and their corresponding outer node. Assigning a
                     // captured variable requires a WriteBack to the outer node so the change is visible
@@ -6364,6 +6523,40 @@ impl<'a> IrBuilder<'a> {
                 let target_expr = &self.current_module().arena.expr(*target).node;
                 let bin_compute = self.compound_assign_op_to_compute_fn(*op, *target);
                 if let crate::ast::Ast::Expr::Ident(name) = target_expr {
+                    // Implicit-this field compound assignment: `field op= value` inside a
+                    // method body resolves to `this.field op= value`.
+                    if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) = self.expr_implicit_this(*target).cloned() {
+                        let this_node = self
+                            .lookup_var("this")
+                            .expect("this binding must exist in method body");
+                        // Read the current field value.
+                        let get_off = self.graph.inputs_pool.push(&[this_node]);
+                        let get_node = self.graph.add_node(Node {
+                            kind: NodeKind::FieldAccess,
+                            input_count: 1,
+                            inputs_offset: get_off,
+                            compute_fn: CF_RECORD_FIELD_GET,
+                        });
+                        // Operation.
+                        let bin_off = self.graph.inputs_pool.push(&[get_node, val_node]);
+                        let raw_result = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: 2,
+                            inputs_offset: bin_off,
+                            compute_fn: bin_compute,
+                        });
+                        let result_node = self.chain_effects(self.current_effect, raw_result);
+                        // Write back.
+                        let set_off = self.graph.inputs_pool.push(&[this_node, result_node]);
+                        let set_node = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: 2,
+                            inputs_offset: set_off,
+                            compute_fn: CF_RECORD_FIELD_SET,
+                        });
+                        self.graph.set_field_set_name(set_node, field.to_string());
+                        return Some(set_node);
+                    }
                     // Check whether this is a lambda-captured variable
                     let captured_source = self.captured_scopes.iter().rev()
                         .find_map(|scope| scope.iter()
@@ -6932,6 +7125,8 @@ impl<'a> IrBuilder<'a> {
         self.current_effect = None;
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
+        let prev_method_type = self.current_method_type.take();
+        self.current_method_type = Some((type_name.into(), type_id));
         self.enter_scope();
 
         for param in &params {
@@ -6958,6 +7153,7 @@ impl<'a> IrBuilder<'a> {
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
         self.current_function_sg = None;
+        self.current_method_type = prev_method_type;
         self.compiling_builtin = prev;
 
         let node_end = self.graph.nodes.len() as u32;
@@ -7014,6 +7210,8 @@ impl<'a> IrBuilder<'a> {
         self.current_effect = None;
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
+        let prev_method_type = self.current_method_type.take();
+        self.current_method_type = Some((type_name.into(), type_id));
         self.enter_scope();
 
         for param in &params {
@@ -7040,6 +7238,7 @@ impl<'a> IrBuilder<'a> {
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
         self.current_function_sg = None;
+        self.current_method_type = prev_method_type;
 
         let node_end = self.graph.nodes.len() as u32;
         let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
@@ -7103,6 +7302,8 @@ impl<'a> IrBuilder<'a> {
         self.current_trait_default_idx = Some(instance_idx);
         let prev_effect = self.current_effect;
         self.current_effect = None;
+        let prev_method_type = self.current_method_type.take();
+        self.current_method_type = Some((impl_type_name.into(), type_id));
         self.enter_scope();
 
         for param in &params {
@@ -7121,6 +7322,7 @@ impl<'a> IrBuilder<'a> {
         self.current_effect = prev_effect;
         self.current_function_sg = None;
         self.current_trait_default_idx = None;
+        self.current_method_type = prev_method_type;
 
         let node_end = self.graph.nodes.len() as u32;
         let sg = &mut self.graph.subgraphs[sg_id.0 as usize];

@@ -19,3 +19,5 @@ pub mod solidify;
 pub mod engine;
 
 pub mod pass;
+
+pub mod tooling;

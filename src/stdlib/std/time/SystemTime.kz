@@ -16,41 +16,41 @@ pub type TimeComponents = TimeComponents(year: i32, month: u8, day: u8, hour: u8
 pub type SystemTime = SystemTime(nanos: i128) {
     // ─── 加减 Duration ─────────────────────────────────────────────────
 
-    pub fun add_duration(self, d: Duration): SystemTime {
-        SystemTime(self.nanos + d.nanos)
+    pub fun add_duration(d: Duration): SystemTime {
+        SystemTime(nanos + d.nanos)
     }
 
-    pub fun sub_duration(self, d: Duration): SystemTime {
-        SystemTime(self.nanos - d.nanos)
+    pub fun sub_duration(d: Duration): SystemTime {
+        SystemTime(nanos - d.nanos)
     }
 
-    // self 相对 earlier 的时间长度
-    pub fun duration_since(self, earlier: SystemTime): Duration {
-        Duration(self.nanos - earlier.nanos)
+    // this 相对 earlier 的时间长度
+    pub fun duration_since(earlier: SystemTime): Duration {
+        Duration(nanos - earlier.nanos)
     }
 
     // ─── 与 DateTime 转换 ──────────────────────────────────────────────
 
     // 转换为本地时区的 DateTime
-    pub fun to_local(self): DateTime {
-        val comp = to_local_components(self.nanos)
+    pub fun to_local(): DateTime {
+        val comp = to_local_components(nanos)
         DateTime.from_components(comp)
     }
 
     // 转换为 UTC 的 DateTime
-    pub fun to_utc(self): DateTime {
-        val comp = to_utc_components(self.nanos)
+    pub fun to_utc(): DateTime {
+        val comp = to_utc_components(nanos)
         DateTime.from_components(comp)
     }
 
     // ─── 比较 ──────────────────────────────────────────────────────────
 
-    pub fun is_before(self, other: SystemTime): bool {
-        self.nanos < other.nanos
+    pub fun is_before(other: SystemTime): bool {
+        nanos < other.nanos
     }
 
-    pub fun is_after(self, other: SystemTime): bool {
-        self.nanos > other.nanos
+    pub fun is_after(other: SystemTime): bool {
+        nanos > other.nanos
     }
 }
 

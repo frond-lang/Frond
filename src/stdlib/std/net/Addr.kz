@@ -16,22 +16,22 @@
 pub type Ipv4Addr = Ipv4Addr(bits: u32) {
     // ─── Ipv4Addr 访问器 ──────────────────────────────────────────────
 
-    pub fun v4_octet(self, i: u8): u8 {
+    pub fun v4_octet(i: u8): u8 {
         val idx = u32(i)
         val shift = (3u32 - idx) * 8u32
-        u8((self.bits >> shift) & 0xFFu32)
+        u8((bits >> shift) & 0xFFu32)
     }
 
-    pub fun v4_bits(self): u32 {
-        self.bits
+    pub fun v4_bits(): u32 {
+        bits
     }
 
-    pub fun v4_is_loopback(self): bool {
-        v4_octet(self, 0u8) == 127u8
+    pub fun v4_is_loopback(): bool {
+        v4_octet(0u8) == 127u8
     }
 
-    pub fun v4_is_unspecified(self): bool {
-        self.bits == 0u32
+    pub fun v4_is_unspecified(): bool {
+        bits == 0u32
     }
 }
 
@@ -39,41 +39,41 @@ pub type Ipv4Addr = Ipv4Addr(bits: u32) {
 pub type Ipv6Addr = Ipv6Addr(hi: u64, lo: u64) {
     // ─── Ipv6Addr 访问器 ──────────────────────────────────────────────
 
-    pub fun v6_segment(self, i: u8): u16 {
+    pub fun v6_segment(i: u8): u16 {
         val idx = u64(i)
-        val word = if idx < 4u64 { self.hi } else { self.lo }
+        val word = if idx < 4u64 { hi } else { lo }
         val shift = (3u64 - (idx % 4u64)) * 16u64
         u16((word >> shift) & 0xFFFFu64)
     }
 
-    pub fun v6_hi(self): u64 {
-        self.hi
+    pub fun v6_hi(): u64 {
+        hi
     }
 
-    pub fun v6_lo(self): u64 {
-        self.lo
+    pub fun v6_lo(): u64 {
+        lo
     }
 
-    pub fun v6_is_loopback(self): bool {
-        self.hi == 0u64 && self.lo == 1u64
+    pub fun v6_is_loopback(): bool {
+        hi == 0u64 && lo == 1u64
     }
 
-    pub fun v6_is_unspecified(self): bool {
-        self.hi == 0u64 && self.lo == 0u64
+    pub fun v6_is_unspecified(): bool {
+        hi == 0u64 && lo == 0u64
     }
 }
 
 // IpAddr：ADT，V4(__tag=0, addr=Ipv4Addr) | V6(__tag=1, addr=Ipv6Addr)
 pub type IpAddr = | V4(Ipv4Addr) | V6(Ipv6Addr) {
-    pub fun ip_is_v4(self): bool {
-        match self {
+    pub fun ip_is_v4(): bool {
+        match this {
             V4(_) => true,
             _ => false,
         }
     }
 
-    pub fun ip_is_v6(self): bool {
-        match self {
+    pub fun ip_is_v6(): bool {
+        match this {
             V6(_) => true,
             _ => false,
         }
@@ -82,12 +82,12 @@ pub type IpAddr = | V4(Ipv4Addr) | V6(Ipv6Addr) {
 
 // SocketAddr：newtype，fields = [__tag=0, ip=IpAddr, port=u16]
 pub type SocketAddr = SocketAddr(ip: IpAddr, port: u16) {
-    pub fun socket_ip(self): IpAddr {
-        self.ip
+    pub fun socket_ip(): IpAddr {
+        ip
     }
 
-    pub fun socket_port(self): u16 {
-        self.port
+    pub fun socket_port(): u16 {
+        port
     }
 }
 

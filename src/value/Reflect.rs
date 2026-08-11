@@ -479,6 +479,21 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                         "<lazy>".to_string()
                     }
                 }
+                HeapObj::ThrowVal(t) => {
+                    // Throw 值格式化：Ok(v) → "Ok(v)"，Err(e) → "Err(e)"
+                    match &t.payload {
+                        crate::value::ThrowPayload::Ok(v) => {
+                            format!("Ok({})", format_value(v, depth + 1))
+                        }
+                        crate::value::ThrowPayload::Err(e) => {
+                            format!("Err({})", format_value(e, depth + 1))
+                        }
+                    }
+                }
+                HeapObj::ErrorVal(e) => {
+                    // 错误值格式化：显示类型名和消息
+                    format!("{}({})", e.type_name, e.message)
+                }
                 _ => {
                     // Other heap objects: fall back to the ref_kind name
                     "<non-scalar>".to_string()

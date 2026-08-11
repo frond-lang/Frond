@@ -270,7 +270,7 @@ pub enum TokenKind {
     FalseLiteral,
     NullLiteral,
 
-    // --- Keywords (28) ---
+    // --- Keywords (29) ---
     KwFun,
     KwType,
     KwTrait,
@@ -299,6 +299,7 @@ pub enum TokenKind {
     KwThrow,
     KwLazy,
     KwDefer,
+    KwThis,
 
     // Identifier
     Identifier,
@@ -1379,6 +1380,7 @@ fn keyword_type(text: &str) -> TokenKind {
         "throw" => TokenKind::KwThrow,
         "lazy" => TokenKind::KwLazy,
         "defer" => TokenKind::KwDefer,
+        "this" => TokenKind::KwThis,
         "true" => TokenKind::TrueLiteral,
         "false" => TokenKind::FalseLiteral,
         "null" => TokenKind::NullLiteral,
@@ -2406,7 +2408,14 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         })
     }
 
-    /// Parse a method declaration
+    /// Parse a method declaration.
+    ///
+    /// Syntax: `pub? override? async? fun &? name<tparams>(params): ret { body }`
+    /// The optional `&` between `fun` and the method name marks the receiver as
+    /// by-reference (`&this`); without `&` the receiver is by-value (`this`).
+    /// The receiver is implicit: it is NOT written in the parameter list. The
+    /// parser injects an internal `Param { name: "this", type_annotation: ThisType/RefType<ThisType> }`
+    /// at params[0] so downstream sema/IR logic (is_this_param, arity, inputs[0]=recv) is unchanged.
     fn parse_method_decl(&mut self) -> ParseResult<MethodDecl<'a>> {
         let mut visibility = Visibility::Private;
         if self.match_token(TokenKind::KwPub) {
@@ -2414,7 +2423,9 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         let is_override = self.match_token(TokenKind::KwOverride);
         let is_async = self.match_token(TokenKind::KwAsync);
-        let _ = self.expect(TokenKind::KwFun, "expected 'fun'");
+        let _ = self.expect(TokenKind::KwFun, "expected 'fun'")?;
+        // Detect by-reference receiver marker: `fun &name(...)` means `&this`.
+        let is_ref_receiver = self.match_token(TokenKind::Ampersand);
         let name_tok = self.expect(TokenKind::Identifier, "expected method name")?;
         let mut type_params = Vec::new();
         if self.match_token(TokenKind::Lt) {
@@ -2424,9 +2435,21 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         let mut params = Vec::new();
         let _ = self.expect(TokenKind::LParen, "expected '('");
         if !self.check(TokenKind::RParen) {
-            self.parse_method_param_list(&mut params)?;
+            self.parse_param_list(&mut params)?;
         }
         let _ = self.expect(TokenKind::RParen, "expected ')'");
+        // Inject the implicit this parameter at params[0].
+        // By-value: ThisType; by-reference (&): RefType<ThisType>.
+        let this_type = if is_ref_receiver {
+            let this_ty = self.alloc_type(token_span(&name_tok), TypeNode::ThisType);
+            self.alloc_type(token_span(&name_tok), TypeNode::RefType { inner: this_ty })
+        } else {
+            self.alloc_type(token_span(&name_tok), TypeNode::ThisType)
+        };
+        params.insert(0, Param {
+            name: "this",
+            type_annotation: Some(this_type),
+        });
         let return_type = if self.match_token(TokenKind::Colon) {
             Some(self.parse_type()?)
         } else {
@@ -2632,32 +2655,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         })
     }
 
-    impl_parse_comma_list!(parse_method_param_list, Param<'a>, parse_method_param, check(TokenKind::RParen));
-
-    fn parse_method_param(&mut self) -> ParseResult<Param<'a>> {
-        let is_ref_self = self.match_token(TokenKind::Ampersand);
-        let name_tok = self.expect(TokenKind::Identifier, "expected parameter name")?;
-        let type_annotation = if self.match_token(TokenKind::Colon) {
-            Some(self.parse_type()?)
-        } else if name_tok.lexeme == "self" {
-            let self_ty = self.alloc_type(token_span(&name_tok), TypeNode::SelfType);
-            if is_ref_self {
-                Some(self.alloc_type(token_span(&name_tok), TypeNode::RefType { inner: self_ty }))
-            } else {
-                Some(self_ty)
-            }
-        } else if is_ref_self {
-            self.report_error("'&' without type annotation is only allowed for 'self' parameter")?;
-            unreachable!()
-        } else {
-            None
-        };
-        Ok(Param {
-            name: name_tok.lexeme,
-            type_annotation,
-        })
-    }
-
     fn parse_trait_bound_list(&mut self, bounds: &mut Vec<TraitBound<'a>>) -> ParseResult<()> {
         self.parse_trait_bound_list_inner(bounds)
     }
@@ -2815,6 +2812,37 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             let _ = self.expect(TokenKind::RParen, "expected ')'");
             let mut ty = inner;
             // Suffix array type T[N]
+            while self.match_token(TokenKind::LBracket) {
+                let mut size: Option<u64> = None;
+                if !self.check(TokenKind::RBracket) {
+                    let size_tok = self.expect(TokenKind::IntLiteral, "expected array size")?;
+                    size = Some(parse_u64(size_tok.lexeme).ok_or_else(|| {
+                        self.report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")
+                    })?);
+                }
+                let _ = self.expect(TokenKind::RBracket, "expected ']'");
+                ty = self.alloc_type(span, TypeNode::Array {
+                    element_type: ty,
+                    size,
+                });
+            }
+            return Ok(ty);
+        }
+        // `This` keyword in type position: resolves to the current type (TypeNode::ThisType).
+        // Sema resolves it via current_this_type() during inference.
+        // Accept both `this` (KwThis, lowercase instance keyword) and `This` (Identifier with
+        // capitalized text, type keyword) — the language convention is:
+        //   - `this` (lowercase): instance keyword (expression position)
+        //   - `This` (capitalized): type keyword (type position, e.g. `fun clone(): This`)
+        // The lexer is case-sensitive and only registers `this` as KwThis; `This` is lexed as an
+        // Identifier, so we match it here by lexeme text.
+        let is_this_type_kw = self.check(TokenKind::KwThis)
+            || (self.check(TokenKind::Identifier) && self.peek().lexeme == "This");
+        if is_this_type_kw {
+            let tok = self.advance();
+            let span = token_span(&tok);
+            // Suffix array type This[N]
+            let mut ty = self.alloc_type(span, TypeNode::ThisType);
             while self.match_token(TokenKind::LBracket) {
                 let mut size: Option<u64> = None;
                 if !self.check(TokenKind::RBracket) {
@@ -3300,6 +3328,13 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         {
             let tok = self.advance();
             return Ok(self.alloc_expr(token_span(&tok), Expr::Ident(tok.lexeme)));
+        }
+        // `this` keyword in expression position: resolve as the implicit receiver identifier "this".
+        // The parser injects a "this" parameter at params[0] of every method;
+        // sema/IR resolve it like any other named parameter.
+        if self.check(TokenKind::KwThis) {
+            let tok = self.advance();
+            return Ok(self.alloc_expr(token_span(&tok), Expr::Ident("this")));
         }
         if matches!(
             self.peek().kind,

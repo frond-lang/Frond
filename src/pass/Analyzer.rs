@@ -493,7 +493,7 @@ pub fn classify_side_effect(
                     let type_name = &name[..dot];
                     if let Some(method_idx) = sema.lookup_method_idx(type_name, method) {
                         let &type_idx = sema.type_def_index.get(type_name)?;
-                        let type_def = &sema.type_defs[type_idx as usize];
+                        let type_def = &sema.type_defs[&type_idx];
                         let method_sig = type_def.methods.get(method_idx as usize)?;
                         if method_sig.is_async || method_sig.is_throwing {
                             return Some(Purity::Impure);
@@ -1042,7 +1042,7 @@ fn mark_entry_reason(
         // if the type implements a trait and the method is in the witness_table's method_slots, it is a TraitMethod
         if let Some(&type_idx) = sema.type_def_index.get(type_name) {
             let type_id = dynamic_type_id(type_idx);
-            for entry in sema.witness_table.entries().iter() {
+            for entry in sema.witness_table.entries() {
                 if entry.type_id == type_id && entry.method_slots.contains_key(method_name) {
                     cg.entry_reasons.insert(func, ReachableReason::TraitMethod);
                     return;
@@ -2821,9 +2821,15 @@ fn mark_dead_decls_stmt(
         // -- Dead store: assignment target is never read within the function and the assignment expression has no side effects --
         // Note: uses reads (not never_read) for determination, because mutable variables may be indirectly read by closures;
         // the new definition site created by assignment has no use site in the def-use graph, but closures read the latest value when called.
+        // Implicit-this field assignments (`field = value` resolving to `this.field = value`) are
+        // NEVER dead: they mutate instance state visible to other methods and callers.
         Stmt::Assignment { target, value } => {
             if let Expr::Ident(name) = &arena.expr(*target).node {
-                if !reads.contains(*name) {
+                let key = module_expr_key(module_name, target.0 as u64);
+                let is_implicit_this = sema.expr_types.get(&key)
+                    .and_then(|info| info.implicit_this.as_ref())
+                    .is_some();
+                if !is_implicit_this && !reads.contains(*name) {
                     let se = classify_side_effect(*value, arena, module_name, sema, purity, escape, func_name_to_id);
                     if is_side_effect_free(se) {
                         report.dead_stmts.insert(stmt_id);
@@ -2834,8 +2840,13 @@ fn mark_dead_decls_stmt(
         }
         Stmt::CompoundAssignment { target, value, .. } => {
             // Compound assignment x += v: if x is never read within the function and v has no side effects, the whole statement is a dead store
+            // Implicit-this field compound assignments are NEVER dead (same rationale as Assignment).
             if let Expr::Ident(name) = &arena.expr(*target).node {
-                if !reads.contains(*name) {
+                let key = module_expr_key(module_name, target.0 as u64);
+                let is_implicit_this = sema.expr_types.get(&key)
+                    .and_then(|info| info.implicit_this.as_ref())
+                    .is_some();
+                if !is_implicit_this && !reads.contains(*name) {
                     let se = classify_side_effect(*value, arena, module_name, sema, purity, escape, func_name_to_id);
                     if is_side_effect_free(se) {
                         report.dead_stmts.insert(stmt_id);
@@ -4059,7 +4070,7 @@ fn analyze_single_match(
     let Some(info) = sema.expr_types.get(&key) else { return };
     let Some(type_name) = info.type_name.as_deref() else { return };
     let Some(&type_idx) = sema.type_def_index.get(type_name) else { return };
-    let type_def = &sema.type_defs[type_idx as usize];
+    let type_def = &sema.type_defs[&type_idx];
     // Only ADT types with multiple constructors require exhaustiveness checking
     if type_def.kind != crate::sema::Sema::TypeDefKind::Adt {
         return;

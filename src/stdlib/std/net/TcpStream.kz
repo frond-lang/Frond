@@ -55,19 +55,19 @@ pub val DEFAULT_BUF_SIZE: usize = 8192
 // rbuf/rpos/rcap 为 read_until 的内部缓冲（懒分配），rpos 当前读位，rcap 已填充长度
 pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, rbuf: u8[], rpos: usize, rcap: usize) {
     // 返回对端地址（构造时传入的 peer 地址）
-    pub fun peer_addr(self): SocketAddr {
-        self.peer_addr
+    pub fun peer_addr(): SocketAddr {
+        peer_addr
     }
 
     // 从流读取数据，返回读到的字节数组（空数组 = EOF）。
     // 单次 read 语义（不循环阻塞）。
     // 当前直接调用同步 C 原语，等 IR/Engine 异步模型就绪后改为 spawn + channel 模式。
-    pub async fun read(self, len: usize): Async<Throw<u8[], IOError>> {
-        if self.is_closed {
+    pub async fun read(len: usize): Async<Throw<u8[], IOError>> {
+        if is_closed {
             throw IOError(InvalidInput, "stream closed", 0, null)
         }
         val buf: u8[] = [0u8] * len
-        val n = __net_tcp_read(self.fd, buf, len)
+        val n = __net_tcp_read(fd, buf, len)
         if n < 0 {
             throw IOError(ConnectionReset, "tcp read failed", 0, null)
         }
@@ -75,11 +75,11 @@ pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, 
     }
 
     // 向流写入数据，返回实际写入字节数。
-    pub async fun write(self, buf: u8[], len: usize): Async<Throw<usize, IOError>> {
-        if self.is_closed {
+    pub async fun write(buf: u8[], len: usize): Async<Throw<usize, IOError>> {
+        if is_closed {
             throw IOError(InvalidInput, "stream closed", 0, null)
         }
-        val n = __net_tcp_write(self.fd, buf, len)
+        val n = __net_tcp_write(fd, buf, len)
         if n < 0 {
             throw IOError(BrokenPipe, "tcp write failed", 0, null)
         }
@@ -87,12 +87,12 @@ pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, 
     }
 
     // 关闭流。幂等：重复 close 不报错。
-    pub async fun close(self): Async<Throw<void, IOError>> {
-        if self.is_closed {
+    pub async fun close(): Async<Throw<void, IOError>> {
+        if is_closed {
             Ok(void)
         } else {
-            self.is_closed = true
-            __net_tcp_close(self.fd)?
+            is_closed = true
+            __net_tcp_close(fd)?
             Ok(void)
         }
     }
@@ -100,14 +100,14 @@ pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, 
     // ─── 组合语义方法（基于 read/write 原语组合，纯 Kuzo 实现） ──────
 
     // 写入全部字节；write 返回 0 时抛 BrokenPipe（避免死循环）
-    pub async fun write_all(self, buf: u8[], len: usize): Async<Throw<void, IOError>> {
-        if self.is_closed {
+    pub async fun write_all(buf: u8[], len: usize): Async<Throw<void, IOError>> {
+        if is_closed {
             throw IOError(InvalidInput, "stream closed", 0, null)
         }
         var written: usize = 0
         while written < len {
             val chunk = buf[written..len]
-            val n = self.write(chunk, chunk.len()).await()?
+            val n = write(chunk, chunk.len()).await()?
             if n == 0 {
                 throw IOError(BrokenPipe, "write_all: write returned 0", 32, null)
             }
@@ -123,40 +123,40 @@ pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, 
     //   - EOF 时返回已累积的 result
     // rbuf 直接引用 read 返回的数组（无需预分配）；缓冲仅 read_until 内部使用，
     // read 原语不碰缓冲；二者混合使用会导致数据顺序错乱。
-    pub async fun read_until(self, delim: u8): Async<Throw<u8[], IOError>> {
-        if self.is_closed {
+    pub async fun read_until(delim: u8): Async<Throw<u8[], IOError>> {
+        if is_closed {
             throw IOError(InvalidInput, "stream closed", 0, null)
         }
         var result: u8[] = []
         loop {
             // 扫描缓冲 [rpos, rcap) 查找 delim
             var found = false
-            val seg_start = self.rpos
-            while self.rpos < self.rcap {
-                val b = self.rbuf[self.rpos]
-                self.rpos = self.rpos + 1
+            val seg_start = rpos
+            while rpos < rcap {
+                val b = rbuf[rpos]
+                rpos = rpos + 1
                 if b == delim {
                     found = true
                     break
                 }
             }
             // 把本段（不含 delim，若 found 则到 delim 前一位）追加到 result
-            val seg_end = if found { self.rpos - 1 } else { self.rpos }
+            val seg_end = if found { rpos - 1 } else { rpos }
             if seg_end > seg_start {
-                result = result ++ self.rbuf[seg_start..seg_end]
+                result = result ++ rbuf[seg_start..seg_end]
             }
             if found {
                 return Ok(result ++ [delim])
             }
             // 缓冲已扫完仍未找到 delim，读下一批作为新缓冲
-            val chunk = self.read(DEFAULT_BUF_SIZE).await()?
+            val chunk = read(DEFAULT_BUF_SIZE).await()?
             if chunk.len() == 0 {
                 // EOF：返回已累积内容（可能为空）
                 return Ok(result)
             }
-            self.rbuf = chunk
-            self.rpos = 0
-            self.rcap = chunk.len()
+            rbuf = chunk
+            rpos = 0
+            rcap = chunk.len()
         }
     }
 }

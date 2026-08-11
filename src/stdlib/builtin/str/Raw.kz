@@ -51,3 +51,9 @@ fun __str_utf8_char_len_at(s: str, offset: usize): usize #{
     else if ((c & 0xF8) == 0xF0) return 4;
     return 1;
 }#
+
+// 一次性拼接字符串数组：str[] + sep → str，O(n) 时间复杂度。
+// C 体为空（纯 Rust 逻辑，在 compute_ffi_call 中实现）。
+@extern("C")
+fun __str_array_join(arr: str[], sep: str): str #{
+}#

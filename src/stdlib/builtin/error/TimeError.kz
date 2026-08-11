@@ -15,7 +15,7 @@ type TimeError: Err = TimeError(
     msg: str,
     value: str,
 ) {
-    override fun type_name(self): str { "time error" }
+    override fun type_name(): str { "time error" }
 }
 
 // Time 错误分类（穷举 ADT）

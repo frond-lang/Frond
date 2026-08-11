@@ -51,14 +51,14 @@ pub type Stat = Stat(size: u64, mtime_ns: i64, ctime_ns: i64, kind: FileKind)
 // File：文件句柄（newtype record，公开导出）
 // fd 用 i64 跨平台存储（POSIX i32 扩展，Windows HANDLE 转整数）
 pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
-    // ─── 实例方法（self : File） ───────────────────────────
+    // ─── 实例方法（this : File） ───────────────────────────
 
-    pub async fun close(self): Async<Throw<void, IOError>> {
-        if self.is_closed {
+    pub async fun close(): Async<Throw<void, IOError>> {
+        if is_closed {
             Ok(void)
         } else {
-            self.is_closed = true
-            __file_close(self.fd)?
+            is_closed = true
+            __file_close(fd)?
             Ok(void)
         }
     }
@@ -68,32 +68,32 @@ pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
     // 不再接受 buf 参数就地填充：async fun 参数会被 orbit worker 深拷贝，
     // 就地修改 buf 对调用方不可见。改为返回新分配的 u8[] 数组。
     // 当前直接调用同步 C 原语，等 IR/Engine 异步模型就绪后改为 spawn + channel 模式。
-    pub async fun read(self, len: usize): Async<Throw<u8[], IOError>> {
-        if self.is_closed {
-            throw IOError(InvalidInput, "file closed", 0, self.path)
+    pub async fun read(len: usize): Async<Throw<u8[], IOError>> {
+        if is_closed {
+            throw IOError(InvalidInput, "file closed", 0, path)
         }
         val buf: u8[] = [0u8] * len
-        val n = __file_read_into(self.fd, buf, len)
+        val n = __file_read_into(fd, buf, len)
         if n < 0 {
-            throw IOError(Other, "file read failed", 0, self.path)
+            throw IOError(Other, "file read failed", 0, path)
         }
         Ok(buf[0..cast(n).to(usize)])
     }
 
-    pub async fun write(self, buf: u8[], len: usize): Async<Throw<usize, IOError>> {
-        if self.is_closed {
-            throw IOError(InvalidInput, "file closed", 0, self.path)
+    pub async fun write(buf: u8[], len: usize): Async<Throw<usize, IOError>> {
+        if is_closed {
+            throw IOError(InvalidInput, "file closed", 0, path)
         }
-        val n = __file_write(self.fd, buf, len)
+        val n = __file_write(fd, buf, len)
         if n < 0 {
-            throw IOError(Other, "file write failed", 0, self.path)
+            throw IOError(Other, "file write failed", 0, path)
         }
         Ok(cast(n).to(usize))
     }
 
-    pub async fun seek(self, from: SeekFrom): Async<Throw<i64, IOError>> {
-        if self.is_closed {
-            throw IOError(InvalidInput, "file closed", 0, self.path)
+    pub async fun seek(from: SeekFrom): Async<Throw<i64, IOError>> {
+        if is_closed {
+            throw IOError(InvalidInput, "file closed", 0, path)
         }
         val offset = match from {
             Set(off) => off,
@@ -105,38 +105,38 @@ pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
             Current(_) => 1,
             End(_) => 2,
         }
-        __file_seek(self.fd, offset, whence)?
+        __file_seek(fd, offset, whence)?
     }
 
     // tell 用 seek(Current(0)) 组合实现（原 __file_tell syscall 已删除——可由 seek 推导）
     // 保留为 std 方法以提供「获取当前位置」的语义抽象，避免用户手写 Current(0)
-    pub async fun tell(self): Async<Throw<i64, IOError>> {
+    pub async fun tell(): Async<Throw<i64, IOError>> {
         val pos: SeekFrom = Current(0i64)
-        self.seek(pos).await()?
+        seek(pos).await()?
     }
 
-    pub async fun stat(self): Async<Throw<Stat, IOError>> {
-        if self.is_closed {
-            throw IOError(InvalidInput, "file closed", 0, self.path)
+    pub async fun stat(): Async<Throw<Stat, IOError>> {
+        if is_closed {
+            throw IOError(InvalidInput, "file closed", 0, path)
         }
-        __file_fstat(self.fd)?
+        __file_fstat(fd)?
     }
 
     // ─── 组合语义方法（基于 read/write 原语组合，纯 Kuzo 实现） ──────
 
     // 精确读取 len 字节，返回 u8[]；EOF 不足时抛 UnexpectedEof
     // 用 str 累积切片（amortized O(n)），避免 u8[] ++ 的 O(n²)
-    pub async fun read_exact(self, len: usize): Async<Throw<u8[], IOError>> {
-        if self.is_closed {
-            throw IOError(InvalidInput, "file closed", 0, self.path)
+    pub async fun read_exact(len: usize): Async<Throw<u8[], IOError>> {
+        if is_closed {
+            throw IOError(InvalidInput, "file closed", 0, path)
         }
         var result: str = ""
         var total: usize = 0
         while total < len {
             val remaining = len - total
-            val chunk = self.read(remaining).await()?
+            val chunk = read(remaining).await()?
             if chunk.len() == 0 {
-                throw IOError(UnexpectedEof, "read_exact: unexpected EOF", 0, self.path)
+                throw IOError(UnexpectedEof, "read_exact: unexpected EOF", 0, path)
             }
             result = result + cast(chunk).to(str)
             total = total + chunk.len()
@@ -145,16 +145,16 @@ pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
     }
 
     // 写入全部字节；write 返回 0 时抛 BrokenPipe（避免死循环）
-    pub async fun write_all(self, buf: u8[], len: usize): Async<Throw<void, IOError>> {
-        if self.is_closed {
-            throw IOError(InvalidInput, "file closed", 0, self.path)
+    pub async fun write_all(buf: u8[], len: usize): Async<Throw<void, IOError>> {
+        if is_closed {
+            throw IOError(InvalidInput, "file closed", 0, path)
         }
         var written: usize = 0
         while written < len {
             val chunk = buf[written..len]
-            val n = self.write(chunk, chunk.len()).await()?
+            val n = write(chunk, chunk.len()).await()?
             if n == 0 {
-                throw IOError(BrokenPipe, "write_all: write returned 0", 32, self.path)
+                throw IOError(BrokenPipe, "write_all: write returned 0", 32, path)
             }
             written = written + n
         }
@@ -162,16 +162,16 @@ pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
     }
 
     // 复制全部内容到 dst，返回已复制字节数
-    pub async fun copy_to(self, dst: File): Async<Throw<usize, IOError>> {
-        if self.is_closed {
-            throw IOError(InvalidInput, "source file closed", 0, self.path)
+    pub async fun copy_to(dst: File): Async<Throw<usize, IOError>> {
+        if is_closed {
+            throw IOError(InvalidInput, "source file closed", 0, path)
         }
         if dst.is_closed {
             throw IOError(InvalidInput, "destination file closed", 0, dst.path)
         }
         var copied: usize = 0
         loop {
-            val chunk = self.read(DEFAULT_BUF_SIZE).await()?
+            val chunk = read(DEFAULT_BUF_SIZE).await()?
             if chunk.len() == 0 {
                 return Ok(copied)
             }

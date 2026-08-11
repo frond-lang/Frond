@@ -12,46 +12,46 @@
 pub type Path = Path(segments: str[], is_absolute: bool) {
     // ─── 转换 ──────────────────────────────────────────────────────────
 
-    pub fun to_str(self): str {
-        join_segments_to_str(self.segments, self.is_absolute)
+    pub fun to_str(): str {
+        join_segments_to_str(segments, is_absolute)
     }
 
     // ─── 拼接 ──────────────────────────────────────────────────────────
 
-    pub fun join(self, other: Path): Path {
-        Path(self.segments ++ other.segments, self.is_absolute)
+    pub fun join(other: Path): Path {
+        Path(segments ++ other.segments, is_absolute)
     }
 
-    pub fun join_str(self, other: str): Path {
-        self.join(path_from(other))
+    pub fun join_str(other: str): Path {
+        join(path_from(other))
     }
 
     // ─── 路径分解 ──────────────────────────────────────────────────────
 
     // 父目录：去掉最后一段。根路径或空 segments 返回 null
-    pub fun parent(self): Path? {
-        val len = self.segments.len()
+    pub fun parent(): Path? {
+        val len = segments.len()
         if len == 0 {
             null
         } else {
-            val parent_segs = self.segments[0..len - 1]
-            Path(parent_segs, self.is_absolute)
+            val parent_segs = segments[0..len - 1]
+            Path(parent_segs, is_absolute)
         }
     }
 
     // 末尾段（文件名）。空 segments 返回 null
-    pub fun filename(self): str? {
-        val len = self.segments.len()
+    pub fun filename(): str? {
+        val len = segments.len()
         if len == 0 {
             null
         } else {
-            self.segments[len - 1]
+            segments[len - 1]
         }
     }
 
     // 扩展名（不含点）。无点或点在首位返回 null
-    pub fun extension(self): str? {
-        val fname = self.filename()
+    pub fun extension(): str? {
+        val fname = filename()
         match fname {
             null => null,
             name => {
@@ -67,8 +67,8 @@ pub type Path = Path(segments: str[], is_absolute: bool) {
     }
 
     // 文件名（去扩展名）。无点返回完整 filename
-    pub fun file_stem(self): str? {
-        match self.filename() {
+    pub fun file_stem(): str? {
+        match filename() {
             null => null,
             name => {
                 val dot = last_index_of(name, '.')
@@ -84,9 +84,9 @@ pub type Path = Path(segments: str[], is_absolute: bool) {
 
     // ─── 查询 ──────────────────────────────────────────────────────────
 
-    pub fun is_absolute_path(self): bool { self.is_absolute }
+    pub fun is_absolute_path(): bool { is_absolute }
 
-    pub fun is_relative_path(self): bool { !self.is_absolute }
+    pub fun is_relative_path(): bool { !is_absolute }
 }
 
 // ─── 辅助函数 ─────────────────────────────────────────────────────
@@ -148,20 +148,12 @@ pub fun split_segments(s: str): str[] {
 
 // 拼接路径段为字符串
 // abs=true 时前缀 '/'，否则无前缀
+// 使用 __str_array_join 一次性 O(n) 拼接，避免循环 result = result + seg 的 O(n²)
 pub fun join_segments_to_str(segs: str[], abs: bool): str {
-    var result: str = ""
     if abs {
-        result = "/"
+        return "/" + __str_array_join(segs, "/")
     }
-    var first = true
-    for seg in segs.iter() {
-        if !first {
-            result = result + "/"
-        }
-        result = result + seg
-        first = false
-    }
-    result
+    __str_array_join(segs, "/")
 }
 
 // 从字符串查找字符的最后位置（字符索引，Unicode 标量值）
