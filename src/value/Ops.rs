@@ -450,28 +450,8 @@ fn cast_to_bool(src_tag: ValueTag, src_bytes: &[u8]) -> bool {
     match src_tag {
         ValueTag::Bool => read_bool(src_bytes),
         ValueTag::Char => read_u32_le(src_bytes) != 0,
-        ValueTag::I8 => src_bytes.first().copied().unwrap_or(0) as i8 != 0,
-        ValueTag::U8 => src_bytes.first().copied().unwrap_or(0) != 0,
-        ValueTag::I16 | ValueTag::U16 => {
-            let mut b = [0u8; 2];
-            let l = src_bytes.len().min(2);
-            b[..l].copy_from_slice(&src_bytes[..l]);
-            u16::from_le_bytes(b) != 0
-        }
-        ValueTag::I32 | ValueTag::U32 => {
-            let v = read_u32_le(src_bytes);
-            v != 0
-        }
-        ValueTag::I64 | ValueTag::U64 | ValueTag::Isize | ValueTag::Usize => {
-            read_u64_le(src_bytes) != 0
-        }
-        ValueTag::I128 | ValueTag::U128 => {
-            read_u128_le(src_bytes) != 0
-        }
-        ValueTag::F32 => read_f32_le(src_bytes) != 0.0,
-        ValueTag::F64 => read_f64_le(src_bytes) != 0.0,
-        ValueTag::F16 => read_f16(src_bytes).to_f32() != 0.0,
-        ValueTag::F128 => read_f128(src_bytes).to_f64() != 0.0,
+        _ if src_tag.is_int() => read_int_as_u128(src_tag, src_bytes) != 0,
+        _ if src_tag.is_float() => read_float_as_f64(src_tag, src_bytes) != 0.0,
         _ => false,
     }
 }
@@ -507,6 +487,16 @@ fn read_float_as_f64(tag: ValueTag, bytes: &[u8]) -> f64 {
     }
 }
 
+fn read_float_as_f128(tag: ValueTag, bytes: &[u8]) -> F128 {
+    match tag {
+        ValueTag::F16 => { let f = read_f16(bytes); F128::from_f64(f.to_f64()) }
+        ValueTag::F32 => { let f = read_f32_le(bytes); F128::from_f64(f as f64) }
+        ValueTag::F64 => F128::from_f64(read_f64_le(bytes)),
+        ValueTag::F128 => read_f128(bytes),
+        _ => F128::from_f64(0.0),
+    }
+}
+
 fn cast_int_to_int(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst: &mut [u8]) {
     if dst_tag.is_signed() {
         let val = read_int_as_i128(src_tag, src_bytes);
@@ -537,25 +527,38 @@ fn cast_int_to_float(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst
 }
 
 fn cast_float_to_int(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst: &mut [u8]) {
+    // F128 source: use native F128→int conversion to preserve the full 113-bit mantissa.
+    // Going through f64 would lose precision for values > 2^53.
+    if src_tag == ValueTag::F128 {
+        let f = read_f128(src_bytes);
+        if dst_tag.is_signed() {
+            write_int_bytes!(f.to_i128(), dst_tag, dst);
+        } else {
+            write_int_bytes!(f.to_u128(), dst_tag, dst);
+        }
+        return;
+    }
     let f = read_float_as_f64(src_tag, src_bytes);
-    match dst_tag {
-        ValueTag::I8 => write_i8(f as i8, dst),
-        ValueTag::I16 => write_i16_le(f as i16, dst),
-        ValueTag::I32 => write_i32_le(f as i32, dst),
-        ValueTag::I64 => write_i64_le(f as i64, dst),
-        ValueTag::I128 => write_i128_le(f as i128, dst),
-        ValueTag::Isize => write_i64_le(f as isize as i64, dst),
-        ValueTag::U8 => write_u8(f as u8, dst),
-        ValueTag::U16 => write_u16_le(f as u16, dst),
-        ValueTag::U32 => write_u32_le(f as u32, dst),
-        ValueTag::U64 => write_u64_le(f as u64, dst),
-        ValueTag::U128 => write_u128_le(f as u128, dst),
-        ValueTag::Usize => write_u64_le(f as usize as u64, dst),
-        _ => {}
+    if dst_tag.is_signed() {
+        write_int_bytes!(f as i128, dst_tag, dst);
+    } else {
+        write_int_bytes!(f as u128, dst_tag, dst);
     }
 }
 
 fn cast_float_to_float(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst: &mut [u8]) {
+    // F128 source: use F128 as intermediate to preserve precision for F128→F64/F128→F32.
+    if src_tag == ValueTag::F128 {
+        let f = read_f128(src_bytes);
+        match dst_tag {
+            ValueTag::F16 => write_f16(F16::from_f64(f.to_f64()), dst),
+            ValueTag::F32 => write_f32_le(f.to_f64() as f32, dst),
+            ValueTag::F64 => write_f64_le(f.to_f64(), dst),
+            ValueTag::F128 => write_f128(f, dst),
+            _ => {}
+        }
+        return;
+    }
     let f = read_float_as_f64(src_tag, src_bytes);
     cast_from_f64(f, dst_tag, dst);
 }

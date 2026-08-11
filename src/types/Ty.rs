@@ -5,6 +5,51 @@
 use super::Tag::*;
 use std::fmt;
 
+// ─── Builtin type name constants ───
+pub const NAME_STR: &str = "str";
+pub const NAME_THROW: &str = "Throw";
+pub const NAME_CHANNEL: &str = "Channel";
+pub const NAME_ASYNC: &str = "Async";
+pub const NAME_LAZY: &str = "Lazy";
+pub const NAME_ATOMIC: &str = "Atomic";
+pub const NAME_SENDER: &str = "Sender";
+pub const NAME_RECEIVER: &str = "Receiver";
+pub const NAME_TIMER: &str = "Timer";
+
+/// Mapping from builtin generic type name → Ty variant.
+/// All string-based type resolution for generics should go through this table.
+pub const BUILTIN_GENERIC_TABLE: &[(&str, TyKind)] = &[
+    (NAME_THROW, TyKind::Throw),
+    (NAME_CHANNEL, TyKind::Channel),
+    (NAME_ASYNC, TyKind::Async),
+    (NAME_LAZY, TyKind::Lazy),
+    (NAME_ATOMIC, TyKind::Atomic),
+    (NAME_SENDER, TyKind::Sender),
+    (NAME_RECEIVER, TyKind::Receiver),
+    (NAME_TIMER, TyKind::Timer),
+];
+
+/// The kind of a builtin generic type (used for name→variant mapping).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TyKind {
+    Throw, Channel, Async, Lazy, Atomic, Sender, Receiver, Timer,
+}
+
+impl TyKind {
+    pub fn to_ty(self, detail: DetailId) -> Ty {
+        match self {
+            TyKind::Throw => Ty::Throw(detail),
+            TyKind::Channel => Ty::Channel(detail),
+            TyKind::Async => Ty::Async(detail),
+            TyKind::Lazy => Ty::Lazy(detail),
+            TyKind::Atomic => Ty::Atomic(detail),
+            TyKind::Sender => Ty::Sender(detail),
+            TyKind::Receiver => Ty::Receiver(detail),
+            TyKind::Timer => Ty::Timer(detail),
+        }
+    }
+}
+
 /// The unified type representation for Kuzo.
 ///
 /// **Single source of types**: both the sema and IR layers use `Ty`; there is no longer
@@ -309,18 +354,9 @@ impl Ty {
         // DetailId uses DetailId(u32::MAX) as a placeholder (family() does not read the payload,
         // so the placeholder is safe).
         let base = name.split('<').next().unwrap_or(name);
+        let kind = BUILTIN_GENERIC_TABLE.iter().find(|(n, _)| *n == base)?.1;
         let placeholder = DetailId(u32::MAX);
-        Some(match base {
-            "Throw" => Ty::Throw(placeholder),
-            "Channel" => Ty::Channel(placeholder),
-            "Async" => Ty::Async(placeholder),
-            "Lazy" => Ty::Lazy(placeholder),
-            "Atomic" => Ty::Atomic(placeholder),
-            "Sender" => Ty::Sender(placeholder),
-            "Receiver" => Ty::Receiver(placeholder),
-            "Timer" => Ty::Timer(placeholder),
-            _ => return None,
-        })
+        Some(kind.to_ty(placeholder))
     }
 
     /// Determine the exact int-to-float widening path.

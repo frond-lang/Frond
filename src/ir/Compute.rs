@@ -103,7 +103,7 @@ fn make_arith_throw(kind: &str, msg: &str) -> Value {
 // reflect helpers — eliminate duplication between the FFI and fallback paths.
 // =========================================================================
 
-/// Returns the reflect kind number of a `Value` (ABI protocol: 0–12).
+/// Returns the reflect kind number of a `Value` (ABI protocol: 0–22).
 /// Single authoritative source shared by FFI and fallback paths to ensure consistency.
 fn reflect_kind(v: &Value) -> u8 {
     match v {
@@ -115,12 +115,22 @@ fn reflect_kind(v: &Value) -> u8 {
             crate::value::HeapObj::Array(_) => 4,
             crate::value::HeapObj::Record(_) => 5,
             crate::value::HeapObj::Adt(_) => 6,
-            crate::value::HeapObj::Closure(_) => 7,
-            crate::value::HeapObj::TraitVal(_) => 8,
-            crate::value::HeapObj::ThrowVal(_) => 9,
-            crate::value::HeapObj::ChannelVal(_) => 10,
-            crate::value::HeapObj::AsyncVal(_) => 11,
-            _ => 12,
+            crate::value::HeapObj::Newtype(_) => 7,
+            crate::value::HeapObj::Cell(_) => 8,
+            crate::value::HeapObj::Range(_) => 9,
+            crate::value::HeapObj::Closure(_) => 10,
+            crate::value::HeapObj::Partial(_) => 11,
+            crate::value::HeapObj::Builtin(_) => 12,
+            crate::value::HeapObj::TraitVal(_) => 13,
+            crate::value::HeapObj::LazyVal(_) => 14,
+            crate::value::HeapObj::ErrorVal(_) => 15,
+            crate::value::HeapObj::ThrowVal(_) => 16,
+            crate::value::HeapObj::AtomicVal(_) => 17,
+            crate::value::HeapObj::AsyncVal(_) => 18,
+            crate::value::HeapObj::ChannelVal(_) => 19,
+            crate::value::HeapObj::SenderVal(_) => 20,
+            crate::value::HeapObj::ReceiverVal(_) => 21,
+            crate::value::HeapObj::CoroutineFrame => 22,
         },
     }
 }
@@ -138,9 +148,21 @@ fn reflect_kind_str(v: &Value) -> &'static str {
             crate::value::HeapObj::Record(_) => "Record",
             crate::value::HeapObj::Adt(_) => "Adt",
             crate::value::HeapObj::Newtype(_) => "Newtype",
+            crate::value::HeapObj::Cell(_) => "Cell",
+            crate::value::HeapObj::Range(_) => "Range",
             crate::value::HeapObj::Closure(_) => "Closure",
+            crate::value::HeapObj::Partial(_) => "Partial",
+            crate::value::HeapObj::Builtin(_) => "Builtin",
             crate::value::HeapObj::TraitVal(_) => "Trait",
-            _ => "Ref",
+            crate::value::HeapObj::LazyVal(_) => "Lazy",
+            crate::value::HeapObj::ErrorVal(_) => "Error",
+            crate::value::HeapObj::ThrowVal(_) => "Throw",
+            crate::value::HeapObj::AtomicVal(_) => "Atomic",
+            crate::value::HeapObj::AsyncVal(_) => "Async",
+            crate::value::HeapObj::ChannelVal(_) => "Channel",
+            crate::value::HeapObj::SenderVal(_) => "Sender",
+            crate::value::HeapObj::ReceiverVal(_) => "Receiver",
+            crate::value::HeapObj::CoroutineFrame => "Coroutine",
         },
     }
 }
@@ -158,7 +180,21 @@ fn reflect_type_name(v: &Value) -> String {
             crate::value::HeapObj::Record(rec) => rec.type_name.clone(),
             crate::value::HeapObj::Adt(a) => a.type_name.clone(),
             crate::value::HeapObj::Newtype(n) => n.type_name.clone(),
-            _ => TYPE_NAME_UNKNOWN.to_string(),
+            crate::value::HeapObj::LazyVal(_) => "Lazy".to_string(),
+            crate::value::HeapObj::ErrorVal(_) => "Error".to_string(),
+            crate::value::HeapObj::ThrowVal(_) => "Throw".to_string(),
+            crate::value::HeapObj::AtomicVal(_) => "Atomic".to_string(),
+            crate::value::HeapObj::AsyncVal(_) => "Async".to_string(),
+            crate::value::HeapObj::ChannelVal(_) => "Channel".to_string(),
+            crate::value::HeapObj::SenderVal(_) => "Sender".to_string(),
+            crate::value::HeapObj::ReceiverVal(_) => "Receiver".to_string(),
+            crate::value::HeapObj::CoroutineFrame => "Coroutine".to_string(),
+            crate::value::HeapObj::Cell(_) => "Cell".to_string(),
+            crate::value::HeapObj::Range(_) => "Range".to_string(),
+            crate::value::HeapObj::Partial(_) => "Partial".to_string(),
+            crate::value::HeapObj::Builtin(b) => b.name.clone(),
+            crate::value::HeapObj::Closure(_) => "Fn".to_string(),
+            crate::value::HeapObj::TraitVal(_) => "Trait".to_string(),
         },
     }
 }
@@ -724,95 +760,53 @@ fn f128_sort_key(bits: u128) -> u128 {
     if (bits >> 127) != 0 { !bits } else { bits | (1u128 << 127) }
 }
 
+// ---- F128 comparisons (unified via helper to eliminate 6x duplicated NaN-check logic) ----
+const F128_NONZERO_MASK: u128 = 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
+
+/// Common F128 comparison dispatch: extracts bytes, checks NaN, delegates to `logic`.
+/// `nan_result` is the value returned when either operand is NaN (true for ne, false for all others).
+#[inline]
+fn f128_cmp_with<F>(frame: &mut Frame, node: NodeId, nan_result: bool, logic: F) -> Value
+where F: FnOnce(u128, u128) -> bool
+{
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let a = force_input(frame, inputs[0]).as_f128();
+    let b = force_input(frame, inputs[1]).as_f128();
+    let ab = u128::from_le_bytes(a.0);
+    let bb = u128::from_le_bytes(b.0);
+    let result = if f128_is_nan(ab) || f128_is_nan(bb) {
+        nan_result
+    } else {
+        logic(ab, bb)
+    };
+    Value::bool_val(result)
+}
+
 pub fn compute_eq_f128(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
-    let a = force_input(frame, inputs[0]).as_f128();
-    let b = force_input(frame, inputs[1]).as_f128();
-    let ab = u128::from_le_bytes(a.0);
-    let bb = u128::from_le_bytes(b.0);
-    let eq = if f128_is_nan(ab) || f128_is_nan(bb) {
-        false
-    } else {
-        ab == bb || (ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0
-    };
-    Value::bool_val(eq)
+    f128_cmp_with(frame, node, false, |ab, bb| ab == bb || (ab | bb) & F128_NONZERO_MASK == 0)
 }
-
 pub fn compute_ne_f128(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
-    let a = force_input(frame, inputs[0]).as_f128();
-    let b = force_input(frame, inputs[1]).as_f128();
-    let ab = u128::from_le_bytes(a.0);
-    let bb = u128::from_le_bytes(b.0);
-    let ne = if f128_is_nan(ab) || f128_is_nan(bb) {
-        true
-    } else {
-        ab != bb && ((ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF != 0)
-    };
-    Value::bool_val(ne)
+    f128_cmp_with(frame, node, true, |ab, bb| ab != bb && (ab | bb) & F128_NONZERO_MASK != 0)
 }
-
 pub fn compute_lt_f128(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
-    let a = force_input(frame, inputs[0]).as_f128();
-    let b = force_input(frame, inputs[1]).as_f128();
-    let ab = u128::from_le_bytes(a.0);
-    let bb = u128::from_le_bytes(b.0);
-    let lt = if f128_is_nan(ab) || f128_is_nan(bb) {
-        false
-    } else if (ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0 {
-        false // -0 == +0, not less than
-    } else {
-        f128_sort_key(ab) < f128_sort_key(bb)
-    };
-    Value::bool_val(lt)
+    f128_cmp_with(frame, node, false, |ab, bb| {
+        if (ab | bb) & F128_NONZERO_MASK == 0 { false } else { f128_sort_key(ab) < f128_sort_key(bb) }
+    })
 }
-
 pub fn compute_gt_f128(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
-    let a = force_input(frame, inputs[0]).as_f128();
-    let b = force_input(frame, inputs[1]).as_f128();
-    let ab = u128::from_le_bytes(a.0);
-    let bb = u128::from_le_bytes(b.0);
-    let gt = if f128_is_nan(ab) || f128_is_nan(bb) {
-        false
-    } else if (ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0 {
-        false // -0 == +0, not greater than
-    } else {
-        f128_sort_key(ab) > f128_sort_key(bb)
-    };
-    Value::bool_val(gt)
+    f128_cmp_with(frame, node, false, |ab, bb| {
+        if (ab | bb) & F128_NONZERO_MASK == 0 { false } else { f128_sort_key(ab) > f128_sort_key(bb) }
+    })
 }
-
 pub fn compute_le_f128(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
-    let a = force_input(frame, inputs[0]).as_f128();
-    let b = force_input(frame, inputs[1]).as_f128();
-    let ab = u128::from_le_bytes(a.0);
-    let bb = u128::from_le_bytes(b.0);
-    let le = if f128_is_nan(ab) || f128_is_nan(bb) {
-        false
-    } else {
-        // -0 == +0 → le=true; otherwise totalOrder less-or-equal
-        (ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0
-            || f128_sort_key(ab) < f128_sort_key(bb)
-    };
-    Value::bool_val(le)
+    f128_cmp_with(frame, node, false, |ab, bb| {
+        (ab | bb) & F128_NONZERO_MASK == 0 || f128_sort_key(ab) < f128_sort_key(bb)
+    })
 }
-
 pub fn compute_ge_f128(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
-    let a = force_input(frame, inputs[0]).as_f128();
-    let b = force_input(frame, inputs[1]).as_f128();
-    let ab = u128::from_le_bytes(a.0);
-    let bb = u128::from_le_bytes(b.0);
-    let ge = if f128_is_nan(ab) || f128_is_nan(bb) {
-        false
-    } else {
-        (ab | bb) & 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF == 0
-            || f128_sort_key(ab) > f128_sort_key(bb)
-    };
-    Value::bool_val(ge)
+    f128_cmp_with(frame, node, false, |ab, bb| {
+        (ab | bb) & F128_NONZERO_MASK == 0 || f128_sort_key(ab) > f128_sort_key(bb)
+    })
 }
 
 // ---- bool logic (indices 22–24, 27) ----
@@ -939,863 +933,1007 @@ pub fn compute_propagate(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) ->
 /// collects argument values from the inputs, dispatches to the corresponding
 /// `Ffi::wrapper` function, and returns the resulting `Value`.
 /// FFI calls are synchronous: they set no `pending_call` and do not suspend the frame.
+///
+/// Refactored to data-driven dispatch: a static lookup table replaces a
+/// giant match block. Adding a new FFI function requires only a new table
+/// entry + handler function — no reworking of the dispatch logic.
+
+// =========================================================================
+// FFI helper functions (extracted from the original compute_ffi_call body)
+// =========================================================================
+
+/// Extract a str argument from a Value (HeapObj::Str → owned String, avoiding
+/// temporary Value lifetime issues).
+#[inline]
+fn ffi_extract_str(v: &Value) -> String {
+    match v.heap_obj() {
+        Some(crate::value::HeapObj::Str(s)) => s.bytes().to_string(),
+        _ => panic!("FFI str arg expected, got non-str value"),
+    }
+}
+
+/// Extract a u8[] argument from a Value (unified through ArrayValue::collect_u8_bytes).
+#[inline]
+fn ffi_extract_u8_buf(v: &Value) -> Vec<u8> {
+    match v.heap_obj() {
+        Some(crate::value::HeapObj::Array(arr)) => arr.collect_u8_bytes(),
+        _ => panic!("FFI u8[] arg expected"),
+    }
+}
+
+/// Writes data read by FFI back into a Kuzo u8[] array (in-place mutation of
+/// the underlying HeapObj, with `&self` semantics).
+///
+/// `ffi_extract_u8_buf` returns a cloned `Vec`; after FFI writes into the local
+/// Vec, it must be written back to the original array, otherwise the Kuzo
+/// side reads zeros (H-2 fix).
+/// Only `buf[0..n]` is written back, where `n` is the FFI return value
+/// (provided by the caller).
+#[inline]
+fn ffi_writeback_u8_buf(buf_val: &Value, data: &[u8], n: usize) {
+    if let Value::Ref(arc) = buf_val {
+        // Safety: the engine executes on a single thread; the caller frame is
+        // suspended while the callee runs, so there is no concurrent access to
+        // the same HeapObj (consistent with `compute_record_field_set`).
+        let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::value::HeapObj;
+        unsafe {
+            if let crate::value::HeapObj::Array(arr) = &mut *ptr {
+                let len = n.min(data.len()).min(arr.elements.len());
+                // SOA fast path: U8 contiguous storage, direct memcpy.
+                if let Some(crate::value::ScalarSoA::U8(ref mut soa_data)) = arr.scalar_soa {
+                    let len = len.min(soa_data.len());
+                    soa_data[..len].copy_from_slice(&data[..len]);
+                } else {
+                    for i in 0..len {
+                        arr.elements[i] = Value::u8(data[i]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// FFI handler function type: takes a frame and input node IDs, returns a Value.
+pub type FfiHandler = fn(frame: &mut Frame, inputs: &[NodeId]) -> Value;
+
+// =========================================================================
+// Macros for generating cast handlers — eliminates the repetitive boilerplate
+// of ~20 cast operations (widening to i128 and narrowing from i128).
+// =========================================================================
+
+#[cfg(has_extern_c)]
+macro_rules! ffi_cast_widening {
+    ($handler_name:ident, $ffi_fn:ident, $src_method:ident, $dst_ctor:ident) => {
+        fn $handler_name(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+            let x = force_input(frame, inputs[0]).$src_method();
+            let r = unsafe { wrapper::$ffi_fn(x) };
+            Value::$dst_ctor(r)
+        }
+    };
+}
+
+#[cfg(has_extern_c)]
+macro_rules! ffi_cast_narrowing {
+    ($handler_name:ident, $ffi_fn:ident, $src_method:ident, $dst_ctor:ident) => {
+        fn $handler_name(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+            let v = force_input(frame, inputs[0]).$src_method();
+            let r = unsafe { wrapper::$ffi_fn(v) };
+            Value::$dst_ctor(r)
+        }
+    };
+}
+
+#[cfg(not(has_extern_c))]
+macro_rules! ffi_cast_widening_pure {
+    ($handler_name:ident, $src_method:ident, $dst_ty:ident, $dst_ctor:ident) => {
+        fn $handler_name(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+            Value::$dst_ctor(force_input(frame, inputs[0]).$src_method() as $dst_ty)
+        }
+    };
+}
+
+#[cfg(not(has_extern_c))]
+macro_rules! ffi_cast_narrowing_pure {
+    ($handler_name:ident, $src_method:ident, $dst_ty:ident, $dst_ctor:ident) => {
+        fn $handler_name(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+            Value::$dst_ctor(force_input(frame, inputs[0]).$src_method() as $dst_ty)
+        }
+    };
+}
+
+// =========================================================================
+// Common FFI handlers — shared between has_extern_c and not(has_extern_c).
+// These are pure-Rust reflect / str functions that have no FFI dependency.
+// =========================================================================
+
+#[allow(dead_code)]
+mod ffi_common {
+    use super::*;
+
+    // ── reflect: __reflect_kind / __reflect_type_name have been split into
+    // standalone compute_fns (CF_REFLECT_FORMAT / CF_REFLECT_SCALAR_TO_STR, idx 290/291),
+    // and no longer go through the FFI dispatch path ──
+
+    pub(crate) fn reflect_kind(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let v = force_input(frame, inputs[0]);
+        Value::u8(super::reflect_kind(&v))
+    }
+
+    pub(crate) fn reflect_type_name(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let v = force_input(frame, inputs[0]);
+        let name = super::reflect_type_name(&v);
+        Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&name)))
+    }
+
+    pub(crate) fn reflect_array_len(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let v = force_input(frame, inputs[0]);
+        match v.heap_obj() {
+            Some(crate::value::HeapObj::Array(arr)) => Value::usize_val(arr.elements.len()),
+            _ => Value::usize_val(0),
+        }
+    }
+
+    pub(crate) fn reflect_field_count(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let v = force_input(frame, inputs[0]);
+        let count: u16 = match v.heap_obj() {
+            Some(crate::value::HeapObj::Record(rec)) => rec.fields.len() as u16,
+            Some(crate::value::HeapObj::Adt(a)) => a.fields.len() as u16,
+            _ => 0,
+        };
+        Value::u16(count)
+    }
+
+    pub(crate) fn reflect_size(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let v = force_input(frame, inputs[0]);
+        let size: u8 = match &v {
+            Value::Scalar(_, tag) => tag.byte_width() as u8,
+            _ => 0,
+        };
+        Value::u8(size)
+    }
+
+    pub(crate) fn reflect_field_name(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let v = force_input(frame, inputs[0]);
+        let i = force_input(frame, inputs[1]).as_u16();
+        let name = match v.heap_obj() {
+            Some(crate::value::HeapObj::Record(rec)) => {
+                rec.field_names.get(i as usize)
+                    .and_then(|n| n.as_ref())
+                    .cloned()
+                    .unwrap_or_default()
+            }
+            Some(crate::value::HeapObj::Adt(a)) => {
+                a.fields.get(i as usize)
+                    .and_then(|f| f.name.as_ref().cloned())
+                    .unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&name)))
+    }
+
+    pub(crate) fn reflect_field_value(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let v = force_input(frame, inputs[0]);
+        let i = force_input(frame, inputs[1]).as_u16();
+        match v.heap_obj() {
+            Some(crate::value::HeapObj::Record(rec)) => {
+                rec.fields.get(i as usize).cloned().unwrap_or(Value::NULL)
+            }
+            Some(crate::value::HeapObj::Adt(a)) => {
+                a.fields.get(i as usize).map(|f| f.value.clone()).unwrap_or(Value::NULL)
+            }
+            _ => Value::NULL,
+        }
+    }
+
+    pub(crate) fn reflect_adt_constructor(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let v = force_input(frame, inputs[0]);
+        let name = match v.heap_obj() {
+            Some(crate::value::HeapObj::Adt(a)) => a.constructor.clone(),
+            _ => String::new(),
+        };
+        Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&name)))
+    }
+
+    pub(crate) fn reflect_kind_str(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let v = force_input(frame, inputs[0]);
+        let kind = super::reflect_kind_str(&v);
+        Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(kind)))
+    }
+
+    pub(crate) fn reflect_layout_size(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let v = force_input(frame, inputs[0]);
+        let size: u32 = crate::value::reflect_layout_size(&v);
+        Value::u32(size)
+    }
+
+    pub(crate) fn reflect_layout_alignment(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let v = force_input(frame, inputs[0]);
+        let align: u32 = crate::value::reflect_layout_alignment(&v);
+        Value::u32(align)
+    }
+}
+
+// =========================================================================
+// has_extern_c FFI dispatch — delegates to FFI wrapper functions
+// =========================================================================
+
+#[cfg(has_extern_c)]
+mod ffi_has_extern_c {
+    use super::*;
+    use crate::ffi::Ffi::wrapper;
+
+    // ── IO: stdout/stderr ──
+
+    fn stdout_write_raw(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let s = ffi_extract_str(&force_input(frame, inputs[0]));
+        let rc = unsafe { wrapper::__stdout_write_raw(&s) };
+        Value::i32(rc)
+    }
+
+    fn stderr_write_raw(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let s = ffi_extract_str(&force_input(frame, inputs[0]));
+        let rc = unsafe { wrapper::__stderr_write_raw(&s) };
+        Value::i32(rc)
+    }
+
+    // ── IO: file ops ──
+
+    fn file_open_raw(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let path = ffi_extract_str(&force_input(frame, inputs[0]));
+        let flags = force_input(frame, inputs[1]).as_i32();
+        let mode = force_input(frame, inputs[2]).as_i32();
+        let fd = unsafe { wrapper::__file_open_raw(&path, flags, mode) };
+        Value::i64(fd)
+    }
+
+    fn file_close_raw(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let fd = force_input(frame, inputs[0]).as_i64();
+        let rc = unsafe { wrapper::__file_close_raw(fd) };
+        Value::i32(rc)
+    }
+
+    fn file_seek_raw(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let fd = force_input(frame, inputs[0]).as_i64();
+        let offset = force_input(frame, inputs[1]).as_i64();
+        let whence = force_input(frame, inputs[2]).as_i32();
+        let pos = unsafe { wrapper::__file_seek_raw(fd, offset, whence) };
+        Value::i64(pos)
+    }
+
+    fn file_remove_raw(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let path = ffi_extract_str(&force_input(frame, inputs[0]));
+        let rc = unsafe { wrapper::__file_remove_raw(&path) };
+        Value::i32(rc)
+    }
+
+    fn file_rename_raw(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let old = ffi_extract_str(&force_input(frame, inputs[0]));
+        let new = ffi_extract_str(&force_input(frame, inputs[1]));
+        let rc = unsafe { wrapper::__file_rename_raw(&old, &new) };
+        Value::i32(rc)
+    }
+
+    fn file_chmod_raw(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let path = ffi_extract_str(&force_input(frame, inputs[0]));
+        let mode = force_input(frame, inputs[1]).as_i32();
+        let rc = unsafe { wrapper::__file_chmod_raw(&path, mode) };
+        Value::i32(rc)
+    }
+
+    // ── IO: file read/write (u8[] + len) ──
+
+    fn file_read_into(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let fd = force_input(frame, inputs[0]).as_i64();
+        let buf_val = force_input(frame, inputs[1]);
+        let mut buf = ffi_extract_u8_buf(&buf_val);
+        let len = force_input(frame, inputs[2]).as_usize();
+        let n = unsafe { wrapper::__file_read_into(fd, &mut buf, len) };
+        if n > 0 { ffi_writeback_u8_buf(&buf_val, &buf, n as usize); }
+        Value::i64(n)
+    }
+
+    fn file_write(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let fd = force_input(frame, inputs[0]).as_i64();
+        let buf = ffi_extract_u8_buf(&force_input(frame, inputs[1]));
+        let len = force_input(frame, inputs[2]).as_usize();
+        let n = unsafe { wrapper::__file_write(fd, &buf, len) };
+        Value::i64(n)
+    }
+
+    // ── IO: stdin ──
+
+    fn stdin_readln_into(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let buf_val = force_input(frame, inputs[0]);
+        let mut buf = ffi_extract_u8_buf(&buf_val);
+        let n = unsafe { wrapper::__stdin_readln_into(&mut buf) };
+        if n > 0 { ffi_writeback_u8_buf(&buf_val, &buf, n as usize); }
+        Value::i64(n)
+    }
+
+    // ── IO: stat/fstat ──
+
+    fn file_stat_into(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let path = ffi_extract_str(&force_input(frame, inputs[0]));
+        let buf_val = force_input(frame, inputs[1]);
+        let mut buf = ffi_extract_u8_buf(&buf_val);
+        let rc = unsafe { wrapper::__file_stat_into(&path, &mut buf) };
+        if rc == 0 { ffi_writeback_u8_buf(&buf_val, &buf, buf.len()); }
+        Value::i32(rc)
+    }
+
+    fn file_fstat_into(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let fd = force_input(frame, inputs[0]).as_i64();
+        let buf_val = force_input(frame, inputs[1]);
+        let mut buf = ffi_extract_u8_buf(&buf_val);
+        let rc = unsafe { wrapper::__file_fstat_into(fd, &mut buf) };
+        if rc == 0 { ffi_writeback_u8_buf(&buf_val, &buf, buf.len()); }
+        Value::i32(rc)
+    }
+
+    // ── IO: dir ops ──
+
+    fn dir_create_raw(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let path = ffi_extract_str(&force_input(frame, inputs[0]));
+        let recursive = force_input(frame, inputs[1]).as_bool();
+        let rc = unsafe { wrapper::__dir_create_raw(&path, recursive) };
+        Value::i32(rc)
+    }
+
+    fn dir_remove_raw(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let path = ffi_extract_str(&force_input(frame, inputs[0]));
+        let recursive = force_input(frame, inputs[1]).as_bool();
+        let rc = unsafe { wrapper::__dir_remove_raw(&path, recursive) };
+        Value::i32(rc)
+    }
+
+    // ── IO: dir list ──
+
+    fn dir_list_into(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let path = ffi_extract_str(&force_input(frame, inputs[0]));
+        let names_val = force_input(frame, inputs[1]);
+        let offsets_val = force_input(frame, inputs[2]);
+        let kinds_val = force_input(frame, inputs[3]);
+        let mut names_buf = ffi_extract_u8_buf(&names_val);
+        let mut name_offsets = ffi_extract_u8_buf(&offsets_val);
+        let mut kinds_buf = ffi_extract_u8_buf(&kinds_val);
+        let max_count = force_input(frame, inputs[4]).as_usize();
+        let count = unsafe {
+            wrapper::__dir_list_into(&path, &mut names_buf, &mut name_offsets, &mut kinds_buf, max_count)
+        };
+        if count > 0 {
+            ffi_writeback_u8_buf(&names_val, &names_buf, names_buf.len());
+            ffi_writeback_u8_buf(&offsets_val, &name_offsets, name_offsets.len());
+            ffi_writeback_u8_buf(&kinds_val, &kinds_buf, kinds_buf.len());
+        }
+        Value::i64(count)
+    }
+
+    // ── net: tcp ──
+
+    fn net_tcp_connect_v4(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let ip_bits = force_input(frame, inputs[0]).as_u32();
+        let port = force_input(frame, inputs[1]).as_u16();
+        let timeout_ns = force_input(frame, inputs[2]).as_i64();
+        let fd = unsafe { wrapper::__net_tcp_connect_v4(ip_bits, port, timeout_ns) };
+        Value::i64(fd)
+    }
+
+    fn net_tcp_listen_v4(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let ip_bits = force_input(frame, inputs[0]).as_u32();
+        let port = force_input(frame, inputs[1]).as_u16();
+        let reuse_addr = force_input(frame, inputs[2]).as_bool();
+        let fd = unsafe { wrapper::__net_tcp_listen_v4(ip_bits, port, reuse_addr) };
+        Value::i64(fd)
+    }
+
+    fn net_tcp_accept(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let fd = force_input(frame, inputs[0]).as_i64();
+        let conn_fd = unsafe { wrapper::__net_tcp_accept(fd) };
+        Value::i64(conn_fd)
+    }
+
+    fn net_tcp_read(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let fd = force_input(frame, inputs[0]).as_i64();
+        let buf_val = force_input(frame, inputs[1]);
+        let mut buf = ffi_extract_u8_buf(&buf_val);
+        let len = force_input(frame, inputs[2]).as_usize();
+        let n = unsafe { wrapper::__net_tcp_read(fd, &mut buf, len) };
+        if n > 0 { ffi_writeback_u8_buf(&buf_val, &buf, n as usize); }
+        Value::i64(n)
+    }
+
+    fn net_tcp_write(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let fd = force_input(frame, inputs[0]).as_i64();
+        let buf = ffi_extract_u8_buf(&force_input(frame, inputs[1]));
+        let len = force_input(frame, inputs[2]).as_usize();
+        let n = unsafe { wrapper::__net_tcp_write(fd, &buf, len) };
+        Value::i64(n)
+    }
+
+    fn net_tcp_close_raw(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let fd = force_input(frame, inputs[0]).as_i64();
+        let rc = unsafe { wrapper::__net_tcp_close_raw(fd) };
+        Value::i32(rc)
+    }
+
+    // ── net: udp v4 ──
+
+    fn net_udp_bind_v4(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let ip_bits = force_input(frame, inputs[0]).as_u32();
+        let port = force_input(frame, inputs[1]).as_u16();
+        let reuse_addr = force_input(frame, inputs[2]).as_bool();
+        let fd = unsafe { wrapper::__net_udp_bind_v4(ip_bits, port, reuse_addr) };
+        Value::i64(fd)
+    }
+
+    fn net_udp_send_to_v4(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let fd = force_input(frame, inputs[0]).as_i64();
+        let ip_bits = force_input(frame, inputs[1]).as_u32();
+        let port = force_input(frame, inputs[2]).as_u16();
+        let buf = ffi_extract_u8_buf(&force_input(frame, inputs[3]));
+        let len = force_input(frame, inputs[4]).as_usize();
+        let n = unsafe { wrapper::__net_udp_send_to_v4(fd, ip_bits, port, &buf, len) };
+        Value::i64(n)
+    }
+
+    fn net_udp_recv_from_v4(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let fd = force_input(frame, inputs[0]).as_i64();
+        let buf_val = force_input(frame, inputs[1]);
+        let mut buf = ffi_extract_u8_buf(&buf_val);
+        let len = force_input(frame, inputs[2]).as_usize();
+        let n = unsafe { wrapper::__net_udp_recv_from_v4(fd, &mut buf, len) };
+        if n > 0 { ffi_writeback_u8_buf(&buf_val, &buf, n as usize); }
+        Value::i64(n)
+    }
+
+    // ── net: resolve ──
+
+    fn net_resolve_into(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let host = ffi_extract_str(&force_input(frame, inputs[0]));
+        let buf_val = force_input(frame, inputs[1]);
+        let mut out_buf = ffi_extract_u8_buf(&buf_val);
+        let max_count = force_input(frame, inputs[2]).as_usize();
+        let count = unsafe { wrapper::__net_resolve_into(&host, &mut out_buf, max_count) };
+        if count > 0 { ffi_writeback_u8_buf(&buf_val, &out_buf, out_buf.len()); }
+        Value::i64(count)
+    }
+
+    // ── net: tcp/udp v6 ──
+
+    fn net_tcp_connect_v6(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let ip_hi = force_input(frame, inputs[0]).as_u64();
+        let ip_lo = force_input(frame, inputs[1]).as_u64();
+        let port = force_input(frame, inputs[2]).as_u16();
+        let timeout_ns = force_input(frame, inputs[3]).as_i64();
+        let fd = unsafe { wrapper::__net_tcp_connect_v6(ip_hi, ip_lo, port, timeout_ns) };
+        Value::i64(fd)
+    }
+
+    fn net_tcp_listen_v6(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let ip_hi = force_input(frame, inputs[0]).as_u64();
+        let ip_lo = force_input(frame, inputs[1]).as_u64();
+        let port = force_input(frame, inputs[2]).as_u16();
+        let reuse_addr = force_input(frame, inputs[3]).as_bool();
+        let fd = unsafe { wrapper::__net_tcp_listen_v6(ip_hi, ip_lo, port, reuse_addr) };
+        Value::i64(fd)
+    }
+
+    fn net_udp_bind_v6(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let ip_hi = force_input(frame, inputs[0]).as_u64();
+        let ip_lo = force_input(frame, inputs[1]).as_u64();
+        let port = force_input(frame, inputs[2]).as_u16();
+        let reuse_addr = force_input(frame, inputs[3]).as_bool();
+        let fd = unsafe { wrapper::__net_udp_bind_v6(ip_hi, ip_lo, port, reuse_addr) };
+        Value::i64(fd)
+    }
+
+    fn net_udp_send_to_v6(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let fd = force_input(frame, inputs[0]).as_i64();
+        let ip_hi = force_input(frame, inputs[1]).as_u64();
+        let ip_lo = force_input(frame, inputs[2]).as_u64();
+        let port = force_input(frame, inputs[3]).as_u16();
+        let buf = ffi_extract_u8_buf(&force_input(frame, inputs[4]));
+        let len = force_input(frame, inputs[5]).as_usize();
+        let n = unsafe { wrapper::__net_udp_send_to_v6(fd, ip_hi, ip_lo, port, &buf, len) };
+        Value::i64(n)
+    }
+
+    fn net_udp_recv_from_v6(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let fd = force_input(frame, inputs[0]).as_i64();
+        let buf_val = force_input(frame, inputs[1]);
+        let mut buf = ffi_extract_u8_buf(&buf_val);
+        let len = force_input(frame, inputs[2]).as_usize();
+        let n = unsafe { wrapper::__net_udp_recv_from_v6(fd, &mut buf, len) };
+        if n > 0 { ffi_writeback_u8_buf(&buf_val, &buf, n as usize); }
+        Value::i64(n)
+    }
+
+    // ── time ──
+
+    fn instant_now_ns(frame: &mut Frame, _inputs: &[NodeId]) -> Value {
+        let ns = unsafe { wrapper::__instant_now_ns() };
+        Value::i64(ns)
+    }
+
+    fn systemtime_now_ns(frame: &mut Frame, _inputs: &[NodeId]) -> Value {
+        let ns = unsafe { wrapper::__systemtime_now_ns() };
+        Value::i64(ns)
+    }
+
+    fn sleep_ns(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let ns = force_input(frame, inputs[0]).as_i64();
+        unsafe { wrapper::__sleep_ns(ns) };
+        Value::VOID
+    }
+
+    fn localtime_offset_minutes(frame: &mut Frame, _inputs: &[NodeId]) -> Value {
+        let minutes = unsafe { wrapper::__localtime_offset_minutes() };
+        Value::i32(minutes)
+    }
+
+    // ── cast: widening to i128 (macro-generated) ──
+    ffi_cast_widening!(cast_i8_to_i128, __cast_i8_to_i128, as_i8, i128);
+    ffi_cast_widening!(cast_i16_to_i128, __cast_i16_to_i128, as_i16, i128);
+    ffi_cast_widening!(cast_i32_to_i128, __cast_i32_to_i128, as_i32, i128);
+    ffi_cast_widening!(cast_i64_to_i128, __cast_i64_to_i128, as_i64, i128);
+    ffi_cast_widening!(cast_u8_to_i128, __cast_u8_to_i128, as_u8, i128);
+    ffi_cast_widening!(cast_u16_to_i128, __cast_u16_to_i128, as_u16, i128);
+    ffi_cast_widening!(cast_u32_to_i128, __cast_u32_to_i128, as_u32, i128);
+    ffi_cast_widening!(cast_u64_to_i128, __cast_u64_to_i128, as_u64, i128);
+    ffi_cast_widening!(cast_usize_to_i128, __cast_usize_to_i128, as_usize, i128);
+
+    // ── cast: narrowing from i128 (macro-generated) ──
+    ffi_cast_narrowing!(cast_i128_to_i8, __cast_i128_to_i8, as_i128, i8);
+    ffi_cast_narrowing!(cast_i128_to_i16, __cast_i128_to_i16, as_i128, i16);
+    ffi_cast_narrowing!(cast_i128_to_i32, __cast_i128_to_i32, as_i128, i32);
+    ffi_cast_narrowing!(cast_i128_to_i64, __cast_i128_to_i64, as_i128, i64);
+    ffi_cast_narrowing!(cast_i128_to_u8, __cast_i128_to_u8, as_i128, u8);
+    ffi_cast_narrowing!(cast_i128_to_u16, __cast_i128_to_u16, as_i128, u16);
+    ffi_cast_narrowing!(cast_i128_to_u32, __cast_i128_to_u32, as_i128, u32);
+    ffi_cast_narrowing!(cast_i128_to_u64, __cast_i128_to_u64, as_i128, u64);
+    ffi_cast_narrowing!(cast_i128_to_usize, __cast_i128_to_usize, as_i128, usize_val);
+
+    // ── cast: char ──
+
+    fn cast_char_to_u8(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let x = force_input(frame, inputs[0]).as_u32();
+        let r = unsafe { wrapper::__cast_char_to_u8(char_from_u32_or_nul(x)) };
+        Value::u8(r)
+    }
+
+    // ── str: UTF-8 per-character decode (pure Rust bit operations, matching the C implementation's semantics) ──
+
+    fn str_utf8_decode_at(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let s = ffi_extract_str(&force_input(frame, inputs[0]));
+        let offset = force_input(frame, inputs[1]).as_usize();
+        let bytes = s.as_bytes();
+        match utf8_decode_at(bytes, offset) {
+            Some((cp, _)) => Value::i64(cp as i64),
+            None => Value::i64(UTF8_DECODE_ERR),
+        }
+    }
+
+    fn str_utf8_char_len_at(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let s = ffi_extract_str(&force_input(frame, inputs[0]));
+        let offset = force_input(frame, inputs[1]).as_usize();
+        let bytes = s.as_bytes();
+        if offset >= bytes.len() {
+            Value::usize_val(0)
+        } else {
+            let c = bytes[offset];
+            let len = if c < 0x80 { 1 }
+                else if (c & 0xE0) == 0xC0 { 2 }
+                else if (c & 0xF0) == 0xE0 { 3 }
+                else if (c & 0xF8) == 0xF0 { 4 }
+                else { 1 };
+            Value::usize_val(len)
+        }
+    }
+
+    // ── str: one-shot array concat O(n) (replaces the stdlib loop `result = result + seg`) ──
+
+    fn str_array_join(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        use crate::value::{HeapObj, KuzoStr};
+        let arr_val = force_input(frame, inputs[0]);
+        let sep = ffi_extract_str(&force_input(frame, inputs[1]));
+        let elements = match arr_val.heap_obj() {
+            Some(HeapObj::Array(a)) => &a.elements,
+            _ => return make_error_throw("TypeError", "__str_array_join: first operand is not array"),
+        };
+        if elements.is_empty() {
+            return Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str("")));
+        }
+        let mut total_len: usize = 0;
+        let mut strs: Vec<String> = Vec::with_capacity(elements.len());
+        for (i, e) in elements.iter().enumerate() {
+            match e.heap_obj() {
+                Some(HeapObj::Str(s)) => {
+                    total_len += s.byte_len();
+                    if i > 0 { total_len += sep.len(); }
+                    strs.push(s.bytes().to_string());
+                }
+                _ => return make_error_throw("TypeError", "__str_array_join: element is not str"),
+            }
+        }
+        let mut buf = String::with_capacity(total_len);
+        for (i, s) in strs.iter().enumerate() {
+            if i > 0 { buf.push_str(&sep); }
+            buf.push_str(s);
+        }
+        Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str(&buf)))
+    }
+
+    // ── terminal: raw mode + read/write ──
+
+    fn terminal_enable_raw_mode(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let buf_val = force_input(frame, inputs[0]);
+        let mut buf = ffi_extract_u8_buf(&buf_val);
+        let rc = unsafe { wrapper::__terminal_enable_raw_mode(&mut buf) };
+        ffi_writeback_u8_buf(&buf_val, &buf, buf.len());
+        Value::i32(rc)
+    }
+
+    fn terminal_disable_raw_mode(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let buf = ffi_extract_u8_buf(&force_input(frame, inputs[0]));
+        let rc = unsafe { wrapper::__terminal_disable_raw_mode(&buf) };
+        Value::i32(rc)
+    }
+
+    fn terminal_read_key_bytes(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let buf_val = force_input(frame, inputs[0]);
+        let mut buf = ffi_extract_u8_buf(&buf_val);
+        let n = unsafe { wrapper::__terminal_read_key_bytes(&mut buf) };
+        if n > 0 { ffi_writeback_u8_buf(&buf_val, &buf, n as usize); }
+        Value::i64(n)
+    }
+
+    fn terminal_get_size_into(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let buf_val = force_input(frame, inputs[0]);
+        let mut buf = ffi_extract_u8_buf(&buf_val);
+        let rc = unsafe { wrapper::__terminal_get_size_into(&mut buf) };
+        if rc == 0 { ffi_writeback_u8_buf(&buf_val, &buf, buf.len()); }
+        Value::i32(rc)
+    }
+
+    fn terminal_write_raw_bytes(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let buf = ffi_extract_u8_buf(&force_input(frame, inputs[0]));
+        let len = force_input(frame, inputs[1]).as_usize();
+        let n = unsafe { wrapper::__terminal_write_raw_bytes(&buf, len) };
+        Value::i64(n)
+    }
+
+    // ── FFI dispatch table (static lookup — linear scan, ~70 entries) ──
+
+    pub const TABLE: &[(&str, FfiHandler)] = &[
+        // IO: stdout/stderr
+        ("__stdout_write_raw", stdout_write_raw as FfiHandler),
+        ("__stderr_write_raw", stderr_write_raw as FfiHandler),
+        // IO: file ops
+        ("__file_open_raw", file_open_raw as FfiHandler),
+        ("__file_close_raw", file_close_raw as FfiHandler),
+        ("__file_seek_raw", file_seek_raw as FfiHandler),
+        ("__file_remove_raw", file_remove_raw as FfiHandler),
+        ("__file_rename_raw", file_rename_raw as FfiHandler),
+        ("__file_chmod_raw", file_chmod_raw as FfiHandler),
+        // IO: file read/write
+        ("__file_read_into", file_read_into as FfiHandler),
+        ("__file_write", file_write as FfiHandler),
+        // IO: stdin
+        ("__stdin_readln_into", stdin_readln_into as FfiHandler),
+        // IO: stat/fstat
+        ("__file_stat_into", file_stat_into as FfiHandler),
+        ("__file_fstat_into", file_fstat_into as FfiHandler),
+        // IO: dir ops
+        ("__dir_create_raw", dir_create_raw as FfiHandler),
+        ("__dir_remove_raw", dir_remove_raw as FfiHandler),
+        // IO: dir list
+        ("__dir_list_into", dir_list_into as FfiHandler),
+        // net: tcp
+        ("__net_tcp_connect_v4", net_tcp_connect_v4 as FfiHandler),
+        ("__net_tcp_listen_v4", net_tcp_listen_v4 as FfiHandler),
+        ("__net_tcp_accept", net_tcp_accept as FfiHandler),
+        ("__net_tcp_read", net_tcp_read as FfiHandler),
+        ("__net_tcp_write", net_tcp_write as FfiHandler),
+        ("__net_tcp_close_raw", net_tcp_close_raw as FfiHandler),
+        // net: udp v4
+        ("__net_udp_bind_v4", net_udp_bind_v4 as FfiHandler),
+        ("__net_udp_send_to_v4", net_udp_send_to_v4 as FfiHandler),
+        ("__net_udp_recv_from_v4", net_udp_recv_from_v4 as FfiHandler),
+        // net: resolve
+        ("__net_resolve_into", net_resolve_into as FfiHandler),
+        // net: tcp/udp v6
+        ("__net_tcp_connect_v6", net_tcp_connect_v6 as FfiHandler),
+        ("__net_tcp_listen_v6", net_tcp_listen_v6 as FfiHandler),
+        ("__net_udp_bind_v6", net_udp_bind_v6 as FfiHandler),
+        ("__net_udp_send_to_v6", net_udp_send_to_v6 as FfiHandler),
+        ("__net_udp_recv_from_v6", net_udp_recv_from_v6 as FfiHandler),
+        // time
+        ("__instant_now_ns", instant_now_ns as FfiHandler),
+        ("__systemtime_now_ns", systemtime_now_ns as FfiHandler),
+        ("__sleep_ns", sleep_ns as FfiHandler),
+        ("__localtime_offset_minutes", localtime_offset_minutes as FfiHandler),
+        // cast: widening to i128
+        ("__cast_i8_to_i128", cast_i8_to_i128 as FfiHandler),
+        ("__cast_i16_to_i128", cast_i16_to_i128 as FfiHandler),
+        ("__cast_i32_to_i128", cast_i32_to_i128 as FfiHandler),
+        ("__cast_i64_to_i128", cast_i64_to_i128 as FfiHandler),
+        ("__cast_u8_to_i128", cast_u8_to_i128 as FfiHandler),
+        ("__cast_u16_to_i128", cast_u16_to_i128 as FfiHandler),
+        ("__cast_u32_to_i128", cast_u32_to_i128 as FfiHandler),
+        ("__cast_u64_to_i128", cast_u64_to_i128 as FfiHandler),
+        ("__cast_usize_to_i128", cast_usize_to_i128 as FfiHandler),
+        // cast: narrowing from i128
+        ("__cast_i128_to_i8", cast_i128_to_i8 as FfiHandler),
+        ("__cast_i128_to_i16", cast_i128_to_i16 as FfiHandler),
+        ("__cast_i128_to_i32", cast_i128_to_i32 as FfiHandler),
+        ("__cast_i128_to_i64", cast_i128_to_i64 as FfiHandler),
+        ("__cast_i128_to_u8", cast_i128_to_u8 as FfiHandler),
+        ("__cast_i128_to_u16", cast_i128_to_u16 as FfiHandler),
+        ("__cast_i128_to_u32", cast_i128_to_u32 as FfiHandler),
+        ("__cast_i128_to_u64", cast_i128_to_u64 as FfiHandler),
+        ("__cast_i128_to_usize", cast_i128_to_usize as FfiHandler),
+        // cast: char
+        ("__cast_char_to_u8", cast_char_to_u8 as FfiHandler),
+        // reflect (shared from ffi_common)
+        ("__reflect_kind", ffi_common::reflect_kind as FfiHandler),
+        ("__reflect_type_name", ffi_common::reflect_type_name as FfiHandler),
+        ("__reflect_array_len", ffi_common::reflect_array_len as FfiHandler),
+        ("__reflect_field_count", ffi_common::reflect_field_count as FfiHandler),
+        ("__reflect_size", ffi_common::reflect_size as FfiHandler),
+        ("__reflect_field_name", ffi_common::reflect_field_name as FfiHandler),
+        ("__reflect_field_value", ffi_common::reflect_field_value as FfiHandler),
+        ("__reflect_adt_constructor", ffi_common::reflect_adt_constructor as FfiHandler),
+        ("__reflect_kind_str", ffi_common::reflect_kind_str as FfiHandler),
+        ("__reflect_layout_size", ffi_common::reflect_layout_size as FfiHandler),
+        ("__reflect_layout_alignment", ffi_common::reflect_layout_alignment as FfiHandler),
+        // str
+        ("__str_utf8_decode_at", str_utf8_decode_at as FfiHandler),
+        ("__str_utf8_char_len_at", str_utf8_char_len_at as FfiHandler),
+        ("__str_array_join", str_array_join as FfiHandler),
+        // terminal
+        ("__terminal_enable_raw_mode", terminal_enable_raw_mode as FfiHandler),
+        ("__terminal_disable_raw_mode", terminal_disable_raw_mode as FfiHandler),
+        ("__terminal_read_key_bytes", terminal_read_key_bytes as FfiHandler),
+        ("__terminal_get_size_into", terminal_get_size_into as FfiHandler),
+        ("__terminal_write_raw_bytes", terminal_write_raw_bytes as FfiHandler),
+    ];
+}
+
+/// compute_fn (idx 46): `@extern("C")` FFI call — has_extern_c version.
+/// Dispatches to FFI wrapper functions via a static lookup table.
 #[cfg(has_extern_c)]
 pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::ffi::Ffi::wrapper;
     read_node_inputs!(frame, node, graph, n, inputs);
     let fn_name = graph.ffi_call_name(node.0 as usize)
         .expect("compute_ffi_call: no ffi_call_name");
 
-    // Extract a str argument from a Value (HeapObj::Str → owned String, avoiding temporary Value lifetime issues).
-    fn extract_str(v: &Value) -> String {
-        match v.heap_obj() {
+    if let Some((_, handler)) = ffi_has_extern_c::TABLE.iter()
+        .find(|(name, _)| *name == fn_name)
+    {
+        handler(frame, inputs)
+    } else {
+        panic!("compute_ffi_call: unimplemented FFI function '{}'", fn_name)
+    }
+}
+
+// =========================================================================
+// not(has_extern_c) FFI dispatch — pure-Rust fallback
+// =========================================================================
+
+#[cfg(not(has_extern_c))]
+mod ffi_no_extern_c {
+    use super::*;
+
+    // ── IO: implemented directly via Rust std ──
+
+    fn stdout_write_raw(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        if let Some(crate::value::HeapObj::Str(s)) = force_input(frame, inputs[0]).heap_obj() {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(s.bytes().as_bytes());
+            let _ = std::io::stdout().flush();
+            Value::i32(IO_OK)
+        } else {
+            Value::i32(IO_ERR)
+        }
+    }
+
+    fn stderr_write_raw(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        if let Some(crate::value::HeapObj::Str(s)) = force_input(frame, inputs[0]).heap_obj() {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(s.bytes().as_bytes());
+            Value::i32(IO_OK)
+        } else {
+            Value::i32(IO_ERR)
+        }
+    }
+
+    // ── time: implemented directly via Rust std ──
+
+    fn instant_now_ns(frame: &mut Frame, _inputs: &[NodeId]) -> Value {
+        let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        Value::i64(ns as i64)
+    }
+
+    fn systemtime_now_ns(frame: &mut Frame, _inputs: &[NodeId]) -> Value {
+        let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        Value::i64(ns as i64)
+    }
+
+    fn sleep_ns(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let ns = force_input(frame, inputs[0]).as_i64();
+        std::thread::sleep(std::time::Duration::from_nanos(ns as u64));
+        Value::VOID
+    }
+
+    fn localtime_offset_minutes(frame: &mut Frame, _inputs: &[NodeId]) -> Value {
+        Value::i32(0)
+    }
+
+    // ── cast: widening to i128 (pure Rust, macro-generated) ──
+    ffi_cast_widening_pure!(cast_i8_to_i128, as_i8, i128, i128);
+    ffi_cast_widening_pure!(cast_i16_to_i128, as_i16, i128, i128);
+    ffi_cast_widening_pure!(cast_i32_to_i128, as_i32, i128, i128);
+    ffi_cast_widening_pure!(cast_i64_to_i128, as_i64, i128, i128);
+    ffi_cast_widening_pure!(cast_u8_to_i128, as_u8, i128, i128);
+    ffi_cast_widening_pure!(cast_u16_to_i128, as_u16, i128, i128);
+    ffi_cast_widening_pure!(cast_u32_to_i128, as_u32, i128, i128);
+    ffi_cast_widening_pure!(cast_u64_to_i128, as_u64, i128, i128);
+    ffi_cast_widening_pure!(cast_usize_to_i128, as_usize, i128, i128);
+
+    // ── cast: narrowing from i128 (pure Rust, macro-generated) ──
+    ffi_cast_narrowing_pure!(cast_i128_to_i8, as_i128, i8, i8);
+    ffi_cast_narrowing_pure!(cast_i128_to_i16, as_i128, i16, i16);
+    ffi_cast_narrowing_pure!(cast_i128_to_i32, as_i128, i32, i32);
+    ffi_cast_narrowing_pure!(cast_i128_to_i64, as_i128, i64, i64);
+    ffi_cast_narrowing_pure!(cast_i128_to_u8, as_i128, u8, u8);
+    ffi_cast_narrowing_pure!(cast_i128_to_u16, as_i128, u16, u16);
+    ffi_cast_narrowing_pure!(cast_i128_to_u32, as_i128, u32, u32);
+    ffi_cast_narrowing_pure!(cast_i128_to_u64, as_i128, u64, u64);
+    ffi_cast_narrowing_pure!(cast_i128_to_usize, as_i128, usize, usize_val);
+
+    // ── cast: char ──
+    ffi_cast_narrowing_pure!(cast_char_to_u8, as_u32, u8, u8);
+
+    // ── str: UTF-8 per-character decode (pure Rust bit operations, matching the C implementation's semantics) ──
+
+    fn str_utf8_decode_at(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let s = match force_input(frame, inputs[0]).heap_obj() {
             Some(crate::value::HeapObj::Str(s)) => s.bytes().to_string(),
-            _ => panic!("FFI str arg expected, got non-str value"),
+            _ => String::new(),
+        };
+        let offset = force_input(frame, inputs[1]).as_usize();
+        let bytes = s.as_bytes();
+        match utf8_decode_at(bytes, offset) {
+            Some((cp, _)) => Value::i64(cp as i64),
+            None => Value::i64(UTF8_DECODE_ERR),
         }
     }
 
-    // Extract a u8[] argument from a Value (unified through ArrayValue::collect_u8_bytes).
-    fn extract_u8_buf(v: &Value) -> Vec<u8> {
-        match v.heap_obj() {
-            Some(crate::value::HeapObj::Array(arr)) => arr.collect_u8_bytes(),
-            _ => panic!("FFI u8[] arg expected"),
+    fn str_utf8_char_len_at(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        let s = match force_input(frame, inputs[0]).heap_obj() {
+            Some(crate::value::HeapObj::Str(s)) => s.bytes().to_string(),
+            _ => String::new(),
+        };
+        let offset = force_input(frame, inputs[1]).as_usize();
+        let bytes = s.as_bytes();
+        if offset >= bytes.len() {
+            Value::usize_val(0)
+        } else {
+            let c = bytes[offset];
+            let len = if c < 0x80 { 1 }
+                else if (c & 0xE0) == 0xC0 { 2 }
+                else if (c & 0xF0) == 0xE0 { 3 }
+                else if (c & 0xF8) == 0xF0 { 4 }
+                else { 1 };
+            Value::usize_val(len)
         }
     }
 
-    // Writes data read by FFI back into a Kuzo u8[] array (in-place mutation of
-    // the underlying HeapObj, with `&self` semantics).
-    //
-    // `extract_u8_buf` returns a cloned `Vec`; after FFI writes into the local
-    // Vec, it must be written back to the original array, otherwise the Kuzo
-    // side reads zeros (H-2 fix).
-    // Only `buf[0..n]` is written back, where `n` is the FFI return value
-    // (provided by the caller).
-    fn writeback_u8_buf(buf_val: &Value, data: &[u8], n: usize) {
-        if let Value::Ref(arc) = buf_val {
-            // Safety: the engine executes on a single thread; the caller frame is
-            // Suspended while the callee runs, so there is no concurrent access to
-            // the same HeapObj (consistent with `compute_record_field_set`).
-            let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::value::HeapObj;
-            unsafe {
-                if let crate::value::HeapObj::Array(arr) = &mut *ptr {
-                    let len = n.min(data.len()).min(arr.elements.len());
-                    // SOA fast path: U8 contiguous storage, direct memcpy.
-                    if let Some(crate::value::ScalarSoA::U8(ref mut soa_data)) = arr.scalar_soa {
-                        let len = len.min(soa_data.len());
-                        soa_data[..len].copy_from_slice(&data[..len]);
-                    } else {
-                        for i in 0..len {
-                            arr.elements[i] = Value::u8(data[i]);
-                        }
-                    }
+    // ── str: one-shot array concat O(n) (replaces the stdlib loop `result = result + seg`) ──
+
+    fn str_array_join(frame: &mut Frame, inputs: &[NodeId]) -> Value {
+        use crate::value::{HeapObj, KuzoStr};
+        let arr_val = force_input(frame, inputs[0]);
+        let sep = match force_input(frame, inputs[1]).heap_obj() {
+            Some(HeapObj::Str(s)) => s.bytes().to_string(),
+            _ => return make_error_throw("TypeError", "__str_array_join: separator is not str"),
+        };
+        let elements = match arr_val.heap_obj() {
+            Some(HeapObj::Array(a)) => &a.elements,
+            _ => return make_error_throw("TypeError", "__str_array_join: first operand is not array"),
+        };
+        if elements.is_empty() {
+            return Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str("")));
+        }
+        let mut total_len: usize = 0;
+        let mut strs: Vec<&str> = Vec::with_capacity(elements.len());
+        for (i, e) in elements.iter().enumerate() {
+            match e.heap_obj() {
+                Some(HeapObj::Str(s)) => {
+                    total_len += s.byte_len();
+                    if i > 0 { total_len += sep.len(); }
+                    strs.push(s.bytes());
                 }
+                _ => return make_error_throw("TypeError", "__str_array_join: element is not str"),
             }
         }
+        let mut buf = String::with_capacity(total_len);
+        for (i, s) in strs.iter().enumerate() {
+            if i > 0 { buf.push_str(&sep); }
+            buf.push_str(s);
+        }
+        Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str(&buf)))
     }
 
+    // ── FFI dispatch table (static lookup — linear scan, ~40 entries) ──
 
-    match fn_name {
-        // ── IO: stdout/stderr ──
-        "__stdout_write_raw" => {
-            let s = extract_str(&force_input(frame, inputs[0]));
-            let rc = unsafe { wrapper::__stdout_write_raw(&s) };
-            Value::i32(rc)
-        }
-        "__stderr_write_raw" => {
-            let s = extract_str(&force_input(frame, inputs[0]));
-            let rc = unsafe { wrapper::__stderr_write_raw(&s) };
-            Value::i32(rc)
-        }
-
-        // ── IO: file ops ──
-        "__file_open_raw" => {
-            let path = extract_str(&force_input(frame, inputs[0]));
-            let flags = force_input(frame, inputs[1]).as_i32();
-            let mode = force_input(frame, inputs[2]).as_i32();
-            let fd = unsafe { wrapper::__file_open_raw(&path, flags, mode) };
-            Value::i64(fd)
-        }
-        "__file_close_raw" => {
-            let fd = force_input(frame, inputs[0]).as_i64();
-            let rc = unsafe { wrapper::__file_close_raw(fd) };
-            Value::i32(rc)
-        }
-        "__file_seek_raw" => {
-            let fd = force_input(frame, inputs[0]).as_i64();
-            let offset = force_input(frame, inputs[1]).as_i64();
-            let whence = force_input(frame, inputs[2]).as_i32();
-            let pos = unsafe { wrapper::__file_seek_raw(fd, offset, whence) };
-            Value::i64(pos)
-        }
-        "__file_remove_raw" => {
-            let path = extract_str(&force_input(frame, inputs[0]));
-            let rc = unsafe { wrapper::__file_remove_raw(&path) };
-            Value::i32(rc)
-        }
-        "__file_rename_raw" => {
-            let old = extract_str(&force_input(frame, inputs[0]));
-            let new = extract_str(&force_input(frame, inputs[1]));
-            let rc = unsafe { wrapper::__file_rename_raw(&old, &new) };
-            Value::i32(rc)
-        }
-        "__file_chmod_raw" => {
-            let path = extract_str(&force_input(frame, inputs[0]));
-            let mode = force_input(frame, inputs[1]).as_i32();
-            let rc = unsafe { wrapper::__file_chmod_raw(&path, mode) };
-            Value::i32(rc)
-        }
-
-        // ── IO: file read/write (u8[] + len) ──
-        "__file_read_into" => {
-            let fd = force_input(frame, inputs[0]).as_i64();
-            let buf_val = force_input(frame, inputs[1]);
-            let mut buf = extract_u8_buf(&buf_val);
-            let len = force_input(frame, inputs[2]).as_usize();
-            let n = unsafe { wrapper::__file_read_into(fd, &mut buf, len) };
-            if n > 0 { writeback_u8_buf(&buf_val, &buf, n as usize); }
-            Value::i64(n)
-        }
-        "__file_write" => {
-            let fd = force_input(frame, inputs[0]).as_i64();
-            let buf = extract_u8_buf(&force_input(frame, inputs[1]));
-            let len = force_input(frame, inputs[2]).as_usize();
-            let n = unsafe { wrapper::__file_write(fd, &buf, len) };
-            Value::i64(n)
-        }
-
-        // ── IO: stdin ──
-        "__stdin_readln_into" => {
-            let buf_val = force_input(frame, inputs[0]);
-            let mut buf = extract_u8_buf(&buf_val);
-            let n = unsafe { wrapper::__stdin_readln_into(&mut buf) };
-            if n > 0 { writeback_u8_buf(&buf_val, &buf, n as usize); }
-            Value::i64(n)
-        }
-
-        // ── IO: stat/fstat ──
-        "__file_stat_into" => {
-            let path = extract_str(&force_input(frame, inputs[0]));
-            let buf_val = force_input(frame, inputs[1]);
-            let mut buf = extract_u8_buf(&buf_val);
-            let rc = unsafe { wrapper::__file_stat_into(&path, &mut buf) };
-            if rc == 0 { writeback_u8_buf(&buf_val, &buf, buf.len()); }
-            Value::i32(rc)
-        }
-        "__file_fstat_into" => {
-            let fd = force_input(frame, inputs[0]).as_i64();
-            let buf_val = force_input(frame, inputs[1]);
-            let mut buf = extract_u8_buf(&buf_val);
-            let rc = unsafe { wrapper::__file_fstat_into(fd, &mut buf) };
-            if rc == 0 { writeback_u8_buf(&buf_val, &buf, buf.len()); }
-            Value::i32(rc)
-        }
-
-        // ── IO: dir ops ──
-        "__dir_create_raw" => {
-            let path = extract_str(&force_input(frame, inputs[0]));
-            let recursive = force_input(frame, inputs[1]).as_bool();
-            let rc = unsafe { wrapper::__dir_create_raw(&path, recursive) };
-            Value::i32(rc)
-        }
-        "__dir_remove_raw" => {
-            let path = extract_str(&force_input(frame, inputs[0]));
-            let recursive = force_input(frame, inputs[1]).as_bool();
-            let rc = unsafe { wrapper::__dir_remove_raw(&path, recursive) };
-            Value::i32(rc)
-        }
-
-        // ── IO: dir list ──
-        "__dir_list_into" => {
-            let path = extract_str(&force_input(frame, inputs[0]));
-            let names_val = force_input(frame, inputs[1]);
-            let offsets_val = force_input(frame, inputs[2]);
-            let kinds_val = force_input(frame, inputs[3]);
-            let mut names_buf = extract_u8_buf(&names_val);
-            let mut name_offsets = extract_u8_buf(&offsets_val);
-            let mut kinds_buf = extract_u8_buf(&kinds_val);
-            let max_count = force_input(frame, inputs[4]).as_usize();
-            let count = unsafe {
-                wrapper::__dir_list_into(&path, &mut names_buf, &mut name_offsets, &mut kinds_buf, max_count)
-            };
-            if count > 0 {
-                writeback_u8_buf(&names_val, &names_buf, names_buf.len());
-                writeback_u8_buf(&offsets_val, &name_offsets, name_offsets.len());
-                writeback_u8_buf(&kinds_val, &kinds_buf, kinds_buf.len());
-            }
-            Value::i64(count)
-        }
-
-        // ── net: tcp ──
-        "__net_tcp_connect_v4" => {
-            let ip_bits = force_input(frame, inputs[0]).as_u32();
-            let port = force_input(frame, inputs[1]).as_u16();
-            let timeout_ns = force_input(frame, inputs[2]).as_i64();
-            let fd = unsafe { wrapper::__net_tcp_connect_v4(ip_bits, port, timeout_ns) };
-            Value::i64(fd)
-        }
-        "__net_tcp_listen_v4" => {
-            let ip_bits = force_input(frame, inputs[0]).as_u32();
-            let port = force_input(frame, inputs[1]).as_u16();
-            let reuse_addr = force_input(frame, inputs[2]).as_bool();
-            let fd = unsafe {
-                wrapper::__net_tcp_listen_v4(ip_bits, port, reuse_addr)
-            };
-            Value::i64(fd)
-        }
-        "__net_tcp_accept" => {
-            let fd = force_input(frame, inputs[0]).as_i64();
-            let conn_fd = unsafe { wrapper::__net_tcp_accept(fd) };
-            Value::i64(conn_fd)
-        }
-        "__net_tcp_read" => {
-            let fd = force_input(frame, inputs[0]).as_i64();
-            let buf_val = force_input(frame, inputs[1]);
-            let mut buf = extract_u8_buf(&buf_val);
-            let len = force_input(frame, inputs[2]).as_usize();
-            let n = unsafe { wrapper::__net_tcp_read(fd, &mut buf, len) };
-            if n > 0 { writeback_u8_buf(&buf_val, &buf, n as usize); }
-            Value::i64(n)
-        }
-        "__net_tcp_write" => {
-            let fd = force_input(frame, inputs[0]).as_i64();
-            let buf = extract_u8_buf(&force_input(frame, inputs[1]));
-            let len = force_input(frame, inputs[2]).as_usize();
-            let n = unsafe { wrapper::__net_tcp_write(fd, &buf, len) };
-            Value::i64(n)
-        }
-        "__net_tcp_close_raw" => {
-            let fd = force_input(frame, inputs[0]).as_i64();
-            let rc = unsafe { wrapper::__net_tcp_close_raw(fd) };
-            Value::i32(rc)
-        }
-
-        // ── net: udp v4 ──
-        "__net_udp_bind_v4" => {
-            let ip_bits = force_input(frame, inputs[0]).as_u32();
-            let port = force_input(frame, inputs[1]).as_u16();
-            let reuse_addr = force_input(frame, inputs[2]).as_bool();
-            let fd = unsafe {
-                wrapper::__net_udp_bind_v4(ip_bits, port, reuse_addr)
-            };
-            Value::i64(fd)
-        }
-        "__net_udp_send_to_v4" => {
-            let fd = force_input(frame, inputs[0]).as_i64();
-            let ip_bits = force_input(frame, inputs[1]).as_u32();
-            let port = force_input(frame, inputs[2]).as_u16();
-            let buf = extract_u8_buf(&force_input(frame, inputs[3]));
-            let len = force_input(frame, inputs[4]).as_usize();
-            let n = unsafe { wrapper::__net_udp_send_to_v4(fd, ip_bits, port, &buf, len) };
-            Value::i64(n)
-        }
-        "__net_udp_recv_from_v4" => {
-            let fd = force_input(frame, inputs[0]).as_i64();
-            let buf_val = force_input(frame, inputs[1]);
-            let mut buf = extract_u8_buf(&buf_val);
-            let len = force_input(frame, inputs[2]).as_usize();
-            let n = unsafe { wrapper::__net_udp_recv_from_v4(fd, &mut buf, len) };
-            if n > 0 { writeback_u8_buf(&buf_val, &buf, n as usize); }
-            Value::i64(n)
-        }
-
-        // ── net: resolve ──
-        "__net_resolve_into" => {
-            let host = extract_str(&force_input(frame, inputs[0]));
-            let buf_val = force_input(frame, inputs[1]);
-            let mut out_buf = extract_u8_buf(&buf_val);
-            let max_count = force_input(frame, inputs[2]).as_usize();
-            let count = unsafe { wrapper::__net_resolve_into(&host, &mut out_buf, max_count) };
-            if count > 0 { writeback_u8_buf(&buf_val, &out_buf, out_buf.len()); }
-            Value::i64(count)
-        }
-
-        // ── net: tcp/udp v6 ──
-        "__net_tcp_connect_v6" => {
-            let ip_hi = force_input(frame, inputs[0]).as_u64();
-            let ip_lo = force_input(frame, inputs[1]).as_u64();
-            let port = force_input(frame, inputs[2]).as_u16();
-            let timeout_ns = force_input(frame, inputs[3]).as_i64();
-            let fd = unsafe { wrapper::__net_tcp_connect_v6(ip_hi, ip_lo, port, timeout_ns) };
-            Value::i64(fd)
-        }
-        "__net_tcp_listen_v6" => {
-            let ip_hi = force_input(frame, inputs[0]).as_u64();
-            let ip_lo = force_input(frame, inputs[1]).as_u64();
-            let port = force_input(frame, inputs[2]).as_u16();
-            let reuse_addr = force_input(frame, inputs[3]).as_bool();
-            let fd = unsafe {
-                wrapper::__net_tcp_listen_v6(ip_hi, ip_lo, port, reuse_addr)
-            };
-            Value::i64(fd)
-        }
-        "__net_udp_bind_v6" => {
-            let ip_hi = force_input(frame, inputs[0]).as_u64();
-            let ip_lo = force_input(frame, inputs[1]).as_u64();
-            let port = force_input(frame, inputs[2]).as_u16();
-            let reuse_addr = force_input(frame, inputs[3]).as_bool();
-            let fd = unsafe {
-                wrapper::__net_udp_bind_v6(ip_hi, ip_lo, port, reuse_addr)
-            };
-            Value::i64(fd)
-        }
-        "__net_udp_send_to_v6" => {
-            let fd = force_input(frame, inputs[0]).as_i64();
-            let ip_hi = force_input(frame, inputs[1]).as_u64();
-            let ip_lo = force_input(frame, inputs[2]).as_u64();
-            let port = force_input(frame, inputs[3]).as_u16();
-            let buf = extract_u8_buf(&force_input(frame, inputs[4]));
-            let len = force_input(frame, inputs[5]).as_usize();
-            let n = unsafe { wrapper::__net_udp_send_to_v6(fd, ip_hi, ip_lo, port, &buf, len) };
-            Value::i64(n)
-        }
-        "__net_udp_recv_from_v6" => {
-            let fd = force_input(frame, inputs[0]).as_i64();
-            let buf_val = force_input(frame, inputs[1]);
-            let mut buf = extract_u8_buf(&buf_val);
-            let len = force_input(frame, inputs[2]).as_usize();
-            let n = unsafe { wrapper::__net_udp_recv_from_v6(fd, &mut buf, len) };
-            if n > 0 { writeback_u8_buf(&buf_val, &buf, n as usize); }
-            Value::i64(n)
-        }
-
-        // ── time ──
-        "__instant_now_ns" => {
-            let ns = unsafe { wrapper::__instant_now_ns() };
-            Value::i64(ns)
-        }
-        "__systemtime_now_ns" => {
-            let ns = unsafe { wrapper::__systemtime_now_ns() };
-            Value::i64(ns)
-        }
-        "__sleep_ns" => {
-            let ns = force_input(frame, inputs[0]).as_i64();
-            unsafe { wrapper::__sleep_ns(ns) };
-            Value::VOID
-        }
-        "__localtime_offset_minutes" => {
-            let minutes = unsafe { wrapper::__localtime_offset_minutes() };
-            Value::i32(minutes)
-        }
-
-        // ── cast: widening to i128 ──
-        "__cast_i8_to_i128" => {
-            let x = force_input(frame, inputs[0]).as_i8();
-            let r = unsafe { wrapper::__cast_i8_to_i128(x) };
-            Value::i128(r)
-        }
-        "__cast_i16_to_i128" => {
-            let x = force_input(frame, inputs[0]).as_i16();
-            let r = unsafe { wrapper::__cast_i16_to_i128(x) };
-            Value::i128(r)
-        }
-        "__cast_i32_to_i128" => {
-            let x = force_input(frame, inputs[0]).as_i32();
-            let r = unsafe { wrapper::__cast_i32_to_i128(x) };
-            Value::i128(r)
-        }
-        "__cast_i64_to_i128" => {
-            let x = force_input(frame, inputs[0]).as_i64();
-            let r = unsafe { wrapper::__cast_i64_to_i128(x) };
-            Value::i128(r)
-        }
-        "__cast_u8_to_i128" => {
-            let x = force_input(frame, inputs[0]).as_u8();
-            let r = unsafe { wrapper::__cast_u8_to_i128(x) };
-            Value::i128(r)
-        }
-        "__cast_u16_to_i128" => {
-            let x = force_input(frame, inputs[0]).as_u16();
-            let r = unsafe { wrapper::__cast_u16_to_i128(x) };
-            Value::i128(r)
-        }
-        "__cast_u32_to_i128" => {
-            let x = force_input(frame, inputs[0]).as_u32();
-            let r = unsafe { wrapper::__cast_u32_to_i128(x) };
-            Value::i128(r)
-        }
-        "__cast_u64_to_i128" => {
-            let x = force_input(frame, inputs[0]).as_u64();
-            let r = unsafe { wrapper::__cast_u64_to_i128(x) };
-            Value::i128(r)
-        }
-        "__cast_usize_to_i128" => {
-            let x = force_input(frame, inputs[0]).as_usize();
-            let r = unsafe { wrapper::__cast_usize_to_i128(x) };
-            Value::i128(r)
-        }
-
-        // ── cast: narrowing from i128 ──
-        "__cast_i128_to_i8" => {
-            let v = force_input(frame, inputs[0]).as_i128();
-            let r = unsafe { wrapper::__cast_i128_to_i8(v) };
-            Value::i8(r)
-        }
-        "__cast_i128_to_i16" => {
-            let v = force_input(frame, inputs[0]).as_i128();
-            let r = unsafe { wrapper::__cast_i128_to_i16(v) };
-            Value::i16(r)
-        }
-        "__cast_i128_to_i32" => {
-            let v = force_input(frame, inputs[0]).as_i128();
-            let r = unsafe { wrapper::__cast_i128_to_i32(v) };
-            Value::i32(r)
-        }
-        "__cast_i128_to_i64" => {
-            let v = force_input(frame, inputs[0]).as_i128();
-            let r = unsafe { wrapper::__cast_i128_to_i64(v) };
-            Value::i64(r)
-        }
-        "__cast_i128_to_u8" => {
-            let v = force_input(frame, inputs[0]).as_i128();
-            let r = unsafe { wrapper::__cast_i128_to_u8(v) };
-            Value::u8(r)
-        }
-        "__cast_i128_to_u16" => {
-            let v = force_input(frame, inputs[0]).as_i128();
-            let r = unsafe { wrapper::__cast_i128_to_u16(v) };
-            Value::u16(r)
-        }
-        "__cast_i128_to_u32" => {
-            let v = force_input(frame, inputs[0]).as_i128();
-            let r = unsafe { wrapper::__cast_i128_to_u32(v) };
-            Value::u32(r)
-        }
-        "__cast_i128_to_u64" => {
-            let v = force_input(frame, inputs[0]).as_i128();
-            let r = unsafe { wrapper::__cast_i128_to_u64(v) };
-            Value::u64(r)
-        }
-        "__cast_i128_to_usize" => {
-            let v = force_input(frame, inputs[0]).as_i128();
-            let r = unsafe { wrapper::__cast_i128_to_usize(v) };
-            Value::usize_val(r)
-        }
-
-        // ── cast: char ──
-        "__cast_char_to_u8" => {
-            let x = force_input(frame, inputs[0]).as_u32();
-            let r = unsafe { wrapper::__cast_char_to_u8(char_from_u32_or_nul(x)) };
-            Value::u8(r)
-        }
-
-        // ── reflect: __reflect_format/__reflect_scalar_to_str have been split into
-        // standalone compute_fns (CF_REFLECT_FORMAT/CF_REFLECT_SCALAR_TO_STR, idx 290/291),
-        // and no longer go through the FFI dispatch path ──
-        "__reflect_kind" => {
-            let v = force_input(frame, inputs[0]);
-            Value::u8(reflect_kind(&v))
-        }
-        "__reflect_type_name" => {
-            let v = force_input(frame, inputs[0]);
-            let name = reflect_type_name(&v);
-            Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&name)))
-        }
-        "__reflect_array_len" => {
-            let v = force_input(frame, inputs[0]);
-            match v.heap_obj() {
-                Some(crate::value::HeapObj::Array(arr)) => Value::usize_val(arr.elements.len()),
-                _ => Value::usize_val(0),
-            }
-        }
-        "__reflect_field_count" => {
-            let v = force_input(frame, inputs[0]);
-            let count: u16 = match v.heap_obj() {
-                Some(crate::value::HeapObj::Record(rec)) => rec.fields.len() as u16,
-                Some(crate::value::HeapObj::Adt(a)) => a.fields.len() as u16,
-                _ => 0,
-            };
-            Value::u16(count)
-        }
-        "__reflect_size" => {
-            let v = force_input(frame, inputs[0]);
-            let size: u8 = match &v {
-                Value::Scalar(_, tag) => tag.byte_width() as u8,
-                _ => 0,
-            };
-            Value::u8(size)
-        }
-        "__reflect_field_name" => {
-            let v = force_input(frame, inputs[0]);
-            let i = force_input(frame, inputs[1]).as_u16();
-            let name = match v.heap_obj() {
-                Some(crate::value::HeapObj::Record(rec)) => {
-                    rec.field_names.get(i as usize)
-                        .and_then(|n| n.as_ref())
-                        .cloned()
-                        .unwrap_or_default()
-                }
-                Some(crate::value::HeapObj::Adt(a)) => {
-                    a.fields.get(i as usize)
-                        .and_then(|f| f.name.as_ref().cloned())
-                        .unwrap_or_default()
-                }
-                _ => String::new(),
-            };
-            Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&name)))
-        }
-        "__reflect_field_value" => {
-            let v = force_input(frame, inputs[0]);
-            let i = force_input(frame, inputs[1]).as_u16();
-            match v.heap_obj() {
-                Some(crate::value::HeapObj::Record(rec)) => {
-                    rec.fields.get(i as usize).cloned().unwrap_or(Value::NULL)
-                }
-                Some(crate::value::HeapObj::Adt(a)) => {
-                    a.fields.get(i as usize).map(|f| f.value.clone()).unwrap_or(Value::NULL)
-                }
-                _ => Value::NULL,
-            }
-        }
-        "__reflect_adt_constructor" => {
-            let v = force_input(frame, inputs[0]);
-            let name = match v.heap_obj() {
-                Some(crate::value::HeapObj::Adt(a)) => a.constructor.clone(),
-                _ => String::new(),
-            };
-            Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&name)))
-        }
-        "__reflect_kind_str" => {
-            let v = force_input(frame, inputs[0]);
-            let kind = reflect_kind_str(&v);
-            Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(kind)))
-        }
-        "__reflect_layout_size" => {
-            let v = force_input(frame, inputs[0]);
-            let size: u32 = crate::value::reflect_layout_size(&v);
-            Value::u32(size)
-        }
-        "__reflect_layout_alignment" => {
-            let v = force_input(frame, inputs[0]);
-            let align: u32 = crate::value::reflect_layout_alignment(&v);
-            Value::u32(align)
-        }
-
-        // ── str: UTF-8 per-character decode (pure Rust bit operations, matching the C implementation's semantics) ──
-        "__str_utf8_decode_at" => {
-            let s = extract_str(&force_input(frame, inputs[0]));
-            let offset = force_input(frame, inputs[1]).as_usize();
-            let bytes = s.as_bytes();
-            match utf8_decode_at(bytes, offset) {
-                Some((cp, _)) => Value::i64(cp as i64),
-                None => Value::i64(UTF8_DECODE_ERR),
-            }
-        }
-        "__str_utf8_char_len_at" => {
-            let s = extract_str(&force_input(frame, inputs[0]));
-            let offset = force_input(frame, inputs[1]).as_usize();
-            let bytes = s.as_bytes();
-            if offset >= bytes.len() {
-                Value::usize_val(0)
-            } else {
-                let c = bytes[offset];
-                let len = if c < 0x80 { 1 }
-                    else if (c & 0xE0) == 0xC0 { 2 }
-                    else if (c & 0xF0) == 0xE0 { 3 }
-                    else if (c & 0xF8) == 0xF0 { 4 }
-                    else { 1 };
-                Value::usize_val(len)
-            }
-        }
-
-        // ── str: one-shot array concat O(n) (replaces the stdlib loop `result = result + seg`) ──
-        "__str_array_join" => {
-            use crate::value::{HeapObj, KuzoStr};
-            let arr_val = force_input(frame, inputs[0]);
-            let sep = extract_str(&force_input(frame, inputs[1]));
-            let elements = match arr_val.heap_obj() {
-                Some(HeapObj::Array(a)) => &a.elements,
-                _ => return make_error_throw("TypeError", "__str_array_join: first operand is not array"),
-            };
-            if elements.is_empty() {
-                return Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str("")));
-            }
-            let mut total_len: usize = 0;
-            let mut strs: Vec<String> = Vec::with_capacity(elements.len());
-            for (i, e) in elements.iter().enumerate() {
-                match e.heap_obj() {
-                    Some(HeapObj::Str(s)) => {
-                        total_len += s.byte_len();
-                        if i > 0 { total_len += sep.len(); }
-                        strs.push(s.bytes().to_string());
-                    }
-                    _ => return make_error_throw("TypeError", "__str_array_join: element is not str"),
-                }
-            }
-            let mut buf = String::with_capacity(total_len);
-            for (i, s) in strs.iter().enumerate() {
-                if i > 0 { buf.push_str(&sep); }
-                buf.push_str(s);
-            }
-            Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str(&buf)))
-        }
-
-        // ── terminal: raw mode + read/write ──
-        "__terminal_enable_raw_mode" => {
-            let buf_val = force_input(frame, inputs[0]);
-            let mut buf = extract_u8_buf(&buf_val);
-            let rc = unsafe { wrapper::__terminal_enable_raw_mode(&mut buf) };
-            // termios struct may be written into orig_buf
-            writeback_u8_buf(&buf_val, &buf, buf.len());
-            Value::i32(rc)
-        }
-        "__terminal_disable_raw_mode" => {
-            let buf = extract_u8_buf(&force_input(frame, inputs[0]));
-            let rc = unsafe { wrapper::__terminal_disable_raw_mode(&buf) };
-            Value::i32(rc)
-        }
-        "__terminal_read_key_bytes" => {
-            let buf_val = force_input(frame, inputs[0]);
-            let mut buf = extract_u8_buf(&buf_val);
-            let n = unsafe { wrapper::__terminal_read_key_bytes(&mut buf) };
-            if n > 0 { writeback_u8_buf(&buf_val, &buf, n as usize); }
-            Value::i64(n)
-        }
-        "__terminal_get_size_into" => {
-            let buf_val = force_input(frame, inputs[0]);
-            let mut buf = extract_u8_buf(&buf_val);
-            let rc = unsafe { wrapper::__terminal_get_size_into(&mut buf) };
-            if rc == 0 { writeback_u8_buf(&buf_val, &buf, buf.len()); }
-            Value::i32(rc)
-        }
-        "__terminal_write_raw_bytes" => {
-            let buf = extract_u8_buf(&force_input(frame, inputs[0]));
-            let len = force_input(frame, inputs[1]).as_usize();
-            let n = unsafe { wrapper::__terminal_write_raw_bytes(&buf, len) };
-            Value::i64(n)
-        }
-
-        // ── Unimplemented FFI functions ──
-        other => panic!("compute_ffi_call: unimplemented FFI function '{}'", other),
-    }
+    pub const TABLE: &[(&str, FfiHandler)] = &[
+        // IO: stdout/stderr
+        ("__stdout_write_raw", stdout_write_raw as FfiHandler),
+        ("__stderr_write_raw", stderr_write_raw as FfiHandler),
+        // time
+        ("__instant_now_ns", instant_now_ns as FfiHandler),
+        ("__systemtime_now_ns", systemtime_now_ns as FfiHandler),
+        ("__sleep_ns", sleep_ns as FfiHandler),
+        ("__localtime_offset_minutes", localtime_offset_minutes as FfiHandler),
+        // cast: widening to i128
+        ("__cast_i8_to_i128", cast_i8_to_i128 as FfiHandler),
+        ("__cast_i16_to_i128", cast_i16_to_i128 as FfiHandler),
+        ("__cast_i32_to_i128", cast_i32_to_i128 as FfiHandler),
+        ("__cast_i64_to_i128", cast_i64_to_i64 as FfiHandler),
+        ("__cast_u8_to_i128", cast_u8_to_i128 as FfiHandler),
+        ("__cast_u16_to_i128", cast_u16_to_i128 as FfiHandler),
+        ("__cast_u32_to_i128", cast_u32_to_i128 as FfiHandler),
+        ("__cast_u64_to_i128", cast_u64_to_i128 as FfiHandler),
+        ("__cast_usize_to_i128", cast_usize_to_i128 as FfiHandler),
+        // cast: narrowing from i128
+        ("__cast_i128_to_i8", cast_i128_to_i8 as FfiHandler),
+        ("__cast_i128_to_i16", cast_i128_to_i16 as FfiHandler),
+        ("__cast_i128_to_i32", cast_i128_to_i32 as FfiHandler),
+        ("__cast_i128_to_i64", cast_i128_to_i64 as FfiHandler),
+        ("__cast_i128_to_u8", cast_i128_to_u8 as FfiHandler),
+        ("__cast_i128_to_u16", cast_i128_to_u16 as FfiHandler),
+        ("__cast_i128_to_u32", cast_i128_to_u32 as FfiHandler),
+        ("__cast_i128_to_u64", cast_i128_to_u64 as FfiHandler),
+        ("__cast_i128_to_usize", cast_i128_to_usize as FfiHandler),
+        // cast: char
+        ("__cast_char_to_u8", cast_char_to_u8 as FfiHandler),
+        // reflect (shared from ffi_common)
+        ("__reflect_kind", ffi_common::reflect_kind as FfiHandler),
+        ("__reflect_type_name", ffi_common::reflect_type_name as FfiHandler),
+        ("__reflect_array_len", ffi_common::reflect_array_len as FfiHandler),
+        ("__reflect_field_count", ffi_common::reflect_field_count as FfiHandler),
+        ("__reflect_size", ffi_common::reflect_size as FfiHandler),
+        ("__reflect_field_name", ffi_common::reflect_field_name as FfiHandler),
+        ("__reflect_field_value", ffi_common::reflect_field_value as FfiHandler),
+        ("__reflect_adt_constructor", ffi_common::reflect_adt_constructor as FfiHandler),
+        ("__reflect_kind_str", ffi_common::reflect_kind_str as FfiHandler),
+        ("__reflect_layout_size", ffi_common::reflect_layout_size as FfiHandler),
+        ("__reflect_layout_alignment", ffi_common::reflect_layout_alignment as FfiHandler),
+        // str
+        ("__str_utf8_decode_at", str_utf8_decode_at as FfiHandler),
+        ("__str_utf8_char_len_at", str_utf8_char_len_at as FfiHandler),
+        ("__str_array_join", str_array_join as FfiHandler),
+    ];
 }
 
 /// compute_fn (idx 46) fallback: when `has_extern_c` is not set (no C compiler),
 /// computes the FFI functions implementable in pure Rust (casts) directly in
 /// Rust; all others return a default value.
+/// Dispatches via a static lookup table; unrecognized functions return i32(0).
 #[cfg(not(has_extern_c))]
 pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let fn_name = graph.ffi_call_name(node.0 as usize)
         .expect("compute_ffi_call: no ffi_call_name");
 
-    match fn_name {
-        // ── IO: implemented directly via Rust std ──
-        "__stdout_write_raw" => {
-            if let Some(crate::value::HeapObj::Str(s)) = force_input(frame, inputs[0]).heap_obj() {
-                use std::io::Write;
-                let _ = std::io::stdout().write_all(s.bytes().as_bytes());
-                let _ = std::io::stdout().flush();
-                Value::i32(IO_OK)
-            } else {
-                Value::i32(IO_ERR)
-            }
-        }
-        "__stderr_write_raw" => {
-            if let Some(crate::value::HeapObj::Str(s)) = force_input(frame, inputs[0]).heap_obj() {
-                use std::io::Write;
-                let _ = std::io::stderr().write_all(s.bytes().as_bytes());
-                Value::i32(IO_OK)
-            } else {
-                Value::i32(IO_ERR)
-            }
-        }
-
-        // ── time: implemented directly via Rust std ──
-        "__instant_now_ns" => {
-            let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-            Value::i64(ns as i64)
-        }
-        "__systemtime_now_ns" => {
-            let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-            Value::i64(ns as i64)
-        }
-        "__sleep_ns" => {
-            let ns = force_input(frame, inputs[0]).as_i64();
-            std::thread::sleep(std::time::Duration::from_nanos(ns as u64));
-            Value::VOID
-        }
-        "__localtime_offset_minutes" => {
-            Value::i32(0)
-        }
-
-        // ── cast: widening to i128 (pure Rust computation) ──
-        "__cast_i8_to_i128" => Value::i128(force_input(frame, inputs[0]).as_i8() as i128),
-        "__cast_i16_to_i128" => Value::i128(force_input(frame, inputs[0]).as_i16() as i128),
-        "__cast_i32_to_i128" => Value::i128(force_input(frame, inputs[0]).as_i32() as i128),
-        "__cast_i64_to_i128" => Value::i128(force_input(frame, inputs[0]).as_i64() as i128),
-        "__cast_u8_to_i128" => Value::i128(force_input(frame, inputs[0]).as_u8() as i128),
-        "__cast_u16_to_i128" => Value::i128(force_input(frame, inputs[0]).as_u16() as i128),
-        "__cast_u32_to_i128" => Value::i128(force_input(frame, inputs[0]).as_u32() as i128),
-        "__cast_u64_to_i128" => Value::i128(force_input(frame, inputs[0]).as_u64() as i128),
-        "__cast_usize_to_i128" => Value::i128(force_input(frame, inputs[0]).as_usize() as i128),
-
-        // ── cast: narrowing from i128 (pure Rust computation) ──
-        "__cast_i128_to_i8" => Value::i8(force_input(frame, inputs[0]).as_i128() as i8),
-        "__cast_i128_to_i16" => Value::i16(force_input(frame, inputs[0]).as_i128() as i16),
-        "__cast_i128_to_i32" => Value::i32(force_input(frame, inputs[0]).as_i128() as i32),
-        "__cast_i128_to_i64" => Value::i64(force_input(frame, inputs[0]).as_i128() as i64),
-        "__cast_i128_to_u8" => Value::u8(force_input(frame, inputs[0]).as_i128() as u8),
-        "__cast_i128_to_u16" => Value::u16(force_input(frame, inputs[0]).as_i128() as u16),
-        "__cast_i128_to_u32" => Value::u32(force_input(frame, inputs[0]).as_i128() as u32),
-        "__cast_i128_to_u64" => Value::u64(force_input(frame, inputs[0]).as_i128() as u64),
-        "__cast_i128_to_usize" => Value::usize_val(force_input(frame, inputs[0]).as_i128() as usize),
-
-        // ── cast: char ──
-        "__cast_char_to_u8" => Value::u8(force_input(frame, inputs[0]).as_u32() as u8),
-
-        // ── reflect: __reflect_format/__reflect_scalar_to_str have been split into
-        // standalone compute_fns (CF_REFLECT_FORMAT/CF_REFLECT_SCALAR_TO_STR, idx 290/291),
-        // and no longer go through the FFI dispatch path ──
-        "__reflect_kind" => {
-            let v = force_input(frame, inputs[0]);
-            Value::u8(reflect_kind(&v))
-        }
-        "__reflect_type_name" => {
-            let v = force_input(frame, inputs[0]);
-            let name = reflect_type_name(&v);
-            Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&name)))
-        }
-        "__reflect_array_len" => {
-            let v = force_input(frame, inputs[0]);
-            match v.heap_obj() {
-                Some(crate::value::HeapObj::Array(arr)) => Value::usize_val(arr.elements.len()),
-                _ => Value::usize_val(0),
-            }
-        }
-        "__reflect_field_count" => {
-            let v = force_input(frame, inputs[0]);
-            let count: u16 = match v.heap_obj() {
-                Some(crate::value::HeapObj::Record(rec)) => rec.fields.len() as u16,
-                Some(crate::value::HeapObj::Adt(a)) => a.fields.len() as u16,
-                _ => 0,
-            };
-            Value::u16(count)
-        }
-        "__reflect_size" => {
-            let v = force_input(frame, inputs[0]);
-            let size: u8 = match &v {
-                Value::Scalar(_, tag) => tag.byte_width() as u8,
-                _ => 0,
-            };
-            Value::u8(size)
-        }
-        "__reflect_field_name" => {
-            let v = force_input(frame, inputs[0]);
-            let i = force_input(frame, inputs[1]).as_u16();
-            let name = match v.heap_obj() {
-                Some(crate::value::HeapObj::Record(rec)) => {
-                    rec.field_names.get(i as usize).and_then(|n| n.as_ref()).cloned().unwrap_or_default()
-                }
-                Some(crate::value::HeapObj::Adt(a)) => {
-                    a.fields.get(i as usize).and_then(|f| f.name.as_ref().cloned()).unwrap_or_default()
-                }
-                _ => String::new(),
-            };
-            Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&name)))
-        }
-        "__reflect_field_value" => {
-            let v = force_input(frame, inputs[0]);
-            let i = force_input(frame, inputs[1]).as_u16();
-            match v.heap_obj() {
-                Some(crate::value::HeapObj::Record(rec)) => rec.fields.get(i as usize).cloned().unwrap_or(Value::NULL),
-                Some(crate::value::HeapObj::Adt(a)) => a.fields.get(i as usize).map(|f| f.value.clone()).unwrap_or(Value::NULL),
-                _ => Value::NULL,
-            }
-        }
-        "__reflect_adt_constructor" => {
-            let v = force_input(frame, inputs[0]);
-            let name = match v.heap_obj() {
-                Some(crate::value::HeapObj::Adt(a)) => a.constructor.clone(),
-                _ => String::new(),
-            };
-            Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&name)))
-        }
-        "__reflect_kind_str" => {
-            let v = force_input(frame, inputs[0]);
-            let kind = reflect_kind_str(&v);
-            Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(kind)))
-        }
-        "__reflect_layout_size" => {
-            let v = force_input(frame, inputs[0]);
-            let size: u32 = crate::value::reflect_layout_size(&v);
-            Value::u32(size)
-        }
-        "__reflect_layout_alignment" => {
-            let v = force_input(frame, inputs[0]);
-            let align: u32 = crate::value::reflect_layout_alignment(&v);
-            Value::u32(align)
-        }
-
-        // ── str: UTF-8 per-character decode (pure Rust bit operations, matching the C implementation's semantics) ──
-        "__str_utf8_decode_at" => {
-            let s = match force_input(frame, inputs[0]).heap_obj() {
-                Some(crate::value::HeapObj::Str(s)) => s.bytes().to_string(),
-                _ => String::new(),
-            };
-            let offset = force_input(frame, inputs[1]).as_usize();
-            let bytes = s.as_bytes();
-            match utf8_decode_at(bytes, offset) {
-                Some((cp, _)) => Value::i64(cp as i64),
-                None => Value::i64(UTF8_DECODE_ERR),
-            }
-        }
-        "__str_utf8_char_len_at" => {
-            let s = match force_input(frame, inputs[0]).heap_obj() {
-                Some(crate::value::HeapObj::Str(s)) => s.bytes().to_string(),
-                _ => String::new(),
-            };
-            let offset = force_input(frame, inputs[1]).as_usize();
-            let bytes = s.as_bytes();
-            if offset >= bytes.len() {
-                Value::usize_val(0)
-            } else {
-                let c = bytes[offset];
-                let len = if c < 0x80 { 1 }
-                    else if (c & 0xE0) == 0xC0 { 2 }
-                    else if (c & 0xF0) == 0xE0 { 3 }
-                    else if (c & 0xF8) == 0xF0 { 4 }
-                    else { 1 };
-                Value::usize_val(len)
-            }
-        }
-
-        // ── str: one-shot array concat O(n) (replaces the stdlib loop `result = result + seg`) ──
-        "__str_array_join" => {
-            use crate::value::{HeapObj, KuzoStr};
-            let arr_val = force_input(frame, inputs[0]);
-            let sep = match force_input(frame, inputs[1]).heap_obj() {
-                Some(HeapObj::Str(s)) => s.bytes().to_string(),
-                _ => return make_error_throw("TypeError", "__str_array_join: separator is not str"),
-            };
-            let elements = match arr_val.heap_obj() {
-                Some(HeapObj::Array(a)) => &a.elements,
-                _ => return make_error_throw("TypeError", "__str_array_join: first operand is not array"),
-            };
-            if elements.is_empty() {
-                return Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str("")));
-            }
-            let mut total_len: usize = 0;
-            let mut strs: Vec<&str> = Vec::with_capacity(elements.len());
-            for (i, e) in elements.iter().enumerate() {
-                match e.heap_obj() {
-                    Some(HeapObj::Str(s)) => {
-                        total_len += s.byte_len();
-                        if i > 0 { total_len += sep.len(); }
-                        strs.push(s.bytes());
-                    }
-                    _ => return make_error_throw("TypeError", "__str_array_join: element is not str"),
-                }
-            }
-            let mut buf = String::with_capacity(total_len);
-            for (i, s) in strs.iter().enumerate() {
-                if i > 0 { buf.push_str(&sep); }
-                buf.push_str(s);
-            }
-            Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str(&buf)))
-        }
-
-        // ── Unimplemented FFI functions (return a default value when no C compiler is available) ──
-        _ => Value::i32(0),
+    if let Some((_, handler)) = ffi_no_extern_c::TABLE.iter()
+        .find(|(name, _)| *name == fn_name)
+    {
+        handler(frame, inputs)
+    } else {
+        Value::i32(0)
     }
 }
 

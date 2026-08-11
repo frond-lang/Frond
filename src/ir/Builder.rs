@@ -1170,7 +1170,7 @@ impl<'a> IrBuilder<'a> {
                 // As with float-suffix dispatch, u128 is the only integer type whose range
                 // exceeds i128; the dedicated parse path is mathematically necessary, not a
                 // special-case judgement.
-                if ty_name == "u128" {
+                if crate::value::ValueTag::from_name(ty_name) == Some(crate::value::ValueTag::U128) {
                     let v = parse_int_to_u128(raw, span)?;
                     return Ok(Some(ConstValue::U128(v)));
                 }

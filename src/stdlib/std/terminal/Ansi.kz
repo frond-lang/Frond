@@ -1,46 +1,265 @@
 // std/terminal/Ansi.kz — ANSI escape sequence construction
 //
 // Pure Kuzo, no FFI. Constructs escape sequences as str using \x1b (ESC byte).
-// Used by the editor Renderer and status bar.
+// Provides a comprehensive set of ANSI/VT100 escape sequences for:
+//   - Cursor positioning and movement
+//   - Screen and line clearing
+//   - Text styling (bold, italic, underline, inverse, etc.)
+//   - Foreground and background colors (8-color + bright variants)
+//   - Scroll region and scrolling
+//   - Alternative screen buffer
+//
+// Reference: https://vt100.net/docs/vt510-rm/chapter4.html
+//            https://en.wikipedia.org/wiki/ANSI_escape_code
 
-// ─── CursorControl: cursor movement escape sequences ───
+// ─── Cursor positioning ───
+
 // ESC[{row};{column}H → move cursor to (row, column) (1-based)
 pub fun cursor_move_to(row: u16, column: u16): str {
     "\x1b[" + cast(row).to(str) + ";" + cast(column).to(str) + "H"
 }
+
+// ESC[{row};{column}f → same as H (HPA/VPR variant)
+pub fun cursor_position(row: u16, column: u16): str {
+    "\x1b[" + cast(row).to(str) + ";" + cast(column).to(str) + "f"
+}
+
+// ESC[{n}A → move cursor up n rows (default 1)
+pub fun cursor_up(n: u16): str {
+    if n == 0 { "\x1b[A" } else { "\x1b[" + cast(n).to(str) + "A" }
+}
+
+// ESC[{n}B → move cursor down n rows (default 1)
+pub fun cursor_down(n: u16): str {
+    if n == 0 { "\x1b[B" } else { "\x1b[" + cast(n).to(str) + "B" }
+}
+
+// ESC[{n}C → move cursor right n columns (default 1)
+pub fun cursor_right(n: u16): str {
+    if n == 0 { "\x1b[C" } else { "\x1b[" + cast(n).to(str) + "C" }
+}
+
+// ESC[{n}D → move cursor left n columns (default 1)
+pub fun cursor_left(n: u16): str {
+    if n == 0 { "\x1b[D" } else { "\x1b[" + cast(n).to(str) + "D" }
+}
+
+// ESC[{n}E → move cursor to beginning of line, n rows down (default 1)
+pub fun cursor_down_to_line_start(n: u16): str {
+    if n == 0 { "\x1b[E" } else { "\x1b[" + cast(n).to(str) + "E" }
+}
+
+// ESC[{n}F → move cursor to beginning of line, n rows up (default 1)
+pub fun cursor_up_to_line_start(n: u16): str {
+    if n == 0 { "\x1b[F" } else { "\x1b[" + cast(n).to(str) + "F" }
+}
+
+// ESC[{n}G → move cursor to column n (1-based)
+pub fun cursor_to_column(n: u16): str {
+    "\x1b[" + cast(n).to(str) + "G"
+}
+
+// ESC[{n}d → move cursor to row n (1-based)
+pub fun cursor_to_row(n: u16): str {
+    "\x1b[" + cast(n).to(str) + "d"
+}
+
 // ESC[?25l → hide cursor
 pub fun cursor_hide(): str { "\x1b[?25l" }
+
 // ESC[?25h → show cursor
 pub fun cursor_show(): str { "\x1b[?25h" }
 
-// ─── ScreenControl: screen clearing escape sequences ───
-// ESC[2J → clear entire screen (does NOT move cursor)
-// ESC[H  → move cursor to home (row 1, col 1)
-// Combined: clean blank screen with cursor at top-left — no ANSI remnants.
-pub fun screen_clear_all(): str { "\x1b[2J\x1b[H" }
-// ESC[K → clear from cursor to end of line (preserves text before cursor)
-pub fun screen_clear_line(): str { "\x1b[K" }
-// ESC[2K → clear entire line (for use before writing content)
-pub fun screen_clear_entire_line(): str { "\x1b[2K" }
+// ESC7 → save cursor position and attributes (DECSC)
+pub fun cursor_save(): str { "\x1b7" }
+
+// ESC8 → restore cursor position and attributes (DECRC)
+pub fun cursor_restore(): str { "\x1b8" }
+
+// ESC[s → save cursor position (ANSI.SYS)
+pub fun cursor_save_ansi(): str { "\x1b[s" }
+
+// ESC[u → restore cursor position (ANSI.SYS)
+pub fun cursor_restore_ansi(): str { "\x1b[u" }
+
+// ─── Screen and line clearing ───
+
+// ESC[2J → clear entire screen, cursor stays in place
+pub fun screen_clear(): str { "\x1b[2J" }
+
+// ESC[2J\x1b[H → clear entire screen and move cursor to home
+pub fun screen_clear_and_home(): str { "\x1b[2J\x1b[H" }
+
 // ESC[J → clear from cursor to end of screen
-pub fun screen_clear_to_bottom(): str { "\x1b[J" }
-// ESC[s → save cursor, ESC[u → restore cursor (for status bar positioning)
-pub fun cursor_save(): str { "\x1b[s" }
-pub fun cursor_restore(): str { "\x1b[u" }
+pub fun clear_to_bottom(): str { "\x1b[J" }
 
-// ─── TextStyle: text styling escape sequences ───
-// ESC[7m → inverse video (for status bar / search highlight)
-pub fun text_style_inverse(): str { "\x1b[7m" }
+// ESC[0J → same as clear_to_bottom (explicit form)
+pub fun clear_from_cursor_to_bottom(): str { "\x1b[0J" }
+
+// ESC[1J → clear from beginning of screen to cursor
+pub fun clear_from_top_to_cursor(): str { "\x1b[1J" }
+
+// ESC[K → clear from cursor to end of line
+pub fun clear_to_end_of_line(): str { "\x1b[K" }
+
+// ESC[0K → same as clear_to_end_of_line (explicit form)
+pub fun clear_from_cursor_to_end(): str { "\x1b[0K" }
+
+// ESC[1K → clear from beginning of line to cursor
+pub fun clear_from_start_to_cursor(): str { "\x1b[1K" }
+
+// ESC[2K → clear entire line
+pub fun clear_line(): str { "\x1b[2K" }
+
+// ─── Text styles ───
+
 // ESC[0m → reset all styles
-pub fun text_style_reset(): str { "\x1b[0m" }
+pub fun reset(): str { "\x1b[0m" }
 
-// ─── Highlight colors (ANSI 16-color, bright variants) ───
-// ESC[90m-ESC[97m: dark gray, bright red/green/yellow/blue/magenta/cyan/white
-pub fun color_dark_gray(): str { "\x1b[90m" }
-pub fun color_bright_red(): str { "\x1b[91m" }
-pub fun color_bright_green(): str { "\x1b[92m" }
-pub fun color_bright_yellow(): str { "\x1b[93m" }
-pub fun color_bright_blue(): str { "\x1b[94m" }
-pub fun color_bright_magenta(): str { "\x1b[95m" }
-pub fun color_bright_cyan(): str { "\x1b[96m" }
-pub fun color_bright_white(): str { "\x1b[97m" }
+// ESC[1m → bold / increased intensity
+pub fun bold(): str { "\x1b[1m" }
+
+// ESC[2m → dim / faint / decreased intensity
+pub fun dim(): str { "\x1b[2m" }
+
+// ESC[3m → italic
+pub fun italic(): str { "\x1b[3m" }
+
+// ESC[4m → underline
+pub fun underline(): str { "\x1b[4m" }
+
+// ESC[5m → blink
+pub fun blink(): str { "\x1b[5m" }
+
+// ESC[7m → inverse / reverse video
+pub fun inverse(): str { "\x1b[7m" }
+
+// ESC[8m → hidden / invisible
+pub fun hidden(): str { "\x1b[8m" }
+
+// ESC[9m → strikethrough
+pub fun strikethrough(): str { "\x1b[9m" }
+
+// ─── Text style resets ───
+
+// ESC[22m → reset bold and dim
+pub fun reset_bold(): str { "\x1b[22m" }
+
+// ESC[23m → reset italic
+pub fun reset_italic(): str { "\x1b[23m" }
+
+// ESC[24m → reset underline
+pub fun reset_underline(): str { "\x1b[24m" }
+
+// ESC[25m → reset blink
+pub fun reset_blink(): str { "\x1b[25m" }
+
+// ESC[27m → reset inverse
+pub fun reset_inverse(): str { "\x1b[27m" }
+
+// ESC[28m → reset hidden
+pub fun reset_hidden(): str { "\x1b[28m" }
+
+// ESC[29m → reset strikethrough
+pub fun reset_strikethrough(): str { "\x1b[29m" }
+
+// ─── Foreground colors (8 standard + 8 bright) ───
+
+// Standard foreground: ESC[30m - ESC[37m
+pub fun fg_black(): str { "\x1b[30m" }
+pub fun fg_red(): str { "\x1b[31m" }
+pub fun fg_green(): str { "\x1b[32m" }
+pub fun fg_yellow(): str { "\x1b[33m" }
+pub fun fg_blue(): str { "\x1b[34m" }
+pub fun fg_magenta(): str { "\x1b[35m" }
+pub fun fg_cyan(): str { "\x1b[36m" }
+pub fun fg_white(): str { "\x1b[37m" }
+
+// Bright foreground: ESC[90m - ESC[97m
+pub fun fg_bright_black(): str { "\x1b[90m" }
+pub fun fg_bright_red(): str { "\x1b[91m" }
+pub fun fg_bright_green(): str { "\x1b[92m" }
+pub fun fg_bright_yellow(): str { "\x1b[93m" }
+pub fun fg_bright_blue(): str { "\x1b[94m" }
+pub fun fg_bright_magenta(): str { "\x1b[95m" }
+pub fun fg_bright_cyan(): str { "\x1b[96m" }
+pub fun fg_bright_white(): str { "\x1b[97m" }
+
+// Default foreground: ESC[39m
+pub fun fg_default(): str { "\x1b[39m" }
+
+// ─── Background colors (8 standard + 8 bright) ───
+
+// Standard background: ESC[40m - ESC[47m
+pub fun bg_black(): str { "\x1b[40m" }
+pub fun bg_red(): str { "\x1b[41m" }
+pub fun bg_green(): str { "\x1b[42m" }
+pub fun bg_yellow(): str { "\x1b[43m" }
+pub fun bg_blue(): str { "\x1b[44m" }
+pub fun bg_magenta(): str { "\x1b[45m" }
+pub fun bg_cyan(): str { "\x1b[46m" }
+pub fun bg_white(): str { "\x1b[47m" }
+
+// Bright background: ESC[100m - ESC[107m
+pub fun bg_bright_black(): str { "\x1b[100m" }
+pub fun bg_bright_red(): str { "\x1b[101m" }
+pub fun bg_bright_green(): str { "\x1b[102m" }
+pub fun bg_bright_yellow(): str { "\x1b[103m" }
+pub fun bg_bright_blue(): str { "\x1b[104m" }
+pub fun bg_bright_magenta(): str { "\x1b[105m" }
+pub fun bg_bright_cyan(): str { "\x1b[106m" }
+pub fun bg_bright_white(): str { "\x1b[107m" }
+
+// Default background: ESC[49m
+pub fun bg_default(): str { "\x1b[49m" }
+
+// ─── Scroll region ───
+
+// ESC[{top};{bottom}r → set scroll region (DECSTBM), 1-based rows
+pub fun set_scroll_region(top: u16, bottom: u16): str {
+    "\x1b[" + cast(top).to(str) + ";" + cast(bottom).to(str) + "r"
+}
+
+// ESC[r → reset scroll region to full screen
+pub fun reset_scroll_region(): str { "\x1b[r" }
+
+// ESC[{n}S → scroll up n lines (default 1)
+pub fun scroll_up(n: u16): str {
+    if n == 0 { "\x1b[S" } else { "\x1b[" + cast(n).to(str) + "S" }
+}
+
+// ESC[{n}T → scroll down n lines (default 1)
+pub fun scroll_down(n: u16): str {
+    if n == 0 { "\x1b[T" } else { "\x1b[" + cast(n).to(str) + "T" }
+}
+
+// ─── Alternative screen buffer ───
+
+// ESC[?1049h → enter alternate screen buffer (saves cursor)
+pub fun enter_alt_screen(): str { "\x1b[?1049h" }
+
+// ESC[?1049l → exit alternate screen buffer (restores cursor)
+pub fun exit_alt_screen(): str { "\x1b[?1049l" }
+
+// ─── Misc ───
+
+// ESC[c → device attributes query (RIS — full reset)
+pub fun device_reset(): str { "\x1bc" }
+
+// \x07 → bell
+pub fun bell(): str { "\x07" }
+
+// ESC[6n → request cursor position report (terminal responds with ESC[row;colR)
+pub fun request_cursor_position(): str { "\x1b[6n" }
+
+// ESC[?2004h → enable bracketed paste mode
+pub fun enable_bracketed_paste(): str { "\x1b[?2004h" }
+
+// ESC[?2004l → disable bracketed paste mode
+pub fun disable_bracketed_paste(): str { "\x1b[?2004l" }
+
+// ESC[?1h → enable application cursor keys mode
+pub fun enable_app_cursor_keys(): str { "\x1b[?1h" }
+
+// ESC[?1l → disable application cursor keys mode
+pub fun disable_app_cursor_keys(): str { "\x1b[?1l" }
