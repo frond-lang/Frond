@@ -1,25 +1,25 @@
-// builtin/reflect/Reflect.kz — 运行时反射（builtin，默认可见）
+// builtin/reflect/Reflect.kz — runtime reflection (builtin, visible by default)
 //
-// 两层反射 API：
-//   1. 值反射：reflect(x)/format(x)/type_name(x) — 接收值，运行时 match HeapObj
-//   2. 类型反射：typeof(Type) — 接收类型名，编译期生成 TypeInfo record
-//      typeof 由 Sema 拦截（不经过普通函数查找），参数解析为类型而非值变量
+// Two-layer reflection API:
+//   1. Value reflection: reflect(x)/format(x)/type_name(x) — receives a value, matches HeapObj at runtime
+//   2. Type reflection: typeof(Type) — receives a type name, generates a TypeInfo record at compile time
+//      typeof is intercepted by Sema (does not go through normal function lookup), the parameter is resolved as a type rather than a value variable
 //
-// 用法（builtin 默认可见，无需 import）：
-//   val r = reflect(x)            // 任意值 → Reflect
-//   val s = format(x)             // 任意值 → str
-//   val tn = type_name(x)         // 任意值 → 类型名 (str)
-//   val info = typeof(Point)      // 类型 → TypeInfo record（编译期反射）
-//   val info = typeof(T)          // 泛型参数 → TypeInfo（单态化后查表）
-//   val info = typeof(This)       // trait default 中 → TypeInfo
-//   val info = typeof(T?)         // nullable → TypeInfo（kind="Nullable"）
+// Usage (builtin visible by default, no import needed):
+//   val r = reflect(x)            // any value → Reflect
+//   val s = format(x)             // any value → str
+//   val tn = type_name(x)         // any value → type name (str)
+//   val info = typeof(Point)      // type → TypeInfo record (compile-time reflection)
+//   val info = typeof(T)          // generic parameter → TypeInfo (lookup after monomorphization)
+//   val info = typeof(This)       // in trait default → TypeInfo
+//   val info = typeof(T?)         // nullable → TypeInfo (kind="Nullable")
 
-// ─── 类型反射类型定义 ─────────────────────────────────────────────
+// ─── Type reflection type definitions ─────────────────────────────────────────────
 
-// 类型布局信息
+// Type layout information
 type LayoutInfo = LayoutInfo(size: u32, alignment: u32)
 
-// trait 实现信息
+// trait implementation information
 type TraitImplInfo = TraitImplInfo(
     parent_traits: str[],
     implemented_traits: str[],
@@ -27,8 +27,8 @@ type TraitImplInfo = TraitImplInfo(
     associated_types: str[]
 )
 
-// 类型元信息（typeof 返回值）
-// structure 字段为 Value 类型，运行时是 record 值（type_name 返回 "record"）
+// Type metadata (typeof return value)
+// The structure field is of Value type, at runtime it is a record value (type_name returns "record")
 type TypeInfo = TypeInfo(
     name: str,
     module: str,
@@ -39,9 +39,9 @@ type TypeInfo = TypeInfo(
     type_params: str[]
 )
 
-// ─── Reflect 内建类型：包装 Value ──────────────────────────────
+// ─── Reflect builtin type: wraps Value ──────────────────────────────
 type Reflect = Reflect(inner: Value) {
-    // ─── 类型元信息方法 ───────────────────────────────────────────
+    // ─── Type metadata methods ───────────────────────────────────────────
     pub fun kind(): u8 {
         __reflect_kind(inner)
     }
@@ -58,7 +58,7 @@ type Reflect = Reflect(inner: Value) {
         __reflect_field_count(inner)
     }
 
-    // ─── 字段元信息方法 ───────────────────────────────────────────
+    // ─── Field metadata methods ───────────────────────────────────────────
     pub fun field_name(index: u16): str {
         __reflect_field_name(inner, index)
     }
@@ -67,24 +67,24 @@ type Reflect = Reflect(inner: Value) {
         Reflect(__reflect_field_value(inner, index))
     }
 
-    // ─── 数组长度 ─────────────────────────────────────────────────
+    // ─── Array length ─────────────────────────────────────────────────
     pub fun array_len(): usize {
         __reflect_array_len(inner)
     }
 
-    // ─── ADT 构造器名 ─────────────────────────────────────────────
+    // ─── ADT constructor name ─────────────────────────────────────────────
     pub fun adt_constructor(): str {
         __reflect_adt_constructor(inner)
     }
 }
 
-// ─── 顶层反射入口 ─────────────────────────────────────────────────
-// reflect(x): 包装 Value 为 Reflect，无 Sema 拦截，无 type_id 注入
+// ─── Top-level reflection entry ─────────────────────────────────────────────────
+// reflect(x): wraps Value as Reflect, no Sema interception, no type_id injection
 pub fun reflect(x: Value): Reflect {
     Reflect(x)
 }
 
-// typeof(x: Value): 值反射，返回完整 TypeInfo record
+// typeof(x: Value): value reflection, returns full TypeInfo record
 pub fun typeof(x: Value): TypeInfo {
     val name = __reflect_type_name(x)
     val kind = __reflect_kind_str(x)

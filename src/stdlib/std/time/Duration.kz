@@ -1,11 +1,11 @@
-// Duration.kz — 时间长度（纳秒精度）
+// Duration.kz — time length (nanosecond precision)
 //
-// 设计文档 §5.3：Duration newtype + 算子
-// 内部存储 nanos: i128，可表达约 ±10^11 秒（3000+ 年）
-// Instant / SystemTime / DateTime 之间的差值都用 Duration 表示
+// Design doc §5.3: Duration newtype + operators
+// Internal storage nanos: i128, can express about ±10^11 seconds (3000+ years)
+// Differences between Instant / SystemTime / DateTime are all represented as Duration
 
 pub type Duration = Duration(nanos: i128) {
-    // ─── 转换器（转换为各时间单位） ───────────────────────────────────
+    // ─── Converters (convert to various time units) ───────────────────────────────────
 
     pub fun as_secs(): i64 {
         cast(nanos / 1_000_000_000).to(i64)
@@ -23,12 +23,12 @@ pub type Duration = Duration(nanos: i128) {
         nanos
     }
 
-    // 纳秒部分（不足 1 秒的部分），0..999_999_999
+    // Subsecond nanoseconds part (the part less than 1 second), 0..999_999_999
     pub fun subsec_nanos(): u32 {
         cast(nanos % 1_000_000_000).to(u32)
     }
 
-    // ─── 算子 ──────────────────────────────────────────────────────────
+    // ─── Operators ──────────────────────────────────────────────────────────
 
     pub fun add(other: Duration): Duration {
         Duration(nanos + other.nanos)
@@ -51,7 +51,7 @@ pub type Duration = Duration(nanos: i128) {
     }
 }
 
-// ─── 构造器（从各时间单位） ───────────────────────────────────────
+// ─── Constructors (from various time units) ───────────────────────────────────────
 
 pub fun from_secs(s: i64): Duration {
     Duration(cast(s).to(i128) * 1_000_000_000)

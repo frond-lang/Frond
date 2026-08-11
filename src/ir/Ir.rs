@@ -426,6 +426,8 @@ compute_fn_ids! {
     318 => CF_ATOMIC_COMPARE_EXCHANGE,
     319 => CF_STR_MULTI_CONCAT,
     320 => CF_STR_ARRAY_JOIN,
+    // Array fill [value, ..count] (321): repeats value count times
+    321 => CF_ARRAY_FILL,
 }
 
 // =========================================================================
@@ -1959,6 +1961,8 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         319 => super::Compute::compute_str_multi_concat,
         // Array join (320): str[] + sep → str, one-shot O(n) concat
         320 => super::Compute::compute_str_array_join,
+        // Array fill (321): [value, ..count] — repeats value count times
+        321 => super::Compute::compute_array_fill,
     };
     // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
     // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values

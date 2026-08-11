@@ -158,7 +158,7 @@ macro_rules! fold_int_arith {
             0 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_add_$ty>](a, b))) }
             1 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_sub_$ty>](a, b))) }
             2 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_mul_$ty>](a, b))) }
-            // div/mod/shl/shr 返回 Option；None（除零/越界）时不折叠，留给运行时返回 Throw
+            // div/mod/shl/shr return Option; None (divide-by-zero/overflow) means no folding, leave it for runtime to return Throw
             3 => { let (a, b) = two($args, $ext)?; crate::value::[<arith_div_$ty>](a, b).map(|v| ConstValue::$cv(v)) }
             4 => { let (a, b) = two($args, $ext)?; crate::value::[<arith_mod_$ty>](a, b).map(|v| ConstValue::$cv(v)) }
             5 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_bitand_$ty>](a, b))) }

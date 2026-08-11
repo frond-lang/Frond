@@ -421,6 +421,26 @@ impl<'a> IrBuilder<'a> {
         None
     }
 
+    /// Look up the NodeId bound to a variable in an outer scope, skipping the innermost scope.
+    ///
+    /// Used by `Assignment` to find the original outer definition of a variable that has already
+    /// been `bind_var`'d into the current subgraph by a prior assignment. In a same_function
+    /// branch subgraph (e.g. loop body), the first assignment generates a WriteBack to the outer
+    /// node and then `bind_var` shadows the outer binding in the current scope. Subsequent
+    /// assignments find the shadowed binding via `lookup_var` and would skip WriteBack — this
+    /// method recovers the original outer node so WriteBack can be emitted again.
+    fn lookup_outer_var(&self, name: &str) -> Option<NodeId> {
+        if self.scope_stack.len() <= 1 {
+            return None;
+        }
+        for scope in self.scope_stack.iter().rev().skip(1) {
+            if let Some(&node_id) = scope.get(name) {
+                return Some(node_id);
+            }
+        }
+        None
+    }
+
     /// Check whether a name is a global variable and return its slot index.
     fn lookup_global_var(&self, name: &str) -> Option<u32> {
         self.global_var_slots.get(name).copied()
@@ -708,8 +728,8 @@ impl<'a> IrBuilder<'a> {
             }
 
             // Array construction
-            crate::ast::Ast::Expr::ArrayLit { elements, .. } => {
-                self.compile_array_lit(expr_id, elements)
+            crate::ast::Ast::Expr::ArrayLit { elements, fill } => {
+                self.compile_array_lit(expr_id, elements, *fill)
             }
 
             // Assignment expression: `target = value`.
@@ -4352,7 +4372,7 @@ impl<'a> IrBuilder<'a> {
             return nodes[0];
         }
 
-        // Multi-input one-shot concat: O(n) 一次性拼接，替代链式 O(n²) concat
+        // Multi-input one-shot concat: O(n) one-shot concatenation, replacing chained O(n²) concat
         let inputs_offset = self.graph.inputs_pool.push(&nodes);
         self.graph.add_node(Node {
             kind: NodeKind::BinOp,
@@ -5599,7 +5619,7 @@ impl<'a> IrBuilder<'a> {
         args: &[crate::ast::Ast::ExprId],
         recv_node_override: Option<NodeId>,
     ) -> NodeId {
-        // 限定名构造器：Type.Ctor(args)（有参数构造器）
+        // Qualified-name constructor: Type.Ctor(args) (constructor with parameters)
         if let crate::ast::Ast::Expr::Ident(type_name) = &self.current_module().arena.expr(recv).node {
             if let Some((ctor_type_name, ctor_name, field_names, kind, is_nullary)) =
                 self.check_qualified_ctor_ir(type_name, method)
@@ -6022,7 +6042,7 @@ impl<'a> IrBuilder<'a> {
         recv: crate::ast::Ast::ExprId,
         field: &str,
     ) -> NodeId {
-        // 限定名构造器：Type.Ctor（零参数构造器）
+        // Qualified-name constructor: Type.Ctor (zero-parameter constructor)
         if let crate::ast::Ast::Expr::Ident(type_name) = &self.current_module().arena.expr(recv).node {
             if let Some((ctor_type_name, ctor_name, field_names, kind, is_nullary)) =
                 self.check_qualified_ctor_ir(type_name, field)
@@ -6245,7 +6265,20 @@ impl<'a> IrBuilder<'a> {
 
     /// Compile an array construction expression.
     /// Allocation sites marked non-escaping by the analyzer use the stack-alloc compute_fn (289).
-    fn compile_array_lit(&mut self, expr_id: crate::ast::Ast::ExprId, elements: &[crate::ast::Ast::ExprRef]) -> NodeId {
+    /// When `fill` is present (`[value, ..count]`), uses compute_array_fill (321).
+    fn compile_array_lit(&mut self, expr_id: crate::ast::Ast::ExprId, elements: &[crate::ast::Ast::ExprRef], fill: Option<(crate::ast::Ast::ExprRef, crate::ast::Ast::ExprRef)>) -> NodeId {
+        if let Some((value, count)) = fill {
+            let val_node = self.compile_subexpr(value);
+            let count_node = self.compile_subexpr(count);
+            let inputs = [val_node, count_node];
+            let inputs_offset = self.graph.inputs_pool.push(&inputs);
+            return self.graph.add_node(Node {
+                kind: NodeKind::BinOp,
+                input_count: 2,
+                inputs_offset,
+                compute_fn: CF_ARRAY_FILL,
+            });
+        }
         let mut inputs = Vec::with_capacity(elements.len());
         for &elem in elements {
             inputs.push(self.compile_subexpr(elem));
@@ -6493,6 +6526,19 @@ impl<'a> IrBuilder<'a> {
                             self.bind_var(name, val_node);
                             return Some(wb_node);
                         } else {
+                            // Same_function branch subgraph (e.g. loop body): a prior assignment
+                            // already bind_var'd the variable into the current subgraph, so
+                            // lookup_var returns a local node and the outer-definition check
+                            // above is skipped. Recover the original outer definition and emit a
+                            // WriteBack so the new value propagates back to the outer frame
+                            // (otherwise only the first assignment per iteration survives).
+                            if let Some(original_outer) = self.lookup_outer_var(name) {
+                                if !self.is_in_current_subgraph(original_outer) {
+                                    let wb_node = self.compile_writeback_node(val_node, original_outer);
+                                    self.bind_var(name, val_node);
+                                    return Some(wb_node);
+                                }
+                            }
                             self.bind_var(name, val_node);
                         }
                     } else if let Some(slot) = self.lookup_global_var(name) {

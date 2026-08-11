@@ -1,17 +1,18 @@
-// UdpSocket.kz — UDP 套接字
+// UdpSocket.kz — UDP socket
 //
-// 设计文档 §6.4：UdpSocket newtype + send_to/recv_from/close。
-// 所有 IO 操作为 async，返回 Async<Throw<T, IOError>>。
+// Design doc §6.4: UdpSocket newtype + send_to/recv_from/close.
+// All IO operations are async, return Async<Throw<T, IOError>>.
 //
-// 底层 @extern("C") 原语（__net_udp_bind_v4 / __net_udp_send_to_v4 等）
-// 由 builtin/net/Raw.kz 声明。__net_udp_bind / __net_udp_send_to 为 Kuzo wrapper。
-// __net_tcp_close 由 TcpStream.kz 定义（TCP/UDP 共用）。
-// async 函数体当前直接调用同步原语，等 IR/Engine 异步模型就绪后再补 spawn 语义。
+// Underlying @extern("C") primitives (__net_udp_bind_v4 / __net_udp_send_to_v4 etc.)
+// are declared in builtin/net/Raw.kz. __net_udp_bind / __net_udp_send_to are Kuzo wrappers.
+// __net_tcp_close is defined in TcpStream.kz (shared by TCP/UDP).
+// async function bodies currently call synchronous primitives directly; spawn semantics
+// will be added once the IR/Engine async model is ready.
 //
-// RecvFromResult 布局（与 syscall/net.zig makeRecordWithNames 对齐）：
+// RecvFromResult layout (aligned with syscall/net.zig makeRecordWithNames):
 //   fields = [__tag=0, data=u8[], src_addr=SocketAddr]
 
-// ─── Kuzo wrapper：@extern("C") 原始返回值 → Throw ──────────────
+// ─── Kuzo wrapper: @extern("C") raw return value → Throw ──────────────
 
 // __net_udp_bind(ip: IpAddr, port: u16, reuse_addr: bool): Throw<i64, IOError>
 fun __net_udp_bind(ip: IpAddr, port: u16, reuse_addr: bool): Throw<i64, IOError> {
@@ -53,21 +54,21 @@ fun __net_udp_send_to(fd: i64, ip: IpAddr, port: u16, buf: u8[]): Throw<usize, I
     }
 }
 
-// ─── 类型定义 ──────────────────────────────────────────────────────
+// ─── Type definitions ──────────────────────────────────────────────────────
 
-// RecvFromResult：newtype，fields = [__tag=0, data=u8[], src_addr=SocketAddr]
-// data 为收到的字节数组，长度可通过 data.len() 获取。
+// RecvFromResult: newtype, fields = [__tag=0, data=u8[], src_addr=SocketAddr]
+// data is the received byte array; length can be obtained via data.len().
 pub type RecvFromResult = RecvFromResult(data: u8[], src_addr: SocketAddr)
 
-// UdpSocket：newtype，fd 跨平台 i64 存储句柄
+// UdpSocket: newtype, fd is cross-platform i64 storage handle
 pub type UdpSocket = UdpSocket(fd: i64, local_addr: SocketAddr, is_closed: bool) {
-    // 返回绑定地址（构造时传入的本地地址）
+    // Returns the bound address (local address passed in at construction)
     pub fun local_addr(): SocketAddr {
         local_addr
     }
 
-    // 向目标地址发送 UDP 数据报。返回实际发送字节数。
-    // send_to 直接使用 buf 的完整长度（syscall 无 len 参数）。
+    // Sends a UDP datagram to the target address. Returns the actual number of bytes sent.
+    // send_to uses the full length of buf directly (syscall has no len parameter).
     pub async fun send_to(dst: SocketAddr, buf: u8[]): Async<Throw<usize, IOError>> {
         if is_closed {
             throw IOError(InvalidInput, "socket closed", 0, null)
@@ -75,11 +76,15 @@ pub type UdpSocket = UdpSocket(fd: i64, local_addr: SocketAddr, is_closed: bool)
         __net_udp_send_to(fd, dst.ip, dst.port, buf)?
     }
 
-    // 接收 UDP 数据报。返回 RecvFromResult(data, src_addr)。
-    // 当前直接调用同步 C 原语，等 IR/Engine 异步模型就绪后改为 spawn + channel 模式。
-    // 注意：__net_udp_recv_from_v4/v6 当前不返回 src_addr，需要额外调用获取发送方地址。
-    // 暂用 local_addr 作为占位，后续 syscall 层补 recvfrom 的 src_addr 输出参数。
-    // 按 local_addr.ip 的 family 分派到对应原语（socket 创建时 family 已固定）。
+    // Receives a UDP datagram. Returns RecvFromResult(data, src_addr).
+    // Currently calls synchronous C primitive directly; will switch to spawn + channel
+    // mode once the IR/Engine async model is ready.
+    // Note: __net_udp_recv_from_v4/v6 currently does not return src_addr; an extra call
+    // is needed to get the sender address.
+    // Temporarily uses local_addr as a placeholder; the syscall layer will add a src_addr
+    // output parameter to recvfrom later.
+    // Dispatches to the corresponding primitive based on local_addr.ip's family
+    // (family is fixed at socket creation).
     pub async fun recv_from(len: usize): Async<Throw<RecvFromResult, IOError>> {
         if is_closed {
             throw IOError(InvalidInput, "socket closed", 0, null)
@@ -95,8 +100,8 @@ pub type UdpSocket = UdpSocket(fd: i64, local_addr: SocketAddr, is_closed: bool)
         Ok(RecvFromResult(buf[0..cast(n).to(usize)], local_addr))
     }
 
-    // 关闭套接字。幂等：重复 close 不报错。
-    // UDP 套接字复用 __net_tcp_close（底层都是 close(fd)）。
+    // Closes the socket. Idempotent: repeated close does not error.
+    // UDP socket reuses __net_tcp_close (both are close(fd) underneath).
     pub async fun close(): Async<Throw<void, IOError>> {
         if is_closed {
             Ok(void)
@@ -108,9 +113,9 @@ pub type UdpSocket = UdpSocket(fd: i64, local_addr: SocketAddr, is_closed: bool)
     }
 }
 
-// ─── 顶层 async 函数（"静态方法"语义） ───────────────────────────
+// ─── Top-level async functions ("static method" semantics) ───────────────────────────
 
-// 绑定 UDP 地址。reuse_addr 为预留参数（syscall 层当前未使用）。
+// Binds a UDP address. reuse_addr is a reserved parameter (currently unused by the syscall layer).
 pub async fun bind(addr: SocketAddr, reuse_addr: bool): Async<Throw<UdpSocket, IOError>> {
     val fd = __net_udp_bind(addr.ip, addr.port, reuse_addr)?
     Ok(UdpSocket(fd, addr, false))

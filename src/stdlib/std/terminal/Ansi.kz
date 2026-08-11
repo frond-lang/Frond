@@ -1,0 +1,39 @@
+// std/terminal/Ansi.kz — ANSI escape sequence construction
+//
+// Pure Kuzo, no FFI. Constructs escape sequences as str using \x1b (ESC byte).
+// Used by the editor Renderer and status bar.
+
+// ─── CursorControl: cursor movement escape sequences ───
+// ESC[{row};{column}H → move cursor to (row, column) (1-based)
+pub fun cursor_move_to(row: u16, column: u16): str {
+    "\x1b[" + cast(row).to(str) + ";" + cast(column).to(str) + "H"
+}
+// ESC[?25l → hide cursor
+pub fun cursor_hide(): str { "\x1b[?25l" }
+// ESC[?25h → show cursor
+pub fun cursor_show(): str { "\x1b[?25h" }
+
+// ─── ScreenControl: screen clearing escape sequences ───
+// ESC[2J → clear entire screen
+pub fun screen_clear_all(): str { "\x1b[2J" }
+// ESC[2K → clear entire line
+pub fun screen_clear_line(): str { "\x1b[2K" }
+// ESC[J → clear from cursor to end of screen
+pub fun screen_clear_to_bottom(): str { "\x1b[J" }
+
+// ─── TextStyle: text styling escape sequences ───
+// ESC[7m → inverse video (for status bar / search highlight)
+pub fun text_style_inverse(): str { "\x1b[7m" }
+// ESC[0m → reset all styles
+pub fun text_style_reset(): str { "\x1b[0m" }
+
+// ─── Highlight colors (ANSI 16-color, bright variants) ───
+// ESC[90m-ESC[97m: dark gray, bright red/green/yellow/blue/magenta/cyan/white
+pub fun color_dark_gray(): str { "\x1b[90m" }
+pub fun color_bright_red(): str { "\x1b[91m" }
+pub fun color_bright_green(): str { "\x1b[92m" }
+pub fun color_bright_yellow(): str { "\x1b[93m" }
+pub fun color_bright_blue(): str { "\x1b[94m" }
+pub fun color_bright_magenta(): str { "\x1b[95m" }
+pub fun color_bright_cyan(): str { "\x1b[96m" }
+pub fun color_bright_white(): str { "\x1b[97m" }

@@ -480,7 +480,7 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                     }
                 }
                 HeapObj::ThrowVal(t) => {
-                    // Throw 值格式化：Ok(v) → "Ok(v)"，Err(e) → "Err(e)"
+                    // Throw value formatting: Ok(v) → "Ok(v)", Err(e) → "Err(e)"
                     match &t.payload {
                         crate::value::ThrowPayload::Ok(v) => {
                             format!("Ok({})", format_value(v, depth + 1))
@@ -491,7 +491,7 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                     }
                 }
                 HeapObj::ErrorVal(e) => {
-                    // 错误值格式化：显示类型名和消息
+                    // Error value formatting: display type name and message
                     format!("{}({})", e.type_name, e.message)
                 }
                 _ => {

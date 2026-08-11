@@ -1,8 +1,8 @@
-// Err trait: 所有错误类型实现的 trait
+// Err trait: trait implemented by all error types
 //
-// message() 默认实现返回 msg——所有 error_newtype 约定拥有 msg: str 字段。
-// 若类型无 msg 字段或需要自定义消息，可 override message()。
-// type_name() 默认实现返回 "Error"，子类型可 override。
+// The message() default implementation returns msg — all error_newtypes are required to have a msg: str field.
+// If a type has no msg field or needs a custom message, override message().
+// The type_name() default implementation returns "Error"; subtypes can override it.
 trait Err {
     fun message(): str {
         msg

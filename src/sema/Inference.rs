@@ -951,7 +951,7 @@ impl<'a> InferContext<'a> {
         if candidates.len() <= 1 {
             return candidates.into_iter().next();
         }
-        // 类型导向消歧：根据 expected_ty 的 Adt type_name 选择
+        // Type-oriented disambiguation: select by the Adt type_name of expected_ty
         let exp_resolved = self.arena.resolve(expected_ty);
         if let Ty::Adt(_) = self.arena.get(exp_resolved) {
             let (exp_type_name, _) = self.arena.adt_parts(exp_resolved);
@@ -962,7 +962,7 @@ impl<'a> InferContext<'a> {
                 return Some(matches[0]);
             }
         }
-        // 回退到第一个候选（保持向后兼容）
+        // Fall back to the first candidate (preserves backward compatibility)
         candidates.into_iter().next()
     }
 
@@ -1755,9 +1755,9 @@ impl<'a> InferContext<'a> {
             return self.try_widen_unify(r1, inner);
         }
 
-        // Bug #60 (方案 A 全严): 移除 numeric widening — 不同 numeric 类型之间
-        // 不再隐式提升，必须显式 cast。strict unify 已在上面尝试过并失败，
-        // numeric 类型对会 fall through 到 match 的 _ 分支返回 TypeMismatch。
+        // Bug #60 (Plan A fully strict): numeric widening is removed — different numeric types
+        // are no longer implicitly promoted; an explicit cast is required. Strict unify has already
+        // been attempted above and failed; numeric type pairs fall through to the match's _ branch and return TypeMismatch.
 
         match (c1, c2) {
             (Ty::Nullable(_), _) => match c2 {
@@ -1791,8 +1791,8 @@ impl<'a> InferContext<'a> {
                     match self.arena.unify(v1, v2) {
                         Ok(_) => Ok(r1),
                         Err(_) => {
-                            // 递归 try_widen_unify 处理 Nullable/Throw 等结构兼容，
-                            // 但不再做 numeric widening（方案 A 全严）。
+                            // Recursively call try_widen_unify to handle structural compatibility for Nullable/Throw etc.,
+                            // but no longer performs numeric widening (Plan A fully strict).
                             match self.try_widen_unify(v1, v2) {
                                 Ok(_) => Ok(r1),
                                 Err(_) => Err(UnifyError::TypeMismatch),
@@ -2472,17 +2472,17 @@ impl<'a> InferContext<'a> {
                     }
                 }
 
-                // ── 构造器多映射消歧 ──
-                // 当 callee 是 Ident 且对应多个同名构造器时，按优先级消歧：
-                //   1. 类型导向：expected_ty 是 Adt 时，按 type_name 选择
-                //   2. 参数个数：当类型导向失败（expected 是 TypeVar 或未提供）时，
-                //      按参数个数选择唯一匹配的构造器
+                // ── Constructor multi-mapping disambiguation ──
+                // When callee is an Ident that maps to multiple same-named constructors, disambiguate by priority:
+                //   1. Type-oriented: when expected_ty is an Adt, select by type_name
+                //   2. Arity: when type-oriented disambiguation fails (expected is a TypeVar or not provided),
+                //      select the unique constructor matching by arity
                 let callee_ty = if let Expr::Ident(name) = &ast.expr(*callee).node {
                     let ctors = self.sema_result.get_ctor_defs(name);
                     if ctors.len() > 1 {
                         let selected: Option<(Box<str>, Box<[TypeRepr]>)> = {
                             let mut found: Option<&CtorDefInfo> = None;
-                            // 1. 类型导向消歧
+                            // 1. Type-oriented disambiguation
                             if let Some(exp) = expected {
                                 let exp_resolved = self.arena.resolve(exp);
                                 if let Ty::Adt(_) = self.arena.get(exp_resolved) {
@@ -2495,7 +2495,7 @@ impl<'a> InferContext<'a> {
                                     }
                                 }
                             }
-                            // 2. 参数个数消歧（类型导向失败时的 fallback）
+                            // 2. Arity disambiguation (fallback when type-oriented fails)
                             if found.is_none() {
                                 let arity_matches: Vec<_> = ctors.iter()
                                     .filter(|c| c.field_type_reprs.len() == args.len())
@@ -2699,13 +2699,13 @@ impl<'a> InferContext<'a> {
             // ── Method calls ──
             Expr::MethodCall { recv, method, args, .. }
             | Expr::SafeMethodCall { recv, method, args, .. } => {
-                // 限定名语法：Type.Ctor(args)（有参数构造器限定名调用）
+                // Qualified-name syntax: Type.Ctor(args) (qualified call of a constructor with arguments)
                 if let Expr::Ident(type_name) = &ast.expr(*recv).node {
                     if let Some((ctor_type_name, field_type_reprs)) =
                         self.check_qualified_ctor(type_name, method)
                     {
                         if !field_type_reprs.is_empty() {
-                            // 有参数构造器：构建函数类型并走调用推断
+                            // Constructor with arguments: build a function type and go through call inference
                             let param_types: Vec<TypeHandle> = field_type_reprs
                                 .iter()
                                 .map(|r| self.type_repr_to_handle(r))
@@ -2726,7 +2726,7 @@ impl<'a> InferContext<'a> {
                             if let Some(exp) = expected {
                                 self.unify_or_constrain(return_type, exp);
                             }
-                            // 标记 recv 为 module-func-recv（IR 编译时跳过 recv）
+                            // Mark recv as module-func-recv (skip recv during IR compilation)
                             let recv_key = crate::sema::Sema::module_expr_key(
                                 &self.current_module_name,
                                 recv.0 as u64,
@@ -2734,7 +2734,7 @@ impl<'a> InferContext<'a> {
                             self.sema_result.module_func_recv_exprs.insert(recv_key);
                             return return_type;
                         }
-                        // 零参数构造器在 MethodCall 中：报错
+                        // Zero-argument constructor in MethodCall: report an error
                         let span = ast.expr(expr).span;
                         self.add_error_at(
                             &format!(
@@ -2937,16 +2937,16 @@ impl<'a> InferContext<'a> {
 
             // ── Field access ──
             Expr::FieldAccess { recv, field } => {
-                // 限定名语法：Type.Ctor（零参数构造器限定名访问）
+                // Qualified-name syntax: Type.Ctor (qualified access of a zero-argument constructor)
                 if let Expr::Ident(type_name) = &ast.expr(*recv).node {
                     if let Some((ctor_type_name, field_type_reprs)) =
                         self.check_qualified_ctor(type_name, field)
                     {
                         if field_type_reprs.is_empty() {
-                            // 零参数构造器：返回 Adt(type_name)
+                            // Zero-argument constructor: return Adt(type_name)
                             return self.arena.make_adt(ctor_type_name, Box::new([]));
                         }
-                        // 有参数构造器在 FieldAccess 中：报错
+                        // Constructor with arguments in FieldAccess: report an error
                         let span = ast.expr(expr).span;
                         self.add_error_at(
                             &format!(
@@ -3055,7 +3055,7 @@ impl<'a> InferContext<'a> {
             }
 
             // ── Array literals ──
-            Expr::ArrayLit { elements, .. } => {
+            Expr::ArrayLit { elements, fill } => {
                 // Extract the element type from expected so literal elements can be promoted per the annotation.
                 // (e.g. in `val data: u8[] = [72, 101]`, 72 should be promoted to u8 rather than the default i32.)
                 let expected_elem = expected.and_then(|exp| {
@@ -3065,6 +3065,13 @@ impl<'a> InferContext<'a> {
                         _ => None,
                     }
                 });
+                // Array fill syntax: [value, ..count] — infer value and count, return runtime-sized array
+                if let Some((value, count)) = fill {
+                    let value_ty = self.infer_expr(*value, ast, env, expected_elem);
+                    // Infer count to register its ExprInfo; length is runtime-determined
+                    let _count_ty = self.infer_expr(*count, ast, env, None);
+                    return self.arena.make_array(value_ty, None);
+                }
                 if elements.is_empty() {
                     let elem_ty = expected_elem.unwrap_or_else(|| self.arena.fresh_type_var());
                     return self.arena.make_array(elem_ty, None);
@@ -4036,7 +4043,7 @@ impl<'a> InferContext<'a> {
 
     // ── infer_stmt ──
 
-    /// Bug #61: 渲染类型注解字符串 — 如果注解是命名类型且是别名，保留别名名。
+    /// Bug #61: render the type annotation string — if the annotation is a named type and is an alias, preserve the alias name.
     fn display_type_annotation(
         &self,
         ta: AstTypeRef,
@@ -4079,7 +4086,7 @@ impl<'a> InferContext<'a> {
         let bind_ty = if let Some(ta) = type_annotation {
             let annot_ty = self.type_from_ast(ta, ast);
             if self.try_widen_unify(annot_ty, val_ty).is_err() {
-                // Bug #61: 如果类型注解是命名类型且是别名，保留别名名而非展开底层类型。
+                // Bug #61: if the type annotation is a named type and is an alias, preserve the alias name rather than unfolding the underlying type.
                 let annot_str = self.display_type_annotation(ta, ast, annot_ty);
                 let val_str = format!("{}", self.arena.display(val_ty));
                 let span = ast.ty(ta).span;

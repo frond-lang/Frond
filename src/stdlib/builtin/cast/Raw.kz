@@ -1,18 +1,18 @@
-// builtin/cast/Raw.kz — 类型转换 @extern("C") 原语（builtin，默认可见）
+// builtin/cast/Raw.kz — type cast @extern("C") primitives (builtin, visible by default)
 //
-// 底层 C 位转换原语，由 cc crate 从 emit-c 生成的 .c 编译。
-// Cast.kz 的 Kuzo wrapper 通过两步中转（S→i128→T）组合这些原语。
+// Low-level C bit cast primitives, compiled by the cc crate from the emit-c generated .c.
+// The Kuzo wrappers in Cast.kz combine these primitives via two-step relay (S→i128→T).
 //
-// 转换策略：
-//   - 整数 → 整数：经 i128 中转（widen S→i128，narrow i128→T）
-//   - char → u8：直接截断（char 内部为 u32 码点）
-//   - char → str：UTF-8 编码码点为字符串
-//   - [u8] → str：字节数组转字符串（假设合法 UTF-8）
+// Cast strategy:
+//   - integer → integer: relayed via i128 (widen S→i128, narrow i128→T)
+//   - char → u8: direct truncation (char is internally a u32 codepoint)
+//   - char → str: UTF-8 encode codepoint as a string
+//   - [u8] → str: byte array to string (assumes valid UTF-8)
 
 @c_include("stdint.h")
 
-// ─── widening: 整数 → i128 ─────────────────────────────────────────
-// 所有整数类型无损拓宽到 i128（i128 本身除外，identity 无需函数）
+// ─── widening: integer → i128 ─────────────────────────────────────────
+// All integer types losslessly widen to i128 (except i128 itself, identity needs no function)
 
 @extern("C")
 fun __cast_i8_to_i128(x: i8): i128 #{
@@ -59,8 +59,8 @@ fun __cast_usize_to_i128(x: usize): i128 #{
     return (__int128_t)x;
 }#
 
-// ─── narrowing: i128 → 整数（wrapping） ────────────────────────────
-// 截断高位，保留低位（C 的默认 cast 语义）
+// ─── narrowing: i128 → integer (wrapping) ────────────────────────────
+// Truncates high bits, keeps low bits (C's default cast semantics)
 
 @extern("C")
 fun __cast_i128_to_i8(x: i128): i8 #{
@@ -107,7 +107,7 @@ fun __cast_i128_to_usize(x: i128): usize #{
     return (size_t)x;
 }#
 
-// ─── special: char 转换 ────────────────────────────────────────────
+// ─── special: char casts ────────────────────────────────────────────
 
 @extern("C")
 fun __cast_char_to_u8(x: char): u8 #{
@@ -116,8 +116,8 @@ fun __cast_char_to_u8(x: char): u8 #{
 
 @extern("C")
 fun __cast_char_to_str(x: char): str #{
-    // UTF-8 编码码点：1-4 字节
-    // 使用 thread-local 静态缓冲区，避免悬垂指针
+    // UTF-8 encode codepoint: 1-4 bytes
+    // Use a thread-local static buffer to avoid dangling pointers
     static __thread char buf[4];
     int len = 0;
     uint32_t cp = (uint32_t)x;
@@ -148,8 +148,8 @@ fun __cast_char_to_str(x: char): str #{
 
 @extern("C")
 fun __cast_bytes_to_str(buf: u8[]): str #{
-    // 直接将字节数组作为字符串内容（假设合法 UTF-8）
-    // out_data 指向输入缓冲区，生命周期绑定到输入 &[u8]
+    // Use the byte array directly as string content (assumes valid UTF-8)
+    // out_data points to the input buffer, lifetime bound to the input &[u8]
     *out_data = (const char*)buf_data;
     *out_len = buf_len;
 }#

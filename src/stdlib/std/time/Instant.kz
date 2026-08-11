@@ -1,24 +1,24 @@
-// Instant.kz — 单调时钟（同步）
+// Instant.kz — monotonic clock (synchronous)
 //
-// 设计文档 §5.4：Instant newtype + 单调时钟操作
-// Instant 基于 CLOCK_MONOTONIC，适合测量时间间隔（不受系统时间调整影响）。
-// 同步实现（廉价 syscall，async 化反而啰嗦）——决策 S04。
-// 跨协程传递时 i128 内部值深拷贝合法——决策 S12。
+// Design doc §5.4: Instant newtype + monotonic clock operations
+// Instant is based on CLOCK_MONOTONIC, suitable for measuring time intervals (unaffected by system time adjustments).
+// Synchronous implementation (cheap syscall, making it async would be more verbose) — decision S04.
+// When passing across coroutines, deep copying the i128 internal value is legal — decision S12.
 
 pub type Instant = Instant(nanos: i128) {
-    // ─── 时间间隔 ──────────────────────────────────────────────────────
+    // ─── Time intervals ──────────────────────────────────────────────────────
 
-    // 从 now 到 this 的时间长度
+    // The length of time from now to this
     pub fun elapsed(): Duration {
         Duration(__instant_now_ns() - nanos)
     }
 
-    // this 相对 earlier 的时间长度（this - earlier，可为负）
+    // The length of time of this relative to earlier (this - earlier, can be negative)
     pub fun duration_since(earlier: Instant): Duration {
         Duration(nanos - earlier.nanos)
     }
 
-    // ─── 加减 Duration ─────────────────────────────────────────────────
+    // ─── Add/subtract Duration ─────────────────────────────────────────────────
 
     pub fun add_duration(d: Duration): Instant {
         Instant(nanos + d.nanos)
@@ -29,9 +29,9 @@ pub type Instant = Instant(nanos: i128) {
     }
 }
 
-// ─── 当前时刻 ──────────────────────────────────────────────────────
+// ─── Current instant ──────────────────────────────────────────────────────
 
-// 获取当前单调时钟时刻
+// Gets the current monotonic clock instant
 pub fun now(): Instant {
     Instant(__instant_now_ns())
 }

@@ -89,11 +89,11 @@ fn make_error_throw(type_name: &str, msg: &str) -> Value {
     Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(err_val) }))
 }
 
-/// 算术错误（除零、shift 越界）构造 Throw 错误值。
-/// 与 make_error_throw 一致，错误类型名为 "ArithmeticError"。
-/// 返回的 ThrowVal(Err) 作为 NodeResult::Value 流向下游：
-///   - 若用户用 `?` 运算符捕获，compute_propagate 会触发 NodeResult::Return 提前返回
-///   - 若直接参与后续运算，则与 throw 表达式语义一致（错误值传播）
+/// Constructs a Throw error value for arithmetic errors (divide by zero, shift out of bounds).
+/// Consistent with make_error_throw; the error type name is "ArithmeticError".
+/// The returned ThrowVal(Err) flows downstream as a NodeResult::Value:
+///   - If captured by the user with the `?` operator, compute_propagate triggers a NodeResult::Return early return
+///   - If it directly participates in subsequent computation, the semantics match the throw expression (error value propagation)
 fn make_arith_throw(kind: &str, msg: &str) -> Value {
     let full_msg = format!("{kind}: {msg}");
     make_error_throw("ArithmeticError", &full_msg)
@@ -1497,7 +1497,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             }
         }
 
-        // ── str: 数组一次性拼接 O(n)（替代 stdlib 中的循环 result = result + seg） ──
+        // ── str: one-shot array concat O(n) (replaces the stdlib loop `result = result + seg`) ──
         "__str_array_join" => {
             use crate::value::{HeapObj, KuzoStr};
             let arr_val = force_input(frame, inputs[0]);
@@ -1724,7 +1724,7 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             }
         }
 
-        // ── str: 数组一次性拼接 O(n)（替代 stdlib 中的循环 result = result + seg） ──
+        // ── str: one-shot array concat O(n) (replaces the stdlib loop `result = result + seg`) ──
         "__str_array_join" => {
             use crate::value::{HeapObj, KuzoStr};
             let arr_val = force_input(frame, inputs[0]);
@@ -1884,6 +1884,22 @@ pub fn compute_array_construct(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(HeapObj::Array(ArrayValue::new(elements)))
 }
 
+/// compute_fn: array fill `[value, ..count]` (321).
+/// inputs[0] = value to repeat, inputs[1] = count (integer).
+/// Returns an array of `count` copies of `value`. Negative or zero count yields empty array.
+pub fn compute_array_fill(frame: &mut Frame, node: NodeId) -> Value {
+    use crate::value::{HeapObj, ArrayValue};
+    read_node_inputs!(frame, node, graph, n, inputs);
+    let value = frame.get_value_by_global(inputs[0]);
+    let count_raw = frame.get_value_by_global(inputs[1]).as_i64();
+    if count_raw <= 0 {
+        return Value::ref_val(HeapObj::Array(ArrayValue::new(Vec::new())));
+    }
+    let count = count_raw as usize;
+    let elements: Vec<Value> = (0..count).map(|_| value.clone()).collect();
+    Value::ref_val(HeapObj::Array(ArrayValue::new(elements)))
+}
+
 /// compute_fn: stack-allocated record construction (288).
 ///
 /// Used at allocation sites the analyzer marks as non-escaping.
@@ -2002,9 +2018,9 @@ pub fn compute_str_concat(frame: &mut Frame, node: NodeId) -> Value {
 
 /// compute_fn (idx 319): multi-input string concatenation.
 ///
-/// 所有输入（≥2）一次性拼接为一个 str，O(n) 时间复杂度。
-/// 用于字符串插值 `"a{b}c{d}e"` 的编译期 lowering，替代链式 `compute_str_concat` 的 O(n²)。
-/// 输入已在 Builder 中经过 `compute_reflect_format` 转换为 str，此处直接拼接。
+/// All inputs (>=2) are concatenated into a single str in one pass, O(n) time complexity.
+/// Used for the compile-time lowering of string interpolation `"a{b}c{d}e"`, replacing the chained `compute_str_concat` which is O(n^2).
+/// Inputs have already been converted to str via `compute_reflect_format` in the Builder; here they are concatenated directly.
 pub fn compute_str_multi_concat(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, KuzoStr};
     let graph = frame.graph.clone();
@@ -2013,12 +2029,12 @@ pub fn compute_str_multi_concat(frame: &mut Frame, node: NodeId) -> Value {
     if inputs.is_empty() {
         return Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str("")));
     }
-    // 先强制求值所有输入，收集 Value（避免临时 Value 在循环中 drop 导致引用失效）
+    // First force-evaluate all inputs and collect Values (to avoid temporary Values being dropped during the loop, which would invalidate references)
     let mut vals: Vec<Value> = Vec::with_capacity(inputs.len());
     for &inp in inputs {
         vals.push(force_input(frame, inp));
     }
-    // 第一遍：计算总长度
+    // First pass: compute total length
     let mut total_len: usize = 0;
     for v in &vals {
         match v.heap_obj() {
@@ -2026,7 +2042,7 @@ pub fn compute_str_multi_concat(frame: &mut Frame, node: NodeId) -> Value {
             _ => return make_error_throw("TypeError", "str_multi_concat on non-str operand"),
         }
     }
-    // 第二遍：一次性分配 + 复制
+    // Second pass: one-shot allocation + copy
     let mut buf = String::with_capacity(total_len);
     for v in &vals {
         if let Some(HeapObj::Str(s)) = v.heap_obj() {
@@ -2036,10 +2052,10 @@ pub fn compute_str_multi_concat(frame: &mut Frame, node: NodeId) -> Value {
     Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str(&buf)))
 }
 
-/// compute_fn (idx 320): string array join — `str[] + sep → str`。
+/// compute_fn (idx 320): string array join — `str[] + sep → str`.
 ///
-/// 一次性 O(n) 拼接，替代 stdlib 中的循环 `result = result + seg`（O(n²)）。
-/// inputs[0] = str[] 数组，inputs[1] = sep 分隔符。
+/// One-shot O(n) concat, replacing the stdlib loop `result = result + seg` (O(n^2)).
+/// inputs[0] = str[] array, inputs[1] = sep separator.
 pub fn compute_str_array_join(frame: &mut Frame, node: NodeId) -> Value {
     use crate::value::{HeapObj, KuzoStr};
     read_node_inputs!(frame, node, graph, n, inputs);
@@ -2056,7 +2072,7 @@ pub fn compute_str_array_join(frame: &mut Frame, node: NodeId) -> Value {
     if elements.is_empty() {
         return Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str("")));
     }
-    // 第一遍：计算总长度
+    // First pass: compute total length
     let sep_bytes = sep.byte_len();
     let mut total_len: usize = 0;
     let mut strs: Vec<&str> = Vec::with_capacity(elements.len());
@@ -2072,7 +2088,7 @@ pub fn compute_str_array_join(frame: &mut Frame, node: NodeId) -> Value {
             _ => return make_error_throw("TypeError", "str_array_join: array element is not str"),
         }
     }
-    // 第二遍：一次性分配 + 复制
+    // Second pass: one-shot allocation + copy
     let mut buf = String::with_capacity(total_len);
     for (i, s) in strs.iter().enumerate() {
         if i > 0 {
@@ -2505,6 +2521,18 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId) -> Value {
         }
         Value::Ref(r) => match r.as_ref() {
             HeapObj::Str(kuzo_str) => kuzo_str.bytes().to_string(),
+            HeapObj::Array(arr) => {
+                // u8[] → str: extract bytes from SoA or elements
+                use crate::value::ScalarSoA;
+                if let Some(ScalarSoA::U8(bytes)) = &arr.scalar_soa {
+                    String::from_utf8_lossy(bytes).into_owned()
+                } else if !arr.elem_is_ref {
+                    let bytes: Vec<u8> = arr.elements.iter().map(|v| v.as_int_i128() as u8).collect();
+                    String::from_utf8_lossy(&bytes).into_owned()
+                } else {
+                    "<non-scalar>".to_string()
+                }
+            }
             _ => "<non-scalar>".to_string(),
         },
     };

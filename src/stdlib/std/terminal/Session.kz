@@ -1,0 +1,65 @@
+// std/terminal/Session.kz — terminal session management
+//
+// Wraps raw mode lifecycle: enter_raw_mode saves original terminal state,
+// exit_raw_mode restores it. Use defer to guarantee exit.
+//
+// TerminalError is defined in builtin/error/TerminalError.kz (globally visible by default).
+
+// Size: terminal dimensions
+type Size = Size(
+    rows: u16,
+    cols: u16
+)
+
+// Session: terminal session, holds original state for restoration
+type Session = Session(
+    original_state: u8[],   // original terminal state (termios or console mode)
+    is_active: bool          // whether raw mode is active
+) {
+    // Exit raw mode, restore original terminal state
+    pub fun &exit_raw_mode(): Throw<void, TerminalError> {
+        if !this.is_active { return Ok(void) }
+        val ret = __terminal_disable_raw_mode(this.original_state)
+        if ret < 0 {
+            throw TerminalError(RawModeFailed, "failed to disable raw mode", ret)
+        }
+        this.is_active = false
+        Ok(void)
+    }
+
+    // Query terminal size
+    pub fun get_size(): Throw<Size, TerminalError> {
+        val buf: u8[] = [0u8, ..4]
+        val ret = __terminal_get_size_into(buf)
+        if ret < 0 {
+            throw TerminalError(SizeQueryFailed, "failed to get terminal size", ret)
+        }
+        val rows = cast(buf[0]).to(u16) + (cast(buf[1]).to(u16) << 8)
+        val cols = cast(buf[2]).to(u16) + (cast(buf[3]).to(u16) << 8)
+        Ok(Size(rows, cols))
+    }
+
+    // Write bytes to terminal
+    pub fun write_bytes(bytes: u8[]): Throw<usize, TerminalError> {
+        val n = __terminal_write_raw_bytes(bytes, bytes.len())
+        if n < 0 {
+            throw TerminalError(WriteFailed, "failed to write to terminal", cast(n).to(i32))
+        }
+        Ok(cast(n).to(usize))
+    }
+
+    // Write str to terminal (convenience method)
+    pub fun write_str(text: str): Throw<usize, TerminalError> {
+        this.write_bytes(text.bytes())
+    }
+}
+
+// Top-level constructor: enter raw mode
+pub fun enter_raw_mode(): Throw<Session, TerminalError> {
+    val orig_buf: u8[] = [0u8, ..256]
+    val ret = __terminal_enable_raw_mode(orig_buf)
+    if ret < 0 {
+        throw TerminalError(RawModeFailed, "failed to enable raw mode", ret)
+    }
+    Ok(Session(orig_buf, true))
+}

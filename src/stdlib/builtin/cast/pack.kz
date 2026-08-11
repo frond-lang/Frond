@@ -1,9 +1,9 @@
-// builtin cast 包声明
+// builtin cast package declaration
 //
-// 暴露 cast 转换模块给所有 Kuzo 用户代码默认可见（builtin 默认全可见）。
-// Raw: @extern("C") 类型转换原语（widen/narrow/special）
-// Cast: Kuzo wrapper（两步中转组合原语）
-// cast(x).to(T) 在 parser 层降级为 __cast_to<T>(x) 普通函数调用，
-// sema 推断源类型 S 后解析为 __cast_S_to_T(x)。
+// Exposes the cast conversion module to all Kuzo user code as visible by default (builtin is fully visible by default).
+// Raw: @extern("C") type cast primitives (widen/narrow/special)
+// Cast: Kuzo wrapper (two-step relay combining primitives)
+// cast(x).to(T) is desugared at the parser layer into a __cast_to<T>(x) normal function call,
+// after sema infers the source type S it resolves to __cast_S_to_T(x).
 pub pack Raw
 pub pack Cast

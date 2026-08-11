@@ -1,0 +1,5 @@
+// builtin terminal pack declaration
+//
+// Exposes terminal control primitives to all Kuzo user code as visible by default.
+// Raw: @extern("C") terminal primitives (termios/console API)
+pub pack Raw

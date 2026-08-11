@@ -1,0 +1,141 @@
+// std/terminal/Key.kz — key decoding state machine
+//
+// Decodes byte sequences from terminal input into Key values.
+// Handles single-byte keys (printable, control, Enter, Backspace, Tab)
+// and multi-byte escape sequences (arrows, Home/End, PageUp/Down, Delete, Alt).
+
+// Key: decoded key
+type Key =
+    | CharacterKey(u8)       // printable character (single byte)
+    | EnterKey               // Enter (0x0D or 0x0A)
+    | BackspaceKey           // Backspace (0x7F or 0x08)
+    | TabKey                 // Tab (0x09)
+    | EscapeKey              // standalone ESC
+    | ArrowUp                // arrow keys
+    | ArrowDown
+    | ArrowLeft
+    | ArrowRight
+    | HomeKey                // Home/End
+    | EndKey
+    | PageUpKey              // PageUp/PageDown
+    | PageDownKey
+    | DeleteKey              // Delete (ESC[3~)
+    | ControlKey(u8)         // Ctrl+letter (0x01-0x1A)
+    | AltKey(u8)             // Alt+letter (ESC followed by char)
+    | UnknownKey             // unrecognized sequence
+
+// Read and decode a key from terminal input.
+// Loops on timeout (n==0) to wait for actual keypress.
+pub fun read_key(): Key {
+    val buf: u8[] = [0u8, ..1]
+    var n = __terminal_read_key_bytes(buf)
+    // VTIME=1 timeout returns 0, loop to wait for actual keypress
+    while n == 0 {
+        val n2 = __terminal_read_key_bytes(buf)
+        if n2 > 0 {
+            return decode_key_from_bytes(buf, n2)
+        }
+        if n2 < 0 {
+            return UnknownKey
+        }
+        // n2 == 0: keep waiting (100ms interval, no busy-loop)
+        n = n2
+    }
+    if n < 0 { return UnknownKey }
+    decode_key_from_bytes(buf, n)
+}
+
+// Decode key from byte sequence (testable pure function).
+// bytes[0] is the first byte; count is the number of valid bytes read.
+// For ESC sequences, this reads additional bytes from stdin.
+pub fun decode_key_from_bytes(bytes: u8[], count: i64): Key {
+    if count <= 0 { return UnknownKey }
+    val first = bytes[0]
+    if first != 0x1Bu8 {
+        return decode_single_byte(first)
+    }
+    // ESC: read next byte to determine if escape sequence or Alt+char
+    val next_buf: u8[] = [0u8, ..8]
+    val n = __terminal_read_key_bytes(next_buf)
+    if n == 0 {
+        return EscapeKey
+    }
+    if n < 0 {
+        return EscapeKey
+    }
+    val second = next_buf[0]
+    // ESC [ ... → CSI sequence (arrows/Home/End/PageUp/Down/Delete)
+    if second == 91u8 {
+        return decode_csi_sequence(next_buf, n)
+    }
+    // ESC O ... → SS3 sequence (some terminals' Home/End)
+    if second == 79u8 {
+        val n3 = __terminal_read_key_bytes(next_buf)
+        if n3 > 0 {
+            match next_buf[0] {
+                72u8 => return HomeKey,
+                70u8 => return EndKey,
+                _ => {}
+            }
+        }
+        return UnknownKey
+    }
+    // ESC <char> → Alt+char
+    AltKey(second)
+}
+
+// Decode CSI sequence (after ESC[)
+fun decode_csi_sequence(buf: u8[], first_n: i64): Key {
+    // first_n is the count for buf[0] which is the byte after ESC[
+    if first_n <= 0 { return UnknownKey }
+    val c = buf[0]
+    match c {
+        65u8 => return ArrowUp,       // 'A'
+        66u8 => return ArrowDown,     // 'B'
+        67u8 => return ArrowRight,    // 'C'
+        68u8 => return ArrowLeft,     // 'D'
+        72u8 => return HomeKey,       // 'H'
+        70u8 => return EndKey,        // 'F'
+        51u8 => {                     // '3' → Delete (ESC[3~)
+            val next_buf: u8[] = [0u8, ..1]
+            val n2 = __terminal_read_key_bytes(next_buf)
+            if n2 > 0 && next_buf[0] == 126u8 { return DeleteKey }
+            return UnknownKey
+        }
+        53u8 => {                     // '5' → PageUp (ESC[5~)
+            val next_buf: u8[] = [0u8, ..1]
+            val n2 = __terminal_read_key_bytes(next_buf)
+            if n2 > 0 && next_buf[0] == 126u8 { return PageUpKey }
+            return UnknownKey
+        }
+        54u8 => {                     // '6' → PageDown (ESC[6~)
+            val next_buf: u8[] = [0u8, ..1]
+            val n2 = __terminal_read_key_bytes(next_buf)
+            if n2 > 0 && next_buf[0] == 126u8 { return PageDownKey }
+            return UnknownKey
+        }
+        _ => {}
+    }
+    UnknownKey
+}
+
+// Decode single-byte key (non-ESC)
+fun decode_single_byte(b: u8): Key {
+    match b {
+        0x0Du8 => return EnterKey,
+        0x0Au8 => return EnterKey,
+        0x09u8 => return TabKey,
+        0x7Fu8 => return BackspaceKey,
+        0x08u8 => return BackspaceKey,
+        _ => {}
+    }
+    // Ctrl+letter: 0x01-0x1A → Ctrl+A to Ctrl+Z
+    if b >= 0x01u8 && b <= 0x1Au8 {
+        return ControlKey(b)
+    }
+    // Printable: 0x20-0x7E
+    if b >= 0x20u8 && b <= 0x7Eu8 {
+        return CharacterKey(b)
+    }
+    UnknownKey
+}

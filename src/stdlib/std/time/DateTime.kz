@@ -1,26 +1,26 @@
-// DateTime.kz — 日历表示 + 格式化（纯 Kuzo）
+// DateTime.kz — calendar representation + formatting (pure Kuzo)
 //
-// 设计文档 §5.7：DateTime newtype + 算术 + strftime-like 格式化
-// 所有日历运算（add_days 等）委托给 Calendar 模块的纯函数
-// pad_int / digit_char 等格式化辅助全部用 Kuzo 实现——决策 S11（不引入 __format_int 原语）
+// Design doc §5.7: DateTime newtype + arithmetic + strftime-like formatting
+// All calendar operations (add_days etc.) are delegated to pure functions of the Calendar module
+// Formatting helpers like pad_int / digit_char are all implemented in Kuzo — decision S11 (no __format_int primitive introduced)
 
 pub type DateTime = DateTime(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8, nanos: u32, weekday: u8, day_of_year: u16) {
-    // ─── 与 TimeComponents 转换 ────────────────────────────────────────
+    // ─── Conversion to/from TimeComponents ────────────────────────────────────────
 
     pub fun to_components(): TimeComponents {
         TimeComponents(year, month, day, hour, minute, second, nanos, weekday, day_of_year)
     }
 
-    // ─── 日期算术 ─────────────────────────────────────────────────────
+    // ─── Date arithmetic ─────────────────────────────────────────────
 
-    // 加天数（委托 Calendar.add_days，重算 weekday 与 day_of_year）
+    // Adds days (delegates to Calendar.add_days, recomputes weekday and day_of_year)
     pub fun add_days(days: i64): DateTime {
         val new_ymd = Calendar.add_days(year, month, day, days)
         DateTime(new_ymd.year, new_ymd.month, new_ymd.day, hour, minute, second, nanos, Calendar.weekday_of(new_ymd.year, new_ymd.month, new_ymd.day), Calendar.day_of_year(new_ymd.year, new_ymd.month, new_ymd.day))
     }
 
-    // 加 Duration（通过 UTC 分量往返转换，纯 Kuzo 算法）
-    // 调用 SystemTime 的纯 Kuzo 转换函数（替代原 __components_to_ns_utc / __systemtime_to_utc_components syscall）
+    // Adds a Duration (round-trip conversion via UTC components, pure Kuzo algorithm)
+    // Calls pure Kuzo conversion functions of SystemTime (replacing the original __components_to_ns_utc / __systemtime_to_utc_components syscalls)
     pub fun add_duration(d: Duration): Throw<DateTime, TimeError> {
         val comp = to_components()
         val ns = std.time.SystemTime.components_to_ns_utc(comp)?
@@ -29,10 +29,10 @@ pub type DateTime = DateTime(year: i32, month: u8, day: u8, hour: u8, minute: u8
         Ok(std.time.DateTime.from_components(new_comp))
     }
 
-    // ─── strftime-like 格式化 ─────────────────────────────────────────
+    // ─── strftime-like formatting ─────────────────────────────────────────
 
-    // 支持占位符：%Y %m %d %H %M %S %y %j %A %a %B %b %e %%
-    // 使用数组收集片段 + __str_array_join 一次性 O(n) 拼接，避免循环 result = result + piece 的 O(n²)
+    // Supported placeholders: %Y %m %d %H %M %S %y %j %A %a %B %b %e %%
+    // Uses an array to collect pieces + __str_array_join for a single O(n) concatenation, avoiding the O(n²) of loop result = result + piece
     pub fun format(pattern: str): str {
         var pieces: str[] = []
         var i: usize = 0
@@ -87,15 +87,15 @@ pub type DateTime = DateTime(year: i32, month: u8, day: u8, hour: u8, minute: u8
     }
 }
 
-// ─── 顶层自由函数（无 this）────────────────────────────────────────
+// ─── Top-level free functions (no this) ─────────────────────────────────────────
 
 pub fun from_components(comp: TimeComponents): DateTime {
     DateTime(comp.year, comp.month, comp.day, comp.hour, comp.minute, comp.second, comp.nanos, comp.weekday, comp.day_of_year)
 }
 
-// ─── 格式化辅助 ───────────────────────────────────────────────────
+// ─── Formatting helpers ───────────────────────────────────────────────────
 
-// 整数转字符串 + 零填充（纯 Kuzo 实现，决策 S11）
+// Integer to string + zero padding (pure Kuzo implementation, decision S11)
 pub fun pad_int(value: i64, width: usize): str {
     val sign: str = if value < 0 { "-" } else { "" }
     var abs_val = if value < 0 { -value } else { value }
@@ -159,10 +159,12 @@ pub fun weekday_abbr(w: u8): str {
     }
 }
 
-// parse 实现：解析 ISO 8601 字符串为 DateTime
-// 已知阻塞：Kuzo 引擎存在函数内调用其他函数后变量绑定错位的 bug
-// （parse_digits_at 在 parse 外直接调用返回正确值，在 parse 内调用后
-//   最终 Ok(DateTime(...)) 构造时 year/month 字段值错位）
-// 待引擎修复后补全实现，参考下方已验证逻辑：
+// parse implementation: parse an ISO 8601 string into a DateTime
+// Known blocker: the Kuzo engine has a bug where variable bindings are misaligned after
+// calling other functions within a function
+// (parse_digits_at returns the correct value when called directly outside parse, but when
+//   called inside parse, the year/month field values are misaligned when constructing the
+//   final Ok(DateTime(...)))
+// To be completed after the engine is fixed, refer to the verified logic below:
 // pub fun parse_digits_at(s: str, pos: usize, count: usize): i64 { ... }
 // pub fun parse(s: str): Throw<DateTime, TimeError> { ... }

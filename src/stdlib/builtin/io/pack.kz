@@ -1,7 +1,7 @@
-// builtin io 包声明
+// builtin io pack declaration
 //
-// 暴露 IO 模块给所有 Kuzo 用户代码默认可见（builtin 默认全可见）。
-// Raw: @extern("C") IO 原语
+// Exposes the IO module to all Kuzo user code as visible by default (builtin is fully visible by default).
+// Raw: @extern("C") IO primitives
 // Reader/Writer: IO trait
 // Console: print/println/eprint/eprintln/scan/scanln
 pub pack Raw

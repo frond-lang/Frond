@@ -1088,6 +1088,18 @@ impl<'a> Lexer<'a> {
                         }
                     }
                 }
+                b'x' => {
+                    // \xHH: exactly 2 hex digits, byte value 0x00-0xFF
+                    self.pos += 1;
+                    self.column += 1;
+                    for _ in 0..2 {
+                        if self.pos >= self.bytes.len() || !is_hex_digit(self.bytes[self.pos]) {
+                            return Err(LexerError::InvalidEscape);
+                        }
+                        self.pos += 1;
+                        self.column += 1;
+                    }
+                }
                 _ => {
                     return Err(LexerError::InvalidEscape);
                 }
@@ -1180,6 +1192,18 @@ impl<'a> Lexer<'a> {
                                 self.pos += 1;
                                 self.column += 1;
                             }
+                        }
+                    }
+                    b'x' => {
+                        // \xHH: exactly 2 hex digits, byte value 0x00-0xFF
+                        self.pos += 1;
+                        self.column += 1;
+                        for _ in 0..2 {
+                            if self.pos >= self.bytes.len() || !is_hex_digit(self.bytes[self.pos]) {
+                                return Err(LexerError::InvalidEscape);
+                            }
+                            self.pos += 1;
+                            self.column += 1;
                         }
                     }
                     _ => {
@@ -2800,12 +2824,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     /// Parse a primary type: named/generic, with suffix array `[N]`
     fn parse_primary_type(&mut self) -> ParseResult<TypeRef> {
         if self.check(TokenKind::LParen) {
-            // Bug #68: 支持 `(type)` 括号包裹的类型表达式（如 `((i32) -> i32)[]`）。
-            // 当括号内不是 record 字段模式（`identifier :`）时，解析为括号包裹的类型。
+            // Bug #68: support `(type)` parenthesized type expressions (e.g. `((i32) -> i32)[]`).
+            // When the parentheses do not contain a record field pattern (`identifier :`), parse as a parenthesized type.
             if self.is_paren_record_type() {
                 return self.parse_record_type();
             }
-            // 括号包裹的类型表达式：(T)
+            // Parenthesized type expression: (T)
             let span = token_span(&self.peek());
             self.advance(); // '('
             let inner = self.parse_type()?;
@@ -2898,19 +2922,19 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(ty)
     }
 
-    /// Lookahead: 判断括号内是否是 record 字段模式（`identifier :`）。
-    /// 用于区分 `(field: Type, ...)` record 类型和 `(T)` 括号包裹的类型表达式。
+    /// Lookahead: determine whether the parentheses contain a record field pattern (`identifier :`).
+    /// Used to distinguish between `(field: Type, ...)` record types and `(T)` parenthesized type expressions.
     fn is_paren_record_type(&self) -> bool {
         let mut i = self.current;
         if i >= self.tokens.len() || self.tokens[i].kind != TokenKind::LParen {
             return false;
         }
         i += 1; // skip '('
-        // 空括号 `()` 不是 record 类型（是空 record 或空类型）
+        // Empty parentheses `()` are not a record type (they are an empty record or empty type)
         if i >= self.tokens.len() || self.tokens[i].kind == TokenKind::RParen {
             return false;
         }
-        // 检查 `identifier :` 模式
+        // Check for the `identifier :` pattern
         if self.tokens[i].kind == TokenKind::Identifier {
             let next = i + 1;
             if next < self.tokens.len() && self.tokens[next].kind == TokenKind::Colon {
@@ -3469,6 +3493,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     }
                     continue;
                 }
+                // \xHH: skip the entire 4-character sequence to avoid mistaking
+                // hex-encoded braces (e.g. \x7b = '{') for interpolation start
+                if i + 1 < content.len() && bytes[i + 1] == b'x' {
+                    i += 4; // skip \xHH
+                    continue;
+                }
                 i += 2;
                 continue;
             }
@@ -3663,6 +3693,20 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                         };
                         let c = char::from_u32(code)
                             .expect("scan_string validated codepoint range");
+                        result.push(c);
+                    }
+                    b'x' => {
+                        // \xHH: exactly 2 hex digits, byte value 0x00-0xFF.
+                        // Lexical scanning (scan_string) has already validated the hex digits.
+                        j += 2; // skip \x
+                        let hex_end = std::cmp::min(j + 2, text.len());
+                        let hex_str = std::str::from_utf8(&bytes[j..hex_end])
+                            .expect("scan_string validated hex digits");
+                        j = hex_end;
+                        let code = u32::from_str_radix(hex_str, 16)
+                            .expect("scan_string validated hex digits");
+                        let c = char::from_u32(code)
+                            .expect("scan_string validated byte range 0x00-0xFF");
                         result.push(c);
                     }
                     _ => {
@@ -4631,6 +4675,16 @@ fn parse_char_value(lexeme: &str) -> u32 {
                     unreachable!("scan_char validated 4 hex digits without braces")
                 }
             }
+            b'x' => {
+                // \xHH: exactly 2 hex digits, byte value 0x00-0xFF.
+                // Lexical scanning (scan_char) has already validated the hex digits.
+                if content.len() >= 4 {
+                    let hex_str = &content[2..4];
+                    u32::from_str_radix(hex_str, 16).expect("scan_char validated hex digits")
+                } else {
+                    unreachable!("scan_char validated 2 hex digits")
+                }
+            }
             _ => bytes[1] as u32,
         };
     }
@@ -4662,6 +4716,12 @@ fn contains_interpolation(raw: &str) -> bool {
                     // \uXXXX without braces: skip 4 hex digits
                     i += 4;
                 }
+                continue;
+            }
+            // \xHH: skip the entire 4-character sequence to avoid mistaking
+            // hex-encoded braces (e.g. \x7b = '{') for interpolation start
+            if i + 1 < raw.len() && bytes[i + 1] == b'x' {
+                i += 4; // skip \xHH
                 continue;
             }
             i += 2;

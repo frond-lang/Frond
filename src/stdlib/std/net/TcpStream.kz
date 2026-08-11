@@ -1,21 +1,25 @@
-// TcpStream.kz — TCP 流
+// TcpStream.kz — TCP stream
 //
-// 设计文档 §6.3：TcpStream newtype + read/write/close。
-// 所有 IO 操作为 async，返回 Async<Throw<T, IOError>>。
-// 单次 read/write 语义（不循环阻塞，与 File.read 一致）。
+// Design doc §6.3: TcpStream newtype + read/write/close.
+// All IO operations are async, return Async<Throw<T, IOError>>.
+// Single-shot read/write semantics (no looping block, consistent with File.read).
 //
-// 底层 @extern("C") 原语（__net_tcp_connect_v4 / __net_tcp_close_raw 等）
-// 由 builtin/net/Raw.kz 声明。本文件定义 Kuzo wrapper 将 C 原始返回值转为 Throw。
-// async 函数体当前直接调用同步原语，等 IR/Engine 异步模型就绪后再补 spawn 语义。
+// Underlying @extern("C") primitives (__net_tcp_connect_v4 / __net_tcp_close_raw etc.)
+// are declared in builtin/net/Raw.kz. This file defines Kuzo wrappers that convert C raw
+// return values to Throw.
+// async function bodies currently call synchronous primitives directly; spawn semantics
+// will be added once the IR/Engine async model is ready.
 //
-// read_until 维护跨调用内部缓冲（rbuf/rpos/rcap），支持分隔符跨批量边界的正确扫描。
-// read 原语直接调 __net_tcp_read 不碰缓冲；二者缓冲隔离，混合使用需注意数据顺序。
+// read_until maintains an internal buffer across calls (rbuf/rpos/rcap), supporting correct
+// scanning of delimiters that span batch boundaries.
+// The read primitive calls __net_tcp_read directly without touching the buffer; the two
+// buffers are isolated, mixing them requires attention to data ordering.
 
-// ─── Kuzo wrapper：@extern("C") 原始返回值 → Throw ──────────────
+// ─── Kuzo wrapper: @extern("C") raw return value → Throw ──────────────
 
 // __net_tcp_connect(ip: IpAddr, port: u16, timeout_ns: i64): Throw<i64, IOError>
-// 从 IpAddr 提取 v4 bits，调用 __net_tcp_connect_v4
-// IPv6 暂不支持，抛 NotSupported
+// Extracts v4 bits from IpAddr, calls __net_tcp_connect_v4
+// IPv6 is not yet supported, throws NotSupported
 fun __net_tcp_connect(ip: IpAddr, port: u16, timeout_ns: i64): Throw<i64, IOError> {
     match ip {
         V4(v4_addr) => {
@@ -36,7 +40,7 @@ fun __net_tcp_connect(ip: IpAddr, port: u16, timeout_ns: i64): Throw<i64, IOErro
 }
 
 // __net_tcp_close(fd: i64): Throw<void, IOError>
-// TCP/UDP 共用 close（底层都是 close(fd)）
+// Shared close for TCP/UDP (both are close(fd) underneath)
 fun __net_tcp_close(fd: i64): Throw<void, IOError> {
     val rc = __net_tcp_close_raw(fd)
     if rc < 0 {
@@ -45,23 +49,25 @@ fun __net_tcp_close(fd: i64): Throw<void, IOError> {
     Ok(void)
 }
 
-// ─── 常量 ──────────────────────────────────────────────────────────
+// ─── Constants ──────────────────────────────────────────────────────────
 
 pub val DEFAULT_BUF_SIZE: usize = 8192
 
-// ─── 类型定义 ──────────────────────────────────────────────────────
+// ─── Type definitions ──────────────────────────────────────────────────────
 
-// TcpStream：newtype，fd 跨平台 i64 存储句柄
-// rbuf/rpos/rcap 为 read_until 的内部缓冲（懒分配），rpos 当前读位，rcap 已填充长度
+// TcpStream: newtype, fd is cross-platform i64 storage handle
+// rbuf/rpos/rcap are the internal buffer for read_until (lazily allocated); rpos is the
+// current read position, rcap is the filled length
 pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, rbuf: u8[], rpos: usize, rcap: usize) {
-    // 返回对端地址（构造时传入的 peer 地址）
+    // Returns the peer address (peer address passed in at construction)
     pub fun peer_addr(): SocketAddr {
         peer_addr
     }
 
-    // 从流读取数据，返回读到的字节数组（空数组 = EOF）。
-    // 单次 read 语义（不循环阻塞）。
-    // 当前直接调用同步 C 原语，等 IR/Engine 异步模型就绪后改为 spawn + channel 模式。
+    // Reads data from the stream, returns the byte array read (empty array = EOF).
+    // Single-shot read semantics (no looping block).
+    // Currently calls synchronous C primitive directly; will switch to spawn + channel
+    // mode once the IR/Engine async model is ready.
     pub async fun read(len: usize): Async<Throw<u8[], IOError>> {
         if is_closed {
             throw IOError(InvalidInput, "stream closed", 0, null)
@@ -74,7 +80,7 @@ pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, 
         Ok(buf[0..cast(n).to(usize)])
     }
 
-    // 向流写入数据，返回实际写入字节数。
+    // Writes data to the stream, returns the actual number of bytes written.
     pub async fun write(buf: u8[], len: usize): Async<Throw<usize, IOError>> {
         if is_closed {
             throw IOError(InvalidInput, "stream closed", 0, null)
@@ -86,7 +92,7 @@ pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, 
         Ok(cast(n).to(usize))
     }
 
-    // 关闭流。幂等：重复 close 不报错。
+    // Closes the stream. Idempotent: repeated close does not error.
     pub async fun close(): Async<Throw<void, IOError>> {
         if is_closed {
             Ok(void)
@@ -97,9 +103,9 @@ pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, 
         }
     }
 
-    // ─── 组合语义方法（基于 read/write 原语组合，纯 Kuzo 实现） ──────
+    // ─── Composite semantics methods (composed from read/write primitives, pure Kuzo) ──────
 
-    // 写入全部字节；write 返回 0 时抛 BrokenPipe（避免死循环）
+    // Writes all bytes; throws BrokenPipe when write returns 0 (avoids infinite loop)
     pub async fun write_all(buf: u8[], len: usize): Async<Throw<void, IOError>> {
         if is_closed {
             throw IOError(InvalidInput, "stream closed", 0, null)
@@ -116,20 +122,24 @@ pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, 
         Ok(void)
     }
 
-    // 读取直到遇到分隔符字节，返回包含分隔符在内的 u8[]
-    // 内部缓冲（rbuf/rpos/rcap）跨调用共享，支持分隔符跨批量边界的正确扫描：
-    //   - 先消费上次剩余缓冲 [rpos, rcap)，找到 delim 则切片返回
-    //   - 未找到则把剩余追加到 result，调 read 批量读取作为新缓冲再扫描
-    //   - EOF 时返回已累积的 result
-    // rbuf 直接引用 read 返回的数组（无需预分配）；缓冲仅 read_until 内部使用，
-    // read 原语不碰缓冲；二者混合使用会导致数据顺序错乱。
+    // Reads until the delimiter byte is encountered, returns u8[] including the delimiter
+    // Internal buffer (rbuf/rpos/rcap) is shared across calls, supporting correct scanning
+    // of delimiters that span batch boundaries:
+    //   - First consume the remaining buffer [rpos, rcap) from last time; if delim is found,
+    //     return the slice
+    //   - If not found, append the remainder to result, call read to batch-read as a new
+    //     buffer and scan again
+    //   - On EOF, return the accumulated result
+    // rbuf directly references the array returned by read (no pre-allocation needed); the
+    // buffer is only used internally by read_until, the read primitive does not touch the
+    // buffer; mixing the two will cause data ordering confusion.
     pub async fun read_until(delim: u8): Async<Throw<u8[], IOError>> {
         if is_closed {
             throw IOError(InvalidInput, "stream closed", 0, null)
         }
         var result: u8[] = []
         loop {
-            // 扫描缓冲 [rpos, rcap) 查找 delim
+            // Scan buffer [rpos, rcap) for delim
             var found = false
             val seg_start = rpos
             while rpos < rcap {
@@ -140,7 +150,7 @@ pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, 
                     break
                 }
             }
-            // 把本段（不含 delim，若 found 则到 delim 前一位）追加到 result
+            // Append this segment (excluding delim; if found, up to the position before delim) to result
             val seg_end = if found { rpos - 1 } else { rpos }
             if seg_end > seg_start {
                 result = result ++ rbuf[seg_start..seg_end]
@@ -148,10 +158,10 @@ pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, 
             if found {
                 return Ok(result ++ [delim])
             }
-            // 缓冲已扫完仍未找到 delim，读下一批作为新缓冲
+            // Buffer fully scanned but delim not found, read next batch as new buffer
             val chunk = read(DEFAULT_BUF_SIZE).await()?
             if chunk.len() == 0 {
-                // EOF：返回已累积内容（可能为空）
+                // EOF: return accumulated content (may be empty)
                 return Ok(result)
             }
             rbuf = chunk
@@ -161,15 +171,15 @@ pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, 
     }
 }
 
-// ─── 顶层 async 函数（"静态方法"语义） ───────────────────────────
+// ─── Top-level async functions ("static method" semantics) ───────────────────────────
 
-// 发起 TCP 连接。timeout_ns <= 0 时无超时。
+// Initiates a TCP connection. When timeout_ns <= 0, no timeout.
 pub async fun connect(addr: SocketAddr, timeout_ns: i64): Async<Throw<TcpStream, IOError>> {
     val fd = __net_tcp_connect(addr.ip, addr.port, timeout_ns)?
     Ok(TcpStream(fd, addr, false, [], 0, 0))
 }
 
-// 从 accept 返回的 fd 构造 TcpStream（服务端使用）。
+// Constructs a TcpStream from the fd returned by accept (used by the server side).
 // AcceptResult.stream_fd + AcceptResult.peer_addr → TcpStream
 pub fun from_accept_fd(fd: i64, peer: SocketAddr): TcpStream {
     TcpStream(fd, peer, false, [], 0, 0)

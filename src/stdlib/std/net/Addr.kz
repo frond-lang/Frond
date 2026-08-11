@@ -1,20 +1,20 @@
-// Addr.kz — IpAddr/Ipv4Addr/Ipv6Addr/SocketAddr 地址类型
+// Addr.kz — IpAddr/Ipv4Addr/Ipv6Addr/SocketAddr address types
 //
-// 设计文档 §6.2：网络地址类型与构造器/访问器。
-// 标量位存储（零浪费）：Ipv4Addr=u32, Ipv6Addr=hi/lo u64。
-// 类型采用 newtype/ADT 形式，以便 syscall 层通过
+// Design doc §6.2: network address types and constructors/accessors.
+// Scalar bit storage (zero waste): Ipv4Addr=u32, Ipv6Addr=hi/lo u64.
+// Types use newtype/ADT form so that values constructed by the syscall layer via
 // Value.makeRecordWithNames(type_name="Ipv4Addr"/"Ipv6Addr"/"IpAddr", ...)
-// 构造的值能在 Kuzo 端被识别。
+// can be recognized on the Kuzo side.
 //
-// 方法分派暂不支持，使用模块函数调用语法（参考 std_instant/Main.kz）：
+// Method dispatch is not yet supported; use module function call syntax (see std_instant/Main.kz):
 //   std.net.Addr.v4_loopback()
 //   std.net.Addr.v4_octet(addr, 0u8)
 
-// ─── 类型定义 ──────────────────────────────────────────────────────
+// ─── Type definitions ──────────────────────────────────────────────────────
 
-// Ipv4Addr：newtype，fields = [__tag=0, bits=u32]（网络字节序大端）
+// Ipv4Addr: newtype, fields = [__tag=0, bits=u32] (network byte order, big-endian)
 pub type Ipv4Addr = Ipv4Addr(bits: u32) {
-    // ─── Ipv4Addr 访问器 ──────────────────────────────────────────────
+    // ─── Ipv4Addr accessors ──────────────────────────────────────────────
 
     pub fun v4_octet(i: u8): u8 {
         val idx = u32(i)
@@ -35,9 +35,9 @@ pub type Ipv4Addr = Ipv4Addr(bits: u32) {
     }
 }
 
-// Ipv6Addr：newtype，fields = [__tag=0, hi=u64, lo=u64]（hi/lo 各 8 字节大端）
+// Ipv6Addr: newtype, fields = [__tag=0, hi=u64, lo=u64] (hi/lo each 8 bytes, big-endian)
 pub type Ipv6Addr = Ipv6Addr(hi: u64, lo: u64) {
-    // ─── Ipv6Addr 访问器 ──────────────────────────────────────────────
+    // ─── Ipv6Addr accessors ──────────────────────────────────────────────
 
     pub fun v6_segment(i: u8): u16 {
         val idx = u64(i)
@@ -63,7 +63,7 @@ pub type Ipv6Addr = Ipv6Addr(hi: u64, lo: u64) {
     }
 }
 
-// IpAddr：ADT，V4(__tag=0, addr=Ipv4Addr) | V6(__tag=1, addr=Ipv6Addr)
+// IpAddr: ADT, V4(__tag=0, addr=Ipv4Addr) | V6(__tag=1, addr=Ipv6Addr)
 pub type IpAddr = | V4(Ipv4Addr) | V6(Ipv6Addr) {
     pub fun ip_is_v4(): bool {
         match this {
@@ -80,7 +80,7 @@ pub type IpAddr = | V4(Ipv4Addr) | V6(Ipv6Addr) {
     }
 }
 
-// SocketAddr：newtype，fields = [__tag=0, ip=IpAddr, port=u16]
+// SocketAddr: newtype, fields = [__tag=0, ip=IpAddr, port=u16]
 pub type SocketAddr = SocketAddr(ip: IpAddr, port: u16) {
     pub fun socket_ip(): IpAddr {
         ip
@@ -91,7 +91,7 @@ pub type SocketAddr = SocketAddr(ip: IpAddr, port: u16) {
     }
 }
 
-// ─── Ipv4Addr 构造器 ──────────────────────────────────────────────
+// ─── Ipv4Addr constructors ──────────────────────────────────────────────
 
 pub fun v4_from_octets(a: u8, b: u8, c: u8, d: u8): Ipv4Addr {
     Ipv4Addr((u32(a) << 24u32) | (u32(b) << 16u32) | (u32(c) << 8u32) | u32(d))
@@ -109,7 +109,7 @@ pub fun v4_unspecified(): Ipv4Addr {
     v4_from_bits(0u32)
 }
 
-// ─── Ipv6Addr 构造器 ──────────────────────────────────────────────
+// ─── Ipv6Addr constructors ──────────────────────────────────────────────
 
 pub fun v6_from_segments(w0: u16, w1: u16, w2: u16, w3: u16, w4: u16, w5: u16, w6: u16, w7: u16): Ipv6Addr {
     val hi = (u64(w0) << 48u64) | (u64(w1) << 32u64) | (u64(w2) << 16u64) | u64(w3)
@@ -129,7 +129,7 @@ pub fun v6_unspecified(): Ipv6Addr {
     v6_from_bits(0u64, 0u64)
 }
 
-// ─── IpAddr 构造器与判断 ──────────────────────────────────────────
+// ─── IpAddr constructors and predicates ──────────────────────────────────
 
 pub fun ip_from_v4(addr: Ipv4Addr): IpAddr {
     V4(addr)

@@ -1,11 +1,11 @@
-// Math 标准库 — 舍入取整
+// Math standard library — Rounding and integer operations
 //
-// 包含: floor/ceil/round/trunc/fabs/copysign/fmod/ldexp
-// 纯 Kuzo 实现，无 FFI 依赖。
-// 泛型函数使用 match type_name(x) 按类型分发到对应精度实现。
+// Contains: floor/ceil/round/trunc/fabs/copysign/fmod/ldexp
+// Pure Kuzo implementation, no FFI dependency.
+// Generic functions use match type_name(x) to dispatch to corresponding precision implementations by type.
 
-// ─── trunc（向零截断）───
-// 利用 cast 到整数再转回来实现截断
+// ─── trunc (truncation toward zero) ───
+// Implemented by casting to integer and back to achieve truncation
 
 fun trunc_f64_impl(x: f64): f64 {
     cast(cast(x).to(i64)).to(f64)
@@ -30,7 +30,7 @@ pub fun trunc<T>(x: T): T {
     }
 }
 
-// ─── floor（向负无穷取整）───
+// ─── floor (rounding toward negative infinity) ───
 
 fun floor_f64_impl(x: f64): f64 {
     val t = trunc_f64_impl(x)
@@ -59,7 +59,7 @@ pub fun floor<T>(x: T): T {
     }
 }
 
-// ─── ceil（向正无穷取整）───
+// ─── ceil (rounding toward positive infinity) ───
 
 fun ceil_f64_impl(x: f64): f64 {
     val t = trunc_f64_impl(x)
@@ -88,7 +88,7 @@ pub fun ceil<T>(x: T): T {
     }
 }
 
-// ─── round（四舍五入到最近整数）───
+// ─── round (round to nearest integer) ───
 
 fun round_f64_impl(x: f64): f64 {
     val t = trunc_f64_impl(x)
@@ -129,7 +129,7 @@ pub fun round<T>(x: T): T {
     }
 }
 
-// ─── fabs（绝对值，浮点专用）───
+// ─── fabs (absolute value, floating point only) ───
 
 pub fun fabs<T>(x: T): T {
     match type_name(x) {
@@ -141,7 +141,7 @@ pub fun fabs<T>(x: T): T {
     }
 }
 
-// ─── copysign（取 y 的符号赋给 x）───
+// ─── copysign (take sign of y and assign to x) ───
 
 pub fun copysign<T>(x: T, y: T): T {
     match type_name(x) {
@@ -169,7 +169,7 @@ pub fun copysign<T>(x: T, y: T): T {
     }
 }
 
-// ─── fmod（浮点取模，结果与 x 同号）───
+// ─── fmod (floating point modulo, result has same sign as x) ───
 
 fun fmod_f64_impl(x: f64, y: f64): f64 {
     if y == 0.0 { return 0.0 / 0.0 }
@@ -206,8 +206,8 @@ pub fun fmod<T>(x: T, y: T): T {
     }
 }
 
-// ─── ldexp（x * 2^exp）───
-// 通过重复乘 2 实现
+// ─── ldexp (x * 2^exp) ───
+// Implemented by repeated multiplication by 2
 
 fun ldexp_f64_impl(x: f64, exp: i32): f64 {
     var result = x
@@ -272,9 +272,9 @@ pub fun ldexp<T>(x: T, exp: i32): T {
     }
 }
 
-// ─── frexp（分解为尾数 m∈[0.5,1) 和指数 e，x = m * 2^e）───
-// x==0 → m=0,e=0；NaN/Inf 原样返回 m=x,e=0
-// Kuzo 无元组，拆为 frexp_mantissa 与 frexp_exponent 两个函数
+// ─── frexp (decompose into mantissa m∈[0.5,1) and exponent e, x = m * 2^e) ───
+// x==0 → m=0,e=0; NaN/Inf returned as-is with m=x,e=0
+// Kuzo has no tuples, split into frexp_mantissa and frexp_exponent two functions
 
 fun frexp_f64_mantissa_impl(x: f64): f64 {
     if x == 0.0 { return 0.0 }
@@ -397,8 +397,8 @@ pub fun frexp_exponent<T>(x: T): i32 {
     }
 }
 
-// ─── modf（分离整数和小数部分，符号均与 x 相同）───
-// integral = trunc(x)；fractional = x - trunc(x)
+// ─── modf (separate integer and fractional parts, both with same sign as x) ───
+// integral = trunc(x); fractional = x - trunc(x)
 
 fun modf_f64_integral_impl(x: f64): f64 { trunc_f64_impl(x) }
 fun modf_f64_fractional_impl(x: f64): f64 { x - trunc_f64_impl(x) }
@@ -429,8 +429,8 @@ pub fun modf_fractional<T>(x: T): T {
     }
 }
 
-// ─── ilogb（以 2 为底的指数，整数返回）───
-// x = m * 2^e, m∈[1,2)，返回 e；x==0 返回 0（简化）；NaN/Inf 返回 0
+// ─── ilogb (base-2 exponent, integer return) ───
+// x = m * 2^e, m∈[1,2), return e; x==0 returns 0 (simplified); NaN/Inf returns 0
 
 fun ilogb_f64_impl(x: f64): i32 {
     if x == 0.0 { return 0 }
@@ -507,7 +507,7 @@ pub fun ilogb<T>(x: T): i32 {
     }
 }
 
-// ─── logb（以 2 为底的指数，浮点返回）───
+// ─── logb (base-2 exponent, floating point return) ───
 // logb(x) = cast(ilogb(x)).to(T)
 
 fun logb_f64_impl(x: f64): f64 { cast(ilogb_f64_impl(x)).to(f64) }
@@ -525,7 +525,7 @@ pub fun logb<T>(x: T): T {
     }
 }
 
-// ─── scalbn（x * 2^n，与 ldexp 同语义，数学函数命名）───
+// ─── scalbn (x * 2^n, same semantics as ldexp, math function naming) ───
 
 fun scalbn_f64_impl(x: f64, n: i32): f64 { ldexp_f64_impl(x, n) }
 fun scalbn_f32_impl(x: f32, n: i32): f32 { ldexp_f32_impl(x, n) }

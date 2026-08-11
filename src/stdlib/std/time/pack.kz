@@ -1,6 +1,6 @@
-// std/time 包声明
+// std/time package declaration
 //
-// 暴露 Time 子模块给用户代码：import std.time.DateTime 等可访问公开符号。
+// Exposes the Time submodules to user code: import std.time.DateTime etc. to access public symbols.
 pub pack Duration
 pub pack Instant
 pub pack SystemTime

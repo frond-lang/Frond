@@ -1,9 +1,10 @@
-// builtin error 包声明（决策 #20：子目录需要 pack.kz）
+// builtin error package declaration (decision #20: subdirectories need a pack.kz)
 //
-// 暴露 Err / Error / CastError / IOError / TimeError 给所有 Kuzo 用户代码默认可见（决策 #19：默认全可见）。
-// builtin 包不通过普通 import 机制加载，而是由 sema 启动时直接注册到全局环境。
+// Exposes Err / Error / CastError / IOError / TimeError to all Kuzo user code as visible by default (decision #19: fully visible by default).
+// builtin packages are not loaded via the normal import mechanism, but are registered directly into the global environment by sema at startup.
 pub pack Err
 pub pack Error
 pub pack CastError
 pub pack IOError
 pub pack TimeError
+pub pack TerminalError

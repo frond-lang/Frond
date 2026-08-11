@@ -172,7 +172,7 @@ macro_rules! impl_bitops {
                 fn bit_xor(self, other: Self) -> Self { self ^ other }
                 fn bit_not(self) -> Self { !self }
                 fn shl(self, amount: u32) -> Self {
-                    // SIMD 批处理路径：shift 越界返回原值（wrapping 语义），单节点路径返回 Throw
+                    // SIMD batch path: shift out of bounds returns the original value (wrapping semantics); single-node path returns Throw
                     if amount >= Self::BITS { self } else { self.wrapping_shl(amount) }
                 }
                 fn shr(self, amount: u32) -> Self {
@@ -637,13 +637,13 @@ where
 #[inline]
 fn binop_scalar_t<T: Num + BitOps>(a: T, b: T, op: BinOp) -> T {
     match op {
-        // Bug #75: 统一 wrapping 语义（与 Bug #22 一致）。
-        // 整数 wrapping_add/sub/mul 回绕；浮点 wrapping_* 等价于 native + - *（Num trait 实现）。
+        // Bug #75: unified wrapping semantics (consistent with Bug #22).
+        // Integer wrapping_add/sub/mul wraps; floating point wrapping_* is equivalent to native + - * (Num trait implementation).
         BinOp::Add => a.wrapping_add(b),
         BinOp::Sub => a.wrapping_sub(b),
         BinOp::Mul => a.wrapping_mul(b),
-        // SIMD 批处理路径：除零返回 0（wrapping 语义），单节点路径返回 Throw。
-        // 浮点 checked_div/checked_rem 始终返回 Some（native / 产生 inf/nan），不触发 panic。
+        // SIMD batch path: divide-by-zero returns 0 (wrapping semantics); single-node path returns Throw.
+        // Floating point checked_div/checked_rem always returns Some (native / produces inf/nan), does not trigger panic.
         BinOp::Div => a.checked_div(b).unwrap_or_else(T::zero),
         BinOp::Mod => a.checked_rem(b).unwrap_or_else(T::zero),
         BinOp::Band => a.bit_and(b),
@@ -660,7 +660,7 @@ where T: Num + BitOps {
     let n = dst.len().min(a.len());
     for i in 0..n {
         dst[i] = match op {
-            // Bug #75: 统一 wrapping 语义（与 Bug #22 一致）。
+            // Bug #75: unified wrapping semantics (consistent with Bug #22).
             UnaryOp::Neg => a[i].wrapping_neg(),
             UnaryOp::Abs => a[i].abs(),
             UnaryOp::Bnot => a[i].bit_not(),
@@ -856,7 +856,7 @@ fn binop_i32_scalar(a: i32, b: i32, op: BinOp) -> i32 {
         BinOp::Add => a.wrapping_add(b),
         BinOp::Sub => a.wrapping_sub(b),
         BinOp::Mul => a.wrapping_mul(b),
-        // SIMD 批处理路径：除零返回 0（wrapping 语义），单节点路径返回 Throw
+        // SIMD batch path: divide-by-zero returns 0 (wrapping semantics); single-node path returns Throw
         BinOp::Div => if b == 0 { 0 } else { a.wrapping_div(b) },
         BinOp::Mod => if b == 0 { 0 } else { a.wrapping_rem(b) },
         BinOp::Band => a & b,
@@ -932,7 +932,7 @@ fn binop_i64_scalar(a: i64, b: i64, op: BinOp) -> i64 {
         BinOp::Add => a.wrapping_add(b),
         BinOp::Sub => a.wrapping_sub(b),
         BinOp::Mul => a.wrapping_mul(b),
-        // SIMD 批处理路径：除零返回 0（wrapping 语义），单节点路径返回 Throw
+        // SIMD batch path: divide-by-zero returns 0 (wrapping semantics); single-node path returns Throw
         BinOp::Div => if b == 0 { 0 } else { a.wrapping_div(b) },
         BinOp::Mod => if b == 0 { 0 } else { a.wrapping_rem(b) },
         BinOp::Band => a & b,
@@ -1103,7 +1103,7 @@ macro_rules! impl_simd_int_binop {
                 BinOp::Add => a.wrapping_add(b),
                 BinOp::Sub => a.wrapping_sub(b),
                 BinOp::Mul => a.wrapping_mul(b),
-                // SIMD 批处理路径：除零返回 0（wrapping 语义），单节点路径返回 Throw
+                // SIMD batch path: divide-by-zero returns 0 (wrapping semantics); single-node path returns Throw
                 BinOp::Div => if b == 0 { 0 } else { a.wrapping_div(b) },
                 BinOp::Mod => if b == 0 { 0 } else { a.wrapping_rem(b) },
                 BinOp::Band => a & b,
@@ -1179,7 +1179,7 @@ macro_rules! impl_simd_int_binop_no_mul {
                 BinOp::Add => a.wrapping_add(b),
                 BinOp::Sub => a.wrapping_sub(b),
                 BinOp::Mul => a.wrapping_mul(b),
-                // SIMD 批处理路径：除零返回 0（wrapping 语义），单节点路径返回 Throw
+                // SIMD batch path: divide-by-zero returns 0 (wrapping semantics); single-node path returns Throw
                 BinOp::Div => if b == 0 { 0 } else { a.wrapping_div(b) },
                 BinOp::Mod => if b == 0 { 0 } else { a.wrapping_rem(b) },
                 BinOp::Band => a & b,
@@ -1390,7 +1390,7 @@ impl_simd_unsigned_cmp!(u64, u64x4, 4);
 // =========================================================================
 //
 // Generates pure arithmetic functions for all integer/float types. Semantics strictly match the compute_fn macro in Engine.rs:
-//   - Integer add/sub/mul/neg: wrapping 语义（与 Bug #22 一致；Bug #75 统一为 wrapping，无 debug/release 分支）
+//   - Integer add/sub/mul/neg: wrapping semantics (consistent with Bug #22; Bug #75 unified to wrapping, no debug/release branch)
 //   - Integer div/mod: divide-by-zero panics (no silent fallback)
 //   - Integer shl/shr: shift amount is i32 (matching Engine.rs reading as_i32), cast to u32 then wrapping
 //   - Float div: native division (divide-by-zero yields inf/nan)
@@ -1404,13 +1404,13 @@ macro_rules! impl_arith_int {
             #[inline] pub fn [<arith_add_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_add(b) }
             #[inline] pub fn [<arith_sub_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_sub(b) }
             #[inline] pub fn [<arith_mul_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_mul(b) }
-            /// 除零返回 None，由调用方转为 Throw 错误值传播（与 compute_str_concat 一致）。
+            /// Divide-by-zero returns None; the caller converts it to a Throw error value for propagation (consistent with compute_str_concat).
             #[inline] pub fn [<arith_div_$ty>](a: $rust, b: $rust) -> Option<$rust> { if b == 0 { None } else { Some(a.wrapping_div(b)) } }
             #[inline] pub fn [<arith_mod_$ty>](a: $rust, b: $rust) -> Option<$rust> { if b == 0 { None } else { Some(a.wrapping_rem(b)) } }
             #[inline] pub fn [<arith_bitand_$ty>](a: $rust, b: $rust) -> $rust { a & b }
             #[inline] pub fn [<arith_bitor_$ty>](a: $rust, b: $rust) -> $rust { a | b }
             #[inline] pub fn [<arith_bitxor_$ty>](a: $rust, b: $rust) -> $rust { a ^ b }
-            /// shift 越界（负数或 ≥ 类型位宽）返回 None，由调用方转为 Throw 错误值。
+            /// Shift out of bounds (negative or >= type bit width) returns None; the caller converts it to a Throw error value.
             #[inline] pub fn [<arith_shl_$ty>](a: $rust, shift: i32) -> Option<$rust> {
                 if shift < 0 || shift as u32 >= <$rust>::BITS { None } else { Some(a.wrapping_shl(shift as u32)) }
             }

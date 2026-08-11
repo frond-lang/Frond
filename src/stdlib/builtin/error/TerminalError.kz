@@ -1,0 +1,26 @@
+// TerminalError: error type returned when a terminal operation fails
+//
+// Usage:
+//   - std/terminal/Session.kz wraps raw mode / size query / write primitives and
+//     returns Throw<_, TerminalError> when the underlying host call fails.
+//   - Field semantics:
+//       kind : error category (exhaustive ADT, used for match handling)
+//       msg  : error description (human readable)
+//       code : host raw return code (negative errno on POSIX, HRESULT-ish on Windows; 0 if N/A)
+//
+// As a builtin error_newtype, it automatically gets the Err trait's message() default
+// implementation (reads the msg field). type_name() override returns "terminal error".
+type TerminalError: Err = TerminalError(
+    kind: TerminalErrorKind,
+    msg: str,
+    code: i32,
+) {
+    override fun type_name(): str { "terminal error" }
+}
+
+// Terminal error categories (exhaustive ADT)
+type TerminalErrorKind =
+    | RawModeFailed      // failed to enable/disable raw mode (tcsetattr / SetConsoleMode)
+    | SizeQueryFailed    // failed to query terminal size (ioctl / GetConsoleScreenBufferInfo)
+    | WriteFailed        // failed to write bytes to terminal (write / WriteFile)
+    | Other              // unclassified (check code field)

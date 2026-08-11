@@ -1,12 +1,12 @@
-// builtin/net/Raw.kz — Net 原语 @extern("C") 声明（builtin，默认可见）
+// builtin/net/Raw.kz — Net primitives @extern("C") declarations (builtin, visible by default)
 //
-// 底层 POSIX/Windows 网络能力，由 cc crate 从 emit-c 生成的 .c 编译。
+// Low-level POSIX/Windows network capabilities, compiled from emit-c generated .c by the cc crate.
 //
-// 设计说明：
-// - IpAddr/Ipv6Addr 等 record 类型由 Kuzo 侧 wrapper 拆解为标量后调用本层。
-// - 例如 __net_tcp_connect_v4 接收 u32 ip_bits，由 std/net/TcpStream.kz 中的
-//   connect wrapper 从 IpAddr.V4(Ipv4Addr(bits)) 中提取 bits 后传入。
-// - 超时参数 timeout_ns: i64，<0 表示无限等待。
+// Design notes:
+// - IpAddr/Ipv6Addr and other record types are decomposed into scalars by the Kuzo-side wrapper before calling this layer.
+// - For example, __net_tcp_connect_v4 receives u32 ip_bits; the connect wrapper in std/net/TcpStream.kz
+//   extracts bits from IpAddr.V4(Ipv4Addr(bits)) and passes it in.
+// - Timeout parameter timeout_ns: i64, <0 means infinite wait.
 
 @c_include("sys/socket.h")
 @c_include("netinet/in.h")
@@ -138,19 +138,19 @@ fun __net_udp_recv_from_v4(fd: i64, buf: u8[], len: usize): i64 #{
     return (int64_t)n;
 }#
 
-// ─── DNS 解析（out-buffer 模式）──────────────────────────────────
+// ─── DNS resolution (out-buffer mode) ──────────────────────────────────
 //
-// 底层标量能力下沉：C 层用 getaddrinfo 解析主机名，将数字地址填入 out_buf。
-// 上层运行时 builtin（__net_resolve）调用本原语后，从 buffer 组装 IpAddr[] 堆对象。
+// Low-level scalar capability: the C layer uses getaddrinfo to resolve hostnames and fills the numeric address into out_buf.
+// The upper-layer runtime builtin (__net_resolve) calls this primitive, then assembles an IpAddr[] heap object from the buffer.
 //
-// out_buf 布局：每个条目 17 字节
-//   [0..16)  地址（family=4 时前 4 字节有效，family=6 时全 16 字节有效）
-//   [16]     family（4=IPv4, 6=IPv6）
+// out_buf layout: each entry is 17 bytes
+//   [0..16)  address (first 4 bytes valid when family=4, all 16 bytes valid when family=6)
+//   [16]     family (4=IPv4, 6=IPv6)
 //
-// 返回值：
-//   >=0  实际解析到的地址数
-//   -1   解析失败（域名不存在 / 网络错误）
-//   -2   out_buf 容量不足（需要 max_count*17 字节）
+// Return value:
+//   >=0  number of addresses actually resolved
+//   -1   resolution failed (domain does not exist / network error)
+//   -2   out_buf capacity insufficient (needs max_count*17 bytes)
 @c_include("sys/types.h")
 @c_include("netdb.h")
 @c_include("netinet/in.h")
@@ -185,12 +185,12 @@ fun __net_resolve_into(host: str, out_buf: u8[], max_count: usize): i64 #{
     return (int64_t)count;
 }#
 
-// ─── IPv6 TCP/UDP 原语 ───────────────────────────────────────────
+// ─── IPv6 TCP/UDP primitives ───────────────────────────────────────────
 //
-// Ipv6Addr 在 Kuzo 侧用 (hi: u64, lo: u64) 大端存储。
-// C 侧 struct in6_addr 是 16 字节数组，本层负责 hi/lo → in6_addr 组装：
-//   bytes[0..8)  = hi 大端
-//   bytes[8..16) = lo 大端
+// Ipv6Addr is stored big-endian as (hi: u64, lo: u64) on the Kuzo side.
+// The C-side struct in6_addr is a 16-byte array; this layer assembles hi/lo → in6_addr:
+//   bytes[0..8)  = hi big-endian
+//   bytes[8..16) = lo big-endian
 
 @c_include("sys/socket.h")
 @c_include("netinet/in.h")
@@ -270,7 +270,7 @@ fun __net_tcp_listen_v6(ip_hi: u64, ip_lo: u64, port: u16, reuse_addr: bool): i6
     return (int64_t)fd;
 }#
 
-// __net_tcp_accept 通用（v4/v6 共用），read/write/close 也通用，无需 v6 版本
+// __net_tcp_accept is generic (shared by v4/v6), read/write/close are also generic, no v6 version needed
 
 @c_include("sys/socket.h")
 @c_include("netinet/in.h")

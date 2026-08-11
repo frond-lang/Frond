@@ -1,10 +1,10 @@
-// Math 标准库 — 通用函数 + 常量 + NaN/Inf
+// Math standard library — General functions + constants + NaN/Inf
 //
-// 纯 Kuzo 实现，零 FFI 依赖。
-// NaN/Inf 利用 IEEE 754 浮点除零语义构造。
-// 泛型函数使用 match type_name(x) 按类型分发到对应精度实现。
+// Pure Kuzo implementation, zero FFI dependency.
+// NaN/Inf constructed using IEEE 754 floating point division by zero semantics.
+// Generic functions use match type_name(x) to dispatch to corresponding precision implementations by type.
 
-// ─── f64 常量（十六进制浮点字面量，IEEE 754 精确位模式）───
+// ─── f64 constants (hexadecimal floating point literals, IEEE 754 exact bit patterns) ───
 pub val PI: f64      = 0x1.921fb54442d18p+1
 pub val E: f64       = 0x1.5bf0a8b145769p+1
 pub val LN2: f64     = 0x1.62e42fefa39efp-1
@@ -13,21 +13,21 @@ pub val SQRT2: f64   = 0x1.6a09e667f3bcdp+0
 pub val LOG2E: f64   = 0x1.71547652b82fep+0
 pub val LOG10E: f64  = 0x1.bcb7b1526e50ep-2
 
-// ─── f32 常量 ───
+// ─── f32 constants ───
 pub val PI_F32: f32    = 0x1.921fb6p+1f32
 pub val E_F32: f32     = 0x1.5bf0a8p+1f32
 pub val LN2_F32: f32   = 0x1.62e43p-1f32
 
-// ─── f128 高精度常量（十六进制浮点字面量，IEEE 754 binary128 精确位模式）───
+// ─── f128 high-precision constants (hexadecimal floating point literals, IEEE 754 binary128 exact bit patterns) ───
 pub val PI_F128: f128  = 0x1.921fb54442d18469898cc51701b8p+1f128
 pub val E_F128: f128   = 0x1.5bf0a8b1457695355fb8ac404e7ap+1f128
 pub val LN2_F128: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1f128
 
-// ─── f16 常量 ───
+// ─── f16 constants ───
 pub val PI_F16: f16    = 0x1.92p+1f16
 pub val E_F16: f16     = 0x1.5cp+1f16
 
-// ─── NaN/Inf 构造（纯 Kuzo 语义，利用 IEEE 754 浮点除零）───
+// ─── NaN/Inf construction (pure Kuzo semantics, using IEEE 754 floating point division by zero) ───
 // 0.0/0.0 = NaN, 1.0/0.0 = +Inf, -1.0/0.0 = -Inf
 
 pub fun nan_f64(): f64       { 0.0 / 0.0 }
@@ -46,7 +46,7 @@ pub fun nan_f128(): f128     { 0.0 / 0.0 }
 pub fun inf_f128(): f128     { 1.0 / 0.0 }
 pub fun neg_inf_f128(): f128 { -1.0 / 0.0 }
 
-// ─── NaN/Inf 检测（利用 IEEE 754: NaN != NaN）───
+// ─── NaN/Inf detection (using IEEE 754: NaN != NaN) ───
 
 pub fun is_nan_f64(x: f64): bool { x != x }
 pub fun is_inf_f64(x: f64): bool { x == 1.0 / 0.0 || x == -1.0 / 0.0 }
@@ -60,7 +60,7 @@ pub fun is_inf_f16(x: f16): bool { x == 1.0 / 0.0 || x == -1.0 / 0.0 }
 pub fun is_nan_f128(x: f128): bool { x != x }
 pub fun is_inf_f128(x: f128): bool { x == 1.0 / 0.0 || x == -1.0 / 0.0 }
 
-// ─── abs（泛型，按类型分发；无符号为 no-op）───
+// ─── abs (generic, dispatch by type; unsigned is no-op) ───
 
 fun abs_i8_impl(x: i8): i8 { if x < 0 { 0 - x } else { x } }
 fun abs_i16_impl(x: i16): i16 { if x < 0 { 0 - x } else { x } }
@@ -89,7 +89,7 @@ pub fun abs<T>(x: T): T {
     }
 }
 
-// ─── min/max（泛型，直接比较）───
+// ─── min/max (generic, direct comparison) ───
 
 pub fun min<T>(a: T, b: T): T {
     if a < b { a } else { b }
@@ -99,13 +99,13 @@ pub fun max<T>(a: T, b: T): T {
     if a > b { a } else { b }
 }
 
-// ─── clamp（泛型，x 限制在 [lo, hi] 范围内）───
+// ─── clamp (generic, clamp x within [lo, hi] range) ───
 
 pub fun clamp<T>(x: T, lo: T, hi: T): T {
     if x < lo { lo } else if x > hi { hi } else { x }
 }
 
-// ─── sign（泛型，返回 -1/0/1 同类型）───
+// ─── sign (generic, return -1/0/1 of same type) ───
 
 pub fun sign<T>(x: T): T {
     match type_name(x) {
@@ -129,9 +129,9 @@ pub fun sign<T>(x: T): T {
     }
 }
 
-// ─── 浮点分类检测 ───
+// ─── Floating point classification detection ───
 
-// isfinite: NaN/Inf → false，其余 → true（整数恒为 true）
+// isfinite: NaN/Inf → false, others → true (integers always true)
 pub fun isfinite<T>(x: T): bool {
     match type_name(x) {
         "f64" => {
@@ -154,7 +154,7 @@ pub fun isfinite<T>(x: T): bool {
     }
 }
 
-// signbit: 负数或 -0.0 → true，其余 → false
+// signbit: negative or -0.0 → true, others → false
 fun signbit_f64_impl(x: f64): bool {
     x < 0.0 || (x == 0.0 && (1.0 / x) < 0.0)
 }
@@ -184,8 +184,8 @@ pub fun signbit<T>(x: T): bool {
     }
 }
 
-// isnormal: 非零、有限、且指数在正常范围内（非 subnormal）
-// 算法：提取指数 e 使 |x|/2^e ∈ [1,2)，检查 e 是否在正常范围内
+// isnormal: non-zero, finite, and exponent in normal range (not subnormal)
+// Algorithm: extract exponent e so |x|/2^e ∈ [1,2), check whether e is in normal range
 fun isnormal_f64_impl(x: f64): bool {
     if is_nan_f64(x) || is_inf_f64(x) { return false }
     if x == 0.0 { return false }
@@ -257,16 +257,16 @@ pub fun isnormal<T>(x: T): bool {
     }
 }
 
-// ─── wrapping 算术（Kuzo 整数运算已使用 wrapping 语义，此处提供显式 API）───
+// ─── wrapping arithmetic (Kuzo integer operations already use wrapping semantics, here providing explicit API) ───
 
 pub fun wrapping_add<T>(a: T, b: T): T { a + b }
 pub fun wrapping_sub<T>(a: T, b: T): T { a - b }
 pub fun wrapping_mul<T>(a: T, b: T): T { a * b }
 
-// ─── 整数位工具 ───
-// 按位宽（8/16/32/64/128）提供实现，有符号类型经 cast 到无符号后复用
+// ─── Integer bit tools ───
+// Provide implementations by bit width (8/16/32/64/128), signed types reuse after cast to unsigned
 
-// is_power_of_two: x > 0 且仅有一位为 1
+// is_power_of_two: x > 0 and only one bit is 1
 fun is_pow2_8_impl(x: u8): bool { x != 0 && (x & (x - 1)) == 0 }
 fun is_pow2_16_impl(x: u16): bool { x != 0 && (x & (x - 1)) == 0 }
 fun is_pow2_32_impl(x: u32): bool { x != 0 && (x & (x - 1)) == 0 }
@@ -291,7 +291,7 @@ pub fun is_power_of_two<T>(x: T): bool {
     }
 }
 
-// count_ones: Brian Kernighan 算法，清除最低位直到归零
+// count_ones: Brian Kernighan algorithm, clear lowest bit until zero
 fun count_ones_8_impl(x: u8): u8 {
     var c = 0
     var v = x
@@ -356,7 +356,7 @@ pub fun count_ones<T>(x: T): T {
     }
 }
 
-// leading_zeros: 从 MSB 扫描连续 0 位
+// leading_zeros: scan consecutive 0 bits from MSB
 fun leading_zeros_8_impl(x: u8): u8 {
     if x == 0 { return 8 }
     var c = 0
@@ -426,7 +426,7 @@ pub fun leading_zeros<T>(x: T): T {
     }
 }
 
-// trailing_zeros: 从 LSB 扫描连续 0 位
+// trailing_zeros: scan consecutive 0 bits from LSB
 fun trailing_zeros_8_impl(x: u8): u8 {
     if x == 0 { return 8 }
     var c = 0
@@ -496,7 +496,7 @@ pub fun trailing_zeros<T>(x: T): T {
     }
 }
 
-// next_power_of_two: 位填充法，v |= v>>1|2|4|... 后 +1
+// next_power_of_two: bit filling method, v |= v>>1|2|4|... then +1
 fun next_pow2_8_impl(x: u8): u8 {
     if x <= 1 { return 1 }
     var v = x - 1
@@ -566,7 +566,7 @@ pub fun next_power_of_two<T>(x: T): T {
     }
 }
 
-// rotate_left: (x << n) | (x >> (bits - n))，wrapping 移位自动处理 n >= bits
+// rotate_left: (x << n) | (x >> (bits - n)), wrapping shift automatically handles n >= bits
 fun rotate_left_8_impl(x: u8, n: u8): u8 { (x << n) | (x >> (8 - n)) }
 fun rotate_left_16_impl(x: u16, n: u16): u16 { (x << n) | (x >> (16 - n)) }
 fun rotate_left_32_impl(x: u32, n: u32): u32 { (x << n) | (x >> (32 - n)) }

@@ -1,6 +1,6 @@
-// std/net 包声明
+// std/net package declaration
 //
-// 暴露 Net 子模块给用户代码：import std.net.TcpStream 等可访问公开符号。
+// Exposes the Net submodules to user code: import std.net.TcpStream etc. to access public symbols.
 pub pack Addr
 pub pack TcpListener
 pub pack TcpStream
