@@ -284,6 +284,11 @@ impl<S: LockStrategy> Engine<S> {
             let node_count = (node_end.0 - node_start.0) as usize;
             let offset = node_start.0 as usize;
 
+            if std::env::var("KUZO_DEBUG_CALL").is_ok() && node_count == 0 {
+                eprintln!("[SUBGRAPH-ZERO] sg={} has 0 nodes! node_range=[{:?},{:?}) param_count={} — function body was NOT compiled (placeholder)",
+                    subgraph_id.0, node_start, node_end, child_sg.param_count);
+            }
+
             let mut child = self.acquire_frame(child_fid, subgraph_id, node_count);
             self.prepare_frame(&mut child);
 

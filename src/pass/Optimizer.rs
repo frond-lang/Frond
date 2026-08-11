@@ -1165,7 +1165,9 @@ pub fn optimize_with_analysis(
         if !no_licm   { pass_licm(graph, &mut ctx, analysis); }
         if !no_unroll { pass_loop_unroll(graph, &mut ctx, analysis); }
         if ctx.has_changes() {
+            check_gate_in_branch(graph, "BEFORE phase1 rebuild");
             graph.rebuild(&ctx.dead, &ctx.redirect);
+            check_gate_in_branch(graph, "AFTER phase1 rebuild");
         }
     }
 
@@ -1192,7 +1194,9 @@ pub fn optimize_with_analysis(
         if dbg_iter {
             eprintln!("[OPT-ITER] iter={} nodes={} before rebuild", 51 - max_iter, graph.nodes.len());
         }
+        check_gate_in_branch(graph, "BEFORE phase2 rebuild");
         let _old_to_new = graph.rebuild(&ctx.dead, &ctx.redirect);
+        check_gate_in_branch(graph, "AFTER phase2 rebuild");
         if dbg_iter {
             eprintln!("[OPT-ITER] iter={} nodes={} after rebuild", 51 - max_iter, graph.nodes.len());
         }
@@ -1200,6 +1204,30 @@ pub fn optimize_with_analysis(
         max_iter -= 1;
         if max_iter == 0 {
             break;
+        }
+    }
+}
+
+/// Debug helper: check if any Gate node is inside its branch subgraph's node_range.
+/// This would cause infinite recursion at runtime (Gate launches a subgraph that contains itself).
+fn check_gate_in_branch(graph: &DataFlowGraph, label: &str) {
+    if std::env::var("KUZO_DEBUG_REBUILD").is_err() {
+        return;
+    }
+    for (idx, gb_opt) in graph.gate_branches.iter().enumerate() {
+        if let Some(gb) = gb_opt {
+            let gate_node = NodeId(idx as u32);
+            for (cond, branch_sg, _) in &gb.branches {
+                let branch_sg_id = branch_sg.0 as usize;
+                if branch_sg_id < graph.subgraphs.len() {
+                    let (s, e) = graph.subgraphs[branch_sg_id].node_range;
+                    if gate_node.0 >= s.0 && gate_node.0 < e.0 {
+                        eprintln!("[{}] BUG: Gate node {} INSIDE branch sg={} (cond={}) range [{},{}) func_id={}",
+                            label, gate_node.0, branch_sg_id, cond, s.0, e.0,
+                            graph.subgraphs[branch_sg_id].function_id);
+                    }
+                }
+            }
         }
     }
 }

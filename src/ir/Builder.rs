@@ -441,6 +441,20 @@ impl<'a> IrBuilder<'a> {
         None
     }
 
+    /// Look up the outermost binding of a variable (the original declaration in the
+    /// function-level scope). Used by `Assignment` to determine the correct WriteBack
+    /// target: when a variable is assigned in a nested same_function subgraph (e.g.
+    /// if branch inside a while body), WriteBack must target the outermost binding
+    /// (the root-frame declaration), not an intermediate node in a branch subgraph.
+    fn lookup_root_frame_var(&self, name: &str) -> Option<NodeId> {
+        for scope in self.scope_stack.iter() {
+            if let Some(&node_id) = scope.get(name) {
+                return Some(node_id);
+            }
+        }
+        None
+    }
+
     /// Check whether a name is a global variable and return its slot index.
     fn lookup_global_var(&self, name: &str) -> Option<u32> {
         self.global_var_slots.get(name).copied()
@@ -1278,6 +1292,14 @@ impl<'a> IrBuilder<'a> {
                 ],
             },
         );
+        if std::env::var("KUZO_DEBUG_COMPILE").is_ok() {
+            let then_r = self.graph.subgraphs[then_sg.0 as usize].node_range;
+            let else_r = self.graph.subgraphs[else_sg.0 as usize].node_range;
+            eprintln!("[COMPILE_IF] cond_node={} then_sg={} then_range=[{},{}) else_sg={} else_range=[{},{}) gate_node={} cur_mod={:?}",
+                cond_node.0, then_sg.0, then_r.0.0, then_r.1.0,
+                else_sg.0, else_r.0.0, else_r.1.0,
+                gate_node.0, self.current_module().name);
+        }
         gate_node
     }
 
@@ -3757,6 +3779,13 @@ impl<'a> IrBuilder<'a> {
             body_node_start: node_start,
         });
 
+        // Enter a new scope so that bind_var inside the loop body does not overwrite
+        // the function-level binding. This is critical for WriteBack target resolution:
+        // when an if/match branch inside the loop body assigns to an outer variable,
+        // lookup_root_frame_var must find the function-level declaration (not an
+        // intermediate node produced by the loop body's bind_var).
+        self.enter_scope();
+
         // Record the function subgraph's event_source_decls length before compilation (same as compile_branch_subgraph, Bug #24)
         let prev_decl_count = self.current_function_sg
             .and_then(|sg_id| self.graph.subgraphs.get(sg_id.0 as usize))
@@ -3765,6 +3794,7 @@ impl<'a> IrBuilder<'a> {
 
         let body_last = self.compile_expr(body);
         self.loop_stack.pop();
+        self.exit_scope();
         self.current_sg_start = prev_sg_start;
         let node_end = self.graph.nodes.len() as u32;
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
@@ -4147,9 +4177,17 @@ impl<'a> IrBuilder<'a> {
 
     /// Select the compute_fn for integer literal equality discriminant.
     fn select_literal_eq_fn(&self, s: &str, _is_unsigned: bool) -> ComputeFnId {
+        // Strip hex/binary/octal prefix so 'x'/'b'/'o' is not mistaken for a type suffix.
+        let stripped = if s.starts_with("0x") || s.starts_with("0X")
+            || s.starts_with("0b") || s.starts_with("0B")
+            || s.starts_with("0o") || s.starts_with("0O") {
+            &s[2..]
+        } else {
+            s
+        };
         // Dispatch via ValueTag::from_name + TypeFamily to eliminate string comparison
-        if let Some(suffix) = s.find(|c: char| c.is_ascii_alphabetic()) {
-            let suffix_str = &s[suffix..];
+        if let Some(suffix) = stripped.find(|c: char| c.is_ascii_alphabetic()) {
+            let suffix_str = &stripped[suffix..];
             if let Some(tag) = crate::value::ValueTag::from_name(suffix_str) {
                 let ty = crate::types::Ty::from(tag);
                 use crate::types::TypeFamily;
@@ -4259,11 +4297,28 @@ impl<'a> IrBuilder<'a> {
     fn compile_pattern_literal(&mut self, pl: &crate::ast::Ast::PatternLiteral) -> NodeId {
         let const_val = match pl {
             crate::ast::Ast::PatternLiteral::Int(s) => {
-                // Strip underscore separators + suffix; keep only digits and sign
-                let digits: String = s.chars()
-                    .filter(|c| *c != '_' && (c.is_ascii_digit() || *c == '-' || *c == '+'))
-                    .collect();
-                digits.parse::<i32>().ok().map(ConstValue::I32)
+                // Strip underscore separators
+                let cleaned: String = s.chars().filter(|c| *c != '_').collect();
+                // Detect radix prefix (0x/0b/0o) — the prefix letter must not be
+                // mistaken for a type suffix when separating digits from suffix.
+                let (radix, skip_prefix) = if cleaned.starts_with("0x") || cleaned.starts_with("0X") {
+                    (16, 2)
+                } else if cleaned.starts_with("0b") || cleaned.starts_with("0B") {
+                    (2, 2)
+                } else if cleaned.starts_with("0o") || cleaned.starts_with("0O") {
+                    (8, 2)
+                } else {
+                    (10, 0)
+                };
+                // After the prefix, find the type suffix (first alphabetic char)
+                let after_prefix = &cleaned[skip_prefix..];
+                let suffix_pos = after_prefix.find(|c: char| c.is_ascii_alphabetic());
+                let digits = if let Some(pos) = suffix_pos {
+                    &after_prefix[..pos]
+                } else {
+                    after_prefix
+                };
+                i32::from_str_radix(digits, radix).ok().map(ConstValue::I32)
             }
             crate::ast::Ast::PatternLiteral::Float(s) => {
                 // Strip underscore separators + type suffix (f64/f32/f16/f128)
@@ -5502,7 +5557,28 @@ impl<'a> IrBuilder<'a> {
             let inst_id = self.sema.call_instantiations.get(&call_inst_key);
             let mangled = inst_id.map(|&id| format!("{}#{}", name, id));
             let target_key: &str = mangled.as_deref().unwrap_or(name);
-            if let Some(&target_sg) = self.func_subgraphs.get(target_key) {
+            // Try mangled name first; fall back to bare name if not found.
+            // This handles: (a) non-generic instances with empty type_args that were
+            // never registered under the mangled name, and (b) cross-module calls
+            // compiled before step 2d pre-registers the instance placeholder.
+            let resolved_sg = self.func_subgraphs.get(target_key)
+                .or_else(|| self.func_subgraphs.get(*name));
+            if std::env::var("KUZO_DEBUG_BUILD").is_ok() {
+                let sg_info = resolved_sg.map(|&sg_id| {
+                    let sg = &self.graph.subgraphs[sg_id.0 as usize];
+                    let (s, e) = sg.node_range;
+                    format!("sg={} nodes=[{},{})", sg_id.0, s.0, e.0)
+                }).unwrap_or_else(|| "NOT FOUND".to_string());
+                let used_key = if self.func_subgraphs.get(target_key).is_some() {
+                    target_key
+                } else {
+                    *name
+                };
+                eprintln!("[CALL-BIND] callee={:?} target_key={:?} resolved_key={:?} inst_id={:?} sg_info={} cur_mod={:?}",
+                    name, target_key, used_key, inst_id, sg_info,
+                    self.current_module().name);
+            }
+            if let Some(&target_sg) = resolved_sg {
                 self.graph.set_call_target(call_node, target_sg);
                 // is_async is derived at runtime by compute_call_launch from has_suspend;
                 // here we only check has_suspend to decide whether the call can be marked tail.
@@ -6503,12 +6579,12 @@ impl<'a> IrBuilder<'a> {
                         return Some(wb_node);
                     } else if let Some(outer_node) = self.lookup_var(name) {
                         if !self.is_in_current_subgraph(outer_node) {
-                            // Outer variable -> WriteBack, returning an effect node to ensure scheduled execution
-                            let wb_node = self.compile_writeback_node(val_node, outer_node);
-                            // Bind a local reference: subsequent reads within the same subgraph use the new
-                            // value (val_node), preventing cond_node from reading the stale root-frame value
-                            // before WriteBack completes. WriteBack handles cross-iteration visibility
-                            // (writes back to the root frame).
+                            // Outer variable -> WriteBack. Use the root-frame declaration as
+                            // WriteBack target, not the intermediate node returned by lookup_var
+                            // (which may be in a same_function branch subgraph like a while body).
+                            // This ensures WriteBack writes to the correct root-frame slot.
+                            let wb_target = self.lookup_root_frame_var(name).unwrap_or(outer_node);
+                            let wb_node = self.compile_writeback_node(val_node, wb_target);
                             self.bind_var(name, val_node);
                             return Some(wb_node);
                         } else if let Some(&captured_node) = self.captured_vars.get(*name) {
@@ -6528,11 +6604,10 @@ impl<'a> IrBuilder<'a> {
                         } else {
                             // Same_function branch subgraph (e.g. loop body): a prior assignment
                             // already bind_var'd the variable into the current subgraph, so
-                            // lookup_var returns a local node and the outer-definition check
-                            // above is skipped. Recover the original outer definition and emit a
-                            // WriteBack so the new value propagates back to the outer frame
-                            // (otherwise only the first assignment per iteration survives).
-                            if let Some(original_outer) = self.lookup_outer_var(name) {
+                            // lookup_var returns a local node. Use lookup_root_frame_var to find
+                            // the outermost binding (root-frame declaration) for WriteBack, so
+                            // the new value propagates back to the root frame.
+                            if let Some(original_outer) = self.lookup_root_frame_var(name) {
                                 if !self.is_in_current_subgraph(original_outer) {
                                     let wb_node = self.compile_writeback_node(val_node, original_outer);
                                     self.bind_var(name, val_node);
@@ -6976,10 +7051,19 @@ impl<'a> IrBuilder<'a> {
         self.compiling_builtin = prev_builtin;
 
         let node_end = self.graph.nodes.len() as u32;
+        let debug_mod_name = if std::env::var("KUZO_DEBUG_BUILD").is_ok() {
+            Some(self.current_module().name.to_string())
+        } else {
+            None
+        };
         let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
         sg.node_range = (NodeId(node_start), NodeId(node_end));
         sg.entry_node = NodeId(node_start);
         sg.return_node = return_node;
+        if let Some(ref mod_name) = debug_mod_name {
+            eprintln!("[COMPILE-FN] name={:?} sg_id={} nodes=[{},{}) param_count={} mod={:?}",
+                name, sg_id.0, node_start, node_end, param_count, mod_name);
+        }
         // Consumes sema's FuncSigInfo.is_async (builtin modules fall back to AST is_async)
         sg.has_suspend = fn_is_async;
         sg.function_id = sg_id.0;
@@ -7596,6 +7680,22 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
+        // 0c. Pre-register monomorphization instance subgraph placeholders BEFORE any module is compiled.
+        //     This ensures that cross-module calls to generic functions (e.g. EditorRenderer calling eprintln<T>)
+        //     can find the mangled name (func_name#instance_id) during step 1 (builtin module compilation).
+        //     Without this, call_target is never set -> compute_call_launch returns VOID at runtime.
+        //     (Previously this ran as step 2d after step 1, causing cross-module generic calls to fail silently.)
+        for inst in self.sema.monomorph_instances.iter().filter(|inst| !inst.type_args.is_empty()) {
+            let mangled = format!("{}#{}", inst.func_name, inst.instance_id);
+            if !self.func_subgraphs.contains_key(mangled.as_str()) {
+                let param_count = self.sema.get_func_sig(&inst.func_name)
+                    .map(|sig| sig.param_is_ref.len() as u8)
+                    .unwrap_or(0);
+                let sg_id = self.register_subgraph_placeholder(&mangled, param_count, inst.is_async);
+                self.func_subgraphs.insert(mangled, sg_id);
+            }
+        }
+
         // 1. Compile builtin module functions first (register into func_subgraphs for user code to call)
         let builtin_fun_names: Vec<(Box<str>, usize)> = self
             .builtin_modules
@@ -7693,20 +7793,6 @@ impl<'a> IrBuilder<'a> {
             );
         }
 
-        // 2d. Pre-register monomorphization instance subgraph placeholders: so that when compiling user functions
-        //     in step 3, call nodes can bind to the instance subgraph via mangled name (the actual body is filled in step 3a).
-        //     Without pre-registration, compile_call cannot find the mangled name -> set_call_target is not executed -> runtime returns void.
-        for inst in self.sema.monomorph_instances.iter().filter(|inst| !inst.type_args.is_empty()) {
-            let mangled = format!("{}#{}", inst.func_name, inst.instance_id);
-            if !self.func_subgraphs.contains_key(mangled.as_str()) {
-                let param_count = self.sema.get_func_sig(&inst.func_name)
-                    .map(|sig| sig.param_is_ref.len() as u8)
-                    .unwrap_or(0);
-                let sg_id = self.register_subgraph_placeholder(&mangled, param_count, inst.is_async);
-                self.func_subgraphs.insert(mangled, sg_id);
-            }
-        }
-
         // 3. Compile user module functions
         for name in &fun_names {
             self.compile_function(name);
@@ -7722,6 +7808,26 @@ impl<'a> IrBuilder<'a> {
             .collect();
         for inst in &instances {
             self.compile_monomorph_instance(inst);
+        }
+
+        // DEBUG: dump all func_subgraphs whose node_range is (0,0) — these are uncompiled placeholders
+        if std::env::var("KUZO_DEBUG_BUILD").is_ok() {
+            eprintln!("=== [BUILD] func_subgraphs with EMPTY node_range (uncompiled) ===");
+            for (name, &sg_id) in &self.func_subgraphs {
+                let sg = &self.graph.subgraphs[sg_id.0 as usize];
+                let (s, e) = sg.node_range;
+                if s.0 == 0 && e.0 == 0 {
+                    eprintln!("  EMPTY: name={:?} sg_id={} param_count={}", name, sg_id.0, sg.param_count);
+                }
+            }
+            eprintln!("=== [BUILD] func_subgraphs with NON-EMPTY node_range (compiled) ===");
+            for (name, &sg_id) in &self.func_subgraphs {
+                let sg = &self.graph.subgraphs[sg_id.0 as usize];
+                let (s, e) = sg.node_range;
+                if !(s.0 == 0 && e.0 == 0) {
+                    eprintln!("  OK: name={:?} sg_id={} nodes=[{},{}) param_count={}", name, sg_id.0, s.0, e.0, sg.param_count);
+                }
+            }
         }
 
         // Compute fan-out

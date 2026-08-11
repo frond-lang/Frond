@@ -45,6 +45,14 @@ pub fun read_key(): Key {
     decode_key_from_bytes(buf, n)
 }
 
+// Simplified read_key for debugging: no while loop
+pub fun read_key_simple(): Key {
+    val buf: u8[] = [0u8, ..1]
+    val n = __terminal_read_key_bytes(buf)
+    if n <= 0 { return UnknownKey }
+    decode_key_from_bytes(buf, n)
+}
+
 // Decode key from byte sequence (testable pure function).
 // bytes[0] is the first byte; count is the number of valid bytes read.
 // For ESC sequences, this reads additional bytes from stdin.

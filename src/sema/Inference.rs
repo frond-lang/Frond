@@ -891,13 +891,17 @@ impl<'a> InferContext<'a> {
 
         // Throw<T, E> builtin type variant matching:
         // Throw is a builtin sum type; its variants Ok(T) / Error(E) are not registered as CtorDefInfo.
-        // - Unregistered constructor (e.g. Ok) → value variant → sub-patterns bind to value_type.
-        // - Registered constructor (e.g. an Error ADT or a newtype error constructor) → error variant → sub-patterns bind to error_type.
-        //   (When the constructor name collides with the Throw error-variant name "Error", regardless of what error_type is,
-        //    the pattern still matches the Throw error variant and sub-patterns bind to error_type rather than the constructor's field types.)
+        // - Ok (or any non-error constructor) → value variant → sub-patterns bind to value_type.
+        // - Error / Err (by name) or any registered error ADT constructor → error variant → sub-patterns bind to error_type.
+        //   (When the constructor name collides with the Throw error-variant name "Error"/"Err",
+        //    regardless of what error_type is, the pattern matches the Throw error variant
+        //    and sub-patterns bind to error_type rather than the constructor's field types.)
         if let Ty::Throw(_) = self.arena.get(resolved_expected) {
             let (value_type, error_type) = self.arena.throw_parts(resolved_expected);
-            let branch_ty = if ctor_info.is_some() { error_type } else { value_type };
+            let is_error_variant = ctor_name == crate::ir::Compute::CTOR_ERR
+                || ctor_name == crate::ir::Compute::CTOR_ERR_ALT
+                || ctor_info.is_some();
+            let branch_ty = if is_error_variant { error_type } else { value_type };
             for &sub_pat in sub_patterns.iter() {
                 self.infer_pattern(sub_pat, ast, branch_ty, env);
             }
@@ -5271,7 +5275,6 @@ impl<'a> InferContext<'a> {
                 let prev_return = self.expected_return;
                 self.expected_return = Some(ret_ty);
                 // Infer the function body.
-                eprintln!("DEBUG check_decl: inferring body of function '{}'", *name);
                 let body_ty = self.infer_expr(*body, ast, fn_env, self.expected_return);
                 // Restore.
                 self.expected_return = prev_return;

@@ -14,12 +14,19 @@ pub fun cursor_hide(): str { "\x1b[?25l" }
 pub fun cursor_show(): str { "\x1b[?25h" }
 
 // ─── ScreenControl: screen clearing escape sequences ───
-// ESC[2J → clear entire screen
-pub fun screen_clear_all(): str { "\x1b[2J" }
-// ESC[2K → clear entire line
-pub fun screen_clear_line(): str { "\x1b[2K" }
+// ESC[2J → clear entire screen (does NOT move cursor)
+// ESC[H  → move cursor to home (row 1, col 1)
+// Combined: clean blank screen with cursor at top-left — no ANSI remnants.
+pub fun screen_clear_all(): str { "\x1b[2J\x1b[H" }
+// ESC[K → clear from cursor to end of line (preserves text before cursor)
+pub fun screen_clear_line(): str { "\x1b[K" }
+// ESC[2K → clear entire line (for use before writing content)
+pub fun screen_clear_entire_line(): str { "\x1b[2K" }
 // ESC[J → clear from cursor to end of screen
 pub fun screen_clear_to_bottom(): str { "\x1b[J" }
+// ESC[s → save cursor, ESC[u → restore cursor (for status bar positioning)
+pub fun cursor_save(): str { "\x1b[s" }
+pub fun cursor_restore(): str { "\x1b[u" }
 
 // ─── TextStyle: text styling escape sequences ───
 // ESC[7m → inverse video (for status bar / search highlight)

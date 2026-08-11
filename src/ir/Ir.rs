@@ -2662,9 +2662,20 @@ impl DataFlowGraph {
 
         // 1a. Compute the owning function-level subgraph for each node (keep a
         // copy for step 5, since step 3b compaction would otherwise clobber it).
+        // Only true function-level subgraphs (id == function_id) set node_owner.
+        // Branch subgraphs (if/match arms) have loop_kind=None, loop_parent=None
+        // but id != function_id — their nodes are owned by the parent function subgraph.
         let mut node_owner: Vec<u32> = vec![u32::MAX; total];
         for sg in &self.subgraphs {
             if sg.loop_kind != LoopKind::None || sg.loop_parent_sg.is_some() {
+                continue;
+            }
+            // Skip branch subgraphs: their nodes are owned by the function-level subgraph
+            // whose node_range encompasses them. This prevents hoisted nodes (whose
+            // hoisted_owners points to the function-level subgraph) from being
+            // incorrectly attributed to a branch subgraph, which would extend the
+            // branch subgraph's new node_range past the Gate node and cause infinite recursion.
+            if sg.id.0 != sg.function_id {
                 continue;
             }
             let start = sg.node_range.0.0 as usize;
@@ -2674,9 +2685,21 @@ impl DataFlowGraph {
             }
         }
         // Ownership of hoisted nodes (not inside any node_range; determined via hoisted_owners).
+        // IMPORTANT: hoisted_owners may point to a branch subgraph (id != function_id).
+        // Hoisted nodes must be attributed to the function-level subgraph, otherwise
+        // the branch subgraph's node_range (recomputed in step 5) would extend to
+        // cover the hoisted nodes' new positions, accidentally encompassing the Gate
+        // node that sits between the branch's native nodes and the hoisted nodes,
+        // causing infinite recursion at runtime (Gate launches a subgraph containing itself).
         for idx in 0..total {
             if self.hoisted_node[idx] && node_owner[idx] == u32::MAX {
-                node_owner[idx] = self.hoisted_owners[idx].0;
+                let raw_owner = self.hoisted_owners[idx].0 as usize;
+                let func_owner = if raw_owner < self.subgraphs.len() {
+                    self.subgraphs[raw_owner].function_id
+                } else {
+                    self.hoisted_owners[idx].0
+                };
+                node_owner[idx] = func_owner;
             }
         }
         // Save a copy of node_owner indexed by old indices (step 5 still needs
@@ -2684,11 +2707,11 @@ impl DataFlowGraph {
         let node_owner_old = node_owner.clone();
 
         // 1b. Collect the function-level subgraph list (sorted by node_range.0
-        // to preserve original order).
+        // to preserve original order). Only true function-level subgraphs (id == function_id).
         let mut func_sgs: Vec<u32> = self
             .subgraphs
             .iter()
-            .filter(|sg| sg.loop_kind == LoopKind::None && sg.loop_parent_sg.is_none())
+            .filter(|sg| sg.loop_kind == LoopKind::None && sg.loop_parent_sg.is_none() && sg.id.0 == sg.function_id)
             .map(|sg| sg.id.0)
             .collect();
         func_sgs.sort_by_key(|&sg_id| self.subgraphs[sg_id as usize].node_range.0);
@@ -2719,12 +2742,14 @@ impl DataFlowGraph {
                 new_nodes.push(self.nodes[old_idx]);
             }
 
-            // Hoisted live nodes (owner == sg_id).
+            // Hoisted live nodes (owner == sg_id). Use node_owner (resolved to
+            // function-level subgraph) instead of raw hoisted_owners, so hoisted
+            // nodes are placed after the function-level subgraph's native nodes.
             for old_idx in 0..total {
                 if !self.hoisted_node[old_idx] {
                     continue;
                 }
-                if self.hoisted_owners[old_idx].0 != sg_id {
+                if node_owner[old_idx] != sg_id {
                     continue;
                 }
                 let old_id = NodeId(old_idx as u32);
@@ -2910,6 +2935,13 @@ impl DataFlowGraph {
         // nodes by function-level subgraph grouping, with hoisted nodes directly
         // following the native nodes, so the new node_range is naturally
         // contiguous (native live node new_id + hoisted live node new_id).
+        let dbg_rebuild = std::env::var("KUZO_DEBUG_REBUILD").is_ok();
+        // Save old node_ranges for debugging.
+        let old_ranges: Vec<(u32, u32)> = if dbg_rebuild {
+            self.subgraphs.iter().map(|sg| (sg.node_range.0.0, sg.node_range.1.0)).collect()
+        } else {
+            Vec::new()
+        };
         for sg in self.subgraphs.iter_mut() {
             let old_start = sg.node_range.0.0 as usize;
             let old_end = (sg.node_range.1.0 as usize).min(total);
@@ -2952,6 +2984,57 @@ impl DataFlowGraph {
                     continue;
                 }
                 update_range(old_to_new[old_idx].unwrap());
+            }
+
+            // DEBUG: if this subgraph is a Gate branch and the new range contains the Gate node, print details.
+            if dbg_rebuild {
+                let (ns, ne) = match new_start {
+                    Some(ns) => (ns, new_end),
+                    None => (0u32, 0u32),
+                };
+                // Check if any Gate node's new_id falls in [ns, ne) for this subgraph's branches
+                let sg_idx = sg_id.0 as usize;
+                if sg_idx < old_ranges.len() {
+                    let (o_s, o_e) = old_ranges[sg_idx];
+                    // gate_branches was already compacted in step 3c, so gate_idx IS the new_id.
+                    // To get the old_idx, use new_to_old[gate_idx].
+                    for (gate_new_id, gb_opt) in self.gate_branches.iter().enumerate() {
+                        if let Some(gb) = gb_opt {
+                            // Check if this subgraph is a branch of this gate
+                            let is_branch = gb.branches.iter().any(|(_, bsg, _)| bsg.0 == sg_id.0);
+                            if is_branch {
+                                let gnid = gate_new_id as u32;
+                                if gnid >= ns && gnid < ne {
+                                    let gate_old_idx = if gate_new_id < new_to_old.len() { new_to_old[gate_new_id] } else { usize::MAX };
+                                    eprintln!("[REBUILD-DETAIL] sg={} old_range=[{},{}) new_range=[{},{}) gate_node old_idx={} new_id={} function_id={} loop_kind={:?} loop_parent={:?}",
+                                        sg_id.0, o_s, o_e, ns, ne, gate_old_idx, gnid,
+                                        sg.function_id, sg.loop_kind, sg.loop_parent_sg);
+                                    // Print the old_to_new mapping for nodes in [old_start, old_end)
+                                    eprint!("[REBUILD-DETAIL]   native mapping:");
+                                    for oi in old_start..old_end {
+                                        if let Some(nid) = old_to_new[oi] {
+                                            let st = if dead.contains(&NodeId(oi as u32)) { "dead" }
+                                                     else if redirect.contains_key(&NodeId(oi as u32)) { "redirect" }
+                                                     else { "live" };
+                                            eprint!(" {}→{}({})", oi, nid.0, st);
+                                        }
+                                    }
+                                    eprintln!();
+                                    // Print hoisted nodes for this sg
+                                    eprint!("[REBUILD-DETAIL]   hoisted (owner={}):", sg_id.0);
+                                    for oi in 0..total {
+                                        if node_owner_old[oi] == sg_id.0 && (oi < old_start || oi >= old_end) {
+                                            if let Some(nid) = old_to_new[oi] {
+                                                eprint!(" {}→{}", oi, nid.0);
+                                            }
+                                        }
+                                    }
+                                    eprintln!();
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             sg.node_range = match new_start {
@@ -3006,6 +3089,27 @@ impl DataFlowGraph {
                 let (s, e) = sg.node_range;
                 if e.0 < s.0 || e.0 as usize > total {
                     eprintln!("[VERIFY] sg={} has invalid node_range [{},{}) (total={})", sg_idx, s.0, e.0, total);
+                }
+            }
+        }
+
+        // DEBUG: check if any Gate node is inside its branch subgraph's node_range.
+        // This would cause infinite recursion (Gate launches a subgraph that contains itself).
+        if std::env::var("KUZO_DEBUG_REBUILD").is_ok() {
+            for (idx, gb_opt) in self.gate_branches.iter().enumerate() {
+                if let Some(gb) = gb_opt {
+                    let gate_node = NodeId(idx as u32);
+                    for (cond, branch_sg, _) in &gb.branches {
+                        let branch_sg_id = branch_sg.0 as usize;
+                        if branch_sg_id < self.subgraphs.len() {
+                            let (s, e) = self.subgraphs[branch_sg_id].node_range;
+                            if gate_node.0 >= s.0 && gate_node.0 < e.0 {
+                                eprintln!("[REBUILD-BUG] Gate node {} is INSIDE branch sg={} (cond={}) node_range [{},{}) function_id={}",
+                                    gate_node.0, branch_sg_id, cond, s.0, e.0,
+                                    self.subgraphs[branch_sg_id].function_id);
+                            }
+                        }
+                    }
                 }
             }
         }

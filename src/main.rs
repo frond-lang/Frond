@@ -677,15 +677,16 @@ fn run_from_project(opt_level: kuzo::pass::Optimizer::OptLevel, debug: bool) {
         eprintln!("[5/5] Executing ...");
     }
     let graph = compile_graph(&entry_path, opt_level, debug);
-    // serialize → zerocopy load → run (validates the .kzo zerocopy path)
-    let kzo_data = kuzo::solidify::Format::serialize_solidify(&graph);
-    let graph = match kuzo::solidify::Format::load_zerocopy_from_bytes(kzo_data) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("error: failed to load serialized graph: {}", e);
-            process::exit(1);
-        }
-    };
+    // NOTE: zerocopy serialize/deserialize path temporarily disabled for debugging.
+    // The zerocopy round-trip may lose call_target or node_range data.
+    // let kzo_data = kuzo::solidify::Format::serialize_solidify(&graph);
+    // let graph = match kuzo::solidify::Format::load_zerocopy_from_bytes(kzo_data) {
+    //     Ok(g) => g,
+    //     Err(e) => {
+    //         eprintln!("error: failed to load serialized graph: {}", e);
+    //         process::exit(1);
+    //     }
+    // };
     // Engine execution (worker count determined automatically)
     let result = EngineRef::new(graph).run();
     if debug {

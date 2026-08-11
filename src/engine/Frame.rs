@@ -4,6 +4,7 @@
 use super::*;
 use crate::ir::Ir::*;
 use crate::ir::Ir::Frame;
+use crate::value::{Value, HeapObj, ArrayValue};
 
 /// Copies ready values from the `src` frame to the `dst` frame, skipping nodes in the
 /// `[branch_start, branch_end)` range.
@@ -100,6 +101,38 @@ impl<S: LockStrategy> Engine<S> {
         let fid = self.alloc_frame_id();
         let mut frame = self.acquire_frame(fid, subgraph_id, node_count);
         self.prepare_frame(&mut frame);
+        self.frames.lock().insert(fid, frame);
+        fid
+    }
+
+    /// Initializes the entry frame (main function) with default argument injection.
+    ///
+    /// `init_frame` leaves Param nodes unset (expecting the caller to inject them via
+    /// `start_subgraph`). But main has no caller — its Param slots are never filled, so
+    /// accessing them (e.g. `args.len()`) reads uninitialised memory and crashes silently.
+    ///
+    /// This method injects a default value (empty array) into each Param slot so that
+    /// `main(args: str[])` receives a valid empty array when no CLI args are provided.
+    pub(super) fn init_entry_frame(&self, subgraph_id: SubGraphId) -> FrameId {
+        let (node_start, node_end) = self.graph.subgraphs[subgraph_id.0 as usize].node_range;
+        let node_count = (node_end.0 - node_start.0) as usize;
+        let fid = self.alloc_frame_id();
+        let mut frame = self.acquire_frame(fid, subgraph_id, node_count);
+        self.prepare_frame(&mut frame);
+
+        // Inject default entry arguments — main has no caller to inject them.
+        let param_count = self.graph.subgraphs[subgraph_id.0 as usize].param_count as usize;
+        let offset = node_start.0 as usize;
+        for i in 0..param_count {
+            let local_id = NodeId(i as u32);
+            let global_id = NodeId((offset + i) as u32);
+            let consumer_count = self.graph.downstream_slice(offset + i).len() as u16;
+            // Default: empty array (main's `args: str[]` receives an empty array).
+            let default_arg = Value::ref_val(HeapObj::Array(ArrayValue::new(Vec::new())));
+            frame.set_value(local_id, default_arg, consumer_count);
+            notify_downstream(&mut frame, &self.graph, local_id, global_id, node_start);
+        }
+
         self.frames.lock().insert(fid, frame);
         fid
     }
@@ -376,8 +409,12 @@ impl<S: LockStrategy> Engine<S> {
         let is_nested = |gid: u32| nested_ranges.iter().any(|&(s, e)| gid >= s && gid < e);
         let is_in_sg = |gid: u32| gid >= sg_start.0 && gid < sg_end.0 && !is_nested(gid);
 
-        // DFS-collect all nodes in the cond_node dependency tree that lie inside the loop subgraph
-        // (excluding Gate nodes).
+        // DFS-collect all nodes in the cond_node dependency tree that lie inside the loop subgraph.
+        //
+        // Gate nodes (from short-circuit && / || lowering) MUST be included so that they are
+        // reset and re-evaluated on each loop iteration. Skipping them was Bug #38: the Gate's
+        // condition_input (lhs) was never reset, so the while-loop's Gate read a stale value
+        // and the loop exited after one iteration.
         let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut stack = vec![cond_node];
         let mut cond_nodes: Vec<NodeId> = Vec::new();
@@ -386,9 +423,6 @@ impl<S: LockStrategy> Engine<S> {
                 continue;
             }
             if !is_in_sg(gid.0) {
-                continue;
-            }
-            if self.graph.node(gid.0 as usize).kind == NodeKind::Gate {
                 continue;
             }
             cond_nodes.push(gid);
@@ -417,7 +451,6 @@ impl<S: LockStrategy> Engine<S> {
                 .filter(|&&inp| {
                     visited.contains(&inp.0)
                         && is_in_sg(inp.0)
-                        && self.graph.node(inp.0 as usize).kind != NodeKind::Gate
                 })
                 .count() as u16;
 

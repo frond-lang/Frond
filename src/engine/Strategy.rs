@@ -111,7 +111,7 @@ impl Engine<Single> {
     /// - Without pending work and without waiters: panic (deadlock detection).
     pub(super) fn run_single(&self) -> Value {
         let entry_sg = self.graph.entry_subgraph.expect("no entry subgraph");
-        let fid = self.init_frame(entry_sg);
+        let fid = self.init_entry_frame(entry_sg);
         let rq = self.ready_frames.as_ref().unwrap();
         rq.borrow_mut().push_back(fid);
 
@@ -204,7 +204,7 @@ impl Engine<Multi> {
     /// Multi-worker entry point that executes the entry subgraph (replaces run_multi_worker).
     pub(super) fn run_multi(self: Arc<Self>) -> Value {
         let entry_sg = self.graph.entry_subgraph.expect("no entry subgraph");
-        let entry_fid = self.init_frame(entry_sg);
+        let entry_fid = self.init_entry_frame(entry_sg);
         let num_workers = *self.active_count.as_ref().unwrap().lock();
         let mut local_queues: Vec<DequeWorker<FrameId>> = Vec::with_capacity(num_workers);
         let mut stealers: Vec<Stealer<FrameId>> = Vec::with_capacity(num_workers);

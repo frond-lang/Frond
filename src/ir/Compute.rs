@@ -1529,6 +1529,41 @@ pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
             Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str(&buf)))
         }
 
+        // ── terminal: raw mode + read/write ──
+        "__terminal_enable_raw_mode" => {
+            let buf_val = force_input(frame, inputs[0]);
+            let mut buf = extract_u8_buf(&buf_val);
+            let rc = unsafe { wrapper::__terminal_enable_raw_mode(&mut buf) };
+            // termios struct may be written into orig_buf
+            writeback_u8_buf(&buf_val, &buf, buf.len());
+            Value::i32(rc)
+        }
+        "__terminal_disable_raw_mode" => {
+            let buf = extract_u8_buf(&force_input(frame, inputs[0]));
+            let rc = unsafe { wrapper::__terminal_disable_raw_mode(&buf) };
+            Value::i32(rc)
+        }
+        "__terminal_read_key_bytes" => {
+            let buf_val = force_input(frame, inputs[0]);
+            let mut buf = extract_u8_buf(&buf_val);
+            let n = unsafe { wrapper::__terminal_read_key_bytes(&mut buf) };
+            if n > 0 { writeback_u8_buf(&buf_val, &buf, n as usize); }
+            Value::i64(n)
+        }
+        "__terminal_get_size_into" => {
+            let buf_val = force_input(frame, inputs[0]);
+            let mut buf = extract_u8_buf(&buf_val);
+            let rc = unsafe { wrapper::__terminal_get_size_into(&mut buf) };
+            if rc == 0 { writeback_u8_buf(&buf_val, &buf, buf.len()); }
+            Value::i32(rc)
+        }
+        "__terminal_write_raw_bytes" => {
+            let buf = extract_u8_buf(&force_input(frame, inputs[0]));
+            let len = force_input(frame, inputs[1]).as_usize();
+            let n = unsafe { wrapper::__terminal_write_raw_bytes(&buf, len) };
+            Value::i64(n)
+        }
+
         // ── Unimplemented FFI functions ──
         other => panic!("compute_ffi_call: unimplemented FFI function '{}'", other),
     }
@@ -2975,6 +3010,10 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
     }
 
     // Neither present: the compiler guarantees a Call node has at least one; no panic here, kept fault-tolerant.
+    if env_flag("KUZO_DEBUG_CALL") {
+        eprintln!("[CALL-FALLTHROUGH] node={:?} frame.sg={} frame.offset={} — NO call_target and NO vtable_method! Returning VOID.",
+            node, frame.subgraph_id.0, frame.node_offset);
+    }
     NodeResult::Value(Value::VOID)
 }
 
@@ -3483,7 +3522,28 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 if (return_local as usize) < frame.value_table.len()
                     && !frame.value_table.is_ready(return_local as usize)
                 {
+                    if std::env::var("KUZO_DEBUG_SYNC").is_ok() {
+                        let ns = sg.node_range.0.0;
+                        let ne = sg.node_range.1.0;
+                        let nc = (ne - ns) as usize;
+                        eprintln!("[SYNC-NULL] sg={} return_node={} (local={}) offset={} range=[{},{}) not ready",
+                            sg.id.0, sg.return_node.0, return_local, frame.node_offset, ns, ne);
+                        // Print pending_inputs status for all nodes in range
+                        for i in 0..nc {
+                            let pi = frame.pending_inputs[i];
+                            let ready = frame.value_table.is_ready(i);
+                            let gid = NodeId(i as u32 + frame.node_offset);
+                            let kind = graph.node(gid.0 as usize).kind;
+                            eprintln!("[SYNC-NULL]   local={} global={} kind={:?} pending={} ready={}",
+                                i, gid.0, kind, pi, ready);
+                        }
+                    }
                     return Value::NULL;
+                }
+                if std::env::var("KUZO_DEBUG_SYNC").is_ok() {
+                    let rv = frame.get_value_by_global(sg.return_node);
+                    eprintln!("[SYNC-RET] sg={} return_node={} (local={}) offset={} val={:?}",
+                        sg.id.0, sg.return_node.0, return_local, frame.node_offset, rv);
                 }
                 return frame.get_value_by_global(sg.return_node);
             }
@@ -3521,6 +3581,10 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
             NodeResult::Call(pending) => {
                 // Tail call: reuse the current frame.
                 if graph.tail_call_flag(graph_node_id.0 as usize) {
+                    if std::env::var("KUZO_DEBUG_CALL").is_ok() {
+                        eprintln!("[CALL-TAIL] node={} target_sg={} (TAIL CALL)",
+                            graph_node_id.0, pending.target_sg.0);
+                    }
                     switch_subgraph(frame, graph, pending.target_sg, &pending.args);
                     continue;
                 }
@@ -3573,6 +3637,12 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
 
                 // Inject the return value into the current frame.
                 let consumer_count = graph.downstream_slice(graph_node_id.0 as usize).len() as u16;
+                if std::env::var("KUZO_DEBUG_CALL").is_ok() {
+                    let csg = &graph.subgraphs[pending.target_sg.0 as usize];
+                    eprintln!("[CALL] node={} target_sg={} range=[{},{}) child_result={:?} signal={:?} consumer_count={}",
+                        graph_node_id.0, pending.target_sg.0, csg.node_range.0.0, csg.node_range.1.0,
+                        child_result, child_signal, consumer_count);
+                }
                 frame.set_value(pending.call_node_local, child_result.clone(), consumer_count);
 
                 // Bug #65: do NOT unconditionally propagate ThrowVal(Err) as a Return
@@ -3595,6 +3665,12 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
 
                 // LoopBody completion handling.
                 if target_loop_kind == LoopKind::LoopBody {
+                    if std::env::var("KUZO_DEBUG_CALL").is_ok() {
+                        eprintln!("[CALL-LB] node={} target_sg={} child_signal={:?} frame.sg={} frame.loop_kind={:?}",
+                            graph_node_id.0, pending.target_sg.0, child_signal,
+                            frame.subgraph_id.0,
+                            graph.subgraphs[frame.subgraph_id.0 as usize].loop_kind);
+                    }
                     match child_signal {
                         ControlSignal::Break | ControlSignal::Return(_) => {
                             frame.control_signal = child_signal;
