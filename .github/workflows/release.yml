@@ -22,24 +22,38 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: kuzo
             archive: tar.gz
+            cc: clang
+            cxx: clang++
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: kuzo
             archive: tar.gz
+            cc: clang
+            cxx: clang++
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: kuzo
             archive: tar.gz
+            cc: clang
+            cxx: clang++
           - os: macos-13
             target: x86_64-apple-darwin
             artifact: kuzo
             archive: tar.gz
+            cc: clang
+            cxx: clang++
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: kuzo.exe
             archive: zip
+            cc: cl
+            cxx: cl
 
     runs-on: ${{ matrix.os }}
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,6 +69,36 @@ jobs:
             exit 1
           fi
           echo "OK: tag is on main"
+        shell: bash
+
+      # ── C/C++ toolchain setup ─────────────────────────────────────────
+      # Linux: install clang (preinstalled, but ensure latest) + make
+      # macOS: Xcode Command Line Tools (clang) already preinstalled
+      # Windows: MSVC (cl.exe) via Visual Studio setup
+      - name: Install C toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm build-essential
+          clang --version
+
+      - name: Verify C toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          clang --version
+          xcrun --find clang
+
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Verify C toolchain (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cl 2>&1 | head -1
+          where cl
         shell: bash
 
       - uses: dtolnay/rust-toolchain@stable
