@@ -4324,6 +4324,70 @@ pub fn compute_defer_register(frame: &mut Frame, node: NodeId, _ctx: &EvalContex
     NodeResult::Value(Value::VOID)
 }
 
+/// compute_block_defer_register (idx 324): block-scoped defer registration.
+///
+/// Identical to `compute_defer_register` except that **input[0]** is an explicit effect
+/// dependency (used solely for dataflow ordering so the node does not fire before the block's
+/// prior effects complete); the actual captured NodeIds are **inputs[1..]**. This exists
+/// because, unlike the loop case (where the register node is naturally ordered by its
+/// captured loop-variable inputs), a block-scoped defer may have zero captures (e.g. a defer
+/// that only touches globals), which would leave the node with zero inputs and let the
+/// scheduler fire it prematurely at frame start. The leading effect input prevents that.
+pub fn compute_block_defer_register(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
+    let graph = frame.graph.clone();
+    let n = graph.node(node.0 as usize);
+    let body_sg = match graph.call_target(node.0 as usize) {
+        Some(sg) => sg,
+        None => return NodeResult::Value(Value::VOID),
+    };
+    let inputs = graph.inputs(n.inputs_offset, n.input_count);
+    // Skip input[0] (effect-ordering dependency); the rest are captured NodeIds.
+    let captured_nodes: Vec<NodeId> = inputs.iter().skip(1).copied().collect();
+    let captured_values: Vec<Value> = captured_nodes
+        .iter()
+        .map(|&inp| frame.get_value_by_global(inp))
+        .collect();
+    let entry = RuntimeDefer {
+        body_subgraph: body_sg,
+        captured_nodes,
+        captured_values,
+    };
+    // Push onto THIS frame's defer_stack (block defers are not loop-scoped, so do not walk to
+    // parent_frame_ptr — the draining CF_DEFER_RUN node runs in the same frame and reads the
+    // same stack).
+    frame.defer_stack.push(entry);
+    NodeResult::Value(Value::VOID)
+}
+/// Runs a list of runtime defer entries (already drained from a `defer_stack`) in LIFO order,
+/// executing each defer body synchronously as a defer frame created from `parent_frame`.
+///
+/// This is the shared core used by:
+///   - `compute_defer_run` (the loop-exit CF_DEFER_RUN node, normal loop exit), and
+///   - the Engine's break path (`complete_and_wake_caller`), so that defers registered during
+///     loop iterations also run when the loop is exited via `break` (Bug G).
+///
+/// `parent_frame` is the frame whose value table the defer bodies read outer variables from
+/// (typically the loop frame for loops, or the function frame for block defers). Captured values
+/// are injected into each defer frame so the body reads the snapshotted (per-registration) values.
+pub fn run_defer_entries_sync(parent_frame: &Frame, defers: &[RuntimeDefer], graph: &DataFlowGraph) {
+    for entry in defers.iter().rev() {
+        let mut defer_frame = prepare_defer_frame_sync(parent_frame, entry.body_subgraph, graph);
+        // Inject captured values: overwrite the value-table slots of the captured NodeIds
+        // so the defer body reads the snapshotted (per-iteration) values.
+        let parent_offset = defer_frame.node_offset;
+        for (i, val) in entry.captured_values.iter().enumerate() {
+            let captured_gid = entry.captured_nodes[i];
+            let local = captured_gid.0.wrapping_sub(parent_offset);
+            if (local as usize) < defer_frame.value_table.len() {
+                let cc = graph.downstream_slice(captured_gid.0 as usize).len() as u16;
+                defer_frame.set_value(NodeId(local), val.clone(), cc);
+                defer_frame.ready_queue.retain(|n| n.0 != local);
+            }
+        }
+        let _ = run_frame_sync(&mut defer_frame, graph);
+    }
+}
+
 /// compute_defer_run (idx 323): drains the loop frame's `defer_stack` in LIFO order
 /// and executes each defer body synchronously.
 ///
@@ -4353,21 +4417,6 @@ pub fn compute_defer_run(frame: &mut Frame, _node: NodeId, _ctx: &EvalContext) -
     } else {
         frame
     };
-    for entry in defers.iter().rev() {
-        let mut defer_frame = prepare_defer_frame_sync(loop_frame, entry.body_subgraph, &graph);
-        // Inject captured values: overwrite the value-table slots of the captured NodeIds
-        // so the defer body reads the snapshotted (per-iteration) values.
-        let parent_offset = defer_frame.node_offset;
-        for (i, val) in entry.captured_values.iter().enumerate() {
-            let captured_gid = entry.captured_nodes[i];
-            let local = captured_gid.0.wrapping_sub(parent_offset);
-            if (local as usize) < defer_frame.value_table.len() {
-                let cc = graph.downstream_slice(captured_gid.0 as usize).len() as u16;
-                defer_frame.set_value(NodeId(local), val.clone(), cc);
-                defer_frame.ready_queue.retain(|n| n.0 != local);
-            }
-        }
-        let _ = run_frame_sync(&mut defer_frame, &graph);
-    }
+    run_defer_entries_sync(loop_frame, &defers, &graph);
     NodeResult::Value(Value::VOID)
 }

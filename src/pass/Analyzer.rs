@@ -875,7 +875,16 @@ fn collect_def_use_stmt(stmt_id: StmtId, arena: &AstArena, func: FuncId, graph: 
         Stmt::Loop { body } => {
             collect_def_use_expr(*body, arena, func, graph);
         }
-        Stmt::LocalDecl { .. } => {}
+        Stmt::LocalDecl { decl } => match decl.as_ref() {
+            // Nested function declaration: scan the body for references to outer
+            // variables (same as Lambda). Without this, a var captured only by a
+            // nested function would be misidentified as dead and skipped by the
+            // IR builder, causing the nested function to read `void`.
+            crate::ast::Ast::Decl::FunDecl { body, .. } => {
+                collect_def_use_expr(*body, arena, func, graph);
+            }
+            _ => {}
+        },
         Stmt::Break | Stmt::Continue => {}
     }
 }
@@ -2033,7 +2042,14 @@ fn collect_lambda_vars_stmt(
         Stmt::Loop { body } => {
             collect_lambda_vars(*body, arena, out);
         }
-        // Break/Continue/LocalDecl do not contain lambda variables
+        // Nested function body may bind lambda variables.
+        Stmt::LocalDecl { decl } => match decl.as_ref() {
+            crate::ast::Ast::Decl::FunDecl { body, .. } => {
+                collect_lambda_vars(*body, arena, out);
+            }
+            _ => {}
+        },
+        // Break/Continue do not contain lambda variables
         _ => {}
     }
 }
@@ -2754,6 +2770,15 @@ fn collect_reads_stmt(stmt_id: StmtId, arena: &AstArena, report: &DeadCodeReport
             }
             collect_reads_expr(*value, arena, report, reads);
         }
+        // Nested function declaration: traverse the body to collect outer-variable
+        // reads (same as Lambda). Without this, a variable captured only by a
+        // nested function would be misidentified as dead.
+        Stmt::LocalDecl { decl } => match decl.as_ref() {
+            crate::ast::Ast::Decl::FunDecl { body, .. } => {
+                collect_reads_expr(*body, arena, report, reads);
+            }
+            _ => {}
+        },
         _ => walk_children_stmt(stmt_id, arena, |e| collect_reads_expr(e, arena, report, reads)),
     }
 }
@@ -2833,13 +2858,17 @@ fn mark_dead_decls_stmt(
         // the new definition site created by assignment has no use site in the def-use graph, but closures read the latest value when called.
         // Implicit-this field assignments (`field = value` resolving to `this.field = value`) are
         // NEVER dead: they mutate instance state visible to other methods and callers.
+        // Global-variable assignments are NEVER dead: they write to process-wide shared storage
+        // (`global_var_storage[slot]`) visible to all functions/callers, so the store is an observable
+        // side effect even when the variable is not read again within this function.
         Stmt::Assignment { target, value } => {
             if let Expr::Ident(name) = &arena.expr(*target).node {
                 let key = module_expr_key(module_name, target.0 as u64);
                 let is_implicit_this = sema.expr_types.get(&key)
                     .and_then(|info| info.implicit_this.as_ref())
                     .is_some();
-                if !is_implicit_this && !reads.contains(*name) {
+                let is_global = def_use.global_vars.contains(*name);
+                if !is_implicit_this && !is_global && !reads.contains(*name) {
                     let se = classify_side_effect(*value, arena, module_name, sema, purity, escape, func_name_to_id);
                     if is_side_effect_free(se) {
                         report.dead_stmts.insert(stmt_id);
@@ -2851,12 +2880,15 @@ fn mark_dead_decls_stmt(
         Stmt::CompoundAssignment { target, value, .. } => {
             // Compound assignment x += v: if x is never read within the function and v has no side effects, the whole statement is a dead store
             // Implicit-this field compound assignments are NEVER dead (same rationale as Assignment).
+            // Global-variable compound assignments are NEVER dead (the store writes shared storage
+            // observable by other functions/callers; see `Stmt::Assignment` above).
             if let Expr::Ident(name) = &arena.expr(*target).node {
                 let key = module_expr_key(module_name, target.0 as u64);
                 let is_implicit_this = sema.expr_types.get(&key)
                     .and_then(|info| info.implicit_this.as_ref())
                     .is_some();
-                if !is_implicit_this && !reads.contains(*name) {
+                let is_global = def_use.global_vars.contains(*name);
+                if !is_implicit_this && !is_global && !reads.contains(*name) {
                     let se = classify_side_effect(*value, arena, module_name, sema, purity, escape, func_name_to_id);
                     if is_side_effect_free(se) {
                         report.dead_stmts.insert(stmt_id);
@@ -2865,6 +2897,13 @@ fn mark_dead_decls_stmt(
             }
             mark_dead_decls_expr(*value, arena, module_name, sema, purity, escape, func_name_to_id, func, def_use, reads, report);
         }
+        // Recurse into nested function bodies so dead code inside them is also detected.
+        Stmt::LocalDecl { decl } => match decl.as_ref() {
+            crate::ast::Ast::Decl::FunDecl { body, .. } => {
+                mark_dead_decls_expr(*body, arena, module_name, sema, purity, escape, func_name_to_id, func, def_use, reads, report);
+            }
+            _ => {}
+        },
         _ => walk_children_stmt(stmt_id, arena, |e| {
             mark_dead_decls_expr(e, arena, module_name, sema, purity, escape, func_name_to_id, func, def_use, reads, report)
         }),

@@ -2188,9 +2188,19 @@ pub(crate) fn concretize_type<'a>(
             arena.make_ref(inner, true)
         }
         TypeNode::Record { .. } => arena.make_record(Vec::<FieldType>::new().into_boxed_slice(), None),
-        TypeNode::Function { .. } => {
-            let ret = arena.make(Type::Unknown);
-            arena.make_fn(Vec::<TypeHandle>::new().into_boxed_slice(), ret)
+        TypeNode::Function { params, return_type } => {
+            // Recursively concretize the parameter and return types so a function
+            // type used as an alias target (e.g. `type IntToInt = (i32) -> i32`)
+            // preserves its arity and signature. Previously this discarded both,
+            // producing a 0-arity `Fn` returning Unknown, which caused callers to
+            // skip argument inference and left argument expressions without ExprInfo
+            // (surfacing as "missing ExprInfo" ICEs in the IR builder).
+            let param_tys: Vec<TypeHandle> = params
+                .iter()
+                .map(|&p| concretize_type(arena, p, type_args, ast, sema_result))
+                .collect();
+            let ret_ty = concretize_type(arena, *return_type, type_args, ast, sema_result);
+            arena.make_fn(param_tys.into_boxed_slice(), ret_ty)
         }
         TypeNode::Array { element_type, size } => {
             let elem = concretize_type(arena, *element_type, type_args, ast, sema_result);

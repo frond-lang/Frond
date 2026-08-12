@@ -55,8 +55,6 @@ pub fn prepare_same_function_frame_sync(frame: &mut Frame, graph: &DataFlowGraph
         let node = graph.node(gid as usize);
         if node.kind == NodeKind::EventSource {
             frame.pending_inputs[i] = PENDING_EXTERNAL;
-        } else if node.kind == NodeKind::Gate && graph.has_select_info(gid as usize) {
-            frame.pending_inputs[i] = 0;
         } else {
             let inputs = graph.inputs(node.inputs_offset, node.input_count);
             let mut pending = 0u16;

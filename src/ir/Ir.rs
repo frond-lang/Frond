@@ -431,6 +431,8 @@ compute_fn_ids! {
     // Runtime defer registration/execution (322-323): table override (new signature)
     322 => CF_DEFER_REGISTER,
     323 => CF_DEFER_RUN,
+    // Block-scoped defer registration (324): like CF_DEFER_REGISTER but input[0] is an effect dep.
+    324 => CF_BLOCK_DEFER_REGISTER,
 }
 
 // =========================================================================
@@ -1987,6 +1989,7 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         // Runtime defer (322-323): new signature, table override
         322 => super::Compute::noop_compute_real, // compute_defer_register
         323 => super::Compute::noop_compute_real, // compute_defer_run
+        324 => super::Compute::noop_compute_real, // compute_block_defer_register
     };
     // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
     // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values
@@ -2010,6 +2013,7 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
     table[49] = super::Compute::compute_writeback;
     table[322] = super::Compute::compute_defer_register;
     table[323] = super::Compute::compute_defer_run;
+    table[324] = super::Compute::compute_block_defer_register;
     table
 }
 

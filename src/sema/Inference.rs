@@ -2150,12 +2150,15 @@ impl<'a> InferContext<'a> {
                 }
             }
             Ast::Expr::FieldAccess { recv, .. }
-            | Ast::Expr::Index { recv, .. }
             | Ast::Expr::RefOf(recv)
             | Ast::Expr::Deref(recv)
             | Ast::Expr::NonNullAssert(recv)
             | Ast::Expr::Propagate(recv) => {
                 self.collect_free_idents_scoped(ast, *recv, bound, out);
+            }
+            Ast::Expr::Index { recv, index } => {
+                self.collect_free_idents_scoped(ast, *recv, bound, out);
+                self.collect_free_idents_scoped(ast, *index, bound, out);
             }
             Ast::Expr::SafeAccess { recv, .. } => {
                 self.collect_free_idents_scoped(ast, *recv, bound, out);
@@ -2411,6 +2414,20 @@ impl<'a> InferContext<'a> {
         let mut free: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
         self.collect_free_idents_scoped(ast, body_expr, &mut bound, &mut free);
 
+        // Implicit-this: if we're inside a method body and any free identifier
+        // is not a known local/var (i.e. it resolves to an implicit `this.field`),
+        // the nested scope needs to capture `this` so escaped closures can reach
+        // the receiver. Add `this` to the capture set.
+        if self.current_this_type().is_some() && !free.contains("this") {
+            let any_implicit = free.iter().any(|name| {
+                name.as_str() != "this"
+                    && !self.local_mutability.iter().any(|((_, n), _)| n.as_str() == name.as_str())
+            });
+            if any_implicit {
+                free.insert("this".to_string());
+            }
+        }
+
         // Deterministic order for stable output.
         let mut names: Vec<String> = free.into_iter().collect();
         names.sort();
@@ -2544,7 +2561,22 @@ impl<'a> InferContext<'a> {
             Expr::VoidLit => self.make_builtin(Type::Void),
 
             // ── Identifiers ──
-            Expr::Ident(_) => self.infer_ident_expr(expr, ast, env),
+            Expr::Ident(_) => {
+                // Bug K: a bare nullary constructor (e.g. `None` for `type Opt<T> = | Some(T) | None`)
+                // is registered in the env as the ADT value `Opt<rigid_T>`. Because `freshen_type`
+                // deliberately skips rigid TypeVars, looking it up leaves the rigid `T` unbound, so
+                // `val x: Opt<i32> = None` fails to infer `T = i32`. When an `expected` type is a
+                // concrete generic ADT matching this constructor's owning type, instantiate the
+                // constructor with the expected type's type arguments directly.
+                if let Some(expected) = expected {
+                    if let Expr::Ident(name) = &ast.expr(expr).node {
+                        if let Some(ty) = self.infer_nullary_ctor_with_expected(name, expected) {
+                            return ty;
+                        }
+                    }
+                }
+                self.infer_ident_expr(expr, ast, env)
+            }
 
             // ── Assignment ──
             Expr::Assign { target, value } => {
@@ -2790,6 +2822,10 @@ impl<'a> InferContext<'a> {
 
             // ── Lambda ──
             Expr::Lambda { params, body, is_async, return_type } => {
+                // Lambda requires an explicit return type annotation.
+                if return_type.is_none() {
+                    self.add_error("lambda requires an explicit return type annotation: fun(params): T { ... }");
+                }
                 let child_env = self.env.child(env);
                 let param_types: Vec<TypeHandle> = params
                     .iter()
@@ -3017,6 +3053,60 @@ impl<'a> InferContext<'a> {
         }
     }
 
+    /// Bug K: when a bare nullary constructor (e.g. `None`) is used in a context with a
+    /// concrete expected ADT type (e.g. `val x: Opt<i32> = None`), instantiate the
+    /// constructor's owning type with the expected type's type arguments so the generic
+    /// parameter is inferred (rather than left as an unbound rigid var).
+    ///
+    /// Returns `Some(ty)` when `name` is a registered nullary constructor and `expected`
+    /// is a concrete `Type::Adt` whose name matches the constructor's owning type;
+    /// otherwise returns `None` so the caller falls back to normal identifier inference.
+    fn infer_nullary_ctor_with_expected(
+        &mut self,
+        name: &str,
+        expected: TypeHandle,
+    ) -> Option<TypeHandle> {
+        // Only consider names registered as constructors.
+        let ctors = self.sema_result.get_ctor_defs(name);
+        if ctors.is_empty() {
+            return None;
+        }
+        // Only nullary constructors (zero fields) are bare values; constructors with
+        // fields go through the Call path and infer via argument unification.
+        let is_nullary = ctors.iter().any(|c| c.field_type_reprs.is_empty());
+        if !is_nullary {
+            return None;
+        }
+        let exp_resolved = self.arena.resolve(expected);
+        let (exp_type_name, exp_args) = match self.arena.get(exp_resolved) {
+            Type::Adt(_) => self.arena.adt_parts(exp_resolved),
+            // Generic is the alias/parameterized form used for some type aliases; treat it
+            // like Adt for instantiation purposes.
+            Type::Generic(_) => self.arena.generic_parts(exp_resolved),
+            _ => return None,
+        };
+        // Disambiguate same-named nullary constructors across types: require the owning
+        // type name to match the expected type name.
+        let matching = ctors
+            .iter()
+            .find(|c| c.field_type_reprs.is_empty() && c.type_name.as_ref() == exp_type_name);
+        let type_name = match matching {
+            Some(c) => c.type_name.clone(),
+            // No name match: only safe to instantiate when there is a single candidate,
+            // to avoid guessing among ambiguous same-named constructors.
+            None => {
+                if ctors.len() == 1 {
+                    ctors[0].type_name.clone()
+                } else {
+                    return None;
+                }
+            }
+        };
+        // Build the concrete instantiation: OwnerType<expected_args...>.
+        // exp_args is already resolved/concrete (it came from the type annotation).
+        Some(self.arena.make_adt(type_name, exp_args.to_vec().into_boxed_slice()))
+    }
+
     /// Infer an `Expr::Ident` expression (extracted from `infer_expr_inner`).
     fn infer_ident_expr(
         &mut self,
@@ -3133,6 +3223,22 @@ impl<'a> InferContext<'a> {
                     BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
                         let rl = self.arena.resolve(left_unwrapped);
                         let rr = self.arena.resolve(right_unwrapped);
+                        // Bug I: arrays must use `++` (ConcatList) for concatenation, not `+`.
+                        // `+` on arrays previously type-checked (returning an array type) but produced
+                        // garbage at runtime (len=0). Note: `*` is a legitimate array-repeat idiom
+                        // (e.g. `[0u8] * 4096`), so only `Add` is rejected here.
+                        if *op == BinaryOp::Add {
+                            let left_is_array = matches!(self.arena.get(rl), Type::Array(_));
+                            let right_is_array = matches!(self.arena.get(rr), Type::Array(_));
+                            if left_is_array || right_is_array {
+                                self.add_error_at(
+                                    "cannot use + on arrays; use ++ for concatenation",
+                                    bin_span.line,
+                                    bin_span.column,
+                                );
+                                return left_unwrapped;
+                            }
+                        }
                         if self.arena.get(rl).is_numeric() && self.arena.get(rr).is_numeric() {
                             // Bug #73/#74: strict numeric type checking.
                             // - Bare literals (no suffix) can be promoted freely.
@@ -4773,7 +4879,6 @@ impl<'a> InferContext<'a> {
                         param_names.push(name); // self-reference is not a capture
                         let captures = self.compute_captures(ast, *body, &param_names, false);
                         let key = module_expr_key(&self.current_module_name, body.0 as u64);
-                        eprintln!("DEBUG sema LocalDecl: name={name} body={} key={key:#x} captures={:?}", body.0, captures);
                         self.sema_result.put_captures(key, &self.current_module_name, captures);
                     }
                 }

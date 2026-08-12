@@ -103,6 +103,17 @@ impl TimerRuntime {
     pub fn cleanup(&mut self) {
         self.fired_set.clear();
     }
+    /// Clears fired_set except the given ids. Used by check_timers to preserve just-fired timers
+    /// for one event-loop iteration so that a woken `select` frame can still consume them via
+    /// `is_fired` (the consuming-read invariant). Entries not consumed by `is_fired` (regular
+    /// timer awaits, which do not re-query is_fired after firing) are cleaned on the next call.
+    pub fn cleanup_except(&mut self, keep: &[crate::ir::Ir::TimerId]) {
+        if keep.is_empty() {
+            self.fired_set.clear();
+        } else {
+            self.fired_set.retain(|id| keep.contains(id));
+        }
+    }
 }
 
 impl Default for TimerRuntime {
@@ -465,12 +476,20 @@ impl<S: LockStrategy> Engine<S> {
         for tid in &fired_timers {
             self.on_event_arrived(RuntimeEvent::TimerFired(*tid), Value::VOID, queue);
         }
-        // All fired-timer events have been dispatched via on_event_arrived, so the residual entries
-        // in fired_set (those not consumed by is_fired) can be safely cleaned up:
-        // is_fired is only called inside the same lock as start() (checking a new timer) and never
-        // queries old entries.
+        // Clean up residual fired_set entries while preserving any id a still-suspended frame may
+        // need to observe via `is_fired`. A `select` frame woken by on_event_arrived is re-enqueued
+        // but not processed in this call, so its just-fired timer (and any other TimerFired event
+        // still pending in event_waiters) must survive until the frame re-runs the gate and consumes
+        // it via `is_fired`. Entries with no remaining waiter (regular timer awaits, which never
+        // re-query is_fired) are cleaned now.
         if !fired_timers.is_empty() {
-            self.timer_runtime.lock().cleanup();
+            let mut keep: Vec<crate::ir::Ir::TimerId> = fired_timers.clone();
+            for (e, _) in self.event_waiters.lock().iter() {
+                if let RuntimeEvent::TimerFired(tid) = e {
+                    keep.push(*tid);
+                }
+            }
+            self.timer_runtime.lock().cleanup_except(&keep);
         }
     }
 }

@@ -152,8 +152,6 @@ impl<S: LockStrategy> Engine<S> {
                 let node = self.graph.node(gid as usize);
                 if node.kind == NodeKind::EventSource {
                     child.pending_inputs[i] = PENDING_EXTERNAL;
-                } else if node.kind == NodeKind::Gate && self.graph.has_select_info(gid as usize) {
-                    child.pending_inputs[i] = 0;
                 } else {
                     // Gate (non-select) and ordinary nodes are unified: count actually-unready
                     // in-frame inputs. Inputs outside the frame range (effect chains, outer
@@ -335,6 +333,22 @@ impl<S: LockStrategy> Engine<S> {
                     if let Some(lf) = loop_frame.as_deref_mut() {
                         lf.cached_child_frame = None;
                         lf.control_signal = child_signal.clone();
+                        // Bug G: a `break` (or `return` penetrating the loop) exits the loop
+                        // WITHOUT entering the loop's void_sg, so the CF_DEFER_RUN node that
+                        // normally drains the loop frame's `defer_stack` (populated each
+                        // iteration by CF_DEFER_REGISTER) never executes. Drain the stack here
+                        // and run the registered defers in LIFO order, mirroring compute_defer_run.
+                        // Only do this for an actual Break/Return signal (not the propagated
+                        // re-entry of an outer loop frame, which has its own stack).
+                        if matches!(child_signal, ControlSignal::Break | ControlSignal::Return(_))
+                            && !lf.defer_stack.is_empty()
+                        {
+                            let defers: Vec<crate::ir::Ir::RuntimeDefer> =
+                                lf.defer_stack.drain(..).collect();
+                            // Defer bodies read outer variables from the loop frame (matching
+                            // compute_defer_run's choice of parent_frame_ptr / self).
+                            crate::ir::Compute::run_defer_entries_sync(lf, &defers, &self.graph);
+                        }
                     }
                     // Iterate on loop_frame (loop_kind is usually While/Loop/For, not LoopBody,
                     // but if it is a nested LoopBody we keep propagating iteratively to avoid

@@ -1556,8 +1556,8 @@ impl<'a> IrBuilder<'a> {
         let mut branches = Vec::with_capacity(arms.len());
 
         for arm in arms {
-            let (event_kind, event_source_node, body_expr) = match arm {
-                crate::ast::Ast::SelectArm::Receive { channel_expr, body, .. } => {
+            let (event_kind, event_source_node, body_expr, binding) = match arm {
+                crate::ast::Ast::SelectArm::Receive { channel_expr, body, binding } => {
                     // `channel_expr` is of the form `ch.recv()`: at compile time we must take the
                     // receiver of `recv` (the channel value), not the entire method call
                     // (`recv()` returns the received value, not the channel itself).
@@ -1580,11 +1580,11 @@ impl<'a> IrBuilder<'a> {
                         }
                         _ => self.compile_subexpr(*channel_expr),
                     };
-                    (EventSourceKind::Channel, ch_node, *body)
+                    (EventSourceKind::Channel, ch_node, *body, *binding)
                 }
                 crate::ast::Ast::SelectArm::Timeout { duration, body } => {
                     let dur_node = self.compile_subexpr(*duration);
-                    (EventSourceKind::Timer, dur_node, *body)
+                    (EventSourceKind::Timer, dur_node, *body, None)
                 }
             };
 
@@ -1616,6 +1616,23 @@ impl<'a> IrBuilder<'a> {
             self.current_function_sg = Some(sg_id);
             self.enter_scope();
 
+            // When the arm has a binding (`ch.recv() => v => body`), the received value is bound
+            // to `binding` inside the body. Emit a 0-input parameter node as the FIRST node of the
+            // branch subgraph; the runtime injects the recv'd value into it (param_count=1) when the
+            // branch is selected. The body then references `binding` via this node.
+            let mut branch_param_count: u8 = 0;
+            if let Some(name) = binding {
+                let off = self.graph.inputs_pool.push(&[]);
+                let param_node = self.graph.add_node(Node {
+                    kind: NodeKind::Const,
+                    input_count: 0,
+                    inputs_offset: off,
+                    compute_fn: CF_NOOP,
+                });
+                self.bind_var(name, param_node);
+                branch_param_count = 1;
+            }
+
             // Compile the body (variable bindings inside the body live in the subgraph scope).
             let result_node = self.compile_expr(body_expr);
 
@@ -1626,6 +1643,7 @@ impl<'a> IrBuilder<'a> {
             let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
             sg.node_range = (NodeId(node_start), NodeId(node_end));
             sg.return_node = result_node;
+            sg.param_count = branch_param_count;
 
             branches.push(SelectBranch {
                 subgraph_id: sg_id,
@@ -1689,9 +1707,7 @@ impl<'a> IrBuilder<'a> {
         // expression's ExprId — fall back to that.
         let sema_captures: Vec<crate::sema::Sema::CaptureInfo> = {
             let key_id = lambda_expr_id.unwrap_or(body_expr);
-            let caps = self.lookup_captures(key_id).to_vec();
-            eprintln!("DEBUG ir compile_lambda: fn_name={fn_name:?} body_expr={} key_id={} caps={:?}", body_expr.0, key_id.0, caps);
-            caps
+            self.lookup_captures(key_id).to_vec()
         };
         let mut captured: Vec<(String, NodeId)> = Vec::new();
 
@@ -1723,13 +1739,7 @@ impl<'a> IrBuilder<'a> {
             if Some(ident) == fn_name && self_upvalue_idx >= 0 {
                 continue;
             }
-            eprintln!("DEBUG ir compile_lambda: looking up var '{ident}' for capture, scope_stack depth={}", self.scope_stack.len());
-            for (i, scope) in self.scope_stack.iter().rev().enumerate() {
-                eprintln!("DEBUG   scope[{i}] keys: {:?}", scope.keys().collect::<Vec<_>>());
-            }
-            let lookup_result = self.lookup_var(ident);
-            eprintln!("DEBUG ir compile_lambda: lookup_var('{ident}') = {lookup_result:?}");
-            if let Some(node) = lookup_result {
+            if let Some(node) = self.lookup_var(ident) {
                 if !captured.iter().any(|(n, _)| n.as_str() == ident) {
                     // If the variable has already been captured by an outer lambda, use the outer
                     // original node.
@@ -6576,7 +6586,6 @@ impl<'a> IrBuilder<'a> {
         stmts: &[crate::ast::Ast::StmtId],
         trailing: &Option<crate::ast::Ast::ExprId>,
     ) -> NodeId {
-        eprintln!("DEBUG compile_block: {} stmts, scope_depth_before={}", stmts.len(), self.scope_stack.len());
         self.enter_scope();
         let prev_effect = self.current_effect;
         // Bug #66: If this is the function body's top-level block, do NOT extract defers —
@@ -6664,23 +6673,73 @@ impl<'a> IrBuilder<'a> {
         // Extract block-scoped defers (drain entries after defer_mark).
         let block_defers: Vec<crate::ir::Ir::DeferEntry> =
             defer_table.drain(defer_mark..).collect();
-        // Generate LIFO cleanup: each defer body is called via make_call with its captured inputs.
-        // The cleanup is chained after the block result via CF_SEQ, preserving the result value.
-        // CF_SEQ returns the value of its last input, so we chain: SEQ(result, defer1) -> SEQ(that, defer2) -> ...
-        // The final SEQ node returns the last defer's value, but the block result is preserved
-        // through the SEQ chain's first input (data dependency).
-        let mut cleanup_chain = result;
+        // Generate cleanup by reusing the loop-defer machinery (CF_DEFER_REGISTER + CF_DEFER_RUN).
+        // Each block-scoped defer is registered onto the runtime defer_stack via a
+        // CF_DEFER_REGISTER node (which snapshots the defer's captured values), then a single
+        // CF_DEFER_RUN node drains the stack in LIFO order, executing each defer body as a proper
+        // defer frame (with parent_frame_ptr/root_frame_ptr set so the body can read/write outer
+        // variables via the frame chain). This mirrors how loops run defer-in-loop bodies and
+        // fixes two issues:
+        //   - The defer body must run as a defer frame (NOT a regular Call via make_call, which
+        //     gives a node_offset=0 frame that cannot reach outer scope via the frame chain).
+        //   - The block result value must be preserved: cleanup nodes are chained BEFORE `result`
+        //     via CF_SEQ (which returns its LAST input's value), so the final node yields `result`.
+        // Generate cleanup by reusing the loop-defer machinery (CF_BLOCK_DEFER_REGISTER +
+        // CF_DEFER_RUN). Each block-scoped defer is registered onto the runtime defer_stack via a
+        // CF_BLOCK_DEFER_REGISTER node (which snapshots the defer's captured values), then a single
+        // CF_DEFER_RUN node drains the stack in LIFO order, executing each defer body as a proper
+        // defer frame (with parent_frame_ptr/root_frame_ptr set so the body can read/write outer
+        // variables via the frame chain). This mirrors how loops run defer-in-loop bodies.
+        //
+        // ORDERING (critical): in the dataflow scheduler every node is scheduled independently
+        // based on its OWN inputs. A node with zero inputs is enqueued at frame start and would
+        // fire before prior effects (e.g. global-var initialization) complete, causing the defer
+        // body's reads of outer/global variables to observe stale/null values. To prevent this,
+        // each register/run node takes the accumulated effect chain as a DIRECT input:
+        //   - CF_BLOCK_DEFER_REGISTER treats input[0] as an effect-ordering dependency and uses
+        //     inputs[1..] as the captured NodeIds.
+        //   - CF_DEFER_RUN ignores all inputs (it reads defer_stack) but still requires them ready.
+        // The block result value is preserved by wrapping the final run node + `result` in a
+        // CF_SEQ (which returns its LAST input's value, i.e. `result`).
         let mut last_defer_call: Option<NodeId> = None;
-        for entry in block_defers.iter().rev() {
-            let call_node = self.make_call(entry.body_subgraph, &entry.captured_inputs);
-            cleanup_chain = self.chain_effects(Some(cleanup_chain), call_node);
-            last_defer_call = Some(call_node);
+        let mut effect_dep: NodeId = result;
+        // Iterate in source (registration) order so the register nodes push onto defer_stack in
+        // the same order; CF_DEFER_RUN then drains in LIFO (rev) order, running the
+        // last-declared defer first — matching the function-level defer semantics.
+        for entry in block_defers.iter() {
+            // Build inputs: [effect_dep] ++ captured_inputs.
+            let mut reg_inputs: Vec<NodeId> = Vec::with_capacity(entry.captured_inputs.len() + 1);
+            reg_inputs.push(effect_dep);
+            reg_inputs.extend_from_slice(&entry.captured_inputs);
+            let inputs_off = self.graph.inputs_pool.push(&reg_inputs);
+            let reg_node = self.graph.add_node(Node {
+                kind: NodeKind::Call,
+                input_count: reg_inputs.len() as u8,
+                inputs_offset: inputs_off,
+                compute_fn: CF_BLOCK_DEFER_REGISTER,
+            });
+            self.graph.set_call_target(reg_node, entry.body_subgraph);
+            effect_dep = reg_node;
+            last_defer_call = Some(reg_node);
         }
-        // Return the block result (preserved through SEQ chain) and the last defer call as effect.
-        // Note: cleanup_chain is the final SEQ node; its value is the last defer's return value,
-        // but subsequent statements use it as an effect dependency, not as a data value.
-        // The block's actual result value flows through the SEQ chain's first input (result).
-        (cleanup_chain, last_defer_call)
+        // CF_DEFER_RUN node: drains defer_stack in LIFO order and runs each defer body as a defer
+        // frame. Give it `effect_dep` as a direct input so it cannot fire before the register
+        // nodes (and thus before the block's prior effects) complete.
+        let run_off = self.graph.inputs_pool.push(&[effect_dep]);
+        let run_node = self.graph.add_node(Node {
+            kind: NodeKind::Call,
+            input_count: 1,
+            inputs_offset: run_off,
+            compute_fn: CF_DEFER_RUN,
+        });
+        if last_defer_call.is_none() {
+            last_defer_call = Some(run_node);
+        }
+        // Wrap run_node + result in CF_SEQ so the block's value is `result` (CF_SEQ returns its
+        // last input's value). Both inputs must be ready before the SEQ computes, so the defer
+        // cleanup side effects are guaranteed to complete before any consumer reads the value.
+        let result_node = self.chain_effects(Some(run_node), result);
+        (result_node, last_defer_call)
     }
 
     /// Compile a statement, returning an effect node (to be sequentially linked into the block result node).
@@ -6716,7 +6775,6 @@ impl<'a> IrBuilder<'a> {
             }
             crate::ast::Ast::Stmt::VarDecl { name, value, .. } => {
                 let value_node = self.compile_subexpr(*value);
-                eprintln!("DEBUG VarDecl bind_var('{name}') scope_depth={}", self.scope_stack.len());
                 self.bind_var(name, value_node);
                 Some(value_node)
             }
@@ -6897,22 +6955,28 @@ impl<'a> IrBuilder<'a> {
                     if captured_source.is_some() {
                         self.compile_writeback_node(result_node, captured_source.unwrap());
                         self.bind_var(name, result_node);
+                        None
                     } else if self.lookup_global_var(name).is_some() && self.lookup_var(name).is_none() {
-                        // Global variable -> global_store
+                        // Global variable -> global_store. Return the store node so it is chained
+                        // into the block's effect chain (last_effect), otherwise the store would be
+                        // orphaned and dropped (the global has no local binding to keep it alive).
                         let slot = self.lookup_global_var(name).unwrap();
                         let store_node = self.compile_global_store(result_node, slot);
                         self.current_effect = Some(store_node);
+                        Some(store_node)
                     } else if !self.is_in_current_subgraph(cur_node) {
                         // Outer variable -> WriteBack + bind a local reference
                         self.compile_writeback_node(result_node, cur_node);
                         self.bind_var(name, result_node);
+                        None
                     } else if let Some(&captured_node) = self.captured_vars.get(*name) {
                         self.compile_writeback_node(result_node, captured_node);
                         self.bind_var(name, result_node);
+                        None
                     } else {
                         self.bind_var(name, result_node);
+                        None
                     }
-                    None
                 } else {
                     // Non-Ident target (FieldAccess/Index/Deref): delegate to
                     // compile_compound_assign which handles read-modify-write for these.
@@ -7178,7 +7242,6 @@ impl<'a> IrBuilder<'a> {
     ///
     /// If the function does not exist or its declaration type mismatches, records a compile error and returns a placeholder subgraph (error recovery).
     pub fn compile_function(&mut self, name: &str) -> SubGraphId {
-        eprintln!("DEBUG compile_function('{name}') called");
         let location = match self.find_function_location(name) {
             Some(loc) => loc,
             None => {

@@ -2585,8 +2585,13 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         let mut kind = None;
         let mut bounds = Vec::new();
         if self.match_token(TokenKind::Colon) {
-            if self.check(TokenKind::Identifier) {
-                let has_paren = self.check(TokenKind::LParen);
+            // Bug H: a parenthesized trait-bound list `(Named, Counted)` must be detected
+            // before the kind-vs-trait decision. Previously the code checked for `Identifier`
+            // first, so when the next token was `(` it fell through to `parse_kind` and
+            // reported "expected kind (* or arrow kind)". Mirror parse_type_decl: check for
+            // `LParen` first, then a single `Identifier` trait bound, else a kind annotation.
+            let has_paren = self.check(TokenKind::LParen);
+            if has_paren || self.check(TokenKind::Identifier) {
                 if has_paren {
                     self.advance();
                 }
@@ -3715,51 +3720,15 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             self.parse_param_list(&mut params)?;
         }
         let _ = self.expect(TokenKind::RParen, "expected ')'");
+        // Lambda requires an explicit return type annotation: fun(params): T { body }
+        let _ = self.expect(TokenKind::Colon, "expected ':' followed by return type in lambda");
+        let return_type = self.parse_type()?;
         let body_expr = self.parse_expr()?;
         Ok(self.alloc_expr(span, Expr::Lambda {
             params,
             body: LambdaBody::Block(body_expr),
             is_async,
-            return_type: None,
-        }))
-    }
-
-    /// Attempt to parse a lambda: `(params) => expr` (backtracks on failure)
-    fn try_parse_lambda(&mut self, saved: usize, span: Span) -> Option<ExprRef> {
-        let saved_error_count = self.handler.errors().len();
-        let mut params = Vec::new();
-        if !self.check(TokenKind::RParen)
-            && self.parse_lambda_param_list(&mut params).is_err()
-        {
-            self.handler.truncate_errors(saved_error_count);
-            self.current = saved;
-            return None;
-        }
-        if !self.check(TokenKind::RParen) {
-            self.handler.truncate_errors(saved_error_count);
-            self.current = saved;
-            return None;
-        }
-        self.advance(); // ')'
-        if !self.check(TokenKind::EqGt) {
-            self.current = saved;
-            self.handler.truncate_errors(saved_error_count);
-            return None;
-        }
-        self.advance(); // '=>'
-        let body_expr = match self.parse_expr() {
-            Ok(e) => e,
-            Err(_) => {
-                self.current = saved;
-                self.handler.truncate_errors(saved_error_count);
-                return None;
-            }
-        };
-        Some(self.alloc_expr(span, Expr::Lambda {
-            params,
-            body: LambdaBody::Expression(body_expr),
-            is_async: false,
-            return_type: None,
+            return_type: Some(return_type),
         }))
     }
 
@@ -3786,10 +3755,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             return Ok(self.alloc_expr(span, Expr::VoidLit));
         }
         let saved = self.current;
-        if let Some(lambda) = self.try_parse_lambda(saved, span) {
-            return Ok(lambda);
-        }
-        self.current = saved;
         // Record extend: (...base, field: value)
         if self.peek().kind == TokenKind::Ellipsis {
             self.advance();
@@ -4258,12 +4223,15 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             self.parse_param_list(&mut params)?;
         }
         let _ = self.expect(TokenKind::RParen, "expected ')'");
+        // Lambda requires an explicit return type annotation: fun(params): T { body }
+        let _ = self.expect(TokenKind::Colon, "expected ':' followed by return type in lambda");
+        let return_type = self.parse_type()?;
         let body_expr = self.parse_expr()?;
         let lambda = self.alloc_expr(span, Expr::Lambda {
             params,
             body: LambdaBody::Block(body_expr),
             is_async: false,
-            return_type: None,
+            return_type: Some(return_type),
         });
         Ok(self.alloc_stmt(span, Stmt::Expression { expr: lambda }))
     }
