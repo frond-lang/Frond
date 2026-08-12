@@ -763,7 +763,7 @@ fn complete_type_name(doc: &DocState, _index: &Option<WorkspaceIndex>) -> Vec<se
 /// General completion: keywords + document symbols + builtin constructors.
 fn complete_general(doc: &DocState, _index: &Option<WorkspaceIndex>) -> Vec<serde_json::Value> {
     let keywords = [
-        "fun", "type", "trait", "override", "pack", "pub", "import", "with", "as", "val", "var",
+        "fun", "type", "trait", "override", "pack", "pub", "import", "as", "val", "var",
         "match", "if", "else", "async", "channel", "select", "atomic", "loop", "for", "in",
         "while", "break", "continue", "return", "throw", "lazy", "defer", "this",
     ];

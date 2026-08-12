@@ -18,6 +18,8 @@
 //! - `Display`: type display formatting (`TypeDisplay`)
 //! - `Ops`: `TypeOps` trait + scalar/reference ops implementations + ops lookup table +
 //!   `DynamicOpsRegistry`
+//! - `Ctype` (file `Ctype.rs`): Kuzo基础数据类型 ↔ C类型映射表(纯数据,
+//!   无 `crate::` 依赖,可被 `build.rs` `include!`)
 
 pub mod Tag;
 
@@ -31,6 +33,9 @@ pub use crate::value::{ValueTag, TypeFamily, BuiltinInfo, BUILTIN_TABLE, builtin
 // `crate::types::Type` resolves to the enum via glob re-export, and `crate::types::Ty`
 // resolves to the module.
 pub mod Ty;
+
+/// Kuzo基础数据类型 ↔ C类型映射(纯数据,无 `crate::` 依赖,可被 `build.rs` `include!`)。
+pub mod Ctype;
 
 pub mod Arena;
 pub mod Display;

@@ -10,7 +10,7 @@ use crate::ast::Ast::{
     InterpolationPart, Kind, LambdaBody, MatchArm, MethodDecl, Module, Param,
     Pattern, PatternLiteral, PatternRecordField, PatternRef,
     RecordFieldExpr, RecordFieldType, SelectArm, Span, Spanned, Stmt,
-    StmtRef, TraitBound, TypeConstraint, TypeDef, TypeNode, TypeParam,
+    StmtRef, TraitBound, TypeDef, TypeNode, TypeParam,
     TypeRef, UnaryOp, Visibility,
 };
 // BinaryOp precedence table
@@ -278,7 +278,6 @@ pub enum TokenKind {
     KwPack,
     KwPub,
     KwImport,
-    KwWith,
     KwAs,
     KwVal,
     KwVar,
@@ -1383,7 +1382,6 @@ fn keyword_type(text: &str) -> TokenKind {
         "pack" => TokenKind::KwPack,
         "pub" => TokenKind::KwPub,
         "import" => TokenKind::KwImport,
-        "with" => TokenKind::KwWith,
         "as" => TokenKind::KwAs,
         "val" => TokenKind::KwVal,
         "var" => TokenKind::KwVar,
@@ -2044,7 +2042,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     // Declaration parsing
     // =====================================================================
 
-    /// Parse a function declaration: `fun name<TParams>(params): ReturnType with bounds { body }`
+    /// Parse a function declaration: `fun name<TParams>(params): ReturnType { body }`
     fn parse_fun_decl(&mut self, visibility: Visibility, is_async: bool, attributes: Vec<Attribute<'a>>) -> ParseResult<Spanned<Decl<'a>>> {
         let fun_tok = self.advance(); // 'fun'
         let name_tok = self.expect(TokenKind::Identifier, "expected function name")?;
@@ -2068,10 +2066,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 "function declaration must explicitly annotate the return type (use ': void' for no return value)",
             ));
         };
-        let mut bounds = Vec::new();
-        if self.match_token(TokenKind::KwWith) {
-            self.parse_trait_bound_list(&mut bounds)?;
-        }
         // @extern("C") function: body is a #{ }# raw block rather than a Kuzo expression
         let extern_c_body = if self.check(TokenKind::RawBlock) {
             let tok = self.advance();
@@ -2093,7 +2087,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 type_params,
                 params,
                 return_type,
-                bounds,
                 body,
                 is_async,
                 is_entry: name_tok.lexeme == "main",
@@ -2103,7 +2096,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         ))
     }
 
-    /// Parse a type declaration: `type Name<TParams> : traits = def with constraints { methods }`
+    /// Parse a type declaration: `type Name<TParams> : traits = def { methods }`
     fn parse_type_decl(&mut self, visibility: Visibility) -> ParseResult<Spanned<Decl<'a>>> {
         let type_tok = self.advance(); // 'type'
         let name_tok = self.expect(TokenKind::Identifier, "expected type name")?;
@@ -2125,10 +2118,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         let _ = self.expect(TokenKind::Eq, "expected '=' to define type body");
         let def = self.parse_type_def()?;
-        let mut type_constraints = Vec::new();
-        if self.match_token(TokenKind::KwWith) {
-            self.parse_type_constraints(&mut type_constraints)?;
-        }
         let mut methods = Vec::new();
         if self.match_token(TokenKind::LBrace) {
             self.parse_method_block(&mut methods)?;
@@ -2141,7 +2130,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 name: name_tok.lexeme,
                 type_params,
                 implemented_traits,
-                type_constraints,
                 def,
                 methods,
             },
@@ -2624,9 +2612,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 kind = Some(Box::new(self.parse_kind()?));
             }
         }
-        if self.match_token(TokenKind::KwWith) {
-            self.parse_trait_bound_list_inner(&mut bounds)?;
-        }
         Ok(TypeParam {
             name: name_tok.lexeme,
             kind,
@@ -2695,18 +2680,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(TraitBound {
             trait_name: name_tok.lexeme,
             type_args,
-        })
-    }
-
-    impl_parse_comma_list!(parse_type_constraints, TypeConstraint<'a>, parse_type_constraint, check(TokenKind::LBrace));
-
-    fn parse_type_constraint(&mut self) -> ParseResult<TypeConstraint<'a>> {
-        let type_param_tok = self.expect(TokenKind::Identifier, "expected type parameter name")?;
-        self.expect(TokenKind::Colon, "expected ':' after type parameter")?;
-        let concrete_type = self.parse_type()?;
-        Ok(TypeConstraint {
-            type_param: type_param_tok.lexeme,
-            concrete_type,
         })
     }
 
@@ -4263,10 +4236,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             } else {
                 None
             };
-            let mut bounds = Vec::new();
-            if self.match_token(TokenKind::KwWith) {
-                self.parse_trait_bound_list(&mut bounds)?;
-            }
             let body = self.parse_expr()?;
             let decl = Decl::FunDecl {
                 visibility: Visibility::Private,
@@ -4274,7 +4243,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 type_params,
                 params,
                 return_type,
-                bounds,
                 body,
                 is_async: false,
                 is_entry: false,

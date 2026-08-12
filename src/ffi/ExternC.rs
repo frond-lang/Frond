@@ -28,7 +28,7 @@ mod gen;
 use crate::ast::Ast::{Attribute, Decl, Module, TypeNode};
 use std::borrow::Cow;
 
-use gen::{is_str_return, kuzo_type_to_c_params, kuzo_type_to_c_return, ExternCFunc};
+use gen::{is_i128_return, is_str_return, kuzo_type_to_c_params, kuzo_type_to_c_return, ExternCFunc};
 
 // ============ Attribute recognition ============
 
@@ -148,12 +148,13 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
             let c_includes = collect_c_includes(attributes);
 
             // Map the return type.
-            // `str` return uses the out-parameter pattern: the C function returns void
-            // and `out_data`/`out_len` parameters are appended.
+            // `str` and 128-bit returns both use the out-parameter pattern: the C
+            // function returns void and trailing out-pointers carry the result.
             let ret_name = extract_type_name(*return_type, arena);
             let kuzo_return = ret_name.as_deref().unwrap_or("void").to_string();
             let is_str_ret = is_str_return(&kuzo_return);
-            let c_return = if is_str_ret {
+            let is_i128_ret = is_i128_return(&kuzo_return);
+            let c_return = if is_str_ret || is_i128_ret {
                 "void".to_string()
             } else {
                 match ret_name.as_deref().and_then(kuzo_type_to_c_return) {
@@ -206,6 +207,20 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
                 c_params.push(gen::CParam {
                     name: "out_len".to_string(),
                     c_type: "size_t*".to_string(),
+                });
+            }
+
+            // For i128/u128/f128 returns, append two uint64_t* out parameters
+            // (low/high). MSVC x64 cannot return `__int128` by value, so we use
+            // the same out-parameter pattern as `str`.
+            if is_i128_ret {
+                c_params.push(gen::CParam {
+                    name: "out_lo".to_string(),
+                    c_type: "uint64_t*".to_string(),
+                });
+                c_params.push(gen::CParam {
+                    name: "out_hi".to_string(),
+                    c_type: "uint64_t*".to_string(),
                 });
             }
 

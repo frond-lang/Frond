@@ -5,6 +5,7 @@
 // Called by wrappers in std/time/*.kz.
 
 @c_include("time.h")
+@c_include("windows.h")
 @extern("C")
 fun __instant_now_ns(): i64 #{
     #if defined(_WIN32) || defined(_WIN64)

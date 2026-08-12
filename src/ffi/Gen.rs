@@ -7,6 +7,12 @@
 // MUST NOT depend on `crate::` — only `std` + pure data. This keeps it
 // compilable in both the lib crate and the build script context.
 
+// Pull in the base Kuzo→C type table (lives in src/types/Ctype.rs, the single
+// source of truth for "which C type does a Kuzo scalar map to"). Both Gen.rs
+// and build.rs include Ctype.rs the same way, so the table is shared without a
+// `crate::` dependency.
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/types/Ctype.rs"));
+
 // ============ Data structures ============
 
 /// C function parameter: name + type.
@@ -36,12 +42,15 @@ pub struct ExternCFunc {
 /// Kuzo type → C/Rust mapping entry (single source of truth, eliminates scalar
 /// duplication across 4 match sites).
 ///
-/// - `c_return`: C return type (`str` returns `None`, handled by the out-parameter pattern)
 /// - `rust_wrapper`: Rust wrapper parameter/return type
 /// - `c_param_kind`: C parameter dispatch mode (scalars pass through directly,
 ///   `i128`/`u128`/`f128` split into `lo`/`hi`, `str`/`u8[]` split into `data`/`len`)
+///
+/// NOTE: the C type for a Kuzo scalar is NOT stored here — it lives in the base
+/// table `KUZO_TO_C_TYPE` (`src/types/Ctype.rs`), queried via `kuzo_to_c_type`.
+/// `KuzoTypeMapping` only carries FFI-strategy data (how to pass the parameter,
+/// what Rust wrapper type to use).
 pub struct KuzoTypeMapping {
-    pub c_return: Option<&'static str>,
     pub rust_wrapper: Option<&'static str>,
     pub c_param_kind: CParamKind,
 }
@@ -57,46 +66,47 @@ pub enum CParamKind {
     DataLen { c_data_type: &'static str },
 }
 
-/// Complete Kuzo type mapping table (scalars + `str`/`void`/pointers/arrays).
+/// Complete Kuzo FFI-strategy mapping table (scalars + `str`/`void`/pointers/arrays).
 ///
-/// To add a new type, simply append a row here; `kuzo_type_to_c_return`,
-/// `kuzo_type_to_rust_wrapper`, and `kuzo_type_to_c_params` are auto-derived.
+/// The C type for each Kuzo scalar is looked up via `kuzo_to_c_type`
+/// (`KUZO_TO_C_TYPE` in `src/types/Ctype.rs`); this table only carries FFI
+/// strategy data (Rust wrapper type + C parameter passing mode).
 pub const KUZO_TYPE_MAP: &[(&str, KuzoTypeMapping)] = &[
     // Scalar integers
-    ("i8",    KuzoTypeMapping { c_return: Some("int8_t"),  rust_wrapper: Some("i8"),    c_param_kind: CParamKind::Single("int8_t") }),
-    ("i16",   KuzoTypeMapping { c_return: Some("int16_t"), rust_wrapper: Some("i16"),   c_param_kind: CParamKind::Single("int16_t") }),
-    ("i32",   KuzoTypeMapping { c_return: Some("int32_t"), rust_wrapper: Some("i32"),   c_param_kind: CParamKind::Single("int32_t") }),
-    ("i64",   KuzoTypeMapping { c_return: Some("int64_t"), rust_wrapper: Some("i64"),   c_param_kind: CParamKind::Single("int64_t") }),
-    ("i128",  KuzoTypeMapping { c_return: Some("__int128"), rust_wrapper: Some("i128"), c_param_kind: CParamKind::LoHi }),
-    ("u8",    KuzoTypeMapping { c_return: Some("uint8_t"), rust_wrapper: Some("u8"),    c_param_kind: CParamKind::Single("uint8_t") }),
-    ("u16",   KuzoTypeMapping { c_return: Some("uint16_t"), rust_wrapper: Some("u16"), c_param_kind: CParamKind::Single("uint16_t") }),
-    ("u32",   KuzoTypeMapping { c_return: Some("uint32_t"), rust_wrapper: Some("u32"), c_param_kind: CParamKind::Single("uint32_t") }),
-    ("u64",   KuzoTypeMapping { c_return: Some("uint64_t"), rust_wrapper: Some("u64"), c_param_kind: CParamKind::Single("uint64_t") }),
-    ("u128",  KuzoTypeMapping { c_return: Some("unsigned __int128"), rust_wrapper: Some("u128"), c_param_kind: CParamKind::LoHi }),
-    ("isize", KuzoTypeMapping { c_return: Some("ssize_t"), rust_wrapper: Some("isize"), c_param_kind: CParamKind::Single("ssize_t") }),
-    ("usize", KuzoTypeMapping { c_return: Some("size_t"),  rust_wrapper: Some("usize"), c_param_kind: CParamKind::Single("size_t") }),
+    ("i8",    KuzoTypeMapping { rust_wrapper: Some("i8"),    c_param_kind: CParamKind::Single("int8_t") }),
+    ("i16",   KuzoTypeMapping { rust_wrapper: Some("i16"),   c_param_kind: CParamKind::Single("int16_t") }),
+    ("i32",   KuzoTypeMapping { rust_wrapper: Some("i32"),   c_param_kind: CParamKind::Single("int32_t") }),
+    ("i64",   KuzoTypeMapping { rust_wrapper: Some("i64"),   c_param_kind: CParamKind::Single("int64_t") }),
+    ("i128",  KuzoTypeMapping { rust_wrapper: Some("i128"), c_param_kind: CParamKind::LoHi }),
+    ("u8",    KuzoTypeMapping { rust_wrapper: Some("u8"),    c_param_kind: CParamKind::Single("uint8_t") }),
+    ("u16",   KuzoTypeMapping { rust_wrapper: Some("u16"), c_param_kind: CParamKind::Single("uint16_t") }),
+    ("u32",   KuzoTypeMapping { rust_wrapper: Some("u32"), c_param_kind: CParamKind::Single("uint32_t") }),
+    ("u64",   KuzoTypeMapping { rust_wrapper: Some("u64"), c_param_kind: CParamKind::Single("uint64_t") }),
+    ("u128",  KuzoTypeMapping { rust_wrapper: Some("u128"), c_param_kind: CParamKind::LoHi }),
+    ("isize", KuzoTypeMapping { rust_wrapper: Some("isize"), c_param_kind: CParamKind::Single("ssize_t") }),
+    ("usize", KuzoTypeMapping { rust_wrapper: Some("usize"), c_param_kind: CParamKind::Single("size_t") }),
     // Scalar floating-point
-    ("f32",   KuzoTypeMapping { c_return: Some("float"),   rust_wrapper: Some("f32"),   c_param_kind: CParamKind::Single("float") }),
-    ("f64",   KuzoTypeMapping { c_return: Some("double"),  rust_wrapper: Some("f64"),   c_param_kind: CParamKind::Single("double") }),
-    ("f16",   KuzoTypeMapping { c_return: Some("uint16_t"), rust_wrapper: Some("u16"),  c_param_kind: CParamKind::Single("uint16_t") }),
-    ("f128",  KuzoTypeMapping { c_return: Some("unsigned __int128"), rust_wrapper: Some("u128"), c_param_kind: CParamKind::LoHi }),
+    ("f32",   KuzoTypeMapping { rust_wrapper: Some("f32"),   c_param_kind: CParamKind::Single("float") }),
+    ("f64",   KuzoTypeMapping { rust_wrapper: Some("f64"),   c_param_kind: CParamKind::Single("double") }),
+    ("f16",   KuzoTypeMapping { rust_wrapper: Some("u16"),  c_param_kind: CParamKind::Single("uint16_t") }),
+    ("f128",  KuzoTypeMapping { rust_wrapper: Some("u128"), c_param_kind: CParamKind::LoHi }),
     // Non-arithmetic scalars
-    ("bool",  KuzoTypeMapping { c_return: Some("int"),     rust_wrapper: Some("bool"),  c_param_kind: CParamKind::Single("int") }),
-    ("char",  KuzoTypeMapping { c_return: Some("uint32_t"), rust_wrapper: Some("char"), c_param_kind: CParamKind::Single("uint32_t") }),
+    ("bool",  KuzoTypeMapping { rust_wrapper: Some("bool"),  c_param_kind: CParamKind::Single("int") }),
+    ("char",  KuzoTypeMapping { rust_wrapper: Some("char"), c_param_kind: CParamKind::Single("uint32_t") }),
     // Special types
-    ("str",   KuzoTypeMapping { c_return: None,            rust_wrapper: Some("&str"),  c_param_kind: CParamKind::DataLen { c_data_type: "const char*" } }),
-    ("void",  KuzoTypeMapping { c_return: Some("void"),    rust_wrapper: Some("()"),    c_param_kind: CParamKind::Single("void") }),
-    ("u8[]",  KuzoTypeMapping { c_return: None,            rust_wrapper: Some("&[u8]"), c_param_kind: CParamKind::DataLen { c_data_type: "uint8_t*" } }),
+    ("str",   KuzoTypeMapping { rust_wrapper: Some("&str"),  c_param_kind: CParamKind::DataLen { c_data_type: "const char*" } }),
+    ("void",  KuzoTypeMapping { rust_wrapper: Some("()"),    c_param_kind: CParamKind::Single("void") }),
+    ("u8[]",  KuzoTypeMapping { rust_wrapper: Some("&[u8]"), c_param_kind: CParamKind::DataLen { c_data_type: "uint8_t*" } }),
     // Pointer types
-    ("*u8",   KuzoTypeMapping { c_return: Some("uint8_t*"), rust_wrapper: Some("*mut u8"),  c_param_kind: CParamKind::Single("uint8_t*") }),
-    ("*i8",   KuzoTypeMapping { c_return: Some("int8_t*"),  rust_wrapper: Some("*mut i8"),  c_param_kind: CParamKind::Single("int8_t*") }),
-    ("*u16",  KuzoTypeMapping { c_return: Some("uint16_t*"), rust_wrapper: Some("*mut u16"), c_param_kind: CParamKind::Single("uint16_t*") }),
-    ("*i16",  KuzoTypeMapping { c_return: Some("int16_t*"), rust_wrapper: Some("*mut i16"), c_param_kind: CParamKind::Single("int16_t*") }),
-    ("*u32",  KuzoTypeMapping { c_return: Some("uint32_t*"), rust_wrapper: Some("*mut u32"), c_param_kind: CParamKind::Single("uint32_t*") }),
-    ("*i32",  KuzoTypeMapping { c_return: Some("int32_t*"), rust_wrapper: Some("*mut i32"), c_param_kind: CParamKind::Single("int32_t*") }),
-    ("*u64",  KuzoTypeMapping { c_return: Some("uint64_t*"), rust_wrapper: Some("*mut u64"), c_param_kind: CParamKind::Single("uint64_t*") }),
-    ("*i64",  KuzoTypeMapping { c_return: Some("int64_t*"), rust_wrapper: Some("*mut i64"), c_param_kind: CParamKind::Single("int64_t*") }),
-    ("*void", KuzoTypeMapping { c_return: Some("void*"),    rust_wrapper: Some("*mut core::ffi::c_void"), c_param_kind: CParamKind::Single("void*") }),
+    ("*u8",   KuzoTypeMapping { rust_wrapper: Some("*mut u8"),  c_param_kind: CParamKind::Single("uint8_t*") }),
+    ("*i8",   KuzoTypeMapping { rust_wrapper: Some("*mut i8"),  c_param_kind: CParamKind::Single("int8_t*") }),
+    ("*u16",  KuzoTypeMapping { rust_wrapper: Some("*mut u16"), c_param_kind: CParamKind::Single("uint16_t*") }),
+    ("*i16",  KuzoTypeMapping { rust_wrapper: Some("*mut i16"), c_param_kind: CParamKind::Single("int16_t*") }),
+    ("*u32",  KuzoTypeMapping { rust_wrapper: Some("*mut u32"), c_param_kind: CParamKind::Single("uint32_t*") }),
+    ("*i32",  KuzoTypeMapping { rust_wrapper: Some("*mut i32"), c_param_kind: CParamKind::Single("int32_t*") }),
+    ("*u64",  KuzoTypeMapping { rust_wrapper: Some("*mut u64"), c_param_kind: CParamKind::Single("uint64_t*") }),
+    ("*i64",  KuzoTypeMapping { rust_wrapper: Some("*mut i64"), c_param_kind: CParamKind::Single("int64_t*") }),
+    ("*void", KuzoTypeMapping { rust_wrapper: Some("*mut core::ffi::c_void"), c_param_kind: CParamKind::Single("void*") }),
 ];
 
 // ============ Type lookup ============
@@ -108,8 +118,17 @@ pub fn lookup_kuzo_type(kuzo_name: &str) -> Option<&'static KuzoTypeMapping> {
 }
 
 /// Kuzo type name → C return type.
+///
+/// For most types this delegates to the base table `kuzo_to_c_type`
+/// (see `src/types/Ctype.rs`). The exceptions are `str` and `u8[]`, which use
+/// the out-parameter pattern and therefore return `None` here (the C function
+/// becomes `void` and trailing out-pointers carry the result).
 pub fn kuzo_type_to_c_return(kuzo_name: &str) -> Option<&'static str> {
-    lookup_kuzo_type(kuzo_name).and_then(|m| m.c_return)
+    // str / u8[] returns are delivered via out-parameters, not a value return.
+    if matches!(kuzo_name, "str" | "u8[]") {
+        return None;
+    }
+    kuzo_to_c_type(kuzo_name)
 }
 
 /// Kuzo type name → Rust wrapper parameter/return type.
@@ -175,11 +194,72 @@ pub fn is_str_return(kuzo_return: &str) -> bool {
     kuzo_return == "str"
 }
 
+/// Returns true if the Kuzo return type is a 128-bit integer/float that MSVC
+/// cannot return by value (MSVC x64's `__int128` does not support conversion
+/// operators, so even `return (__int128)x;` fails to compile).
+///
+/// Such returns use the same out-parameter pattern as `str`: the C function
+/// becomes `void` and two trailing `uint64_t* out_lo, out_hi` parameters carry
+/// the low/high 64 bits. GCC/Clang also accept this path uniformly, so the
+/// generated C is portable across all three compilers.
+#[inline]
+pub fn is_i128_return(kuzo_return: &str) -> bool {
+    matches!(kuzo_return, "i128" | "u128" | "f128")
+}
+
 // ============ C source generation ============
+
+/// Headers that only exist on POSIX (Linux/macOS/BSD). On MSVC these files do
+/// not exist, so an unconditional `#include` would fail the build even when the
+/// surrounding `#if defined(_WIN32)` branch never calls into them. Such headers
+/// must be wrapped in `#else` so the preprocessor only pulls them in off-Windows.
+///
+/// NOTE: `fcntl.h` and `sys/stat.h` are NOT here — MSVC ships both (with `_O_*`
+/// and `_stat64` variants), so they are cross-platform and stay unconditional.
+const POSIX_ONLY_HEADERS: &[&str] = &[
+    "unistd.h",
+    "sys/socket.h",
+    "netinet/in.h",
+    "arpa/inet.h",
+    "netdb.h",
+    "sys/types.h",
+    "sys/ioctl.h",
+    "sys/un.h",
+    "termios.h",
+    "dirent.h",
+    "sys/mman.h",
+    "sys/wait.h",
+    "pthread.h",
+];
+
+/// Headers that only exist on Windows. Wrapped in `#if defined(_WIN32)` so
+/// POSIX toolchains never try to resolve them.
+const WINDOWS_ONLY_HEADERS: &[&str] = &[
+    "windows.h",
+    "winsock2.h",
+    "ws2tcpip.h",
+    "winbase.h",
+    "io.h",
+    "direct.h",
+    "wincon.h",
+    "winuser.h",
+    "process.h",
+];
+
+/// Classify a header name as `"posix"`, `"windows"`, or `"common"`.
+fn classify_header(h: &str) -> &'static str {
+    if POSIX_ONLY_HEADERS.contains(&h) {
+        "posix"
+    } else if WINDOWS_ONLY_HEADERS.contains(&h) {
+        "windows"
+    } else {
+        "common"
+    }
+}
 
 /// Generate the complete `.c` file content from a list of extracted functions.
 pub fn generate_c_source(funcs: &[ExternCFunc]) -> Result<String, String> {
-    // Collect all header files and deduplicate them.
+    // Collect all header files and deduplicate them, preserving first-seen order.
     let mut all_includes: Vec<String> = Vec::new();
     for func in funcs {
         for inc in &func.c_includes {
@@ -189,13 +269,51 @@ pub fn generate_c_source(funcs: &[ExternCFunc]) -> Result<String, String> {
         }
     }
 
+    // Partition headers by platform so platform-exclusive includes are guarded
+    // by `#if defined(_WIN32)` / `#else`. Without this, an MSVC build fails at
+    // `#include <termios.h>` even when the C body's own `#if` never uses it.
+    let mut common: Vec<&String> = Vec::new();
+    let mut posix: Vec<&String> = Vec::new();
+    let mut windows: Vec<&String> = Vec::new();
+    for inc in &all_includes {
+        match classify_header(inc) {
+            "common" => common.push(inc),
+            "posix" => posix.push(inc),
+            "windows" => windows.push(inc),
+            _ => common.push(inc),
+        }
+    }
+
     let mut out = String::new();
     out.push_str("// Auto-generated by kuzo-rs @extern(\"C\") extractor\n");
     out.push_str("// DO NOT EDIT — regenerate with: kuzo emit-c <file>\n");
+    // Always-available freestanding headers.
     out.push_str("#include <stdint.h>\n");
     out.push_str("#include <stddef.h>\n");
-    for inc in &all_includes {
+    for inc in &common {
         out.push_str(&format!("#include <{}>\n", inc));
+    }
+    // Windows-exclusive headers.
+    if !windows.is_empty() {
+        out.push_str("#if defined(_WIN32) || defined(_WIN64)\n");
+        for inc in &windows {
+            out.push_str(&format!("#include <{}>\n", inc));
+        }
+        // POSIX-exclusive headers go in the #else (only pulled in off-Windows).
+        if !posix.is_empty() {
+            out.push_str("#else\n");
+            for inc in &posix {
+                out.push_str(&format!("#include <{}>\n", inc));
+            }
+        }
+        out.push_str("#endif\n");
+    } else if !posix.is_empty() {
+        // No Windows headers requested — guard the POSIX headers directly.
+        out.push_str("#if !defined(_WIN32) && !defined(_WIN64)\n");
+        for inc in &posix {
+            out.push_str(&format!("#include <{}>\n", inc));
+        }
+        out.push_str("#endif\n");
     }
     out.push('\n');
 
@@ -213,17 +331,20 @@ pub fn generate_c_source(funcs: &[ExternCFunc]) -> Result<String, String> {
 
         // For i128/u128/f128 parameters, automatically insert lo/hi reconstruction
         // variables so the C body can use the original parameter name.
+        // On MSVC x64, `__int128` is not a usable type (no conversion/arithmetic
+        // operators), so the reconstruction is guarded out — the C body must use
+        // the raw `{n}_lo` / `{n}_hi` variables directly on that platform.
         for p in &func.kuzo_params {
             match p.kuzo_type.as_str() {
                 "i128" => {
                     out.push_str(&format!(
-                        "    __int128 {n} = (__int128)((unsigned __int128){n}_lo | ((unsigned __int128){n}_hi << 64));\n",
+                        "#if !defined(_WIN32) && !defined(_WIN64)\n    __int128 {n} = (__int128)((unsigned __int128){n}_lo | ((unsigned __int128){n}_hi << 64));\n#endif\n",
                         n = p.name
                     ));
                 }
                 "u128" | "f128" => {
                     out.push_str(&format!(
-                        "    unsigned __int128 {n} = (unsigned __int128){n}_lo | ((unsigned __int128){n}_hi << 64);\n",
+                        "#if !defined(_WIN32) && !defined(_WIN64)\n    unsigned __int128 {n} = (unsigned __int128){n}_lo | ((unsigned __int128){n}_hi << 64);\n#endif\n",
                         n = p.name
                     ));
                 }
@@ -294,6 +415,7 @@ pub fn generate_rust_ffi(funcs: &[ExternCFunc]) -> Result<String, String> {
 fn generate_wrapper_fn(func: &ExternCFunc) -> String {
     let mut out = String::new();
     let is_str_ret = is_str_return(&func.kuzo_return);
+    let is_i128_ret = is_i128_return(&func.kuzo_return);
 
     // Doc comment.
     let kuzo_sig = format!(
@@ -322,9 +444,9 @@ fn generate_wrapper_fn(func: &ExternCFunc) -> String {
         })
         .collect();
     let rust_return = if is_str_ret {
-        "&'static str"
+        "&'static str".to_string()
     } else {
-        kuzo_type_to_rust_wrapper(&func.kuzo_return).unwrap_or("()")
+        kuzo_type_to_rust_wrapper(&func.kuzo_return).unwrap_or("()").to_string()
     };
 
     out.push_str("    #[cfg(has_extern_c)]\n");
@@ -347,6 +469,11 @@ fn generate_wrapper_fn(func: &ExternCFunc) -> String {
     if is_str_ret {
         out.push_str("        let mut out_data: *const core::ffi::c_char = core::ptr::null();\n");
         out.push_str("        let mut out_len: usize = 0;\n");
+    }
+    // For i128/u128/f128 returns: declare low/high out variables.
+    if is_i128_ret {
+        out.push_str("        let mut out_lo: u64 = 0;\n");
+        out.push_str("        let mut out_hi: u64 = 0;\n");
     }
 
     // Marshal code: generate split variables for 1:N parameters.
@@ -403,6 +530,11 @@ fn generate_wrapper_fn(func: &ExternCFunc) -> String {
         call_args.push("&mut out_data".to_string());
         call_args.push("&mut out_len".to_string());
     }
+    // For i128/u128/f128 returns, append the low/high out parameters.
+    if is_i128_ret {
+        call_args.push("&mut out_lo".to_string());
+        call_args.push("&mut out_hi".to_string());
+    }
 
     // Return value conversion.
     let call_expr = format!("bindings::{}({})", func.c_name, call_args.join(", "));
@@ -415,6 +547,10 @@ fn generate_wrapper_fn(func: &ExternCFunc) -> String {
         out.push_str("            let bytes = core::slice::from_raw_parts(out_data as *const u8, out_len);\n");
         out.push_str("            core::str::from_utf8(bytes).unwrap_or(\"\")\n");
         out.push_str("        }\n");
+    } else if is_i128_ret {
+        // The C call is void; the result is in out_lo/out_hi (low 64 / high 64 bits).
+        out.push_str(&format!("        {};\n", call_expr));
+        out.push_str(&format!("        ((out_hi as {}) << 64) | (out_lo as {})\n", rust_return, rust_return));
     } else {
         let return_expr = if rust_return == "()" {
             call_expr

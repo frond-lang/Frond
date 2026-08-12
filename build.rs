@@ -33,7 +33,7 @@ mod gen {
     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ffi/Gen.rs"));
 }
 
-use gen::{is_str_return, kuzo_type_to_c_params, kuzo_type_to_c_return, ExternCFunc};
+use gen::{is_i128_return, is_str_return, kuzo_type_to_c_params, kuzo_type_to_c_return, ExternCFunc};
 
 /// List of `.kz` files containing `@extern("C")` declarations.
 ///
@@ -147,7 +147,15 @@ fn main() {
 
     // 3. Compile all .c files with cc::Build
     let mut build = cc::Build::new();
-    build.flag("-Wno-unused-parameter");
+    // Suppress the "unused parameter" warning. The flag spelling differs by compiler:
+    //   - GCC/Clang: -Wno-unused-parameter
+    //   - MSVC (cl.exe): /wd4100  (C4100 = unreferenced formal parameter)
+    // cc::Build::is_flag_supported probes the active compiler, so we pick whichever it accepts.
+    if build.is_flag_supported("-Wno-unused-parameter").unwrap_or(false) {
+        build.flag("-Wno-unused-parameter");
+    } else if build.is_flag_supported("/wd4100").unwrap_or(false) {
+        build.flag("/wd4100");
+    }
     for c_file in &c_files {
         build.file(c_file);
     }
@@ -481,9 +489,12 @@ fn build_extern_c_func(
 ) -> Option<ExternCFunc> {
     let kuzo_return = ret_type.to_string();
     let is_str_ret = is_str_return(&kuzo_return);
+    let is_i128_ret = is_i128_return(&kuzo_return);
 
-    // Map return type
-    let c_return = if is_str_ret {
+    // Map return type. Both `str` and 128-bit returns use the out-parameter
+    // pattern (the C function becomes `void` and trailing out-pointers carry
+    // the result), so the direct return slot is `void` for both.
+    let c_return = if is_str_ret || is_i128_ret {
         "void".to_string()
     } else {
         match kuzo_type_to_c_return(&kuzo_return) {
@@ -527,6 +538,21 @@ fn build_extern_c_func(
         c_params.push(gen::CParam {
             name: "out_len".to_string(),
             c_type: "size_t*".to_string(),
+        });
+    }
+
+    // For i128/u128/f128 returns, append two uint64_t* out parameters (low/high).
+    // MSVC x64 cannot return `__int128` by value (no conversion operators), so
+    // we use the same out-parameter pattern as `str`. The C body must write
+    // `*out_lo` / `*out_hi` instead of using a `return` statement.
+    if is_i128_ret {
+        c_params.push(gen::CParam {
+            name: "out_lo".to_string(),
+            c_type: "uint64_t*".to_string(),
+        });
+        c_params.push(gen::CParam {
+            name: "out_hi".to_string(),
+            c_type: "uint64_t*".to_string(),
         });
     }
 
