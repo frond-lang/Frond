@@ -60,8 +60,8 @@ pub fn try_fold(cf: ComputeFnId, args: &[ConstValue]) -> Option<ConstValue> {
         1  => { let (a, b) = two(args, cv_i32)?; Some(ConstValue::I32(V::arith_add_i32(a, b))) }
         3  => { let (a, b) = two(args, cv_i32)?; Some(ConstValue::I32(V::arith_mul_i32(a, b))) }
         5  => { let (a, b) = two(args, cv_i32)?; Some(ConstValue::I32(V::arith_sub_i32(a, b))) }
-        6  => { let (a, b) = two(args, cv_i32)?; Some(ConstValue::I32(V::arith_div_i32(a, b))) }
-        7  => { let (a, b) = two(args, cv_i32)?; Some(ConstValue::I32(V::arith_mod_i32(a, b))) }
+        6  => { let (a, b) = two(args, cv_i32)?; V::arith_div_i32(a, b).map(|v| ConstValue::I32(v)) }
+        7  => { let (a, b) = two(args, cv_i32)?; V::arith_mod_i32(a, b).map(|v| ConstValue::I32(v)) }
         // ── Legacy i32 comparison (4,8,9,10,11,12) → bool ──
         4  => { let (a, b) = two(args, cv_i32)?; Some(ConstValue::Bool(a <= b)) }
         8  => { let (a, b) = two(args, cv_i32)?; Some(ConstValue::Bool(a == b)) }
@@ -94,8 +94,8 @@ pub fn try_fold(cf: ComputeFnId, args: &[ConstValue]) -> Option<ConstValue> {
         50 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_add_i64(a, b))) }
         51 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_sub_i64(a, b))) }
         52 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_mul_i64(a, b))) }
-        53 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_div_i64(a, b))) }
-        54 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_mod_i64(a, b))) }
+        53 => { let (a, b) = two(args, cv_i64)?; V::arith_div_i64(a, b).map(|v| ConstValue::I64(v)) }
+        54 => { let (a, b) = two(args, cv_i64)?; V::arith_mod_i64(a, b).map(|v| ConstValue::I64(v)) }
         55 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a == b)) }
         56 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a != b)) }
         57 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a < b)) }
@@ -112,8 +112,8 @@ pub fn try_fold(cf: ComputeFnId, args: &[ConstValue]) -> Option<ConstValue> {
         64 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_add_i128(a, b))) }
         65 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_sub_i128(a, b))) }
         66 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_mul_i128(a, b))) }
-        67 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_div_i128(a, b))) }
-        68 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_mod_i128(a, b))) }
+        67 => { let (a, b) = two(args, cv_i128)?; V::arith_div_i128(a, b).map(|v| ConstValue::I128(v)) }
+        68 => { let (a, b) = two(args, cv_i128)?; V::arith_mod_i128(a, b).map(|v| ConstValue::I128(v)) }
         69 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a == b)) }
         70 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a != b)) }
         71 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a < b)) }
@@ -135,14 +135,14 @@ pub fn try_fold(cf: ComputeFnId, args: &[ConstValue]) -> Option<ConstValue> {
         84 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_bitor_i128(a, b))) }
         85 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_bitxor_i128(a, b))) }
         // ── Shifts i32 (86-87): shift amount is i32 ──
-        86 => { let a = cv_i32(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; Some(ConstValue::I32(V::arith_shl_i32(a, s))) }
-        87 => { let a = cv_i32(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; Some(ConstValue::I32(V::arith_shr_i32(a, s))) }
+        86 => { let a = cv_i32(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shl_i32(a, s).map(|v| ConstValue::I32(v)) }
+        87 => { let a = cv_i32(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shr_i32(a, s).map(|v| ConstValue::I32(v)) }
         // ── Shifts i64 (88-89) ──
-        88 => { let a = cv_i64(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; Some(ConstValue::I64(V::arith_shl_i64(a, s))) }
-        89 => { let a = cv_i64(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; Some(ConstValue::I64(V::arith_shr_i64(a, s))) }
+        88 => { let a = cv_i64(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shl_i64(a, s).map(|v| ConstValue::I64(v)) }
+        89 => { let a = cv_i64(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shr_i64(a, s).map(|v| ConstValue::I64(v)) }
         // ── Shifts i128 (90-91) ──
-        90 => { let a = cv_i128(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; Some(ConstValue::I128(V::arith_shl_i128(a, s))) }
-        91 => { let a = cv_i128(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; Some(ConstValue::I128(V::arith_shr_i128(a, s))) }
+        90 => { let a = cv_i128(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shl_i128(a, s).map(|v| ConstValue::I128(v)) }
+        91 => { let a = cv_i128(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shr_i128(a, s).map(|v| ConstValue::I128(v)) }
 
         // ── All primitive type arithmetic (92-259) ──
         id if id >= 92 && id <= 259 => fold_basic_range(id, args),
@@ -158,13 +158,14 @@ macro_rules! fold_int_arith {
             0 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_add_$ty>](a, b))) }
             1 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_sub_$ty>](a, b))) }
             2 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_mul_$ty>](a, b))) }
-            3 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_div_$ty>](a, b))) }
-            4 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_mod_$ty>](a, b))) }
+            // div/mod/shl/shr return Option; None (divide-by-zero/overflow) means no folding, leave it for runtime to return Throw
+            3 => { let (a, b) = two($args, $ext)?; crate::value::[<arith_div_$ty>](a, b).map(|v| ConstValue::$cv(v)) }
+            4 => { let (a, b) = two($args, $ext)?; crate::value::[<arith_mod_$ty>](a, b).map(|v| ConstValue::$cv(v)) }
             5 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_bitand_$ty>](a, b))) }
             6 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_bitor_$ty>](a, b))) }
             7 => { let (a, b) = two($args, $ext)?; Some(ConstValue::$cv(crate::value::[<arith_bitxor_$ty>](a, b))) }
-            8 => { let a = $ext($args.get(0)?)?; let s = cv_i32($args.get(1)?)?; Some(ConstValue::$cv(crate::value::[<arith_shl_$ty>](a, s))) }
-            9 => { let a = $ext($args.get(0)?)?; let s = cv_i32($args.get(1)?)?; Some(ConstValue::$cv(crate::value::[<arith_shr_$ty>](a, s))) }
+            8 => { let a = $ext($args.get(0)?)?; let s = cv_i32($args.get(1)?)?; crate::value::[<arith_shl_$ty>](a, s).map(|v| ConstValue::$cv(v)) }
+            9 => { let a = $ext($args.get(0)?)?; let s = cv_i32($args.get(1)?)?; crate::value::[<arith_shr_$ty>](a, s).map(|v| ConstValue::$cv(v)) }
             10 => { let a = $ext($args.get(0)?)?; Some(ConstValue::$cv(crate::value::[<arith_neg_$ty>](a))) }
             11 => { let a = $ext($args.get(0)?)?; Some(ConstValue::$cv(crate::value::[<arith_bitnot_$ty>](a))) }
             _ => None,
@@ -585,7 +586,7 @@ pub fn pass_dce(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &Fx
         if live.contains(&id) { continue; }
         if !ctx.is_live(id) { continue; }
         let is_pure_calc = match node.kind {
-            NodeKind::BinOp | NodeKind::UnOp | NodeKind::FieldAccess => {
+            NodeKind::BinOp | NodeKind::TriOp | NodeKind::UnOp | NodeKind::FieldAccess => {
                 pure_set.contains(&node.compute_fn)
             }
             NodeKind::Const | NodeKind::Call | NodeKind::Gate
@@ -1164,7 +1165,9 @@ pub fn optimize_with_analysis(
         if !no_licm   { pass_licm(graph, &mut ctx, analysis); }
         if !no_unroll { pass_loop_unroll(graph, &mut ctx, analysis); }
         if ctx.has_changes() {
+            check_gate_in_branch(graph, "BEFORE phase1 rebuild");
             graph.rebuild(&ctx.dead, &ctx.redirect);
+            check_gate_in_branch(graph, "AFTER phase1 rebuild");
         }
     }
 
@@ -1191,7 +1194,9 @@ pub fn optimize_with_analysis(
         if dbg_iter {
             eprintln!("[OPT-ITER] iter={} nodes={} before rebuild", 51 - max_iter, graph.nodes.len());
         }
+        check_gate_in_branch(graph, "BEFORE phase2 rebuild");
         let _old_to_new = graph.rebuild(&ctx.dead, &ctx.redirect);
+        check_gate_in_branch(graph, "AFTER phase2 rebuild");
         if dbg_iter {
             eprintln!("[OPT-ITER] iter={} nodes={} after rebuild", 51 - max_iter, graph.nodes.len());
         }
@@ -1199,6 +1204,30 @@ pub fn optimize_with_analysis(
         max_iter -= 1;
         if max_iter == 0 {
             break;
+        }
+    }
+}
+
+/// Debug helper: check if any Gate node is inside its branch subgraph's node_range.
+/// This would cause infinite recursion at runtime (Gate launches a subgraph that contains itself).
+fn check_gate_in_branch(graph: &DataFlowGraph, label: &str) {
+    if std::env::var("KUZO_DEBUG_REBUILD").is_err() {
+        return;
+    }
+    for (idx, gb_opt) in graph.gate_branches.iter().enumerate() {
+        if let Some(gb) = gb_opt {
+            let gate_node = NodeId(idx as u32);
+            for (cond, branch_sg, _) in &gb.branches {
+                let branch_sg_id = branch_sg.0 as usize;
+                if branch_sg_id < graph.subgraphs.len() {
+                    let (s, e) = graph.subgraphs[branch_sg_id].node_range;
+                    if gate_node.0 >= s.0 && gate_node.0 < e.0 {
+                        eprintln!("[{}] BUG: Gate node {} INSIDE branch sg={} (cond={}) range [{},{}) func_id={}",
+                            label, gate_node.0, branch_sg_id, cond, s.0, e.0,
+                            graph.subgraphs[branch_sg_id].function_id);
+                    }
+                }
+            }
         }
     }
 }
@@ -1591,7 +1620,7 @@ fn collect_inline_candidates(graph: &DataFlowGraph) -> Vec<InlineCandidate> {
             let cn = &graph.nodes[cidx];
             if !matches!(
                 cn.kind,
-                NodeKind::Const | NodeKind::BinOp | NodeKind::UnOp | NodeKind::FieldAccess
+                NodeKind::Const | NodeKind::BinOp | NodeKind::TriOp | NodeKind::UnOp | NodeKind::FieldAccess
             ) {
                 safe_body = false;
                 break;

@@ -26,6 +26,7 @@ const EXTERN_KUZO_FILES: &[&str] = &[
     "src/stdlib/builtin/time/Raw.kz",
     "src/stdlib/builtin/cast/Raw.kz",
     "src/stdlib/builtin/str/Raw.kz",
+    "src/stdlib/builtin/terminal/Raw.kz",
 ];
 
 fn main() {

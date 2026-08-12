@@ -1,22 +1,22 @@
-// builtin/reflect/Raw.kz — 反射 @extern("C") 原语（builtin，默认可见）
+// builtin/reflect/Raw.kz — reflection @extern("C") primitives (builtin, visible by default)
 //
-// 全部原语接收 Value (ValueHandle, u32)，实现在 Rust 侧 extern "C" fn，
-// 直接 match HeapObj 读取已携带的类型信息。
+// All primitives receive Value (ValueHandle, u32), implemented on the Rust side as extern "C" fn,
+// directly matching HeapObj to read the already-carried type information.
 //
-// 无 type_table、无 type_id 注入、无查表。零元数据内存，零额外开销。
+// No type_table, no type_id injection, no lookup. Zero metadata memory, zero extra overhead.
 //
-// 反射数据流：
-//   1. Value 系统自描述（RecordValue.type_name 等字段已自带类型信息）
-//   2. Raw.kz：@extern("C") 声明，C ABI 调用约定
-//   3. Reflect.rs：Rust extern "C" fn 实现，match HeapObj 返回反射信息
+// Reflection data flow:
+//   1. Value system is self-describing (RecordValue.type_name and other fields already carry type information)
+//   2. Raw.kz: @extern("C") declarations, C ABI calling convention
+//   3. Reflect.rs: Rust extern "C" fn implementation, matches HeapObj and returns reflection info
 //
-// 内存布局约定：
-//   - Value (ValueHandle) 是 u32，C ABI 直接传 uint32_t
-//   - C 侧不需理解 HeapObj 布局，只存 u32
-//   - str 返回用 out 参数模式（C 无法直接返回 fat pointer）
+// Memory layout convention:
+//   - Value (ValueHandle) is u32, C ABI directly passes uint32_t
+//   - The C side does not need to understand the HeapObj layout, only stores u32
+//   - str return uses the out-parameter pattern (C cannot directly return a fat pointer)
 //
-// 注：body 为空，实现在 Rust 侧 #[no_mangle] extern "C" fn。
-// Raw.kz 不参与 emit-c（不在 build.rs EXTERN_KUZO_FILES）。
+// Note: body is empty, implementation is on the Rust side #[no_mangle] extern "C" fn.
+// Raw.kz does not participate in emit-c (not in build.rs EXTERN_KUZO_FILES).
 
 @extern("C")
 fun __reflect_kind(v: Value): u8 #{

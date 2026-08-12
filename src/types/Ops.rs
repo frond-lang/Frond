@@ -2,11 +2,11 @@
 // Ops — TypeOps trait + scalar/reference ops implementations + DynamicOpsRegistry.
 // =========================================================================
 //
-// The TypeOps trait is kept separate from Ty: Ty is type identity (Copy data), while
+// The TypeOps trait is kept separate from Type: Type is type identity (Copy data), while
 // TypeOps covers runtime value operations. The TypeDescriptor struct has been removed;
 // static DESC constants are no longer generated.
 
-use super::Tag::*;
+use crate::value::ValueTag;
 use crate::value::{Char, F128, F16, ValueArena, ValueHandle};
 
 /// Type operations trait: describes the conversion semantics between a raw byte buffer

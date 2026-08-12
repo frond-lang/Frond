@@ -315,7 +315,6 @@ fn extract_type_name<'a>(
 fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, String> {
     let arena = &module.arena;
     let mut funcs = Vec::new();
-    let mut errors = Vec::new();
 
     for decl in &module.declarations {
         if let Decl::FunDecl {
@@ -336,10 +335,10 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
             let c_body = match extern_c_body {
                 Some(body) => body.to_string(),
                 None => {
-                    errors.push(format!(
-                        "@extern(\"C\") function '{}': missing C function body (expected #{{ ... }}# raw block)",
+                    eprintln!(
+                        "warning: @extern(\"C\") function '{}': missing C function body (expected #{{ ... }}# raw block), skipping",
                         name
-                    ));
+                    );
                     continue;
                 }
             };
@@ -362,10 +361,10 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
                     Some(c) => c.to_string(),
                     None => {
                         let ty_str = ret_name.as_deref().unwrap_or("<unknown>");
-                        errors.push(format!(
-                            "@extern(\"C\") function '{}': unsupported return type '{}'",
+                        eprintln!(
+                            "warning: @extern(\"C\") function '{}': unsupported return type '{}', skipping",
                             name, ty_str
-                        ));
+                        );
                         continue;
                     }
                 }
@@ -382,10 +381,10 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
                     Some(ps) => c_params.extend(ps),
                     None => {
                         let ty_str = param_ty_name.as_deref().unwrap_or("<unknown>");
-                        errors.push(format!(
-                            "@extern(\"C\") function '{}': unsupported parameter type '{}' (parameter '{}')",
+                        eprintln!(
+                            "warning: @extern(\"C\") function '{}': unsupported parameter type '{}' (parameter '{}'), skipping",
                             name, ty_str, param.name
-                        ));
+                        );
                         param_ok = false;
                         break;
                     }
@@ -422,10 +421,6 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
                 kuzo_return,
             });
         }
-    }
-
-    if !errors.is_empty() {
-        return Err(errors.join("\n"));
     }
 
     Ok(funcs)

@@ -1,6 +1,6 @@
-// std/io 包声明
+// std/io package declaration
 //
-// 暴露 IO 子模块给用户代码：import std.io.Fs 等可访问公开符号。
+// Expose IO submodules to user code: import std.io.Fs etc. to access public symbols.
 pub pack File
 pub pack Path
 pub pack Buffered

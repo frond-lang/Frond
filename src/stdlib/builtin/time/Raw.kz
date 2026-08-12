@@ -1,8 +1,8 @@
-// builtin/time/Raw.kz — Time 原语 @extern("C") 声明（builtin，默认可见）
+// builtin/time/Raw.kz — Time primitives @extern("C") declarations (builtin, visible by default)
 //
-// 底层 POSIX/Windows 时间能力，由 cc crate 从 emit-c 生成的 .c 编译。
-// 跨平台逻辑通过 #if 条件编译在 C body 中实现。
-// 供 std/time/*.kz 的 wrapper 调用。
+// Low-level POSIX/Windows time capabilities, compiled from emit-c generated .c by the cc crate.
+// Cross-platform logic is implemented via #if conditional compilation in the C body.
+// Called by wrappers in std/time/*.kz.
 
 @c_include("time.h")
 @extern("C")

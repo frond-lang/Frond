@@ -12,7 +12,7 @@
 
 use std::ffi::CString;
 
-use super::arena::ValueArena;
+use super::Arena::ValueArena;
 use super::value::{F16, F128, HeapObj, RefKind, ValueTag, Value, ValueHandle};
 
 // =========================================================================
@@ -154,7 +154,7 @@ pub extern "C" fn __reflect_type_name(handle: u32, out_data: *mut *const u8, out
     let h = ValueHandle::from_raw(handle);
     let tag = h.tag();
     if tag != ValueTag::Ref {
-        let info = crate::types::builtin_info_by_tag(tag)
+        let info = super::Tag::builtin_info_by_tag(tag)
             .expect("non-Ref ValueTag must be in BUILTIN_TABLE");
         // info.name is &'static str; the pointer is 'static and has no dangling risk
         write_slice_out(info.name.as_bytes(), out_data, out_len);
@@ -478,6 +478,21 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                     } else {
                         "<lazy>".to_string()
                     }
+                }
+                HeapObj::ThrowVal(t) => {
+                    // Throw value formatting: Ok(v) → "Ok(v)", Err(e) → "Err(e)"
+                    match &t.payload {
+                        crate::value::ThrowPayload::Ok(v) => {
+                            format!("Ok({})", format_value(v, depth + 1))
+                        }
+                        crate::value::ThrowPayload::Err(e) => {
+                            format!("Err({})", format_value(e, depth + 1))
+                        }
+                    }
+                }
+                HeapObj::ErrorVal(e) => {
+                    // Error value formatting: display type name and message
+                    format!("{}({})", e.type_name, e.message)
                 }
                 _ => {
                     // Other heap objects: fall back to the ref_kind name

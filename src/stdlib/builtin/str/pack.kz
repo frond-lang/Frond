@@ -1,5 +1,5 @@
-// builtin str 包声明
+// builtin str pack declaration
 //
-// 暴露字符串 UTF-8 解码原语给所有 Kuzo 用户代码默认可见（builtin 默认全可见）。
-// Raw: @extern("C") UTF-8 解码原语（decode_at / char_len_at）
+// Exposes the string UTF-8 decoding primitives to all Kuzo user code as visible by default (builtin is fully visible by default).
+// Raw: @extern("C") UTF-8 decoding primitives (decode_at / char_len_at)
 pub pack Raw

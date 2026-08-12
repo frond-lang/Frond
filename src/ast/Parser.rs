@@ -270,7 +270,7 @@ pub enum TokenKind {
     FalseLiteral,
     NullLiteral,
 
-    // --- Keywords (28) ---
+    // --- Keywords (29) ---
     KwFun,
     KwType,
     KwTrait,
@@ -299,6 +299,7 @@ pub enum TokenKind {
     KwThrow,
     KwLazy,
     KwDefer,
+    KwThis,
 
     // Identifier
     Identifier,
@@ -1087,6 +1088,18 @@ impl<'a> Lexer<'a> {
                         }
                     }
                 }
+                b'x' => {
+                    // \xHH: exactly 2 hex digits, byte value 0x00-0xFF
+                    self.pos += 1;
+                    self.column += 1;
+                    for _ in 0..2 {
+                        if self.pos >= self.bytes.len() || !is_hex_digit(self.bytes[self.pos]) {
+                            return Err(LexerError::InvalidEscape);
+                        }
+                        self.pos += 1;
+                        self.column += 1;
+                    }
+                }
                 _ => {
                     return Err(LexerError::InvalidEscape);
                 }
@@ -1179,6 +1192,18 @@ impl<'a> Lexer<'a> {
                                 self.pos += 1;
                                 self.column += 1;
                             }
+                        }
+                    }
+                    b'x' => {
+                        // \xHH: exactly 2 hex digits, byte value 0x00-0xFF
+                        self.pos += 1;
+                        self.column += 1;
+                        for _ in 0..2 {
+                            if self.pos >= self.bytes.len() || !is_hex_digit(self.bytes[self.pos]) {
+                                return Err(LexerError::InvalidEscape);
+                            }
+                            self.pos += 1;
+                            self.column += 1;
                         }
                     }
                     _ => {
@@ -1379,6 +1404,7 @@ fn keyword_type(text: &str) -> TokenKind {
         "throw" => TokenKind::KwThrow,
         "lazy" => TokenKind::KwLazy,
         "defer" => TokenKind::KwDefer,
+        "this" => TokenKind::KwThis,
         "true" => TokenKind::TrueLiteral,
         "false" => TokenKind::FalseLiteral,
         "null" => TokenKind::NullLiteral,
@@ -2166,6 +2192,16 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                         return Ok(def);
                     }
                     self.current = saved;
+                } else {
+                    // Bug #69: Empty parens `Name()` — try single-constructor ADT.
+                    // Without this, `type Unit = Unit()` falls through to the alias path
+                    // (parsing `Unit()` as a type expression), and the constructor is never
+                    // registered.
+                    self.current = saved;
+                    if let Some(def) = self.try_parse_single_ctor_adt() {
+                        return Ok(def);
+                    }
+                    self.current = saved;
                 }
             }
             self.current = saved;
@@ -2396,7 +2432,14 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         })
     }
 
-    /// Parse a method declaration
+    /// Parse a method declaration.
+    ///
+    /// Syntax: `pub? override? async? fun &? name<tparams>(params): ret { body }`
+    /// The optional `&` between `fun` and the method name marks the receiver as
+    /// by-reference (`&this`); without `&` the receiver is by-value (`this`).
+    /// The receiver is implicit: it is NOT written in the parameter list. The
+    /// parser injects an internal `Param { name: "this", type_annotation: ThisType/RefType<ThisType> }`
+    /// at params[0] so downstream sema/IR logic (is_this_param, arity, inputs[0]=recv) is unchanged.
     fn parse_method_decl(&mut self) -> ParseResult<MethodDecl<'a>> {
         let mut visibility = Visibility::Private;
         if self.match_token(TokenKind::KwPub) {
@@ -2404,7 +2447,9 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         let is_override = self.match_token(TokenKind::KwOverride);
         let is_async = self.match_token(TokenKind::KwAsync);
-        let _ = self.expect(TokenKind::KwFun, "expected 'fun'");
+        let _ = self.expect(TokenKind::KwFun, "expected 'fun'")?;
+        // Detect by-reference receiver marker: `fun &name(...)` means `&this`.
+        let is_ref_receiver = self.match_token(TokenKind::Ampersand);
         let name_tok = self.expect(TokenKind::Identifier, "expected method name")?;
         let mut type_params = Vec::new();
         if self.match_token(TokenKind::Lt) {
@@ -2414,9 +2459,21 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         let mut params = Vec::new();
         let _ = self.expect(TokenKind::LParen, "expected '('");
         if !self.check(TokenKind::RParen) {
-            self.parse_method_param_list(&mut params)?;
+            self.parse_param_list(&mut params)?;
         }
         let _ = self.expect(TokenKind::RParen, "expected ')'");
+        // Inject the implicit this parameter at params[0].
+        // By-value: ThisType; by-reference (&): RefType<ThisType>.
+        let this_type = if is_ref_receiver {
+            let this_ty = self.alloc_type(token_span(&name_tok), TypeNode::ThisType);
+            self.alloc_type(token_span(&name_tok), TypeNode::RefType { inner: this_ty })
+        } else {
+            self.alloc_type(token_span(&name_tok), TypeNode::ThisType)
+        };
+        params.insert(0, Param {
+            name: "this",
+            type_annotation: Some(this_type),
+        });
         let return_type = if self.match_token(TokenKind::Colon) {
             Some(self.parse_type()?)
         } else {
@@ -2622,32 +2679,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         })
     }
 
-    impl_parse_comma_list!(parse_method_param_list, Param<'a>, parse_method_param, check(TokenKind::RParen));
-
-    fn parse_method_param(&mut self) -> ParseResult<Param<'a>> {
-        let is_ref_self = self.match_token(TokenKind::Ampersand);
-        let name_tok = self.expect(TokenKind::Identifier, "expected parameter name")?;
-        let type_annotation = if self.match_token(TokenKind::Colon) {
-            Some(self.parse_type()?)
-        } else if name_tok.lexeme == "self" {
-            let self_ty = self.alloc_type(token_span(&name_tok), TypeNode::SelfType);
-            if is_ref_self {
-                Some(self.alloc_type(token_span(&name_tok), TypeNode::RefType { inner: self_ty }))
-            } else {
-                Some(self_ty)
-            }
-        } else if is_ref_self {
-            self.report_error("'&' without type annotation is only allowed for 'self' parameter")?;
-            unreachable!()
-        } else {
-            None
-        };
-        Ok(Param {
-            name: name_tok.lexeme,
-            type_annotation,
-        })
-    }
-
     fn parse_trait_bound_list(&mut self, bounds: &mut Vec<TraitBound<'a>>) -> ParseResult<()> {
         self.parse_trait_bound_list_inner(bounds)
     }
@@ -2793,7 +2824,64 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     /// Parse a primary type: named/generic, with suffix array `[N]`
     fn parse_primary_type(&mut self) -> ParseResult<TypeRef> {
         if self.check(TokenKind::LParen) {
-            return self.parse_record_type();
+            // Bug #68: support `(type)` parenthesized type expressions (e.g. `((i32) -> i32)[]`).
+            // When the parentheses do not contain a record field pattern (`identifier :`), parse as a parenthesized type.
+            if self.is_paren_record_type() {
+                return self.parse_record_type();
+            }
+            // Parenthesized type expression: (T)
+            let span = token_span(&self.peek());
+            self.advance(); // '('
+            let inner = self.parse_type()?;
+            let _ = self.expect(TokenKind::RParen, "expected ')'");
+            let mut ty = inner;
+            // Suffix array type T[N]
+            while self.match_token(TokenKind::LBracket) {
+                let mut size: Option<u64> = None;
+                if !self.check(TokenKind::RBracket) {
+                    let size_tok = self.expect(TokenKind::IntLiteral, "expected array size")?;
+                    size = Some(parse_u64(size_tok.lexeme).ok_or_else(|| {
+                        self.report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")
+                    })?);
+                }
+                let _ = self.expect(TokenKind::RBracket, "expected ']'");
+                ty = self.alloc_type(span, TypeNode::Array {
+                    element_type: ty,
+                    size,
+                });
+            }
+            return Ok(ty);
+        }
+        // `This` keyword in type position: resolves to the current type (TypeNode::ThisType).
+        // Sema resolves it via current_this_type() during inference.
+        // Accept both `this` (KwThis, lowercase instance keyword) and `This` (Identifier with
+        // capitalized text, type keyword) — the language convention is:
+        //   - `this` (lowercase): instance keyword (expression position)
+        //   - `This` (capitalized): type keyword (type position, e.g. `fun clone(): This`)
+        // The lexer is case-sensitive and only registers `this` as KwThis; `This` is lexed as an
+        // Identifier, so we match it here by lexeme text.
+        let is_this_type_kw = self.check(TokenKind::KwThis)
+            || (self.check(TokenKind::Identifier) && self.peek().lexeme == "This");
+        if is_this_type_kw {
+            let tok = self.advance();
+            let span = token_span(&tok);
+            // Suffix array type This[N]
+            let mut ty = self.alloc_type(span, TypeNode::ThisType);
+            while self.match_token(TokenKind::LBracket) {
+                let mut size: Option<u64> = None;
+                if !self.check(TokenKind::RBracket) {
+                    let size_tok = self.expect(TokenKind::IntLiteral, "expected array size")?;
+                    size = Some(parse_u64(size_tok.lexeme).ok_or_else(|| {
+                        self.report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")
+                    })?);
+                }
+                let _ = self.expect(TokenKind::RBracket, "expected ']'");
+                ty = self.alloc_type(span, TypeNode::Array {
+                    element_type: ty,
+                    size,
+                });
+            }
+            return Ok(ty);
         }
         let name_tok = self.expect(TokenKind::Identifier, "expected type name")?;
         let span = token_span(&name_tok);
@@ -2832,6 +2920,28 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             });
         }
         Ok(ty)
+    }
+
+    /// Lookahead: determine whether the parentheses contain a record field pattern (`identifier :`).
+    /// Used to distinguish between `(field: Type, ...)` record types and `(T)` parenthesized type expressions.
+    fn is_paren_record_type(&self) -> bool {
+        let mut i = self.current;
+        if i >= self.tokens.len() || self.tokens[i].kind != TokenKind::LParen {
+            return false;
+        }
+        i += 1; // skip '('
+        // Empty parentheses `()` are not a record type (they are an empty record or empty type)
+        if i >= self.tokens.len() || self.tokens[i].kind == TokenKind::RParen {
+            return false;
+        }
+        // Check for the `identifier :` pattern
+        if self.tokens[i].kind == TokenKind::Identifier {
+            let next = i + 1;
+            if next < self.tokens.len() && self.tokens[next].kind == TokenKind::Colon {
+                return true;
+            }
+        }
+        false
     }
 
     /// Parse a record type: `(field: Type, ...)`
@@ -3243,6 +3353,13 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             let tok = self.advance();
             return Ok(self.alloc_expr(token_span(&tok), Expr::Ident(tok.lexeme)));
         }
+        // `this` keyword in expression position: resolve as the implicit receiver identifier "this".
+        // The parser injects a "this" parameter at params[0] of every method;
+        // sema/IR resolve it like any other named parameter.
+        if self.check(TokenKind::KwThis) {
+            let tok = self.advance();
+            return Ok(self.alloc_expr(token_span(&tok), Expr::Ident("this")));
+        }
         if matches!(
             self.peek().kind,
             TokenKind::Identifier | TokenKind::KwVal | TokenKind::KwVar | TokenKind::KwChannel
@@ -3376,6 +3493,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     }
                     continue;
                 }
+                // \xHH: skip the entire 4-character sequence to avoid mistaking
+                // hex-encoded braces (e.g. \x7b = '{') for interpolation start
+                if i + 1 < content.len() && bytes[i + 1] == b'x' {
+                    i += 4; // skip \xHH
+                    continue;
+                }
                 i += 2;
                 continue;
             }
@@ -3415,6 +3538,16 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     i += 1;
                 }
                 let expr_text = &content[expr_start..i - 1];
+                // Bug #70: Empty interpolation `{}` — report a clear error instead of
+                // silently failing inside parse_interpolation_expr (which truncates errors).
+                if expr_text.trim().is_empty() {
+                    let span = token_span(&tok);
+                    return Err(ParseError {
+                        line: span.line,
+                        column: span.column + i as u32,
+                        message: "empty interpolation expression in string literal; use {{}} for literal braces".to_string(),
+                    });
+                }
                 // Bug #54: the interpolation expression text may contain escape sequences from the
                 // outer string (e.g. \"); unescape it before passing to parse_interpolation_expr.
                 let unescaped_expr = self.unescape_string(expr_text);
@@ -3560,6 +3693,20 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                         };
                         let c = char::from_u32(code)
                             .expect("scan_string validated codepoint range");
+                        result.push(c);
+                    }
+                    b'x' => {
+                        // \xHH: exactly 2 hex digits, byte value 0x00-0xFF.
+                        // Lexical scanning (scan_string) has already validated the hex digits.
+                        j += 2; // skip \x
+                        let hex_end = std::cmp::min(j + 2, text.len());
+                        let hex_str = std::str::from_utf8(&bytes[j..hex_end])
+                            .expect("scan_string validated hex digits");
+                        j = hex_end;
+                        let code = u32::from_str_radix(hex_str, 16)
+                            .expect("scan_string validated hex digits");
+                        let c = char::from_u32(code)
+                            .expect("scan_string validated byte range 0x00-0xFF");
                         result.push(c);
                     }
                     _ => {
@@ -4528,6 +4675,16 @@ fn parse_char_value(lexeme: &str) -> u32 {
                     unreachable!("scan_char validated 4 hex digits without braces")
                 }
             }
+            b'x' => {
+                // \xHH: exactly 2 hex digits, byte value 0x00-0xFF.
+                // Lexical scanning (scan_char) has already validated the hex digits.
+                if content.len() >= 4 {
+                    let hex_str = &content[2..4];
+                    u32::from_str_radix(hex_str, 16).expect("scan_char validated hex digits")
+                } else {
+                    unreachable!("scan_char validated 2 hex digits")
+                }
+            }
             _ => bytes[1] as u32,
         };
     }
@@ -4559,6 +4716,12 @@ fn contains_interpolation(raw: &str) -> bool {
                     // \uXXXX without braces: skip 4 hex digits
                     i += 4;
                 }
+                continue;
+            }
+            // \xHH: skip the entire 4-character sequence to avoid mistaking
+            // hex-encoded braces (e.g. \x7b = '{') for interpolation start
+            if i + 1 < raw.len() && bytes[i + 1] == b'x' {
+                i += 4; // skip \xHH
                 continue;
             }
             i += 2;

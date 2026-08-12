@@ -3,12 +3,12 @@
 // =========================================================================
 
 use super::Tag::*;
-use super::ty::*;
+use super::Ty::*;
 use super::Arena::*;
 use std::fmt;
 
-/// Formatting wrapper for `Ty`: a `type_var` follows the `bound` chain to display the
-/// final type; an unbound variable is displayed as `'_<idx>`.
+/// Formatting wrapper for `Type`: a `type_var` follows the `bound` chain to display the
+/// final type; an unbound variable is displayed as `'_` (hiding the internal index).
 pub struct TypeDisplay<'a> {
     pub arena: &'a TypeArena,
     pub ty: TypeHandle,
@@ -19,18 +19,18 @@ impl fmt::Display for TypeDisplay<'_> {
         let resolved = self.arena.resolve(self.ty);
         let t = self.arena.get(resolved);
         match t {
-            Ty::TypeVar(idx) => write!(f, "'_{}", idx),
-            Ty::Void => f.write_str("void"),
-            Ty::Never => f.write_str("!"),
-            Ty::Unknown => f.write_str("?"),
+            Type::TypeVar(_) => f.write_str("'_"),
+            Type::Void => f.write_str("void"),
+            Type::Never => f.write_str("!"),
+            Type::Unknown => f.write_str("?"),
             // Builtin scalars + Str/Null: emit the static name directly.
-            Ty::Bool | Ty::Char
-            | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128
-            | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128
-            | Ty::Isize | Ty::Usize
-            | Ty::F16 | Ty::F32 | Ty::F64 | Ty::F128
-            | Ty::Str | Ty::Null => f.write_str(t.name()),
-            Ty::Fn(_) => {
+            Type::Bool | Type::Char
+            | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128
+            | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
+            | Type::Isize | Type::Usize
+            | Type::F16 | Type::F32 | Type::F64 | Type::F128
+            | Type::Str | Type::Null => f.write_str(t.name()),
+            Type::Fn(_) => {
                 let (params, return_type) = self.arena.fn_parts(resolved);
                 f.write_str("(")?;
                 for (i, &p) in params.iter().enumerate() {
@@ -42,7 +42,7 @@ impl fmt::Display for TypeDisplay<'_> {
                 f.write_str(") -> ")?;
                 write!(f, "{}", self.arena.display(return_type))
             }
-            Ty::Record(_) => {
+            Type::Record(_) => {
                 let fields = self.arena.record_fields(resolved);
                 f.write_str("(")?;
                 for (i, field) in fields.iter().enumerate() {
@@ -56,25 +56,25 @@ impl fmt::Display for TypeDisplay<'_> {
                 }
                 f.write_str(")")
             }
-            Ty::Adt(_) => {
+            Type::Adt(_) => {
                 let (name, type_args) = self.arena.adt_parts(resolved);
                 f.write_str(name)?;
                 fmt_type_args(f, self.arena, type_args)
             }
-            Ty::Nullable(_) => {
+            Type::Nullable(_) => {
                 write!(f, "{}?", self.arena.display(self.arena.nullable_inner(resolved)))
             }
-            Ty::Ref(_) => {
+            Type::Ref(_) => {
                 let (inner, is_raw) = self.arena.ref_parts(resolved);
                 f.write_str(if is_raw { "*" } else { "&" })?;
                 write!(f, "{}", self.arena.display(inner))
             }
-            Ty::Generic(_) => {
+            Type::Generic(_) => {
                 let (name, args) = self.arena.generic_parts(resolved);
                 f.write_str(name)?;
                 fmt_type_args(f, self.arena, args)
             }
-            Ty::Array(_) => {
+            Type::Array(_) => {
                 let (elem, size) = self.arena.array_parts(resolved);
                 write!(f, "{}[", self.arena.display(elem))?;
                 if let Some(s) = size {
@@ -82,7 +82,7 @@ impl fmt::Display for TypeDisplay<'_> {
                 }
                 f.write_str("]")
             }
-            Ty::Throw(_) => {
+            Type::Throw(_) => {
                 let (value_type, error_type) = self.arena.throw_parts(resolved);
                 f.write_str("Throw<")?;
                 write!(f, "{}", self.arena.display(value_type))?;
@@ -90,12 +90,12 @@ impl fmt::Display for TypeDisplay<'_> {
                 write!(f, "{}", self.arena.display(error_type))?;
                 f.write_str(">")
             }
-            Ty::Trait(_) => {
+            Type::Trait(_) => {
                 let (name, type_args) = self.arena.trait_parts(resolved);
                 f.write_str(name)?;
                 fmt_type_args(f, self.arena, type_args)
             }
-            Ty::TraitObject(_) => {
+            Type::TraitObject(_) => {
                 let (trait_name, method_sigs) = self.arena.trait_object_parts(resolved);
                 write!(f, "dyn {}", trait_name)?;
                 if method_sigs.is_empty() {
@@ -111,14 +111,14 @@ impl fmt::Display for TypeDisplay<'_> {
                 f.write_str(" }")
             }
             // Builtin generic names: Channel/Async/Lazy/Atomic/Sender/Receiver.
-            Ty::Channel(_)
-            | Ty::Async(_)
-            | Ty::Lazy(_)
-            | Ty::Atomic(_)
-            | Ty::Sender(_)
-            | Ty::Receiver(_)
-            | Ty::Timer(_) => f.write_str(t.name()),
-            Ty::ModuleRef(_) => {
+            Type::Channel(_)
+            | Type::Async(_)
+            | Type::Lazy(_)
+            | Type::Atomic(_)
+            | Type::Sender(_)
+            | Type::Receiver(_)
+            | Type::Timer(_) => f.write_str(t.name()),
+            Type::ModuleRef(_) => {
                 let (path, _) = self.arena.module_ref_parts(resolved);
                 write!(f, "module::{}", path)
             }

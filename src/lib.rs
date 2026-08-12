@@ -2,6 +2,8 @@
 
 pub mod ast;
 
+pub mod cli;
+
 pub mod types;
 
 pub mod value;
@@ -19,3 +21,5 @@ pub mod solidify;
 pub mod engine;
 
 pub mod pass;
+
+pub mod tooling;

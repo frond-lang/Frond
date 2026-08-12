@@ -1,38 +1,38 @@
 // Timer.kz — async sleep + ticker
 //
-// 设计文档 §5.8：async sleep/ticker/timeout
-// 仅此模块的 Time 操作为 async（sleep 阻塞当前协程）；时钟读取同步——决策 S04。
-// ticker/timeout 通过 channel + 后台 ticker_loop 实现；channel<Instant>(1)
-// 允许 newtype 元素深拷贝——决策 S12。
+// Design doc §5.8: async sleep/ticker/timeout
+// Only the Time operations in this module are async (sleep blocks the current coroutine); clock reads are synchronous — decision S04.
+// ticker/timeout are implemented via channel + background ticker_loop; channel<Instant>(1)
+// allows deep copying of newtype elements — decision S12.
 //
-// sleep 通过 Timer 类型实现非阻塞挂起：
-// sleep(d) 构造 Timer(duration_ns) → Timer.await() → EventSourceKind::Timer
-// → resolve_and_check_await 惰性启动 timer → 帧挂起 TimerFired 事件
-// → timer 到期 → on_event_arrived 唤醒帧（不阻塞线程，不占用 worker）。
-// 无 runtime 特判：Timer 与 Channel/Async 走同一通用事件源路径。
+// sleep implements non-blocking suspension via the Timer type:
+// sleep(d) constructs Timer(duration_ns) → Timer.await() → EventSourceKind::Timer
+// → resolve_and_check_await lazily starts the timer → frame suspends on TimerFired event
+// → timer expires → on_event_arrived wakes the frame (does not block the thread, does not occupy a worker).
+// No runtime special-casing: Timer and Channel/Async go through the same generic event source path.
 
-// ─── Timer 类型 ───────────────────────────────────────────────────
+// ─── Timer type ───────────────────────────────────────────────────
 
-// Timer：待启动的定时器，内部存储纳秒级 duration。
-// await Timer → EventSourceKind::Timer → 运行时惰性启动 timer 并挂起帧。
+// Timer: a timer to be started, internally stores nanosecond-level duration.
+// await Timer → EventSourceKind::Timer → runtime lazily starts the timer and suspends the frame.
 pub type Timer = Timer(duration_ns: i64)
 
 // ─── sleep ─────────────────────────────────────────────────────────
 
-// 睡眠指定 Duration（挂起当前协程，不阻塞线程）
-// Duration.as_nanos() 返回 i128，Timer.duration_ns 为 i64（足够覆盖实际范围）
+// Sleeps for the specified Duration (suspends the current coroutine, does not block the thread)
+// Duration.as_nanos() returns i128, Timer.duration_ns is i64 (sufficient to cover the practical range)
 pub async fun sleep(d: Duration): Async<void> {
     Timer(cast(d.as_nanos()).to(i64)).await()
 }
 
-// 睡眠指定秒数（便捷重载）
+// Sleeps for the specified number of seconds (convenience overload)
 pub async fun sleep_secs(secs: i64): Async<void> {
     Timer(secs * 1_000_000_000).await()
 }
 
-// ─── ticker：周期性向 channel 推送当前 Instant ────────────────────
+// ─── ticker: periodically pushes the current Instant to a channel ────────────────────
 
-// 后台循环：每 period 向 ch 发送当前 Instant.now()
+// Background loop: sends the current Instant.now() to ch every period
 pub async fun ticker_loop(ch: Channel<Instant>, period: Duration): Async<void> {
     loop {
         sleep(period).await()
@@ -40,25 +40,26 @@ pub async fun ticker_loop(ch: Channel<Instant>, period: Duration): Async<void> {
     }
 }
 
-// 启动 ticker，返回 Receiver<Instant>，调用方周期性 recv 获取时间戳
+// Starts a ticker, returns Receiver<Instant>; the caller periodically recv to get timestamps
 pub async fun ticker(period: Duration): Async<Receiver<Instant>> {
     val ch = channel<Instant>(1)
     ticker_loop(ch, period)
     ch.receiver
 }
 
-// ─── timeout：d 后向 channel 推送一次 void ───────────────────────
+// ─── timeout: pushes a single void to a channel after d ───────────────────────
 
-// 后台 worker：sleep(d) 后向 ch 发送一次 void，然后退出
+// Background worker: sends a single void to ch after sleep(d), then exits
 pub async fun timeout_worker(ch: Channel<void>, d: Duration): Async<void> {
     sleep(d).await()
     ch.send(void)
 }
 
-// 单次定时器：立即返回 Receiver<void>，d 后 channel 收到 void
-// 调用方 recv 会阻塞到超时触发（非 await 阻塞）
-// 修复：后台启动 timeout_worker（不 await），立即返回 receiver，
-// 避免原实现 sleep(d).await() 阻塞 timeout 函数自身导致调用方 await 即阻塞 d
+// One-shot timer: returns Receiver<void> immediately; the channel receives void after d
+// The caller's recv will block until the timeout triggers (non-await blocking)
+// Fix: start timeout_worker in the background (without await), return receiver immediately,
+// to avoid the original implementation where sleep(d).await() blocks the timeout function itself,
+// causing the caller's await to block for d
 pub async fun timeout(d: Duration): Async<Receiver<void>> {
     val ch = channel<void>(1)
     timeout_worker(ch, d)

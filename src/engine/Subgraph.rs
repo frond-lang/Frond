@@ -284,6 +284,11 @@ impl<S: LockStrategy> Engine<S> {
             let node_count = (node_end.0 - node_start.0) as usize;
             let offset = node_start.0 as usize;
 
+            if std::env::var("KUZO_DEBUG_CALL").is_ok() && node_count == 0 {
+                eprintln!("[SUBGRAPH-ZERO] sg={} has 0 nodes! node_range=[{:?},{:?}) param_count={} — function body was NOT compiled (placeholder)",
+                    subgraph_id.0, node_start, node_end, child_sg.param_count);
+            }
+
             let mut child = self.acquire_frame(child_fid, subgraph_id, node_count);
             self.prepare_frame(&mut child);
 
@@ -329,7 +334,7 @@ impl<S: LockStrategy> Engine<S> {
                     let mut loop_frame = self.frames.lock().remove(&loop_fid);
                     if let Some(lf) = loop_frame.as_deref_mut() {
                         lf.cached_child_frame = None;
-                        lf.control_signal = child_signal;
+                        lf.control_signal = child_signal.clone();
                     }
                     // Iterate on loop_frame (loop_kind is usually While/Loop/For, not LoopBody,
                     // but if it is a nested LoopBody we keep propagating iteratively to avoid
@@ -339,26 +344,52 @@ impl<S: LockStrategy> Engine<S> {
                             child_frame = *lf; // Iterate instead of recursing.
                             continue;
                         }
-                        None => panic!(
-                            "complete_and_wake_caller: LoopBody break/return but loop_frame {:?} is not in frames (invariant violation: the loop frame referenced by the body frame's caller must exist)",
-                            loop_fid
-                        ),
+                        None => {
+                            // Bug #78: loop_frame is being processed by another worker (concurrent
+                            // race). Store the completion into pending_completions so process_frame
+                            // propagates the control_signal when the loop_frame is re-inserted.
+                            let return_value = super::Schedule::extract_child_return(&child_frame, &self.graph);
+                            let call_node = child_frame
+                                .caller
+                                .map(|(_, cn)| cn)
+                                .expect("LoopBody frame missing caller");
+                            self.release_frame(Box::new(child_frame));
+                            self.pending_completions
+                                .lock()
+                                .entry(loop_fid)
+                                .or_insert_with(Vec::new)
+                                .push((call_node, return_value, child_signal));
+                            return;
+                        }
                     }
                 }
                 ControlSignal::Continue => {
                     // continue -> loop reset (frame reuse).
-                    let mut loop_frame = self.frames.lock().remove(&loop_fid).unwrap_or_else(|| {
-                        panic!(
-                            "complete_and_wake_caller: LoopBody continue but loop_frame {:?} is not in frames (invariant violation: the loop frame referenced by the body frame's caller must exist)",
-                            loop_fid
-                        )
-                    });
-                    let mut child = child_frame; // Take ownership to modify.
-                    self.reset_loop_iteration(&mut *loop_frame, loop_fid, &mut child);
-                    self.frames.lock().insert(loop_fid, loop_frame);
-                    queue.push(loop_fid);
-                    let body_id = child.id;
-                    self.frames.lock().insert(body_id, Box::new(child));
+                    let mut loop_frame_opt = self.frames.lock().remove(&loop_fid);
+                    if let Some(loop_frame) = loop_frame_opt.as_deref_mut() {
+                        let mut child = child_frame; // Take ownership to modify.
+                        self.reset_loop_iteration(&mut *loop_frame, loop_fid, &mut child);
+                        let body_id = child.id;
+                        let loop_box = loop_frame_opt.take().unwrap();
+                        self.frames.lock().insert(loop_fid, loop_box);
+                        queue.push(loop_fid);
+                        self.frames.lock().insert(body_id, Box::new(child));
+                        return;
+                    }
+                    // Bug #78: loop_frame is being processed by another worker (concurrent race).
+                    // Continue is treated as None so the loop_frame resumes normal iteration when
+                    // re-inserted (the loop condition gate re-evaluates and starts a new body).
+                    let return_value = super::Schedule::extract_child_return(&child_frame, &self.graph);
+                    let call_node = child_frame
+                        .caller
+                        .map(|(_, cn)| cn)
+                        .expect("LoopBody frame missing caller");
+                    self.release_frame(Box::new(child_frame));
+                    self.pending_completions
+                        .lock()
+                        .entry(loop_fid)
+                        .or_insert_with(Vec::new)
+                        .push((call_node, return_value, ControlSignal::None));
                     return;
                 }
                 ControlSignal::None => {
@@ -377,32 +408,51 @@ impl<S: LockStrategy> Engine<S> {
                         eprintln!("[FORIN-BODY-DONE] child_sg={} rq_len={} unready_count={} unready={:?}",
                             child_frame.subgraph_id.0, rq_len, unready.len(), &unready[..unready.len().min(10)]);
                     }
-                    let mut loop_frame = self.frames.lock().remove(&loop_fid).unwrap_or_else(|| {
-                        panic!(
-                            "complete_and_wake_caller: LoopBody none but loop_frame {:?} is not in frames (invariant violation: the loop frame referenced by the body frame's caller must exist)",
-                            loop_fid
-                        )
-                    });
-                    let loop_kind = self.graph.subgraphs[loop_frame.subgraph_id.0 as usize].loop_kind;
-                    if loop_kind == crate::ir::Ir::LoopKind::TailRec {
-                        // TailRec loop: body_sg completes with no signal = base case hit.
-                        // Extract body_sg's return value and convert it to a Return signal to exit
-                        // the loop.
-                        let return_value = super::Schedule::extract_child_return(&child_frame, &self.graph);
-                        loop_frame.cached_child_frame = None;
-                        loop_frame.control_signal = ControlSignal::Return(return_value);
-                        child_frame = *loop_frame;
-                        continue;
-                    } else {
-                        // Ordinary loop (While/Loop/For): normal completion -> loop reset (frame
-                        // reuse).
-                        let mut child = child_frame;
-                        self.reset_loop_iteration(&mut *loop_frame, loop_fid, &mut child);
-                        self.frames.lock().insert(loop_fid, loop_frame);
-                        queue.push(loop_fid);
-                        let body_id = child.id;
-                        self.frames.lock().insert(body_id, Box::new(child));
-                        return;
+                    let loop_frame_opt = self.frames.lock().remove(&loop_fid);
+                    match loop_frame_opt {
+                        Some(mut loop_frame) => {
+                            let loop_kind = self.graph.subgraphs[loop_frame.subgraph_id.0 as usize].loop_kind;
+                            if loop_kind == crate::ir::Ir::LoopKind::TailRec {
+                                // TailRec loop: body_sg completes with no signal = base case hit.
+                                // Extract body_sg's return value and convert it to a Return signal to exit
+                                // the loop.
+                                let return_value = super::Schedule::extract_child_return(&child_frame, &self.graph);
+                                loop_frame.cached_child_frame = None;
+                                loop_frame.control_signal = ControlSignal::Return(return_value);
+                                child_frame = *loop_frame;
+                                continue;
+                            } else {
+                                // Ordinary loop (While/Loop/For): normal completion -> loop reset (frame
+                                // reuse).
+                                let mut child = child_frame;
+                                self.reset_loop_iteration(&mut *loop_frame, loop_fid, &mut child);
+                                self.frames.lock().insert(loop_fid, loop_frame);
+                                queue.push(loop_fid);
+                                let body_id = child.id;
+                                self.frames.lock().insert(body_id, Box::new(child));
+                                return;
+                            }
+                        }
+                        None => {
+                            // Bug #78: loop_frame is being processed by another worker (concurrent
+                            // race). Store the completion into pending_completions; the loop_frame
+                            // resumes normal iteration when re-inserted. For TailRec the base-case
+                            // return value is written to the call_node; the next iteration's body_sg
+                            // will re-evaluate the base case and emit a Return signal through the
+                            // normal path.
+                            let return_value = super::Schedule::extract_child_return(&child_frame, &self.graph);
+                            let call_node = child_frame
+                                .caller
+                                .map(|(_, cn)| cn)
+                                .expect("LoopBody frame missing caller");
+                            self.release_frame(Box::new(child_frame));
+                            self.pending_completions
+                                .lock()
+                                .entry(loop_fid)
+                                .or_insert_with(Vec::new)
+                                .push((call_node, return_value, ControlSignal::None));
+                            return;
+                        }
                     }
                 }
             }

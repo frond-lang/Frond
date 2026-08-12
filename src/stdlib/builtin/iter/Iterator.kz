@@ -1,33 +1,33 @@
-// Iterator<T>: 迭代器 trait（builtin Kuzo 实现）
+// Iterator<T>: iterator trait (builtin Kuzo implementation)
 //
-// 三种内置实现：
-//   ArrayIter<T>     — 数组迭代器，next() 返回 T?
-//   RangeIterator    — 范围迭代器，next() 返回 i64?
-//   StringIterator   — 字符串迭代器，next() 返回 i64?（Unicode 码点）
+// Three built-in implementations:
+//   ArrayIter<T>     — array iterator, next() returns T?
+//   RangeIterator    — range iterator, next() returns i64?
+//   StringIterator   — string iterator, next() returns i64? (Unicode code point)
 //
-// 用户自定义类型 implement Iterator 后可被 For 循环使用：
-//   type MyRange: (Iterator<i32>) = MyRange(lo: i32, hi: i32) { pub fun next(&self): i32? { ... } }
-//   for x in MyRange(1, 10) { ... }  // 静态分派，零开销
+// After a user-defined type implements Iterator, it can be used by For loops:
+//   type MyRange: (Iterator<i32>) = MyRange(lo: i32, hi: i32) { pub fun &next(): i32? { ... } }
+//   for x in MyRange(1, 10) { ... }  // static dispatch, zero overhead
 //
-// 用法：
-//   for x in arr.iter() { ... }   // 数组需显式 .iter()
-//   for x in range_iter(1, 10, false) { ... }  // RangeIterator 直接用
+// Usage:
+//   for x in arr.iter() { ... }   // arrays need explicit .iter()
+//   for x in range_iter(1, 10, false) { ... }  // RangeIterator used directly
 
 // ---- Iterator trait ----
 trait Iterator<T> {
-    // 返回下一个元素，null 表示耗尽
-    // &self 按引用接收者（迭代器有可变状态，next 修改 pos）
-    fun next(&self): T?
+    // Returns the next element, null means exhausted
+    // &next takes the receiver by reference (iterator has mutable state, next modifies pos)
+    fun &next(): T?
 }
 
-// ---- 数组迭代器 ----
+// ---- Array iterator ----
 type ArrayIter<T>: (Iterator<T>) = ArrayIter(data: T[], pos: usize) {
-    pub fun next(&self): T? {
-        if self.pos >= self.data.len() {
+    pub fun &next(): T? {
+        if pos >= data.len() {
             return null
         }
-        val v = self.data[self.pos]
-        self.pos = self.pos + 1
+        val v = data[pos]
+        pos = pos + 1
         return v
     }
 }
@@ -36,16 +36,16 @@ pub fun iter<T>(arr: T[]): ArrayIter<T> {
     ArrayIter(arr, 0)
 }
 
-// ---- 范围迭代器 ----
+// ---- Range iterator ----
 type RangeIterator: (Iterator<i64>) = RangeIterator(current: i64, end: i64, inclusive: bool) {
-    pub fun next(&self): i64? {
-        if self.inclusive {
-            if self.current > self.end { return null }
+    pub fun &next(): i64? {
+        if inclusive {
+            if current > end { return null }
         } else {
-            if self.current >= self.end { return null }
+            if current >= end { return null }
         }
-        val v = self.current
-        self.current = self.current + 1
+        val v = current
+        current = current + 1
         return v
     }
 }
@@ -54,21 +54,21 @@ pub fun range_iter(start: i64, end: i64, inclusive: bool): RangeIterator {
     RangeIterator(start, end, inclusive)
 }
 
-// ---- 字符串迭代器 ----
-// 逐 Unicode 码点遍历字符串，next() 返回 i64?（码点，null 表示耗尽）。
-// UTF-8 解码由 builtin/str/Raw.kz 的 @extern("C") 原语提供。
-// pos 是字节偏移（非码点索引），终止条件通过 char_len==0 检测（offset 越界时返回 0）。
+// ---- String iterator ----
+// Iterates the string character by character by Unicode code point, next() returns i64? (code point, null means exhausted).
+// UTF-8 decoding is provided by the @extern("C") primitives in builtin/str/Raw.kz.
+// pos is the byte offset (not the code point index), termination is detected via char_len==0 (returns 0 when offset is out of bounds).
 type StringIterator: (Iterator<i64>) = StringIterator(data: str, pos: usize) {
-    pub fun next(&self): i64? {
-        val len = __str_utf8_char_len_at(self.data, self.pos)
+    pub fun &next(): i64? {
+        val len = __str_utf8_char_len_at(data, pos)
         if len == 0 {
             return null
         }
-        val cp = __str_utf8_decode_at(self.data, self.pos)
+        val cp = __str_utf8_decode_at(data, pos)
         if cp < 0 {
             return null
         }
-        self.pos = self.pos + len
+        pos = pos + len
         return cp
     }
 }

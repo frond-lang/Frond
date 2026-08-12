@@ -13,7 +13,7 @@ use crate::ir::Ir::*;
 use crate::value::{Value, ValueArena};
 use std::cell::RefCell;
 use parking_lot::{Condvar, Mutex as ParkingMutex};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use std::sync::OnceLock;
 use crossbeam_deque::Injector;
 use std::sync::Arc;
@@ -57,6 +57,12 @@ pub struct Engine<S: LockStrategy> {
     /// process_frame (and is therefore absent from the HashMap), the event is stashed here and
     /// consumed once process_frame inserts the frame (symmetric to pending_completions).
     pub pending_events: S::Mutex<HashMap<FrameId, (crate::ir::Ir::RuntimeEvent, Value)>>,
+    /// Defer-frame tracking: the set of all currently-active defer frames (distinguishes defer
+    /// frames from ordinary child frames in `process_frame`'s Completed/Failed branches).
+    pub defer_frames: S::Mutex<HashSet<FrameId>>,
+    /// Defer-waiter tracking: maps a frame that is suspended waiting for its defer frames to the
+    /// number of defer frames still pending. When the count reaches zero the frame is resumed.
+    pub defer_waiters: S::Mutex<HashMap<FrameId, u32>>,
     pub result: S::Mutex<Option<Value>>,
     /// Frame pool: reclaims completed `Box<Frame>` for reuse, eliminating frequent Vec
     /// allocation/deallocation.

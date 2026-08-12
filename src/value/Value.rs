@@ -7,11 +7,11 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::AtomicBool;
 
-// Re-export the type discriminant tag from the Type module
-pub use crate::types::ValueTag;
+// Re-export the type discriminant tag from the Tag submodule
+pub use super::Tag::ValueTag;
 
 // Cross-submodule: HeapObj::hash (in this file) reuses the SIMD batch hash helper from Arena.rs
-use super::arena::simd_hash_soa;
+use super::Arena::simd_hash_soa;
 
 // =========================================================================
 // Part 1: scalar primitive types (scalar.rs + char.rs)
@@ -505,6 +505,29 @@ impl F128 {
         }
         Self::pack(false, 0, x, false)
     }
+
+    /// Extracts the integer part of an F128 value as i128 (lossless for values within i128 range).
+    /// Uses the 113-bit mantissa and exponent directly — never goes through f64.
+    pub fn to_i128(self) -> i128 {
+        let (sign, exp, mant) = self.unpack();
+        // NaN / Inf → 0
+        if exp > 16383 + 127 {
+            return 0;
+        }
+        let val = f128_mant_to_i128(exp, mant);
+        if sign { -val } else { val }
+    }
+
+    /// Extracts the integer part of an F128 value as u128 (lossless for non-negative values within u128 range).
+    pub fn to_u128(self) -> u128 {
+        let (sign, exp, mant) = self.unpack();
+        if sign { return 0; }
+        if exp > 16383 + 127 {
+            return u128::MAX;
+        }
+        f128_mant_to_u128(exp, mant)
+    }
+
     pub fn is_nan(self) -> bool {
         let bits = u128::from_le_bytes(self.0);
         let exp = (bits >> 112) & 0x7FFF;
@@ -909,6 +932,43 @@ impl F128 {
         let q_val = Self::from_u128(q_int);
         let prod = q_val.mul_f128(other);
         self.sub_f128(prod)
+    }
+}
+
+/// Converts F128 mantissa (113-bit with implicit 1) + unbiased exponent to i128 integer part.
+/// Uses the 113-bit mantissa directly without f64 intermediate — lossless for values within i128 range.
+fn f128_mant_to_i128(exp: i32, mant: u128) -> i128 {
+    if exp < 112 {
+        // Fractional only: shift right to truncate
+        (mant >> (112 - exp)) as i128
+    } else {
+        let shift = exp - 112;
+        if shift >= 128 {
+            return i128::MAX;
+        }
+        let result = mant as u128;
+        if shift >= 113 {
+            // mant is at most 2^113 - 1, shift >= 113 → result > 2^126 → overflow
+            return i128::MAX;
+        }
+        let shifted = result.checked_shl(shift as u32);
+        match shifted {
+            Some(v) if v <= i128::MAX as u128 => v as i128,
+            _ => i128::MAX,
+        }
+    }
+}
+
+/// Converts F128 mantissa (113-bit with implicit 1) + unbiased exponent to u128 integer part.
+fn f128_mant_to_u128(exp: i32, mant: u128) -> u128 {
+    if exp < 112 {
+        mant >> (112 - exp)
+    } else {
+        let shift = exp - 112;
+        if shift >= 128 {
+            return u128::MAX;
+        }
+        mant.checked_shl(shift as u32).unwrap_or(u128::MAX)
     }
 }
 
@@ -1971,6 +2031,20 @@ impl AtomicValue {
     }
     pub fn swap(&self, val: Value) -> Value {
         std::mem::replace(&mut *self.data.lock().unwrap_or_else(|e| e.into_inner()), val)
+    }
+    /// Compare-and-exchange: if the current value equals `expected`, replace it with
+    /// `new` and return true; otherwise return false (leaving the value unchanged).
+    ///
+    /// Uses semantic value equality (`value_equals`) rather than reference equality,
+    /// so atomic semantics apply to the logical value, not the heap identity.
+    pub fn compare_exchange(&self, expected: &Value, new: Value) -> bool {
+        let mut guard = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::value::value_equals(&*guard, expected) {
+            *guard = new;
+            true
+        } else {
+            false
+        }
     }
 }
 

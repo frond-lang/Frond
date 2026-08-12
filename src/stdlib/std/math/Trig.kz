@@ -1,11 +1,11 @@
-// Math 标准库 — 三角双曲
+// Math standard library — Trigonometric and hyperbolic functions
 //
-// 纯 Kuzo 实现，算法：Taylor 级数 + 参数缩减。
-// 依赖 Round.kz 的 fmod 实现，Power.kz 的 exp/log/sqrt 实现。
-// 泛型函数使用 match type_name(x) 按类型分发到对应精度实现。
+// Pure Kuzo implementation, algorithm: Taylor series + argument reduction.
+// Depends on Round.kz for fmod implementation, Power.kz for exp/log/sqrt implementation.
+// Generic functions use match type_name(x) to dispatch to the corresponding precision implementation.
 
-// ─── sin（正弦，参数缩减 + Taylor）───
-// r = fmod(x, 2π)，缩减到 [-π,π]；sin(r) = r - r³/3! + r⁵/5! - ...
+// ─── sin (sine, argument reduction + Taylor) ───
+// r = fmod(x, 2π), reduced to [-π,π]; sin(r) = r - r³/3! + r⁵/5! - ...
 
 fun sin_f64_impl(x: f64): f64 {
     val two_pi = 0x1.921fb54442d18p+2
@@ -94,7 +94,7 @@ pub fun sin<T>(x: T): T {
     }
 }
 
-// ─── cos（余弦，cos(x) = sin(x + π/2)）───
+// ─── cos (cosine, cos(x) = sin(x + π/2)) ───
 
 fun cos_f64_impl(x: f64): f64 {
     val pi_half = 0x1.921fb54442d18p+0
@@ -123,7 +123,7 @@ pub fun cos<T>(x: T): T {
     }
 }
 
-// ─── tan（正切，sin(x)/cos(x)，cos==0 返回 Inf）───
+// ─── tan (tangent, sin(x)/cos(x), returns Inf when cos==0) ───
 
 fun tan_f64_impl(x: f64): f64 {
     val s = sin_f64_impl(x)
@@ -134,19 +134,19 @@ fun tan_f64_impl(x: f64): f64 {
 fun tan_f32_impl(x: f32): f32 {
     val s = sin_f32_impl(x)
     val c = cos_f32_impl(x)
-    if c == 0.0 { return 1.0 / 0.0 }
+    if c == 0.0 { return 1.0f32 / 0.0f32 }
     s / c
 }
 fun tan_f16_impl(x: f16): f16 {
     val s = sin_f16_impl(x)
     val c = cos_f16_impl(x)
-    if c == 0.0 { return 1.0 / 0.0 }
+    if c == 0.0 { return 1.0f16 / 0.0f16 }
     s / c
 }
 fun tan_f128_impl(x: f128): f128 {
     val s = sin_f128_impl(x)
     val c = cos_f128_impl(x)
-    if c == 0.0 { return 1.0 / 0.0 }
+    if c == 0.0 { return 1.0f128 / 0.0f128 }
     s / c
 }
 
@@ -160,7 +160,7 @@ pub fun tan<T>(x: T): T {
     }
 }
 
-// ─── sinh（双曲正弦，(exp(x) - exp(-x)) / 2）───
+// ─── sinh (hyperbolic sine, (exp(x) - exp(-x)) / 2) ───
 
 fun sinh_f64_impl(x: f64): f64 {
     val ex = exp_f64_impl(x)
@@ -197,7 +197,7 @@ pub fun sinh<T>(x: T): T {
     }
 }
 
-// ─── cosh（双曲余弦，(exp(x) + exp(-x)) / 2）───
+// ─── cosh (hyperbolic cosine, (exp(x) + exp(-x)) / 2) ───
 
 fun cosh_f64_impl(x: f64): f64 {
     val ex = exp_f64_impl(x)
@@ -234,7 +234,7 @@ pub fun cosh<T>(x: T): T {
     }
 }
 
-// ─── tanh（双曲正切，(exp(x) - exp(-x)) / (exp(x) + exp(-x))）───
+// ─── tanh (hyperbolic tangent, (exp(x) - exp(-x)) / (exp(x) + exp(-x))) ───
 
 fun tanh_f64_impl(x: f64): f64 {
     val ex = exp_f64_impl(x)
@@ -275,7 +275,7 @@ pub fun tanh<T>(x: T): T {
     }
 }
 
-// ─── atan（反正切，多项式逼近）───
+// ─── atan (arctangent, polynomial approximation) ───
 // |x|<=1: atan(x) = x - x³/3 + x⁵/5 - ...
 // |x|>1:  atan(x) = ±(π/2 - atan(1/|x|))
 
@@ -386,8 +386,8 @@ pub fun atan<T>(x: T): T {
     }
 }
 
-// ─── asin（反正弦，atan(x / sqrt(1-x²))）───
-// |x|>1 返回 NaN，x==±1 返回 ±π/2
+// ─── asin (arcsine, atan(x / sqrt(1-x²))) ───
+// |x|>1 returns NaN, x==±1 returns ±π/2
 
 fun asin_f64_impl(x: f64): f64 {
     val pi_half = 0x1.921fb54442d18p+0
@@ -398,21 +398,21 @@ fun asin_f64_impl(x: f64): f64 {
 }
 fun asin_f32_impl(x: f32): f32 {
     val pi_half: f32 = 0x1.921fb6p+0f32
-    if x > 1.0 || x < 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x > 1.0 || x < 0.0 - 1.0 { return 0.0f32 / 0.0f32 }
     if x == 1.0 { return pi_half }
     if x == 0.0 - 1.0 { return 0.0 - pi_half }
     atan_f32_impl(x / sqrt_f32_impl(1.0 - x * x))
 }
 fun asin_f16_impl(x: f16): f16 {
     val pi_half: f16 = 0x1.92p+0f16
-    if x > 1.0 || x < 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x > 1.0 || x < 0.0 - 1.0 { return 0.0f16 / 0.0f16 }
     if x == 1.0 { return pi_half }
     if x == 0.0 - 1.0 { return 0.0 - pi_half }
     atan_f16_impl(x / sqrt_f16_impl(1.0 - x * x))
 }
 fun asin_f128_impl(x: f128): f128 {
     val pi_half = 0x1.921fb54442d18469898cc51701b8p+0f128
-    if x > 1.0 || x < 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x > 1.0 || x < 0.0 - 1.0 { return 0.0f128 / 0.0f128 }
     if x == 1.0 { return pi_half }
     if x == 0.0 - 1.0 { return 0.0 - pi_half }
     atan_f128_impl(x / sqrt_f128_impl(1.0 - x * x))
@@ -428,7 +428,7 @@ pub fun asin<T>(x: T): T {
     }
 }
 
-// ─── acos（反余弦，π/2 - asin(x)）───
+// ─── acos (arccosine, π/2 - asin(x)) ───
 
 fun acos_f64_impl(x: f64): f64 {
     val pi_half = 0x1.921fb54442d18p+0
@@ -457,8 +457,8 @@ pub fun acos<T>(x: T): T {
     }
 }
 
-// ─── atan2（四象限反正切）───
-// x>0: atan(y/x)；x<0: y>=0 → atan(y/x)+π, y<0 → atan(y/x)-π；x==0: y>0 → π/2, y<0 → -π/2, y==0 → 0
+// ─── atan2 (four-quadrant arctangent) ───
+// x>0: atan(y/x); x<0: y>=0 → atan(y/x)+π, y<0 → atan(y/x)-π; x==0: y>0 → π/2, y<0 → -π/2, y==0 → 0
 
 fun atan2_f64_impl(y: f64, x: f64): f64 {
     val pi = 0x1.921fb54442d18p+1
@@ -519,7 +519,7 @@ pub fun atan2<T>(y: T, x: T): T {
     }
 }
 
-// ─── asinh（反双曲正弦，log(x + sqrt(x² + 1))）───
+// ─── asinh (inverse hyperbolic sine, log(x + sqrt(x² + 1))) ───
 
 fun asinh_f64_impl(x: f64): f64 {
     log_f64_impl(x + sqrt_f64_impl(x * x + 1.0))
@@ -544,23 +544,23 @@ pub fun asinh<T>(x: T): T {
     }
 }
 
-// ─── acosh（反双曲余弦，log(x + sqrt(x² - 1))）───
-// x<1 返回 NaN
+// ─── acosh (inverse hyperbolic cosine, log(x + sqrt(x² - 1))) ───
+// x<1 returns NaN
 
 fun acosh_f64_impl(x: f64): f64 {
     if x < 1.0 { return 0.0 / 0.0 }
     log_f64_impl(x + sqrt_f64_impl(x * x - 1.0))
 }
 fun acosh_f32_impl(x: f32): f32 {
-    if x < 1.0 { return 0.0 / 0.0 }
+    if x < 1.0 { return 0.0f32 / 0.0f32 }
     log_f32_impl(x + sqrt_f32_impl(x * x - 1.0))
 }
 fun acosh_f16_impl(x: f16): f16 {
-    if x < 1.0 { return 0.0 / 0.0 }
+    if x < 1.0 { return 0.0f16 / 0.0f16 }
     log_f16_impl(x + sqrt_f16_impl(x * x - 1.0))
 }
 fun acosh_f128_impl(x: f128): f128 {
-    if x < 1.0 { return 0.0 / 0.0 }
+    if x < 1.0 { return 0.0f128 / 0.0f128 }
     log_f128_impl(x + sqrt_f128_impl(x * x - 1.0))
 }
 
@@ -574,23 +574,23 @@ pub fun acosh<T>(x: T): T {
     }
 }
 
-// ─── atanh（反双曲正切，0.5 * log((1+x)/(1-x))）───
-// |x|>=1 返回 NaN
+// ─── atanh (inverse hyperbolic tangent, 0.5 * log((1+x)/(1-x))) ───
+// |x|>=1 returns NaN
 
 fun atanh_f64_impl(x: f64): f64 {
     if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0 / 0.0 }
     0.5 * log_f64_impl((1.0 + x) / (1.0 - x))
 }
 fun atanh_f32_impl(x: f32): f32 {
-    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0f32 / 0.0f32 }
     0.5 * log_f32_impl((1.0 + x) / (1.0 - x))
 }
 fun atanh_f16_impl(x: f16): f16 {
-    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0f16 / 0.0f16 }
     0.5 * log_f16_impl((1.0 + x) / (1.0 - x))
 }
 fun atanh_f128_impl(x: f128): f128 {
-    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0 / 0.0 }
+    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0f128 / 0.0f128 }
     0.5 * log_f128_impl((1.0 + x) / (1.0 - x))
 }
 

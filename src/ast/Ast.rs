@@ -367,7 +367,7 @@ pub enum TypeNode<'a> {
     /// Named type, e.g. `i32`, `String`.
     Named { name: &'a str },
     /// The `Self` type.
-    SelfType,
+    ThisType,
     /// Generic application, e.g. `List<i32>`.
     Generic { name: &'a str, args: Vec<TypeRef> },
     /// Nullable type `T?`.
@@ -1161,7 +1161,7 @@ pub fn walk_type<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, id: 
     v.visit_type(id);
     let ty = arena.ty(id);
     match &ty.node {
-        TypeNode::Named { .. } | TypeNode::SelfType => {}
+        TypeNode::Named { .. } | TypeNode::ThisType => {}
         TypeNode::Generic { args, .. } => {
             for a in args {
                 walk_type(v, arena, *a);
@@ -1701,7 +1701,7 @@ impl<'a> AstVisitor<'a> for Printer<'a> {
             TypeNode::Named { name } => {
                 self.write_line(&format!("(type_named \"{}\")", name));
             }
-            TypeNode::SelfType => {
+            TypeNode::ThisType => {
                 self.write_line("(type_self)");
             }
             TypeNode::Generic { name, args } => {

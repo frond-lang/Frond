@@ -7,7 +7,7 @@ use super::*;
 use crate::ir::Ir::*;
 use crate::ir::Ir::Frame;
 use crate::value::Value;
-use crate::ir::Compute::char_from_u32_or_nul;
+use crate::ir::Ir::char_from_u32_or_nul;
 
 // =========================================================================
 // Frame-operation helper functions (pure, do not depend on Engine state)
@@ -640,6 +640,7 @@ impl<S: LockStrategy> Engine<S> {
             let sg_id = frame.subgraph_id;
             graph.subgraphs[sg_id.0 as usize].defer_table.clone()
         };
+        let mut pending_defer_count: u32 = 0;
         for entry in defer_entries.iter().rev() {
             let defer_fid = self.init_defer_frame(entry.body_subgraph, frame);
             let mut defer_frame = self.frames.lock().remove(&defer_fid);
@@ -648,9 +649,27 @@ impl<S: LockStrategy> Engine<S> {
             }
             if let Some(df) = defer_frame {
                 if df.state != FrameState::Completed {
+                    pending_defer_count += 1;
                     self.frames.lock().insert(defer_fid, df);
+                } else {
+                    // Defer frame finished synchronously: unregister it so process_frame's
+                    // Completed branch does not mis-route it as a defer-waiter wakeup.
+                    self.defer_frames.lock().remove(&defer_fid);
                 }
             }
+        }
+
+        if pending_defer_count > 0 {
+            // Bug #77: some defer frames are still running (suspended on calls/awaits inside the
+            // defer body). The frame must wait for all defer frames to finish before it can be
+            // marked Completed. Suspend the frame and register a defer-waiter; each defer frame's
+            // completion (in process_frame) decrements the count and, when it reaches zero, resumes
+            // this frame for the final Completed transition.
+            self.defer_waiters.lock().insert(fid, pending_defer_count);
+            frame.state = FrameState::Suspended;
+            frame.suspend_state = SuspendState::WaitingSubgraph(FrameId(0));
+            frame.suspend_event = None;
+            return;
         }
 
         // Mark the frame completed.
@@ -686,6 +705,15 @@ impl<S: LockStrategy> Engine<S> {
 
         match state {
             FrameState::Suspended => {
+                // Bug #77: if this frame is a defer-waiter (suspended waiting for its defer
+                // frames to complete), do not process pending_completions/pending_events — it
+                // must only be resumed when all its defer frames finish (handled in the
+                // defer-frame Completed/Failed branches below).
+                let is_defer_waiter = self.defer_waiters.lock().contains_key(&fid);
+                if is_defer_waiter {
+                    self.frames.lock().insert(fid, frame_box);
+                    return;
+                }
                 let event = frame.suspend_event;
                 // Check pending_completions (the race where a child frame completes before the
                 // parent frame is re-inserted). Use a Vec to support concurrent completion of
@@ -715,9 +743,10 @@ impl<S: LockStrategy> Engine<S> {
                         frame.set_value(call_node, return_value, consumer_count);
                         // Gate branch subgraph control-signal propagation (consistent with the
                         // normal path in complete_and_wake_caller).
-                        let is_gate = self.graph.node(call_graph_id.0 as usize).kind
-                            == crate::ir::Ir::NodeKind::Gate;
-                        if is_gate && !matches!(child_signal, ControlSignal::None) {
+                        // Bug #78: propagate control_signal for all call nodes (not just Gate),
+                        // because LoopBody completion may also arrive via pending_completions when
+                        // the loop_frame is being processed by another worker.
+                        if !matches!(child_signal, ControlSignal::None) {
                             frame.control_signal = child_signal;
                         }
                         notify_downstream(
@@ -756,6 +785,53 @@ impl<S: LockStrategy> Engine<S> {
                 }
             }
             FrameState::Completed => {
+                // Bug #77: check if this is a defer frame completing. Defer frames are
+                // registered in `defer_frames` by init_defer_frame; their completion must
+                // decrement the parent's defer-waiter count and, when all defer frames are
+                // done, finalize the parent frame (without re-running run_frame_nodes, which
+                // would re-execute defer).
+                let is_defer_frame = self.defer_frames.lock().remove(&fid);
+                if is_defer_frame {
+                    let caller = frame.caller;
+                    self.release_frame(frame_box);
+                    if let Some((parent_fid, _)) = caller {
+                        let resume_parent = {
+                            let mut waiters = self.defer_waiters.lock();
+                            if let Some(count) = waiters.get_mut(&parent_fid) {
+                                *count -= 1;
+                                if *count == 0 {
+                                    waiters.remove(&parent_fid);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        };
+                        if resume_parent {
+                            // All defer frames finished: finalize the parent frame directly.
+                            let mut parent_box = self.frames.lock().remove(&parent_fid);
+                            if let Some(pf) = parent_box.as_deref_mut() {
+                                pf.state = FrameState::Completed;
+                                pf.suspend_state = SuspendState::NotSuspended;
+                                pf.suspend_event = None;
+                            }
+                            if let Some(pf) = parent_box {
+                                let parent_has_caller = pf.caller.is_some();
+                                if parent_has_caller {
+                                    self.complete_and_wake_caller(*pf, queue);
+                                } else {
+                                    // Top-level frame (e.g. main): set the result.
+                                    let ret = extract_child_return(&pf, &self.graph);
+                                    *self.result.lock() = Some(ret);
+                                    self.release_frame(pf);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
                 if has_caller {
                     // Distinguish sync-call vs async-call child-frame completion.
                     let async_id = self.async_join_runtime.lock().find_by_child(fid);
@@ -797,6 +873,47 @@ impl<S: LockStrategy> Engine<S> {
                 }
             }
             FrameState::Failed => {
+                // Bug #77: a failed defer frame must also decrement the parent's defer-waiter
+                // count (treat failure as completion for accounting purposes).
+                let is_defer_frame = self.defer_frames.lock().remove(&fid);
+                if is_defer_frame {
+                    let caller = frame.caller;
+                    self.release_frame(frame_box);
+                    if let Some((parent_fid, _)) = caller {
+                        let resume_parent = {
+                            let mut waiters = self.defer_waiters.lock();
+                            if let Some(count) = waiters.get_mut(&parent_fid) {
+                                *count -= 1;
+                                if *count == 0 {
+                                    waiters.remove(&parent_fid);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        };
+                        if resume_parent {
+                            let mut parent_box = self.frames.lock().remove(&parent_fid);
+                            if let Some(pf) = parent_box.as_deref_mut() {
+                                pf.state = FrameState::Failed;
+                                pf.suspend_state = SuspendState::NotSuspended;
+                                pf.suspend_event = None;
+                            }
+                            if let Some(pf) = parent_box {
+                                let parent_has_caller = pf.caller.is_some();
+                                if parent_has_caller {
+                                    self.complete_and_wake_caller(*pf, queue);
+                                } else {
+                                    *self.result.lock() = Some(Value::NULL);
+                                    self.release_frame(pf);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
                 if has_caller {
                     // Failed child frame (after cancel): clean up the waiter + wake the caller.
                     self.event_waiters.lock().retain(|(e, _)| {

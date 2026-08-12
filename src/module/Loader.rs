@@ -3,6 +3,7 @@
 //! Merges the stdlib embed table and the filesystem as two backends, transparently to the caller.
 //! builtin modules are fully preloaded in `new()`.
 
+use bumpalo::Bump;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::PathBuf;
 
@@ -25,6 +26,10 @@ pub struct ModuleLoader {
     load_errors: Vec<LoadError>,
     /// Set of paths already attempted but failed, to avoid recording duplicate errors for the same path.
     failed_paths: FxHashSet<String>,
+    /// Forward import graph: module_key -> directly imported module_keys
+    forward_deps: FxHashMap<String, FxHashSet<String>>,
+    /// Reverse import graph: module_key -> modules that directly import it
+    reverse_deps: FxHashMap<String, FxHashSet<String>>,
 }
 
 impl ModuleLoader {
@@ -35,6 +40,8 @@ impl ModuleLoader {
             search_paths: Vec::new(),
             load_errors: Vec::new(),
             failed_paths: FxHashSet::default(),
+            forward_deps: FxHashMap::default(),
+            reverse_deps: FxHashMap::default(),
         };
         loader.preload_builtins();
         loader
@@ -54,10 +61,17 @@ impl ModuleLoader {
     fn preload_builtins(&mut self) {
         for (path, source) in BUILTIN_FILES {
             match parse_source(path, source) {
-                Ok(module) => {
+                Ok((arena, source_owned, module)) => {
                     let exports = collect_exports(&module);
-                    self.modules
-                        .insert(path.to_string(), LoadedModule { module, exports });
+                    self.modules.insert(
+                        path.to_string(),
+                        LoadedModule {
+                            _arena: arena,
+                            _source: source_owned,
+                            module,
+                            exports,
+                        },
+                    );
                 }
                 Err(err) => {
                     self.failed_paths.insert(path.to_string());
@@ -95,12 +109,18 @@ impl ModuleLoader {
 
         // 3. Look up the stdlib embed table
         if let Some(source) = find(&path_str) {
-            let path_static: &'static str = Box::leak(path_str.clone().into_boxed_str());
-            match parse_source(path_static, source) {
-                Ok(module) => {
+            match parse_source(&path_str, source) {
+                Ok((arena, source_owned, module)) => {
                     let exports = collect_exports(&module);
-                    self.modules
-                        .insert(path_str.clone(), LoadedModule { module, exports });
+                    self.modules.insert(
+                        path_str.clone(),
+                        LoadedModule {
+                            _arena: arena,
+                            _source: source_owned,
+                            module,
+                            exports,
+                        },
+                    );
                     return self.modules.get(&path_str).map(|m| &m.module);
                 }
                 Err(err) => {
@@ -122,16 +142,17 @@ impl ModuleLoader {
             if full.exists() {
                 match std::fs::read_to_string(&full) {
                     Ok(source) => {
-                        let source_static: &'static str =
-                            Box::leak(source.into_boxed_str());
-                        let path_static: &'static str =
-                            Box::leak(path_str.clone().into_boxed_str());
-                        match parse_source(path_static, source_static) {
-                            Ok(module) => {
+                        match parse_source(&path_str, &source) {
+                            Ok((arena, source_owned, module)) => {
                                 let exports = collect_exports(&module);
                                 self.modules.insert(
                                     path_str.clone(),
-                                    LoadedModule { module, exports },
+                                    LoadedModule {
+                                        _arena: arena,
+                                        _source: source_owned,
+                                        module,
+                                        exports,
+                                    },
                                 );
                                 return self.modules.get(&path_str).map(|m| &m.module);
                             }
@@ -166,21 +187,20 @@ impl ModuleLoader {
                 Err(_) => continue,
             };
             let pack_path_key = format!("{}/pack.kz", dir_name);
-            let pack_path_static: &'static str = Box::leak(pack_path_key.into_boxed_str());
-            let pack_source_static: &'static str = Box::leak(pack_source.into_boxed_str());
-            let pack_module = match parse_source(pack_path_static, pack_source_static) {
-                Ok(m) => m,
-                Err(err) => {
-                    self.failed_paths.insert(path_str.clone());
-                    self.load_errors.push(LoadError::ParseFailed {
-                        path: path_str,
-                        line: err.line,
-                        column: err.column,
-                        message: err.message,
-                    });
-                    return None;
-                }
-            };
+            let (pack_arena, pack_source_owned, pack_module) =
+                match parse_source(&pack_path_key, &pack_source) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        self.failed_paths.insert(path_str.clone());
+                        self.load_errors.push(LoadError::ParseFailed {
+                            path: path_str,
+                            line: err.line,
+                            column: err.column,
+                            message: err.message,
+                        });
+                        return None;
+                    }
+                };
             // Load each submodule declared by the pack
             for sub_name in collect_pack_submodules(&pack_module) {
                 let sub_path_str = format!("{}/{}.kz", dir_name, sub_name);
@@ -190,15 +210,15 @@ impl ModuleLoader {
                 }
                 let sub_full = base.join(&sub_path_str);
                 if let Ok(sub_source) = std::fs::read_to_string(&sub_full) {
-                    let sub_source_static: &'static str =
-                        Box::leak(sub_source.into_boxed_str());
-                    let sub_path_static: &'static str =
-                        Box::leak(sub_path_str.clone().into_boxed_str());
-                    if let Ok(sub_module) = parse_source(sub_path_static, sub_source_static) {
+                    if let Ok((sub_arena, sub_source_owned, sub_module)) =
+                        parse_source(&sub_path_str, &sub_source)
+                    {
                         let sub_exports = collect_exports(&sub_module);
                         self.modules.insert(
                             sub_path_str,
                             LoadedModule {
+                                _arena: sub_arena,
+                                _source: sub_source_owned,
                                 module: sub_module,
                                 exports: sub_exports,
                             },
@@ -210,6 +230,8 @@ impl ModuleLoader {
             let pack_exports = collect_exports(&pack_module);
             self.modules
                 .insert(path_str.clone(), LoadedModule {
+                    _arena: pack_arena,
+                    _source: pack_source_owned,
                     module: pack_module,
                     exports: pack_exports,
                 });
@@ -253,13 +275,20 @@ impl ModuleLoader {
                 }
                 // Unloaded sibling module: load it and check its exports
                 if let Some(source) = find(sibling_file) {
-                    let sibling_static: &'static str =
-                        Box::leak(sibling_file.to_string().into_boxed_str());
-                    if let Ok(module) = parse_source(sibling_static, source) {
+                    if let Ok((sib_arena, sib_source_owned, module)) =
+                        parse_source(sibling_file, source)
+                    {
                         let exports = collect_exports(&module);
                         if exports.contains(&symbol_name) {
-                            self.modules
-                                .insert(sibling_file.to_string(), LoadedModule { module, exports });
+                            self.modules.insert(
+                                sibling_file.to_string(),
+                                LoadedModule {
+                                    _arena: sib_arena,
+                                    _source: sib_source_owned,
+                                    module,
+                                    exports,
+                                },
+                            );
                             self.failed_paths.insert(path_str);
                             return None;
                         }
@@ -360,6 +389,33 @@ impl ModuleLoader {
                 order.push(key);
             }
         }
+        // Phase 2: build forward/reverse dependency graphs
+        let all_keys: Vec<String> = self.modules.keys().cloned().collect();
+        for key in &all_keys {
+            if let Some(loaded) = self.modules.get(key) {
+                let imports = collect_imports(&loaded.module);
+                let mut new_deps: FxHashSet<String> = FxHashSet::default();
+                for (path, _) in imports {
+                    new_deps.insert(module_path_to_file(&path));
+                }
+                // Remove old reverse_deps edges that are no longer present
+                let old_deps = self.forward_deps.get(key).cloned().unwrap_or_default();
+                for old in &old_deps {
+                    if !new_deps.contains(old) {
+                        if let Some(rev) = self.reverse_deps.get_mut(old) {
+                            rev.remove(key);
+                        }
+                    }
+                }
+                // Add new reverse_deps edges
+                for new in &new_deps {
+                    if !old_deps.contains(new) {
+                        self.reverse_deps.entry(new.clone()).or_default().insert(key.clone());
+                    }
+                }
+                self.forward_deps.insert(key.clone(), new_deps);
+            }
+        }
         order
     }
 
@@ -371,6 +427,86 @@ impl ModuleLoader {
     /// Returns the cache keys of all loaded modules (in file-path form, e.g. `"std/io/File.kz"`).
     pub fn loaded_keys(&self) -> Vec<String> {
         self.modules.keys().map(|s| s.to_string()).collect()
+    }
+
+    /// Get forward deps for a module (for LSP/testing)
+    pub fn get_forward_deps(&self, module_key: &str) -> Option<&FxHashSet<String>> {
+        self.forward_deps.get(module_key)
+    }
+
+    /// Get reverse deps for a module (for LSP/testing)
+    pub fn get_reverse_deps(&self, module_key: &str) -> Option<&FxHashSet<String>> {
+        self.reverse_deps.get(module_key)
+    }
+
+    /// Compute dirty closure after module M changes (transitive reverse deps).
+    /// Returns the set of modules that need sema recheck: M plus all modules
+    /// that transitively import M.
+    pub fn dirty_closure(&self, changed: &str) -> FxHashSet<String> {
+        let mut dirty = FxHashSet::default();
+        dirty.insert(changed.to_string());
+        let mut frontier = vec![changed.to_string()];
+        while let Some(m) = frontier.pop() {
+            if let Some(importers) = self.reverse_deps.get(&m) {
+                for imp in importers {
+                    if dirty.insert(imp.clone()) {
+                        frontier.push(imp.clone());
+                    }
+                }
+            }
+        }
+        dirty
+    }
+
+    /// Replace a module's source code and re-parse it.
+    /// Used by LSP didChange to update a single module without reloading everything.
+    /// Returns true if the module was successfully parsed and cached.
+    pub fn replace_module(&mut self, key: &str, source: &str) -> bool {
+        match parse_source(key, source) {
+            Ok((arena, source_owned, module)) => {
+                // Update dep graph
+                let imports = collect_imports(&module);
+                let mut new_deps: FxHashSet<String> = FxHashSet::default();
+                for (path, _) in imports {
+                    new_deps.insert(module_path_to_file(&path));
+                }
+
+                // Remove old reverse_deps edges that are no longer present
+                let old_deps = self.forward_deps.get(key).cloned().unwrap_or_default();
+                for old in &old_deps {
+                    if !new_deps.contains(old) {
+                        if let Some(rev) = self.reverse_deps.get_mut(old) {
+                            rev.remove(key);
+                        }
+                    }
+                }
+                // Add new reverse_deps edges
+                for new in &new_deps {
+                    if !old_deps.contains(new) {
+                        self.reverse_deps
+                            .entry(new.clone())
+                            .or_default()
+                            .insert(key.to_string());
+                    }
+                }
+                self.forward_deps.insert(key.to_string(), new_deps);
+
+                // Compute exports and replace in cache.
+                // The old LoadedModule (if any) is dropped here, reclaiming its arena and source.
+                let exports = collect_exports(&module);
+                self.modules.insert(
+                    key.to_string(),
+                    LoadedModule {
+                        _arena: arena,
+                        _source: source_owned,
+                        module,
+                        exports,
+                    },
+                );
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -411,39 +547,58 @@ fn parent_directory(path: &str) -> String {
     }
 }
 
-/// Parses source code into a `Module<'static>`.
+/// Parses source code into a `Module<'static>`, owning the backing arena and source string.
 ///
-/// `source` and `path` must be `'static` (stdlib's `include_str!` or user source via `Box::leak`).
-/// The arena is made `'static` via `Box::leak`, ensuring the `Module<'static>` is safe to cache.
+/// Returns `(arena, source, module)` so the caller can keep them alive together — typically
+/// stored in a `LoadedModule` whose field drop order (reverse declaration) drops `module`
+/// before `_arena` and `_source`.
 ///
-/// Returns a `Result`: on success the `Module`; on a fatal parse error, a `ParseError`.
+/// On a fatal parse error, a `ParseError` is returned and all allocations are freed.
 /// Non-fatal parse errors (already recovered by the parser) are emitted to stderr as warnings
 /// and do not block loading.
-fn parse_source(path: &'static str, source: &'static str) -> Result<Module<'static>, ParseError> {
-    // Box::leak arena: lives for the duration of the compiler process; reclaimed by the OS on exit
-    let arena: &'static bumpalo::Bump = Box::leak(Box::new(bumpalo::Bump::new()));
+fn parse_source(
+    path: &str,
+    source: &str,
+) -> Result<(Box<Bump>, Box<str>, Module<'static>), ParseError> {
+    let arena: Box<Bump> = Box::new(Bump::new());
+    let source_owned: Box<str> = source.into();
 
-    let mut lexer = Lexer::new(source);
-    let mut sink = TokenCollector::new();
-    lexer.tokenize_into(&mut sink);
-    let tokens: Vec<Token> = sink.into_tokens();
-    let tokens_ref = arena.alloc_slice_copy(&tokens);
+    let module: Module<'static> = {
+        // Borrow arena for the parsing scope; path is copied in so Module.name outlives the call.
+        let arena_ref: &Bump = &*arena;
+        let path_ref: &str = arena_ref.alloc_str(path);
 
-    let mut parser = Parser::new(tokens_ref, arena, ErrorCollector::new());
+        let mut lexer = Lexer::new(&source_owned);
+        let mut sink = TokenCollector::new();
+        lexer.tokenize_into(&mut sink);
+        let tokens: Vec<Token> = sink.into_tokens();
+        let tokens_ref = arena_ref.alloc_slice_copy(&tokens);
 
-    match parser.parse_module(path) {
-        Ok(module) => {
-            // Non-fatal parse errors (already recovered by the parser): emit warnings; the module is still usable
-            for err in parser.errors() {
-                eprintln!(
-                    "Warning: parse error in {} at {}:{}: {}",
-                    path, err.line, err.column, err.message
-                );
+        let mut parser = Parser::new(tokens_ref, arena_ref, ErrorCollector::new());
+
+        match parser.parse_module(path_ref) {
+            Ok(module) => {
+                // Non-fatal parse errors (already recovered by the parser): emit warnings; the module is still usable
+                for err in parser.errors() {
+                    eprintln!(
+                        "Warning: parse error in {} at {}:{}: {}",
+                        path, err.line, err.column, err.message
+                    );
+                }
+                // Safety: `module` contains `&'a str` references that point into `arena`
+                // (dynamically built strings, copied path) and `source_owned` (token lexemes).
+                // Both are returned alongside `module` and stored in the same `LoadedModule`,
+                // which drops fields in reverse declaration order — `module` is dropped before
+                // `_arena` and `_source`. `Module` has no custom `Drop`; dropping it only
+                // frees `Vec` buffers (on the regular heap, not the arena) and drops `&str`
+                // references (no-ops), never dereferencing arena-allocated data.
+                unsafe { std::mem::transmute::<_, Module<'static>>(module) }
             }
-            Ok(module)
+            Err(err) => return Err(err),
         }
-        Err(err) => Err(err),
-    }
+    };
+
+    Ok((arena, source_owned, module))
 }
 
 /// Collects the public export symbols of a module.

@@ -34,6 +34,7 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     ("builtin/io/Raw.kz", include_str!("../stdlib/builtin/io/Raw.kz")),
     ("builtin/net/Raw.kz", include_str!("../stdlib/builtin/net/Raw.kz")),
     ("builtin/time/Raw.kz", include_str!("../stdlib/builtin/time/Raw.kz")),
+    ("builtin/terminal/Raw.kz", include_str!("../stdlib/builtin/terminal/Raw.kz")),
     // error module
     ("builtin/error/pack.kz", include_str!("../stdlib/builtin/error/pack.kz")),
     ("builtin/error/Err.kz", include_str!("../stdlib/builtin/error/Err.kz")),
@@ -41,6 +42,7 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     ("builtin/error/CastError.kz", include_str!("../stdlib/builtin/error/CastError.kz")),
     ("builtin/error/IOError.kz", include_str!("../stdlib/builtin/error/IOError.kz")),
     ("builtin/error/TimeError.kz", include_str!("../stdlib/builtin/error/TimeError.kz")),
+    ("builtin/error/TerminalError.kz", include_str!("../stdlib/builtin/error/TerminalError.kz")),
     // cast module (type conversion primitives + kuzo wrapper)
     ("builtin/cast/pack.kz", include_str!("../stdlib/builtin/cast/pack.kz")),
     ("builtin/cast/Raw.kz", include_str!("../stdlib/builtin/cast/Raw.kz")),
@@ -64,6 +66,8 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     // iter module
     ("builtin/iter/pack.kz", include_str!("../stdlib/builtin/iter/pack.kz")),
     ("builtin/iter/Iterator.kz", include_str!("../stdlib/builtin/iter/Iterator.kz")),
+    // terminal module (pack declaration; Raw already loaded at the primitive layer)
+    ("builtin/terminal/pack.kz", include_str!("../stdlib/builtin/terminal/pack.kz")),
 ];
 
 /// Standard library module file manifest (requires `import std.xxx` to load).
@@ -99,6 +103,11 @@ pub const STD_FILES: &[StdlibFile] = &[
     ("std/math/Power.kz", include_str!("../stdlib/std/math/Power.kz")),
     ("std/math/Trig.kz",  include_str!("../stdlib/std/math/Trig.kz")),
     ("std/math/Round.kz", include_str!("../stdlib/std/math/Round.kz")),
+    // terminal module (high-level terminal abstraction)
+    ("std/terminal/pack.kz", include_str!("../stdlib/std/terminal/pack.kz")),
+    ("std/terminal/Session.kz", include_str!("../stdlib/std/terminal/Session.kz")),
+    ("std/terminal/Ansi.kz", include_str!("../stdlib/std/terminal/Ansi.kz")),
+    ("std/terminal/Key.kz", include_str!("../stdlib/std/terminal/Key.kz")),
 ];
 
 /// Looks up a stdlib file by path.

@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use pastey::paste;
 use wide::{f32x4, f64x4, i8x16, i16x8, i32x4, i64x4, u8x16, u16x8, u32x4, u64x4, CmpEq, CmpGe, CmpGt, CmpLe, CmpLt, CmpNe};
 
-pub use crate::types::ValueTag;
+pub use super::Tag::ValueTag;
 
 use super::value::*;
 
@@ -171,8 +171,13 @@ macro_rules! impl_bitops {
                 fn bit_or(self, other: Self) -> Self { self | other }
                 fn bit_xor(self, other: Self) -> Self { self ^ other }
                 fn bit_not(self) -> Self { !self }
-                fn shl(self, amount: u32) -> Self { self.wrapping_shl(amount) }
-                fn shr(self, amount: u32) -> Self { self.wrapping_shr(amount) }
+                fn shl(self, amount: u32) -> Self {
+                    // SIMD batch path: shift out of bounds returns the original value (wrapping semantics); single-node path returns Throw
+                    if amount >= Self::BITS { self } else { self.wrapping_shl(amount) }
+                }
+                fn shr(self, amount: u32) -> Self {
+                    if amount >= Self::BITS { self } else { self.wrapping_shr(amount) }
+                }
             }
         )*
     };
@@ -445,28 +450,8 @@ fn cast_to_bool(src_tag: ValueTag, src_bytes: &[u8]) -> bool {
     match src_tag {
         ValueTag::Bool => read_bool(src_bytes),
         ValueTag::Char => read_u32_le(src_bytes) != 0,
-        ValueTag::I8 => src_bytes.first().copied().unwrap_or(0) as i8 != 0,
-        ValueTag::U8 => src_bytes.first().copied().unwrap_or(0) != 0,
-        ValueTag::I16 | ValueTag::U16 => {
-            let mut b = [0u8; 2];
-            let l = src_bytes.len().min(2);
-            b[..l].copy_from_slice(&src_bytes[..l]);
-            u16::from_le_bytes(b) != 0
-        }
-        ValueTag::I32 | ValueTag::U32 => {
-            let v = read_u32_le(src_bytes);
-            v != 0
-        }
-        ValueTag::I64 | ValueTag::U64 | ValueTag::Isize | ValueTag::Usize => {
-            read_u64_le(src_bytes) != 0
-        }
-        ValueTag::I128 | ValueTag::U128 => {
-            read_u128_le(src_bytes) != 0
-        }
-        ValueTag::F32 => read_f32_le(src_bytes) != 0.0,
-        ValueTag::F64 => read_f64_le(src_bytes) != 0.0,
-        ValueTag::F16 => read_f16(src_bytes).to_f32() != 0.0,
-        ValueTag::F128 => read_f128(src_bytes).to_f64() != 0.0,
+        _ if src_tag.is_int() => read_int_as_u128(src_tag, src_bytes) != 0,
+        _ if src_tag.is_float() => read_float_as_f64(src_tag, src_bytes) != 0.0,
         _ => false,
     }
 }
@@ -532,25 +517,38 @@ fn cast_int_to_float(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst
 }
 
 fn cast_float_to_int(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst: &mut [u8]) {
+    // F128 source: use native F128→int conversion to preserve the full 113-bit mantissa.
+    // Going through f64 would lose precision for values > 2^53.
+    if src_tag == ValueTag::F128 {
+        let f = read_f128(src_bytes);
+        if dst_tag.is_signed() {
+            write_int_bytes!(f.to_i128(), dst_tag, dst);
+        } else {
+            write_int_bytes!(f.to_u128(), dst_tag, dst);
+        }
+        return;
+    }
     let f = read_float_as_f64(src_tag, src_bytes);
-    match dst_tag {
-        ValueTag::I8 => write_i8(f as i8, dst),
-        ValueTag::I16 => write_i16_le(f as i16, dst),
-        ValueTag::I32 => write_i32_le(f as i32, dst),
-        ValueTag::I64 => write_i64_le(f as i64, dst),
-        ValueTag::I128 => write_i128_le(f as i128, dst),
-        ValueTag::Isize => write_i64_le(f as isize as i64, dst),
-        ValueTag::U8 => write_u8(f as u8, dst),
-        ValueTag::U16 => write_u16_le(f as u16, dst),
-        ValueTag::U32 => write_u32_le(f as u32, dst),
-        ValueTag::U64 => write_u64_le(f as u64, dst),
-        ValueTag::U128 => write_u128_le(f as u128, dst),
-        ValueTag::Usize => write_u64_le(f as usize as u64, dst),
-        _ => {}
+    if dst_tag.is_signed() {
+        write_int_bytes!(f as i128, dst_tag, dst);
+    } else {
+        write_int_bytes!(f as u128, dst_tag, dst);
     }
 }
 
 fn cast_float_to_float(src_tag: ValueTag, src_bytes: &[u8], dst_tag: ValueTag, dst: &mut [u8]) {
+    // F128 source: use F128 as intermediate to preserve precision for F128→F64/F128→F32.
+    if src_tag == ValueTag::F128 {
+        let f = read_f128(src_bytes);
+        match dst_tag {
+            ValueTag::F16 => write_f16(F16::from_f64(f.to_f64()), dst),
+            ValueTag::F32 => write_f32_le(f.to_f64() as f32, dst),
+            ValueTag::F64 => write_f64_le(f.to_f64(), dst),
+            ValueTag::F128 => write_f128(f, dst),
+            _ => {}
+        }
+        return;
+    }
     let f = read_float_as_f64(src_tag, src_bytes);
     cast_from_f64(f, dst_tag, dst);
 }
@@ -632,14 +630,15 @@ where
 #[inline]
 fn binop_scalar_t<T: Num + BitOps>(a: T, b: T, op: BinOp) -> T {
     match op {
+        // Bug #75: unified wrapping semantics (consistent with Bug #22).
+        // Integer wrapping_add/sub/mul wraps; floating point wrapping_* is equivalent to native + - * (Num trait implementation).
         BinOp::Add => a.wrapping_add(b),
         BinOp::Sub => a.wrapping_sub(b),
         BinOp::Mul => a.wrapping_mul(b),
-        // Division-by-zero semantics match scalar arith_div/arith_mod:
-        //   - Integer checked_div/checked_rem return None on divide-by-zero → unwrap_or(zero) yields 0
-        //   - Float checked_div/checked_rem always return Some (divide-by-zero yields inf/nan) → unwrap_or never fires
-        BinOp::Div => a.checked_div(b).unwrap_or(T::zero()),
-        BinOp::Mod => a.checked_rem(b).unwrap_or(T::zero()),
+        // SIMD batch path: divide-by-zero returns 0 (wrapping semantics); single-node path returns Throw.
+        // Floating point checked_div/checked_rem always returns Some (native / produces inf/nan), does not trigger panic.
+        BinOp::Div => a.checked_div(b).unwrap_or_else(T::zero),
+        BinOp::Mod => a.checked_rem(b).unwrap_or_else(T::zero),
         BinOp::Band => a.bit_and(b),
         BinOp::Bor => a.bit_or(b),
         BinOp::Bxor => a.bit_xor(b),
@@ -654,6 +653,7 @@ where T: Num + BitOps {
     let n = dst.len().min(a.len());
     for i in 0..n {
         dst[i] = match op {
+            // Bug #75: unified wrapping semantics (consistent with Bug #22).
             UnaryOp::Neg => a[i].wrapping_neg(),
             UnaryOp::Abs => a[i].abs(),
             UnaryOp::Bnot => a[i].bit_not(),
@@ -714,370 +714,145 @@ fn cmp_scalar_t<T: PartialOrd + ?Sized>(a: &T, b: &T, op: CmpOp) -> bool {
 /// SIMD lane width.
 pub const SIMD_LANES: usize = 4;
 
-// -------------------- f32 --------------------
+// -------------------- f32 / f64 binop (SIMD) --------------------
+// f32/f64 use a dedicated float macro: no bitwise/shift ops; Div is native float division.
+// i32/i64 binop is generated by impl_simd_int_binop! (defined below) — calls are placed
+// alongside the other integer macro invocations.
 
-#[inline]
-fn binop_f32_scalar(a: f32, b: f32, op: BinOp) -> f32 {
-    match op {
-        BinOp::Add => a + b,
-        BinOp::Sub => a - b,
-        BinOp::Mul => a * b,
-        BinOp::Div => a / b,
-        BinOp::Mod => a % b,
-        // f32 does not support bitwise/shift ops; keep the original value
-        _ => a,
-    }
-}
-
-fn binop_f32_kernel(dst: &mut [f32], a: &[f32], b: &[f32], op: BinOp) {
-    let n = dst.len().min(a.len()).min(b.len());
-    let blocks = n / SIMD_LANES;
-    let use_simd = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
-    if use_simd {
-        for blk in 0..blocks {
-            let i = blk * SIMD_LANES;
-            let va = f32x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
-            let vb = f32x4::new(b[i..i + SIMD_LANES].try_into().unwrap());
-            let r = match op {
-                BinOp::Add => va + vb,
-                BinOp::Sub => va - vb,
-                BinOp::Mul => va * vb,
-                BinOp::Div => va / vb,
-                _ => unreachable!(),
-            };
-            dst[i..i + SIMD_LANES].copy_from_slice(&r.to_array());
-        }
-    } else {
-        for blk in 0..blocks {
-            let i = blk * SIMD_LANES;
-            for j in 0..SIMD_LANES {
-                dst[i + j] = binop_f32_scalar(a[i + j], b[i + j], op);
+/// Float SIMD binop kernel generation macro.
+/// Accelerates add/sub/mul/div via SIMD; mod and bitwise/shift ops fall back to scalar.
+/// f32/f64 do not support bitwise/shift ops — the scalar fn keeps the original value for those.
+macro_rules! impl_simd_float_binop {
+    ($ty:ty, $vec:ty, $lanes:expr, $scalar_fn:ident) => {
+        #[inline]
+        fn $scalar_fn(a: $ty, b: $ty, op: BinOp) -> $ty {
+            match op {
+                BinOp::Add => a + b,
+                BinOp::Sub => a - b,
+                BinOp::Mul => a * b,
+                BinOp::Div => a / b,
+                BinOp::Mod => a % b,
+                // f32/f64 does not support bitwise/shift ops; keep the original value
+                _ => a,
             }
         }
-    }
-    let tail = blocks * SIMD_LANES;
-    for i in tail..n {
-        dst[i] = binop_f32_scalar(a[i], b[i], op);
-    }
-}
 
-/// f32 SIMD + rayon parallel binary operation.
-pub fn batch_binop_f32(dst: &mut [f32], a: &[f32], b: &[f32], op: BinOp) {
-    let n = dst.len().min(a.len()).min(b.len());
-    if n == 0 {
-        return;
-    }
-    if n > PARALLEL_THRESHOLD {
-        let chunk = par_chunk_size(n);
-        dst[..n]
-            .par_chunks_mut(chunk)
-            .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
-            .for_each(|(d, (av, bv))| binop_f32_kernel(d, av, bv, op));
-    } else {
-        binop_f32_kernel(&mut dst[..n], &a[..n], &b[..n], op);
-    }
-}
+        paste! {
+            #[inline]
+            fn [<binop_ $ty _kernel>](dst: &mut [$ty], a: &[$ty], b: &[$ty], op: BinOp) {
+                let n = dst.len().min(a.len()).min(b.len());
+                let blocks = n / $lanes;
+                let use_simd = matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
+                );
+                if use_simd {
+                    for blk in 0..blocks {
+                        let i = blk * $lanes;
+                        let va = <$vec>::new(a[i..i + $lanes].try_into().unwrap());
+                        let vb = <$vec>::new(b[i..i + $lanes].try_into().unwrap());
+                        let r = match op {
+                            BinOp::Add => va + vb,
+                            BinOp::Sub => va - vb,
+                            BinOp::Mul => va * vb,
+                            BinOp::Div => va / vb,
+                            _ => unreachable!(),
+                        };
+                        dst[i..i + $lanes].copy_from_slice(&r.to_array());
+                    }
+                } else {
+                    for blk in 0..blocks {
+                        let i = blk * $lanes;
+                        for j in 0..$lanes {
+                            dst[i + j] = $scalar_fn(a[i + j], b[i + j], op);
+                        }
+                    }
+                }
+                let tail = blocks * $lanes;
+                for i in tail..n {
+                    dst[i] = $scalar_fn(a[i], b[i], op);
+                }
+            }
 
-// -------------------- f64 --------------------
-
-#[inline]
-fn binop_f64_scalar(a: f64, b: f64, op: BinOp) -> f64 {
-    match op {
-        BinOp::Add => a + b,
-        BinOp::Sub => a - b,
-        BinOp::Mul => a * b,
-        BinOp::Div => a / b,
-        BinOp::Mod => a % b,
-        _ => a,
-    }
-}
-
-fn binop_f64_kernel(dst: &mut [f64], a: &[f64], b: &[f64], op: BinOp) {
-    let n = dst.len().min(a.len()).min(b.len());
-    let blocks = n / SIMD_LANES;
-    let use_simd = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
-    if use_simd {
-        for blk in 0..blocks {
-            let i = blk * SIMD_LANES;
-            let va = f64x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
-            let vb = f64x4::new(b[i..i + SIMD_LANES].try_into().unwrap());
-            let r = match op {
-                BinOp::Add => va + vb,
-                BinOp::Sub => va - vb,
-                BinOp::Mul => va * vb,
-                BinOp::Div => va / vb,
-                _ => unreachable!(),
-            };
-            dst[i..i + SIMD_LANES].copy_from_slice(&r.to_array());
-        }
-    } else {
-        for blk in 0..blocks {
-            let i = blk * SIMD_LANES;
-            for j in 0..SIMD_LANES {
-                dst[i + j] = binop_f64_scalar(a[i + j], b[i + j], op);
+            pub fn [<batch_binop_ $ty>](dst: &mut [$ty], a: &[$ty], b: &[$ty], op: BinOp) {
+                let n = dst.len().min(a.len()).min(b.len());
+                if n == 0 { return; }
+                if n > PARALLEL_THRESHOLD {
+                    let chunk = par_chunk_size(n);
+                    dst[..n]
+                        .par_chunks_mut(chunk)
+                        .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
+                        .for_each(|(d, (av, bv))| [<binop_ $ty _kernel>](d, av, bv, op));
+                } else {
+                    [<binop_ $ty _kernel>](&mut dst[..n], &a[..n], &b[..n], op);
+                }
             }
         }
-    }
-    let tail = blocks * SIMD_LANES;
-    for i in tail..n {
-        dst[i] = binop_f64_scalar(a[i], b[i], op);
-    }
+    };
 }
 
-/// f64 SIMD + rayon parallel binary operation.
-pub fn batch_binop_f64(dst: &mut [f64], a: &[f64], b: &[f64], op: BinOp) {
-    let n = dst.len().min(a.len()).min(b.len());
-    if n == 0 {
-        return;
-    }
-    if n > PARALLEL_THRESHOLD {
-        let chunk = par_chunk_size(n);
-        dst[..n]
-            .par_chunks_mut(chunk)
-            .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
-            .for_each(|(d, (av, bv))| binop_f64_kernel(d, av, bv, op));
-    } else {
-        binop_f64_kernel(&mut dst[..n], &a[..n], &b[..n], op);
-    }
-}
+impl_simd_float_binop!(f32, f32x4, 4, binop_f32_scalar);
+impl_simd_float_binop!(f64, f64x4, 4, binop_f64_scalar);
 
-// -------------------- i32 --------------------
+// -------------------- Compare f32 / f64 (SIMD) --------------------
 
-#[inline]
-fn binop_i32_scalar(a: i32, b: i32, op: BinOp) -> i32 {
-    match op {
-        BinOp::Add => a.wrapping_add(b),
-        BinOp::Sub => a.wrapping_sub(b),
-        BinOp::Mul => a.wrapping_mul(b),
-        // Integer divide-by-zero panics directly (no fallback)
-        BinOp::Div => a / b,
-        BinOp::Mod => a % b,
-        BinOp::Band => a & b,
-        BinOp::Bor => a | b,
-        BinOp::Bxor => a ^ b,
-        BinOp::Shl => a.wrapping_shl(b as u32),
-        BinOp::Shr => a.wrapping_shr(b as u32),
-    }
-}
+/// Float SIMD cmp kernel generation macro.
+/// wide provides all six comparison methods (cmp_lt/cmp_gt/cmp_eq/cmp_ne/cmp_le/cmp_ge) as
+/// inherent methods on f32x4/f64x4. The returned mask is all-1 bits (appears as NaN) for true
+/// and 0.0 for false; use to_bits() != 0 to convert to bool.
+/// NaN semantics follow IEEE 754: == returns false for NaN, != returns true, ordered comparisons
+/// (lt/gt/le/ge) return false when either operand is NaN — consistent with scalar cmp_scalar_t.
+macro_rules! impl_simd_float_cmp {
+    ($ty:ty, $vec:ty, $lanes:expr) => {
+        paste! {
+            #[inline]
+            fn [<cmp_ $ty _kernel>](dst: &mut [u8], a: &[$ty], b: &[$ty], op: CmpOp) {
+                let n = dst.len().min(a.len()).min(b.len());
+                let blocks = n / $lanes;
+                for blk in 0..blocks {
+                    let i = blk * $lanes;
+                    let va = <$vec>::new(a[i..i + $lanes].try_into().unwrap());
+                    let vb = <$vec>::new(b[i..i + $lanes].try_into().unwrap());
+                    // wide float comparison returns a mask: true is all-1 bits (f32 appears as NaN),
+                    // false is 0.0. Use to_bits() != 0 to test.
+                    let m = match op {
+                        CmpOp::Lt => va.cmp_lt(vb),
+                        CmpOp::Gt => va.cmp_gt(vb),
+                        CmpOp::Eq => va.cmp_eq(vb),
+                        CmpOp::Ne => va.cmp_ne(vb),
+                        CmpOp::Le => va.cmp_le(vb),
+                        CmpOp::Ge => va.cmp_ge(vb),
+                    };
+                    let arr = m.to_array();
+                    for j in 0..$lanes {
+                        dst[i + j] = (arr[j].to_bits() != 0) as u8;
+                    }
+                }
+                let tail = blocks * $lanes;
+                for i in tail..n {
+                    dst[i] = cmp_scalar_t(&a[i], &b[i], op) as u8;
+                }
+            }
 
-fn binop_i32_kernel(dst: &mut [i32], a: &[i32], b: &[i32], op: BinOp) {
-    let n = dst.len().min(a.len()).min(b.len());
-    let blocks = n / SIMD_LANES;
-    // i32x4 supports arithmetic + bitwise ops (all wrapping, consistent with the generic semantics);
-    // Div/Mod (no SIMD integer division, and divide-by-zero protection needed) and Shl/Shr
-    // (per-lane variable-length shifts are unsupported) fall back to scalar.
-    let use_simd = matches!(
-        op,
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Band | BinOp::Bor | BinOp::Bxor
-    );
-    if use_simd {
-        for blk in 0..blocks {
-            let i = blk * SIMD_LANES;
-            let va = i32x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
-            let vb = i32x4::new(b[i..i + SIMD_LANES].try_into().unwrap());
-            let r = match op {
-                BinOp::Add => va + vb,
-                BinOp::Sub => va - vb,
-                BinOp::Mul => va * vb,
-                BinOp::Band => va & vb,
-                BinOp::Bor => va | vb,
-                BinOp::Bxor => va ^ vb,
-                _ => unreachable!(),
-            };
-            dst[i..i + SIMD_LANES].copy_from_slice(&r.to_array());
-        }
-    } else {
-        for blk in 0..blocks {
-            let i = blk * SIMD_LANES;
-            for j in 0..SIMD_LANES {
-                dst[i + j] = binop_i32_scalar(a[i + j], b[i + j], op);
+            pub fn [<batch_cmp_ $ty>](dst: &mut [u8], a: &[$ty], b: &[$ty], op: CmpOp) {
+                let n = dst.len().min(a.len()).min(b.len());
+                if n == 0 { return; }
+                if n > PARALLEL_THRESHOLD {
+                    let chunk = par_chunk_size(n);
+                    dst[..n]
+                        .par_chunks_mut(chunk)
+                        .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
+                        .for_each(|(d, (av, bv))| [<cmp_ $ty _kernel>](d, av, bv, op));
+                } else {
+                    [<cmp_ $ty _kernel>](&mut dst[..n], &a[..n], &b[..n], op);
+                }
             }
         }
-    }
-    let tail = blocks * SIMD_LANES;
-    for i in tail..n {
-        dst[i] = binop_i32_scalar(a[i], b[i], op);
-    }
+    };
 }
 
-/// i32 SIMD + rayon parallel binary operation.
-pub fn batch_binop_i32(dst: &mut [i32], a: &[i32], b: &[i32], op: BinOp) {
-    let n = dst.len().min(a.len()).min(b.len());
-    if n == 0 {
-        return;
-    }
-    if n > PARALLEL_THRESHOLD {
-        let chunk = par_chunk_size(n);
-        dst[..n]
-            .par_chunks_mut(chunk)
-            .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
-            .for_each(|(d, (av, bv))| binop_i32_kernel(d, av, bv, op));
-    } else {
-        binop_i32_kernel(&mut dst[..n], &a[..n], &b[..n], op);
-    }
-}
-
-// -------------------- i64 --------------------
-
-#[inline]
-fn binop_i64_scalar(a: i64, b: i64, op: BinOp) -> i64 {
-    match op {
-        BinOp::Add => a.wrapping_add(b),
-        BinOp::Sub => a.wrapping_sub(b),
-        BinOp::Mul => a.wrapping_mul(b),
-        BinOp::Div => a / b,
-        BinOp::Mod => a % b,
-        BinOp::Band => a & b,
-        BinOp::Bor => a | b,
-        BinOp::Bxor => a ^ b,
-        BinOp::Shl => a.wrapping_shl(b as u32),
-        BinOp::Shr => a.wrapping_shr(b as u32),
-    }
-}
-
-fn binop_i64_kernel(dst: &mut [i64], a: &[i64], b: &[i64], op: BinOp) {
-    let n = dst.len().min(a.len()).min(b.len());
-    let blocks = n / SIMD_LANES;
-    let use_simd = matches!(
-        op,
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Band | BinOp::Bor | BinOp::Bxor
-    );
-    if use_simd {
-        for blk in 0..blocks {
-            let i = blk * SIMD_LANES;
-            let va = i64x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
-            let vb = i64x4::new(b[i..i + SIMD_LANES].try_into().unwrap());
-            let r = match op {
-                BinOp::Add => va + vb,
-                BinOp::Sub => va - vb,
-                BinOp::Mul => va * vb,
-                BinOp::Band => va & vb,
-                BinOp::Bor => va | vb,
-                BinOp::Bxor => va ^ vb,
-                _ => unreachable!(),
-            };
-            dst[i..i + SIMD_LANES].copy_from_slice(&r.to_array());
-        }
-    } else {
-        for blk in 0..blocks {
-            let i = blk * SIMD_LANES;
-            for j in 0..SIMD_LANES {
-                dst[i + j] = binop_i64_scalar(a[i + j], b[i + j], op);
-            }
-        }
-    }
-    let tail = blocks * SIMD_LANES;
-    for i in tail..n {
-        dst[i] = binop_i64_scalar(a[i], b[i], op);
-    }
-}
-
-/// i64 SIMD + rayon parallel binary operation.
-pub fn batch_binop_i64(dst: &mut [i64], a: &[i64], b: &[i64], op: BinOp) {
-    let n = dst.len().min(a.len()).min(b.len());
-    if n == 0 {
-        return;
-    }
-    if n > PARALLEL_THRESHOLD {
-        let chunk = par_chunk_size(n);
-        dst[..n]
-            .par_chunks_mut(chunk)
-            .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
-            .for_each(|(d, (av, bv))| binop_i64_kernel(d, av, bv, op));
-    } else {
-        binop_i64_kernel(&mut dst[..n], &a[..n], &b[..n], op);
-    }
-}
-
-// -------------------- Compare f32 / f64 --------------------
-
-fn cmp_f32_kernel(dst: &mut [u8], a: &[f32], b: &[f32], op: CmpOp) {
-    let n = dst.len().min(a.len()).min(b.len());
-    let blocks = n / SIMD_LANES;
-    for blk in 0..blocks {
-        let i = blk * SIMD_LANES;
-        let va = f32x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
-        let vb = f32x4::new(b[i..i + SIMD_LANES].try_into().unwrap());
-        // wide float comparison returns a mask: true is all-1 bits (f32 appears as NaN),
-        // false is 0.0. Use to_bits() != 0 to test.
-        let m = match op {
-            CmpOp::Lt => va.cmp_lt(vb),
-            CmpOp::Gt => va.cmp_gt(vb),
-            CmpOp::Eq => va.cmp_eq(vb),
-            CmpOp::Ne => va.cmp_ne(vb),
-            CmpOp::Le => va.cmp_le(vb),
-            CmpOp::Ge => va.cmp_ge(vb),
-        };
-        let arr = m.to_array();
-        for j in 0..SIMD_LANES {
-            dst[i + j] = (arr[j].to_bits() != 0) as u8;
-        }
-    }
-    let tail = blocks * SIMD_LANES;
-    for i in tail..n {
-        dst[i] = cmp_scalar_t(&a[i], &b[i], op) as u8;
-    }
-}
-
-/// f32 SIMD + rayon parallel comparison (outputs a u8 mask).
-pub fn batch_cmp_f32(dst: &mut [u8], a: &[f32], b: &[f32], op: CmpOp) {
-    let n = dst.len().min(a.len()).min(b.len());
-    if n == 0 {
-        return;
-    }
-    if n > PARALLEL_THRESHOLD {
-        let chunk = par_chunk_size(n);
-        dst[..n]
-            .par_chunks_mut(chunk)
-            .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
-            .for_each(|(d, (av, bv))| cmp_f32_kernel(d, av, bv, op));
-    } else {
-        cmp_f32_kernel(&mut dst[..n], &a[..n], &b[..n], op);
-    }
-}
-
-fn cmp_f64_kernel(dst: &mut [u8], a: &[f64], b: &[f64], op: CmpOp) {
-    let n = dst.len().min(a.len()).min(b.len());
-    let blocks = n / SIMD_LANES;
-    for blk in 0..blocks {
-        let i = blk * SIMD_LANES;
-        let va = f64x4::new(a[i..i + SIMD_LANES].try_into().unwrap());
-        let vb = f64x4::new(b[i..i + SIMD_LANES].try_into().unwrap());
-        let m = match op {
-            CmpOp::Lt => va.cmp_lt(vb),
-            CmpOp::Gt => va.cmp_gt(vb),
-            CmpOp::Eq => va.cmp_eq(vb),
-            CmpOp::Ne => va.cmp_ne(vb),
-            CmpOp::Le => va.cmp_le(vb),
-            CmpOp::Ge => va.cmp_ge(vb),
-        };
-        let arr = m.to_array();
-        for j in 0..SIMD_LANES {
-            dst[i + j] = (arr[j].to_bits() != 0) as u8;
-        }
-    }
-    let tail = blocks * SIMD_LANES;
-    for i in tail..n {
-        dst[i] = cmp_scalar_t(&a[i], &b[i], op) as u8;
-    }
-}
-
-/// f64 SIMD + rayon parallel comparison (outputs a u8 mask).
-pub fn batch_cmp_f64(dst: &mut [u8], a: &[f64], b: &[f64], op: CmpOp) {
-    let n = dst.len().min(a.len()).min(b.len());
-    if n == 0 {
-        return;
-    }
-    if n > PARALLEL_THRESHOLD {
-        let chunk = par_chunk_size(n);
-        dst[..n]
-            .par_chunks_mut(chunk)
-            .zip(a[..n].par_chunks(chunk).zip(b[..n].par_chunks(chunk)))
-            .for_each(|(d, (av, bv))| cmp_f64_kernel(d, av, bv, op));
-    } else {
-        cmp_f64_kernel(&mut dst[..n], &a[..n], &b[..n], op);
-    }
-}
+impl_simd_float_cmp!(f32, f32x4, 4);
+impl_simd_float_cmp!(f64, f64x4, 4);
 
 // =========================================================================
 // SIMD completion: i8/i16/u8/u16/u32/u64 binop + cmp, plus i32/i64 cmp
@@ -1095,13 +870,14 @@ macro_rules! impl_simd_int_binop {
                 BinOp::Add => a.wrapping_add(b),
                 BinOp::Sub => a.wrapping_sub(b),
                 BinOp::Mul => a.wrapping_mul(b),
-                BinOp::Div => a / b,
-                BinOp::Mod => a % b,
+                // SIMD batch path: divide-by-zero returns 0 (wrapping semantics); single-node path returns Throw
+                BinOp::Div => if b == 0 { 0 } else { a.wrapping_div(b) },
+                BinOp::Mod => if b == 0 { 0 } else { a.wrapping_rem(b) },
                 BinOp::Band => a & b,
                 BinOp::Bor => a | b,
                 BinOp::Bxor => a ^ b,
-                BinOp::Shl => a.wrapping_shl(b as u32),
-                BinOp::Shr => a.wrapping_shr(b as u32),
+                BinOp::Shl => if (b as i64) < 0 || b as u32 >= <$ty>::BITS { a } else { a.wrapping_shl(b as u32) },
+                BinOp::Shr => if (b as i64) < 0 || b as u32 >= <$ty>::BITS { a } else { a.wrapping_shr(b as u32) },
             }
         }
 
@@ -1170,13 +946,14 @@ macro_rules! impl_simd_int_binop_no_mul {
                 BinOp::Add => a.wrapping_add(b),
                 BinOp::Sub => a.wrapping_sub(b),
                 BinOp::Mul => a.wrapping_mul(b),
-                BinOp::Div => a / b,
-                BinOp::Mod => a % b,
+                // SIMD batch path: divide-by-zero returns 0 (wrapping semantics); single-node path returns Throw
+                BinOp::Div => if b == 0 { 0 } else { a.wrapping_div(b) },
+                BinOp::Mod => if b == 0 { 0 } else { a.wrapping_rem(b) },
                 BinOp::Band => a & b,
                 BinOp::Bor => a | b,
                 BinOp::Bxor => a ^ b,
-                BinOp::Shl => a.wrapping_shl(b as u32),
-                BinOp::Shr => a.wrapping_shr(b as u32),
+                BinOp::Shl => if (b as i64) < 0 || b as u32 >= <$ty>::BITS { a } else { a.wrapping_shl(b as u32) },
+                BinOp::Shr => if (b as i64) < 0 || b as u32 >= <$ty>::BITS { a } else { a.wrapping_shr(b as u32) },
             }
         }
 
@@ -1242,6 +1019,9 @@ impl_simd_int_binop_no_mul!(u8, u8x16, 16, binop_u8_scalar);
 impl_simd_int_binop!(u16, u16x8, 8, binop_u16_scalar);
 impl_simd_int_binop!(u32, u32x4, 4, binop_u32_scalar);
 impl_simd_int_binop!(u64, u64x4, 4, binop_u64_scalar);
+// i32/i64 binop was previously handwritten; now generated by the same macro (structurally identical).
+impl_simd_int_binop!(i32, i32x4, 4, binop_i32_scalar);
+impl_simd_int_binop!(i64, i64x4, 4, binop_i64_scalar);
 
 // -------------------- Signed integer SIMD cmp (i8/i16/i32/i64) --------------------
 // wide provides CmpEq/CmpLt/CmpGt for signed integers; other combinations: Ne=!Eq, Le=Lt|Eq, Ge=Gt|Eq
@@ -1380,8 +1160,8 @@ impl_simd_unsigned_cmp!(u64, u64x4, 4);
 // =========================================================================
 //
 // Generates pure arithmetic functions for all integer/float types. Semantics strictly match the compute_fn macro in Engine.rs:
-//   - Integer add/sub/mul: wrapping semantics
-//   - Integer div/mod: checked; divide-by-zero returns 0
+//   - Integer add/sub/mul/neg: wrapping semantics (consistent with Bug #22; Bug #75 unified to wrapping, no debug/release branch)
+//   - Integer div/mod: divide-by-zero panics (no silent fallback)
 //   - Integer shl/shr: shift amount is i32 (matching Engine.rs reading as_i32), cast to u32 then wrapping
 //   - Float div: native division (divide-by-zero yields inf/nan)
 // runtime compute_fn calls these pure functions (reuse); compile-time ConstFold also calls the same arithmetic (decoupled from Frame).
@@ -1394,13 +1174,19 @@ macro_rules! impl_arith_int {
             #[inline] pub fn [<arith_add_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_add(b) }
             #[inline] pub fn [<arith_sub_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_sub(b) }
             #[inline] pub fn [<arith_mul_$ty>](a: $rust, b: $rust) -> $rust { a.wrapping_mul(b) }
-            #[inline] pub fn [<arith_div_$ty>](a: $rust, b: $rust) -> $rust { if b == 0 { 0 } else { a.wrapping_div(b) } }
-            #[inline] pub fn [<arith_mod_$ty>](a: $rust, b: $rust) -> $rust { if b == 0 { 0 } else { a.wrapping_rem(b) } }
+            /// Divide-by-zero returns None; the caller converts it to a Throw error value for propagation (consistent with compute_str_concat).
+            #[inline] pub fn [<arith_div_$ty>](a: $rust, b: $rust) -> Option<$rust> { if b == 0 { None } else { Some(a.wrapping_div(b)) } }
+            #[inline] pub fn [<arith_mod_$ty>](a: $rust, b: $rust) -> Option<$rust> { if b == 0 { None } else { Some(a.wrapping_rem(b)) } }
             #[inline] pub fn [<arith_bitand_$ty>](a: $rust, b: $rust) -> $rust { a & b }
             #[inline] pub fn [<arith_bitor_$ty>](a: $rust, b: $rust) -> $rust { a | b }
             #[inline] pub fn [<arith_bitxor_$ty>](a: $rust, b: $rust) -> $rust { a ^ b }
-            #[inline] pub fn [<arith_shl_$ty>](a: $rust, shift: i32) -> $rust { a.wrapping_shl(shift as u32) }
-            #[inline] pub fn [<arith_shr_$ty>](a: $rust, shift: i32) -> $rust { a.wrapping_shr(shift as u32) }
+            /// Shift out of bounds (negative or >= type bit width) returns None; the caller converts it to a Throw error value.
+            #[inline] pub fn [<arith_shl_$ty>](a: $rust, shift: i32) -> Option<$rust> {
+                if shift < 0 || shift as u32 >= <$rust>::BITS { None } else { Some(a.wrapping_shl(shift as u32)) }
+            }
+            #[inline] pub fn [<arith_shr_$ty>](a: $rust, shift: i32) -> Option<$rust> {
+                if shift < 0 || shift as u32 >= <$rust>::BITS { None } else { Some(a.wrapping_shr(shift as u32)) }
+            }
             #[inline] pub fn [<arith_neg_$ty>](a: $rust) -> $rust { a.wrapping_neg() }
             #[inline] pub fn [<arith_bitnot_$ty>](a: $rust) -> $rust { !a }
         }

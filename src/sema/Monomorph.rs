@@ -46,10 +46,10 @@ fn type_identity_hash(arena: &TypeArena, h: TypeHandle) -> u64 {
     }
     // User types: use name as identity
     let name: &str = match &ty {
-        Ty::Adt(_) => arena.adt_parts(resolved).0,
-        Ty::Generic(_) => arena.generic_parts(resolved).0,
-        Ty::Trait(_) => arena.trait_parts(resolved).0,
-        Ty::TraitObject(_) => arena.trait_object_parts(resolved).0,
+        Type::Adt(_) => arena.adt_parts(resolved).0,
+        Type::Generic(_) => arena.generic_parts(resolved).0,
+        Type::Trait(_) => arena.trait_parts(resolved).0,
+        Type::TraitObject(_) => arena.trait_object_parts(resolved).0,
         _ => ty.name(),
     };
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -145,7 +145,7 @@ fn infer_type_args<'a>(
     func_name: &str,
     arguments: &[ExprId],
     type_args_hint: Option<&[AstTypeRef]>,
-    sig: &FuncSigInfo,
+    type_params: &[Box<str>],
     ast: &'a AstArena<'a>,
     func_decls: &FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
     func_arenas: &FxHashMap<&'a str, &'a AstArena<'a>>,
@@ -164,7 +164,7 @@ fn infer_type_args<'a>(
                             &format!("failed to resolve type argument in {}", func_name),
                             0, 0,
                         ));
-                        arena.make(crate::types::Ty::Unknown)
+                        arena.make(crate::types::Type::Unknown)
                     });
                 args.push(h);
             }
@@ -178,8 +178,7 @@ fn infer_type_args<'a>(
         None => {
             // AST-unreachable (likely a method or built-in): create a named Adt
             // placeholder for each type parameter.
-            return sig
-                .type_params
+            return type_params
                 .iter()
                 .map(|tp| arena.make_adt((*tp).clone(), Box::new([])))
                 .collect();
@@ -210,7 +209,7 @@ fn infer_type_args<'a>(
 
     let mut name_to_handle: FxHashMap<&str, TypeHandle> = FxHashMap::default();
 
-    let is_type_param = |name: &str| sig.type_params.iter().any(|tp| tp.as_ref() == name);
+    let is_type_param = |name: &str| type_params.iter().any(|tp| tp.as_ref() == name);
 
     let param_count = fd.params.len().min(arguments.len());
 
@@ -305,8 +304,8 @@ fn infer_type_args<'a>(
 
     // Emit type_args: build a placeholder Adt from the type parameter name so
     // `resolve_type_node_resolved` can match by name.
-    let mut args = Vec::with_capacity(sig.type_params.len());
-    for tp_name in sig.type_params.iter() {
+    let mut args = Vec::with_capacity(type_params.len());
+    for tp_name in type_params.iter() {
         let h = if let Some(&h) = name_to_handle.get(tp_name.as_ref()) {
             h
         } else {
@@ -412,7 +411,7 @@ fn get_or_create_instance<'a>(
                     &format!("failed to resolve return type of {}", func_name),
                     0, 0,
                 ));
-                arena.make(crate::types::Ty::Unknown)
+                arena.make(crate::types::Type::Unknown)
             });
 
     let mut instance = MonomorphInstance {
@@ -451,6 +450,11 @@ fn get_or_create_instance<'a>(
     // 6. Write to the instance table and cache.
     sema_result.monomorph_instances.push(instance);
     sema_result.monomorph_index.insert(cache_key, instance_id);
+    // Record module ownership for incremental purge (monomorph index).
+    sema_result.module_ownership.monomorph_indices
+        .entry(module_name.to_string())
+        .or_default()
+        .insert(instance_id);
     instance_id
 }
 
@@ -492,11 +496,11 @@ fn process_call<'a>(
         _ => return,
     };
     // Look up the function signature: skip unregistered and non-generic
-    // functions.
-    let sig_owned: Option<FuncSigInfo> = sema_result
-        .get_func_sig(func_name).cloned();
-    let sig = match sig_owned {
-        Some(s) if !s.type_params.is_empty() => s,
+    // functions. Clone only the lightweight type_params (short names like "T")
+    // instead of the entire FuncSigInfo, to release the sema_result borrow
+    // before the mutable borrow in infer_type_args.
+    let type_params: Box<[Box<str>]> = match sema_result.get_func_sig(func_name) {
+        Some(s) if !s.type_params.is_empty() => s.type_params.clone(),
         _ => return,
     };
 
@@ -515,7 +519,7 @@ fn process_call<'a>(
         func_name,
         arguments,
         type_args_hint,
-        &sig,
+        &type_params,
         ast,
         func_decls,
         func_arenas,
@@ -577,10 +581,11 @@ fn process_method_call<'a>(
     arena: &mut TypeArena,
 ) {
     // Look up `func_sig` directly by method name (covers the rare case of a
-    // same-named top-level function).
-    let sig_owned: Option<FuncSigInfo> = sema_result.get_func_sig(method).cloned();
-    let sig = match sig_owned {
-        Some(s) if !s.type_params.is_empty() => s,
+    // same-named top-level function). Clone only the lightweight type_params
+    // (short names like "T") instead of the entire FuncSigInfo, to release the
+    // sema_result borrow before the mutable borrow in infer_type_args.
+    let type_params: Box<[Box<str>]> = match sema_result.get_func_sig(method) {
+        Some(s) if !s.type_params.is_empty() => s.type_params.clone(),
         Some(_) => return,
         None => return,
     };
@@ -594,7 +599,7 @@ fn process_method_call<'a>(
         method,
         arguments,
         type_args_hint,
-        &sig,
+        &type_params,
         ast,
         func_decls,
         func_arenas,
@@ -1021,7 +1026,7 @@ pub fn collect_monomorph_instances<'a>(
                             &format!("failed to resolve return type of {}", name),
                             0, 0,
                         ));
-                        arena.make(crate::types::Ty::Unknown)
+                        arena.make(crate::types::Type::Unknown)
                     });
 
                     let instance = MonomorphInstance {
@@ -1035,7 +1040,13 @@ pub fn collect_monomorph_instances<'a>(
                         expr_types: FxHashMap::default(),
                         field_accesses: FxHashMap::default(),
                     };
+                    let mono_idx = instance.instance_id;
                     sema_result.monomorph_instances.push(instance);
+                    // Record module ownership for incremental purge (monomorph index).
+                    sema_result.module_ownership.monomorph_indices
+                        .entry(module.name.to_string())
+                        .or_default()
+                        .insert(mono_idx);
 
                     // Non-generic function: walk the function body to collect
                     // generic call sites.
@@ -1240,13 +1251,13 @@ pub fn collect_trait_default_instances<'a>(
             let impl_entries: Vec<(u16, String)> = sema_result
                 .witness_table
                 .entries()
-                .iter()
                 .filter(|e| e.trait_name.as_ref() == *name)
                 .filter_map(|e| {
-                    // type_id → type_name (reverse-lookup in type_defs).
-                    sema_result.type_defs.iter().enumerate()
-                        .find(|(i, _)| crate::types::dynamic_type_id(*i as u16) == e.type_id)
-                        .map(|(_, td)| (e.type_id, td.name.to_string()))
+                    // type_id → type_name (O(1) reverse-lookup via
+                    // type_id_to_name index, replacing the former O(n) linear
+                    // scan over type_defs).
+                    sema_result.type_id_to_name.get(&e.type_id)
+                        .map(|name| (e.type_id, name.to_string()))
                 })
                 .collect();
 

@@ -1,18 +1,19 @@
-// TcpListener.kz — TCP 监听器
+// TcpListener.kz — TCP listener
 //
-// 设计文档 §6.3：TcpListener newtype + accept/close。
-// 所有 IO 操作为 async，返回 Async<Throw<T, IOError>>。
+// Design doc §6.3: TcpListener newtype + accept/close.
+// All IO operations are async, return Async<Throw<T, IOError>>.
 //
-// 底层 @extern("C") 原语（__net_tcp_listen_v4 / __net_tcp_close_raw）
-// 由 builtin/net/Raw.kz 声明。__net_tcp_listen 为 Kuzo wrapper。
-// __net_tcp_close 由 TcpStream.kz 定义（TCP/UDP 共用）。
-// async 函数体当前直接调用同步原语，等 IR/Engine 异步模型就绪后再补 spawn 语义。
+// Underlying @extern("C") primitives (__net_tcp_listen_v4 / __net_tcp_close_raw)
+// are declared in builtin/net/Raw.kz. __net_tcp_listen is a Kuzo wrapper.
+// __net_tcp_close is defined in TcpStream.kz (shared by TCP/UDP).
+// async function bodies currently call synchronous primitives directly; spawn semantics
+// will be added once the IR/Engine async model is ready.
 //
-// AcceptResult 布局（与 syscall/net.zig makeRecordWithNames 对齐）：
+// AcceptResult layout (aligned with syscall/net.zig makeRecordWithNames):
 //   fields = [__tag=0, stream_fd=i64, peer_addr=SocketAddr]
-// accept 成功后，stream_fd 可用于构造 TcpStream（见 TcpStream.from_accept_fd）。
+// After accept succeeds, stream_fd can be used to construct a TcpStream (see TcpStream.from_accept_fd).
 
-// ─── Kuzo wrapper：@extern("C") 原始返回值 → Throw ──────────────
+// ─── Kuzo wrapper: @extern("C") raw return value → Throw ──────────────
 
 // __net_tcp_listen(ip: IpAddr, port: u16, reuse_addr: bool): Throw<i64, IOError>
 fun __net_tcp_listen(ip: IpAddr, port: u16, reuse_addr: bool): Throw<i64, IOError> {
@@ -34,49 +35,51 @@ fun __net_tcp_listen(ip: IpAddr, port: u16, reuse_addr: bool): Throw<i64, IOErro
     }
 }
 
-// ─── 类型定义 ──────────────────────────────────────────────────────
+// ─── Type definitions ──────────────────────────────────────────────────────
 
-// AcceptResult：newtype，fields = [__tag=0, stream_fd=i64, peer_addr=SocketAddr]
+// AcceptResult: newtype, fields = [__tag=0, stream_fd=i64, peer_addr=SocketAddr]
 pub type AcceptResult = AcceptResult(stream_fd: i64, peer_addr: SocketAddr)
 
-// TcpListener：newtype，fd 跨平台 i64 存储句柄
+// TcpListener: newtype, fd is cross-platform i64 storage handle
 pub type TcpListener = TcpListener(fd: i64, local_addr: SocketAddr, is_closed: bool) {
-    // 返回监听地址（构造时传入的本地地址）
-    pub fun local_addr(self): SocketAddr {
-        self.local_addr
+    // Returns the listen address (local address passed in at construction)
+    pub fun local_addr(): SocketAddr {
+        local_addr
     }
 
-    // 接受一个 TCP 连接。
-    // 当前直接调用同步 C 原语，等 IR/Engine 异步模型就绪后改为 spawn + channel 模式。
-    // 返回 AcceptResult(stream_fd, peer_addr)。
-    // 注意：__net_tcp_accept 当前不返回 peer_addr，需要额外调用获取对端地址。
-    // 暂用 local_addr 作为占位，后续 syscall 层补 getpeername。
-    pub async fun accept(self): Async<Throw<AcceptResult, IOError>> {
-        if self.is_closed {
+    // Accepts a TCP connection.
+    // Currently calls synchronous C primitive directly; will switch to spawn + channel
+    // mode once the IR/Engine async model is ready.
+    // Returns AcceptResult(stream_fd, peer_addr).
+    // Note: __net_tcp_accept currently does not return peer_addr; an extra call is needed
+    // to get the peer address.
+    // Temporarily uses local_addr as a placeholder; the syscall layer will add getpeername later.
+    pub async fun accept(): Async<Throw<AcceptResult, IOError>> {
+        if is_closed {
             throw IOError(InvalidInput, "listener closed", 0, null)
         }
-        val client_fd = __net_tcp_accept(self.fd)
+        val client_fd = __net_tcp_accept(fd)
         if client_fd < 0 {
             throw IOError(ConnectionRefused, "tcp accept failed", 0, null)
         }
-        Ok(AcceptResult(client_fd, self.local_addr))
+        Ok(AcceptResult(client_fd, local_addr))
     }
 
-    // 关闭监听器。幂等：重复 close 不报错。
-    pub async fun close(self): Async<Throw<void, IOError>> {
-        if self.is_closed {
+    // Closes the listener. Idempotent: repeated close does not error.
+    pub async fun close(): Async<Throw<void, IOError>> {
+        if is_closed {
             Ok(void)
         } else {
-            self.is_closed = true
-            __net_tcp_close(self.fd)?
+            is_closed = true
+            __net_tcp_close(fd)?
             Ok(void)
         }
     }
 }
 
-// ─── 顶层 async 函数（"静态方法"语义） ───────────────────────────
+// ─── Top-level async functions ("static method" semantics) ───────────────────────────
 
-// 绑定并监听 TCP 地址。reuse_addr 控制 SO_REUSEADDR。
+// Binds and listens on a TCP address. reuse_addr controls SO_REUSEADDR.
 pub async fun bind(addr: SocketAddr, reuse_addr: bool): Async<Throw<TcpListener, IOError>> {
     val fd = __net_tcp_listen(addr.ip, addr.port, reuse_addr)?
     Ok(TcpListener(fd, addr, false))

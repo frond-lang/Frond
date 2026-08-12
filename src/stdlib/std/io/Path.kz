@@ -1,57 +1,57 @@
-// Path.kz — 跨平台路径抽象（纯 Kuzo 实现，无 syscall 依赖）
+// Path.kz — Cross-platform path abstraction (pure Kuzo implementation, no syscall dependency)
 //
-// 设计文档 §4.4：Path newtype + 路径操作
-// Path 内部存储 segments（已规范化的非空段列表）+ is_absolute 标志
+// Design doc §4.4: Path newtype + path operations
+// Path internally stores segments (normalized non-empty segment list) + is_absolute flag
 //
-// Phase 2 重构：完全去除 __path_* syscall 依赖
-// - 分隔符规范化：'\' → '/'，去除冗余 '.'
-// - 路径切分：按 '/' 拆分并过滤空段与当前目录标记
-// - 绝对性：检测首字符是否为 '/'
-// - 路径拼接：segments 数组拼接 + 绝对性继承
+// Phase 2 refactor: completely remove __path_* syscall dependency
+// - Separator normalization: '\' → '/', remove redundant '.'
+// - Path splitting: split by '/' and filter empty segments and current directory markers
+// - Absoluteness: detect whether the first character is '/'
+// - Path join: segments array concatenation + absoluteness inheritance
 
 pub type Path = Path(segments: str[], is_absolute: bool) {
-    // ─── 转换 ──────────────────────────────────────────────────────────
+    // ─── Conversion ─────────────────────────────────────────────────
 
-    pub fun to_str(self): str {
-        join_segments_to_str(self.segments, self.is_absolute)
+    pub fun to_str(): str {
+        join_segments_to_str(segments, is_absolute)
     }
 
-    // ─── 拼接 ──────────────────────────────────────────────────────────
+    // ─── Join ───────────────────────────────────────────────────────
 
-    pub fun join(self, other: Path): Path {
-        Path(self.segments ++ other.segments, self.is_absolute)
+    pub fun join(other: Path): Path {
+        Path(segments ++ other.segments, is_absolute)
     }
 
-    pub fun join_str(self, other: str): Path {
-        self.join(path_from(other))
+    pub fun join_str(other: str): Path {
+        join(path_from(other))
     }
 
-    // ─── 路径分解 ──────────────────────────────────────────────────────
+    // ─── Path decomposition ─────────────────────────────────────────
 
-    // 父目录：去掉最后一段。根路径或空 segments 返回 null
-    pub fun parent(self): Path? {
-        val len = self.segments.len()
+    // Parent directory: remove the last segment. Root path or empty segments return null
+    pub fun parent(): Path? {
+        val len = segments.len()
         if len == 0 {
             null
         } else {
-            val parent_segs = self.segments[0..len - 1]
-            Path(parent_segs, self.is_absolute)
+            val parent_segs = segments[0..len - 1]
+            Path(parent_segs, is_absolute)
         }
     }
 
-    // 末尾段（文件名）。空 segments 返回 null
-    pub fun filename(self): str? {
-        val len = self.segments.len()
+    // Trailing segment (filename). Empty segments return null
+    pub fun filename(): str? {
+        val len = segments.len()
         if len == 0 {
             null
         } else {
-            self.segments[len - 1]
+            segments[len - 1]
         }
     }
 
-    // 扩展名（不含点）。无点或点在首位返回 null
-    pub fun extension(self): str? {
-        val fname = self.filename()
+    // Extension (without dot). No dot or dot at first position returns null
+    pub fun extension(): str? {
+        val fname = filename()
         match fname {
             null => null,
             name => {
@@ -66,9 +66,9 @@ pub type Path = Path(segments: str[], is_absolute: bool) {
         }
     }
 
-    // 文件名（去扩展名）。无点返回完整 filename
-    pub fun file_stem(self): str? {
-        match self.filename() {
+    // Filename (without extension). No dot returns full filename
+    pub fun file_stem(): str? {
+        match filename() {
             null => null,
             name => {
                 val dot = last_index_of(name, '.')
@@ -82,23 +82,23 @@ pub type Path = Path(segments: str[], is_absolute: bool) {
         }
     }
 
-    // ─── 查询 ──────────────────────────────────────────────────────────
+    // ─── Query ─────────────────────────────────────────────────────────
 
-    pub fun is_absolute_path(self): bool { self.is_absolute }
+    pub fun is_absolute_path(): bool { is_absolute }
 
-    pub fun is_relative_path(self): bool { !self.is_absolute }
+    pub fun is_relative_path(): bool { !is_absolute }
 }
 
-// ─── 辅助函数 ─────────────────────────────────────────────────────
+// ─── Helper functions ────────────────────────────────────────────
 
-// 路径分隔符规范化：'\' → '/'
-// 不调用 syscall，纯字符串扫描替换
-// 优化：用 str 累积（走 concatInPlace amortized O(n)），避免 u8[] ++ 的 O(n²)
+// Path separator normalization: '\' → '/'
+// Does not call syscall, pure string scan and replace
+// Optimization: accumulate with str (via concatInPlace amortized O(n)), avoid O(n²) of u8[] ++
 pub fun normalize_seps(s: str): str {
     var out: str = ""
     var i: usize = 0
     var seg_start: usize = 0
-    // 按段累积：遇到反斜杠记录前段并追加 '/'，其余原样追加
+    // Accumulate by segment: on backslash record the previous segment and append '/', otherwise append as-is
     while i < s.len() {
         val c = s[i]
         if c == '\\' {
@@ -110,15 +110,15 @@ pub fun normalize_seps(s: str): str {
         }
         i = i + 1
     }
-    // 追加末尾段
+    // Append trailing segment
     if seg_start < s.len() {
         out = out + s[seg_start..s.len()]
     }
     out
 }
 
-// 按分隔符切分字符串，过滤空段和 "."（当前目录）
-// 返回非空、非 "." 的段列表
+// Split string by separator, filter empty segments and "." (current directory)
+// Return list of segments that are non-empty and not "."
 pub fun split_segments(s: str): str[] {
     var result: str[] = []
     var start: usize = 0
@@ -136,7 +136,7 @@ pub fun split_segments(s: str): str[] {
         }
         i = i + 1
     }
-    // 处理末尾段
+    // Handle trailing segment
     if start < s.len() {
         val seg = s[start..s.len()]
         if seg != "." && seg != "" {
@@ -146,26 +146,18 @@ pub fun split_segments(s: str): str[] {
     result
 }
 
-// 拼接路径段为字符串
-// abs=true 时前缀 '/'，否则无前缀
+// Join path segments into a string
+// When abs=true prefix with '/', otherwise no prefix
+// Use __str_array_join for one-shot O(n) join, avoid O(n²) of loop result = result + seg
 pub fun join_segments_to_str(segs: str[], abs: bool): str {
-    var result: str = ""
     if abs {
-        result = "/"
+        return "/" + __str_array_join(segs, "/")
     }
-    var first = true
-    for seg in segs.iter() {
-        if !first {
-            result = result + "/"
-        }
-        result = result + seg
-        first = false
-    }
-    result
+    __str_array_join(segs, "/")
 }
 
-// 从字符串查找字符的最后位置（字符索引，Unicode 标量值）
-// 未找到返回 -1
+// Find the last position of a character in a string (character index, Unicode scalar value)
+// Returns -1 if not found
 pub fun last_index_of(s: str, ch: char): i64 {
     var i: usize = s.len()
     while i > 0 {
@@ -177,9 +169,9 @@ pub fun last_index_of(s: str, ch: char): i64 {
     return -1
 }
 
-// ─── 构造 ──────────────────────────────────────────────────────────
+// ─── Construction ────────────────────────────────────────────────
 
-// 从字符串构造 Path：规范化分隔符 → 切分 → 记录绝对性
+// Construct Path from string: normalize separators → split → record absoluteness
 pub fun path_from(s: str): Path {
     val normalized = normalize_seps(s)
     val parts = split_segments(normalized)

@@ -1,12 +1,12 @@
-// Reader trait: 字节读取抽象
+// Reader trait: byte read abstraction
 //
-// 实现者提供 read 的 async IO 语义：
-// - read(&self, len) 读取最多 len 字节，返回 u8[]；空数组表示 EOF
-// - read_byte(&self) 读取单个字节，返回 u8?；null 表示 EOF
+// Implementers provide the async IO semantics of read:
+// - &read(len) reads at most len bytes, returns u8[]; empty array means EOF
+// - &read_byte() reads a single byte, returns u8?; null means EOF
 trait Reader {
-    // 核心读取方法：返回最多 len 字节，空数组 = EOF
-    async fun read(&self, len: usize): Async<Throw<u8[], IOError>>
+    // Core read method: returns at most len bytes, empty array = EOF
+    async fun &read(len: usize): Async<Throw<u8[], IOError>>
 
-    // 读取单个字节，EOF 返回 null
-    async fun read_byte(&self): Async<Throw<u8?, IOError>>
+    // Reads a single byte, returns null on EOF
+    async fun &read_byte(): Async<Throw<u8?, IOError>>
 }

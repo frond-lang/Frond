@@ -4,6 +4,7 @@
 use super::*;
 use crate::ir::Ir::*;
 use crate::ir::Ir::Frame;
+use crate::value::{Value, HeapObj, ArrayValue};
 
 /// Copies ready values from the `src` frame to the `dst` frame, skipping nodes in the
 /// `[branch_start, branch_end)` range.
@@ -26,6 +27,109 @@ fn copy_outer_ready_values(dst: &mut Frame, src: &Frame, count: usize, branch_st
             dst.value_table.refcounts[i] = 0;
         }
     }
+}
+
+/// Sets up pending_inputs + enqueues 0-input nodes for a same_function branch frame.
+/// Extracted from `Engine::prepare_same_function_frame` so the sync execution path
+/// (ir::Compute::run_defers_sync) can reuse the same logic without an Engine instance.
+pub fn prepare_same_function_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) {
+    let parent_start = frame.node_offset;
+    let parent_node_count = frame.value_table.len();
+    let sg_id = frame.subgraph_id;
+    let sg = &graph.subgraphs[sg_id.0 as usize];
+    let branch_start = sg.node_range.0 .0;
+    let branch_end = sg.node_range.1 .0;
+    let branch_param_count = sg.param_count as usize;
+
+    let nested_ranges: &[(u32, u32)] = graph.sg_nested_ranges(sg_id.0 as usize);
+    let is_nested = |gid: u32| nested_ranges.iter().any(|&(s, e)| gid >= s && gid < e);
+
+    // 1. Set pending_inputs.
+    for i in 0..parent_node_count {
+        let gid = (parent_start as usize + i) as u32;
+        let in_branch = gid >= branch_start && gid < branch_end;
+        if !in_branch || is_nested(gid) {
+            frame.pending_inputs[i] = PENDING_EXTERNAL;
+            continue;
+        }
+        let node = graph.node(gid as usize);
+        if node.kind == NodeKind::EventSource {
+            frame.pending_inputs[i] = PENDING_EXTERNAL;
+        } else if node.kind == NodeKind::Gate && graph.has_select_info(gid as usize) {
+            frame.pending_inputs[i] = 0;
+        } else {
+            let inputs = graph.inputs(node.inputs_offset, node.input_count);
+            let mut pending = 0u16;
+            for &inp in inputs {
+                let il = inp.0.wrapping_sub(parent_start) as usize;
+                if il < parent_node_count {
+                    let inp_gid = (parent_start as usize + il) as u32;
+                    let inp_in_branch = inp_gid >= branch_start && inp_gid < branch_end;
+                    if inp_in_branch && !frame.value_table.is_ready(il) {
+                        pending += 1;
+                    }
+                }
+            }
+            frame.pending_inputs[i] = pending;
+        }
+    }
+
+    // 2. Enqueue in-branch 0-input non-Param nodes.
+    for i in 0..parent_node_count {
+        let gid = (parent_start as usize + i) as u32;
+        let in_branch = gid >= branch_start && gid < branch_end;
+        if !in_branch || is_nested(gid) {
+            continue;
+        }
+        let local_in_branch = (gid - branch_start) as usize;
+        if local_in_branch < branch_param_count {
+            continue;
+        }
+        if frame.pending_inputs[i] == 0 && !frame.value_table.is_ready(i) {
+            frame.push_ready(NodeId(i as u32));
+        }
+    }
+}
+
+/// Creates a defer body frame for synchronous execution.
+/// Mirrors `Engine::init_defer_frame`: uses the parent frame's node_offset + value_table size,
+/// copies the parent's ready values, sets up pending_inputs via `prepare_same_function_frame_sync`,
+/// and wires frame-chain pointers so the defer body can read/write the parent function's locals.
+pub fn prepare_defer_frame_sync(
+    parent_frame: &Frame,
+    body_subgraph: SubGraphId,
+    graph: &DataFlowGraph,
+) -> Frame {
+    let parent_start = parent_frame.node_offset;
+    let parent_node_count = parent_frame.value_table.len();
+    let child_sg = &graph.subgraphs[body_subgraph.0 as usize];
+    let (branch_start, branch_end) = child_sg.node_range;
+
+    let mut frame = Frame::new(
+        FrameId(u32::MAX),
+        body_subgraph,
+        parent_node_count,
+        parent_frame.graph.clone(),
+    );
+    frame.node_offset = parent_start;
+
+    // Copy the parent frame's ready values (skipping nodes inside the defer body range).
+    copy_outer_ready_values(&mut frame, parent_frame, parent_node_count, branch_start.0, branch_end.0);
+
+    // Set pending_inputs + prefill Const + enqueue 0-input nodes.
+    prepare_same_function_frame_sync(&mut frame, graph);
+
+    // Frame-chain pointers: the defer body accesses outer variables through the frame chain.
+    let parent_ptr = parent_frame as *const Frame as *mut Frame;
+    let parent_root = if !parent_frame.root_frame_ptr.is_null() {
+        parent_frame.root_frame_ptr
+    } else {
+        parent_ptr
+    };
+    frame.parent_frame_ptr = parent_ptr;
+    frame.root_frame_ptr = parent_root;
+
+    frame
 }
 
 // =========================================================================
@@ -92,14 +196,35 @@ impl<S: LockStrategy> Engine<S> {
         // else: pool full, frame_box drops
     }
 
-    /// Initializes a frame: allocation + prefill. Returns the FrameId (the frame is already
-    /// inserted into `frames`).
-    pub(super) fn init_frame(&self, subgraph_id: SubGraphId) -> FrameId {
+    /// Initializes the entry frame (main function) with default argument injection.
+    ///
+    /// The base frame allocation leaves Param nodes unset (expecting the caller to inject
+    /// them via `start_subgraph`). But main has no caller — its Param slots are never
+    /// filled, so accessing them (e.g. `args.len()`) reads uninitialised memory and
+    /// crashes silently.
+    ///
+    /// This method injects a default value (empty array) into each Param slot so that
+    /// `main(args: str[])` receives a valid empty array when no CLI args are provided.
+    pub(super) fn init_entry_frame(&self, subgraph_id: SubGraphId) -> FrameId {
         let (node_start, node_end) = self.graph.subgraphs[subgraph_id.0 as usize].node_range;
         let node_count = (node_end.0 - node_start.0) as usize;
         let fid = self.alloc_frame_id();
         let mut frame = self.acquire_frame(fid, subgraph_id, node_count);
         self.prepare_frame(&mut frame);
+
+        // Inject default entry arguments — main has no caller to inject them.
+        let param_count = self.graph.subgraphs[subgraph_id.0 as usize].param_count as usize;
+        let offset = node_start.0 as usize;
+        for i in 0..param_count {
+            let local_id = NodeId(i as u32);
+            let global_id = NodeId((offset + i) as u32);
+            let consumer_count = self.graph.downstream_slice(offset + i).len() as u16;
+            // Default: empty array (main's `args: str[]` receives an empty array).
+            let default_arg = Value::ref_val(HeapObj::Array(ArrayValue::new(Vec::new())));
+            frame.set_value(local_id, default_arg, consumer_count);
+            notify_downstream(&mut frame, &self.graph, local_id, global_id, node_start);
+        }
+
         self.frames.lock().insert(fid, frame);
         fid
     }
@@ -107,9 +232,10 @@ impl<S: LockStrategy> Engine<S> {
     /// Initializes a defer body frame: same_function branch frame setup (Bug #52).
     ///
     /// The defer body subgraph is compiled as a same_function branch subgraph (function_id = parent
-    /// function), but `init_frame` creates the frame using the defer body's own node_range, so the
-    /// node_offset and value_table size do not match the parent function, causing WriteBack to
-    /// compute an out-of-bounds local index (`writeback target out of current frame range`).
+    /// function), but the base frame allocation creates the frame using the defer body's own
+    /// node_range, so the node_offset and value_table size do not match the parent function,
+    /// causing WriteBack to compute an out-of-bounds local index
+    /// (`writeback target out of current frame range`).
     ///
     /// This method instead creates the frame using the parent frame's node_offset and value_table
     /// size, copies the parent frame's ready values, then uses `prepare_same_function_frame` to set
@@ -145,7 +271,16 @@ impl<S: LockStrategy> Engine<S> {
         frame.parent_frame_ptr = parent_ptr;
         frame.root_frame_ptr = parent_root;
 
+        // Bug #77: set caller to the parent frame so that when this defer frame completes (in
+        // process_frame's Completed/Failed branch) the parent frame can be woken. The call_node
+        // value is unused for defer frames (defer frames are identified via `defer_frames`), so
+        // NodeId(0) is a safe placeholder.
+        frame.caller = Some((parent_frame.id, crate::ir::Ir::NodeId(0)));
+
         self.frames.lock().insert(fid, frame);
+        // Bug #77: register this frame as a defer frame so process_frame can distinguish it from
+        // ordinary child frames and route its completion to defer_waiter wakeup.
+        self.defer_frames.lock().insert(fid);
         fid
     }
 
@@ -265,71 +400,7 @@ impl<S: LockStrategy> Engine<S> {
     /// node_offset is the parent function's node_start (value table sized to the parent function)
     /// and must be left unchanged.
     fn prepare_same_function_frame(&self, frame: &mut Frame) {
-        let parent_start = frame.node_offset;
-        let parent_node_count = frame.value_table.len();
-        let sg_id = frame.subgraph_id;
-        let sg = &self.graph.subgraphs[sg_id.0 as usize];
-        let branch_start = sg.node_range.0 .0;
-        let branch_end = sg.node_range.1 .0;
-        let branch_param_count = sg.param_count as usize;
-
-        // Use the precomputed nested_ranges (filled at build time) to avoid a runtime full-graph scan.
-        let nested_ranges: &[(u32, u32)] = self.graph.sg_nested_ranges(sg_id.0 as usize);
-        let is_nested = |gid: u32| nested_ranges.iter().any(|&(s, e)| gid >= s && gid < e);
-
-        // 1. Set pending_inputs.
-        for i in 0..parent_node_count {
-            let gid = (parent_start as usize + i) as u32;
-            let in_branch = gid >= branch_start && gid < branch_end;
-            if !in_branch || is_nested(gid) {
-                frame.pending_inputs[i] = PENDING_EXTERNAL;
-                continue;
-            }
-            let node = self.graph.node(gid as usize);
-            if node.kind == NodeKind::EventSource {
-                frame.pending_inputs[i] = PENDING_EXTERNAL;
-            } else if node.kind == NodeKind::Gate
-                && self.graph.has_select_info(gid as usize)
-            {
-                frame.pending_inputs[i] = 0;
-            } else {
-                let inputs =
-                    self.graph
-                        .inputs(node.inputs_offset, node.input_count);
-                let mut pending = 0u16;
-                for &inp in inputs {
-                    let il = inp.0.wrapping_sub(parent_start) as usize;
-                    if il < parent_node_count {
-                        let inp_gid = (parent_start as usize + il) as u32;
-                        let inp_in_branch = inp_gid >= branch_start && inp_gid < branch_end;
-                        // In-branch node: count toward pending when not ready.
-                        // Outer variable (!in_branch): accessed via frame-chain penetration, not counted.
-                        if inp_in_branch && !frame.value_table.is_ready(il) {
-                            pending += 1;
-                        }
-                    }
-                    // Outside the frame range -> frame-chain penetration, not counted.
-                }
-                frame.pending_inputs[i] = pending;
-            }
-        }
-
-        // 2. Enqueue in-branch 0-input non-Param nodes (Const nodes also take this path — compute_fn
-        // returns a value).
-        for i in 0..parent_node_count {
-            let gid = (parent_start as usize + i) as u32;
-            let in_branch = gid >= branch_start && gid < branch_end;
-            if !in_branch || is_nested(gid) {
-                continue;
-            }
-            let local_in_branch = (gid - branch_start) as usize;
-            if local_in_branch < branch_param_count {
-                continue;
-            }
-            if frame.pending_inputs[i] == 0 && !frame.value_table.is_ready(i) {
-                frame.push_ready(NodeId(i as u32));
-            }
-        }
+        prepare_same_function_frame_sync(frame, &self.graph);
     }
 
     /// Recursively resets the condition dependency tree (While/Loop per-iteration reset).
@@ -367,8 +438,12 @@ impl<S: LockStrategy> Engine<S> {
         let is_nested = |gid: u32| nested_ranges.iter().any(|&(s, e)| gid >= s && gid < e);
         let is_in_sg = |gid: u32| gid >= sg_start.0 && gid < sg_end.0 && !is_nested(gid);
 
-        // DFS-collect all nodes in the cond_node dependency tree that lie inside the loop subgraph
-        // (excluding Gate nodes).
+        // DFS-collect all nodes in the cond_node dependency tree that lie inside the loop subgraph.
+        //
+        // Gate nodes (from short-circuit && / || lowering) MUST be included so that they are
+        // reset and re-evaluated on each loop iteration. Skipping them was Bug #38: the Gate's
+        // condition_input (lhs) was never reset, so the while-loop's Gate read a stale value
+        // and the loop exited after one iteration.
         let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut stack = vec![cond_node];
         let mut cond_nodes: Vec<NodeId> = Vec::new();
@@ -377,9 +452,6 @@ impl<S: LockStrategy> Engine<S> {
                 continue;
             }
             if !is_in_sg(gid.0) {
-                continue;
-            }
-            if self.graph.node(gid.0 as usize).kind == NodeKind::Gate {
                 continue;
             }
             cond_nodes.push(gid);
@@ -408,7 +480,6 @@ impl<S: LockStrategy> Engine<S> {
                 .filter(|&&inp| {
                     visited.contains(&inp.0)
                         && is_in_sg(inp.0)
-                        && self.graph.node(inp.0 as usize).kind != NodeKind::Gate
                 })
                 .count() as u16;
 

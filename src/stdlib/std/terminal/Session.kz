@@ -1,0 +1,257 @@
+// std/terminal/Session.kz — terminal session management
+//
+// Wraps raw mode lifecycle and provides unified I/O convenience methods.
+//
+// Lifecycle:
+//   val session = enter_raw_mode()
+//   defer session.exit_raw_mode()
+//
+// Input (via KeyDecoder):
+//   session.read_key()           — blocking key read, infinite wait
+//   session.read_key(timeout_ms) — blocking key read with timeout
+//   session.read_key_nonblocking() — non-blocking key read
+//
+// Output (via ANSI sequences):
+//   session.write_str(str)       — write string to terminal
+//   session.write_bytes(u8[])    — write raw bytes to terminal
+//   session.cursor_move_to(r,c)  — move cursor via ANSI
+//   session.cursor_hide()        — hide cursor
+//   session.cursor_show()        — show cursor
+//   session.clear_screen()       — clear screen and home cursor
+//   session.clear_line()         — clear current line
+//   session.set_fg_color(...)    — set foreground color
+//   session.set_bg_color(...)    — set background color
+//   session.reset_style()         — reset all styles
+//
+// TerminalError is defined in builtin/error/TerminalError.kz.
+
+import std.terminal.Key
+
+// Size: terminal dimensions (rows × columns)
+type Size = Size(
+    rows: u16,
+    cols: u16
+)
+
+// Session: terminal session, holds original state for restoration.
+type Session = Session(
+    original_state: u8[],
+    is_active: bool
+) {
+    // ── Lifecycle ──
+
+    // Exit raw mode, restore original terminal state.
+    // Safe to call multiple times; only the first call has effect.
+    pub fun &exit_raw_mode(): Throw<void, TerminalError> {
+        if !this.is_active { return Ok(void) }
+        val ret = __terminal_disable_raw_mode(this.original_state)
+        if ret < 0 {
+            throw TerminalError(RawModeFailed, "failed to disable raw mode", ret)
+        }
+        this.is_active = false
+        Ok(void)
+    }
+
+    // ── Terminal properties ──
+
+    // Query terminal size (rows, cols).
+    pub fun get_size(): Throw<Size, TerminalError> {
+        val buf: u8[] = [0u8, ..4]
+        val ret = __terminal_get_size_into(buf)
+        if ret < 0 {
+            throw TerminalError(SizeQueryFailed, "failed to get terminal size", ret)
+        }
+        val rows = cast(buf[0]).to(u16) + (cast(buf[1]).to(u16) << 8)
+        val cols = cast(buf[2]).to(u16) + (cast(buf[3]).to(u16) << 8)
+        Ok(Size(rows, cols))
+    }
+
+    // ── Output ──
+
+    // Write raw bytes to terminal output (stdout).
+    // Automatically handles partial writes and flushes.
+    pub fun write_bytes(bytes: u8[]): Throw<usize, TerminalError> {
+        val n = __terminal_write_raw_bytes(bytes, bytes.len())
+        if n < 0 {
+            throw TerminalError(WriteFailed, "failed to write to terminal", cast(n).to(i32))
+        }
+        Ok(cast(n).to(usize))
+    }
+
+    // Write a string to terminal output (convenience, calls write_bytes).
+    pub fun write_str(text: str): Throw<usize, TerminalError> {
+        this.write_bytes(text.bytes())
+    }
+
+    // ── Input ──
+
+    // Blocking key read. Waits indefinitely until a key is pressed.
+    pub fun read_key(): Key {
+        key_read_blocking()
+    }
+
+    // Blocking key read with timeout (milliseconds).
+    // Returns UnknownKey if no key pressed within timeout.
+    pub fun read_key_timeout(timeout_ms: i32): Key {
+        key_read(timeout_ms)
+    }
+
+    // Non-blocking key read. Returns UnknownKey if no key available.
+    pub fun read_key_nonblocking(): Key {
+        key_read_nonblocking()
+    }
+
+    // ── Cursor helpers ──
+
+    // Move cursor to (row, column), 1-based.
+    pub fun cursor_move_to(row: u16, column: u16): Throw<usize, TerminalError> {
+        this.write_str(cursor_move_to(row, column))
+    }
+
+    pub fun cursor_up(n: u16): Throw<usize, TerminalError> {
+        this.write_str(cursor_up(n))
+    }
+
+    pub fun cursor_down(n: u16): Throw<usize, TerminalError> {
+        this.write_str(cursor_down(n))
+    }
+
+    pub fun cursor_left(n: u16): Throw<usize, TerminalError> {
+        this.write_str(cursor_left(n))
+    }
+
+    pub fun cursor_right(n: u16): Throw<usize, TerminalError> {
+        this.write_str(cursor_right(n))
+    }
+
+    pub fun cursor_to_column(col: u16): Throw<usize, TerminalError> {
+        this.write_str(cursor_to_column(col))
+    }
+
+    pub fun cursor_hide(): Throw<usize, TerminalError> {
+        this.write_str(cursor_hide())
+    }
+
+    pub fun cursor_show(): Throw<usize, TerminalError> {
+        this.write_str(cursor_show())
+    }
+
+    pub fun cursor_save_pos(): Throw<usize, TerminalError> {
+        this.write_str(cursor_save())
+    }
+
+    pub fun cursor_restore_pos(): Throw<usize, TerminalError> {
+        this.write_str(cursor_restore())
+    }
+
+    // ── Screen / line clearing ──
+
+    pub fun clear_screen(): Throw<usize, TerminalError> {
+        this.write_str(screen_clear_and_home())
+    }
+
+    pub fun clear_entire_screen(): Throw<usize, TerminalError> {
+        this.write_str(screen_clear())
+    }
+
+    pub fun clear_line(): Throw<usize, TerminalError> {
+        this.write_str(clear_line())
+    }
+
+    pub fun clear_to_eol(): Throw<usize, TerminalError> {
+        this.write_str(clear_to_end_of_line())
+    }
+
+    pub fun clear_to_bottom(): Throw<usize, TerminalError> {
+        this.write_str(clear_to_bottom())
+    }
+
+    // ── Text style ──
+
+    pub fun set_bold(): Throw<usize, TerminalError> {
+        this.write_str(bold())
+    }
+
+    pub fun set_italic(): Throw<usize, TerminalError> {
+        this.write_str(italic())
+    }
+
+    pub fun set_underline(): Throw<usize, TerminalError> {
+        this.write_str(underline())
+    }
+
+    pub fun set_inverse(): Throw<usize, TerminalError> {
+        this.write_str(inverse())
+    }
+
+    pub fun reset_style(): Throw<usize, TerminalError> {
+        this.write_str(reset())
+    }
+
+    // ── Colors ──
+
+    pub fun set_fg(c: u16): Throw<usize, TerminalError> {
+        this.write_str("\x1b[" + cast(c).to(str) + "m")
+    }
+
+    pub fun set_bg(c: u16): Throw<usize, TerminalError> {
+        this.write_str("\x1b[" + cast(c).to(str) + "m")
+    }
+
+    pub fun set_fg_black(): Throw<usize, TerminalError> { this.write_str(fg_black()) }
+    pub fun set_fg_red(): Throw<usize, TerminalError> { this.write_str(fg_red()) }
+    pub fun set_fg_green(): Throw<usize, TerminalError> { this.write_str(fg_green()) }
+    pub fun set_fg_yellow(): Throw<usize, TerminalError> { this.write_str(fg_yellow()) }
+    pub fun set_fg_blue(): Throw<usize, TerminalError> { this.write_str(fg_blue()) }
+    pub fun set_fg_magenta(): Throw<usize, TerminalError> { this.write_str(fg_magenta()) }
+    pub fun set_fg_cyan(): Throw<usize, TerminalError> { this.write_str(fg_cyan()) }
+    pub fun set_fg_white(): Throw<usize, TerminalError> { this.write_str(fg_white()) }
+    pub fun set_fg_default(): Throw<usize, TerminalError> { this.write_str(fg_default()) }
+
+    pub fun set_bg_black(): Throw<usize, TerminalError> { this.write_str(bg_black()) }
+    pub fun set_bg_red(): Throw<usize, TerminalError> { this.write_str(bg_red()) }
+    pub fun set_bg_green(): Throw<usize, TerminalError> { this.write_str(bg_green()) }
+    pub fun set_bg_yellow(): Throw<usize, TerminalError> { this.write_str(bg_yellow()) }
+    pub fun set_bg_blue(): Throw<usize, TerminalError> { this.write_str(bg_blue()) }
+    pub fun set_bg_magenta(): Throw<usize, TerminalError> { this.write_str(bg_magenta()) }
+    pub fun set_bg_cyan(): Throw<usize, TerminalError> { this.write_str(bg_cyan()) }
+    pub fun set_bg_white(): Throw<usize, TerminalError> { this.write_str(bg_white()) }
+    pub fun set_bg_default(): Throw<usize, TerminalError> { this.write_str(bg_default()) }
+
+    // ── Scroll region ──
+
+    pub fun set_scroll_region(top: u16, bottom: u16): Throw<usize, TerminalError> {
+        this.write_str(set_scroll_region(top, bottom))
+    }
+
+    pub fun reset_scroll_region(): Throw<usize, TerminalError> {
+        this.write_str(reset_scroll_region())
+    }
+
+    // ── Alternate screen ──
+
+    pub fun enter_alt_screen(): Throw<usize, TerminalError> {
+        this.write_str(enter_alt_screen())
+    }
+
+    pub fun exit_alt_screen(): Throw<usize, TerminalError> {
+        this.write_str(exit_alt_screen())
+    }
+
+    // ── Bell ──
+
+    pub fun bell(): Throw<usize, TerminalError> {
+        this.write_str(bell())
+    }
+}
+
+// Enter raw mode: saves original terminal state and switches to raw mode.
+// Returns a Session that must have exit_raw_mode() called (use defer).
+pub fun enter_raw_mode(): Throw<Session, TerminalError> {
+    val orig_buf: u8[] = [0u8, ..256]
+    val ret = __terminal_enable_raw_mode(orig_buf)
+    if ret < 0 {
+        throw TerminalError(RawModeFailed, "failed to enable raw mode", ret)
+    }
+    Ok(Session(orig_buf, true))
+}

@@ -1,10 +1,10 @@
-// Dns.kz — DNS / 主机名解析
+// Dns.kz — DNS / hostname resolution
 //
-// 设计文档 §6.5：DNS 解析。
-// 一期：仅 IP 字面量解析（非完整 DNS），返回单元素数组或空数组。
-// DNS（HostName.lookup）为二期补全。
+// Design doc §6.5: DNS resolution.
+// Phase 1: IP literal resolution only (not full DNS), returns a single-element array or empty array.
+// DNS (HostName.lookup) will be completed in phase 2.
 
-// ─── buffer 读取辅助（local，避免跨包依赖 std.io.File） ──────────
+// ─── buffer read helpers (local, to avoid cross-package dependency on std.io.File) ──────────
 
 fun __dns_read_u32_le(buf: u8[], offset: usize): u32 {
     u32(buf[offset])
@@ -24,11 +24,11 @@ fun __dns_read_u64_le(buf: u8[], offset: usize): u64 {
         | (u64(buf[offset + 7]) << 56u64)
 }
 
-// ─── Kuzo wrapper：__net_resolve_into → Throw<IpAddr[], IOError> ──
+// ─── Kuzo wrapper: __net_resolve_into → Throw<IpAddr[], IOError> ──
 
 // __net_resolve(host: str): Throw<IpAddr[], IOError>
-// 通过 __net_resolve_into 填充 out-buffer（每条目 17 字节），然后组装 IpAddr[]
-// 缓冲区大小：16 条目上限，16 * 17 = 272 字节
+// Fills the out-buffer via __net_resolve_into (17 bytes per entry), then assembles IpAddr[]
+// Buffer size: 16 entries max, 16 * 17 = 272 bytes
 fun __net_resolve(host: str): Throw<IpAddr[], IOError> {
     val max_count: usize = 16
     var buf: u8[] = []
@@ -39,21 +39,21 @@ fun __net_resolve(host: str): Throw<IpAddr[], IOError> {
     }
     val count = __net_resolve_into(host, buf, max_count)
     if count < 0 {
-        // 解析失败：返回空数组（IP 字面量解析失败非错误）
+        // Resolution failed: return empty array (IP literal resolution failure is not an error)
         Ok([])
     } else {
-        // 解析 buffer 组装 IpAddr[]
+        // Parse buffer to assemble IpAddr[]
         var addrs: IpAddr[] = []
         var idx: usize = 0
         while idx < cast(count).to(usize) {
             val base = idx * 17
             val family = cast(buf[base + 16]).to(i32)
             if family == 4 {
-                // IPv4: 前 4 字节为 u32 地址
+                // IPv4: first 4 bytes are the u32 address
                 val bits = __dns_read_u32_le(buf, base)
                 addrs = addrs ++ [V4(Ipv4Addr(bits))]
             } else {
-                // IPv6: 前 16 字节为两个 u64（hi, lo）
+                // IPv6: first 16 bytes are two u64 (hi, lo)
                 val hi = __dns_read_u64_le(buf, base)
                 val lo = __dns_read_u64_le(buf, base + 8)
                 addrs = addrs ++ [V6(Ipv6Addr(hi, lo))]
@@ -64,10 +64,10 @@ fun __net_resolve(host: str): Throw<IpAddr[], IOError> {
     }
 }
 
-// ─── 公开 API ─────────────────────────────────────────────────────
+// ─── Public API ─────────────────────────────────────────────────────
 
-// 解析主机名为 IpAddr 数组。
-// 一期：IP 字面量（IPv4/IPv6）解析成功 → 单元素数组；失败 → 空数组（非错误）。
+// Resolves a hostname to an IpAddr array.
+// Phase 1: IP literal (IPv4/IPv6) resolution success → single-element array; failure → empty array (not an error).
 pub async fun resolve(host: str): Async<Throw<IpAddr[], IOError>> {
     __net_resolve(host)?
 }

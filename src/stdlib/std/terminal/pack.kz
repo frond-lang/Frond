@@ -1,0 +1,6 @@
+// std/terminal package declaration
+//
+// Expose terminal submodules to user code: import std.terminal.Session etc.
+pub pack Session
+pub pack Ansi
+pub pack Key

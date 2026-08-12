@@ -1,0 +1,277 @@
+// std/terminal/Key.kz — key input decoding
+//
+// Provides two layers of key handling:
+//
+// 1. KeyDecoder — pure state machine
+//    Stateless key decoder that processes bytes from any source (stdin, network, file).
+//    Feed bytes one at a time via feed(); returns a Key when a complete sequence is
+//    decoded, or null if more bytes are needed.
+//
+// 2. Blocking/non-blocking I/O convenience functions
+//    key_read_blocking(timeout_ms) → Key
+//    key_read_nonblocking() → Key
+//    These use the terminal raw-mode FFI to read bytes and feed them to a decoder.
+//
+// The Key type covers common terminal keys:
+//   - Single-byte: printable chars, Enter, Backspace, Tab
+//   - Control: Ctrl+A through Ctrl+Z (ControlKey(u8))
+//   - Escape sequences: arrows, Home/End, PageUp/Down, Delete, Insert
+//   - Function keys: F1-F4 (via ESC OP/ESC[P)
+//   - Modifier keys: Alt+char (AltKey(u8))
+//   - Special: EscapeKey (standalone ESC), UnknownKey
+
+// ─── Key type ───
+
+// Key: all decodable terminal keys.
+// ControlKey(u8): byte is the raw control code (0x01-0x1A for Ctrl+A to Ctrl+Z)
+// AltKey(u8): byte is the character after ESC (e.g., 'a' for Alt+A)
+type Key =
+    | CharacterKey(u8)     // printable ASCII (0x20-0x7E)
+    | EnterKey             // 0x0D (CR) or 0x0A (LF)
+    | BackspaceKey         // 0x7F (DEL) or 0x08 (BS)
+    | TabKey               // 0x09 (HT)
+    | EscapeKey            // standalone ESC (0x1B)
+    | ArrowUp | ArrowDown | ArrowLeft | ArrowRight
+    | HomeKey | EndKey
+    | PageUpKey | PageDownKey
+    | DeleteKey
+    | InsertKey
+    | F1Key | F2Key | F3Key | F4Key
+    | ControlKey(u8)       // Ctrl+letter (0x01-0x1A)
+    | AltKey(u8)           // Alt+letter (ESC + char)
+    | UnknownKey
+
+// ─── KeyDecoder — pure state machine ───
+
+// KeyDecoder: stateful decoder that processes bytes one at a time.
+// Decodes multi-byte escape sequences without any I/O.
+// Usage: create, then call feed(byte) repeatedly until it returns a Key.
+type KeyDecoder = KeyDecoder(
+    state: u8,          // 0=idle, 1=escape, 2=csi, 3=ss3
+    buf: u8[],          // scratch buffer for collecting sequence bytes
+    buf_pos: usize      // current write position in buf
+) {
+    // Create a new decoder in idle state.
+    pub fun new(): KeyDecoder {
+        KeyDecoder(0, [0u8, ..8], 0)
+    }
+
+    // Feed one byte to the decoder.
+    // Returns a complete Key, or null if more bytes are needed.
+    pub fun feed(byte: u8): Key {
+        // State: idle
+        if this.state == 0u8 {
+            if byte == 0x1Bu8 {
+                // ESC — might start an escape sequence
+                this.state = 1u8
+                this.buf_pos = 0
+                return UnknownKey  // need more bytes
+            }
+            // Single-byte key
+            return decode_single_byte(byte)
+        }
+
+        // State: ESC seen, waiting for next byte
+        if this.state == 1u8 {
+            if byte == 0x5Bu8 {  // '[' → CSI sequence
+                this.state = 2u8
+                this.buf_pos = 0
+                return UnknownKey
+            }
+            if byte == 0x4Fu8 {  // 'O' → SS3 sequence
+                this.state = 3u8
+                this.buf_pos = 0
+                return UnknownKey
+            }
+            // ESC + other char → Alt+char
+            this.state = 0u8
+            return AltKey(byte)
+        }
+
+        // State: CSI sequence (ESC[...)
+        if this.state == 2u8 {
+            // Check for '~' terminator (e.g., ESC[3~, ESC[5~)
+            if byte == 0x7Eu8 {
+                this.state = 0u8
+                return decode_csi_with_tilde(this.buf, this.buf_pos)
+            }
+            // Check for letter terminator (e.g., ESC[A, ESC[H)
+            if byte >= 0x41u8 && byte <= 0x7Eu8 {
+                this.state = 0u8
+                this.buf[this.buf_pos] = byte
+                this.buf_pos = this.buf_pos + 1
+                return decode_csi_no_tilde(this.buf, this.buf_pos)
+            }
+            // Accumulate parameter bytes (digits, semicolons, etc.)
+            if this.buf_pos < 8 {
+                this.buf[this.buf_pos] = byte
+                this.buf_pos = this.buf_pos + 1
+            }
+            return UnknownKey  // need more bytes or ignore
+        }
+
+        // State: SS3 sequence (ESCO...)
+        if this.state == 3u8 {
+            this.state = 0u8
+            match byte {
+                0x41u8 => return ArrowUp,      // ESC O A
+                0x42u8 => return ArrowDown,    // ESC O B
+                0x43u8 => return ArrowRight,   // ESC O C
+                0x44u8 => return ArrowLeft,    // ESC O D
+                0x48u8 => return HomeKey,      // ESC O H
+                0x46u8 => return EndKey,       // ESC O F
+                0x50u8 => return F1Key,        // ESC O P
+                0x51u8 => return F2Key,        // ESC O Q
+                0x52u8 => return F3Key,        // ESC O R
+                0x53u8 => return F4Key,        // ESC O S
+                _ => return UnknownKey
+            }
+        }
+
+        UnknownKey
+    }
+
+    // Reset decoder to idle state.
+    pub fun reset(): void {
+        this.state = 0u8
+        this.buf_pos = 0
+    }
+}
+
+// ─── High-level I/O functions ───
+
+// Read a key with optional timeout.
+// timeout_ms: max wait time in milliseconds. 0 = non-blocking (single attempt).
+// Returns Key (or UnknownKey if timeout/error).
+pub fun key_read(timeout_ms: i32): Key {
+    var dec = KeyDecoder(0, [0u8, ..8], 0)
+    val rbuf: u8[] = [0u8, ..1]
+
+    if timeout_ms <= 0 {
+        // Non-blocking: one read attempt
+        val n = __terminal_read_key_bytes(rbuf)
+        if n <= 0 { return UnknownKey }
+        val k = dec.feed(rbuf[0])
+        if k != UnknownKey { return k }
+        // Need more bytes for escape sequence — read more
+        var n2 = __terminal_read_key_bytes(rbuf)
+        while n2 > 0 {
+            val k2 = dec.feed(rbuf[0])
+            if k2 != UnknownKey { return k2 }
+            n2 = __terminal_read_key_bytes(rbuf)
+        }
+        return UnknownKey
+    }
+
+    // Blocking with timeout: poll in 100ms intervals
+    var elapsed: i32 = 0
+    var first_read = true
+    while elapsed < timeout_ms || timeout_ms < 0 {
+        val n = __terminal_read_key_bytes(rbuf)
+        if n > 0 {
+            val k = dec.feed(rbuf[0])
+            if k != UnknownKey { return k }
+            // Continue reading escape sequence bytes
+            var n2 = __terminal_read_key_bytes(rbuf)
+            while n2 > 0 {
+                val k2 = dec.feed(rbuf[0])
+                if k2 != UnknownKey { return k2 }
+                n2 = __terminal_read_key_bytes(rbuf)
+            }
+            // Sequence incomplete but no more data available — discard
+            dec.reset()
+        }
+        if !first_read {
+            elapsed = elapsed + 100
+        }
+        first_read = false
+    }
+    UnknownKey
+}
+
+// Non-blocking key read. Returns UnknownKey if no key is available.
+pub fun key_read_nonblocking(): Key {
+    key_read(0)
+}
+
+// Blocking key read. Waits indefinitely until a key is pressed.
+pub fun key_read_blocking(): Key {
+    key_read(-1)
+}
+
+// ─── Pure decode helpers ───
+
+// Decode a single non-ESC byte into a Key.
+fun decode_single_byte(b: u8): Key {
+    // Check for special keys first
+    if b == 0x0Du8 || b == 0x0Au8 {
+        return EnterKey
+    }
+    if b == 0x09u8 {
+        return TabKey
+    }
+    if b == 0x7Fu8 || b == 0x08u8 {
+        return BackspaceKey
+    }
+    // Control keys (Ctrl+A to Ctrl+Z)
+    if b >= 0x01u8 && b <= 0x1Au8 {
+        return ControlKey(b)
+    }
+    // Printable ASCII characters
+    if b >= 0x20u8 && b <= 0x7Eu8 {
+        return CharacterKey(b)
+    }
+    UnknownKey
+}
+
+// Decode CSI sequence with '~' terminator (ESC[{param}~).
+// buf contains the parameter bytes collected so far.
+fun decode_csi_with_tilde(buf: u8[], len: usize): Key {
+    if len == 0 { return UnknownKey }
+    val c = buf[0]
+    match c {
+        0x31u8 => return HomeKey,       // ESC[1~
+        0x32u8 => return InsertKey,     // ESC[2~
+        0x33u8 => return DeleteKey,     // ESC[3~
+        0x34u8 => return EndKey,        // ESC[4~
+        0x35u8 => return PageUpKey,     // ESC[5~
+        0x36u8 => return PageDownKey,   // ESC[6~
+        _ => {}
+    }
+    UnknownKey
+}
+
+// Decode CSI sequence without '~' terminator (ESC[{letter}).
+// buf contains all bytes including the letter terminator.
+fun decode_csi_no_tilde(buf: u8[], len: usize): Key {
+    if len == 0 { return UnknownKey }
+    // Last byte is the terminator letter
+    val term = buf[len - 1]
+    val last_idx = len - 1
+    match term {
+        0x41u8 => return ArrowUp,       // ESC[A or ESC[1;A
+        0x42u8 => return ArrowDown,     // ESC[B
+        0x43u8 => return ArrowRight,    // ESC[C
+        0x44u8 => return ArrowLeft,     // ESC[D
+        0x48u8 => return HomeKey,       // ESC[H
+        0x46u8 => return EndKey,        // ESC[F
+        0x50u8 => return F1Key,         // ESC[P
+        0x51u8 => return F2Key,         // ESC[Q
+        0x52u8 => return F3Key,         // ESC[R
+        0x53u8 => return F4Key,         // ESC[S
+        _ => {}
+    }
+    // Handle ESC[1;5A style (Ctrl+arrow, Shift+arrow, etc.)
+    // For now, just return the basic key — modifiers can be decoded from params
+    if last_idx == 0 {
+        val c = buf[0]
+        match c {
+            0x41u8 => return ArrowUp,
+            0x42u8 => return ArrowDown,
+            0x43u8 => return ArrowRight,
+            0x44u8 => return ArrowLeft,
+            _ => {}
+        }
+    }
+    UnknownKey
+}
