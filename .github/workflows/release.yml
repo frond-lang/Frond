@@ -1,17 +1,19 @@
 name: Release
 
 on:
-  release:
-    types: [published, released, prereleased]
+  push:
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and release (e.g. v0.1.0)'
+        required: true
 
 permissions:
   contents: write
 
 jobs:
   build:
-    if: github.event_name == 'workflow_dispatch' || github.event.action == 'published' || github.event.action == 'released' || github.event.action == 'prereleased'
-
     strategy:
       fail-fast: false
       matrix:
@@ -56,6 +58,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       # ── C/C++ toolchain setup ─────────────────────────────────────────
       - name: Install C toolchain (Linux)
@@ -121,7 +124,7 @@ jobs:
           path: |
             kuzo-${{ matrix.target }}.*
 
-  upload:
+  release:
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -130,9 +133,21 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Upload binaries to Release
+      - name: Extract tag name
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
           files: |
             artifacts/*
