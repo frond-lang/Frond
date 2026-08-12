@@ -2078,6 +2078,382 @@ impl<'a> InferContext<'a> {
         }
     }
 
+    // ── Unified capture analysis ──
+    //
+    // Computes the capture list (outer variables referenced by a nested scope:
+    // lambda / defer / nested function) with per-capture mutability. This is the
+    // single source of truth consumed by the IR builder (replacing its own
+    // `collect_free_idents_expr` re-scan) and by the assignment-decision-tree
+    // simplification.
+    //
+    // Capture mode rules:
+    //   - `var` binding            → Reference (reads/writes reflect latest value)
+    //   - `val` binding            → Snapshot  (captures declaration-time value)
+    //   - parameter                → Snapshot  (params are immutable; no `var param`)
+    //   - `this`                   → Reference (receiver is shared; mutations via it)
+    //   - defer bodies             → ALL captures forced to Reference (defer semantics
+    //                                require reading the value at exit, not at defer-site;
+    //                                this directly resolves the Bug #49 tension where a
+    //                                `val` snapshot and defer-latest conflicted on the
+    //                                same node).
+    //
+    // The walk is scope-aware: bindings introduced *inside* the nested scope
+    // (block ValDecl/VarDecl, for-loop binders, nested lambda params, pattern
+    // binders) are excluded — only names resolved from the enclosing scope count
+    // as captures. This correctly handles nested lambdas/defers whose own
+    // captures are computed independently.
+
+    /// Collect free identifier names referenced by a nested-scope body, excluding
+    /// names bound *inside* the body. `bound` is seeded with the nested scope's
+    /// own parameter names (plus `self`-reference for named functions); the walk
+    /// adds inner bindings as it descends.
+    fn collect_free_idents_scoped(
+        &self,
+        ast: &AstArena<'_>,
+        expr: ExprId,
+        bound: &mut rustc_hash::FxHashSet<String>,
+        out: &mut rustc_hash::FxHashSet<String>,
+    ) {
+        use crate::ast::Ast;
+        let node = &ast.expr(expr).node;
+        match node {
+            Ast::Expr::Ident(name) => {
+                if !bound.contains(*name) {
+                    out.insert(name.to_string());
+                }
+            }
+            Ast::Expr::Assign { target, value } => {
+                self.collect_free_idents_scoped(ast, *target, bound, out);
+                self.collect_free_idents_scoped(ast, *value, bound, out);
+            }
+            Ast::Expr::Binary { lhs, rhs, .. } => {
+                self.collect_free_idents_scoped(ast, *lhs, bound, out);
+                self.collect_free_idents_scoped(ast, *rhs, bound, out);
+            }
+            Ast::Expr::CompoundAssign { target, value, .. } => {
+                self.collect_free_idents_scoped(ast, *target, bound, out);
+                self.collect_free_idents_scoped(ast, *value, bound, out);
+            }
+            Ast::Expr::Unary { operand, .. } => {
+                self.collect_free_idents_scoped(ast, *operand, bound, out);
+            }
+            Ast::Expr::Call { callee, args, .. } => {
+                self.collect_free_idents_scoped(ast, *callee, bound, out);
+                for &a in args {
+                    self.collect_free_idents_scoped(ast, a, bound, out);
+                }
+            }
+            Ast::Expr::MethodCall { recv, args, .. } => {
+                self.collect_free_idents_scoped(ast, *recv, bound, out);
+                for &a in args {
+                    self.collect_free_idents_scoped(ast, a, bound, out);
+                }
+            }
+            Ast::Expr::FieldAccess { recv, .. }
+            | Ast::Expr::Index { recv, .. }
+            | Ast::Expr::RefOf(recv)
+            | Ast::Expr::Deref(recv)
+            | Ast::Expr::NonNullAssert(recv)
+            | Ast::Expr::Propagate(recv) => {
+                self.collect_free_idents_scoped(ast, *recv, bound, out);
+            }
+            Ast::Expr::SafeAccess { recv, .. } => {
+                self.collect_free_idents_scoped(ast, *recv, bound, out);
+            }
+            Ast::Expr::SafeMethodCall { recv, args, .. } => {
+                self.collect_free_idents_scoped(ast, *recv, bound, out);
+                for &a in args {
+                    self.collect_free_idents_scoped(ast, a, bound, out);
+                }
+            }
+            Ast::Expr::Slice { recv, start, end, .. } => {
+                self.collect_free_idents_scoped(ast, *recv, bound, out);
+                self.collect_free_idents_scoped(ast, *start, bound, out);
+                self.collect_free_idents_scoped(ast, *end, bound, out);
+            }
+            Ast::Expr::Elvis { lhs, rhs } => {
+                self.collect_free_idents_scoped(ast, *lhs, bound, out);
+                self.collect_free_idents_scoped(ast, *rhs, bound, out);
+            }
+            Ast::Expr::If { cond, then_branch, else_branch } => {
+                self.collect_free_idents_scoped(ast, *cond, bound, out);
+                self.collect_free_idents_scoped(ast, *then_branch, bound, out);
+                if let Some(eb) = else_branch {
+                    self.collect_free_idents_scoped(ast, *eb, bound, out);
+                }
+            }
+            Ast::Expr::Block { stmts, trailing } => {
+                // Block introduces a new lexical scope: snapshot `bound`, recurse
+                // (inner ValDecl/VarDecl names are added to `bound` by the stmt
+                // walker), then restore.
+                let snapshot = bound.clone();
+                for &s in stmts {
+                    self.collect_free_idents_stmt_scoped(ast, s, bound, out);
+                }
+                if let Some(t) = trailing {
+                    self.collect_free_idents_scoped(ast, *t, bound, out);
+                }
+                *bound = snapshot;
+            }
+            Ast::Expr::Match { scrutinee, arms } => {
+                self.collect_free_idents_scoped(ast, *scrutinee, bound, out);
+                for arm in arms {
+                    let snapshot = bound.clone();
+                    self.collect_pattern_binders(ast, arm.pattern, bound);
+                    if let Some(g) = arm.guard {
+                        self.collect_free_idents_scoped(ast, g, bound, out);
+                    }
+                    self.collect_free_idents_scoped(ast, arm.body, bound, out);
+                    *bound = snapshot;
+                }
+            }
+            Ast::Expr::Lambda { params, body, .. } => {
+                // Nested lambda: its params belong to it, not to the outer scope.
+                let snapshot = bound.clone();
+                for p in params {
+                    bound.insert(p.name.to_string());
+                }
+                match body {
+                    Ast::LambdaBody::Block(b) => self.collect_free_idents_scoped(ast, *b, bound, out),
+                    Ast::LambdaBody::Expression(e) => self.collect_free_idents_scoped(ast, *e, bound, out),
+                }
+                *bound = snapshot;
+            }
+            Ast::Expr::ArrayLit { elements, fill } => {
+                for &e in elements {
+                    self.collect_free_idents_scoped(ast, e, bound, out);
+                }
+                if let Some((v, c)) = fill {
+                    self.collect_free_idents_scoped(ast, *v, bound, out);
+                    self.collect_free_idents_scoped(ast, *c, bound, out);
+                }
+            }
+            Ast::Expr::RecordLit(fields) => {
+                for f in fields {
+                    self.collect_free_idents_scoped(ast, f.value, bound, out);
+                }
+            }
+            Ast::Expr::RecordExtend { base, updates } => {
+                self.collect_free_idents_scoped(ast, *base, bound, out);
+                for f in updates {
+                    self.collect_free_idents_scoped(ast, f.value, bound, out);
+                }
+            }
+            Ast::Expr::StrInterp(parts) => {
+                for part in parts {
+                    if let Ast::InterpolationPart::Expression(e) = part {
+                        self.collect_free_idents_scoped(ast, *e, bound, out);
+                    }
+                }
+            }
+            Ast::Expr::Select(arms) => {
+                for arm in arms {
+                    match arm {
+                        Ast::SelectArm::Receive { channel_expr, binding, body } => {
+                            self.collect_free_idents_scoped(ast, *channel_expr, bound, out);
+                            // The `binding` name is local to the arm body.
+                            let snapshot = bound.clone();
+                            if let Some(b) = binding {
+                                bound.insert(b.to_string());
+                            }
+                            self.collect_free_idents_scoped(ast, *body, bound, out);
+                            *bound = snapshot;
+                        }
+                        Ast::SelectArm::Timeout { duration, body } => {
+                            self.collect_free_idents_scoped(ast, *duration, bound, out);
+                            self.collect_free_idents_scoped(ast, *body, bound, out);
+                        }
+                    }
+                }
+            }
+            Ast::Expr::Atomic(inner) | Ast::Expr::Lazy(inner) => {
+                self.collect_free_idents_scoped(ast, *inner, bound, out);
+            }
+            Ast::Expr::InlineTrait(methods) => {
+                for m in methods {
+                    if let Some(body_expr) = m.body {
+                        self.collect_free_idents_scoped(ast, body_expr, bound, out);
+                    }
+                }
+            }
+            // Literals and other leaf variants: no sub-expressions.
+            _ => {}
+        }
+    }
+
+    /// Statement-level scoped free-identifier collection (companion to
+    /// `collect_free_idents_scoped`).
+    fn collect_free_idents_stmt_scoped(
+        &self,
+        ast: &AstArena<'_>,
+        stmt: StmtId,
+        bound: &mut rustc_hash::FxHashSet<String>,
+        out: &mut rustc_hash::FxHashSet<String>,
+    ) {
+        use crate::ast::Ast;
+        let node = &ast.stmt(stmt).node;
+        match node {
+            Ast::Stmt::ValDecl { name, value, .. }
+            | Ast::Stmt::VarDecl { name, value, .. } => {
+                self.collect_free_idents_scoped(ast, *value, bound, out);
+                bound.insert(name.to_string());
+            }
+            Ast::Stmt::Expression { expr } => {
+                self.collect_free_idents_scoped(ast, *expr, bound, out);
+            }
+            Ast::Stmt::Assignment { target, value } => {
+                self.collect_free_idents_scoped(ast, *target, bound, out);
+                self.collect_free_idents_scoped(ast, *value, bound, out);
+            }
+            Ast::Stmt::FieldAssignment { object, value, .. } => {
+                self.collect_free_idents_scoped(ast, *object, bound, out);
+                self.collect_free_idents_scoped(ast, *value, bound, out);
+            }
+            Ast::Stmt::CompoundAssignment { target, value, .. } => {
+                self.collect_free_idents_scoped(ast, *target, bound, out);
+                self.collect_free_idents_scoped(ast, *value, bound, out);
+            }
+            Ast::Stmt::Return { value } => {
+                if let Some(v) = value {
+                    self.collect_free_idents_scoped(ast, *v, bound, out);
+                }
+            }
+            Ast::Stmt::Throw { expr } => {
+                self.collect_free_idents_scoped(ast, *expr, bound, out);
+            }
+            Ast::Stmt::For { name, iterable, body } => {
+                self.collect_free_idents_scoped(ast, *iterable, bound, out);
+                let snapshot = bound.clone();
+                bound.insert(name.to_string());
+                self.collect_free_idents_scoped(ast, *body, bound, out);
+                *bound = snapshot;
+            }
+            Ast::Stmt::While { condition, body } => {
+                self.collect_free_idents_scoped(ast, *condition, bound, out);
+                self.collect_free_idents_scoped(ast, *body, bound, out);
+            }
+            Ast::Stmt::Loop { body } => {
+                self.collect_free_idents_scoped(ast, *body, bound, out);
+            }
+            Ast::Stmt::Defer { expr } => {
+                self.collect_free_idents_scoped(ast, *expr, bound, out);
+            }
+            Ast::Stmt::Break | Ast::Stmt::Continue => {}
+            Ast::Stmt::LocalDecl { decl } => match decl.as_ref() {
+                Ast::Decl::FunDecl { name, params, body, .. } => {
+                    // A nested function declaration binds its own name in the
+                    // current scope. Its params belong to it. References inside
+                    // its body that resolve to the *current* scope are captures
+                    // of the current scope — record them, treating the nested
+                    // function's name + params as bound.
+                    bound.insert(name.to_string());
+                    let snapshot = bound.clone();
+                    for p in params {
+                        bound.insert(p.name.to_string());
+                    }
+                    self.collect_free_idents_scoped(ast, *body, bound, out);
+                    *bound = snapshot;
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// Add pattern-bound variable names to `bound`.
+    fn collect_pattern_binders(
+        &self,
+        ast: &AstArena<'_>,
+        pat: PatternId,
+        bound: &mut rustc_hash::FxHashSet<String>,
+    ) {
+        use crate::ast::Ast;
+        let node = &ast.pattern(pat).node;
+        match node {
+            Ast::Pattern::Variable { name } => {
+                bound.insert(name.to_string());
+            }
+            Ast::Pattern::Wildcard | Ast::Pattern::Literal(_) => {}
+            Ast::Pattern::Constructor { patterns, .. } => {
+                for &p in patterns {
+                    self.collect_pattern_binders(ast, p, bound);
+                }
+            }
+            Ast::Pattern::Record { fields } => {
+                for f in fields {
+                    self.collect_pattern_binders(ast, f.pattern, bound);
+                }
+            }
+            Ast::Pattern::OrPattern { left, right } => {
+                self.collect_pattern_binders(ast, *left, bound);
+                self.collect_pattern_binders(ast, *right, bound);
+            }
+            Ast::Pattern::Guard { pattern, .. } => {
+                self.collect_pattern_binders(ast, *pattern, bound);
+            }
+        }
+    }
+
+    /// Compute the capture list for a nested scope.
+    ///
+    /// `body_expr` is the scope's body expression; `param_names` are the scope's
+    /// own parameter names (excluded from captures); `force_reference` overrides
+    /// all captures to `Reference` mode (used for defer).
+    fn compute_captures(
+        &self,
+        ast: &AstArena<'_>,
+        body_expr: ExprId,
+        param_names: &[&str],
+        force_reference: bool,
+    ) -> Vec<crate::sema::Sema::CaptureInfo> {
+        use crate::sema::Sema::{CaptureInfo, CaptureMode};
+
+        let mut bound: rustc_hash::FxHashSet<String> = param_names.iter().map(|s| s.to_string()).collect();
+        let mut free: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+        self.collect_free_idents_scoped(ast, body_expr, &mut bound, &mut free);
+
+        // Deterministic order for stable output.
+        let mut names: Vec<String> = free.into_iter().collect();
+        names.sort();
+
+        names
+            .into_iter()
+            .map(|name| {
+                let mode = if force_reference {
+                    CaptureMode::Reference
+                } else {
+                    self.capture_mode_for(&name)
+                };
+                CaptureInfo {
+                    name: name.into_boxed_str(),
+                    decl_key: 0, // resolved by name on the IR side (lookup_var)
+                    mode,
+                }
+            })
+            .collect()
+    }
+
+    /// Decide the capture mode for a referenced variable based on its declared
+    /// mutability. `this` is always `Reference` (shared receiver). `var`
+    /// bindings are `Reference`; `val`/params/unresolved default to `Snapshot`.
+    fn capture_mode_for(&self, name: &str) -> crate::sema::Sema::CaptureMode {
+        use crate::sema::Sema::CaptureMode;
+        if name == "this" {
+            return CaptureMode::Reference;
+        }
+        // Search local_mutability for any entry with this name (the env_id
+        // component is not known here; a `var` binding will have an entry with
+        // `is_mutable == true` somewhere in the table).
+        let is_var = self
+            .local_mutability
+            .iter()
+            .any(|((_, n), mutable)| n.as_str() == name && *mutable);
+        if is_var {
+            CaptureMode::Reference
+        } else {
+            CaptureMode::Snapshot
+        }
+    }
+
     // ── infer_expr ──
 
     /// Infers the type of an expression. This is the core entry point of type checking and recursively handles all expression variants.
@@ -2430,6 +2806,32 @@ impl<'a> InferContext<'a> {
                     LambdaBody::Block(b) => self.infer_expr(*b, ast, child_env, None),
                     LambdaBody::Expression(e) => self.infer_expr(*e, ast, child_env, None),
                 };
+                // ── Unified capture analysis ──
+                // Record the capture list for this lambda scope. The IR builder
+                // consumes this (replacing its own `collect_free_idents_expr`
+                // re-scan); the per-capture mode drives by-val vs by-ref at
+                // runtime. Self-reference detection: a named nested function
+                // referencing its own name is excluded from captures.
+                {
+                    let body_expr_id = match body {
+                        LambdaBody::Block(b) => *b,
+                        LambdaBody::Expression(e) => *e,
+                    };
+                    let mut param_names: Vec<&str> = params.iter().map(|p| p.name).collect();
+                    // No name available at the Lambda expr level (named nested
+                    // functions go through `Stmt::LocalDecl`); self-upvalue is
+                    // handled there.
+                    let _ = &mut param_names;
+                    let captures = self.compute_captures(ast, body_expr_id, &param_names, false);
+                    if !captures.is_empty() || self.instantiation_ctx.is_none() {
+                        // Only record during the HM pass (instantiation mode
+                        // reuses the HM-pass capture table).
+                        if self.instantiation_ctx.is_none() {
+                            let key = module_expr_key(&self.current_module_name, expr.0 as u64);
+                            self.sema_result.put_captures(key, &self.current_module_name, captures);
+                        }
+                    }
+                }
                 let effective_body_ty = if let Some(rt) = return_type {
                     let annot_ty = self.type_from_ast(*rt, ast);
                     if let Err(e) = self.try_widen_unify(annot_ty, body_ty) {
@@ -2593,7 +2995,10 @@ impl<'a> InferContext<'a> {
                             let body_ty = self.infer_expr(*body, ast, child_env, None);
                             arm_tys.push(body_ty);
                         }
-                        crate::ast::Ast::SelectArm::Timeout { body, .. } => {
+                        crate::ast::Ast::SelectArm::Timeout { duration, body } => {
+                            // Infer the duration expression too — without this, its ExprInfo
+                            // is never written and the IR builder reports "missing ExprInfo".
+                            let _ = self.infer_expr(*duration, ast, child_env, None);
                             let body_ty = self.infer_expr(*body, ast, child_env, None);
                             arm_tys.push(body_ty);
                         }
@@ -4263,6 +4668,16 @@ impl<'a> InferContext<'a> {
             }
             Stmt::Defer { expr } => {
                 let _ = self.infer_expr(*expr, ast, env, None);
+                // Record the defer's capture list. Defer semantics require
+                // observing values at function/block exit, so ALL captures are
+                // forced to Reference mode (this directly resolves Bug #49:
+                // the `val`-snapshot vs defer-latest tension is eliminated
+                // because defer never snapshots).
+                if self.instantiation_ctx.is_none() {
+                    let captures = self.compute_captures(ast, *expr, &[], true);
+                    let key = module_expr_key(&self.current_module_name, expr.0 as u64);
+                    self.sema_result.put_captures(key, &self.current_module_name, captures);
+                }
                 None
             }
             Stmt::Throw { expr } => {
@@ -4349,6 +4764,19 @@ impl<'a> InferContext<'a> {
                 // Route through check_decl uniformly: nested function/type/trait declarations
                 // share the same processing path.
                 // LocalDecl's Box<Decl> has no span; the enclosing Stmt provides it.
+                // For nested function declarations, record the capture list (the
+                // nested function captures outer-scope variables; self-reference
+                // to its own name is excluded).
+                if let crate::ast::Ast::Decl::FunDecl { name, params, body, .. } = decl.as_ref() {
+                    if self.instantiation_ctx.is_none() {
+                        let mut param_names: Vec<&str> = params.iter().map(|p| p.name).collect();
+                        param_names.push(name); // self-reference is not a capture
+                        let captures = self.compute_captures(ast, *body, &param_names, false);
+                        let key = module_expr_key(&self.current_module_name, body.0 as u64);
+                        eprintln!("DEBUG sema LocalDecl: name={name} body={} key={key:#x} captures={:?}", body.0, captures);
+                        self.sema_result.put_captures(key, &self.current_module_name, captures);
+                    }
+                }
                 self.check_decl(decl.as_ref(), ast.stmt(stmt).span, ast, env);
                 None
             }
@@ -5337,6 +5765,12 @@ impl<'a> InferContext<'a> {
                 // Register the nested type definition into sema_result (so constructor calls are
                 // recognized during type checking).
                 ast_type_decl_to_type_def(self.arena, self.sema_result, *name, type_params, def, ast, decl_span, &self.current_module_name);
+                // Register methods into TypeDefInfo.methods (indexed by method_idx).
+                // This mirrors what `populate_module` does for top-level TypeDecls. Without this,
+                // `lookup_method_idx` cannot find local-type methods and IR dispatch returns void.
+                for method in methods.iter() {
+                    crate::sema::Sema::ast_method_to_func_sig_pub(self.arena, self.sema_result, *name, method, ast);
+                }
                 // Type parameter bindings (including kind registration): so references to the
                 // generic parameter T inside the type block can be resolved from
                 // type_binding_stack.

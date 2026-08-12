@@ -2323,6 +2323,16 @@ fn collect_free_idents_stmt(stmt_id: StmtId, arena: &AstArena, names: &mut Vec<S
 /// 2. Use collect_free_idents_expr to collect all identifiers in the lambda body
 /// 3. Exclude the lambda's own parameter names; the remaining are free variables
 /// 4. Check whether any free variable is in any layer of loop_body_vars_stack -> loop body capture escape
+///
+/// NOTE: This scan is intentionally kept separate from Sema's unified capture
+/// table (`SemaResult.captures`). The two serve different purposes:
+/// - Sema captures: per-capture mode (Snapshot/Reference) for IR codegen.
+/// - Analyzer escape: per-lambda escape classification (loop_body_capture) for
+///   function_id allocation.
+/// A future cleanup could unify them (the Analyzer could read
+/// `SemaResult.captures` instead of re-scanning), but the current duplication
+/// is harmless (both produce consistent results) and avoids coupling the
+/// Analyzer's AST-only pass to Sema's tables.
 fn scan_lambda_escapes_in_expr(
     expr_id: ExprId,
     arena: &AstArena,

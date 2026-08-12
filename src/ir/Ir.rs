@@ -2307,6 +2307,11 @@ pub struct DataFlowGraph {
     pub memo_infos: Vec<Option<MemoInfo>>,
     /// Memoization cache table runtime storage (one HashMap<u64, Value> per memoized function).
     pub memo_tables: Arc<Vec<std::sync::Mutex<rustc_hash::FxHashMap<u64, Value>>>>,
+    /// Vtable fallback dispatch: (vtable_method_idx, type_name) → SubGraphId.
+    /// When a vtable call receives a concrete record (not a TraitVal), the runtime looks up
+    /// the method subgraph by the value's type_name here, enabling static dispatch on the
+    /// concrete type without boxing into a TraitVal.
+    pub vtable_fallback_dispatch: rustc_hash::FxHashMap<(u16, Box<str>), SubGraphId>,
     /// String pool: ConstValue::Str { offset, len } references this pool.
     /// Maintained by IrBuilder as intern during build; filled from the .kzo StringPool section during load.
     pub string_pool: Arc<[u8]>,
@@ -2379,6 +2384,7 @@ impl DataFlowGraph {
             global_var_storage: Arc::new(Vec::new()),
             memo_infos: Vec::new(),
             memo_tables: Arc::new(Vec::new()),
+            vtable_fallback_dispatch: rustc_hash::FxHashMap::default(),
             string_pool: Arc::from(Vec::new()),
             mem: None,
             sg_uv_offsets: Vec::new(),

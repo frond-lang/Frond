@@ -2855,6 +2855,8 @@ pub fn compute_record_field_set(frame: &mut Frame, node: NodeId) -> Value {
     let new_value = force_input(frame, inputs[1]);
     let field_name = graph.field_set_name(node.0 as usize)
         .expect("field set node has no field name");
+    let field_name = graph.field_set_name(node.0 as usize)
+        .expect("field set node has no field name");
     let record_node_local = NodeId(inputs[0].0.wrapping_sub(frame.node_offset));
     // &self semantics: mutate the Arc's underlying HeapObj directly, so the
     // change is visible to all owners. This is critical for iterator-style
@@ -3134,7 +3136,50 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
                     _ => panic!("vtable method_idx {} is not a Closure", method_idx),
                 }
             }
-            _ => panic!("vtable call on non-trait value"),
+            Some(other) => {
+                // Concrete record/ADT passed as a trait-typed parameter: use the
+                // vtable_fallback_dispatch table to statically resolve the method subgraph
+                // by the value's type_name. This avoids requiring the caller to box the
+                // value into a TraitVal.
+                let type_name = match other {
+                    crate::value::HeapObj::Adt(a) => a.type_name.as_str(),
+                    crate::value::HeapObj::Record(r) => r.type_name.as_str(),
+                    crate::value::HeapObj::Newtype(n) => n.type_name.as_str(),
+                    _ => {
+                        return NodeResult::Value(crate::value::Value::NULL);
+                    }
+                };
+                let found = graph.vtable_fallback_dispatch.iter()
+                    .find(|((mi, tn), _)| *mi == method_idx && tn.as_ref() == type_name)
+                    .map(|(_, sg)| *sg);
+                match found {
+                    Some(sg) => {
+                        // Static dispatch: the receiver (inputs[0]) IS the `this` parameter.
+                        // Build args = [recv, ...method_args], matching the method subgraph's
+                        // param_count (which includes `this` as param 0).
+                        let sg_def = &graph.subgraphs[sg.0 as usize];
+                        let arity = sg_def.param_count as usize;
+                        let mut static_args: Vec<Value> = Vec::with_capacity(arity);
+                        // inputs[0] = receiver (this), inputs[1..] = method args
+                        for &in_node in inputs.iter().take(arity) {
+                            static_args.push(frame.get_value_by_global(in_node));
+                        }
+                        return NodeResult::Call(PendingCall {
+                            target_sg: sg,
+                            args: static_args,
+                            call_node_local,
+                            is_async: sg_def.has_suspend,
+                            closure_val: None,
+                        });
+                    }
+                    None => {
+                        return NodeResult::Value(crate::value::Value::NULL);
+                    }
+                }
+            }
+            None => {
+                return NodeResult::Value(crate::value::Value::NULL);
+            }
         };
 
         let is_async = graph.subgraphs[target_sg.0 as usize].has_suspend;
@@ -3327,8 +3372,6 @@ pub fn compute_closure_construct(frame: &mut Frame, node: NodeId) -> Value {
         .expect("closure construct node has no ClosureInfo");
     // Wrap each upvalue in a Cell so that escaping closures (cross-function
     // calls) can persist upvalue mutations via the Cell's interior mutability.
-    // same_function calls do not use the Cell (they read the latest value
-    // directly from the parent frame).
     let upvalues: Vec<Value> = inputs
         .iter()
         .map(|&in_node| frame.get_value_by_global(in_node))
@@ -3620,9 +3663,6 @@ fn run_defers_sync(frame: &mut Frame, graph: &DataFlowGraph) {
     let defer_entries: Vec<crate::ir::Ir::DeferEntry> =
         graph.subgraphs[sg_id.0 as usize].defer_table.clone();
     for entry in defer_entries.iter().rev() {
-        // Use prepare_defer_frame_sync: creates a same_function branch frame that copies
-        // the parent frame's values and wires frame-chain pointers, so the defer body can
-        // read/write the parent function's local variables (Bug #52 / Test 1 fix).
         let mut defer_frame = crate::engine::prepare_defer_frame_sync(
             frame,
             entry.body_subgraph,
@@ -3951,7 +3991,6 @@ pub fn compute_closure_call(frame: &mut Frame, node: NodeId, _ctx: &EvalContext)
         Some(HeapObj::Closure(c)) => {
             let total_params = graph.subgraphs[c.func_id as usize].param_count as usize;
             let needed = total_params.saturating_sub(c.upvalues.len());
-            // Unwrap Cell upvalues into raw values for parameter injection (Cell is used for escaped closure persistent writeback).
             let upvalues: Vec<Value> = c.upvalues.iter().map(|v| unwrap_cell(v)).collect();
             (c.func_id, upvalues, Vec::new(), needed, c.self_upvalue_idx)
         }
