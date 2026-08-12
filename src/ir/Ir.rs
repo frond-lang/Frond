@@ -689,15 +689,9 @@ impl ValueTable {
 
     /// Resets all slots to unready (heap object Arc Drop auto-decrefs).
     pub fn reset_all(&mut self) {
-        for v in self.values.iter_mut() {
-            *v = Value::NULL;
-        }
-        for r in self.ready.iter_mut() {
-            *r = 0;
-        }
-        for rc in self.refcounts.iter_mut() {
-            *rc = 0;
-        }
+        self.values.fill(Value::NULL);
+        self.ready.fill(0);
+        self.refcounts.fill(0);
     }
 }
 

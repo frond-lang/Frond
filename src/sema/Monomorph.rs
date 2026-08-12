@@ -145,7 +145,7 @@ fn infer_type_args<'a>(
     func_name: &str,
     arguments: &[ExprId],
     type_args_hint: Option<&[AstTypeRef]>,
-    sig: &FuncSigInfo,
+    type_params: &[Box<str>],
     ast: &'a AstArena<'a>,
     func_decls: &FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
     func_arenas: &FxHashMap<&'a str, &'a AstArena<'a>>,
@@ -178,8 +178,7 @@ fn infer_type_args<'a>(
         None => {
             // AST-unreachable (likely a method or built-in): create a named Adt
             // placeholder for each type parameter.
-            return sig
-                .type_params
+            return type_params
                 .iter()
                 .map(|tp| arena.make_adt((*tp).clone(), Box::new([])))
                 .collect();
@@ -210,7 +209,7 @@ fn infer_type_args<'a>(
 
     let mut name_to_handle: FxHashMap<&str, TypeHandle> = FxHashMap::default();
 
-    let is_type_param = |name: &str| sig.type_params.iter().any(|tp| tp.as_ref() == name);
+    let is_type_param = |name: &str| type_params.iter().any(|tp| tp.as_ref() == name);
 
     let param_count = fd.params.len().min(arguments.len());
 
@@ -305,8 +304,8 @@ fn infer_type_args<'a>(
 
     // Emit type_args: build a placeholder Adt from the type parameter name so
     // `resolve_type_node_resolved` can match by name.
-    let mut args = Vec::with_capacity(sig.type_params.len());
-    for tp_name in sig.type_params.iter() {
+    let mut args = Vec::with_capacity(type_params.len());
+    for tp_name in type_params.iter() {
         let h = if let Some(&h) = name_to_handle.get(tp_name.as_ref()) {
             h
         } else {
@@ -497,11 +496,11 @@ fn process_call<'a>(
         _ => return,
     };
     // Look up the function signature: skip unregistered and non-generic
-    // functions.
-    let sig_owned: Option<FuncSigInfo> = sema_result
-        .get_func_sig(func_name).cloned();
-    let sig = match sig_owned {
-        Some(s) if !s.type_params.is_empty() => s,
+    // functions. Clone only the lightweight type_params (short names like "T")
+    // instead of the entire FuncSigInfo, to release the sema_result borrow
+    // before the mutable borrow in infer_type_args.
+    let type_params: Box<[Box<str>]> = match sema_result.get_func_sig(func_name) {
+        Some(s) if !s.type_params.is_empty() => s.type_params.clone(),
         _ => return,
     };
 
@@ -520,7 +519,7 @@ fn process_call<'a>(
         func_name,
         arguments,
         type_args_hint,
-        &sig,
+        &type_params,
         ast,
         func_decls,
         func_arenas,
@@ -582,10 +581,11 @@ fn process_method_call<'a>(
     arena: &mut TypeArena,
 ) {
     // Look up `func_sig` directly by method name (covers the rare case of a
-    // same-named top-level function).
-    let sig_owned: Option<FuncSigInfo> = sema_result.get_func_sig(method).cloned();
-    let sig = match sig_owned {
-        Some(s) if !s.type_params.is_empty() => s,
+    // same-named top-level function). Clone only the lightweight type_params
+    // (short names like "T") instead of the entire FuncSigInfo, to release the
+    // sema_result borrow before the mutable borrow in infer_type_args.
+    let type_params: Box<[Box<str>]> = match sema_result.get_func_sig(method) {
+        Some(s) if !s.type_params.is_empty() => s.type_params.clone(),
         Some(_) => return,
         None => return,
     };
@@ -599,7 +599,7 @@ fn process_method_call<'a>(
         method,
         arguments,
         type_args_hint,
-        &sig,
+        &type_params,
         ast,
         func_decls,
         func_arenas,
@@ -1253,10 +1253,11 @@ pub fn collect_trait_default_instances<'a>(
                 .entries()
                 .filter(|e| e.trait_name.as_ref() == *name)
                 .filter_map(|e| {
-                    // type_id → type_name (reverse-lookup in type_defs).
-                    sema_result.type_defs.iter()
-                        .find(|(i, _)| crate::types::dynamic_type_id(**i) == e.type_id)
-                        .map(|(_, td)| (e.type_id, td.name.to_string()))
+                    // type_id → type_name (O(1) reverse-lookup via
+                    // type_id_to_name index, replacing the former O(n) linear
+                    // scan over type_defs).
+                    sema_result.type_id_to_name.get(&e.type_id)
+                        .map(|name| (e.type_id, name.to_string()))
                 })
                 .collect();
 

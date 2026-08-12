@@ -665,56 +665,11 @@ impl<'a> InferContext<'a> {
             Ty::TypeVar(idx) => {
                 subst.entry(idx).or_insert(TypeHandle(0));
             }
-            Ty::Fn(_) => {
-                let (params, return_type) = self.arena.fn_parts(resolved);
-                for &p in params.iter() {
-                    self.collect_type_vars(p, subst);
-                }
-                self.collect_type_vars(return_type, subst);
-            }
-            Ty::Record(_) => {
-                let fields = self.arena.record_fields(resolved);
-                for f in fields.iter() {
-                    self.collect_type_vars(f.ty, subst);
-                }
-            }
-            Ty::Adt(_) => {
-                let (_, type_args) = self.arena.adt_parts(resolved);
-                for &a in type_args.iter() {
-                    self.collect_type_vars(a, subst);
-                }
-            }
-            Ty::Nullable(_) => {
-                let inner = self.arena.nullable_inner(resolved);
-                self.collect_type_vars(inner, subst)
-            }
-            Ty::Ref(_) => {
-                let (inner, _) = self.arena.ref_parts(resolved);
-                self.collect_type_vars(inner, subst)
-            }
-            Ty::Generic(_) => {
-                let (_, args) = self.arena.generic_parts(resolved);
-                for &a in args.iter() {
-                    self.collect_type_vars(a, subst);
-                }
-            }
-            Ty::Array(_) => {
-                let (element_type, _) = self.arena.array_parts(resolved);
-                self.collect_type_vars(element_type, subst)
-            }
-            Ty::Throw(_) => {
-                let (value_type, error_type) = self.arena.throw_parts(resolved);
-                self.collect_type_vars(value_type, subst);
-                self.collect_type_vars(error_type, subst);
-            }
-            Ty::Trait(_) => {
-                let (_, type_args) = self.arena.trait_parts(resolved);
-                for &a in type_args.iter() {
-                    self.collect_type_vars(a, subst);
-                }
-            }
-            Ty::TraitObject(_) => {}
-            _ => {}
+            // All composite types (incl. Channel/Async/Lazy/Atomic/Sender/Receiver) delegate
+            // their child traversal to `for_each_child`, the single source of truth.
+            _ => self
+                .arena
+                .for_each_child(resolved, |c| self.collect_type_vars(c, subst)),
         }
     }
 
@@ -838,7 +793,40 @@ impl<'a> InferContext<'a> {
                 let new_inner = self.substitute_type(inner, subst);
                 self.arena.make_ref(new_inner, is_raw)
             }
-            // Scalars, Never, Unknown, Void, Null, etc. have no sub-nodes → return as-is.
+            // Single-element builtin generics — kept in lockstep with `for_each_child` so that
+            // TypeVars nested inside them are substituted (otherwise instantiate_fn_type would
+            // collect a var via collect_type_vars but fail to replace it here).
+            Ty::Channel(_) => {
+                let elem = self.arena.channel_elem(resolved);
+                let new_elem = self.substitute_type(elem, subst);
+                self.arena.make_channel(new_elem)
+            }
+            Ty::Async(_) => {
+                let value = self.arena.async_value(resolved);
+                let new_value = self.substitute_type(value, subst);
+                self.arena.make_async(new_value)
+            }
+            Ty::Lazy(_) => {
+                let value = self.arena.lazy_value(resolved);
+                let new_value = self.substitute_type(value, subst);
+                self.arena.make_lazy(new_value)
+            }
+            Ty::Atomic(_) => {
+                let elem = self.arena.atomic_elem(resolved);
+                let new_elem = self.substitute_type(elem, subst);
+                self.arena.make_atomic(new_elem)
+            }
+            Ty::Sender(_) => {
+                let elem = self.arena.sender_elem(resolved);
+                let new_elem = self.substitute_type(elem, subst);
+                self.arena.make_sender(new_elem)
+            }
+            Ty::Receiver(_) => {
+                let elem = self.arena.receiver_elem(resolved);
+                let new_elem = self.substitute_type(elem, subst);
+                self.arena.make_receiver(new_elem)
+            }
+            // Scalars, Never, Unknown, Void, Null, TraitObject, ModuleRef, Timer have no sub-nodes → return as-is.
             _ => resolved,
         }
     }
@@ -1546,49 +1534,10 @@ impl<'a> InferContext<'a> {
             }
             // Skip Fn types: instantiation is handled by instantiate_fn_type at the call site.
             Ty::Fn(_) => {}
-            Ty::Record(_) => {
-                let fields = self.arena.record_fields(resolved);
-                for f in fields.iter() {
-                    self.collect_free_vars(f.ty, free_vars);
-                }
-            }
-            Ty::Adt(_) => {
-                let (_, type_args) = self.arena.adt_parts(resolved);
-                for &a in type_args.iter() {
-                    self.collect_free_vars(a, free_vars);
-                }
-            }
-            Ty::Nullable(_) => {
-                let inner = self.arena.nullable_inner(resolved);
-                self.collect_free_vars(inner, free_vars)
-            }
-            Ty::Ref(_) => {
-                let (inner, _) = self.arena.ref_parts(resolved);
-                self.collect_free_vars(inner, free_vars)
-            }
-            Ty::Generic(_) => {
-                let (_, args) = self.arena.generic_parts(resolved);
-                for &a in args.iter() {
-                    self.collect_free_vars(a, free_vars);
-                }
-            }
-            Ty::Array(_) => {
-                let (element_type, _) = self.arena.array_parts(resolved);
-                self.collect_free_vars(element_type, free_vars)
-            }
-            Ty::Throw(_) => {
-                let (value_type, error_type) = self.arena.throw_parts(resolved);
-                self.collect_free_vars(value_type, free_vars);
-                self.collect_free_vars(error_type, free_vars);
-            }
-            Ty::Trait(_) => {
-                let (_, type_args) = self.arena.trait_parts(resolved);
-                for &a in type_args.iter() {
-                    self.collect_free_vars(a, free_vars);
-                }
-            }
-            Ty::TraitObject(_) => {}
-            _ => {}
+            // All other composite types delegate child traversal to `for_each_child`.
+            _ => self
+                .arena
+                .for_each_child(resolved, |c| self.collect_free_vars(c, free_vars)),
         }
     }
 
@@ -5937,40 +5886,17 @@ impl ConstraintSolver {
         let resolved = arena.resolve(ty);
         match arena.get(resolved) {
             Ty::TypeVar(_) => true,
-            Ty::Fn(_) => {
-                let (params, return_type) = arena.fn_parts(resolved);
-                params.iter().any(|&p| Self::resolve_has_type_var(arena, p))
-                    || Self::resolve_has_type_var(arena, return_type)
+            // Every composite type (incl. Channel/Async/Lazy/Atomic/Sender/Receiver and Record)
+            // delegates child traversal to `for_each_child`. Short-circuits on the first hit.
+            _ => {
+                let mut found = false;
+                arena.for_each_child(resolved, |c| {
+                    if !found && Self::resolve_has_type_var(arena, c) {
+                        found = true;
+                    }
+                });
+                found
             }
-            Ty::Nullable(_) => {
-                Self::resolve_has_type_var(arena, arena.nullable_inner(resolved))
-            }
-            Ty::Ref(_) => {
-                let (inner, _) = arena.ref_parts(resolved);
-                Self::resolve_has_type_var(arena, inner)
-            }
-            Ty::Adt(_) => {
-                let (_, type_args) = arena.adt_parts(resolved);
-                type_args.iter().any(|&a| Self::resolve_has_type_var(arena, a))
-            }
-            Ty::Throw(_) => {
-                let (value_type, error_type) = arena.throw_parts(resolved);
-                Self::resolve_has_type_var(arena, value_type)
-                    || Self::resolve_has_type_var(arena, error_type)
-            }
-            Ty::Generic(_) => {
-                let (_, args) = arena.generic_parts(resolved);
-                args.iter().any(|&a| Self::resolve_has_type_var(arena, a))
-            }
-            Ty::Trait(_) => {
-                let (_, type_args) = arena.trait_parts(resolved);
-                type_args.iter().any(|&a| Self::resolve_has_type_var(arena, a))
-            }
-            Ty::Array(_) => {
-                let (element_type, _) = arena.array_parts(resolved);
-                Self::resolve_has_type_var(arena, element_type)
-            }
-            _ => false,
         }
     }
 

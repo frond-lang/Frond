@@ -25,11 +25,15 @@ fn env_flag(name: &str) -> bool {
     static FLAG_GATE: OnceLock<bool> = OnceLock::new();
     static FLAG_STALL: OnceLock<bool> = OnceLock::new();
     static FLAG_WB: OnceLock<bool> = OnceLock::new();
+    static FLAG_SYNC: OnceLock<bool> = OnceLock::new();
+    static FLAG_MEMO: OnceLock<bool> = OnceLock::new();
     match name {
         "KUZO_DEBUG_CALL" => *FLAG_CALL.get_or_init(|| std::env::var("KUZO_DEBUG_CALL").is_ok()),
         "KUZO_DEBUG_GATE" => *FLAG_GATE.get_or_init(|| std::env::var("KUZO_DEBUG_GATE").is_ok()),
         "KUZO_DEBUG_STALL" => *FLAG_STALL.get_or_init(|| std::env::var("KUZO_DEBUG_STALL").is_ok()),
         "KUZO_DEBUG_WB" => *FLAG_WB.get_or_init(|| std::env::var("KUZO_DEBUG_WB").is_ok()),
+        "KUZO_DEBUG_SYNC" => *FLAG_SYNC.get_or_init(|| std::env::var("KUZO_DEBUG_SYNC").is_ok()),
+        "KUZO_DEBUG_MEMO" => *FLAG_MEMO.get_or_init(|| std::env::var("KUZO_DEBUG_MEMO").is_ok()),
         _ => std::env::var(name).is_ok(),
     }
 }
@@ -1700,17 +1704,26 @@ mod ffi_has_extern_c {
     ];
 }
 
+/// Build a cached FxHashMap from the static TABLE for O(1) dispatch.
+/// The TABLE slice is linear-scanned once to build the map; all subsequent
+/// FFI calls do a single hash lookup instead of ~70 string comparisons.
+#[cfg(has_extern_c)]
+fn ffi_dispatch_table() -> &'static rustc_hash::FxHashMap<&'static str, FfiHandler> {
+    static TABLE_MAP: OnceLock<rustc_hash::FxHashMap<&'static str, FfiHandler>> = OnceLock::new();
+    TABLE_MAP.get_or_init(|| {
+        ffi_has_extern_c::TABLE.iter().copied().collect()
+    })
+}
+
 /// compute_fn (idx 46): `@extern("C")` FFI call — has_extern_c version.
-/// Dispatches to FFI wrapper functions via a static lookup table.
+/// Dispatches to FFI wrapper functions via a cached hashmap for O(1) lookup.
 #[cfg(has_extern_c)]
 pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let fn_name = graph.ffi_call_name(node.0 as usize)
         .expect("compute_ffi_call: no ffi_call_name");
 
-    if let Some((_, handler)) = ffi_has_extern_c::TABLE.iter()
-        .find(|(name, _)| *name == fn_name)
-    {
+    if let Some(handler) = ffi_dispatch_table().get(fn_name) {
         handler(frame, inputs)
     } else {
         panic!("compute_ffi_call: unimplemented FFI function '{}'", fn_name)
@@ -1881,7 +1894,7 @@ mod ffi_no_extern_c {
         ("__cast_i8_to_i128", cast_i8_to_i128 as FfiHandler),
         ("__cast_i16_to_i128", cast_i16_to_i128 as FfiHandler),
         ("__cast_i32_to_i128", cast_i32_to_i128 as FfiHandler),
-        ("__cast_i64_to_i128", cast_i64_to_i64 as FfiHandler),
+        ("__cast_i64_to_i128", cast_i64_to_i128 as FfiHandler),
         ("__cast_u8_to_i128", cast_u8_to_i128 as FfiHandler),
         ("__cast_u16_to_i128", cast_u16_to_i128 as FfiHandler),
         ("__cast_u32_to_i128", cast_u32_to_i128 as FfiHandler),
@@ -1918,19 +1931,26 @@ mod ffi_no_extern_c {
     ];
 }
 
+/// Build a cached FxHashMap from the static TABLE for O(1) dispatch.
+#[cfg(not(has_extern_c))]
+fn ffi_dispatch_table() -> &'static rustc_hash::FxHashMap<&'static str, FfiHandler> {
+    static TABLE_MAP: OnceLock<rustc_hash::FxHashMap<&'static str, FfiHandler>> = OnceLock::new();
+    TABLE_MAP.get_or_init(|| {
+        ffi_no_extern_c::TABLE.iter().copied().collect()
+    })
+}
+
 /// compute_fn (idx 46) fallback: when `has_extern_c` is not set (no C compiler),
 /// computes the FFI functions implementable in pure Rust (casts) directly in
 /// Rust; all others return a default value.
-/// Dispatches via a static lookup table; unrecognized functions return i32(0).
+/// Dispatches via a cached hashmap for O(1) lookup; unrecognized functions return i32(0).
 #[cfg(not(has_extern_c))]
 pub fn compute_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
     read_node_inputs!(frame, node, graph, n, inputs);
     let fn_name = graph.ffi_call_name(node.0 as usize)
         .expect("compute_ffi_call: no ffi_call_name");
 
-    if let Some((_, handler)) = ffi_no_extern_c::TABLE.iter()
-        .find(|(name, _)| *name == fn_name)
-    {
+    if let Some(handler) = ffi_dispatch_table().get(fn_name) {
         handler(frame, inputs)
     } else {
         Value::i32(0)
@@ -2321,7 +2341,7 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId) -> Value {
     let param_vals: Vec<Value> = inputs[..param_count].iter()
         .map(|&inp| frame.get_value_by_global(inp))
         .collect();
-    if std::env::var("KUZO_DEBUG_MEMO").is_ok() {
+    if env_flag("KUZO_DEBUG_MEMO") {
         eprintln!("[MEMO_CHECK] table={} params={:?}", info.table_index, param_vals);
     }
     for val in &param_vals {
@@ -2334,7 +2354,7 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId) -> Value {
         let guard = table[info.table_index as usize].lock().unwrap();
         guard.get(&key).cloned()
     };
-    if std::env::var("KUZO_DEBUG_MEMO").is_ok() {
+    if env_flag("KUZO_DEBUG_MEMO") {
         eprintln!("[MEMO_CHECK] key={} hit={}", key, hit_val.is_some());
     }
     match hit_val {
@@ -2380,7 +2400,7 @@ pub fn compute_memo_store(frame: &mut Frame, node: NodeId) -> Value {
         val.hash(&mut hasher);
     }
     let key = hasher.finish();
-    if std::env::var("KUZO_DEBUG_MEMO").is_ok() {
+    if env_flag("KUZO_DEBUG_MEMO") {
         eprintln!("[MEMO_STORE] table={} key={} params={:?} result={:?}",
             info.table_index, key, param_vals, result_val);
     }
@@ -3659,7 +3679,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 if (return_local as usize) < frame.value_table.len()
                     && !frame.value_table.is_ready(return_local as usize)
                 {
-                    if std::env::var("KUZO_DEBUG_SYNC").is_ok() {
+                    if env_flag("KUZO_DEBUG_SYNC") {
                         let ns = sg.node_range.0.0;
                         let ne = sg.node_range.1.0;
                         let nc = (ne - ns) as usize;
@@ -3677,7 +3697,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                     }
                     return Value::NULL;
                 }
-                if std::env::var("KUZO_DEBUG_SYNC").is_ok() {
+                if env_flag("KUZO_DEBUG_SYNC") {
                     let rv = frame.get_value_by_global(sg.return_node);
                     eprintln!("[SYNC-RET] sg={} return_node={} (local={}) offset={} val={:?}",
                         sg.id.0, sg.return_node.0, return_local, frame.node_offset, rv);
@@ -3718,7 +3738,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
             NodeResult::Call(pending) => {
                 // Tail call: reuse the current frame.
                 if graph.tail_call_flag(graph_node_id.0 as usize) {
-                    if std::env::var("KUZO_DEBUG_CALL").is_ok() {
+                    if env_flag("KUZO_DEBUG_CALL") {
                         eprintln!("[CALL-TAIL] node={} target_sg={} (TAIL CALL)",
                             graph_node_id.0, pending.target_sg.0);
                     }
@@ -3774,7 +3794,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
 
                 // Inject the return value into the current frame.
                 let consumer_count = graph.downstream_slice(graph_node_id.0 as usize).len() as u16;
-                if std::env::var("KUZO_DEBUG_CALL").is_ok() {
+                if env_flag("KUZO_DEBUG_CALL") {
                     let csg = &graph.subgraphs[pending.target_sg.0 as usize];
                     eprintln!("[CALL] node={} target_sg={} range=[{},{}) child_result={:?} signal={:?} consumer_count={}",
                         graph_node_id.0, pending.target_sg.0, csg.node_range.0.0, csg.node_range.1.0,
@@ -3802,7 +3822,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
 
                 // LoopBody completion handling.
                 if target_loop_kind == LoopKind::LoopBody {
-                    if std::env::var("KUZO_DEBUG_CALL").is_ok() {
+                    if env_flag("KUZO_DEBUG_CALL") {
                         eprintln!("[CALL-LB] node={} target_sg={} child_signal={:?} frame.sg={} frame.loop_kind={:?}",
                             graph_node_id.0, pending.target_sg.0, child_signal,
                             frame.subgraph_id.0,

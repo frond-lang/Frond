@@ -358,6 +358,68 @@ impl TypeArena {
         }
     }
 
+    /// Visits every direct child `TypeHandle` of `ty` via `f`, in a fixed canonical order.
+    ///
+    /// This is the single source of truth for "which sub-types does a type contain":
+    /// traversal-style walkers (`collect_type_vars`, `collect_free_vars`,
+    /// `resolve_has_type_var`) delegate here so that adding a new composite variant only
+    /// requires updating this one match instead of every walker. The set of children
+    /// visited matches [`TypeArena::occurs`] / [`TypeArena::unify`] / `types_equal`.
+    ///
+    /// `TypeVar` and leaf types (scalars, `Str`/`Null`/`Void`/`Never`/`Unknown`,
+    /// `TraitObject`, `ModuleRef`, `Timer`) carry no child `TypeHandle`s and visit nothing.
+    pub fn for_each_child<F: FnMut(TypeHandle)>(&self, h: TypeHandle, mut f: F) {
+        let resolved = self.resolve(h);
+        match self.get(resolved) {
+            Ty::Fn(_) => {
+                let (params, return_type) = self.fn_parts(resolved);
+                for &p in params {
+                    f(p);
+                }
+                f(return_type);
+            }
+            Ty::Record(_) => {
+                for field in self.record_fields(resolved) {
+                    f(field.ty);
+                }
+            }
+            Ty::Adt(_) => {
+                let (_, args) = self.adt_parts(resolved);
+                for &a in args {
+                    f(a);
+                }
+            }
+            Ty::Generic(_) => {
+                let (_, args) = self.generic_parts(resolved);
+                for &a in args {
+                    f(a);
+                }
+            }
+            Ty::Trait(_) => {
+                let (_, args) = self.trait_parts(resolved);
+                for &a in args {
+                    f(a);
+                }
+            }
+            Ty::Nullable(_) => f(self.nullable_inner(resolved)),
+            Ty::Ref(_) => f(self.ref_parts(resolved).0),
+            Ty::Array(_) => f(self.array_parts(resolved).0),
+            Ty::Throw(_) => {
+                let (value_type, error_type) = self.throw_parts(resolved);
+                f(value_type);
+                f(error_type);
+            }
+            Ty::Channel(_) => f(self.channel_elem(resolved)),
+            Ty::Async(_) => f(self.async_value(resolved)),
+            Ty::Lazy(_) => f(self.lazy_value(resolved)),
+            Ty::Atomic(_) => f(self.atomic_elem(resolved)),
+            Ty::Sender(_) => f(self.sender_elem(resolved)),
+            Ty::Receiver(_) => f(self.receiver_elem(resolved)),
+            // TypeVar, scalars, Str/Null/Void/Never/Unknown, TraitObject, ModuleRef, Timer: no children.
+            _ => {}
+        }
+    }
+
     // -- Type variable construction --
 
     pub fn fresh_type_var(&mut self) -> TypeHandle {
@@ -519,6 +581,36 @@ impl TypeArena {
         }
     }
 
+    /// Resolve with path compression: flattens the TypeVar chain so subsequent
+    /// resolves are O(1). Use in mutable contexts (unify, constraint solving)
+    /// for amortized near-constant-time resolution.
+    pub fn resolve_mut(&mut self, h: TypeHandle) -> TypeHandle {
+        // First pass: find the root (immutable borrow).
+        let root = self.resolve(h);
+        if root == h {
+            return root;
+        }
+        // Second pass: compress — point each intermediate var directly at root.
+        let mut cur = h;
+        loop {
+            match self.get(cur) {
+                Ty::TypeVar(idx) => {
+                    let bound = self.type_vars[idx as usize].bound;
+                    match bound {
+                        Some(b) if b != root && b != cur => {
+                            self.type_vars[idx as usize].bound = Some(root);
+                            cur = b;
+                            continue;
+                        }
+                        _ => break,
+                    }
+                }
+                _ => break,
+            }
+        }
+        root
+    }
+
     /// Occurs check: whether type variable `var_idx` occurs within `ty` (prevents infinite types).
     pub fn occurs(&self, var_idx: u32, ty: TypeHandle) -> bool {
         let t = self.get(ty);
@@ -565,8 +657,8 @@ impl TypeArena {
 
     /// Unify two types (in-place mutation of `type_var.bound` or overwriting `never`/`unknown` slots).
     pub fn unify(&mut self, t1: TypeHandle, t2: TypeHandle) -> Result<(), UnifyError> {
-        let a = self.resolve(t1);
-        let b = self.resolve(t2);
+        let a = self.resolve_mut(t1);
+        let b = self.resolve_mut(t2);
         if a == b {
             return Ok(());
         }
@@ -649,27 +741,9 @@ impl TypeArena {
         // For fields requiring recursive unify, TypeHandle pairs are first collected into a
         // Vec to avoid borrow conflicts.
         match (a_ty, b_ty) {
-            (Ty::I8, Ty::I8)
-            | (Ty::I16, Ty::I16)
-            | (Ty::I32, Ty::I32)
-            | (Ty::I64, Ty::I64)
-            | (Ty::I128, Ty::I128)
-            | (Ty::U8, Ty::U8)
-            | (Ty::U16, Ty::U16)
-            | (Ty::U32, Ty::U32)
-            | (Ty::U64, Ty::U64)
-            | (Ty::U128, Ty::U128)
-            | (Ty::Isize, Ty::Isize)
-            | (Ty::Usize, Ty::Usize)
-            | (Ty::F16, Ty::F16)
-            | (Ty::F32, Ty::F32)
-            | (Ty::F64, Ty::F64)
-            | (Ty::F128, Ty::F128)
-            | (Ty::Bool, Ty::Bool)
-            | (Ty::Str, Ty::Str)
-            | (Ty::Char, Ty::Char)
-            | (Ty::Null, Ty::Null)
-            | (Ty::Void, Ty::Void) => Ok(()),
+            // Payload-less unit variants: `==` is sufficient (scalars + Str/Null/Void +
+            // Never/Unknown). DetailId-carrying variants are excluded by is_atomic_unit.
+            (a_ty, b_ty) if a_ty.is_atomic_unit() && a_ty == b_ty => Ok(()),
 
             (Ty::Fn(_), Ty::Fn(_)) => {
                 let (pa, ra) = self.fn_parts(a);
@@ -712,47 +786,11 @@ impl TypeArena {
                 self.unify(ia, ib)
             }
 
-            (Ty::Adt(_), Ty::Adt(_)) => {
-                let (na, ta) = self.adt_parts(a);
-                let (nb, tb) = self.adt_parts(b);
-                if na != nb || ta.len() != tb.len() {
-                    return Err(UnifyError::TypeMismatch);
-                }
-                let pairs: Vec<(TypeHandle, TypeHandle)> =
-                    ta.iter().copied().zip(tb.iter().copied()).collect();
-                for (x, y) in pairs {
-                    self.unify(x, y)?;
-                }
-                Ok(())
-            }
+            (Ty::Adt(_), Ty::Adt(_)) => self.unify_named_args(a, b, Self::adt_parts),
 
-            (Ty::Generic(_), Ty::Generic(_)) => {
-                let (na, ta) = self.generic_parts(a);
-                let (nb, tb) = self.generic_parts(b);
-                if na != nb || ta.len() != tb.len() {
-                    return Err(UnifyError::TypeMismatch);
-                }
-                let pairs: Vec<(TypeHandle, TypeHandle)> =
-                    ta.iter().copied().zip(tb.iter().copied()).collect();
-                for (x, y) in pairs {
-                    self.unify(x, y)?;
-                }
-                Ok(())
-            }
+            (Ty::Generic(_), Ty::Generic(_)) => self.unify_named_args(a, b, Self::generic_parts),
 
-            (Ty::Trait(_), Ty::Trait(_)) => {
-                let (na, ta) = self.trait_parts(a);
-                let (nb, tb) = self.trait_parts(b);
-                if na != nb || ta.len() != tb.len() {
-                    return Err(UnifyError::TypeMismatch);
-                }
-                let pairs: Vec<(TypeHandle, TypeHandle)> =
-                    ta.iter().copied().zip(tb.iter().copied()).collect();
-                for (x, y) in pairs {
-                    self.unify(x, y)?;
-                }
-                Ok(())
-            }
+            (Ty::Trait(_), Ty::Trait(_)) => self.unify_named_args(a, b, Self::trait_parts),
 
             (Ty::TraitObject(_), Ty::TraitObject(_)) => {
                 let (na, ma) = self.trait_object_parts(a);
@@ -823,6 +861,31 @@ impl TypeArena {
 
             _ => Err(UnifyError::TypeMismatch),
         }
+    }
+
+    /// Unify two named-and-arg'd types (Adt / Generic / Trait) via a shared accessor.
+    ///
+    /// `parts_fn` extracts the `(name, type_args)` pair from each side; names and arg
+    /// counts must match, then args are unified pairwise. The `pairs` vec is collected
+    /// up-front so the `&mut self` borrows in the recursive `unify` calls do not alias
+    /// the `&self` borrows held by the accessor.
+    fn unify_named_args(
+        &mut self,
+        a: TypeHandle,
+        b: TypeHandle,
+        parts_fn: impl Fn(&TypeArena, TypeHandle) -> (&str, &[TypeHandle]),
+    ) -> Result<(), UnifyError> {
+        let (na, ta) = parts_fn(self, a);
+        let (nb, tb) = parts_fn(self, b);
+        if na != nb || ta.len() != tb.len() {
+            return Err(UnifyError::TypeMismatch);
+        }
+        let pairs: Vec<(TypeHandle, TypeHandle)> =
+            ta.iter().copied().zip(tb.iter().copied()).collect();
+        for (x, y) in pairs {
+            self.unify(x, y)?;
+        }
+        Ok(())
     }
 
     /// Extract the type name (used for `ExprInfo.type_name`).

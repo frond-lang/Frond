@@ -218,6 +218,24 @@ impl Ty {
             TypeFamily::Str | TypeFamily::Null | TypeFamily::Void) || self.is_builtin_generic()
     }
 
+    /// Whether this variant is a payload-less unit for which `==` equality is
+    /// sufficient for unification (all scalars + Str + Null + Void + Never + Unknown).
+    ///
+    /// Variants carrying a `DetailId` are excluded: even when their family matches,
+    /// the structural data behind the `DetailId` must be compared via the arena.
+    #[inline]
+    pub fn is_atomic_unit(&self) -> bool {
+        matches!(self,
+            Ty::Bool | Ty::Char
+            | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128
+            | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128
+            | Ty::Isize | Ty::Usize
+            | Ty::F16 | Ty::F32 | Ty::F64 | Ty::F128
+            | Ty::Str | Ty::Null | Ty::Void
+            | Ty::Never | Ty::Unknown
+        )
+    }
+
     // -- Derived metadata (no intermediate ScalarInfo struct) --
 
     /// Bit width: scalars return `Some(bits)`; Str/Null/Void/composite/special return `None`.

@@ -90,6 +90,91 @@ impl<T: Clone> Bucket<T> {
     }
 }
 
+// =========================================================================
+// Macros for eliminating repetitive 20-arm ValueTag → bucket dispatch.
+// Adding a new scalar ValueTag only requires updating these macros.
+// =========================================================================
+
+/// Dispatches a single-argument method call to the correct bucket by ValueTag.
+/// `Null | Void | Bool` are singletons (no-op). Used by inc_ref / dec_ref.
+macro_rules! dispatch_bucket_method {
+    ($self:expr, $tag:expr, $idx:expr, $method:ident) => {
+        match $tag {
+            ValueTag::Null | ValueTag::Void | ValueTag::Bool => {}
+            ValueTag::Char => { $self.char_bucket.$method($idx); }
+            ValueTag::I8 => { $self.i8_bucket.$method($idx); }
+            ValueTag::I16 => { $self.i16_bucket.$method($idx); }
+            ValueTag::I32 => { $self.i32_bucket.$method($idx); }
+            ValueTag::I64 => { $self.i64_bucket.$method($idx); }
+            ValueTag::I128 => { $self.i128_bucket.$method($idx); }
+            ValueTag::U8 => { $self.u8_bucket.$method($idx); }
+            ValueTag::U16 => { $self.u16_bucket.$method($idx); }
+            ValueTag::U32 => { $self.u32_bucket.$method($idx); }
+            ValueTag::U64 => { $self.u64_bucket.$method($idx); }
+            ValueTag::U128 => { $self.u128_bucket.$method($idx); }
+            ValueTag::Isize => { $self.isz_bucket.$method($idx); }
+            ValueTag::Usize => { $self.usz_bucket.$method($idx); }
+            ValueTag::F16 => { $self.f16_bucket.$method($idx); }
+            ValueTag::F32 => { $self.f32_bucket.$method($idx); }
+            ValueTag::F64 => { $self.f64_bucket.$method($idx); }
+            ValueTag::F128 => { $self.f128_bucket.$method($idx); }
+            ValueTag::Ref => { $self.ref_bucket.$method($idx); }
+        }
+    };
+}
+
+/// Checks `idx < bucket.len()` for the correct bucket by ValueTag.
+/// `Null | Void | Bool` are singletons (always valid).
+macro_rules! check_bucket_len {
+    ($self:expr, $tag:expr, $idx:expr) => {
+        match $tag {
+            ValueTag::Null | ValueTag::Void | ValueTag::Bool => true,
+            ValueTag::Char => $idx < $self.char_bucket.len(),
+            ValueTag::I8 => $idx < $self.i8_bucket.len(),
+            ValueTag::I16 => $idx < $self.i16_bucket.len(),
+            ValueTag::I32 => $idx < $self.i32_bucket.len(),
+            ValueTag::I64 => $idx < $self.i64_bucket.len(),
+            ValueTag::I128 => $idx < $self.i128_bucket.len(),
+            ValueTag::U8 => $idx < $self.u8_bucket.len(),
+            ValueTag::U16 => $idx < $self.u16_bucket.len(),
+            ValueTag::U32 => $idx < $self.u32_bucket.len(),
+            ValueTag::U64 => $idx < $self.u64_bucket.len(),
+            ValueTag::U128 => $idx < $self.u128_bucket.len(),
+            ValueTag::Isize => $idx < $self.isz_bucket.len(),
+            ValueTag::Usize => $idx < $self.usz_bucket.len(),
+            ValueTag::F16 => $idx < $self.f16_bucket.len(),
+            ValueTag::F32 => $idx < $self.f32_bucket.len(),
+            ValueTag::F64 => $idx < $self.f64_bucket.len(),
+            ValueTag::F128 => $idx < $self.f128_bucket.len(),
+            ValueTag::Ref => $idx < $self.ref_bucket.len(),
+        }
+    };
+}
+
+/// Calls `.reset()` on every bucket.
+macro_rules! reset_all_buckets {
+    ($self:expr) => {
+        $self.char_bucket.reset();
+        $self.i8_bucket.reset();
+        $self.i16_bucket.reset();
+        $self.i32_bucket.reset();
+        $self.i64_bucket.reset();
+        $self.u8_bucket.reset();
+        $self.u16_bucket.reset();
+        $self.u32_bucket.reset();
+        $self.u64_bucket.reset();
+        $self.isz_bucket.reset();
+        $self.usz_bucket.reset();
+        $self.i128_bucket.reset();
+        $self.u128_bucket.reset();
+        $self.f16_bucket.reset();
+        $self.f32_bucket.reset();
+        $self.f64_bucket.reset();
+        $self.f128_bucket.reset();
+        $self.ref_bucket.reset();
+    };
+}
+
 /// Unified storage for Value: bucketed by type (SoA), each scalar type stored in independent contiguous storage.
 /// Heap objects (HeapObj) use Arc and are stored in ref_bucket.
 pub struct ValueArena {
@@ -183,27 +268,7 @@ impl ValueArena {
 
     pub(crate) fn is_valid_handle_inner(&self, h: ValueHandle) -> bool {
         let idx = h.index();
-        match h.tag() {
-            ValueTag::Null | ValueTag::Void | ValueTag::Bool => true,
-            ValueTag::Char => idx < self.char_bucket.len(),
-            ValueTag::I8 => idx < self.i8_bucket.len(),
-            ValueTag::I16 => idx < self.i16_bucket.len(),
-            ValueTag::I32 => idx < self.i32_bucket.len(),
-            ValueTag::I64 => idx < self.i64_bucket.len(),
-            ValueTag::U8 => idx < self.u8_bucket.len(),
-            ValueTag::U16 => idx < self.u16_bucket.len(),
-            ValueTag::U32 => idx < self.u32_bucket.len(),
-            ValueTag::U64 => idx < self.u64_bucket.len(),
-            ValueTag::Isize => idx < self.isz_bucket.len(),
-            ValueTag::Usize => idx < self.usz_bucket.len(),
-            ValueTag::I128 => idx < self.i128_bucket.len(),
-            ValueTag::U128 => idx < self.u128_bucket.len(),
-            ValueTag::F16 => idx < self.f16_bucket.len(),
-            ValueTag::F32 => idx < self.f32_bucket.len(),
-            ValueTag::F64 => idx < self.f64_bucket.len(),
-            ValueTag::F128 => idx < self.f128_bucket.len(),
-            ValueTag::Ref => idx < self.ref_bucket.len(),
-        }
+        check_bucket_len!(self, h.tag(), idx)
     }
 
     pub fn new() -> Self {
@@ -232,24 +297,7 @@ impl ValueArena {
     /// Resets the arena, clearing all buckets and reclaiming memory.
     /// Used for batch cleanup after reflection operations, preventing memory buildup from reflection primitive allocs with no dec_ref.
     pub fn reset(&mut self) {
-        self.char_bucket.reset();
-        self.i8_bucket.reset();
-        self.i16_bucket.reset();
-        self.i32_bucket.reset();
-        self.i64_bucket.reset();
-        self.u8_bucket.reset();
-        self.u16_bucket.reset();
-        self.u32_bucket.reset();
-        self.u64_bucket.reset();
-        self.isz_bucket.reset();
-        self.usz_bucket.reset();
-        self.i128_bucket.reset();
-        self.u128_bucket.reset();
-        self.f16_bucket.reset();
-        self.f32_bucket.reset();
-        self.f64_bucket.reset();
-        self.f128_bucket.reset();
-        self.ref_bucket.reset();
+        reset_all_buckets!(self);
     }
 
     #[inline]
@@ -498,50 +546,10 @@ impl ValueArena {
 
     // ---- Reference counting ----
     pub fn inc_ref(&mut self, h: ValueHandle) {
-        match h.tag() {
-            ValueTag::Null | ValueTag::Void | ValueTag::Bool => {}
-            ValueTag::Char => self.char_bucket.inc_ref(h.index() as u32),
-            ValueTag::I8 => self.i8_bucket.inc_ref(h.index() as u32),
-            ValueTag::I16 => self.i16_bucket.inc_ref(h.index() as u32),
-            ValueTag::I32 => self.i32_bucket.inc_ref(h.index() as u32),
-            ValueTag::I64 => self.i64_bucket.inc_ref(h.index() as u32),
-            ValueTag::I128 => self.i128_bucket.inc_ref(h.index() as u32),
-            ValueTag::U8 => self.u8_bucket.inc_ref(h.index() as u32),
-            ValueTag::U16 => self.u16_bucket.inc_ref(h.index() as u32),
-            ValueTag::U32 => self.u32_bucket.inc_ref(h.index() as u32),
-            ValueTag::U64 => self.u64_bucket.inc_ref(h.index() as u32),
-            ValueTag::U128 => self.u128_bucket.inc_ref(h.index() as u32),
-            ValueTag::Isize => self.isz_bucket.inc_ref(h.index() as u32),
-            ValueTag::Usize => self.usz_bucket.inc_ref(h.index() as u32),
-            ValueTag::F16 => self.f16_bucket.inc_ref(h.index() as u32),
-            ValueTag::F32 => self.f32_bucket.inc_ref(h.index() as u32),
-            ValueTag::F64 => self.f64_bucket.inc_ref(h.index() as u32),
-            ValueTag::F128 => self.f128_bucket.inc_ref(h.index() as u32),
-            ValueTag::Ref => self.ref_bucket.inc_ref(h.index() as u32),
-        }
+        dispatch_bucket_method!(self, h.tag(), h.index() as u32, inc_ref);
     }
     pub fn dec_ref(&mut self, h: ValueHandle) {
-        match h.tag() {
-            ValueTag::Null | ValueTag::Void | ValueTag::Bool => {}
-            ValueTag::Char => { self.char_bucket.dec_ref(h.index() as u32); }
-            ValueTag::I8 => { self.i8_bucket.dec_ref(h.index() as u32); }
-            ValueTag::I16 => { self.i16_bucket.dec_ref(h.index() as u32); }
-            ValueTag::I32 => { self.i32_bucket.dec_ref(h.index() as u32); }
-            ValueTag::I64 => { self.i64_bucket.dec_ref(h.index() as u32); }
-            ValueTag::I128 => { self.i128_bucket.dec_ref(h.index() as u32); }
-            ValueTag::U8 => { self.u8_bucket.dec_ref(h.index() as u32); }
-            ValueTag::U16 => { self.u16_bucket.dec_ref(h.index() as u32); }
-            ValueTag::U32 => { self.u32_bucket.dec_ref(h.index() as u32); }
-            ValueTag::U64 => { self.u64_bucket.dec_ref(h.index() as u32); }
-            ValueTag::U128 => { self.u128_bucket.dec_ref(h.index() as u32); }
-            ValueTag::Isize => { self.isz_bucket.dec_ref(h.index() as u32); }
-            ValueTag::Usize => { self.usz_bucket.dec_ref(h.index() as u32); }
-            ValueTag::F16 => { self.f16_bucket.dec_ref(h.index() as u32); }
-            ValueTag::F32 => { self.f32_bucket.dec_ref(h.index() as u32); }
-            ValueTag::F64 => { self.f64_bucket.dec_ref(h.index() as u32); }
-            ValueTag::F128 => { self.f128_bucket.dec_ref(h.index() as u32); }
-            ValueTag::Ref => { self.ref_bucket.dec_ref(h.index() as u32); }
-        }
+        dispatch_bucket_method!(self, h.tag(), h.index() as u32, dec_ref);
     }
 
     /// Fills the SoA fast path for an array (when elements are same-type scalars).

@@ -608,6 +608,9 @@ pub struct SemaResult {
     pub next_type_def_id: u16,
     /// Type name → index into `type_defs`.
     pub type_def_index: FxHashMap<String, u16>,
+    /// Dynamic type_id → type name (reverse index for O(1) lookup).
+    /// Updated in tandem with `type_defs` (put_type_def / purge_module).
+    pub type_id_to_name: FxHashMap<u16, Box<str>>,
     /// Trait definition table.
     pub trait_defs: FxHashMap<u16, TraitDefInfo>,
     /// u16 index allocator for `trait_defs` (never recycles).
@@ -732,6 +735,7 @@ impl SemaResult {
             type_defs: FxHashMap::default(),
             next_type_def_id: 0,
             type_def_index: FxHashMap::default(),
+            type_id_to_name: FxHashMap::default(),
             trait_defs: FxHashMap::default(),
             next_trait_def_id: 0,
             trait_def_index: FxHashMap::default(),
@@ -843,6 +847,10 @@ impl SemaResult {
             .entry(module_name.to_string())
             .or_default()
             .insert(idx);
+        // Populate the type_id → name reverse index (O(1) lookup replacing
+        // the former O(n) linear scan in collect_trait_default_instances).
+        let type_id = dynamic_type_id(idx);
+        self.type_id_to_name.insert(type_id, def.name.clone());
         self.type_defs.insert(idx, def);
         true
     }
@@ -1072,6 +1080,9 @@ impl SemaResult {
             for idx in indices {
                 if let Some(def) = self.type_defs.remove(&idx) {
                     self.type_def_index.remove(def.name.as_ref());
+                    // Remove the type_id → name reverse-index entry.
+                    let type_id = dynamic_type_id(idx);
+                    self.type_id_to_name.remove(&type_id);
                     // Remove constructor entries from ctor_def_index
                     for ctor in &def.constructors {
                         if let Some(vec) = self.ctor_def_index.get_mut(ctor.name.as_ref()) {
