@@ -428,6 +428,9 @@ compute_fn_ids! {
     320 => CF_STR_ARRAY_JOIN,
     // Array fill [value, ..count] (321): repeats value count times
     321 => CF_ARRAY_FILL,
+    // Runtime defer registration/execution (322-323): table override (new signature)
+    322 => CF_DEFER_REGISTER,
+    323 => CF_DEFER_RUN,
 }
 
 // =========================================================================
@@ -1111,7 +1114,8 @@ pub struct Frame {
     /// Suspend state (set when a call/await node suspends).
     pub suspend_state: SuspendState,
     /// Defer stack (runtime; executed LIFO on frame release).
-    pub defer_stack: Vec<DeferEntry>,
+    /// Stores dynamically-registered defers (e.g. defer-in-loop), each with captured values.
+    pub defer_stack: Vec<RuntimeDefer>,
     /// Suspend event (subgraph completion, etc.; drives frame resumption).
     pub suspend_event: Option<RuntimeEvent>,
     /// Timers already started in select (branch_idx, timer_id); Timer branches are started on first check.
@@ -1268,6 +1272,22 @@ pub struct DeferEntry {
     pub captured_inputs: Vec<NodeId>,
     /// Whether it has been registered to the frame's defer_stack (runtime marker to prevent duplicate execution).
     pub registered: bool,
+}
+
+/// Runtime defer entry: a defer body subgraph + the captured values at registration time.
+///
+/// Used by the dynamic defer mechanism (CF_DEFER_REGISTER / CF_DEFER_RUN) to support
+/// defer-in-loop: each loop iteration pushes a `RuntimeDefer` (with the current loop
+/// variable values) onto `frame.defer_stack`; the loop-exit `CF_DEFER_RUN` node drains
+/// the stack in LIFO order and executes each defer body with its captured values.
+#[derive(Debug, Clone)]
+pub struct RuntimeDefer {
+    /// defer block body subgraph (same_function branch).
+    pub body_subgraph: SubGraphId,
+    /// Captured NodeIds (global) whose values were snapshotted at registration time.
+    pub captured_nodes: Vec<NodeId>,
+    /// Captured values snapshotted at registration time (injected into defer frame slots).
+    pub captured_values: Vec<Value>,
 }
 
 // =========================================================================
@@ -1963,6 +1983,9 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         320 => super::Compute::compute_str_array_join,
         // Array fill (321): [value, ..count] — repeats value count times
         321 => super::Compute::compute_array_fill,
+        // Runtime defer (322-323): new signature, table override
+        322 => super::Compute::noop_compute_real, // compute_defer_register
+        323 => super::Compute::noop_compute_real, // compute_defer_run
     };
     // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
     // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values
@@ -1984,6 +2007,8 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
     table[313] = super::Compute::compute_continue;
     table[314] = super::Compute::compute_match_fallback;
     table[49] = super::Compute::compute_writeback;
+    table[322] = super::Compute::compute_defer_register;
+    table[323] = super::Compute::compute_defer_run;
     table
 }
 
@@ -3181,6 +3206,11 @@ pub struct LoopContext {
     pub sg: SubGraphId,
     pub iter_node: Option<NodeId>,
     pub body_node_start: u32,
+    /// For-loop's current-value param node (bound to the loop variable `name`).
+    /// Used by defer-in-loop: CF_DEFER_REGISTER captures this node's value per-iteration
+    /// so each defer body reads the iteration's `i` rather than the final value.
+    /// None for while/loop (no loop variable).
+    pub loop_var_node: Option<NodeId>,
 }
 
 // =========================================================================

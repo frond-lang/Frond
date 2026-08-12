@@ -13,7 +13,7 @@
 
 use super::Ir::*;
 use crate::value::Value;
-use crate::engine::{prepare_frame_nodes, switch_subgraph, notify_downstream};
+use crate::engine::{prepare_frame_nodes, switch_subgraph, notify_downstream, prepare_defer_frame_sync};
 use std::sync::OnceLock;
 
 /// Caches environment-variable boolean flags so hot paths do not call `std::env::var`
@@ -3612,15 +3612,14 @@ fn run_defers_sync(frame: &mut Frame, graph: &DataFlowGraph) {
     let defer_entries: Vec<crate::ir::Ir::DeferEntry> =
         graph.subgraphs[sg_id.0 as usize].defer_table.clone();
     for entry in defer_entries.iter().rev() {
-        let (dn_start, dn_end) = graph.subgraphs[entry.body_subgraph.0 as usize].node_range;
-        let dn_count = (dn_end.0 - dn_start.0) as usize;
-        let mut defer_frame = Frame::new(
-            FrameId(u32::MAX),
+        // Use prepare_defer_frame_sync: creates a same_function branch frame that copies
+        // the parent frame's values and wires frame-chain pointers, so the defer body can
+        // read/write the parent function's local variables (Bug #52 / Test 1 fix).
+        let mut defer_frame = crate::engine::prepare_defer_frame_sync(
+            frame,
             entry.body_subgraph,
-            dn_count,
-            frame.graph.clone(),
+            graph,
         );
-        prepare_frame_nodes(&mut defer_frame, graph);
         let _ = run_frame_sync(&mut defer_frame, graph);
     }
 }
@@ -4239,4 +4238,89 @@ pub fn compute_tailrec_writeback(frame: &mut Frame, node: NodeId, _ctx: &EvalCon
         NodeResult::Value(_) => NodeResult::Continue,
         other => other,
     }
+}
+
+/// compute_defer_register (idx 322): registers a defer body onto the loop frame's
+/// `defer_stack`.
+///
+/// The node's `call_target` stores the defer body subgraph; the node's inputs are the
+/// captured loop-variable NodeIds whose **current values** are snapshotted at registration
+/// time. The entry is pushed onto the **loop frame's** defer_stack (accessed via
+/// `parent_frame_ptr`), which persists across iterations (reset_loop_iteration does not
+/// clear it). The loop-exit `CF_DEFER_RUN` node (in void_sg) drains the stack in LIFO
+/// order and executes each defer body with its captured values.
+pub fn compute_defer_register(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
+    let graph = frame.graph.clone();
+    let n = graph.node(node.0 as usize);
+    let body_sg = match graph.call_target(node.0 as usize) {
+        Some(sg) => sg,
+        None => return NodeResult::Value(Value::VOID),
+    };
+    let inputs = graph.inputs(n.inputs_offset, n.input_count);
+    let captured_nodes: Vec<NodeId> = inputs.to_vec();
+    let captured_values: Vec<Value> = inputs
+        .iter()
+        .map(|&inp| frame.get_value_by_global(inp))
+        .collect();
+    let entry = RuntimeDefer {
+        body_subgraph: body_sg,
+        captured_nodes,
+        captured_values,
+    };
+    // Push to the loop frame's defer_stack (via parent_frame_ptr). The loop frame persists
+    // across iterations; reset_loop_iteration does not clear defer_stack.
+    if !frame.parent_frame_ptr.is_null() {
+        unsafe { &mut *frame.parent_frame_ptr }.defer_stack.push(entry);
+    } else {
+        frame.defer_stack.push(entry);
+    }
+    NodeResult::Value(Value::VOID)
+}
+
+/// compute_defer_run (idx 323): drains the loop frame's `defer_stack` in LIFO order
+/// and executes each defer body synchronously.
+///
+/// Runs in void_sg (the loop-exit subgraph). The defer_stack lives on the **loop frame**
+/// (accessed via `parent_frame_ptr`). Defer frames are created from the **function frame**
+/// (accessed via `root_frame_ptr`) so they read the latest outer-variable values (e.g. `log`
+/// updated by previous defers in LIFO order). Captured loop-variable values are injected
+/// into the defer frame so the defer body reads per-iteration values.
+pub fn compute_defer_run(frame: &mut Frame, _node: NodeId, _ctx: &EvalContext) -> NodeResult {
+    let graph = frame.graph.clone();
+    // Drain the loop frame's defer_stack (via parent_frame_ptr).
+    let defers: Vec<RuntimeDefer> = if !frame.parent_frame_ptr.is_null() {
+        unsafe { &mut *frame.parent_frame_ptr }.defer_stack.drain(..).collect()
+    } else {
+        frame.defer_stack.drain(..).collect()
+    };
+    if defers.is_empty() {
+        return NodeResult::Value(Value::VOID);
+    }
+    // Use the LOOP FRAME as the parent for defer body frames (not root_frame_ptr).
+    // root_frame_ptr walks to the outermost same-function frame (e.g. main), but variables
+    // like `log` are declared in the function that directly contains the loop (e.g. test2).
+    // The loop frame (parent_frame_ptr) has these variables ready (copied from its parent
+    // via start_subgraph's same_function path).
+    let loop_frame: &Frame = if !frame.parent_frame_ptr.is_null() {
+        unsafe { &*frame.parent_frame_ptr }
+    } else {
+        frame
+    };
+    for entry in defers.iter().rev() {
+        let mut defer_frame = prepare_defer_frame_sync(loop_frame, entry.body_subgraph, &graph);
+        // Inject captured values: overwrite the value-table slots of the captured NodeIds
+        // so the defer body reads the snapshotted (per-iteration) values.
+        let parent_offset = defer_frame.node_offset;
+        for (i, val) in entry.captured_values.iter().enumerate() {
+            let captured_gid = entry.captured_nodes[i];
+            let local = captured_gid.0.wrapping_sub(parent_offset);
+            if (local as usize) < defer_frame.value_table.len() {
+                let cc = graph.downstream_slice(captured_gid.0 as usize).len() as u16;
+                defer_frame.set_value(NodeId(local), val.clone(), cc);
+                defer_frame.ready_queue.retain(|n| n.0 != local);
+            }
+        }
+        let _ = run_frame_sync(&mut defer_frame, &graph);
+    }
+    NodeResult::Value(Value::VOID)
 }

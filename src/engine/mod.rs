@@ -36,6 +36,7 @@ pub use Schedule::{prepare_frame_nodes, notify_downstream, alloc_const_value};
 pub use Subgraph::switch_subgraph;
 pub use Strategy::{LockStrategy, Lockable, Single, Multi, QueueHandle};
 pub use AsyncRt::{TimerRuntime, AsyncJoinRuntime};
+pub use Frame::{prepare_defer_frame_sync, prepare_same_function_frame_sync};
 
 // Scheduler constants/helpers originate from EngineCore.rs; they are re-imported here into the
 // engine namespace so that submodules can use them by bare name after `use super::*`

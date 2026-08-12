@@ -86,6 +86,13 @@ pub struct IrBuilder<'a> {
     /// call (the function body itself). Nested blocks see `false`, so only they extract
     /// block-scoped defers — function-level defers stay in `defer_table` for function-exit execution.
     pub in_function_top_block: bool,
+    /// Whether the current `compile_block` call is inside a loop body subgraph.
+    /// Set to `true` by `compile_loop_body_subgraph`; reset to `false` by `compile_block`
+    /// (so nested blocks within the loop body see `false`). When `true`, `defer` statements
+    /// compile to `CF_DEFER_REGISTER` nodes (dynamic defer_stack registration) instead of
+    /// being registered to the static `defer_table`; the loop-exit `CF_DEFER_RUN` node drains
+    /// the stack in LIFO order, capturing per-iteration values.
+    pub in_loop_body: bool,
     /// Tail-recursion-to-iteration context: when `Some`, `compile_call` intercepts self-calls
     /// as `WriteBack + Call(while_sg)`.
     /// `None` = not compiling a tail-recursion-to-iteration body.
@@ -259,6 +266,7 @@ impl<'a> IrBuilder<'a> {
             current_effect: None,
             in_tail_position: false,
             in_function_top_block: false,
+            in_loop_body: false,
             tail_rec_ctx: None,
             non_tail_rec_ctx: None,
             current_type_args: Vec::new(),
@@ -1420,6 +1428,43 @@ impl<'a> IrBuilder<'a> {
         sg_id
     }
 
+    /// Compile a defer-run exit subgraph for loops.
+    ///
+    /// Contains a single CF_DEFER_RUN node that drains the loop frame's `defer_stack`
+    /// (accumulated by CF_DEFER_REGISTER during each iteration) in LIFO order and
+    /// executes each defer body with its captured loop-variable value.
+    /// Used as the "exit" branch (void_sg replacement) for For/While loops.
+    fn compile_defer_run_subgraph(&mut self) -> SubGraphId {
+        let inputs_offset = self.graph.inputs_pool.push(&[]);
+        let node = self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 0,
+            inputs_offset,
+            compute_fn: CF_DEFER_RUN,
+        });
+        let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
+        self.graph.add_subgraph(SubGraph {
+            id: sg_id,
+            node_range: (node, NodeId(node.0 + 1)),
+            param_count: 0,
+            entry_node: node,
+            return_node: node,
+            has_suspend: false,
+            event_source_decls: Vec::new(),
+            defer_table: Vec::new(),
+            loop_kind: LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: self.current_function_id,
+            iter_next_node: None,
+            upvalue_count: 0,
+            upvalue_outer_nodes: Vec::new(),
+            nested_ranges: Vec::new(),
+            reset_plan: None,
+        });
+        sg_id
+    }
+
     /// Compile a panic subgraph (used as match fallback when no arm matches).
     /// The single node uses CF_MATCH_FALLBACK which panics at runtime.
     fn compile_panic_subgraph(&mut self) -> SubGraphId {
@@ -2419,8 +2464,8 @@ impl<'a> IrBuilder<'a> {
         self.current_effect = None;
         let body_sg = self.compile_for_body_subgraph(body, sg_id, name);
 
-        // void_sg (exit).
-        let void_sg = self.compile_void_subgraph();
+        // void_sg (exit): includes CF_DEFER_RUN to drain defer-in-loop entries at loop exit.
+        let void_sg = self.compile_defer_run_subgraph();
         self.current_effect = prev_effect;
 
         // gate = Gate(is_null_node): true -> void_sg, false -> body_sg (inputs=[iter_param,
@@ -2497,11 +2542,15 @@ impl<'a> IrBuilder<'a> {
             sg: for_sg,
             iter_node: Some(iter_param),
             body_node_start: node_start,
+            loop_var_node: Some(val_param),
         });
 
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
+        let prev_in_loop = self.in_loop_body;
+        self.in_loop_body = true;
         let body_last = self.compile_expr(body);
+        self.in_loop_body = prev_in_loop;
         self.current_sg_start = prev_sg_start;
 
         self.loop_stack.pop();
@@ -2587,8 +2636,8 @@ impl<'a> IrBuilder<'a> {
         let cond_node = self.compile_subexpr(condition);
         // body subgraph (trailing tail-recursive call to while_sg).
         let body_sg = self.compile_loop_body_subgraph(body, sg_id);
-        // void subgraph (false branch; loop ends).
-        let void_sg = self.compile_void_subgraph();
+        // void subgraph (false branch; loop ends): includes CF_DEFER_RUN for defer-in-loop.
+        let void_sg = self.compile_defer_run_subgraph();
         self.current_effect = prev_effect;
 
         // Gate node: cond true -> body_sg, false -> void_sg.
@@ -3419,6 +3468,7 @@ impl<'a> IrBuilder<'a> {
             sg: while_sg_id,
             iter_node: None,
             body_node_start,
+            loop_var_node: None,
         });
 
         // Record the function subgraph's event_source_decls length before compilation (same as compile_loop_body_subgraph)
@@ -3722,8 +3772,8 @@ impl<'a> IrBuilder<'a> {
         self.current_effect = None;
         // body subgraph (not tail-recursive)
         let body_sg = self.compile_loop_body_subgraph(body, sg_id);
-        // void subgraph (unreachable branch; used on break exit)
-        let void_sg = self.compile_void_subgraph();
+        // void subgraph (unreachable branch; used on break exit): includes CF_DEFER_RUN for defer-in-loop.
+        let void_sg = self.compile_defer_run_subgraph();
         self.current_effect = prev_effect;
 
         // Gate node: cond(true) -> body_sg, false -> void_sg (unreachable)
@@ -3777,6 +3827,7 @@ impl<'a> IrBuilder<'a> {
             sg: loop_sg,
             iter_node: None,
             body_node_start: node_start,
+            loop_var_node: None,
         });
 
         // Enter a new scope so that bind_var inside the loop body does not overwrite
@@ -3792,7 +3843,10 @@ impl<'a> IrBuilder<'a> {
             .map(|sg| sg.event_source_decls.len())
             .unwrap_or(0);
 
+        let prev_in_loop = self.in_loop_body;
+        self.in_loop_body = true;
         let body_last = self.compile_expr(body);
+        self.in_loop_body = prev_in_loop;
         self.loop_stack.pop();
         self.exit_scope();
         self.current_sg_start = prev_sg_start;
@@ -6827,21 +6881,45 @@ impl<'a> IrBuilder<'a> {
                 Some(call_node)
             }
             crate::ast::Ast::Stmt::Defer { expr } => {
-                // defer expr -> compile expr as an independent subgraph and register it in the current function subgraph's defer_table
-                let (body_sg, captured_inputs) = self.compile_branch_subgraph(*expr);
-                let trigger = self.compile_void_const();
-                if let Some(cur_sg) = self.current_function_sg {
-                    let entry = DeferEntry {
-                        trigger_node: trigger,
-                        body_subgraph: body_sg,
-                        captured_inputs,
-                        registered: false,
+                if self.in_loop_body {
+                    // Defer-in-loop: compile as CF_DEFER_REGISTER node.
+                    // The defer body subgraph + captured loop-variable value are pushed onto
+                    // the loop frame's defer_stack at runtime; CF_DEFER_RUN (in void_sg) drains
+                    // it in LIFO order at loop exit.
+                    let (body_sg, _captured_inputs) = self.compile_branch_subgraph(*expr);
+                    // Capture the loop variable (if any) so each defer body reads the
+                    // per-iteration value rather than the final loop-variable value.
+                    let loop_var = self.loop_stack.last().and_then(|lc| lc.loop_var_node);
+                    let inputs: &[NodeId] = match &loop_var {
+                        Some(n) => &[*n],
+                        None => &[],
                     };
-                    self.graph.subgraphs[cur_sg.0 as usize]
-                        .defer_table
-                        .push(entry);
+                    let inputs_off = self.graph.inputs_pool.push(inputs);
+                    let reg_node = self.graph.add_node(Node {
+                        kind: NodeKind::Call,
+                        input_count: inputs.len() as u8,
+                        inputs_offset: inputs_off,
+                        compute_fn: CF_DEFER_REGISTER,
+                    });
+                    self.graph.set_call_target(reg_node, body_sg);
+                    Some(reg_node)
+                } else {
+                    // defer expr -> compile expr as an independent subgraph and register it in the current function subgraph's defer_table
+                    let (body_sg, captured_inputs) = self.compile_branch_subgraph(*expr);
+                    let trigger = self.compile_void_const();
+                    if let Some(cur_sg) = self.current_function_sg {
+                        let entry = DeferEntry {
+                            trigger_node: trigger,
+                            body_subgraph: body_sg,
+                            captured_inputs,
+                            registered: false,
+                        };
+                        self.graph.subgraphs[cur_sg.0 as usize]
+                            .defer_table
+                            .push(entry);
+                    }
+                    None
                 }
-                None
             }
             crate::ast::Ast::Stmt::LocalDecl { decl } => {
                 match decl.as_ref() {
