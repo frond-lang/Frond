@@ -10,10 +10,9 @@ permissions:
 
 jobs:
   build:
-    # Only run when the tag is created from the main branch (or manually dispatched).
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.event.base_ref == 'refs/heads/main')
+    # Only run when manually dispatched; for tag pushes we verify the tagged
+    # commit is on the main branch in the first step below.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
 
     strategy:
       fail-fast: false
@@ -43,6 +42,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag is on main branch
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          if ! git branch -r --contains ${{ github.sha }} | grep -q 'origin/main'; then
+            echo "Tag ${{ github.ref }} is not on main branch"
+            echo "Tagged commit is reachable from:"
+            git branch -r --contains ${{ github.sha }}
+            exit 1
+          fi
+          echo "OK: tag is on main"
+        shell: bash
 
       - uses: dtolnay/rust-toolchain@stable
         with:
