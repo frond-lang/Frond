@@ -7,7 +7,7 @@ use super::*;
 use crate::ir::Ir::*;
 use crate::ir::Ir::Frame;
 use crate::value::Value;
-use crate::ir::Compute::char_from_u32_or_nul;
+use crate::ir::Ir::char_from_u32_or_nul;
 
 // =========================================================================
 // Frame-operation helper functions (pure, do not depend on Engine state)

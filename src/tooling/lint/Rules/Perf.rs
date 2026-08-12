@@ -3,7 +3,7 @@
 use crate::ast::Ast::Module;
 use crate::pass::Analyzer::AnalysisReport;
 use crate::sema::Sema::SemaResult;
-use crate::tooling::common::Diagnostic::{Diagnostic, Severity, Category, expr_range};
+use crate::tooling::Common::Diagnostic::{Diagnostic, Severity, Category, expr_range};
 
 /// PERF001: memoizable function.
 pub fn memoizable(report: &AnalysisReport, _sema: &SemaResult, module: &Module) -> Vec<Diagnostic> {

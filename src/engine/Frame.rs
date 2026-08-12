@@ -196,23 +196,12 @@ impl<S: LockStrategy> Engine<S> {
         // else: pool full, frame_box drops
     }
 
-    /// Initializes a frame: allocation + prefill. Returns the FrameId (the frame is already
-    /// inserted into `frames`).
-    pub(super) fn init_frame(&self, subgraph_id: SubGraphId) -> FrameId {
-        let (node_start, node_end) = self.graph.subgraphs[subgraph_id.0 as usize].node_range;
-        let node_count = (node_end.0 - node_start.0) as usize;
-        let fid = self.alloc_frame_id();
-        let mut frame = self.acquire_frame(fid, subgraph_id, node_count);
-        self.prepare_frame(&mut frame);
-        self.frames.lock().insert(fid, frame);
-        fid
-    }
-
     /// Initializes the entry frame (main function) with default argument injection.
     ///
-    /// `init_frame` leaves Param nodes unset (expecting the caller to inject them via
-    /// `start_subgraph`). But main has no caller — its Param slots are never filled, so
-    /// accessing them (e.g. `args.len()`) reads uninitialised memory and crashes silently.
+    /// The base frame allocation leaves Param nodes unset (expecting the caller to inject
+    /// them via `start_subgraph`). But main has no caller — its Param slots are never
+    /// filled, so accessing them (e.g. `args.len()`) reads uninitialised memory and
+    /// crashes silently.
     ///
     /// This method injects a default value (empty array) into each Param slot so that
     /// `main(args: str[])` receives a valid empty array when no CLI args are provided.
@@ -243,9 +232,10 @@ impl<S: LockStrategy> Engine<S> {
     /// Initializes a defer body frame: same_function branch frame setup (Bug #52).
     ///
     /// The defer body subgraph is compiled as a same_function branch subgraph (function_id = parent
-    /// function), but `init_frame` creates the frame using the defer body's own node_range, so the
-    /// node_offset and value_table size do not match the parent function, causing WriteBack to
-    /// compute an out-of-bounds local index (`writeback target out of current frame range`).
+    /// function), but the base frame allocation creates the frame using the defer body's own
+    /// node_range, so the node_offset and value_table size do not match the parent function,
+    /// causing WriteBack to compute an out-of-bounds local index
+    /// (`writeback target out of current frame range`).
     ///
     /// This method instead creates the frame using the parent frame's node_offset and value_table
     /// size, copies the parent frame's ready values, then uses `prepare_same_function_frame` to set

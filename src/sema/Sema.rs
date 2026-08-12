@@ -1,7 +1,7 @@
 //! Sema.rs — core data structures for semantic analysis.
 //!
 //! The single source of truth for the type system is `crate::types`
-//! (`Ty` / `TypeArena` / `TypeOps`). The legacy `ConcreteType` / `TypeDescriptor`
+//! (`Type` / `TypeArena` / `TypeOps`). The legacy `ConcreteType` / `TypeDescriptor`
 //! types are no longer used — a clean removal with no compatibility layer.
 //!
 //! Key design decisions:
@@ -14,7 +14,7 @@
 //!   provide index-based environment access.
 //!
 //! Dependencies: one-way dependency on `crate::types`
-//! (`Ty` / `TypeArena` / `TypeOps` / `DynamicOpsRegistry`) and `crate::Ast`
+//! (`Type` / `TypeArena` / `TypeOps` / `DynamicOpsRegistry`) and `crate::Ast`
 //! (`TypeRef`, referenced only by the GADT backtrack field of `CtorDefInfo`).
 
 use crate::ast::Ast::{
@@ -29,7 +29,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 // circular dependency). sema submodules (Inference.rs / Relations.rs /
 // Monomorph.rs) obtain these symbols via `use crate::sema::Sema::*;` glob import.
 pub use crate::types::{
-    TypeHandle, Ty, TypeFamily, DetailId, EnvId, FieldType, TraitMethodSig,
+    TypeHandle, Type, TypeFamily, DetailId, EnvId, FieldType, TraitMethodSig,
     SemKind, TypeVar, UnifyError,
     TypeArena, TypeDetail, TypeDisplay,
     TypeOps,
@@ -207,7 +207,7 @@ pub struct ExprInfo {
     /// Type name of the expression (for adt/generic scenarios, eliminating AST
     /// lookbacks on the IR side).
     pub type_name: Option<Box<str>>,
-    /// Whether this is a trait object (`Ty::TraitObject`): the IR layer uses this
+    /// Whether this is a trait object (`Type::TraitObject`): the IR layer uses this
     /// to drive vtable-based dynamic dispatch rather than matching the trait name
     /// by string. Applies to any trait (Iterator/Stream/Iterable, etc.).
     pub is_trait_object: bool,
@@ -488,7 +488,7 @@ pub struct MonomorphInstance {
 /// `Ir.trait_default_subgraphs`.
 #[derive(Debug, Clone)]
 pub struct TraitDefaultInstance {
-    /// `type_id` of the implementing type (matches the `type_id` on `Ty`).
+    /// `type_id` of the implementing type (matches the `type_id` on `Type`).
     pub type_id: u16,
     /// Name of the implementing type (e.g. "Lt", "Ordering").
     pub type_name: Box<str>,
@@ -1006,7 +1006,7 @@ impl SemaResult {
         }
     }
 
-    // ── Method signatures (Ty-driven) ──
+    // ── Method signatures (Type-driven) ──
 
     /// Look up `method_idx` (the position in `TypeDefInfo.methods`) by type name
     /// and method name.
@@ -1142,7 +1142,7 @@ impl SemaResult {
 // =========================================================================
 // builtin_types — built-in type registry.
 //
-// A Rust port of `src/sema/builtin_types.zig`. Unifies the scalar name → Ty
+// A Rust port of `src/sema/builtin_types.zig`. Unifies the scalar name → Type
 // mapping and the arity table for built-in generic types.
 // Data source: BUILTIN_TABLE in Type.rs (type_id 1..=21), the single source of
 // truth.
@@ -1167,7 +1167,7 @@ pub struct BuiltinGenericEntry {
 ///
 /// Types in the `generic` group use the `TypeNode::Generic { name, .. }` AST
 /// node and must have an entry in `BUILTIN_GENERIC_TYPES` so kind_check can look
-/// up their arity. The `nongeneric` group has dedicated `Ty`/`TypeNode` variants
+/// up their arity. The `nongeneric` group has dedicated `Type`/`TypeNode` variants
 /// (e.g. Array/Nullable/Str) and does not need an arity-table entry.
 ///
 /// Declaration syntax:
@@ -1208,11 +1208,11 @@ macro_rules! define_builtin_types {
         /// - Generic parameters use Named("T")/Named("E"), resolved via
         ///   `type_binding_stack`.
         /// - Scalar return types use Named("usize")/Named("bool")/Named("void")/Named("str").
-        /// - `build_fn_type_from_sig` reconstructs the full `Ty::Fn` via
+        /// - `build_fn_type_from_sig` reconstructs the full `Type::Fn` via
         ///   `type_repr_to_handle`.
         pub fn register_builtin_method_sigs(sema_result: &mut SemaResult) {
             /// Build a single built-in method signature. The `type` field is a
-            /// `Ty::Void` placeholder (does not affect type checking;
+            /// `Type::Void` placeholder (does not affect type checking;
             /// `build_fn_type_from_sig` only reads `param_type_reprs` /
             /// `return_type_repr`).
             /// The `intrinsic` parameter tags the lowering strategy; `None` means
@@ -1262,7 +1262,7 @@ macro_rules! define_builtin_types {
             $(
                 register(sema_result, $gname, &[$($gp),*], vec![$($gmethod),*]);
             )*
-            // ── nongeneric group: method registration only (has dedicated Ty variant) ──
+            // ── nongeneric group: method registration only (has dedicated Type variant) ──
             $(
                 register(sema_result, $nname, &[$($np),*], vec![$($nmethod),*]);
             )*
@@ -1367,9 +1367,9 @@ pub fn type_name_from_node<'a>(
 /// Check if a TypeHandle corresponds to a type with the given name.
 fn type_handle_name_matches(arena: &TypeArena, h: TypeHandle, name: &str) -> bool {
     match arena.get(h) {
-        Ty::Adt(_) => arena.adt_parts(h).0 == name,
-        Ty::Generic(_) => arena.generic_parts(h).0 == name,
-        Ty::Trait(_) => arena.trait_parts(h).0 == name,
+        Type::Adt(_) => arena.adt_parts(h).0 == name,
+        Type::Generic(_) => arena.generic_parts(h).0 == name,
+        Type::Trait(_) => arena.trait_parts(h).0 == name,
         // Other types (including built-in generics Throw/Channel/Async/Lazy/Atomic/
         // Sender/Receiver/Timer and scalars/str/void) uniformly go through
         // `ty.name()`, the single source of truth.
@@ -1408,7 +1408,7 @@ fn resolve_named_type_resolved(
         }
     }
     // 2. Built-in scalar/str/null/void.
-    if let Some(ty) = Ty::from_type_name(name) {
+    if let Some(ty) = Type::from_type_name(name) {
         return arena.make(ty);
     }
     // Cyclic-alias detection: `name` already in `visiting` means a cycle;
@@ -1472,7 +1472,7 @@ pub fn resolve_type_node_resolved<'a>(
         TypeNode::Named { name } => resolve_named_type_resolved(arena, name, type_args, sema_result, &mut visiting),
         TypeNode::Generic { name, args } => {
             // Lazy<T>: recursively resolve the inner type.
-            if Ty::from_type_name(name).is_some_and(|t| t.family() == TypeFamily::Lazy)
+            if Type::from_type_name(name).is_some_and(|t| t.family() == TypeFamily::Lazy)
                 && !args.is_empty() {
                 if let Some(inner_ty) =
                     resolve_type_node_resolved(arena, Some(args[0]), type_args, ast, sema_result)
@@ -1495,7 +1495,7 @@ pub fn resolve_type_node_resolved<'a>(
         }
         TypeNode::Record { .. } => arena.make_record(Vec::<FieldType>::new().into_boxed_slice(), None),
         TypeNode::Function { .. } => {
-            let ret = arena.make(Ty::Unknown);
+            let ret = arena.make(Type::Unknown);
             arena.make_fn(Vec::<TypeHandle>::new().into_boxed_slice(), ret)
         }
         TypeNode::Array { .. } => arena.make_adt("array".into(), Box::new([])),
@@ -1567,7 +1567,7 @@ impl TypeBindingFrame {
 /// `lookup` searches from the top of the stack down, so inner bindings take
 /// precedence (shadowing semantics).
 ///
-/// Note: this stack holds `TypeHandle`s (Ty indices); type resolution goes
+/// Note: this stack holds `TypeHandle`s (Type indices); type resolution goes
 /// through `InferContext::lookup_type_binding`, without a separate trait
 /// abstraction to avoid type confusion.
 #[derive(Debug, Default)]
@@ -1898,7 +1898,7 @@ fn ast_fun_decl_to_func_sig_inner<'a>(
             let ty = concretize_type(arena, rt, &[], ast, sema_result);
             (ty, is_throw_type(&ast.ty(rt).node))
         }
-        None => (arena.make(Ty::Void), false),
+        None => (arena.make(Type::Void), false),
     };
 
     // return_is_ref: true when the return type is a RefType.
@@ -1935,7 +1935,7 @@ pub(crate) fn ast_trait_decl_to_trait_def<'a>(
         .map(|m| {
             let return_type = match m.return_type {
                 Some(rt) => concretize_type(arena, rt, &[], ast, sema_result),
-                None => arena.make(Ty::Void),
+                None => arena.make(Type::Void),
             };
             TraitMethodSig {
                 name: m.name.into(),
@@ -2085,12 +2085,12 @@ pub(crate) fn concretize_type<'a>(
             // built-in scalar → alias/newtype chain expansion (visiting cycle
             // detection + MAX_TYPE_RECURSION_DEPTH depth limit) → user-defined
             // Adt. Fixes the precision gap in the old Named branch, which only
-            // used Ty::from_type_name/make_adt.
+            // used Type::from_type_name/make_adt.
             let mut visiting = FxHashSet::default();
             resolve_named_type_resolved(arena, name, type_args, sema_result, &mut visiting)
         }
         TypeNode::Generic { name, .. } => {
-            if let Some(ty) = Ty::from_type_name(name) {
+            if let Some(ty) = Type::from_type_name(name) {
                 arena.make(ty)
             } else {
                 arena.make_generic((*name).into(), Box::new([]))
@@ -2110,7 +2110,7 @@ pub(crate) fn concretize_type<'a>(
         }
         TypeNode::Record { .. } => arena.make_record(Vec::<FieldType>::new().into_boxed_slice(), None),
         TypeNode::Function { .. } => {
-            let ret = arena.make(Ty::Unknown);
+            let ret = arena.make(Type::Unknown);
             arena.make_fn(Vec::<TypeHandle>::new().into_boxed_slice(), ret)
         }
         TypeNode::Array { element_type, size } => {
@@ -2136,7 +2136,7 @@ pub(crate) fn concretize_type<'a>(
 /// `Throw` is represented in `TypeNode` as `Generic { name: "Throw", args: [V, E] }`.
 fn is_throw_type(tn: &TypeNode) -> bool {
     matches!(tn, TypeNode::Generic { name, .. }
-        if Ty::from_type_name(name).is_some_and(|t| t.family() == TypeFamily::Throw))
+        if Type::from_type_name(name).is_some_and(|t| t.family() == TypeFamily::Throw))
 }
 
 /// Recursively convert an AST `TypeNode` into a self-contained `TypeRepr`
@@ -2265,7 +2265,7 @@ fn record_fields_to_ctor_info<'a>(
 // Design rationale (original, not a copy of Swift/Haskell):
 // - Trait implementations are materialized at compile time into a WitnessEntry
 //   (a function-pointer table).
-// - Dispatch is indexed by the type_id on `Ty`, in O(1).
+// - Dispatch is indexed by the type_id on `Type`, in O(1).
 // - Replaces the current mangled-name ("TypeName.method") lookup.
 // - Naturally fits Kuzo's type_id / reflection mechanism.
 //
@@ -2289,7 +2289,7 @@ fn record_fields_to_ctor_info<'a>(
 pub struct WitnessEntry {
     /// Trait name (e.g. "Show", "Eq", "Error").
     pub trait_name: Box<str>,
-    /// `type_id` of the implementing type (matches the `type_id` on `Ty`).
+    /// `type_id` of the implementing type (matches the `type_id` on `Type`).
     pub type_id: u16,
     /// Method slots: method_name → method_idx (position in
     /// `TypeDefInfo.methods`).

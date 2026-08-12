@@ -5,8 +5,8 @@ use std::path::Path;
 use rustc_hash::FxHashMap;
 
 use crate::ast::Ast::Module;
-use crate::tooling::common::Pipeline;
-use crate::tooling::lsp::DocState::{extract_symbols, SymbolInfo};
+use crate::tooling::Common::Pipeline;
+use crate::tooling::Lsp::DocState::{extract_symbols, SymbolInfo};
 
 #[derive(Default)]
 pub struct WorkspaceIndex {

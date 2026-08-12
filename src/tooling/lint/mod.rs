@@ -1,4 +1,10 @@
-//! Linter: rule-based static analysis with configurable severity.
+#![allow(non_snake_case)]
+//! Lint — rule-based static analysis with configurable severity.
+//!
+//! Aggregates three submodules:
+//! - [`Registry`]: rule registry + lint config (RuleRegistry / LintConfig)
+//! - [`Rules`]: lint rule implementations by category (Correctness / Style / Perf / Idioms)
+//! - [`Report`]: report formatting (text / JSON)
 
 pub mod Registry;
 pub mod Rules;
@@ -8,8 +14,8 @@ pub use Registry::{RuleRegistry, LintConfig};
 
 use std::fs;
 use bumpalo::Bump;
-use crate::tooling::common::Pipeline;
-use crate::tooling::common::Diagnostic::{Diagnostic, Severity, Category, Range};
+use crate::tooling::Common::Pipeline;
+use crate::tooling::Common::Diagnostic::{Diagnostic, Severity, Category, Range};
 use crate::pass::Analyzer;
 
 /// Lint a single file: parse → sema → analyze → run rules.

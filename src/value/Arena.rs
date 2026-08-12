@@ -11,12 +11,12 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use wide::{i32x4, i64x4, CmpEq};
 
-pub use crate::types::ValueTag;
+pub use super::Tag::ValueTag;
 
 use super::value::*;
-use super::ops::SIMD_LANES;
-use super::ops::PARALLEL_THRESHOLD;
-use super::ops::par_chunk_size;
+use super::Ops::SIMD_LANES;
+use super::Ops::PARALLEL_THRESHOLD;
+use super::Ops::par_chunk_size;
 
 // =========================================================================
 // Part 3: Bucket<T> + ValueArena (fully bucketed SoA storage)

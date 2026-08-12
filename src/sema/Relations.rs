@@ -33,7 +33,7 @@ fn named_args_equal(
 }
 
 /// Recursively determine whether two types are structurally equal (compares
-/// `Ty` contents after `resolve`).
+/// `Type` contents after `resolve`).
 ///
 /// Authoritative implementation: `InferContext::types_structurally_equal`
 /// delegates to this function.
@@ -50,15 +50,15 @@ pub fn types_equal(arena: &TypeArena, a: TypeHandle, b: TypeHandle) -> bool {
         return false;
     }
     match (a_ct, b_ct) {
-        (Ty::TypeVar(ia), Ty::TypeVar(ib)) => ia == ib,
-        (Ty::Fn(_), Ty::Fn(_)) => {
+        (Type::TypeVar(ia), Type::TypeVar(ib)) => ia == ib,
+        (Type::Fn(_), Type::Fn(_)) => {
             let (pa, rpa) = arena.fn_parts(ra);
             let (pb, rpb) = arena.fn_parts(rb);
             pa.len() == pb.len()
                 && pa.iter().zip(pb.iter()).all(|(&x, &y)| types_equal(arena, x, y))
                 && types_equal(arena, rpa, rpb)
         }
-        (Ty::Record(_), Ty::Record(_)) => {
+        (Type::Record(_), Type::Record(_)) => {
             let fa = arena.record_fields(ra);
             let fb = arena.record_fields(rb);
             if fa.len() != fb.len() {
@@ -76,51 +76,51 @@ pub fn types_equal(arena: &TypeArena, a: TypeHandle, b: TypeHandle) -> bool {
             }
             true
         }
-        (Ty::Adt(_), Ty::Adt(_)) => {
+        (Type::Adt(_), Type::Adt(_)) => {
             let (na, ta) = arena.adt_parts(ra);
             let (nb, tb) = arena.adt_parts(rb);
             named_args_equal(arena, na, ta, nb, tb)
         }
-        (Ty::Generic(_), Ty::Generic(_)) => {
+        (Type::Generic(_), Type::Generic(_)) => {
             let (na, ta) = arena.generic_parts(ra);
             let (nb, tb) = arena.generic_parts(rb);
             named_args_equal(arena, na, ta, nb, tb)
         }
-        (Ty::Array(_), Ty::Array(_)) => {
+        (Type::Array(_), Type::Array(_)) => {
             let (ea, sa) = arena.array_parts(ra);
             let (eb, sb) = arena.array_parts(rb);
             sa == sb && types_equal(arena, ea, eb)
         }
-        (Ty::Throw(_), Ty::Throw(_)) => {
+        (Type::Throw(_), Type::Throw(_)) => {
             let (va, ea) = arena.throw_parts(ra);
             let (vb, eb) = arena.throw_parts(rb);
             types_equal(arena, va, vb) && types_equal(arena, ea, eb)
         }
         // Single-parameter builtin generics: equal iff element types are equal
-        (Ty::Channel(_), Ty::Channel(_)) => {
+        (Type::Channel(_), Type::Channel(_)) => {
             types_equal(arena, arena.channel_elem(ra), arena.channel_elem(rb))
         }
-        (Ty::Async(_), Ty::Async(_)) => {
+        (Type::Async(_), Type::Async(_)) => {
             types_equal(arena, arena.async_value(ra), arena.async_value(rb))
         }
-        (Ty::Lazy(_), Ty::Lazy(_)) => {
+        (Type::Lazy(_), Type::Lazy(_)) => {
             types_equal(arena, arena.lazy_value(ra), arena.lazy_value(rb))
         }
-        (Ty::Atomic(_), Ty::Atomic(_)) => {
+        (Type::Atomic(_), Type::Atomic(_)) => {
             types_equal(arena, arena.atomic_elem(ra), arena.atomic_elem(rb))
         }
-        (Ty::Sender(_), Ty::Sender(_)) => {
+        (Type::Sender(_), Type::Sender(_)) => {
             types_equal(arena, arena.sender_elem(ra), arena.sender_elem(rb))
         }
-        (Ty::Receiver(_), Ty::Receiver(_)) => {
+        (Type::Receiver(_), Type::Receiver(_)) => {
             types_equal(arena, arena.receiver_elem(ra), arena.receiver_elem(rb))
         }
-        (Ty::Trait(_), Ty::Trait(_)) => {
+        (Type::Trait(_), Type::Trait(_)) => {
             let (na, ta) = arena.trait_parts(ra);
             let (nb, tb) = arena.trait_parts(rb);
             named_args_equal(arena, na, ta, nb, tb)
         }
-        (Ty::TraitObject(_), Ty::TraitObject(_)) => {
+        (Type::TraitObject(_), Type::TraitObject(_)) => {
             let (na, ma) = arena.trait_object_parts(ra);
             let (nb, mb) = arena.trait_object_parts(rb);
             na == nb
@@ -129,12 +129,12 @@ pub fn types_equal(arena: &TypeArena, a: TypeHandle, b: TypeHandle) -> bool {
                     a.name == b.name && a.param_count == b.param_count
                 })
         }
-        (Ty::Nullable(_), Ty::Nullable(_)) => {
+        (Type::Nullable(_), Type::Nullable(_)) => {
             let ia = arena.nullable_inner(ra);
             let ib = arena.nullable_inner(rb);
             types_equal(arena, ia, ib)
         }
-        (Ty::Ref(_), Ty::Ref(_)) => {
+        (Type::Ref(_), Type::Ref(_)) => {
             let (ia, ra_raw) = arena.ref_parts(ra);
             let (ib, rb_raw) = arena.ref_parts(rb);
             ra_raw == rb_raw && types_equal(arena, ia, ib)
@@ -177,7 +177,7 @@ impl SubtypeRule for NullToNullableRule {
     fn check(&self, arena: &TypeArena, sub: TypeHandle, sup: TypeHandle) -> Option<bool> {
         let sub_ct = arena.get(arena.resolve(sub));
         let sup_ct = arena.get(arena.resolve(sup));
-        if matches!(sub_ct, Ty::Null) && matches!(sup_ct, Ty::Nullable(_)) {
+        if matches!(sub_ct, Type::Null) && matches!(sup_ct, Type::Nullable(_)) {
             Some(true)
         } else {
             None
@@ -191,7 +191,7 @@ impl SubtypeRule for NullableInnerRule {
     fn check(&self, arena: &TypeArena, sub: TypeHandle, sup: TypeHandle) -> Option<bool> {
         let sup_resolved = arena.resolve(sup);
         let sup_ct = arena.get(sup_resolved);
-        if let Ty::Nullable(_) = sup_ct {
+        if let Type::Nullable(_) = sup_ct {
             let inner = arena.nullable_inner(sup_resolved);
             Some(is_subtype(arena, sub, inner))
         } else {
@@ -209,7 +209,7 @@ impl SubtypeRule for RecordSubtypeRule {
         let sup_resolved = arena.resolve(sup);
         let sub_ct = arena.get(sub_resolved);
         let sup_ct = arena.get(sup_resolved);
-        if let (Ty::Record(_), Ty::Record(_)) = (sub_ct, sup_ct) {
+        if let (Type::Record(_), Type::Record(_)) = (sub_ct, sup_ct) {
             let sub_fields = arena.record_fields(sub_resolved);
             let sup_fields = arena.record_fields(sup_resolved);
             Some(is_record_subtype(arena, sub_fields, sup_fields))
@@ -227,7 +227,7 @@ impl SubtypeRule for AdtNameRule {
         let sup_resolved = arena.resolve(sup);
         let sub_ct = arena.get(sub_resolved);
         let sup_ct = arena.get(sup_resolved);
-        if let (Ty::Adt(_), Ty::Adt(_)) = (sub_ct, sup_ct) {
+        if let (Type::Adt(_), Type::Adt(_)) = (sub_ct, sup_ct) {
             let (sub_name, _) = arena.adt_parts(sub_resolved);
             let (sup_name, _) = arena.adt_parts(sup_resolved);
             Some(sub_name == sup_name)
@@ -245,7 +245,7 @@ impl SubtypeRule for ThrowSubtypeRule {
         let sup_resolved = arena.resolve(sup);
         let sub_ct = arena.get(sub_resolved);
         let sup_ct = arena.get(sup_resolved);
-        if let (Ty::Throw(_), Ty::Throw(_)) = (sub_ct, sup_ct) {
+        if let (Type::Throw(_), Type::Throw(_)) = (sub_ct, sup_ct) {
             let (sv, se) = arena.throw_parts(sub_resolved);
             let (pv, pe) = arena.throw_parts(sup_resolved);
             Some(is_throw_subtype(arena, sv, se, pv, pe))
@@ -389,7 +389,7 @@ pub fn record_arg_satisfies(arena: &TypeArena, param: TypeHandle, arg: TypeHandl
     let param_ct = arena.get(rp);
     let arg_ct = arena.get(ra);
     match (param_ct, arg_ct) {
-        (Ty::Record(_), Ty::Record(_)) => {
+        (Type::Record(_), Type::Record(_)) => {
             let pf = arena.record_fields(rp);
             let af = arena.record_fields(ra);
             // pf requires, af provides; verify recursively.
@@ -410,20 +410,20 @@ pub fn record_arg_satisfies(arena: &TypeArena, param: TypeHandle, arg: TypeHandl
 /// Returns the integer's rank (for widening comparison). Signed and unsigned
 /// integers of the same width share the same rank; non-integers return 0.
 #[inline]
-pub fn int_type_rank(ty: &Ty) -> u8 {
+pub fn int_type_rank(ty: &Type) -> u8 {
     ty.int_rank().unwrap_or(0)
 }
 
 /// Returns the float type's rank (for widening comparison); non-floats return 0.
 #[inline]
-pub fn float_type_rank(ty: &Ty) -> u8 {
+pub fn float_type_rank(ty: &Type) -> u8 {
     ty.float_bit_width().map(|b| b as u8).unwrap_or(0)
 }
 
 /// Determines whether this is a signed integer (free-function version,
-/// equivalent to `Ty::is_signed_int`).
+/// equivalent to `Type::is_signed_int`).
 #[inline]
-pub fn is_signed_int_ct(ty: &Ty) -> bool {
+pub fn is_signed_int_ct(ty: &Type) -> bool {
     ty.is_signed_int()
 }
 
@@ -744,7 +744,7 @@ impl ModuleChecker {
 /// 10. No common type → `Unknown`
 pub fn peer_type(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
     if types.is_empty() {
-        return arena.make(Ty::Unknown);
+        return arena.make(Type::Unknown);
     }
     if types.len() == 1 {
         return types[0];
@@ -758,7 +758,7 @@ pub fn peer_type(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
         .filter(|&&t| {
             !matches!(
                 arena.get(arena.resolve(t)),
-                Ty::Never | Ty::Void
+                Type::Never | Type::Void
             )
         })
         .copied()
@@ -772,11 +772,11 @@ pub fn peer_type(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
         // single-sided diverging if.
         if types
             .iter()
-            .all(|&t| matches!(arena.get(arena.resolve(t)), Ty::Never))
+            .all(|&t| matches!(arena.get(arena.resolve(t)), Type::Never))
         {
-            return arena.make(Ty::Never);
+            return arena.make(Type::Never);
         }
-        return arena.make(Ty::Void);
+        return arena.make(Type::Void);
     }
     if non_trivial.len() == 1 {
         return non_trivial[0];
@@ -799,7 +799,7 @@ pub fn peer_type(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
 
     // All nullable → Nullable<peer(inners)>
     let all_nullable = non_trivial.iter().all(|&t| {
-        matches!(arena.get(arena.resolve(t)), Ty::Nullable(_))
+        matches!(arena.get(arena.resolve(t)), Type::Nullable(_))
     });
     if all_nullable {
         let inners: Vec<TypeHandle> = non_trivial
@@ -807,7 +807,7 @@ pub fn peer_type(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
             .map(|&t| {
                 let resolved = arena.resolve(t);
                 match arena.get(resolved) {
-                    Ty::Nullable(_) => arena.nullable_inner(resolved),
+                    Type::Nullable(_) => arena.nullable_inner(resolved),
                     _ => unreachable!(),
                 }
             })
@@ -818,7 +818,7 @@ pub fn peer_type(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
 
     // Contains nullable + non-nullable → Nullable<peer(all inners)>
     let has_nullable = non_trivial.iter().any(|&t| {
-        matches!(arena.get(arena.resolve(t)), Ty::Nullable(_))
+        matches!(arena.get(arena.resolve(t)), Type::Nullable(_))
     });
     if has_nullable {
         let inners: Vec<TypeHandle> = non_trivial
@@ -826,10 +826,10 @@ pub fn peer_type(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
             .map(|&t| {
                 let resolved = arena.resolve(t);
                 match arena.get(resolved) {
-                    Ty::Nullable(_) => arena.nullable_inner(resolved),
+                    Type::Nullable(_) => arena.nullable_inner(resolved),
                     other => {
-                        if matches!(other, Ty::Null) {
-                            arena.make(Ty::Unknown)
+                        if matches!(other, Type::Null) {
+                            arena.make(Type::Unknown)
                         } else {
                             t
                         }
@@ -843,7 +843,7 @@ pub fn peer_type(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
 
     // All throw → Throw<peer(values), peer(errors)>
     let all_throw = non_trivial.iter().all(|&t| {
-        matches!(arena.get(arena.resolve(t)), Ty::Throw(_))
+        matches!(arena.get(arena.resolve(t)), Type::Throw(_))
     });
     if all_throw {
         let (values, errors): (Vec<TypeHandle>, Vec<TypeHandle>) = non_trivial
@@ -851,7 +851,7 @@ pub fn peer_type(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
             .map(|&t| {
                 let resolved = arena.resolve(t);
                 match arena.get(resolved) {
-                    Ty::Throw(_) => arena.throw_parts(resolved),
+                    Type::Throw(_) => arena.throw_parts(resolved),
                     _ => unreachable!(),
                 }
             })
@@ -862,7 +862,7 @@ pub fn peer_type(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
     }
 
     // Incompatible → Unknown
-    arena.make(Ty::Unknown)
+    arena.make(Type::Unknown)
 }
 
 /// Peer-type resolution for binary operations (internalizes literal
@@ -904,7 +904,7 @@ pub fn peer_type_binary(
 /// 2. All int → take the widest int (same sign: largest bit width; mixed sign:
 ///    take the unsigned type with the largest bit width)
 fn peer_numeric(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
-    let resolved: Vec<Ty> = types
+    let resolved: Vec<Type> = types
         .iter()
         .map(|&t| arena.get(arena.resolve(t)))
         .collect();
@@ -912,17 +912,17 @@ fn peer_numeric(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
     // Contains float → take the widest float
     let has_float = resolved.iter().any(|ct| ct.is_float());
     if has_float {
-        let mut widest = Ty::F16;
+        let mut widest = Type::F16;
         let mut widest_bits: u16 = 16;
         for ct in &resolved {
             if let Some(bits) = ct.float_bit_width() {
                 if bits > widest_bits {
                     widest_bits = bits;
                     widest = match ct {
-                        Ty::F16 => Ty::F16,
-                        Ty::F32 => Ty::F32,
-                        Ty::F64 => Ty::F64,
-                        Ty::F128 => Ty::F128,
+                        Type::F16 => Type::F16,
+                        Type::F32 => Type::F32,
+                        Type::F64 => Type::F64,
+                        Type::F128 => Type::F128,
                         _ => unreachable!(),
                     };
                 }
@@ -932,7 +932,7 @@ fn peer_numeric(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
     }
 
     // All int → take the widest
-    let mut widest = Ty::I8;
+    let mut widest = Type::I8;
     let mut widest_bits: u16 = 8;
     for ct in &resolved {
         if let Some(bits) = ct.int_bit_width() {

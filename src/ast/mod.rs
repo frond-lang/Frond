@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 //! ast — Abstract syntax tree and parsing modules.
 //!
 //! Aggregates the two AST-related submodules:

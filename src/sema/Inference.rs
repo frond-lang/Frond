@@ -14,7 +14,7 @@ use crate::ast::Ast::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Generates the match arm for numeric literal inference (shared structure for IntLit/FloatLit).
-/// `$suffix_fn` is the suffix→TypeHandle method, `$predicate` is the expected-type predicate, and `$fallback` is the default Ty variant.
+/// `$suffix_fn` is the suffix→TypeHandle method, `$predicate` is the expected-type predicate, and `$fallback` is the default Type variant.
 macro_rules! numeric_lit {
     ($self:expr, $suffix:expr, $expected:expr, $suffix_fn:ident, $predicate:ident, $fallback:ident) => {{
         if let Some(suf) = $suffix {
@@ -28,7 +28,7 @@ macro_rules! numeric_lit {
                 return exp;
             }
         }
-        $self.make_builtin(Ty::$fallback)
+        $self.make_builtin(Type::$fallback)
     }};
 }
 
@@ -183,44 +183,44 @@ fn type_contains_any_unresolved(
 ) -> bool {
     let resolved = arena.resolve(ty);
     match arena.get(resolved) {
-        Ty::TypeVar(idx) => unresolved_set.contains(&idx),
-        Ty::Fn(_) => {
+        Type::TypeVar(idx) => unresolved_set.contains(&idx),
+        Type::Fn(_) => {
             let (params, return_type) = arena.fn_parts(resolved);
             params.iter().any(|&p| type_contains_any_unresolved(p, arena, unresolved_set))
                 || type_contains_any_unresolved(return_type, arena, unresolved_set)
         }
-        Ty::Record(_) => arena.record_fields(resolved)
+        Type::Record(_) => arena.record_fields(resolved)
             .iter()
             .any(|f| type_contains_any_unresolved(f.ty, arena, unresolved_set)),
-        Ty::Adt(_) => {
+        Type::Adt(_) => {
             let (_, type_args) = arena.adt_parts(resolved);
             type_args
                 .iter()
                 .any(|&a| type_contains_any_unresolved(a, arena, unresolved_set))
         }
-        Ty::Nullable(_) => {
+        Type::Nullable(_) => {
             let inner = arena.nullable_inner(resolved);
             type_contains_any_unresolved(inner, arena, unresolved_set)
         }
-        Ty::Ref(_) => {
+        Type::Ref(_) => {
             let (inner, _) = arena.ref_parts(resolved);
             type_contains_any_unresolved(inner, arena, unresolved_set)
         }
-        Ty::Generic(_) => {
+        Type::Generic(_) => {
             let (_, args) = arena.generic_parts(resolved);
             args.iter()
                 .any(|&a| type_contains_any_unresolved(a, arena, unresolved_set))
         }
-        Ty::Array(_) => {
+        Type::Array(_) => {
             let (element_type, _) = arena.array_parts(resolved);
             type_contains_any_unresolved(element_type, arena, unresolved_set)
         }
-        Ty::Throw(_) => {
+        Type::Throw(_) => {
             let (value_type, error_type) = arena.throw_parts(resolved);
             type_contains_any_unresolved(value_type, arena, unresolved_set)
                 || type_contains_any_unresolved(error_type, arena, unresolved_set)
         }
-        Ty::Trait(_) => {
+        Type::Trait(_) => {
             let (_, type_args) = arena.trait_parts(resolved);
             type_args
                 .iter()
@@ -662,7 +662,7 @@ impl<'a> InferContext<'a> {
     fn collect_type_vars(&self, ty: TypeHandle, subst: &mut FxHashMap<u32, TypeHandle>) {
         let resolved = self.arena.resolve(ty);
         match self.arena.get(resolved) {
-            Ty::TypeVar(idx) => {
+            Type::TypeVar(idx) => {
                 subst.entry(idx).or_insert(TypeHandle(0));
             }
             // All composite types (incl. Channel/Async/Lazy/Atomic/Sender/Receiver) delegate
@@ -683,7 +683,7 @@ impl<'a> InferContext<'a> {
     // Collect all unbound TypeVar idxs in the function signature (collect_type_vars follows resolve;
     // already-bound TypeVars are not collected).
     let mut subst: FxHashMap<u32, TypeHandle> = FxHashMap::default();
-    if !matches!(self.arena.get(resolved), Ty::Fn(_)) {
+    if !matches!(self.arena.get(resolved), Type::Fn(_)) {
         return resolved;
     }
     {
@@ -712,11 +712,11 @@ impl<'a> InferContext<'a> {
     fn substitute_type(&mut self, ty: TypeHandle, subst: &FxHashMap<u32, TypeHandle>) -> TypeHandle {
         let resolved = self.arena.resolve(ty);
         match self.arena.get(resolved) {
-            Ty::TypeVar(idx) => {
+            Type::TypeVar(idx) => {
                 // Hit in the substitution table → return the substituted type; otherwise leave as-is.
                 subst.get(&idx).copied().unwrap_or(resolved)
             }
-            Ty::Fn(_) => {
+            Type::Fn(_) => {
                 let (params, return_type) = self.arena.fn_parts(resolved);
                 let params: Vec<TypeHandle> = params.to_vec();
                 let new_params: Vec<TypeHandle> = params
@@ -726,7 +726,7 @@ impl<'a> InferContext<'a> {
                 let new_ret = self.substitute_type(return_type, subst);
                 self.arena.make_fn(new_params.into_boxed_slice(), new_ret)
             }
-            Ty::Record(_) => {
+            Type::Record(_) => {
                 let fields = self.arena.record_fields(resolved).to_vec();
                 let name = self.arena.record_name(resolved).map(|s| s.into());
                 let new_fields: Vec<FieldType> = fields
@@ -738,7 +738,7 @@ impl<'a> InferContext<'a> {
                     .collect();
                 self.arena.make_record(new_fields.into_boxed_slice(), name)
             }
-            Ty::Adt(_) => {
+            Type::Adt(_) => {
                 let (name, type_args) = self.arena.adt_parts(resolved);
                 let name: Box<str> = name.into();
                 let type_args: Vec<TypeHandle> = type_args.to_vec();
@@ -748,12 +748,12 @@ impl<'a> InferContext<'a> {
                     .collect();
                 self.arena.make_adt(name, new_args.into_boxed_slice())
             }
-            Ty::Nullable(_) => {
+            Type::Nullable(_) => {
                 let inner = self.arena.nullable_inner(resolved);
                 let new_inner = self.substitute_type(inner, subst);
                 self.arena.make_nullable(new_inner)
             }
-            Ty::Generic(_) => {
+            Type::Generic(_) => {
                 let (name, args) = self.arena.generic_parts(resolved);
                 let name: Box<str> = name.into();
                 let args: Vec<TypeHandle> = args.to_vec();
@@ -763,18 +763,18 @@ impl<'a> InferContext<'a> {
                     .collect();
                 self.arena.make_generic(name, new_args.into_boxed_slice())
             }
-            Ty::Array(_) => {
+            Type::Array(_) => {
                 let (element_type, size) = self.arena.array_parts(resolved);
                 let new_elem = self.substitute_type(element_type, subst);
                 self.arena.make_array(new_elem, size)
             }
-            Ty::Throw(_) => {
+            Type::Throw(_) => {
                 let (value_type, error_type) = self.arena.throw_parts(resolved);
                 let new_v = self.substitute_type(value_type, subst);
                 let new_e = self.substitute_type(error_type, subst);
                 self.arena.make_throw(new_v, new_e)
             }
-            Ty::Trait(_) => {
+            Type::Trait(_) => {
                 let (name, type_args) = self.arena.trait_parts(resolved);
                 let name: Box<str> = name.into();
                 let type_args: Vec<TypeHandle> = type_args.to_vec();
@@ -784,11 +784,11 @@ impl<'a> InferContext<'a> {
                     .collect();
                 self.arena.make_trait(name, new_args.into_boxed_slice())
             }
-            Ty::TraitObject(_) => {
+            Type::TraitObject(_) => {
                 let (trait_name, method_sigs) = self.arena.trait_object_parts(resolved);
                 self.arena.make_trait_object(trait_name.into(), method_sigs.to_vec().into_boxed_slice())
             }
-            Ty::Ref(_) => {
+            Type::Ref(_) => {
                 let (inner, is_raw) = self.arena.ref_parts(resolved);
                 let new_inner = self.substitute_type(inner, subst);
                 self.arena.make_ref(new_inner, is_raw)
@@ -796,32 +796,32 @@ impl<'a> InferContext<'a> {
             // Single-element builtin generics — kept in lockstep with `for_each_child` so that
             // TypeVars nested inside them are substituted (otherwise instantiate_fn_type would
             // collect a var via collect_type_vars but fail to replace it here).
-            Ty::Channel(_) => {
+            Type::Channel(_) => {
                 let elem = self.arena.channel_elem(resolved);
                 let new_elem = self.substitute_type(elem, subst);
                 self.arena.make_channel(new_elem)
             }
-            Ty::Async(_) => {
+            Type::Async(_) => {
                 let value = self.arena.async_value(resolved);
                 let new_value = self.substitute_type(value, subst);
                 self.arena.make_async(new_value)
             }
-            Ty::Lazy(_) => {
+            Type::Lazy(_) => {
                 let value = self.arena.lazy_value(resolved);
                 let new_value = self.substitute_type(value, subst);
                 self.arena.make_lazy(new_value)
             }
-            Ty::Atomic(_) => {
+            Type::Atomic(_) => {
                 let elem = self.arena.atomic_elem(resolved);
                 let new_elem = self.substitute_type(elem, subst);
                 self.arena.make_atomic(new_elem)
             }
-            Ty::Sender(_) => {
+            Type::Sender(_) => {
                 let elem = self.arena.sender_elem(resolved);
                 let new_elem = self.substitute_type(elem, subst);
                 self.arena.make_sender(new_elem)
             }
-            Ty::Receiver(_) => {
+            Type::Receiver(_) => {
                 let elem = self.arena.receiver_elem(resolved);
                 let new_elem = self.substitute_type(elem, subst);
                 self.arena.make_receiver(new_elem)
@@ -884,7 +884,7 @@ impl<'a> InferContext<'a> {
         //   (When the constructor name collides with the Throw error-variant name "Error"/"Err",
         //    regardless of what error_type is, the pattern matches the Throw error variant
         //    and sub-patterns bind to error_type rather than the constructor's field types.)
-        if let Ty::Throw(_) = self.arena.get(resolved_expected) {
+        if let Type::Throw(_) = self.arena.get(resolved_expected) {
             let (value_type, error_type) = self.arena.throw_parts(resolved_expected);
             let is_error_variant = ctor_name == crate::ir::Compute::CTOR_ERR
                 || ctor_name == crate::ir::Compute::CTOR_ERR_ALT
@@ -945,7 +945,7 @@ impl<'a> InferContext<'a> {
         }
         // Type-oriented disambiguation: select by the Adt type_name of expected_ty
         let exp_resolved = self.arena.resolve(expected_ty);
-        if let Ty::Adt(_) = self.arena.get(exp_resolved) {
+        if let Type::Adt(_) = self.arena.get(exp_resolved) {
             let (exp_type_name, _) = self.arena.adt_parts(exp_resolved);
             let matches: Vec<_> = candidates.iter()
                 .filter(|c| c.type_name.as_ref() == exp_type_name)
@@ -993,7 +993,7 @@ impl<'a> InferContext<'a> {
         // handling to avoid arity-0 fallback that loses sub-pattern information.
         if let PatCtor::Adt(name) = ctor {
             let resolved = self.arena.resolve(col_type);
-            if let Ty::Throw(_) = self.arena.get(resolved) {
+            if let Type::Throw(_) = self.arena.get(resolved) {
                 let (value_type, error_type) = self.arena.throw_parts(resolved);
                 let field_ty = if name.as_ref() == "Ok" { value_type } else { error_type };
                 return (1, vec![field_ty]);
@@ -1005,7 +1005,7 @@ impl<'a> InferContext<'a> {
             PatCtor::Adt(name) => {
                 let resolved = self.arena.resolve(col_type);
                 match self.arena.get(resolved) {
-                    Ty::Adt(_) => {
+                    Type::Adt(_) => {
                         let (type_name, type_args) = self.arena.adt_parts(resolved);
                         self.sema_result.get_type_def(type_name).and_then(|td| {
                             td.constructors.iter()
@@ -1041,7 +1041,7 @@ impl<'a> InferContext<'a> {
     fn type_all_ctors(&self, col_type: TypeHandle) -> Option<Vec<PatCtor>> {
         let resolved = self.arena.resolve(col_type);
         match self.arena.get(resolved) {
-            Ty::Adt(_) => {
+            Type::Adt(_) => {
                 let (type_name, _) = self.arena.adt_parts(resolved);
                 let type_def = self.sema_result.get_type_def(type_name)?;
                 if type_def.constructors.is_empty() {
@@ -1051,7 +1051,7 @@ impl<'a> InferContext<'a> {
                     .map(|c| PatCtor::Adt(c.name.clone()))
                     .collect())
             }
-            Ty::Bool => Some(vec![PatCtor::Bool(true), PatCtor::Bool(false)]),
+            Type::Bool => Some(vec![PatCtor::Bool(true), PatCtor::Bool(false)]),
             _ => None,
         }
     }
@@ -1160,7 +1160,7 @@ impl<'a> InferContext<'a> {
         let has_wild = matrix.iter().any(|r| !r.is_empty() && matches!(r[0], NormPat::Wild));
 
         match ty {
-            Ty::Adt(_) => {
+            Type::Adt(_) => {
                 let (type_name, _) = self.arena.adt_parts(resolved);
                 // Collect constructor names (cloned to release the borrow).
                 let ctor_names: Vec<Box<str>> = self.sema_result.get_type_def(type_name)
@@ -1191,7 +1191,7 @@ impl<'a> InferContext<'a> {
                 }
                 String::new()
             }
-            Ty::Bool => {
+            Type::Bool => {
                 if !seen.iter().any(|c| matches!(c, PatCtor::Bool(true))) {
                     ": missing `true`".to_string()
                 } else if !seen.iter().any(|c| matches!(c, PatCtor::Bool(false))) {
@@ -1243,7 +1243,7 @@ impl<'a> InferContext<'a> {
         // Only report non-exhaustive for types with finite constructor sets (ADT, Bool).
         // For infinite types (int, str, char, ...), preserve existing lenient behavior.
         let resolved = self.arena.resolve(scrutinee_ty);
-        let is_finite = matches!(self.arena.get(resolved), Ty::Adt(_) | Ty::Bool);
+        let is_finite = matches!(self.arena.get(resolved), Type::Adt(_) | Type::Bool);
 
         if is_finite && self.is_useful(&exhaust_matrix, &col_types, &[NormPat::Wild], 0) {
             let span = ast.expr(scrutinee).span;
@@ -1400,7 +1400,7 @@ impl<'a> InferContext<'a> {
                 None => {
                     let span = ast.ty(type_ref).span;
                     self.add_error_at("This type can only be used within type or trait methods", span.line, span.column);
-                    self.arena.make(Ty::Void)
+                    self.arena.make(Type::Void)
                 }
             },
             TypeNode::Generic { name, args } => {
@@ -1430,8 +1430,8 @@ impl<'a> InferContext<'a> {
                     }
                     return self.arena.make_generic((*name).into(), args_box);
                 }
-                // Builtin generic types (Throw/Atomic/Async/Channel, etc.) construct dedicated Ty variants
-                // and do not go through the Ty::Generic path — this avoids later matching builtin generics by string name.
+                // Builtin generic types (Throw/Atomic/Async/Channel, etc.) construct dedicated Type variants
+                // and do not go through the Type::Generic path — this avoids later matching builtin generics by string name.
                 if is_builtin_generic_type(name) {
                     return self.make_builtin_generic((*name).into(), args_box);
                 }
@@ -1473,7 +1473,7 @@ impl<'a> InferContext<'a> {
             }
             TypeNode::Record { fields } => {
                 if fields.is_empty() {
-                    return self.arena.make(Ty::Void);
+                    return self.arena.make(Type::Void);
                 }
                 let new_fields: Vec<FieldType> = fields
                     .iter()
@@ -1524,7 +1524,7 @@ impl<'a> InferContext<'a> {
     fn collect_free_vars(&self, ty: TypeHandle, free_vars: &mut Vec<u32>) {
         let resolved = self.arena.resolve(ty);
         match self.arena.get(resolved) {
-            Ty::TypeVar(idx) => {
+            Type::TypeVar(idx) => {
                 // A rigid var represents a generic parameter declaration (e.g. T in type ArrayIter<T>);
                 // it is fixed within the current scope and must not be freshened/instantiated.
                 // Collect only unbound non-rigid TypeVars (local inference variables).
@@ -1533,7 +1533,7 @@ impl<'a> InferContext<'a> {
                 }
             }
             // Skip Fn types: instantiation is handled by instantiate_fn_type at the call site.
-            Ty::Fn(_) => {}
+            Type::Fn(_) => {}
             // All other composite types delegate child traversal to `for_each_child`.
             _ => self
                 .arena
@@ -1579,22 +1579,22 @@ impl<'a> InferContext<'a> {
 
         // async function: the declared return type should be Async<X> and the body infers Async<Y>;
         // recursively unify the inner types X and Y.
-        if let (Ty::Async(_), Ty::Async(_)) = (declared_ty, inferred_ty) {
+        if let (Type::Async(_), Type::Async(_)) = (declared_ty, inferred_ty) {
             let da = self.arena.async_value(r_declared);
             let ia = self.arena.async_value(r_inferred);
             return self.unify_return_type(da, ia);
         }
         // async function body directly returns the inner value (not Async-wrapped):
         // declared Async<X>, body infers Y → recursively unify X with Y.
-        if let Ty::Async(_) = declared_ty {
+        if let Type::Async(_) = declared_ty {
             let da = self.arena.async_value(r_declared);
             return self.unify_return_type(da, r_inferred);
         }
 
         match declared_ty {
-            Ty::Nullable(_) => match inferred_ty {
-                Ty::Nullable(_) => self.arena.unify(declared, inferred),
-                Ty::Void => Ok(()), // The body produced no value; compatible with nullable.
+            Type::Nullable(_) => match inferred_ty {
+                Type::Nullable(_) => self.arena.unify(declared, inferred),
+                Type::Void => Ok(()), // The body produced no value; compatible with nullable.
                 _ => {
                     let inner_ty = self.arena.nullable_inner(r_declared);
                     match self.try_widen_unify(inner_ty, r_inferred) {
@@ -1603,14 +1603,14 @@ impl<'a> InferContext<'a> {
                     }
                 }
             },
-            Ty::Throw(_) => match inferred_ty {
-                Ty::Throw(_) => {
+            Type::Throw(_) => match inferred_ty {
+                Type::Throw(_) => {
                     match self.try_widen_unify(declared, inferred) {
                         Ok(_) => Ok(()),
                         Err(_) => self.arena.unify(declared, inferred),
                     }
                 }
-                Ty::Void => Ok(()), // The body produced no value; compatible with throw.
+                Type::Void => Ok(()), // The body produced no value; compatible with throw.
                 _ => {
                     let (vt, _) = self.arena.throw_parts(r_declared);
                     match self.try_widen_unify(vt, r_inferred) {
@@ -1646,8 +1646,8 @@ impl<'a> InferContext<'a> {
             let InferContext { arena, .. } = self;
             let ra = arena.resolve(t1);
             let rb = arena.resolve(t2);
-            let a_is_lazy = matches!(arena.get(ra), Ty::Lazy(_));
-            let b_is_lazy = matches!(arena.get(rb), Ty::Lazy(_));
+            let a_is_lazy = matches!(arena.get(ra), Type::Lazy(_));
+            let b_is_lazy = matches!(arena.get(rb), Type::Lazy(_));
             if a_is_lazy && !b_is_lazy {
                 let inner = arena.lazy_value(ra);
                 self.unify_or_constrain(inner, t2);
@@ -1683,10 +1683,10 @@ impl<'a> InferContext<'a> {
         let r2 = self.arena.resolve(t2);
 
         // never unifies with any type as the other type.
-        if matches!(self.arena.get(r1), Ty::Never) {
+        if matches!(self.arena.get(r1), Type::Never) {
             return Ok(r2);
         }
-        if matches!(self.arena.get(r2), Ty::Never) {
+        if matches!(self.arena.get(r2), Type::Never) {
             return Ok(r1);
         }
 
@@ -1699,11 +1699,11 @@ impl<'a> InferContext<'a> {
         // Async unfolding: Async<X> with Y (non-Async) → recursively unify X with Y.
         // Scenario: inside an async function body, Ok(void) returns Throw<void, '_E>,
         // expected is Async<Throw<void, IOError>>; the Async layer must be unfolded to solve '_E.
-        if let Ty::Async(_) = c1 {
+        if let Type::Async(_) = c1 {
             let inner = self.arena.async_value(r1);
             return self.try_widen_unify(inner, r2);
         }
-        if let Ty::Async(_) = c2 {
+        if let Type::Async(_) = c2 {
             let inner = self.arena.async_value(r2);
             return self.try_widen_unify(r1, inner);
         }
@@ -1713,8 +1713,8 @@ impl<'a> InferContext<'a> {
         // been attempted above and failed; numeric type pairs fall through to the match's _ branch and return TypeMismatch.
 
         match (c1, c2) {
-            (Ty::Nullable(_), _) => match c2 {
-                Ty::Nullable(_) => {
+            (Type::Nullable(_), _) => match c2 {
+                Type::Nullable(_) => {
                     let i1 = self.arena.resolve(self.arena.nullable_inner(r1));
                     let i2 = self.arena.resolve(self.arena.nullable_inner(r2));
                     match self.arena.unify(i1, i2) {
@@ -1722,7 +1722,7 @@ impl<'a> InferContext<'a> {
                         Err(_) => Err(UnifyError::TypeMismatch),
                     }
                 }
-                Ty::Void => Ok(r1), // void can be treated as the "empty" value of a nullable.
+                Type::Void => Ok(r1), // void can be treated as the "empty" value of a nullable.
                 _ => {
                     // nullable<T> is compatible with T.
                     let inner1_ty = self.arena.nullable_inner(r1);
@@ -1732,8 +1732,8 @@ impl<'a> InferContext<'a> {
                     }
                 }
             },
-            (Ty::Throw(_), _) => match c2 {
-                Ty::Throw(_) => {
+            (Type::Throw(_), _) => match c2 {
+                Type::Throw(_) => {
                     let (vt1, et1) = self.arena.throw_parts(r1);
                     let (vt2, et2) = self.arena.throw_parts(r2);
                     let v1 = self.arena.resolve(vt1);
@@ -1753,7 +1753,7 @@ impl<'a> InferContext<'a> {
                         }
                     }
                 }
-                Ty::Void => Ok(r1), // void can be treated as throw's "no value taken".
+                Type::Void => Ok(r1), // void can be treated as throw's "no value taken".
                 _ => {
                     // Throw<T, E> is compatible with T (value dimension only).
                     let (vt1_ty, _) = self.arena.throw_parts(r1);
@@ -1763,17 +1763,17 @@ impl<'a> InferContext<'a> {
                     }
                 }
             },
-            (Ty::Void, _) => match c2 {
-                Ty::Nullable(_) | Ty::Throw(_) => Ok(r2),
+            (Type::Void, _) => match c2 {
+                Type::Nullable(_) | Type::Throw(_) => Ok(r2),
                 _ => Err(UnifyError::TypeMismatch),
             },
-            (_, Ty::Nullable(_)) => {
+            (_, Type::Nullable(_)) => {
                 // T is compatible with nullable<T>; unify as nullable.
                 let inner2_ty = self.arena.nullable_inner(r2);
                 self.arena.unify(r1, inner2_ty)?;
                 Ok(r2)
             }
-            (_, Ty::Throw(_)) => {
+            (_, Type::Throw(_)) => {
                 // T is compatible with Throw<T, E>; unify as throw.
                 let (vt2_ty, _) = self.arena.throw_parts(r2);
                 self.arena.unify(r1, vt2_ty)?;
@@ -1802,8 +1802,8 @@ impl<'a> InferContext<'a> {
     ) -> TypeHandle {
         let ct = self.arena.get(resolved_inner);
         match ct {
-            Ty::Nullable(_) => self.arena.nullable_inner(resolved_inner),
-            Ty::Throw(_) => {
+            Type::Nullable(_) => self.arena.nullable_inner(resolved_inner),
+            Type::Throw(_) => {
                 let (value_type, error_type) = self.arena.throw_parts(resolved_inner);
                 // Unify error_type with the enclosing function's error_type (when the outer function is a throwing one).
                 // Kuzo allows `?` in non-throwing functions (panics/exits on failure); in that case error_type is not propagated.
@@ -1811,13 +1811,13 @@ impl<'a> InferContext<'a> {
                     let er_resolved = self.arena.resolve(er);
                     let er_ty = self.arena.get(er_resolved);
                     // async function: expected_return may be Async<Throw<V', E'>>.
-                    let outer_throw_handle = if let Ty::Async(_) = er_ty {
+                    let outer_throw_handle = if let Type::Async(_) = er_ty {
                         Some(self.arena.resolve(self.arena.async_value(er_resolved)))
                     } else {
                         None
                     };
                     let outer_resolved = outer_throw_handle.unwrap_or(er_resolved);
-                    if let Ty::Throw(_) = self.arena.get(outer_resolved) {
+                    if let Type::Throw(_) = self.arena.get(outer_resolved) {
                         let (_, outer_err) = self.arena.throw_parts(outer_resolved);
                         self.unify_or_constrain(error_type, outer_err);
                     }
@@ -1825,7 +1825,7 @@ impl<'a> InferContext<'a> {
                 }
                 value_type
             }
-            Ty::TypeVar(_) => {
+            Type::TypeVar(_) => {
                 // Operand type not yet determined; defer to the solver for later judgment.
                 // Return a fresh_type_var to avoid cascading false positives in downstream lookups.
                 self.arena.fresh_type_var()
@@ -1847,9 +1847,9 @@ impl<'a> InferContext<'a> {
         let resolved = self.arena.resolve(thrown_ty);
         let ct = self.arena.get(resolved);
         match ct {
-            Ty::TypeVar(_) => return,   // Deferred to the unification stage.
-            Ty::Throw(_) => return, // throw Error("...") returns Throw; legal.
-            Ty::Adt(_) | Ty::Generic(_) => return, // Error type (ordinary ADT).
+            Type::TypeVar(_) => return,   // Deferred to the unification stage.
+            Type::Throw(_) => return, // throw Error("...") returns Throw; legal.
+            Type::Adt(_) | Type::Generic(_) => return, // Error type (ordinary ADT).
             _ => return, // Permissive: throw is a general-purpose mechanism.
         }
     }
@@ -1857,12 +1857,12 @@ impl<'a> InferContext<'a> {
     // ── infer_expr / infer_stmt / infer_pattern placeholders (implemented below) ──
 
     /// Returns the TypeHandle for a builtin scalar type (helper).
-    fn make_builtin(&mut self, ty: Ty) -> TypeHandle {
+    fn make_builtin(&mut self, ty: Type) -> TypeHandle {
         self.arena.make(ty)
     }
 
-    /// Constructs the dedicated Ty variant for a builtin generic type (Throw/Channel/Async/Lazy/Atomic/Sender/Receiver).
-    /// Falls back to Ty::Generic on arity mismatch (fault-tolerant; sema already constrains builtin generic arity).
+    /// Constructs the dedicated Type variant for a builtin generic type (Throw/Channel/Async/Lazy/Atomic/Sender/Receiver).
+    /// Falls back to Type::Generic on arity mismatch (fault-tolerant; sema already constrains builtin generic arity).
     fn make_builtin_generic(&mut self, name: Box<str>, args: Box<[TypeHandle]>) -> TypeHandle {
         match name.as_ref() {
             "Throw" if args.len() == 2 => self.arena.make_throw(args[0], args[1]),
@@ -1969,8 +1969,8 @@ impl<'a> InferContext<'a> {
     fn unwrap_ref(&self, ty: TypeHandle) -> TypeHandle {
         let resolved = self.arena.resolve(ty);
         match self.arena.get(resolved) {
-            Ty::Ref(_) => self.arena.ref_parts(resolved).0,
-            Ty::Nullable(_) => self.arena.nullable_inner(resolved),
+            Type::Ref(_) => self.arena.ref_parts(resolved).0,
+            Type::Nullable(_) => self.arena.nullable_inner(resolved),
             _ => resolved,
         }
     }
@@ -1986,14 +1986,14 @@ impl<'a> InferContext<'a> {
     fn extract_iterator_element(&mut self, h: TypeHandle) -> Option<TypeHandle> {
         let ty = self.arena.get(h);
         match ty {
-            Ty::Array(_) => Some(self.arena.array_parts(h).0),
-            Ty::Str => Some(self.make_builtin(Ty::Char)),
-            Ty::Generic(_) => {
+            Type::Array(_) => Some(self.arena.array_parts(h).0),
+            Type::Str => Some(self.make_builtin(Type::Char)),
+            Type::Generic(_) => {
                 let (name, args) = self.arena.generic_parts(h);
                 match name {
                     // Standard iterators: ArrayIter<T>, Iter<T>, RangeIterator (no args; element is i64).
                     "ArrayIter" | "Iter" if args.len() == 1 => Some(args[0]),
-                    "RangeIterator" => Some(self.make_builtin(Ty::I64)),
+                    "RangeIterator" => Some(self.make_builtin(Type::I64)),
                     // Map iterators return Entry<K,V>.
                     "MapIter" | "MapKeys" | "MapValues" if args.len() == 1 => Some(args[0]),
                     "Map" if args.len() == 2 => {
@@ -2006,7 +2006,7 @@ impl<'a> InferContext<'a> {
                     _ => None,
                 }
             }
-            Ty::Throw(_) => Some(self.arena.throw_parts(h).0),
+            Type::Throw(_) => Some(self.arena.throw_parts(h).0),
             _ => None,
         }
     }
@@ -2025,10 +2025,10 @@ impl<'a> InferContext<'a> {
         let resolved = self.arena.resolve(ty);
         let ct = self.arena.get(resolved);
         let type_name: Option<String> = self.arena.type_name(resolved).map(|s| s.to_string());
-        let is_ref = matches!(ct, Ty::Ref(_));
-        let is_raw_ref = matches!(ct, Ty::Ref(_)) && self.arena.ref_parts(resolved).1;
+        let is_ref = matches!(ct, Type::Ref(_));
+        let is_raw_ref = matches!(ct, Type::Ref(_)) && self.arena.ref_parts(resolved).1;
 
-        let is_trait_object = matches!(ct, Ty::TraitObject(_));
+        let is_trait_object = matches!(ct, Type::TraitObject(_));
 
         let key = if let Some(ref ictx) = self.instantiation_ctx {
             // Instantiation mode: compute the key with the instance's module name; write to the instance-local staging table + global resolved_types.
@@ -2138,9 +2138,9 @@ impl<'a> InferContext<'a> {
                 numeric_lit!(self, suffix, expected, int_suffix_to_type, is_int, I32)
             }
             Expr::FloatLit { suffix, .. } => numeric_lit!(self, suffix, expected, float_suffix_to_type, is_float, F64),
-            Expr::BoolLit(_) => self.make_builtin(Ty::Bool),
-            Expr::CharLit(_) => self.make_builtin(Ty::Char),
-            Expr::StrLit(_) => self.make_builtin(Ty::Str),
+            Expr::BoolLit(_) => self.make_builtin(Type::Bool),
+            Expr::CharLit(_) => self.make_builtin(Type::Char),
+            Expr::StrLit(_) => self.make_builtin(Type::Str),
             Expr::StrInterp(parts) => {
                 // Recursively infer the sub-expressions inside the interpolation so their ExprInfo is registered in expr_types.
                 // Otherwise the IR compiler's `select_binary_compute_fn` falls back to "i32" when it cannot find the type,
@@ -2150,7 +2150,7 @@ impl<'a> InferContext<'a> {
                         let _ = self.infer_expr(*e, ast, env, None);
                     }
                 }
-                self.make_builtin(Ty::Str)
+                self.make_builtin(Type::Str)
             }
             Expr::NullLit => {
                 // The null literal has type Nullable<T>, where T is solved via the expected constraint.
@@ -2165,84 +2165,17 @@ impl<'a> InferContext<'a> {
                 }
                 ty
             }
-            Expr::VoidLit => self.make_builtin(Ty::Void),
+            Expr::VoidLit => self.make_builtin(Type::Void),
 
             // ── Identifiers ──
-            Expr::Ident(name) => {
-                // sema v2: prefer the flow-narrowing result (path-sensitive type refinement).
-                if let Some(narrowed_ty) = self.flow_ctx.lookup_narrowed(name) {
-                    return narrowed_ty;
-                }
-                // Resolution order inside a method body (current_this_type non-empty):
-                //   1. lookup_local  — local variables and parameters only (no parent traversal)
-                //   2. For concrete types: try_implicit_this_field — fields before methods
-                //      (prevents same-named methods in the parent env from shadowing fields)
-                //   3. env.lookup    — full chain (methods, top-level functions)
-                //   4. For trait default methods (TypeVar): try_implicit_this_field — permissive
-                //      fallback for fields that can't be verified at trait definition time
-                let this_ty_opt = self.current_this_type();
-                if let Some(this_ty) = this_ty_opt {
-                    // 1. Local variables and parameters only.
-                    if let Some(scheme) = self.env.lookup_local(env, name) {
-                        return self.freshen_type(scheme);
-                    }
-                    let is_typevar = matches!(
-                        self.arena.get(self.arena.resolve(this_ty)),
-                        Ty::TypeVar(_)
-                    );
-                    // 2. Concrete types: fields take precedence over same-named methods.
-                    if !is_typevar {
-                        if let Some(field_ty) = self.try_implicit_this_field(this_ty, name) {
-                            self.pending_implicit_this = Some((
-                                expr,
-                                crate::sema::Sema::ImplicitThisAccess::Field((*name).to_string().into_boxed_str()),
-                            ));
-                            return field_ty;
-                        }
-                    }
-                    // 3. Full lookup (methods registered in parent env, top-level functions).
-                    if let Some(scheme) = self.env.lookup(env, name) {
-                        return self.freshen_type(scheme);
-                    }
-                    // 4. Trait default methods: permissive field fallback (TypeVar can't
-                    //    verify field existence; deferred to monomorphization).
-                    if is_typevar {
-                        if let Some(field_ty) = self.try_implicit_this_field(this_ty, name) {
-                            self.pending_implicit_this = Some((
-                                expr,
-                                crate::sema::Sema::ImplicitThisAccess::Field((*name).to_string().into_boxed_str()),
-                            ));
-                            return field_ty;
-                        }
-                    }
-                } else {
-                    // Outside methods: full env lookup.
-                    if let Some(scheme) = self.env.lookup(env, name) {
-                        return self.freshen_type(scheme);
-                    }
-                }
-                // Instantiation mode: the temporary InferContext's env does not contain module-level declarations;
-                // query sema_result instead (already resolved in the HM stage).
-                if self.instantiation_ctx.is_some() {
-                    // Look up from expr_types (the expression's type was already resolved in the HM stage).
-                    let key = module_expr_key(&self.current_module_name, expr.0 as u64);
-                    if let Some(info) = self.sema_result.get_expr(key) {
-                        return info.ty;
-                    }
-                    // In instantiation mode, do not report an error; return a fresh_type_var.
-                    return self.arena.fresh_type_var();
-                }
-                let span = ast.expr(expr).span;
-                self.add_error_at(&format!("undefined variable '{}'", name), span.line, span.column);
-                self.arena.fresh_type_var()
-            }
+            Expr::Ident(_) => self.infer_ident_expr(expr, ast, env),
 
             // ── Assignment ──
             Expr::Assign { target, value } => {
                 let target_ty = self.infer_expr(*target, ast, env, None);
                 let val_ty = self.infer_expr(*value, ast, env, Some(target_ty));
                 self.unify_or_constrain(target_ty, val_ty);
-                self.make_builtin(Ty::Void)
+                self.make_builtin(Type::Void)
             }
             Expr::CompoundAssign { target, value, .. } => {
                 let target_ty = self.infer_expr(*target, ast, env, None);
@@ -2252,128 +2185,7 @@ impl<'a> InferContext<'a> {
             }
 
             // ── Binary operations ──
-            Expr::Binary { op, lhs, rhs } => {
-                let left_ty = self.infer_expr(*lhs, ast, env, None);
-                let right_ty = self.infer_expr(*rhs, ast, env, None);
-                let left_is_lit = Self::expr_is_literal(ast, *lhs);
-                let right_is_lit = Self::expr_is_literal(ast, *rhs);
-                let bin_span = ast.expr(expr).span;
-                // Lazy<T> subsumption: unwrap Lazy to inner type for binary operations.
-                // `lazy(1i32) + 3i32` treats the left operand as i32.
-                let left_unwrapped = {
-                    let rl = self.arena.resolve(left_ty);
-                    if matches!(self.arena.get(rl), Ty::Lazy(_)) {
-                        self.arena.lazy_value(rl)
-                    } else {
-                        left_ty
-                    }
-                };
-                let right_unwrapped = {
-                    let rr = self.arena.resolve(right_ty);
-                    if matches!(self.arena.get(rr), Ty::Lazy(_)) {
-                        self.arena.lazy_value(rr)
-                    } else {
-                        right_ty
-                    }
-                };
-                match op {
-                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
-                        let rl = self.arena.resolve(left_unwrapped);
-                        let rr = self.arena.resolve(right_unwrapped);
-                        if self.arena.get(rl).is_numeric() && self.arena.get(rr).is_numeric() {
-                            // Bug #73/#74: strict numeric type checking.
-                            // - Bare literals (no suffix) can be promoted freely.
-                            // - Explicitly typed operands (suffixed literals or variables)
-                            //   require explicit cast for different bit widths or int/float crossing.
-                            self.check_numeric_binop_compat(ast, *lhs, *rhs, rl, rr, bin_span);
-                            // v2 convergence: peer_type_binary replaces literal_promotion;
-                            // literal promotion rules are inlined into peer_type_binary.
-                            return peer_type_binary(
-                                self.arena,
-                                left_unwrapped,
-                                right_unwrapped,
-                                left_is_lit,
-                                right_is_lit,
-                            );
-                        }
-                        self.unify_or_constrain(left_unwrapped, right_unwrapped);
-                        left_unwrapped
-                    }
-                    BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::RefEq | BinaryOp::RefNeq
-                    | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
-                        let rl = self.arena.resolve(left_unwrapped);
-                        let rr = self.arena.resolve(right_unwrapped);
-                        if self.arena.get(rl).is_numeric() && self.arena.get(rr).is_numeric() {
-                            // Bug #73/#74: same strict checking for comparison ops.
-                            self.check_numeric_binop_compat(ast, *lhs, *rhs, rl, rr, bin_span);
-                            // v2 convergence: comparison ops use peer_type_binary to unify operand types.
-                            let _ = peer_type_binary(
-                                self.arena,
-                                left_unwrapped,
-                                right_unwrapped,
-                                left_is_lit,
-                                right_is_lit,
-                            );
-                        } else {
-                            self.unify_or_constrain(left_unwrapped, right_unwrapped);
-                        }
-                        self.make_builtin(Ty::Bool)
-                    }
-                    BinaryOp::And | BinaryOp::Or => {
-                        let bool_ty = self.make_builtin(Ty::Bool);
-                        self.unify_or_constrain(left_unwrapped, bool_ty);
-                        self.unify_or_constrain(right_unwrapped, bool_ty);
-                        bool_ty
-                    }
-                    BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
-                    | BinaryOp::Shl | BinaryOp::Shr => {
-                        self.unify_or_constrain(left_unwrapped, right_unwrapped);
-                        left_unwrapped
-                    }
-                    BinaryOp::ConcatList => {
-                        // Array concatenation a ++ b: left and right element types must match; the result reuses the left operand's element type.
-                        // Avoids creating an orphan fresh_type_var (res_elem would have no constraint to the inputs).
-                        let left_elem = self.arena.fresh_type_var();
-                        let left_arr = self.arena.make_array(left_elem, None);
-                        self.unify_or_constrain(left_unwrapped, left_arr);
-                        let right_arr = self.arena.make_array(left_elem, None);
-                        self.unify_or_constrain(right_unwrapped, right_arr);
-                        self.arena.make_array(left_elem, None)
-                    }
-                    BinaryOp::Range | BinaryOp::RangeInclusive => {
-                        // Range expressions a..b / a..=b return a RangeIterator type
-                        // (Range is itself an iterator; For loops statically dispatch through RangeIterator.next).
-                        let i64_ty = self.make_builtin(Ty::I64);
-                        if let Err(e) = self.try_widen_unify(i64_ty, left_unwrapped) {
-                            self.add_error(&format!("range operand must be integer: {}", e));
-                        }
-                        let i64_ty = self.make_builtin(Ty::I64);
-                        if let Err(e) = self.try_widen_unify(i64_ty, right_unwrapped) {
-                            self.add_error(&format!("range operand must be integer: {}", e));
-                        }
-                        self.arena.make_generic(
-                            "RangeIterator".into(),
-                            Box::new([]),
-                        )
-                    }
-                    BinaryOp::Elvis => {
-                        let rl = self.arena.resolve(left_ty);
-                        if let Ty::Nullable(_) = self.arena.get(rl) {
-                            return self.arena.nullable_inner(rl);
-                        }
-                        // Throw<T,E> ?? rhs → returns T (the Ok value type), symmetric with Nullable (Bug #28).
-                        if let Ty::Throw(_) = self.arena.get(rl) {
-                            let value_ty = self.arena.throw_parts(rl).0;
-                            // Unify rhs with value_ty to ensure the default value's type is compatible.
-                            if let Err(e) = self.try_widen_unify(value_ty, right_ty) {
-                                self.add_error(&format!("?? default value incompatible with Throw value type: {}", e));
-                            }
-                            return value_ty;
-                        }
-                        left_ty
-                    }
-                }
-            }
+            Expr::Binary { .. } => self.infer_binary_expr(expr, ast, env),
 
             // ── Unary operations ──
             Expr::Unary { operand, .. } => {
@@ -2391,502 +2203,17 @@ impl<'a> InferContext<'a> {
                 let operand_ty = self.infer_expr(*operand, ast, env, None);
                 let resolved = self.arena.resolve(operand_ty);
                 match self.arena.get(resolved) {
-                    Ty::Ref(_) => self.arena.ref_parts(resolved).0,
+                    Type::Ref(_) => self.arena.ref_parts(resolved).0,
                     _ => operand_ty, // Dereferencing a non-reference: return the original type.
                 }
             }
 
             // ── Function calls ──
-            Expr::Call { callee, args, type_args } => {
-                // cast call resolution: __cast_to<T>(x) / __cast_try_to<T>(x).
-                // The parser lowers cast(x).to(T) into an ordinary __cast_to<T>(x) Call;
-                // sema infers the source type S and returns T (or Throw<T, CastError> for try_to).
-                // Lookup goes through the CAST_BUILTINS registry, avoiding name-specific branches.
-                if let Expr::Ident(name) = &ast.expr(*callee).node {
-                    if let Some(is_try) = CAST_BUILTINS
-                        .iter()
-                        .find_map(|(n, t)| (*n == *name).then_some(*t))
-                    {
-                        // Infer the source expression's type.
-                        let _ = self.infer_expr(args[0], ast, env, None);
-                        // Take the target type T from type_args.
-                        let target_ty = match type_args {
-                            Some(ta) if !ta.is_empty() => self.type_from_ast(ta[0], ast),
-                            _ => self.arena.fresh_type_var(),
-                        };
-                        if is_try {
-                            let err_ty = self.arena.make_adt(
-                                "CastError".into(),
-                                Box::new([]),
-                            );
-                            return self.arena.make_throw(target_ty, err_ty);
-                        }
-                        return target_ty;
-                    }
-                }
-
-                // ── Constructor multi-mapping disambiguation ──
-                // When callee is an Ident that maps to multiple same-named constructors, disambiguate by priority:
-                //   1. Type-oriented: when expected_ty is an Adt, select by type_name
-                //   2. Arity: when type-oriented disambiguation fails (expected is a TypeVar or not provided),
-                //      select the unique constructor matching by arity
-                let callee_ty = if let Expr::Ident(name) = &ast.expr(*callee).node {
-                    let ctors = self.sema_result.get_ctor_defs(name);
-                    if ctors.len() > 1 {
-                        let selected: Option<(Box<str>, Box<[TypeRepr]>)> = {
-                            let mut found: Option<&CtorDefInfo> = None;
-                            // 1. Type-oriented disambiguation
-                            if let Some(exp) = expected {
-                                let exp_resolved = self.arena.resolve(exp);
-                                if let Ty::Adt(_) = self.arena.get(exp_resolved) {
-                                    let (exp_type_name, _) = self.arena.adt_parts(exp_resolved);
-                                    let matches: Vec<_> = ctors.iter()
-                                        .filter(|c| c.type_name.as_ref() == exp_type_name)
-                                        .collect();
-                                    if matches.len() == 1 {
-                                        found = Some(matches[0]);
-                                    }
-                                }
-                            }
-                            // 2. Arity disambiguation (fallback when type-oriented fails)
-                            if found.is_none() {
-                                let arity_matches: Vec<_> = ctors.iter()
-                                    .filter(|c| c.field_type_reprs.len() == args.len())
-                                    .collect();
-                                if arity_matches.len() == 1 {
-                                    found = Some(arity_matches[0]);
-                                }
-                            }
-                            found.map(|c| (c.type_name.clone(), c.field_type_reprs.clone()))
-                        };
-                        match selected {
-                            Some((type_name, field_type_reprs)) => {
-                                let param_types: Vec<TypeHandle> = field_type_reprs
-                                    .iter()
-                                    .map(|r| self.type_repr_to_handle(r))
-                                    .collect();
-                                let ret_ty = self.arena.make_adt(type_name, Box::new([]));
-                                if param_types.is_empty() {
-                                    ret_ty
-                                } else {
-                                    self.arena.make_fn(param_types.into_boxed_slice(), ret_ty)
-                                }
-                            }
-                            None => {
-                                let span = ast.expr(expr).span;
-                                let type_names: Vec<&str> = ctors.iter()
-                                    .map(|c| c.type_name.as_ref())
-                                    .collect();
-                                self.add_error_at(
-                                    &format!(
-                                        "ambiguous constructor '{}': defined by types [{}]; use Type.{} to disambiguate or provide a type context",
-                                        name,
-                                        type_names.join(", "),
-                                        name,
-                                    ),
-                                    span.line,
-                                    span.column,
-                                );
-                                self.arena.fresh_type_var()
-                            }
-                        }
-                    } else if ctors.len() == 1
-                        && args.is_empty()
-                        && ctors[0].field_type_reprs.is_empty()
-                    {
-                        // Bug #69: Zero-arg constructor called with `()` syntax.
-                        // Zero-arg constructors are registered as values (ADT type), not
-                        // function types, so `Unit()` is equivalent to the bare value `Unit`.
-                        let ret_ty = self.arena.make_adt(
-                            ctors[0].type_name.clone(),
-                            Box::new([]),
-                        );
-                        if let Some(exp) = expected {
-                            self.unify_or_constrain(ret_ty, exp);
-                        }
-                        ret_ty
-                    } else {
-                        // [Implicit this] Try resolving as this.method(args) before
-                        // falling through to infer_expr (which would report undefined).
-                        if let Some(this_ty) = self.current_this_type() {
-                            if let Some(fn_ty) = self.lookup_method_type(this_ty, name) {
-                                let inst_fn = self.instantiate_fn_type(fn_ty);
-                                if let Ty::Fn(_) = self.arena.get(inst_fn) {
-                                    let (params, return_type) = self.arena.fn_parts(inst_fn);
-                                    let params: Vec<TypeHandle> = params.to_vec();
-                                    // Skip params[0] (this), match args with params[1..].
-                                    let n = params.len().min(args.len() + 1);
-                                    for i in 1..n {
-                                        let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
-                                        self.unify_or_constrain(params[i], arg_ty);
-                                    }
-                                    // Store callee's ExprInfo so that pending_implicit_this
-                                    // (flushed in infer_expr) can attach the implicit_this marker.
-                                    // Without this, the marker is lost because we bypass
-                                    // infer_expr(callee) on this fast path.
-                                    self.store_expr_info(*callee, fn_ty);
-                                    self.pending_implicit_this = Some((
-                                        *callee,
-                                        crate::sema::Sema::ImplicitThisAccess::Method((*name).to_string().into_boxed_str()),
-                                    ));
-                                    return return_type;
-                                }
-                            }
-                        }
-                        self.infer_expr(*callee, ast, env, None)
-                    }
-                } else {
-                    self.infer_expr(*callee, ast, env, None)
-                };
-                let resolved_callee = self.arena.resolve(callee_ty);
-
-                // Instantiation mode: skip HM unify (types were already checked in the sema HM stage);
-                // only infer argument types and return the return type. Monomorphization triggers are orchestrated externally.
-                if self.instantiation_ctx.is_some() {
-                    // ModuleRef call: look up the function signature from the module env.
-                    if let Ty::ModuleRef(_) = self.arena.get(resolved_callee) {
-                        let (path, module_env) = self.arena.module_ref_parts(resolved_callee);
-                        if let Some(func_name) = path.rsplit('.').next() {
-                            if let Some(fn_ty) = self.env.lookup_local(module_env, func_name) {
-                                let inst_fn = self.instantiate_fn_type(fn_ty);
-                                if let Ty::Fn(_) = self.arena.get(inst_fn) {
-                                    let (params, return_type) = self.arena.fn_parts(inst_fn);
-                                    let params: Vec<TypeHandle> = params.to_vec();
-                                    for (&param_ty, &arg) in params.iter().zip(args.iter()) {
-                                        let _ = self.infer_expr(arg, ast, env, Some(param_ty));
-                                    }
-                                    return return_type;
-                                }
-                            }
-                        }
-                    }
-                    // Ordinary function call: infer argument types and return the return type.
-                    let inst_callee = self.instantiate_fn_type(resolved_callee);
-                    if let Ty::Fn(_) = self.arena.get(inst_callee) {
-                        let (params, return_type) = self.arena.fn_parts(inst_callee);
-                        let params: Vec<TypeHandle> = params.to_vec();
-                        for (&param_ty, &arg) in params.iter().zip(args.iter()) {
-                            let _ = self.infer_expr(arg, ast, env, Some(param_ty));
-                        }
-                        return return_type;
-                    }
-                    // Non-Fn callee: report an error and return Unknown.
-                    let span = ast.expr(expr).span;
-                    let callee_name = self
-                        .arena
-                        .type_name(resolved_callee)
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("{:?}", self.arena.get(resolved_callee)));
-                    self.add_error_at(
-                        &format!("cannot call non-function value of type '{}'", callee_name),
-                        span.line,
-                        span.column,
-                    );
-                    for &a in args.iter() {
-                        let _ = self.infer_expr(a, ast, env, None);
-                    }
-                    return self.arena.make(Ty::Unknown);
-                }
-
-                // ModuleRef call: callee is a module path reference (e.g. "std.reflect.Reflect.format");
-                // look up the function signature by its trailing bare name directly in the module env carried by the ModuleRef (no parent-env traversal).
-                if let Ty::ModuleRef(_) = self.arena.get(resolved_callee) {
-                    let (path, module_env) = self.arena.module_ref_parts(resolved_callee);
-                    // The trailing segment is the function name (e.g. "std.reflect.Reflect.format" → "format").
-                    if let Some(func_name) = path.rsplit('.').next() {
-                        if let Some(fn_ty) = self.env.lookup_local(module_env, func_name) {
-                            // Instantiate the polymorphic function type to avoid type-constraint clashes across calls.
-                            let inst_fn = self.instantiate_fn_type(fn_ty);
-                            if let Ty::Fn(_) = self.arena.get(inst_fn) {
-                                let (params, return_type) = self.arena.fn_parts(inst_fn);
-                                let params: Vec<TypeHandle> = params.to_vec();
-                                if params.len() == args.len() {
-                                    for (&param_ty, &arg) in params.iter().zip(args.iter()) {
-                                        let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
-                                        if let Err(e) = self.try_widen_unify(param_ty, arg_ty) {
-                                            self.add_error(&format!("argument type incompatible with parameter type: {}", e));
-                                        }
-                                    }
-                                    return return_type;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Instantiate the polymorphic function type (replace rigid vars / unbound TypeVars with fresh non-rigid vars)
-                // so each call has its own type variables, avoiding type-constraint clashes across calls.
-                let inst_callee = self.instantiate_fn_type(resolved_callee);
-                if let Ty::Fn(_) = self.arena.get(inst_callee) {
-                    let (params, return_type) = self.arena.fn_parts(inst_callee);
-                    let params: Vec<TypeHandle> = params.to_vec();
-                    if params.len() == args.len() {
-                        for (&param_ty, &arg) in params.iter().zip(args.iter()) {
-                            let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
-                            // On unify failure, register a constraint (rather than discarding) so the fixpoint iteration can solve the argument type.
-                            self.unify_or_constrain(param_ty, arg_ty);
-                        }
-                    }
-                    // Always return the declared return type, to avoid cascading type loss from argument mismatches.
-                    // If there is an expected type, unify the return type with it to solve pending TypeVars in the return type
-                    // (e.g. Ok(void) returns Throw<void, '_E>; expected=Throw<void, IOError> solves E=IOError).
-                    if let Some(exp) = expected {
-                        self.unify_or_constrain(return_type, exp);
-                    }
-                    return return_type;
-                }
-                // Fallback: infer all arguments and unify the callee with (args -> ret).
-                let ret_ty = self.arena.fresh_type_var();
-                let arg_types: Vec<TypeHandle> = args
-                    .iter()
-                    .map(|&a| self.infer_expr(a, ast, env, None))
-                    .collect();
-                let expected_fn = self.arena.make_fn(
-                    arg_types.into_boxed_slice(),
-                    ret_ty,
-                );
-                self.unify_or_constrain(callee_ty, expected_fn);
-                ret_ty
-            }
+            Expr::Call { .. } => self.infer_call_expr(expr, ast, env, expected),
 
             // ── Method calls ──
-            Expr::MethodCall { recv, method, args, .. }
-            | Expr::SafeMethodCall { recv, method, args, .. } => {
-                // Qualified-name syntax: Type.Ctor(args) (qualified call of a constructor with arguments)
-                if let Expr::Ident(type_name) = &ast.expr(*recv).node {
-                    if let Some((ctor_type_name, field_type_reprs)) =
-                        self.check_qualified_ctor(type_name, method)
-                    {
-                        if !field_type_reprs.is_empty() {
-                            // Constructor with arguments: build a function type and go through call inference
-                            let param_types: Vec<TypeHandle> = field_type_reprs
-                                .iter()
-                                .map(|r| self.type_repr_to_handle(r))
-                                .collect();
-                            let ret_ty = self.arena.make_adt(ctor_type_name, Box::new([]));
-                            let fn_ty = self.arena.make_fn(
-                                param_types.into_boxed_slice(),
-                                ret_ty,
-                            );
-                            let (params, return_type) = self.arena.fn_parts(fn_ty);
-                            let params: Vec<TypeHandle> = params.to_vec();
-                            if params.len() == args.len() {
-                                for (&param_ty, &arg) in params.iter().zip(args.iter()) {
-                                    let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
-                                    self.unify_or_constrain(param_ty, arg_ty);
-                                }
-                            }
-                            if let Some(exp) = expected {
-                                self.unify_or_constrain(return_type, exp);
-                            }
-                            // Mark recv as module-func-recv (skip recv during IR compilation)
-                            let recv_key = crate::sema::Sema::module_expr_key(
-                                &self.current_module_name,
-                                recv.0 as u64,
-                            );
-                            self.sema_result.module_func_recv_exprs.insert(recv_key);
-                            return return_type;
-                        }
-                        // Zero-argument constructor in MethodCall: report an error
-                        let span = ast.expr(expr).span;
-                        self.add_error_at(
-                            &format!(
-                                "constructor '{}' of type '{}' takes no arguments; use {}.{} syntax",
-                                method, type_name, type_name, method
-                            ),
-                            span.line,
-                            span.column,
-                        );
-                        return self.arena.fresh_type_var();
-                    }
-                }
-
-                let recv_ty = self.infer_expr(*recv, ast, env, None);
-
-                // Path 0a: ModuleRef recv → module-path function call.
-                // When recv is a ModuleRef (e.g. std.net.UdpSocket), method is a top-level function in that module;
-                // look it up by its bare name directly in the module env carried by the ModuleRef (no parent-env traversal).
-                let recv_resolved_0a = self.arena.resolve(recv_ty);
-                if let Ty::ModuleRef(_) = self.arena.get(recv_resolved_0a) {
-                    let (mod_path, module_env) = self.arena.module_ref_parts(recv_resolved_0a);
-                    let found = self.env.lookup_local(module_env, method);
-                    // Directory-module semantics: when lookup_local misses in the current module env,
-                    // search sibling modules in the same directory (e.g. Math.sqrt where sqrt lives in Power.kz,
-                    // with Math and Power both under the std.math directory).
-                    let found = found.or_else(|| {
-                        self.lookup_sibling_module_fn(mod_path, module_env, method)
-                    });
-                    if let Some(fn_ty) = found {
-                        let inst_fn = self.instantiate_fn_type(fn_ty);
-                        if let Ty::Fn(_) = self.arena.get(inst_fn) {
-                            let (params, return_type) = self.arena.fn_parts(inst_fn);
-                            let params: Vec<TypeHandle> = params.to_vec();
-                            let n = params.len().min(args.len());
-                            for i in 0..n {
-                                let arg_ty = self.infer_expr(args[i], ast, env, Some(params[i]));
-                                self.unify_or_constrain(params[i], arg_ty);
-                            }
-                            // Mark recv as a module-function-call receiver so IR compilation does not pass recv.
-                            // (Consistent with path 0b: ModuleRef recv has Module.fun(args) semantics.)
-                            let recv_key = module_expr_key(
-                                &self.current_module_name,
-                                recv.0 as u64,
-                            );
-                            self.sema_result.module_func_recv_exprs.insert(recv_key);
-                            return return_type;
-                        }
-                    }
-                }
-
-                // Path 0b: constructor recv (type name == module name) → module function call (Zig-style @This semantics).
-                // When recv is a type constructor (Fn, with return_type Adt) and the type name matches a module name,
-                // look up free functions by the method's bare name in that module's env.
-                // Typical scenario: after `import std.time.Duration`, Duration.from_millis(100),
-                // where Duration is both a type and a module (file with the same name; predefine redefine overwrote the ModuleRef).
-                if let Ty::Fn(_) = self.arena.get(recv_resolved_0a) {
-                    let (_, ret_ty) = self.arena.fn_parts(recv_resolved_0a);
-                    let ret_resolved = self.arena.resolve(ret_ty);
-                    if let Ty::Adt(_) = self.arena.get(ret_resolved) {
-                        let (type_name, _) = self.arena.adt_parts(ret_resolved);
-                        if let Some(&mod_env) = self.ctor_module_envs.get(type_name) {
-                            if let Some(fn_ty) = self.env.lookup_local(mod_env, method) {
-                                let inst_fn = self.instantiate_fn_type(fn_ty);
-                                if let Ty::Fn(_) = self.arena.get(inst_fn) {
-                                    let (params, return_type) = self.arena.fn_parts(inst_fn);
-                                    let params: Vec<TypeHandle> = params.to_vec();
-                                    let n = params.len().min(args.len());
-                                    for i in 0..n {
-                                        let arg_ty = self.infer_expr(args[i], ast, env, Some(params[i]));
-                                        self.unify_or_constrain(params[i], arg_ty);
-                                    }
-                                    // Mark recv as a module-function-call receiver so IR compilation does not pass recv.
-                                    let recv_key = module_expr_key(
-                                        &self.current_module_name,
-                                        recv.0 as u64,
-                                    );
-                                    self.sema_result.module_func_recv_exprs.insert(recv_key);
-                                    return return_type;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Language-level intrinsic tagging: await/recv are recognized uniformly by sema
-                // and registered into method_dispatches for IR consumption (eliminates IR-side string guards).
-                // await is a general suspend semantic (for all types); recv is tagged only for Channel/Receiver types.
-                {
-                    let intrinsic = if *method == "await" && args.is_empty() {
-                        Some(crate::sema::Sema::IntrinsicKind::Await)
-                    } else if *method == "recv" && args.is_empty() {
-                        match self.arena.get(recv_resolved_0a) {
-                            Ty::Channel(_) | Ty::Receiver(_) => {
-                                Some(crate::sema::Sema::IntrinsicKind::ChannelAwait)
-                            }
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                    if intrinsic.is_some() {
-                        let key = crate::sema::Sema::module_expr_key(
-                            &self.current_module_name,
-                            expr.0 as u64,
-                        );
-                        self.sema_result.method_dispatches.insert(
-                            key,
-                            crate::sema::Sema::DispatchInfo {
-                                trait_id: 0,
-                                method_idx: 0,
-                                impl_fn_idx: 0,
-                                instance_id: 0,
-                                intrinsic,
-                            },
-                        );
-                    }
-                }
-
-                // Path 1 (preferred): type-aware method lookup.
-                // lookup_method_type looks up the receiver's type against witness_table / func_sigs / builtin methods,
-                // ensuring same-named methods (e.g. Instant.add_duration vs DateTime.add_duration) dispatch to the correct signature.
-                let method_fn_ty = self.lookup_method_type(recv_ty, method);
-                if let Some(fn_ty) = method_fn_ty {
-                    let inst_fn = self.instantiate_fn_type(fn_ty);
-                    if let Ty::Fn(_) = self.arena.get(inst_fn) {
-                        let (params, return_type) = self.arena.fn_parts(inst_fn);
-                        let params: Vec<TypeHandle> = params.to_vec();
-                        // The first parameter is self; skip it.
-                        let n = params.len().min(args.len() + 1);
-                        for i in 1..n {
-                            let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
-                            self.unify_or_constrain(params[i], arg_ty);
-                        }
-                        return return_type;
-                    }
-                }
-
-                // Path 0 (fallback): look up a binding named after the method as an Fn type in env (free function with a self parameter).
-                // Use lookup_with_pred to skip same-named non-function bindings (e.g. a local variable shadowing a free function).
-                // In Kuzo `recv.method(args)` is sugar for `method(recv, args)`.
-                if let Some(fn_ty) = self.env.lookup_with_pred(env, method, |ty| {
-                    let r = self.arena.resolve(ty);
-                    matches!(self.arena.get(r), Ty::Fn(_))
-                }) {
-                    let inst_fn = self.instantiate_fn_type(fn_ty);
-                    if let Ty::Fn(_) = self.arena.get(inst_fn) {
-                        let (params, return_type) = self.arena.fn_parts(inst_fn);
-                        let params: Vec<TypeHandle> = params.to_vec();
-                        // The first parameter is self/receiver: unify recv with params[0].
-                        // This lets the free function's generic parameters be inferred from the receiver's type (e.g. iter<T> infers T from arr: T[]).
-                        if !params.is_empty() {
-                            self.unify_or_constrain(params[0], recv_ty);
-                        }
-                        // The remaining parameters are inferred from args.
-                        let n = params.len().min(args.len() + 1);
-                        for i in 1..n {
-                            let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
-                            self.unify_or_constrain(params[i], arg_ty);
-                        }
-                        return return_type;
-                    }
-                }
-
-                // await is a general suspend semantic: it produces no value; it only suspends the frame waiting for an event.
-                // The IR layer uses infer_event_source_kind to decide the event-source kind based on the recv type
-                // (AsyncJoin/Channel/Timer); the Sema layer uniformly returns void.
-                if *method == "await" && args.is_empty() {
-                    return self.make_builtin(Ty::Void);
-                }
-
-                // Fallback: infer arguments and return a fresh var.
-                // For a receiver whose type is already determined (not TypeVar/Unknown/Never), report "method does not exist"
-                // to help the user locate the problem; for a TypeVar receiver, silently return a fresh var (inference pending, deferred to the solver).
-                let span = ast.expr(expr).span;
-                let recv_resolved = self.arena.resolve(recv_ty);
-                match self.arena.get(recv_resolved) {
-                    Ty::TypeVar(_) | Ty::Unknown | Ty::Never => {
-                        // Receiver type pending; silently return a fresh var.
-                    }
-                    Ty::Void => {
-                        // void receiver: handled by the IR layer (void method call).
-                    }
-                    ct => {
-                        // Receiver type is determined but method lookup failed: report an error.
-                        let recv_name = self.arena.type_name(recv_resolved)
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| format!("{:?}", ct));
-                        self.add_error_at(
-                            &format!("no method '{}' on type '{}'", method, recv_name),
-                            span.line,
-                            span.column,
-                        );
-                    }
-                }
-                for &a in args.iter() {
-                    let _ = self.infer_expr(a, ast, env, None);
-                }
-                self.arena.fresh_type_var()
-            }
+            Expr::MethodCall { .. }
+            | Expr::SafeMethodCall { .. } => self.infer_method_call_expr(expr, ast, env, expected),
 
             // ── Field access ──
             Expr::FieldAccess { recv, field } => {
@@ -2918,7 +2245,7 @@ impl<'a> InferContext<'a> {
                 // On hit, record recv's expr key → mangled name (module_path.field) into
                 // module_const_recv_exprs, so IR compilation skips recv and emits a global_load directly.
                 let recv_resolved = self.arena.resolve(recv_ty);
-                if let Ty::ModuleRef(_) = self.arena.get(recv_resolved) {
+                if let Type::ModuleRef(_) = self.arena.get(recv_resolved) {
                     let (path, module_env) = self.arena.module_ref_parts(recv_resolved);
                     if self.env.lookup_local(module_env, field).is_some() {
                         let mangled = format!("{}.{}", path, field);
@@ -2936,7 +2263,7 @@ impl<'a> InferContext<'a> {
                 let recv_ty = self.infer_expr(*recv, ast, env, None);
                 let resolved = self.arena.resolve(recv_ty);
                 // SafeAccess `?.` is only meaningful for Nullable/Ref; for other types it degrades to an ordinary field access.
-                let is_nullable = matches!(self.arena.get(resolved), Ty::Nullable(_));
+                let is_nullable = matches!(self.arena.get(resolved), Type::Nullable(_));
                 let inner = self.unwrap_ref(recv_ty);
                 let span = ast.expr(expr).span;
                 let field_ty = self.lookup_field_type(inner, field, span.line, span.column);
@@ -2954,9 +2281,9 @@ impl<'a> InferContext<'a> {
                 let _ = self.infer_expr(*index, ast, env, None);
                 let resolved = self.arena.resolve(recv_ty);
                 match self.arena.get(resolved) {
-                    Ty::Array(_) => self.arena.array_parts(resolved).0,
+                    Type::Array(_) => self.arena.array_parts(resolved).0,
                     // Str indexing returns Char (stdlib uses patterns like normalized[0] == '/').
-                    Ty::Str => self.arena.make(Ty::Char),
+                    Type::Str => self.arena.make(Type::Char),
                     // Unknown/TypeVar/Generic/Adt, etc. do not report errors:
                     // sema v2 does not always infer variable types precisely (e.g. u8[] may be unified as Unknown);
                     // until sema type inference matures, permissively allow these to avoid cascading false positives.
@@ -2981,7 +2308,7 @@ impl<'a> InferContext<'a> {
                 let operand_ty = self.infer_expr(*operand, ast, env, None);
                 let resolved = self.arena.resolve(operand_ty);
                 match self.arena.get(resolved) {
-                    Ty::Nullable(_) => self.arena.nullable_inner(resolved),
+                    Type::Nullable(_) => self.arena.nullable_inner(resolved),
                     _ => operand_ty,
                 }
             }
@@ -2989,13 +2316,13 @@ impl<'a> InferContext<'a> {
                 let left_ty = self.infer_expr(*lhs, ast, env, None);
                 let right_ty = self.infer_expr(*rhs, ast, env, None);
                 let rl = self.arena.resolve(left_ty);
-                if let Ty::Nullable(_) = self.arena.get(rl) {
+                if let Type::Nullable(_) = self.arena.get(rl) {
                     let inner = self.arena.nullable_inner(rl);
                     if let Err(e) = self.try_widen_unify(inner, right_ty) {
                         self.add_error(&format!("?? default value incompatible with Nullable inner type: {}", e));
                     }
                     inner
-                } else if let Ty::Throw(_) = self.arena.get(rl) {
+                } else if let Type::Throw(_) = self.arena.get(rl) {
                     // Throw<T,E> ?? rhs → returns T, symmetric with Nullable (Bug #28).
                     let value_ty = self.arena.throw_parts(rl).0;
                     if let Err(e) = self.try_widen_unify(value_ty, right_ty) {
@@ -3014,7 +2341,7 @@ impl<'a> InferContext<'a> {
                 let expected_elem = expected.and_then(|exp| {
                     let r = self.arena.resolve(exp);
                     match self.arena.get(r) {
-                        Ty::Array(_) => Some(self.arena.array_parts(r).0),
+                        Type::Array(_) => Some(self.arena.array_parts(r).0),
                         _ => None,
                     }
                 });
@@ -3054,7 +2381,7 @@ impl<'a> InferContext<'a> {
                 let base_ty = self.infer_expr(*base, ast, env, None);
                 let resolved = self.arena.resolve(base_ty);
                 match self.arena.get(resolved) {
-                    Ty::Record(_) => {
+                    Type::Record(_) => {
                         let base_fields = self.arena.record_fields(resolved);
                         let name = self.arena.record_name(resolved).map(|s| s.into());
                         let mut all_fields: Vec<FieldType> = base_fields.to_vec();
@@ -3123,7 +2450,7 @@ impl<'a> InferContext<'a> {
             // ── if expressions ──
             Expr::If { cond, then_branch, else_branch } => {
                 let cond_ty = self.infer_expr(*cond, ast, env, None);
-                let bool_ty = self.make_builtin(Ty::Bool);
+                let bool_ty = self.make_builtin(Type::Bool);
                 self.unify_or_constrain(cond_ty, bool_ty);
 
                 // sema v2: extract flow facts (nullable narrowing).
@@ -3162,7 +2489,7 @@ impl<'a> InferContext<'a> {
                     // peer_type(then, Void) ensures a diverging then (Never) does
                     // not make the whole if diverge — the fall-through path is
                     // reachable. Only an explicit `else { diverge }` yields Never.
-                    let void_ty = self.make_builtin(Ty::Void);
+                    let void_ty = self.make_builtin(Type::Void);
                     peer_type(self.arena, &[then_ty, void_ty])
                 }
             }
@@ -3189,7 +2516,7 @@ impl<'a> InferContext<'a> {
                         Stmt::Return { .. } | Stmt::Throw { .. } | Stmt::Break | Stmt::Continue
                     );
                     let is_never = stmt_ty
-                        .map(|t| matches!(self.arena.get(self.arena.resolve(t)), Ty::Never))
+                        .map(|t| matches!(self.arena.get(self.arena.resolve(t)), Type::Never))
                         .unwrap_or(false);
                     if !diverges && (is_direct_exit || is_never) {
                         diverges = true;
@@ -3205,18 +2532,309 @@ impl<'a> InferContext<'a> {
                         // of sema's divergence analysis). The block's type is Never
                         // regardless of the trailing expression's type.
                         let _ = self.infer_expr(*te, ast, child_env, expected);
-                        self.make_builtin(Ty::Never)
+                        self.make_builtin(Type::Never)
                     } else {
                         self.infer_expr(*te, ast, child_env, expected)
                     }
                 } else if diverges {
-                    self.make_builtin(Ty::Never)
+                    self.make_builtin(Type::Never)
                 } else {
-                    self.make_builtin(Ty::Void)
+                    self.make_builtin(Type::Void)
                 }
             }
 
             // ── match expressions ──
+            Expr::Match { .. } => self.infer_match_expr(expr, ast, env, expected),
+
+            // ── Atomic / Lazy ──
+            Expr::Atomic(operand) => {
+                let inner_ty = self.infer_expr(*operand, ast, env, None);
+                self.arena.make_atomic(inner_ty)
+            }
+            Expr::Lazy(operand) => {
+                let inner_ty = self.infer_expr(*operand, ast, env, None);
+                self.arena.make_lazy(inner_ty)
+            }
+
+            // ── select expressions: Go-style channel multiplexing ──
+            //
+            // Iterate over all arms:
+            //   receive arm: create a child env, infer Channel<T> from channel_expr,
+            //                extract the element type T for the binding (if any), and infer the body type.
+            //   timeout arm: directly infer the body type.
+            // Use peer_type to join all body types (consistent with Match; more robust than the Zig side, which only takes the first).
+            Expr::Select(arms) => {
+                let mut arm_tys: Vec<TypeHandle> = Vec::new();
+                for arm in arms.iter() {
+                    let child_env = self.env.child(env);
+                    self.flow_ctx.push_scope();
+                    match arm {
+                        crate::ast::Ast::SelectArm::Receive { channel_expr, binding, body } => {
+                            // Infer the channel expression's type and extract the element type for the binding.
+                            let chan_ty = self.infer_expr(*channel_expr, ast, child_env, None);
+                            let resolved = self.arena.resolve(chan_ty);
+                            let elem_ty = match self.arena.get(resolved) {
+                                // Nullable(Channel<T>) → take Channel's T.
+                                Type::Nullable(_) => {
+                                    let inner = self.arena.nullable_inner(resolved);
+                                    let inner_resolved = self.arena.resolve(inner);
+                                    match self.arena.get(inner_resolved) {
+                                        Type::Channel(_) => self.arena.channel_elem(inner_resolved),
+                                        _ => chan_ty,
+                                    }
+                                }
+                                // Channel<T> → take T.
+                                Type::Channel(_) => self.arena.channel_elem(resolved),
+                                _ => chan_ty,
+                            };
+                            if let Some(name) = binding {
+                                let _ = self.env.define(child_env, name, elem_ty);
+                            }
+                            let body_ty = self.infer_expr(*body, ast, child_env, None);
+                            arm_tys.push(body_ty);
+                        }
+                        crate::ast::Ast::SelectArm::Timeout { body, .. } => {
+                            let body_ty = self.infer_expr(*body, ast, child_env, None);
+                            arm_tys.push(body_ty);
+                        }
+                    }
+                    self.flow_ctx.pop_scope();
+                }
+                if arm_tys.is_empty() {
+                    self.make_builtin(Type::Void)
+                } else {
+                    peer_type(self.arena, &arm_tys)
+                }
+            }
+
+            // ── inline_trait values: construct a TraitObject type ──
+            Expr::InlineTrait(_) => self.infer_inline_trait_expr(expr, ast, env, expected),
+        }
+    }
+
+    /// Infer an `Expr::Ident` expression (extracted from `infer_expr_inner`).
+    fn infer_ident_expr(
+        &mut self,
+        expr: ExprId,
+        ast: &AstArena<'_>,
+        env: EnvId,
+    ) -> TypeHandle {
+        match &ast.expr(expr).node {
+            Expr::Ident(name) => {
+                // sema v2: prefer the flow-narrowing result (path-sensitive type refinement).
+                if let Some(narrowed_ty) = self.flow_ctx.lookup_narrowed(name) {
+                    return narrowed_ty;
+                }
+                // Resolution order inside a method body (current_this_type non-empty):
+                //   1. lookup_local  — local variables and parameters only (no parent traversal)
+                //   2. For concrete types: try_implicit_this_field — fields before methods
+                //      (prevents same-named methods in the parent env from shadowing fields)
+                //   3. env.lookup    — full chain (methods, top-level functions)
+                //   4. For trait default methods (TypeVar): try_implicit_this_field — permissive
+                //      fallback for fields that can't be verified at trait definition time
+                let this_ty_opt = self.current_this_type();
+                if let Some(this_ty) = this_ty_opt {
+                    // 1. Local variables and parameters only.
+                    if let Some(scheme) = self.env.lookup_local(env, name) {
+                        return self.freshen_type(scheme);
+                    }
+                    let is_typevar = matches!(
+                        self.arena.get(self.arena.resolve(this_ty)),
+                        Type::TypeVar(_)
+                    );
+                    // 2. Concrete types: fields take precedence over same-named methods.
+                    if !is_typevar {
+                        if let Some(field_ty) = self.try_implicit_this_field(this_ty, name) {
+                            self.pending_implicit_this = Some((
+                                expr,
+                                crate::sema::Sema::ImplicitThisAccess::Field((*name).to_string().into_boxed_str()),
+                            ));
+                            return field_ty;
+                        }
+                    }
+                    // 3. Full lookup (methods registered in parent env, top-level functions).
+                    if let Some(scheme) = self.env.lookup(env, name) {
+                        return self.freshen_type(scheme);
+                    }
+                    // 4. Trait default methods: permissive field fallback (TypeVar can't
+                    //    verify field existence; deferred to monomorphization).
+                    if is_typevar {
+                        if let Some(field_ty) = self.try_implicit_this_field(this_ty, name) {
+                            self.pending_implicit_this = Some((
+                                expr,
+                                crate::sema::Sema::ImplicitThisAccess::Field((*name).to_string().into_boxed_str()),
+                            ));
+                            return field_ty;
+                        }
+                    }
+                } else {
+                    // Outside methods: full env lookup.
+                    if let Some(scheme) = self.env.lookup(env, name) {
+                        return self.freshen_type(scheme);
+                    }
+                }
+                // Instantiation mode: the temporary InferContext's env does not contain module-level declarations;
+                // query sema_result instead (already resolved in the HM stage).
+                if self.instantiation_ctx.is_some() {
+                    // Look up from expr_types (the expression's type was already resolved in the HM stage).
+                    let key = module_expr_key(&self.current_module_name, expr.0 as u64);
+                    if let Some(info) = self.sema_result.get_expr(key) {
+                        return info.ty;
+                    }
+                    // In instantiation mode, do not report an error; return a fresh_type_var.
+                    return self.arena.fresh_type_var();
+                }
+                let span = ast.expr(expr).span;
+                self.add_error_at(&format!("undefined variable '{}'", name), span.line, span.column);
+                self.arena.fresh_type_var()
+            }
+            _ => unreachable!("infer_ident_expr called on non-Ident expression"),
+        }
+    }
+
+    /// Infer an `Expr::Binary` expression (extracted from `infer_expr_inner`).
+    fn infer_binary_expr(
+        &mut self,
+        expr: ExprId,
+        ast: &AstArena<'_>,
+        env: EnvId,
+    ) -> TypeHandle {
+        match &ast.expr(expr).node {
+            Expr::Binary { op, lhs, rhs } => {
+                let left_ty = self.infer_expr(*lhs, ast, env, None);
+                let right_ty = self.infer_expr(*rhs, ast, env, None);
+                let left_is_lit = Self::expr_is_literal(ast, *lhs);
+                let right_is_lit = Self::expr_is_literal(ast, *rhs);
+                let bin_span = ast.expr(expr).span;
+                // Lazy<T> subsumption: unwrap Lazy to inner type for binary operations.
+                // `lazy(1i32) + 3i32` treats the left operand as i32.
+                let left_unwrapped = {
+                    let rl = self.arena.resolve(left_ty);
+                    if matches!(self.arena.get(rl), Type::Lazy(_)) {
+                        self.arena.lazy_value(rl)
+                    } else {
+                        left_ty
+                    }
+                };
+                let right_unwrapped = {
+                    let rr = self.arena.resolve(right_ty);
+                    if matches!(self.arena.get(rr), Type::Lazy(_)) {
+                        self.arena.lazy_value(rr)
+                    } else {
+                        right_ty
+                    }
+                };
+                match op {
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                        let rl = self.arena.resolve(left_unwrapped);
+                        let rr = self.arena.resolve(right_unwrapped);
+                        if self.arena.get(rl).is_numeric() && self.arena.get(rr).is_numeric() {
+                            // Bug #73/#74: strict numeric type checking.
+                            // - Bare literals (no suffix) can be promoted freely.
+                            // - Explicitly typed operands (suffixed literals or variables)
+                            //   require explicit cast for different bit widths or int/float crossing.
+                            self.check_numeric_binop_compat(ast, *lhs, *rhs, rl, rr, bin_span);
+                            // v2 convergence: peer_type_binary replaces literal_promotion;
+                            // literal promotion rules are inlined into peer_type_binary.
+                            return peer_type_binary(
+                                self.arena,
+                                left_unwrapped,
+                                right_unwrapped,
+                                left_is_lit,
+                                right_is_lit,
+                            );
+                        }
+                        self.unify_or_constrain(left_unwrapped, right_unwrapped);
+                        left_unwrapped
+                    }
+                    BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::RefEq | BinaryOp::RefNeq
+                    | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
+                        let rl = self.arena.resolve(left_unwrapped);
+                        let rr = self.arena.resolve(right_unwrapped);
+                        if self.arena.get(rl).is_numeric() && self.arena.get(rr).is_numeric() {
+                            // Bug #73/#74: same strict checking for comparison ops.
+                            self.check_numeric_binop_compat(ast, *lhs, *rhs, rl, rr, bin_span);
+                            // v2 convergence: comparison ops use peer_type_binary to unify operand types.
+                            let _ = peer_type_binary(
+                                self.arena,
+                                left_unwrapped,
+                                right_unwrapped,
+                                left_is_lit,
+                                right_is_lit,
+                            );
+                        } else {
+                            self.unify_or_constrain(left_unwrapped, right_unwrapped);
+                        }
+                        self.make_builtin(Type::Bool)
+                    }
+                    BinaryOp::And | BinaryOp::Or => {
+                        let bool_ty = self.make_builtin(Type::Bool);
+                        self.unify_or_constrain(left_unwrapped, bool_ty);
+                        self.unify_or_constrain(right_unwrapped, bool_ty);
+                        bool_ty
+                    }
+                    BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
+                    | BinaryOp::Shl | BinaryOp::Shr => {
+                        self.unify_or_constrain(left_unwrapped, right_unwrapped);
+                        left_unwrapped
+                    }
+                    BinaryOp::ConcatList => {
+                        // Array concatenation a ++ b: left and right element types must match; the result reuses the left operand's element type.
+                        // Avoids creating an orphan fresh_type_var (res_elem would have no constraint to the inputs).
+                        let left_elem = self.arena.fresh_type_var();
+                        let left_arr = self.arena.make_array(left_elem, None);
+                        self.unify_or_constrain(left_unwrapped, left_arr);
+                        let right_arr = self.arena.make_array(left_elem, None);
+                        self.unify_or_constrain(right_unwrapped, right_arr);
+                        self.arena.make_array(left_elem, None)
+                    }
+                    BinaryOp::Range | BinaryOp::RangeInclusive => {
+                        // Range expressions a..b / a..=b return a RangeIterator type
+                        // (Range is itself an iterator; For loops statically dispatch through RangeIterator.next).
+                        let i64_ty = self.make_builtin(Type::I64);
+                        if let Err(e) = self.try_widen_unify(i64_ty, left_unwrapped) {
+                            self.add_error(&format!("range operand must be integer: {}", e));
+                        }
+                        let i64_ty = self.make_builtin(Type::I64);
+                        if let Err(e) = self.try_widen_unify(i64_ty, right_unwrapped) {
+                            self.add_error(&format!("range operand must be integer: {}", e));
+                        }
+                        self.arena.make_generic(
+                            "RangeIterator".into(),
+                            Box::new([]),
+                        )
+                    }
+                    BinaryOp::Elvis => {
+                        let rl = self.arena.resolve(left_ty);
+                        if let Type::Nullable(_) = self.arena.get(rl) {
+                            return self.arena.nullable_inner(rl);
+                        }
+                        // Throw<T,E> ?? rhs → returns T (the Ok value type), symmetric with Nullable (Bug #28).
+                        if let Type::Throw(_) = self.arena.get(rl) {
+                            let value_ty = self.arena.throw_parts(rl).0;
+                            // Unify rhs with value_ty to ensure the default value's type is compatible.
+                            if let Err(e) = self.try_widen_unify(value_ty, right_ty) {
+                                self.add_error(&format!("?? default value incompatible with Throw value type: {}", e));
+                            }
+                            return value_ty;
+                        }
+                        left_ty
+                    }
+                }
+            }
+            _ => unreachable!("infer_binary_expr called on non-Binary expression"),
+        }
+    }
+
+    /// Infer an `Expr::Match` expression (extracted from `infer_expr_inner`).
+    fn infer_match_expr(
+        &mut self,
+        expr: ExprId,
+        ast: &AstArena<'_>,
+        env: EnvId,
+        expected: Option<TypeHandle>,
+    ) -> TypeHandle {
+        match &ast.expr(expr).node {
             Expr::Match { scrutinee, arms } => {
                 let scrutinee_ty = self.infer_expr(*scrutinee, ast, env, None);
                 let resolved_scrutinee = self.arena.resolve(scrutinee_ty);
@@ -3228,7 +2846,7 @@ impl<'a> InferContext<'a> {
                 let resolved_scrutinee = {
                     let is_throw = matches!(
                         self.arena.get(resolved_scrutinee),
-                        Ty::Throw(_)
+                        Type::Throw(_)
                     );
                     let has_ok_arm = arms.iter().any(|arm| {
                         match &ast.pattern(arm.pattern).node {
@@ -3304,7 +2922,7 @@ impl<'a> InferContext<'a> {
                 // v2 convergence: use only peer_type to unify all arm types (eliminates the per-arm widen dual-track scheme).
                 // peer_type handles single-arm (return directly), multi-arm (join), and all-Never/Void (return Never/Void).
                 let result_ty = if arm_tys.is_empty() {
-                    self.make_builtin(Ty::Void)
+                    self.make_builtin(Type::Void)
                 } else {
                     peer_type(self.arena, &arm_tys)
                 };
@@ -3321,83 +2939,33 @@ impl<'a> InferContext<'a> {
 
                 result_ty
             }
+            _ => unreachable!("infer_match_expr called on non-Match expression"),
+        }
+    }
 
-            // ── Atomic / Lazy ──
-            Expr::Atomic(operand) => {
-                let inner_ty = self.infer_expr(*operand, ast, env, None);
-                self.arena.make_atomic(inner_ty)
-            }
-            Expr::Lazy(operand) => {
-                let inner_ty = self.infer_expr(*operand, ast, env, None);
-                self.arena.make_lazy(inner_ty)
-            }
-
-            // ── select expressions: Go-style channel multiplexing ──
-            //
-            // Iterate over all arms:
-            //   receive arm: create a child env, infer Channel<T> from channel_expr,
-            //                extract the element type T for the binding (if any), and infer the body type.
-            //   timeout arm: directly infer the body type.
-            // Use peer_type to join all body types (consistent with Match; more robust than the Zig side, which only takes the first).
-            Expr::Select(arms) => {
-                let mut arm_tys: Vec<TypeHandle> = Vec::new();
-                for arm in arms.iter() {
-                    let child_env = self.env.child(env);
-                    self.flow_ctx.push_scope();
-                    match arm {
-                        crate::ast::Ast::SelectArm::Receive { channel_expr, binding, body } => {
-                            // Infer the channel expression's type and extract the element type for the binding.
-                            let chan_ty = self.infer_expr(*channel_expr, ast, child_env, None);
-                            let resolved = self.arena.resolve(chan_ty);
-                            let elem_ty = match self.arena.get(resolved) {
-                                // Nullable(Channel<T>) → take Channel's T.
-                                Ty::Nullable(_) => {
-                                    let inner = self.arena.nullable_inner(resolved);
-                                    let inner_resolved = self.arena.resolve(inner);
-                                    match self.arena.get(inner_resolved) {
-                                        Ty::Channel(_) => self.arena.channel_elem(inner_resolved),
-                                        _ => chan_ty,
-                                    }
-                                }
-                                // Channel<T> → take T.
-                                Ty::Channel(_) => self.arena.channel_elem(resolved),
-                                _ => chan_ty,
-                            };
-                            if let Some(name) = binding {
-                                let _ = self.env.define(child_env, name, elem_ty);
-                            }
-                            let body_ty = self.infer_expr(*body, ast, child_env, None);
-                            arm_tys.push(body_ty);
-                        }
-                        crate::ast::Ast::SelectArm::Timeout { body, .. } => {
-                            let body_ty = self.infer_expr(*body, ast, child_env, None);
-                            arm_tys.push(body_ty);
-                        }
-                    }
-                    self.flow_ctx.pop_scope();
-                }
-                if arm_tys.is_empty() {
-                    self.make_builtin(Ty::Void)
-                } else {
-                    peer_type(self.arena, &arm_tys)
-                }
-            }
-
-            // ── inline_trait values: construct a TraitObject type ──
-            //
-            // Obtain the trait name from the expected type (the val_decl's type annotation),
-            // verify method completeness, and produce TraitObject { trait_name, method_sigs }.
-            // With no expected type, report an error and return a fresh_type_var (an inline_trait without an annotation is not allowed).
+    /// Infer an `Expr::InlineTrait` expression (extracted from `infer_expr_inner`).
+    ///
+    /// Obtain the trait name from the expected type (the val_decl's type annotation),
+    /// verify method completeness, and produce TraitObject { trait_name, method_sigs }.
+    /// With no expected type, report an error and return a fresh_type_var (an inline_trait without an annotation is not allowed).
+    fn infer_inline_trait_expr(
+        &mut self,
+        expr: ExprId,
+        ast: &AstArena<'_>,
+        env: EnvId,
+        expected: Option<TypeHandle>,
+    ) -> TypeHandle {
+        match &ast.expr(expr).node {
             Expr::InlineTrait(methods) => {
                 // Obtain the trait name from the expected type.
                 let trait_name: Option<Box<str>> = if let Some(exp) = expected {
                     let resolved = self.arena.resolve(exp);
                     match self.arena.get(resolved) {
-                        Ty::Trait(_) => {
+                        Type::Trait(_) => {
                             let (name, _) = self.arena.trait_parts(resolved);
                             Some(name.into())
                         }
-                        Ty::TraitObject(_) => {
+                        Type::TraitObject(_) => {
                             let (trait_name, _) = self.arena.trait_object_parts(resolved);
                             Some(trait_name.into())
                         }
@@ -3413,7 +2981,7 @@ impl<'a> InferContext<'a> {
                     .map(|m| {
                         let return_type = match m.return_type {
                             Some(rt) => self.type_from_ast(rt, ast),
-                            None => self.arena.make(Ty::Void),
+                            None => self.arena.make(Type::Void),
                         };
                         TraitMethodSig {
                             name: m.name.into(),
@@ -3487,6 +3055,521 @@ impl<'a> InferContext<'a> {
                     self.arena.fresh_type_var()
                 }
             }
+            _ => unreachable!("infer_inline_trait_expr called on non-InlineTrait expression"),
+        }
+    }
+
+    /// Infer an `Expr::Call` expression (extracted from `infer_expr_inner`).
+    fn infer_call_expr(
+        &mut self,
+        expr: ExprId,
+        ast: &AstArena<'_>,
+        env: EnvId,
+        expected: Option<TypeHandle>,
+    ) -> TypeHandle {
+        match &ast.expr(expr).node {
+            Expr::Call { callee, args, type_args } => {
+                // cast call resolution: __cast_to<T>(x) / __cast_try_to<T>(x).
+                // The parser lowers cast(x).to(T) into an ordinary __cast_to<T>(x) Call;
+                // sema infers the source type S and returns T (or Throw<T, CastError> for try_to).
+                // Lookup goes through the CAST_BUILTINS registry, avoiding name-specific branches.
+                if let Expr::Ident(name) = &ast.expr(*callee).node {
+                    if let Some(is_try) = CAST_BUILTINS
+                        .iter()
+                        .find_map(|(n, t)| (*n == *name).then_some(*t))
+                    {
+                        // Infer the source expression's type.
+                        let _ = self.infer_expr(args[0], ast, env, None);
+                        // Take the target type T from type_args.
+                        let target_ty = match type_args {
+                            Some(ta) if !ta.is_empty() => self.type_from_ast(ta[0], ast),
+                            _ => self.arena.fresh_type_var(),
+                        };
+                        if is_try {
+                            let err_ty = self.arena.make_adt(
+                                "CastError".into(),
+                                Box::new([]),
+                            );
+                            return self.arena.make_throw(target_ty, err_ty);
+                        }
+                        return target_ty;
+                    }
+                }
+
+                // ── Constructor multi-mapping disambiguation ──
+                // When callee is an Ident that maps to multiple same-named constructors, disambiguate by priority:
+                //   1. Type-oriented: when expected_ty is an Adt, select by type_name
+                //   2. Arity: when type-oriented disambiguation fails (expected is a TypeVar or not provided),
+                //      select the unique constructor matching by arity
+                let callee_ty = if let Expr::Ident(name) = &ast.expr(*callee).node {
+                    let ctors = self.sema_result.get_ctor_defs(name);
+                    if ctors.len() > 1 {
+                        let selected: Option<(Box<str>, Box<[TypeRepr]>)> = {
+                            let mut found: Option<&CtorDefInfo> = None;
+                            // 1. Type-oriented disambiguation
+                            if let Some(exp) = expected {
+                                let exp_resolved = self.arena.resolve(exp);
+                                if let Type::Adt(_) = self.arena.get(exp_resolved) {
+                                    let (exp_type_name, _) = self.arena.adt_parts(exp_resolved);
+                                    let matches: Vec<_> = ctors.iter()
+                                        .filter(|c| c.type_name.as_ref() == exp_type_name)
+                                        .collect();
+                                    if matches.len() == 1 {
+                                        found = Some(matches[0]);
+                                    }
+                                }
+                            }
+                            // 2. Arity disambiguation (fallback when type-oriented fails)
+                            if found.is_none() {
+                                let arity_matches: Vec<_> = ctors.iter()
+                                    .filter(|c| c.field_type_reprs.len() == args.len())
+                                    .collect();
+                                if arity_matches.len() == 1 {
+                                    found = Some(arity_matches[0]);
+                                }
+                            }
+                            found.map(|c| (c.type_name.clone(), c.field_type_reprs.clone()))
+                        };
+                        match selected {
+                            Some((type_name, field_type_reprs)) => {
+                                let param_types: Vec<TypeHandle> = field_type_reprs
+                                    .iter()
+                                    .map(|r| self.type_repr_to_handle(r))
+                                    .collect();
+                                let ret_ty = self.arena.make_adt(type_name, Box::new([]));
+                                if param_types.is_empty() {
+                                    ret_ty
+                                } else {
+                                    self.arena.make_fn(param_types.into_boxed_slice(), ret_ty)
+                                }
+                            }
+                            None => {
+                                let span = ast.expr(expr).span;
+                                let type_names: Vec<&str> = ctors.iter()
+                                    .map(|c| c.type_name.as_ref())
+                                    .collect();
+                                self.add_error_at(
+                                    &format!(
+                                        "ambiguous constructor '{}': defined by types [{}]; use Type.{} to disambiguate or provide a type context",
+                                        name,
+                                        type_names.join(", "),
+                                        name,
+                                    ),
+                                    span.line,
+                                    span.column,
+                                );
+                                self.arena.fresh_type_var()
+                            }
+                        }
+                    } else if ctors.len() == 1
+                        && args.is_empty()
+                        && ctors[0].field_type_reprs.is_empty()
+                    {
+                        // Bug #69: Zero-arg constructor called with `()` syntax.
+                        // Zero-arg constructors are registered as values (ADT type), not
+                        // function types, so `Unit()` is equivalent to the bare value `Unit`.
+                        let ret_ty = self.arena.make_adt(
+                            ctors[0].type_name.clone(),
+                            Box::new([]),
+                        );
+                        if let Some(exp) = expected {
+                            self.unify_or_constrain(ret_ty, exp);
+                        }
+                        ret_ty
+                    } else {
+                        // [Implicit this] Try resolving as this.method(args) before
+                        // falling through to infer_expr (which would report undefined).
+                        if let Some(this_ty) = self.current_this_type() {
+                            if let Some(fn_ty) = self.lookup_method_type(this_ty, name) {
+                                let inst_fn = self.instantiate_fn_type(fn_ty);
+                                if let Type::Fn(_) = self.arena.get(inst_fn) {
+                                    let (params, return_type) = self.arena.fn_parts(inst_fn);
+                                    let params: Vec<TypeHandle> = params.to_vec();
+                                    // Skip params[0] (this), match args with params[1..].
+                                    let n = params.len().min(args.len() + 1);
+                                    for i in 1..n {
+                                        let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
+                                        self.unify_or_constrain(params[i], arg_ty);
+                                    }
+                                    // Store callee's ExprInfo so that pending_implicit_this
+                                    // (flushed in infer_expr) can attach the implicit_this marker.
+                                    // Without this, the marker is lost because we bypass
+                                    // infer_expr(callee) on this fast path.
+                                    self.store_expr_info(*callee, fn_ty);
+                                    self.pending_implicit_this = Some((
+                                        *callee,
+                                        crate::sema::Sema::ImplicitThisAccess::Method((*name).to_string().into_boxed_str()),
+                                    ));
+                                    return return_type;
+                                }
+                            }
+                        }
+                        self.infer_expr(*callee, ast, env, None)
+                    }
+                } else {
+                    self.infer_expr(*callee, ast, env, None)
+                };
+                let resolved_callee = self.arena.resolve(callee_ty);
+
+                // Instantiation mode: skip HM unify (types were already checked in the sema HM stage);
+                // only infer argument types and return the return type. Monomorphization triggers are orchestrated externally.
+                if self.instantiation_ctx.is_some() {
+                    // ModuleRef call: look up the function signature from the module env.
+                    if let Type::ModuleRef(_) = self.arena.get(resolved_callee) {
+                        let (path, module_env) = self.arena.module_ref_parts(resolved_callee);
+                        if let Some(func_name) = path.rsplit('.').next() {
+                            if let Some(fn_ty) = self.env.lookup_local(module_env, func_name) {
+                                let inst_fn = self.instantiate_fn_type(fn_ty);
+                                if let Type::Fn(_) = self.arena.get(inst_fn) {
+                                    let (params, return_type) = self.arena.fn_parts(inst_fn);
+                                    let params: Vec<TypeHandle> = params.to_vec();
+                                    for (&param_ty, &arg) in params.iter().zip(args.iter()) {
+                                        let _ = self.infer_expr(arg, ast, env, Some(param_ty));
+                                    }
+                                    return return_type;
+                                }
+                            }
+                        }
+                    }
+                    // Ordinary function call: infer argument types and return the return type.
+                    let inst_callee = self.instantiate_fn_type(resolved_callee);
+                    if let Type::Fn(_) = self.arena.get(inst_callee) {
+                        let (params, return_type) = self.arena.fn_parts(inst_callee);
+                        let params: Vec<TypeHandle> = params.to_vec();
+                        for (&param_ty, &arg) in params.iter().zip(args.iter()) {
+                            let _ = self.infer_expr(arg, ast, env, Some(param_ty));
+                        }
+                        return return_type;
+                    }
+                    // Non-Fn callee: report an error and return Unknown.
+                    let span = ast.expr(expr).span;
+                    let callee_name = self
+                        .arena
+                        .type_name(resolved_callee)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("{:?}", self.arena.get(resolved_callee)));
+                    self.add_error_at(
+                        &format!("cannot call non-function value of type '{}'", callee_name),
+                        span.line,
+                        span.column,
+                    );
+                    for &a in args.iter() {
+                        let _ = self.infer_expr(a, ast, env, None);
+                    }
+                    return self.arena.make(Type::Unknown);
+                }
+
+                // ModuleRef call: callee is a module path reference (e.g. "std.reflect.Reflect.format");
+                // look up the function signature by its trailing bare name directly in the module env carried by the ModuleRef (no parent-env traversal).
+                if let Type::ModuleRef(_) = self.arena.get(resolved_callee) {
+                    let (path, module_env) = self.arena.module_ref_parts(resolved_callee);
+                    // The trailing segment is the function name (e.g. "std.reflect.Reflect.format" → "format").
+                    if let Some(func_name) = path.rsplit('.').next() {
+                        if let Some(fn_ty) = self.env.lookup_local(module_env, func_name) {
+                            // Instantiate the polymorphic function type to avoid type-constraint clashes across calls.
+                            let inst_fn = self.instantiate_fn_type(fn_ty);
+                            if let Type::Fn(_) = self.arena.get(inst_fn) {
+                                let (params, return_type) = self.arena.fn_parts(inst_fn);
+                                let params: Vec<TypeHandle> = params.to_vec();
+                                if params.len() == args.len() {
+                                    for (&param_ty, &arg) in params.iter().zip(args.iter()) {
+                                        let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
+                                        if let Err(e) = self.try_widen_unify(param_ty, arg_ty) {
+                                            self.add_error(&format!("argument type incompatible with parameter type: {}", e));
+                                        }
+                                    }
+                                    return return_type;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Instantiate the polymorphic function type (replace rigid vars / unbound TypeVars with fresh non-rigid vars)
+                // so each call has its own type variables, avoiding type-constraint clashes across calls.
+                let inst_callee = self.instantiate_fn_type(resolved_callee);
+                if let Type::Fn(_) = self.arena.get(inst_callee) {
+                    let (params, return_type) = self.arena.fn_parts(inst_callee);
+                    let params: Vec<TypeHandle> = params.to_vec();
+                    if params.len() == args.len() {
+                        for (&param_ty, &arg) in params.iter().zip(args.iter()) {
+                            let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
+                            // On unify failure, register a constraint (rather than discarding) so the fixpoint iteration can solve the argument type.
+                            self.unify_or_constrain(param_ty, arg_ty);
+                        }
+                    }
+                    // Always return the declared return type, to avoid cascading type loss from argument mismatches.
+                    // If there is an expected type, unify the return type with it to solve pending TypeVars in the return type
+                    // (e.g. Ok(void) returns Throw<void, '_E>; expected=Throw<void, IOError> solves E=IOError).
+                    if let Some(exp) = expected {
+                        self.unify_or_constrain(return_type, exp);
+                    }
+                    return return_type;
+                }
+                // Fallback: infer all arguments and unify the callee with (args -> ret).
+                let ret_ty = self.arena.fresh_type_var();
+                let arg_types: Vec<TypeHandle> = args
+                    .iter()
+                    .map(|&a| self.infer_expr(a, ast, env, None))
+                    .collect();
+                let expected_fn = self.arena.make_fn(
+                    arg_types.into_boxed_slice(),
+                    ret_ty,
+                );
+                self.unify_or_constrain(callee_ty, expected_fn);
+                ret_ty
+            }
+            _ => unreachable!("infer_call_expr called on non-Call expression"),
+        }
+    }
+
+    /// Infer an `Expr::MethodCall` / `Expr::SafeMethodCall` expression (extracted from `infer_expr_inner`).
+    fn infer_method_call_expr(
+        &mut self,
+        expr: ExprId,
+        ast: &AstArena<'_>,
+        env: EnvId,
+        expected: Option<TypeHandle>,
+    ) -> TypeHandle {
+        match &ast.expr(expr).node {
+            Expr::MethodCall { recv, method, args, .. }
+            | Expr::SafeMethodCall { recv, method, args, .. } => {
+                // Qualified-name syntax: Type.Ctor(args) (qualified call of a constructor with arguments)
+                if let Expr::Ident(type_name) = &ast.expr(*recv).node {
+                    if let Some((ctor_type_name, field_type_reprs)) =
+                        self.check_qualified_ctor(type_name, method)
+                    {
+                        if !field_type_reprs.is_empty() {
+                            // Constructor with arguments: build a function type and go through call inference
+                            let param_types: Vec<TypeHandle> = field_type_reprs
+                                .iter()
+                                .map(|r| self.type_repr_to_handle(r))
+                                .collect();
+                            let ret_ty = self.arena.make_adt(ctor_type_name, Box::new([]));
+                            let fn_ty = self.arena.make_fn(
+                                param_types.into_boxed_slice(),
+                                ret_ty,
+                            );
+                            let (params, return_type) = self.arena.fn_parts(fn_ty);
+                            let params: Vec<TypeHandle> = params.to_vec();
+                            if params.len() == args.len() {
+                                for (&param_ty, &arg) in params.iter().zip(args.iter()) {
+                                    let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
+                                    self.unify_or_constrain(param_ty, arg_ty);
+                                }
+                            }
+                            if let Some(exp) = expected {
+                                self.unify_or_constrain(return_type, exp);
+                            }
+                            // Mark recv as module-func-recv (skip recv during IR compilation)
+                            let recv_key = crate::sema::Sema::module_expr_key(
+                                &self.current_module_name,
+                                recv.0 as u64,
+                            );
+                            self.sema_result.module_func_recv_exprs.insert(recv_key);
+                            return return_type;
+                        }
+                        // Zero-argument constructor in MethodCall: report an error
+                        let span = ast.expr(expr).span;
+                        self.add_error_at(
+                            &format!(
+                                "constructor '{}' of type '{}' takes no arguments; use {}.{} syntax",
+                                method, type_name, type_name, method
+                            ),
+                            span.line,
+                            span.column,
+                        );
+                        return self.arena.fresh_type_var();
+                    }
+                }
+
+                let recv_ty = self.infer_expr(*recv, ast, env, None);
+
+                // Path 0a: ModuleRef recv → module-path function call.
+                // When recv is a ModuleRef (e.g. std.net.UdpSocket), method is a top-level function in that module;
+                // look it up by its bare name directly in the module env carried by the ModuleRef (no parent-env traversal).
+                let recv_resolved_0a = self.arena.resolve(recv_ty);
+                if let Type::ModuleRef(_) = self.arena.get(recv_resolved_0a) {
+                    let (mod_path, module_env) = self.arena.module_ref_parts(recv_resolved_0a);
+                    let found = self.env.lookup_local(module_env, method);
+                    // Directory-module semantics: when lookup_local misses in the current module env,
+                    // search sibling modules in the same directory (e.g. Math.sqrt where sqrt lives in Power.kz,
+                    // with Math and Power both under the std.math directory).
+                    let found = found.or_else(|| {
+                        self.lookup_sibling_module_fn(mod_path, module_env, method)
+                    });
+                    if let Some(fn_ty) = found {
+                        let inst_fn = self.instantiate_fn_type(fn_ty);
+                        if let Type::Fn(_) = self.arena.get(inst_fn) {
+                            let (params, return_type) = self.arena.fn_parts(inst_fn);
+                            let params: Vec<TypeHandle> = params.to_vec();
+                            let n = params.len().min(args.len());
+                            for i in 0..n {
+                                let arg_ty = self.infer_expr(args[i], ast, env, Some(params[i]));
+                                self.unify_or_constrain(params[i], arg_ty);
+                            }
+                            // Mark recv as a module-function-call receiver so IR compilation does not pass recv.
+                            // (Consistent with path 0b: ModuleRef recv has Module.fun(args) semantics.)
+                            let recv_key = module_expr_key(
+                                &self.current_module_name,
+                                recv.0 as u64,
+                            );
+                            self.sema_result.module_func_recv_exprs.insert(recv_key);
+                            return return_type;
+                        }
+                    }
+                }
+
+                // Path 0b: constructor recv (type name == module name) → module function call (Zig-style @This semantics).
+                // When recv is a type constructor (Fn, with return_type Adt) and the type name matches a module name,
+                // look up free functions by the method's bare name in that module's env.
+                // Typical scenario: after `import std.time.Duration`, Duration.from_millis(100),
+                // where Duration is both a type and a module (file with the same name; predefine redefine overwrote the ModuleRef).
+                if let Type::Fn(_) = self.arena.get(recv_resolved_0a) {
+                    let (_, ret_ty) = self.arena.fn_parts(recv_resolved_0a);
+                    let ret_resolved = self.arena.resolve(ret_ty);
+                    if let Type::Adt(_) = self.arena.get(ret_resolved) {
+                        let (type_name, _) = self.arena.adt_parts(ret_resolved);
+                        if let Some(&mod_env) = self.ctor_module_envs.get(type_name) {
+                            if let Some(fn_ty) = self.env.lookup_local(mod_env, method) {
+                                let inst_fn = self.instantiate_fn_type(fn_ty);
+                                if let Type::Fn(_) = self.arena.get(inst_fn) {
+                                    let (params, return_type) = self.arena.fn_parts(inst_fn);
+                                    let params: Vec<TypeHandle> = params.to_vec();
+                                    let n = params.len().min(args.len());
+                                    for i in 0..n {
+                                        let arg_ty = self.infer_expr(args[i], ast, env, Some(params[i]));
+                                        self.unify_or_constrain(params[i], arg_ty);
+                                    }
+                                    // Mark recv as a module-function-call receiver so IR compilation does not pass recv.
+                                    let recv_key = module_expr_key(
+                                        &self.current_module_name,
+                                        recv.0 as u64,
+                                    );
+                                    self.sema_result.module_func_recv_exprs.insert(recv_key);
+                                    return return_type;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Language-level intrinsic tagging: await/recv are recognized uniformly by sema
+                // and registered into method_dispatches for IR consumption (eliminates IR-side string guards).
+                // await is a general suspend semantic (for all types); recv is tagged only for Channel/Receiver types.
+                {
+                    let intrinsic = if *method == "await" && args.is_empty() {
+                        Some(crate::sema::Sema::IntrinsicKind::Await)
+                    } else if *method == "recv" && args.is_empty() {
+                        match self.arena.get(recv_resolved_0a) {
+                            Type::Channel(_) | Type::Receiver(_) => {
+                                Some(crate::sema::Sema::IntrinsicKind::ChannelAwait)
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if intrinsic.is_some() {
+                        let key = crate::sema::Sema::module_expr_key(
+                            &self.current_module_name,
+                            expr.0 as u64,
+                        );
+                        self.sema_result.method_dispatches.insert(
+                            key,
+                            crate::sema::Sema::DispatchInfo {
+                                trait_id: 0,
+                                method_idx: 0,
+                                impl_fn_idx: 0,
+                                instance_id: 0,
+                                intrinsic,
+                            },
+                        );
+                    }
+                }
+
+                // Path 1 (preferred): type-aware method lookup.
+                // lookup_method_type looks up the receiver's type against witness_table / func_sigs / builtin methods,
+                // ensuring same-named methods (e.g. Instant.add_duration vs DateTime.add_duration) dispatch to the correct signature.
+                let method_fn_ty = self.lookup_method_type(recv_ty, method);
+                if let Some(fn_ty) = method_fn_ty {
+                    let inst_fn = self.instantiate_fn_type(fn_ty);
+                    if let Type::Fn(_) = self.arena.get(inst_fn) {
+                        let (params, return_type) = self.arena.fn_parts(inst_fn);
+                        let params: Vec<TypeHandle> = params.to_vec();
+                        // The first parameter is self; skip it.
+                        let n = params.len().min(args.len() + 1);
+                        for i in 1..n {
+                            let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
+                            self.unify_or_constrain(params[i], arg_ty);
+                        }
+                        return return_type;
+                    }
+                }
+
+                // Path 0 (fallback): look up a binding named after the method as an Fn type in env (free function with a self parameter).
+                // Use lookup_with_pred to skip same-named non-function bindings (e.g. a local variable shadowing a free function).
+                // In Kuzo `recv.method(args)` is sugar for `method(recv, args)`.
+                if let Some(fn_ty) = self.env.lookup_with_pred(env, method, |ty| {
+                    let r = self.arena.resolve(ty);
+                    matches!(self.arena.get(r), Type::Fn(_))
+                }) {
+                    let inst_fn = self.instantiate_fn_type(fn_ty);
+                    if let Type::Fn(_) = self.arena.get(inst_fn) {
+                        let (params, return_type) = self.arena.fn_parts(inst_fn);
+                        let params: Vec<TypeHandle> = params.to_vec();
+                        // The first parameter is self/receiver: unify recv with params[0].
+                        // This lets the free function's generic parameters be inferred from the receiver's type (e.g. iter<T> infers T from arr: T[]).
+                        if !params.is_empty() {
+                            self.unify_or_constrain(params[0], recv_ty);
+                        }
+                        // The remaining parameters are inferred from args.
+                        let n = params.len().min(args.len() + 1);
+                        for i in 1..n {
+                            let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
+                            self.unify_or_constrain(params[i], arg_ty);
+                        }
+                        return return_type;
+                    }
+                }
+
+                // await is a general suspend semantic: it produces no value; it only suspends the frame waiting for an event.
+                // The IR layer uses infer_event_source_kind to decide the event-source kind based on the recv type
+                // (AsyncJoin/Channel/Timer); the Sema layer uniformly returns void.
+                if *method == "await" && args.is_empty() {
+                    return self.make_builtin(Type::Void);
+                }
+
+                // Fallback: infer arguments and return a fresh var.
+                // For a receiver whose type is already determined (not TypeVar/Unknown/Never), report "method does not exist"
+                // to help the user locate the problem; for a TypeVar receiver, silently return a fresh var (inference pending, deferred to the solver).
+                let span = ast.expr(expr).span;
+                let recv_resolved = self.arena.resolve(recv_ty);
+                match self.arena.get(recv_resolved) {
+                    Type::TypeVar(_) | Type::Unknown | Type::Never => {
+                        // Receiver type pending; silently return a fresh var.
+                    }
+                    Type::Void => {
+                        // void receiver: handled by the IR layer (void method call).
+                    }
+                    ct => {
+                        // Receiver type is determined but method lookup failed: report an error.
+                        let recv_name = self.arena.type_name(recv_resolved)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("{:?}", ct));
+                        self.add_error_at(
+                            &format!("no method '{}' on type '{}'", method, recv_name),
+                            span.line,
+                            span.column,
+                        );
+                    }
+                }
+                for &a in args.iter() {
+                    let _ = self.infer_expr(a, ast, env, None);
+                }
+                self.arena.fresh_type_var()
+            }
+            _ => unreachable!("infer_method_call_expr called on non-MethodCall expression"),
         }
     }
 
@@ -3510,7 +3593,7 @@ impl<'a> InferContext<'a> {
         }
     }
 
-    /// Builds a Ty::Fn type from the owned data of a MethodSigInfo.
+    /// Builds a Type::Fn type from the owned data of a MethodSigInfo.
     /// Both parameters and the return type are fully resolved from TypeRepr via type_repr_to_handle,
     /// correctly handling nested generics (e.g. Async<Throw<T, E>>), arrays, Nullable, and other compound types,
     /// overcoming the limitation that type_name only stores the top-level name.
@@ -3552,7 +3635,7 @@ impl<'a> InferContext<'a> {
                     args.iter().map(|a| self.type_repr_to_handle(a)).collect();
                 let args_box: Box<[TypeHandle]> = new_args.into_boxed_slice();
 
-                // Builtin generic types (Throw/Atomic/Async/Channel, etc.) construct dedicated Ty variants.
+                // Builtin generic types (Throw/Atomic/Async/Channel, etc.) construct dedicated Type variants.
                 if is_builtin_generic_type(name) {
                     return self.make_builtin_generic(name.clone(), args_box);
                 }
@@ -3610,7 +3693,7 @@ impl<'a> InferContext<'a> {
         // so calls like s?.len() / (&arr).len() auto-unwrap to the correct method table.
         // Nullable's own methods (is_null) are handled via the unified TypeDefInfo path and are not forwarded.
         match self.arena.get(resolved) {
-            Ty::Nullable(_) => {
+            Type::Nullable(_) => {
                 // Nullable's own method (is_null) goes through the TypeDefInfo("nullable") path;
                 // other methods are recursively forwarded to the inner type.
                 if method != "is_null" {
@@ -3618,7 +3701,7 @@ impl<'a> InferContext<'a> {
                     return self.lookup_method_type(inner, method);
                 }
             }
-            Ty::Ref(_) => {
+            Type::Ref(_) => {
                 // Ref auto-deref: method lookup on &T forwards to T.
                 let inner = self.arena.ref_parts(resolved).0;
                 return self.lookup_method_type(inner, method);
@@ -3640,30 +3723,30 @@ impl<'a> InferContext<'a> {
         // so that generic parameters in builtin-type method signatures also bind correctly.
         let mut pushed_bindings = false;
         let builtin_bindings: Option<(Box<str>, Vec<TypeHandle>)> = match self.arena.get(resolved) {
-            Ty::Adt(_) => {
+            Type::Adt(_) => {
                 let (name, type_args) = self.arena.adt_parts(resolved);
                 Some((name.into(), type_args.to_vec()))
             }
-            Ty::Array(_) => {
+            Type::Array(_) => {
                 let (element_type, _) = self.arena.array_parts(resolved);
                 Some(("array".into(), vec![element_type]))
             }
-            Ty::Nullable(_) => {
+            Type::Nullable(_) => {
                 let inner = self.arena.nullable_inner(resolved);
                 Some(("nullable".into(), vec![inner]))
             }
-            Ty::Throw(_) => {
+            Type::Throw(_) => {
                 let (value_type, error_type) = self.arena.throw_parts(resolved);
                 Some(("Throw".into(), vec![value_type, error_type]))
             }
             // Builtin generic dedicated variants: extract element/value types as type_args bindings.
-            Ty::Channel(_) => Some(("Channel".into(), vec![self.arena.channel_elem(resolved)])),
-            Ty::Async(_) => Some(("Async".into(), vec![self.arena.async_value(resolved)])),
-            Ty::Lazy(_) => Some(("Lazy".into(), vec![self.arena.lazy_value(resolved)])),
-            Ty::Atomic(_) => Some(("Atomic".into(), vec![self.arena.atomic_elem(resolved)])),
-            Ty::Sender(_) => Some(("Sender".into(), vec![self.arena.sender_elem(resolved)])),
-            Ty::Receiver(_) => Some(("Receiver".into(), vec![self.arena.receiver_elem(resolved)])),
-            Ty::Generic(_) => {
+            Type::Channel(_) => Some(("Channel".into(), vec![self.arena.channel_elem(resolved)])),
+            Type::Async(_) => Some(("Async".into(), vec![self.arena.async_value(resolved)])),
+            Type::Lazy(_) => Some(("Lazy".into(), vec![self.arena.lazy_value(resolved)])),
+            Type::Atomic(_) => Some(("Atomic".into(), vec![self.arena.atomic_elem(resolved)])),
+            Type::Sender(_) => Some(("Sender".into(), vec![self.arena.sender_elem(resolved)])),
+            Type::Receiver(_) => Some(("Receiver".into(), vec![self.arena.receiver_elem(resolved)])),
+            Type::Generic(_) => {
                 let (name, args) = self.arena.generic_parts(resolved);
                 Some((name.into(), args.to_vec()))
             }
@@ -3695,7 +3778,7 @@ impl<'a> InferContext<'a> {
         method: &str,
     ) -> Option<TypeHandle> {
         match self.arena.get(resolved) {
-            Ty::Trait(_) => {
+            Type::Trait(_) => {
                 let (name, _) = self.arena.trait_parts(resolved);
                 // For a trait type (e.g. l: Logger), look up trait_def.methods directly to restore the method signature;
                 // parameters use fresh_type_var (a trait method's exact parameter types are determined by the implementing type).
@@ -3711,7 +3794,7 @@ impl<'a> InferContext<'a> {
                     }
                 }
             }
-            Ty::TypeVar(idx) => {
+            Type::TypeVar(idx) => {
                 // Inside a trait default method, current_this_type() is a rigid TypeVar
                 // representing the (unknown) implementing type. Method lookup must consult
                 // the current trait's method signatures rather than the receiver's (nonexistent)
@@ -3737,10 +3820,10 @@ impl<'a> InferContext<'a> {
         // or recurses to the inner type. Method lookup needs a unified type name to query type_def_index;
         // map them here to the synthetic TypeDefInfo names used at registration.
         let type_name: Option<String> = match self.arena.get(resolved) {
-            Ty::Array(_) => Some("array".to_string()),
-            Ty::Str => Some("str".to_string()),
-            Ty::Nullable(_) => Some("nullable".to_string()),
-            Ty::Throw(_) => Some("Throw".to_string()),
+            Type::Array(_) => Some("array".to_string()),
+            Type::Str => Some("str".to_string()),
+            Type::Nullable(_) => Some("nullable".to_string()),
+            Type::Throw(_) => Some("Throw".to_string()),
             _ => self.arena.type_name(resolved).map(|s| s.to_string()),
         };
 
@@ -3800,7 +3883,7 @@ impl<'a> InferContext<'a> {
         // First extract the sig data (param_count + return_type) into owned variables,
         // releasing the arena.types borrow before constructing the Fn type.
         let trait_sig_data: Option<(u8, TypeHandle)> =
-            if let Ty::TraitObject(_) = self.arena.get(resolved) {
+            if let Type::TraitObject(_) = self.arena.get(resolved) {
                 let (_, method_sigs) = self.arena.trait_object_parts(resolved);
                 method_sigs
                     .iter()
@@ -3849,7 +3932,7 @@ impl<'a> InferContext<'a> {
         let resolved = self.arena.resolve(this_ty);
         // Ref auto-deref: field access on &T forwards to T.
         let inner = match self.arena.get(resolved) {
-            Ty::Ref(_) => self.arena.ref_parts(resolved).0,
+            Type::Ref(_) => self.arena.ref_parts(resolved).0,
             _ => resolved,
         };
         // Inside a trait default method, this_ty is a rigid TypeVar.
@@ -3858,7 +3941,7 @@ impl<'a> InferContext<'a> {
         // implicit this field access and return a fresh_type_var, matching the old
         // behavior where self.field on a TypeVar silently returned a fresh_type_var.
         // Field resolution is deferred to monomorphization specialization.
-        if let Ty::TypeVar(_) = self.arena.get(inner) {
+        if let Type::TypeVar(_) = self.arena.get(inner) {
             return Some(self.arena.fresh_type_var());
         }
         let type_name = self.arena.type_name(inner)?.to_string();
@@ -3888,7 +3971,7 @@ impl<'a> InferContext<'a> {
         // Ref auto-deref: field access on &T forwards to T.
         // For reference types like &Record / &Adt, strip the Ref first and then take the normal field-lookup path,
         // to avoid the type_name indirection returning None (and silently failing) when the inner is a TypeVar.
-        if let Ty::Ref(_) = self.arena.get(resolved) {
+        if let Type::Ref(_) = self.arena.get(resolved) {
             let inner = self.arena.ref_parts(resolved).0;
             return self.lookup_field_type(inner, field, line, column);
         }
@@ -3899,7 +3982,7 @@ impl<'a> InferContext<'a> {
         // - submodules: ensure_module_env registers the submodule's short name in the parent env when creating the hierarchical env.
         // - in-module symbols: predeclare_declarations has registered functions/constructors into module_env.
         // On miss, report an error; no string concatenation or prefix check is needed.
-        if let Ty::ModuleRef(_) = self.arena.get(resolved) {
+        if let Type::ModuleRef(_) = self.arena.get(resolved) {
             let (path, module_env) = self.arena.module_ref_parts(resolved);
             if let Some(sym_ty) = self.env.lookup_local(module_env, field) {
                 return sym_ty;
@@ -3909,7 +3992,7 @@ impl<'a> InferContext<'a> {
                 line,
                 column,
             );
-            return self.arena.make(Ty::Unknown);
+            return self.arena.make(Type::Unknown);
         }
 
         let type_name = self.arena.type_name(resolved).map(|s| s.to_string());
@@ -3937,7 +4020,7 @@ impl<'a> InferContext<'a> {
         }
         // Record structural fields.
         let ct = self.arena.get(resolved);
-        if let Ty::Record(_) = ct {
+        if let Type::Record(_) = ct {
             let fields = self.arena.record_fields(resolved);
             for f in fields.iter() {
                 if f.name.as_deref() == Some(field) {
@@ -3947,7 +4030,7 @@ impl<'a> InferContext<'a> {
         }
         // Channel<T>.sender / .receiver fields: return Sender<T> / Receiver<T>.
         // (Already supported at runtime in Value.rs; the Sema layer fills in the type signature.)
-        if let Ty::Channel(_) = ct {
+        if let Type::Channel(_) = ct {
             let elem = self.arena.channel_elem(resolved);
             match field {
                 "sender" => return self.arena.make_sender(elem),
@@ -3958,11 +4041,11 @@ impl<'a> InferContext<'a> {
         // Field not found: for a determined type, report a "no such field" error (consistent with the method-call fallback);
         // for pending types (TypeVar/Unknown/Never/Void), silently return a fresh var, deferring to the solver's global diagnostics.
         match ct {
-            Ty::Record(_) => {
+            Type::Record(_) => {
                 self.add_error_at(&format!("no such field '{}' on this type", field), line, column);
                 self.arena.fresh_type_var()
             }
-            Ty::Adt(_) => {
+            Type::Adt(_) => {
                 let (name, _) = self.arena.adt_parts(resolved);
                 // For a registered Adt type, report a "no such field" error; for unregistered ones, permissively allow.
                 if self.sema_result.get_type_def(name).is_some() {
@@ -3975,8 +4058,8 @@ impl<'a> InferContext<'a> {
                 self.arena.fresh_type_var()
             }
             // Pending types: silently return a fresh var (inference pending, deferred to the solver's global diagnostics).
-            Ty::TypeVar(_) | Ty::Unknown
-            | Ty::Never | Ty::Void => {
+            Type::TypeVar(_) | Type::Unknown
+            | Type::Never | Type::Void => {
                 self.arena.fresh_type_var()
             }
             // Determined type but field lookup failed: report an error.
@@ -4105,7 +4188,7 @@ impl<'a> InferContext<'a> {
                 // Propagate Never so Block-level divergence analysis detects
                 // `val x = <never>` (e.g. a val bound to an if/match/block that
                 // always diverges) as a diverging statement. Bug #84 generality.
-                if matches!(self.arena.get(self.arena.resolve(val_ty)), Ty::Never) {
+                if matches!(self.arena.get(self.arena.resolve(val_ty)), Type::Never) {
                     Some(val_ty)
                 } else {
                     None
@@ -4113,7 +4196,7 @@ impl<'a> InferContext<'a> {
             }
             Stmt::VarDecl { name, type_annotation, value, .. } => {
                 let val_ty = self.check_local_decl(name, *type_annotation, *value, true, ast, env, stmt);
-                if matches!(self.arena.get(self.arena.resolve(val_ty)), Ty::Never) {
+                if matches!(self.arena.get(self.arena.resolve(val_ty)), Type::Never) {
                     Some(val_ty)
                 } else {
                     None
@@ -4175,7 +4258,7 @@ impl<'a> InferContext<'a> {
                     }
                     Some(val_ty)
                 } else {
-                    Some(self.make_builtin(Ty::Void))
+                    Some(self.make_builtin(Type::Void))
                 }
             }
             Stmt::Defer { expr } => {
@@ -4203,13 +4286,13 @@ impl<'a> InferContext<'a> {
                     let ct = self.arena.get(resolved);
                     // Check whether iterable is a non-iterator type (Array/Str/primitive)
                     let is_non_iterator = match ct {
-                        Ty::Array(_) => true,
+                        Type::Array(_) => true,
                         ct if ct.is_scalar() => true,
                         _ => false,
                     };
                     if is_non_iterator {
                         let type_name = match ct {
-                            Ty::Array(_) => "array",
+                            Type::Array(_) => "array",
                             _ => ct.name(),
                         };
                         self.add_error_at(
@@ -4242,7 +4325,7 @@ impl<'a> InferContext<'a> {
             }
             Stmt::While { condition, body } => {
                 let cond_ty = self.infer_expr(*condition, ast, env, None);
-                let bool_ty = self.make_builtin(Ty::Bool);
+                let bool_ty = self.make_builtin(Type::Bool);
                 if self.arena.unify(cond_ty, bool_ty).is_err() {
                     let cond_str = format!("{}", self.arena.display(cond_ty));
                     let span = ast.stmt(stmt).span;
@@ -4288,11 +4371,11 @@ impl<'a> InferContext<'a> {
             Pattern::Wildcard => {}
             Pattern::Literal(lit) => {
                 let lit_ty = match lit {
-                    PatternLiteral::Int(_) => Some(self.make_builtin(Ty::I32)),
-                    PatternLiteral::Float(_) => Some(self.make_builtin(Ty::F64)),
-                    PatternLiteral::Bool(_) => Some(self.make_builtin(Ty::Bool)),
-                    PatternLiteral::Char(_) => Some(self.make_builtin(Ty::Char)),
-                    PatternLiteral::String(_) => Some(self.make_builtin(Ty::Str)),
+                    PatternLiteral::Int(_) => Some(self.make_builtin(Type::I32)),
+                    PatternLiteral::Float(_) => Some(self.make_builtin(Type::F64)),
+                    PatternLiteral::Bool(_) => Some(self.make_builtin(Type::Bool)),
+                    PatternLiteral::Char(_) => Some(self.make_builtin(Type::Char)),
+                    PatternLiteral::String(_) => Some(self.make_builtin(Type::Str)),
                     PatternLiteral::Null => None,
                 };
                 if let Some(lt) = lit_ty {
@@ -4361,7 +4444,7 @@ impl<'a> InferContext<'a> {
             Pattern::Guard { pattern, condition } => {
                 self.infer_pattern(*pattern, ast, expected_ty, env);
                 let cond_ty = self.infer_expr(*condition, ast, env, None);
-                let bool_ty = self.make_builtin(Ty::Bool);
+                let bool_ty = self.make_builtin(Type::Bool);
                 self.unify_or_constrain(cond_ty, bool_ty);
             }
         }
@@ -4372,8 +4455,8 @@ impl<'a> InferContext<'a> {
     /// Registers builtin functions into the environment.
     pub fn register_builtins(&mut self, env: EnvId) {
         // Panic: (str) -> void
-        let str_ty = self.make_builtin(Ty::Str);
-        let void_ty = self.make_builtin(Ty::Void);
+        let str_ty = self.make_builtin(Type::Str);
+        let void_ty = self.make_builtin(Type::Void);
         let panic_fn = self.arena.make_fn(
             vec![str_ty].into_boxed_slice(),
             void_ty,
@@ -4409,7 +4492,7 @@ impl<'a> InferContext<'a> {
 
         // channel<T>(capacity: usize) -> Channel<T>
         // Builtin channel constructor: creates a Channel<T> with the given capacity.
-        let usize_ty = self.make_builtin(Ty::Usize);
+        let usize_ty = self.make_builtin(Type::Usize);
         let t_var3 = self.arena.fresh_rigid_var();
         let chan_ret = self.arena.make_channel(t_var3);
         let chan_fn = self.arena.make_fn(
@@ -4672,7 +4755,7 @@ impl<'a> InferContext<'a> {
         // error fallback.
         // Real type errors are caught by unify failures and ambiguity detection, independent of
         // this diagnostic.
-        let void_ty = arena.make(Ty::Void);
+        let void_ty = arena.make(Type::Void);
         for i in type_vars_baseline..arena.type_vars.len() {
             let tv = &mut arena.type_vars[i];
             if !tv.is_rigid && tv.bound.is_none() {
@@ -4889,7 +4972,7 @@ impl<'a> InferContext<'a> {
             return ret_ty;
         }
         let resolved = self.arena.resolve(ret_ty);
-        let already_async = matches!(self.arena.get(resolved), Ty::Async(_));
+        let already_async = matches!(self.arena.get(resolved), Type::Async(_));
         if already_async {
             ret_ty
         } else {
@@ -5498,50 +5581,50 @@ impl<'a> InferContext<'a> {
     }
 }
 
-/// Builtin scalar name → Ty (single derivation point, replacing the three previously duplicated
+/// Builtin scalar name → Type (single derivation point, replacing the three previously duplicated
 /// match sites).
 ///
-/// Derived from `Type::BUILTIN_TABLE`: look up ValueTag by name, then dispatch to Ty by ValueTag.
+/// Derived from `Type::BUILTIN_TABLE`: look up ValueTag by name, then dispatch to Type by ValueTag.
 /// The name → ValueTag mapping comes from a single source of truth.
 ///
 /// Type names are uniformly lower-case (consistent with .kz source syntax): null/void/bool/char/str
 /// and the numeric types.
-fn name_to_concrete(name: &str) -> Option<Ty> {
+fn name_to_concrete(name: &str) -> Option<Type> {
     use crate::types::{builtin_info_by_name, ValueTag};
     let info = builtin_info_by_name(name)?;
     let ct = match info.value_tag {
-        ValueTag::I8 => Ty::I8,
-        ValueTag::I16 => Ty::I16,
-        ValueTag::I32 => Ty::I32,
-        ValueTag::I64 => Ty::I64,
-        ValueTag::I128 => Ty::I128,
-        ValueTag::U8 => Ty::U8,
-        ValueTag::U16 => Ty::U16,
-        ValueTag::U32 => Ty::U32,
-        ValueTag::U64 => Ty::U64,
-        ValueTag::U128 => Ty::U128,
-        ValueTag::Isize => Ty::Isize,
-        ValueTag::Usize => Ty::Usize,
-        ValueTag::F16 => Ty::F16,
-        ValueTag::F32 => Ty::F32,
-        ValueTag::F64 => Ty::F64,
-        ValueTag::F128 => Ty::F128,
-        ValueTag::Bool => Ty::Bool,
-        ValueTag::Char => Ty::Char,
-        ValueTag::Ref => Ty::Str,   // str's value_tag is Ref.
-        ValueTag::Null => Ty::Null,
-        ValueTag::Void => Ty::Void,
+        ValueTag::I8 => Type::I8,
+        ValueTag::I16 => Type::I16,
+        ValueTag::I32 => Type::I32,
+        ValueTag::I64 => Type::I64,
+        ValueTag::I128 => Type::I128,
+        ValueTag::U8 => Type::U8,
+        ValueTag::U16 => Type::U16,
+        ValueTag::U32 => Type::U32,
+        ValueTag::U64 => Type::U64,
+        ValueTag::U128 => Type::U128,
+        ValueTag::Isize => Type::Isize,
+        ValueTag::Usize => Type::Usize,
+        ValueTag::F16 => Type::F16,
+        ValueTag::F32 => Type::F32,
+        ValueTag::F64 => Type::F64,
+        ValueTag::F128 => Type::F128,
+        ValueTag::Bool => Type::Bool,
+        ValueTag::Char => Type::Char,
+        ValueTag::Ref => Type::Str,   // str's value_tag is Ref.
+        ValueTag::Null => Type::Null,
+        ValueTag::Void => Type::Void,
     };
     Some(ct)
 }
 
-/// Returns all numeric builtin type names + Ty (derived from BUILTIN_TABLE).
+/// Returns all numeric builtin type names + Type (derived from BUILTIN_TABLE).
 ///
 /// Replaces the original static `NUMERIC_BUILTIN_NAMES` table; automatically syncs with
 /// BUILTIN_TABLE changes.
 /// Includes all scalars (including bool/char, consistent with the original table); excludes
 /// str/null/void.
-fn numeric_builtin_names() -> Vec<(&'static str, Ty)> {
+fn numeric_builtin_names() -> Vec<(&'static str, Type)> {
     use crate::types::{BUILTIN_TABLE, ValueTag};
     BUILTIN_TABLE.iter()
         .filter(|s| !matches!(s.value_tag, ValueTag::Ref | ValueTag::Null | ValueTag::Void))
@@ -5736,7 +5819,7 @@ impl ConstraintSolver {
                 match c {
                     Constraint::Equality(t1, t2) => {
                         // Record candidate before resolve/unify (multi-value record).
-                        // arena.get returns the raw Ty; even if the TypeVar was bound by a
+                        // arena.get returns the raw Type; even if the TypeVar was bound by a
                         // previous unify, get still returns TypeVar(idx), so we can capture
                         // binding requirements from all constraint paths to this TypeVar.
                         self.record_candidate(arena, t1, t2);
@@ -5786,7 +5869,7 @@ impl ConstraintSolver {
                     Constraint::TraitBound { ty, trait_name, type_args } => {
                         let resolved = arena.resolve(ty);
                         // ty is still a TypeVar: re-enqueue for the next round.
-                        if matches!(arena.get(resolved), Ty::TypeVar(_)) {
+                        if matches!(arena.get(resolved), Type::TypeVar(_)) {
                             pending.push(Constraint::TraitBound {
                                 ty,
                                 trait_name,
@@ -5799,7 +5882,7 @@ impl ConstraintSolver {
                         if let Some(wt) = witness {
                             let ct = arena.get(resolved);
                             let type_id = match ct {
-                                Ty::Adt(_) | Ty::Generic(_) => {
+                                Type::Adt(_) | Type::Generic(_) => {
                                     // User type: type_id is registered externally.
                                     // Cannot access sema_result here; skip (handled uniformly by
                                     // check_module).
@@ -5836,7 +5919,7 @@ impl ConstraintSolver {
                         // type must be compatible with the original).
                         let r_orig = arena.resolve(original);
                         let r_narrow = arena.resolve(narrowed);
-                        if let Ty::TypeVar(idx) = arena.get(r_orig).clone() {
+                        if let Type::TypeVar(idx) = arena.get(r_orig).clone() {
                             // TypeVar unbound: bind directly to the narrowed type.
                             arena.type_vars[idx as usize].bound = Some(r_narrow);
                             changed = true;
@@ -5885,7 +5968,7 @@ impl ConstraintSolver {
     fn resolve_has_type_var(arena: &TypeArena, ty: TypeHandle) -> bool {
         let resolved = arena.resolve(ty);
         match arena.get(resolved) {
-            Ty::TypeVar(_) => true,
+            Type::TypeVar(_) => true,
             // Every composite type (incl. Channel/Async/Lazy/Atomic/Sender/Receiver and Record)
             // delegates child traversal to `for_each_child`. Short-circuits on the first hit.
             _ => {
@@ -5902,7 +5985,7 @@ impl ConstraintSolver {
 
     /// Records a TypeVar's candidate binding into `candidates` (multi-value record).
     ///
-    /// Called **before** unify; uses `arena.get` (raw Ty, no resolve) to detect TypeVars.
+    /// Called **before** unify; uses `arena.get` (raw Type, no resolve) to detect TypeVars.
     /// Even if a TypeVar was already bound to a concrete type by a previous unify, `get` still
     /// returns `TypeVar(idx)`, so we can capture binding requirements from all constraint paths
     /// to this TypeVar for later ambiguity detection.
@@ -5912,14 +5995,14 @@ impl ConstraintSolver {
     /// - Both sides TypeVars → do not record (var-var bindings are handled directly by unify).
     pub fn record_candidate(&mut self, arena: &TypeArena, t1: TypeHandle, t2: TypeHandle) {
         match (arena.get(t1), arena.get(t2)) {
-            (Ty::TypeVar(_), Ty::TypeVar(_)) => {
+            (Type::TypeVar(_), Type::TypeVar(_)) => {
                 // Both sides are TypeVars: var-var binding is handled by unify; do not record
                 // candidates.
             }
-            (Ty::TypeVar(idx), _) => {
+            (Type::TypeVar(idx), _) => {
                 self.candidates.entry(idx).or_default().push(t2);
             }
-            (_, Ty::TypeVar(idx)) => {
+            (_, Type::TypeVar(idx)) => {
                 self.candidates.entry(idx).or_default().push(t1);
             }
             _ => {}
@@ -5938,7 +6021,7 @@ impl ConstraintSolver {
         let candidates = std::mem::take(&mut self.candidates);
         for (idx, cands) in candidates {
             // Deduplicate based on structural equality (not TypeHandle identity).
-            // `make()` does not intern types, so two `Ty::Bool` from different call
+            // `make()` does not intern types, so two `Type::Bool` from different call
             // sites have different TypeHandles; comparing by handle would wrongly
             // flag them as distinct candidates and emit a false "ambiguous
             // inference" error (e.g. `identity(true) == true`).
@@ -6247,7 +6330,7 @@ pub fn analyze_null_check_facts(
             if matches!(ast.expr(null_expr).node, Expr::NullLit) {
                 if let Some(ty) = env_arena.lookup(env, &path) {
                     let resolved = arena.resolve(ty);
-                    if let Ty::Nullable(_) = arena.get(resolved) {
+                    if let Type::Nullable(_) = arena.get(resolved) {
                         facts.push(FlowFact {
                             path: path.into(),
                             narrowed_ty: arena.nullable_inner(resolved),

@@ -2,7 +2,7 @@
 //! sema — Semantic analysis modules.
 //!
 //! Aggregates the Sema pipeline submodules:
-//! - `Sema`: Core type system data structures (Ty / TypeArena / SemaResult).
+//! - `Sema`: Core type system data structures (Type / TypeArena / SemaResult).
 //! - `Relations`: Type relation checks (equality / subtype / numeric promotion).
 //! - `Inference`: Type inference and constraint solving.
 //! - `Monomorph`: Monomorphization instance collection.

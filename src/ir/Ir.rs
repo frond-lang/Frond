@@ -828,6 +828,13 @@ impl ConstValue {
     }
 }
 
+/// Converts a `u32` codepoint to a `char`, falling back to U+0000 for invalid codepoints.
+/// Used by ConstValue::Char conversion and compute_fn cast operations.
+#[inline]
+pub fn char_from_u32_or_nul(u: u32) -> char {
+    char::from_u32(u).unwrap_or('\0')
+}
+
 /// Branch info for a Gate node.
 ///
 /// A Gate node selects which branch subgraph to activate based on the condition value.

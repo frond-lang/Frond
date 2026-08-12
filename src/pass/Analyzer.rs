@@ -389,7 +389,7 @@ fn resolve_method_mangled(recv: ExprId, method: &str, module_name: &str, sema: &
 /// Classifies the side effect of a single expression.
 ///
 /// Recursively classifies sub-expressions: only when all sub-expressions are Pure/AllocNoEscape can the result be Pure.
-/// Function calls consult the PurityTable; allocations consult the EscapeTable; field accesses consult Ty mutability.
+/// Function calls consult the PurityTable; allocations consult the EscapeTable; field accesses consult Type mutability.
 /// Method calls resolve the implementation function via sema and check its purity.
 pub fn classify_side_effect(
     expr_id: ExprId,

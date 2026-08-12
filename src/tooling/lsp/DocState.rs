@@ -3,9 +3,9 @@
 use bumpalo::Bump;
 
 use crate::pass::Analyzer;
-use crate::tooling::common::Diagnostic::Diagnostic;
-use crate::tooling::common::Pipeline;
-use crate::tooling::lint::RuleRegistry;
+use crate::tooling::Common::Diagnostic::Diagnostic;
+use crate::tooling::Common::Pipeline;
+use crate::tooling::Lint::RuleRegistry;
 
 /// Per-document state.
 pub struct DocState {

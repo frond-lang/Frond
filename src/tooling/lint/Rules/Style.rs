@@ -2,7 +2,7 @@
 
 use crate::ast::Ast::{Module, AstArena};
 use crate::sema::Sema::SemaResult;
-use crate::tooling::common::Diagnostic::Diagnostic;
+use crate::tooling::Common::Diagnostic::Diagnostic;
 
 /// STYLE001: naming convention check.
 /// fun/type: lowerCamel / PascalCase; val/var: lowerCamel; CONST: UPPER_SNAKE.

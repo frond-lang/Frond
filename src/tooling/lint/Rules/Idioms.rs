@@ -2,7 +2,7 @@
 
 use crate::ast::Ast::{Module, AstArena};
 use crate::sema::Sema::SemaResult;
-use crate::tooling::common::Diagnostic::Diagnostic;
+use crate::tooling::Common::Diagnostic::Diagnostic;
 
 /// IDIOM001: prefer val over var.
 pub fn prefer_val(_module: &Module, _arena: &AstArena, _sema: &SemaResult) -> Vec<Diagnostic> {

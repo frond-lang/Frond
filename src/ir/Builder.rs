@@ -429,26 +429,6 @@ impl<'a> IrBuilder<'a> {
         None
     }
 
-    /// Look up the NodeId bound to a variable in an outer scope, skipping the innermost scope.
-    ///
-    /// Used by `Assignment` to find the original outer definition of a variable that has already
-    /// been `bind_var`'d into the current subgraph by a prior assignment. In a same_function
-    /// branch subgraph (e.g. loop body), the first assignment generates a WriteBack to the outer
-    /// node and then `bind_var` shadows the outer binding in the current scope. Subsequent
-    /// assignments find the shadowed binding via `lookup_var` and would skip WriteBack — this
-    /// method recovers the original outer node so WriteBack can be emitted again.
-    fn lookup_outer_var(&self, name: &str) -> Option<NodeId> {
-        if self.scope_stack.len() <= 1 {
-            return None;
-        }
-        for scope in self.scope_stack.iter().rev().skip(1) {
-            if let Some(&node_id) = scope.get(name) {
-                return Some(node_id);
-            }
-        }
-        None
-    }
-
     /// Look up the outermost binding of a variable (the original declaration in the
     /// function-level scope). Used by `Assignment` to determine the correct WriteBack
     /// target: when a variable is assigned in a nested same_function subgraph (e.g.
@@ -618,67 +598,7 @@ impl<'a> IrBuilder<'a> {
             | crate::ast::Ast::Expr::VoidLit => self.compile_const_with_value(expr_id),
 
             // Variable reference
-            crate::ast::Ast::Expr::Ident(name) => match self.lookup_var(name) {
-                Some(node_id) => {
-                    // When `current_effect` exists, create a CF_SEQ dependency node to ensure the
-                    // variable read executes only after prior side effects complete.
-                    // This prevents an expression from reading a stale value before a WriteBack in
-                    // a while/loop subgraph updates it.
-                    // Consistent with the `current_effect` dependency mechanism in
-                    // `compile_global_load`.
-                    match self.current_effect {
-                        Some(eff) => self.chain_effects(Some(eff), node_id),
-                        None => node_id,
-                    }
-                }
-                None => {
-                    // Implicit this: bare identifier resolved to an instance field by sema.
-                    // Sema marks such accesses on `ExprInfo.implicit_this`; synthesize an explicit
-                    // `this.<field>` FieldAccess node. The method variant is handled in the Call
-                    // branch (it needs the argument list).
-                    if let Some(access) = self.expr_implicit_this(expr_id).cloned() {
-                        if let crate::sema::Sema::ImplicitThisAccess::Field(field) = access {
-                            let this_node = self
-                                .lookup_var("this")
-                                .expect("this binding must exist in method body");
-                            return self.build_implicit_field_access(this_node, &field);
-                        }
-                        // Method variant handled in Call branch.
-                    }
-                    match self.lookup_global_var(name) {
-                        Some(slot) => self.compile_global_load(slot),
-                        None => {
-                            // Nullary ADT / type constructor detection: when an Ident is neither a
-                            // local nor a global variable, check whether it is a nullary constructor
-                            // (e.g. `Lt`/`Leaf`/`Red`) and compile it as a nullary construct node.
-                            // Parameterized constructors (non-empty `field_names`) are not handled
-                            // here (they go through the `Call` path with arguments).
-                            // A newtype always has an inner value, so it can never be nullary.
-                            let tf_info = self.lookup_constructor_field_names(name)
-                                .or_else(|| self.lookup_type_field_names(name));
-                            match tf_info {
-                                Some(info) if info.field_names.is_empty() && info.kind != RecordLitKind::Newtype => {
-                                    let inputs_offset = self.graph.inputs_pool.push(&[]);
-                                    let node = self.graph.add_node(Node {
-                                        kind: NodeKind::BinOp,
-                                        input_count: 0,
-                                        inputs_offset,
-                                        compute_fn: CF_RECORD_CONSTRUCT, // record_construct
-                                    });
-                                    self.graph.set_record_lit_info(node, RecordLitInfo {
-                                        type_name: info.type_name.clone(),
-                                        field_names: Vec::new(),
-                                        constructor: name.to_string(),
-                                        kind: info.kind,
-                                    });
-                                    node
-                                }
-                                _ => self.compile_const(),
-                            }
-                        }
-                    }
-                }
-            },
+            crate::ast::Ast::Expr::Ident(name) => self.compile_ident(expr_id, name),
 
             // Binary operations
             crate::ast::Ast::Expr::Binary { op, lhs, rhs } => {
@@ -760,209 +680,12 @@ impl<'a> IrBuilder<'a> {
             //   captured variable -> WriteBack; outer variable -> WriteBack;
             //   global variable -> global_store; local -> bind_var.
             crate::ast::Ast::Expr::Assign { target, value } => {
-                let raw_val = self.compile_subexpr(*value);
-                let val_node = self.chain_effects(self.current_effect, raw_val);
-                let target_expr = &self.current_module().arena.expr(*target).node;
-                match target_expr {
-                    crate::ast::Ast::Expr::Ident(name) => {
-                        // Implicit-this field assignment: `field = value` inside a method body
-                        // resolves to `this.field = value`. Without this, the bare name would
-                        // create a local binding instead of mutating the instance field.
-                        if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) = self.expr_implicit_this(*target).cloned() {
-                            let this_node = self
-                                .lookup_var("this")
-                                .expect("this binding must exist in method body");
-                            let off = self.graph.inputs_pool.push(&[this_node, val_node]);
-                            let set_node = self.graph.add_node(Node {
-                                kind: NodeKind::BinOp,
-                                input_count: 2,
-                                inputs_offset: off,
-                                compute_fn: CF_RECORD_FIELD_SET,
-                            });
-                            self.graph.set_field_set_name(set_node, field.to_string());
-                            return self.compile_void_const();
-                        }
-                        let captured_source = self.captured_scopes.iter().rev()
-                            .find_map(|scope| scope.iter()
-                                .find(|(n, _)| n.as_str() == *name)
-                                .map(|(_, node)| *node));
-                        if let Some(source) = captured_source {
-                            let wb_node = self.compile_writeback_node(val_node, source);
-                            self.bind_var(name, val_node);
-                            self.current_effect = Some(wb_node);
-                        } else if let Some(outer_node) = self.lookup_var(name) {
-                            if !self.is_in_current_subgraph(outer_node) {
-                                let wb_node = self.compile_writeback_node(val_node, outer_node);
-                                self.bind_var(name, val_node);
-                                self.current_effect = Some(wb_node);
-                            } else if let Some(&captured_node) = self.captured_vars.get(*name) {
-                                let wb_node = self.compile_writeback_node(val_node, captured_node);
-                                self.bind_var(name, val_node);
-                                self.current_effect = Some(wb_node);
-                            } else {
-                                self.bind_var(name, val_node);
-                            }
-                        } else if let Some(slot) = self.lookup_global_var(name) {
-                            let store_node = self.compile_global_store(val_node, slot);
-                            self.current_effect = Some(store_node);
-                        } else {
-                            self.bind_var(name, val_node);
-                        }
-                    }
-                    crate::ast::Ast::Expr::FieldAccess { recv: obj, field } => {
-                        let obj_node = self.compile_subexpr(*obj);
-                        let off = self.graph.inputs_pool.push(&[obj_node, val_node]);
-                        let set_node = self.graph.add_node(Node {
-                            kind: NodeKind::BinOp,
-                            input_count: 2,
-                            inputs_offset: off,
-                            compute_fn: CF_RECORD_FIELD_SET, // record_field_set
-                        });
-                        self.graph.set_field_set_name(set_node, field.to_string());
-                    }
-                    // `recv?.field = value`: skip the assignment when `obj` is null.
-                    crate::ast::Ast::Expr::SafeAccess { recv: obj, field } => {
-                        let obj_node = self.compile_subexpr(*obj);
-                        let off = self.graph.inputs_pool.push(&[obj_node, val_node]);
-                        let set_node = self.graph.add_node(Node {
-                            kind: NodeKind::BinOp,
-                            input_count: 2,
-                            inputs_offset: off,
-                            compute_fn: CF_RECORD_FIELD_SET, // record_field_set
-                        });
-                        self.graph.set_field_set_name(set_node, field.to_string());
-                        self.graph.set_safe_op(set_node);
-                    }
-                    // `*ref = value` → compute_deref_write(282)
-                    crate::ast::Ast::Expr::Deref(ref_inner) => {
-                        let ref_node = self.compile_subexpr(*ref_inner);
-                        let off = self.graph.inputs_pool.push(&[ref_node, val_node]);
-                        let _write_node = self.graph.add_node(Node {
-                            kind: NodeKind::BinOp,
-                            input_count: 2,
-                            inputs_offset: off,
-                            compute_fn: CF_DEREF_WRITE, // compute_deref_write
-                        });
-                    }
-                    _ => {}
-                }
-                self.compile_void_const()
+                self.compile_assign(*target, *value)
             }
 
             // Compound assignment: `target op= value`
             crate::ast::Ast::Expr::CompoundAssign { op, target, value } => {
-                let val_node = self.compile_subexpr(*value);
-                let target_expr = &self.current_module().arena.expr(*target).node;
-                let bin_compute = self.compound_assign_op_to_compute_fn(*op, *target);
-                match target_expr {
-                    crate::ast::Ast::Expr::Ident(name) => {
-                        // Implicit-this field compound assignment: `field op= value` inside a
-                        // method body resolves to `this.field op= value`.
-                        if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) = self.expr_implicit_this(*target).cloned() {
-                            let this_node = self
-                                .lookup_var("this")
-                                .expect("this binding must exist in method body");
-                            // Read the current field value.
-                            let get_off = self.graph.inputs_pool.push(&[this_node]);
-                            let get_node = self.graph.add_node(Node {
-                                kind: NodeKind::FieldAccess,
-                                input_count: 1,
-                                inputs_offset: get_off,
-                                compute_fn: CF_RECORD_FIELD_GET,
-                            });
-                            // Operation.
-                            let bin_off = self.graph.inputs_pool.push(&[get_node, val_node]);
-                            let result_node = self.graph.add_node(Node {
-                                kind: NodeKind::BinOp,
-                                input_count: 2,
-                                inputs_offset: bin_off,
-                                compute_fn: bin_compute,
-                            });
-                            // Write back.
-                            let set_off = self.graph.inputs_pool.push(&[this_node, result_node]);
-                            let set_node = self.graph.add_node(Node {
-                                kind: NodeKind::BinOp,
-                                input_count: 2,
-                                inputs_offset: set_off,
-                                compute_fn: CF_RECORD_FIELD_SET,
-                            });
-                            self.graph.set_field_set_name(set_node, field.to_string());
-                            return result_node;
-                        }
-                        let cur_node = self
-                            .lookup_var(name)
-                            .unwrap_or_else(|| self.compile_placeholder());
-                        let off = self.graph.inputs_pool.push(&[cur_node, val_node]);
-                        let result_node = self.graph.add_node(Node {
-                            kind: NodeKind::BinOp,
-                            input_count: 2,
-                            inputs_offset: off,
-                            compute_fn: bin_compute,
-                        });
-                        self.bind_var(name, result_node);
-                        result_node
-                    }
-                    crate::ast::Ast::Expr::FieldAccess { recv: obj, field }
-                    | crate::ast::Ast::Expr::SafeAccess { recv: obj, field } => {
-                        let obj_node = self.compile_subexpr(*obj);
-                        // Read the current field value.
-                        let get_off = self.graph.inputs_pool.push(&[obj_node]);
-                        let get_node = self.graph.add_node(Node {
-                            kind: NodeKind::FieldAccess,
-                            input_count: 1,
-                            inputs_offset: get_off,
-                            compute_fn: CF_RECORD_FIELD_GET, // record_field_get
-                        });
-                        // Operation.
-                        let bin_off = self.graph.inputs_pool.push(&[get_node, val_node]);
-                        let result_node = self.graph.add_node(Node {
-                            kind: NodeKind::BinOp,
-                            input_count: 2,
-                            inputs_offset: bin_off,
-                            compute_fn: bin_compute,
-                        });
-                        // Write back.
-                        let set_off = self.graph.inputs_pool.push(&[obj_node, result_node]);
-                        let set_node = self.graph.add_node(Node {
-                            kind: NodeKind::BinOp,
-                            input_count: 2,
-                            inputs_offset: set_off,
-                            compute_fn: CF_RECORD_FIELD_SET, // record_field_set
-                        });
-                        self.graph.set_field_set_name(set_node, field.to_string());
-                        result_node
-                    }
-                    // `*ref op= value` -> read Cell + operation + write back to Cell.
-                    crate::ast::Ast::Expr::Deref(ref_inner) => {
-                        let ref_node = self.compile_subexpr(*ref_inner);
-                        // Read the current value: compute_deref_read (281).
-                        let read_off = self.graph.inputs_pool.push(&[ref_node]);
-                        let read_node = self.graph.add_node(Node {
-                            kind: NodeKind::UnOp,
-                            input_count: 1,
-                            inputs_offset: read_off,
-                            compute_fn: CF_DEREF_READ,
-                        });
-                        // Operation.
-                        let bin_off = self.graph.inputs_pool.push(&[read_node, val_node]);
-                        let result_node = self.graph.add_node(Node {
-                            kind: NodeKind::BinOp,
-                            input_count: 2,
-                            inputs_offset: bin_off,
-                            compute_fn: bin_compute,
-                        });
-                        // Write back to Cell: compute_deref_write (282).
-                        let write_off = self.graph.inputs_pool.push(&[ref_node, result_node]);
-                        let _write_node = self.graph.add_node(Node {
-                            kind: NodeKind::BinOp,
-                            input_count: 2,
-                            inputs_offset: write_off,
-                            compute_fn: CF_DEREF_WRITE,
-                        });
-                        result_node
-                    }
-                    _ => self.compile_void_const(),
-                }
+                self.compile_compound_assign(*op, *target, *value)
             }
 
             // select expression -> Gate node (compute_select_gate) + an independent subgraph per branch.
@@ -1082,6 +805,297 @@ impl<'a> IrBuilder<'a> {
             crate::ast::Ast::Expr::Slice { recv, start, end, inclusive } => {
                 self.compile_slice(*recv, *start, *end, *inclusive)
             }
+        }
+    }
+
+    /// Compile an `Expr::Ident(name)` reference: local var, captured/outer var, implicit-this
+    /// field access, global load, or nullary ADT/type constructor.
+    fn compile_ident(
+        &mut self,
+        expr_id: crate::ast::Ast::ExprId,
+        name: &str,
+    ) -> NodeId {
+        match self.lookup_var(name) {
+            Some(node_id) => {
+                // When `current_effect` exists, create a CF_SEQ dependency node to ensure the
+                // variable read executes only after prior side effects complete.
+                // This prevents an expression from reading a stale value before a WriteBack in
+                // a while/loop subgraph updates it.
+                // Consistent with the `current_effect` dependency mechanism in
+                // `compile_global_load`.
+                match self.current_effect {
+                    Some(eff) => self.chain_effects(Some(eff), node_id),
+                    None => node_id,
+                }
+            }
+            None => {
+                // Implicit this: bare identifier resolved to an instance field by sema.
+                // Sema marks such accesses on `ExprInfo.implicit_this`; synthesize an explicit
+                // `this.<field>` FieldAccess node. The method variant is handled in the Call
+                // branch (it needs the argument list).
+                if let Some(access) = self.expr_implicit_this(expr_id).cloned() {
+                    if let crate::sema::Sema::ImplicitThisAccess::Field(field) = access {
+                        let this_node = self
+                            .lookup_var("this")
+                            .expect("this binding must exist in method body");
+                        return self.build_implicit_field_access(this_node, &field);
+                    }
+                    // Method variant handled in Call branch.
+                }
+                match self.lookup_global_var(name) {
+                    Some(slot) => self.compile_global_load(slot),
+                    None => {
+                        // Nullary ADT / type constructor detection: when an Ident is neither a
+                        // local nor a global variable, check whether it is a nullary constructor
+                        // (e.g. `Lt`/`Leaf`/`Red`) and compile it as a nullary construct node.
+                        // Parameterized constructors (non-empty `field_names`) are not handled
+                        // here (they go through the `Call` path with arguments).
+                        // A newtype always has an inner value, so it can never be nullary.
+                        let tf_info = self.lookup_constructor_field_names(name)
+                            .or_else(|| self.lookup_type_field_names(name));
+                        match tf_info {
+                            Some(info) if info.field_names.is_empty() && info.kind != RecordLitKind::Newtype => {
+                                let inputs_offset = self.graph.inputs_pool.push(&[]);
+                                let node = self.graph.add_node(Node {
+                                    kind: NodeKind::BinOp,
+                                    input_count: 0,
+                                    inputs_offset,
+                                    compute_fn: CF_RECORD_CONSTRUCT, // record_construct
+                                });
+                                self.graph.set_record_lit_info(node, RecordLitInfo {
+                                    type_name: info.type_name.clone(),
+                                    field_names: Vec::new(),
+                                    constructor: name.to_string(),
+                                    kind: info.kind,
+                                });
+                                node
+                            }
+                            _ => self.compile_const(),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compile an `Expr::Assign { target, value }` expression.
+    ///
+    /// Used for assignments in expression contexts such as defer bodies.
+    /// Consistent with the `Ident` logic of `Stmt::Assignment`:
+    ///   captured variable -> WriteBack; outer variable -> WriteBack;
+    ///   global variable -> global_store; local -> bind_var.
+    fn compile_assign(
+        &mut self,
+        target: crate::ast::Ast::ExprId,
+        value: crate::ast::Ast::ExprId,
+    ) -> NodeId {
+        let raw_val = self.compile_subexpr(value);
+        let val_node = self.chain_effects(self.current_effect, raw_val);
+        let target_expr = &self.current_module().arena.expr(target).node;
+        match target_expr {
+            crate::ast::Ast::Expr::Ident(name) => {
+                // Implicit-this field assignment: `field = value` inside a method body
+                // resolves to `this.field = value`. Without this, the bare name would
+                // create a local binding instead of mutating the instance field.
+                if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) = self.expr_implicit_this(target).cloned() {
+                    let this_node = self
+                        .lookup_var("this")
+                        .expect("this binding must exist in method body");
+                    let off = self.graph.inputs_pool.push(&[this_node, val_node]);
+                    let set_node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: 2,
+                        inputs_offset: off,
+                        compute_fn: CF_RECORD_FIELD_SET,
+                    });
+                    self.graph.set_field_set_name(set_node, field.to_string());
+                    return self.compile_void_const();
+                }
+                let captured_source = self.captured_scopes.iter().rev()
+                    .find_map(|scope| scope.iter()
+                        .find(|(n, _)| n.as_str() == *name)
+                        .map(|(_, node)| *node));
+                if let Some(source) = captured_source {
+                    let wb_node = self.compile_writeback_node(val_node, source);
+                    self.bind_var(name, val_node);
+                    self.current_effect = Some(wb_node);
+                } else if let Some(outer_node) = self.lookup_var(name) {
+                    if !self.is_in_current_subgraph(outer_node) {
+                        let wb_node = self.compile_writeback_node(val_node, outer_node);
+                        self.bind_var(name, val_node);
+                        self.current_effect = Some(wb_node);
+                    } else if let Some(&captured_node) = self.captured_vars.get(*name) {
+                        let wb_node = self.compile_writeback_node(val_node, captured_node);
+                        self.bind_var(name, val_node);
+                        self.current_effect = Some(wb_node);
+                    } else {
+                        self.bind_var(name, val_node);
+                    }
+                } else if let Some(slot) = self.lookup_global_var(name) {
+                    let store_node = self.compile_global_store(val_node, slot);
+                    self.current_effect = Some(store_node);
+                } else {
+                    self.bind_var(name, val_node);
+                }
+            }
+            crate::ast::Ast::Expr::FieldAccess { recv: obj, field } => {
+                let obj_node = self.compile_subexpr(*obj);
+                let off = self.graph.inputs_pool.push(&[obj_node, val_node]);
+                let set_node = self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset: off,
+                    compute_fn: CF_RECORD_FIELD_SET, // record_field_set
+                });
+                self.graph.set_field_set_name(set_node, field.to_string());
+            }
+            // `recv?.field = value`: skip the assignment when `obj` is null.
+            crate::ast::Ast::Expr::SafeAccess { recv: obj, field } => {
+                let obj_node = self.compile_subexpr(*obj);
+                let off = self.graph.inputs_pool.push(&[obj_node, val_node]);
+                let set_node = self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset: off,
+                    compute_fn: CF_RECORD_FIELD_SET, // record_field_set
+                });
+                self.graph.set_field_set_name(set_node, field.to_string());
+                self.graph.set_safe_op(set_node);
+            }
+            // `*ref = value` → compute_deref_write(282)
+            crate::ast::Ast::Expr::Deref(ref_inner) => {
+                let ref_node = self.compile_subexpr(*ref_inner);
+                let off = self.graph.inputs_pool.push(&[ref_node, val_node]);
+                let _write_node = self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset: off,
+                    compute_fn: CF_DEREF_WRITE, // compute_deref_write
+                });
+            }
+            _ => {}
+        }
+        self.compile_void_const()
+    }
+
+    /// Compile an `Expr::CompoundAssign { op, target, value }` expression: `target op= value`.
+    fn compile_compound_assign(
+        &mut self,
+        op: crate::ast::Ast::CompoundAssignOp,
+        target: crate::ast::Ast::ExprId,
+        value: crate::ast::Ast::ExprId,
+    ) -> NodeId {
+        let val_node = self.compile_subexpr(value);
+        let target_expr = &self.current_module().arena.expr(target).node;
+        let bin_compute = self.compound_assign_op_to_compute_fn(op, target);
+        match target_expr {
+            crate::ast::Ast::Expr::Ident(name) => {
+                // Implicit-this field compound assignment: `field op= value` inside a
+                // method body resolves to `this.field op= value`.
+                if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) = self.expr_implicit_this(target).cloned() {
+                    let this_node = self
+                        .lookup_var("this")
+                        .expect("this binding must exist in method body");
+                    // Read the current field value.
+                    let get_off = self.graph.inputs_pool.push(&[this_node]);
+                    let get_node = self.graph.add_node(Node {
+                        kind: NodeKind::FieldAccess,
+                        input_count: 1,
+                        inputs_offset: get_off,
+                        compute_fn: CF_RECORD_FIELD_GET,
+                    });
+                    // Operation.
+                    let bin_off = self.graph.inputs_pool.push(&[get_node, val_node]);
+                    let result_node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: 2,
+                        inputs_offset: bin_off,
+                        compute_fn: bin_compute,
+                    });
+                    // Write back.
+                    let set_off = self.graph.inputs_pool.push(&[this_node, result_node]);
+                    let set_node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: 2,
+                        inputs_offset: set_off,
+                        compute_fn: CF_RECORD_FIELD_SET,
+                    });
+                    self.graph.set_field_set_name(set_node, field.to_string());
+                    return result_node;
+                }
+                let cur_node = self
+                    .lookup_var(name)
+                    .unwrap_or_else(|| self.compile_placeholder());
+                let off = self.graph.inputs_pool.push(&[cur_node, val_node]);
+                let result_node = self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset: off,
+                    compute_fn: bin_compute,
+                });
+                self.bind_var(name, result_node);
+                result_node
+            }
+            crate::ast::Ast::Expr::FieldAccess { recv: obj, field }
+            | crate::ast::Ast::Expr::SafeAccess { recv: obj, field } => {
+                let obj_node = self.compile_subexpr(*obj);
+                // Read the current field value.
+                let get_off = self.graph.inputs_pool.push(&[obj_node]);
+                let get_node = self.graph.add_node(Node {
+                    kind: NodeKind::FieldAccess,
+                    input_count: 1,
+                    inputs_offset: get_off,
+                    compute_fn: CF_RECORD_FIELD_GET, // record_field_get
+                });
+                // Operation.
+                let bin_off = self.graph.inputs_pool.push(&[get_node, val_node]);
+                let result_node = self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset: bin_off,
+                    compute_fn: bin_compute,
+                });
+                // Write back.
+                let set_off = self.graph.inputs_pool.push(&[obj_node, result_node]);
+                let set_node = self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset: set_off,
+                    compute_fn: CF_RECORD_FIELD_SET, // record_field_set
+                });
+                self.graph.set_field_set_name(set_node, field.to_string());
+                result_node
+            }
+            // `*ref op= value` -> read Cell + operation + write back to Cell.
+            crate::ast::Ast::Expr::Deref(ref_inner) => {
+                let ref_node = self.compile_subexpr(*ref_inner);
+                // Read the current value: compute_deref_read (281).
+                let read_off = self.graph.inputs_pool.push(&[ref_node]);
+                let read_node = self.graph.add_node(Node {
+                    kind: NodeKind::UnOp,
+                    input_count: 1,
+                    inputs_offset: read_off,
+                    compute_fn: CF_DEREF_READ,
+                });
+                // Operation.
+                let bin_off = self.graph.inputs_pool.push(&[read_node, val_node]);
+                let result_node = self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset: bin_off,
+                    compute_fn: bin_compute,
+                });
+                // Write back to Cell: compute_deref_write (282).
+                let write_off = self.graph.inputs_pool.push(&[ref_node, result_node]);
+                let _write_node = self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset: write_off,
+                    compute_fn: CF_DEREF_WRITE,
+                });
+                result_node
+            }
+            _ => self.compile_void_const(),
         }
     }
 
@@ -1828,7 +1842,7 @@ impl<'a> IrBuilder<'a> {
     /// `node_range`.
     /// The upvalues of all methods are concatenated in order as the construct node's inputs.
     fn compile_inline_trait(&mut self, expr_id: crate::ast::Ast::ExprId, methods: &[crate::ast::Ast::MethodDecl<'_>]) -> NodeId {
-        // Infer the trait name (from `sema.expr_types` as `Ty::TraitObject`).
+        // Infer the trait name (from `sema.expr_types` as `Type::TraitObject`).
         let trait_name = self.expr_type_name(expr_id)
             .map(|s| s.to_string())
             .unwrap_or_else(|| "Unknown".to_string());
@@ -4243,7 +4257,7 @@ impl<'a> IrBuilder<'a> {
         if let Some(suffix) = stripped.find(|c: char| c.is_ascii_alphabetic()) {
             let suffix_str = &stripped[suffix..];
             if let Some(tag) = crate::value::ValueTag::from_name(suffix_str) {
-                let ty = crate::types::Ty::from(tag);
+                let ty = crate::types::Type::from(tag);
                 use crate::types::TypeFamily;
                 return match ty.family() {
                     TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64 => CF_EQ_I64,
@@ -4600,7 +4614,7 @@ impl<'a> IrBuilder<'a> {
         "i32"
     }
 
-    /// Determine whether an expression is a nullable type (Ty::Nullable).
+    /// Determine whether an expression is a nullable type (Type::Nullable).
     /// Nullable types' ==/!= need null-discriminant comparison: ?. short-circuit or null literals
     /// produce Value::Null, and dedicated comparison functions for str/i32 etc. do not handle Null,
     /// yielding wrong results.
@@ -4610,7 +4624,7 @@ impl<'a> IrBuilder<'a> {
         self.sema
             .expr_types
             .get(&key)
-            .map(|info| matches!(self.type_arena.get(info.ty), crate::sema::Sema::Ty::Nullable(_)))
+            .map(|info| matches!(self.type_arena.get(info.ty), crate::sema::Sema::Type::Nullable(_)))
             .unwrap_or(false)
     }
 
@@ -5842,7 +5856,7 @@ impl<'a> IrBuilder<'a> {
         }
 
         {
-            // Ty-driven method dispatch: (type_id, method_idx) structured key lookup into method_subgraphs
+            // Type-driven method dispatch: (type_id, method_idx) structured key lookup into method_subgraphs
             // current_effect appended at the end as an implicit dependency (ensures Call executes only after prior effects complete)
             let mut inputs = Vec::with_capacity(2 + args.len());
             inputs.push(recv_node);
@@ -6067,8 +6081,8 @@ impl<'a> IrBuilder<'a> {
         }
         let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr.0 as u64);
         let info = self.sema.expr_types.get(&key)?;
-        // Consistent with expr_type_name: prefer type_name, fall back to Ty::name()
-        // (built-in structural variants like array/nullable/str/Throw return their registered name via Ty::name();
+        // Consistent with expr_type_name: prefer type_name, fall back to Type::name()
+        // (built-in structural variants like array/nullable/str/Throw return their registered name via Type::name();
         // "unknown" only appears in degenerate paths where Adt/Record arena lookup fails).
         let type_name = info
             .type_name
@@ -6133,8 +6147,8 @@ impl<'a> IrBuilder<'a> {
         if let Some(info) = self.sema.expr_types.get(&key) {
             if let Some(ref tn) = info.type_name {
                 let tn = tn.as_ref();
-                // Built-in generics + Timer: derived from Ty::from_type_name + family() (eliminates string matching)
-                if let Some(ty) = crate::types::Ty::from_type_name(tn) {
+                // Built-in generics + Timer: derived from Type::from_type_name + family() (eliminates string matching)
+                if let Some(ty) = crate::types::Type::from_type_name(tn) {
                     use crate::types::TypeFamily;
                     match ty.family() {
                         TypeFamily::Async => return EventSourceKind::AsyncJoin,
@@ -6155,7 +6169,7 @@ impl<'a> IrBuilder<'a> {
         let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr_id.0 as u64);
         if let Some(info) = self.sema.expr_types.get(&key) {
             if let Some(ref tn) = info.type_name {
-                if let Some(ty) = crate::types::Ty::from_type_name(tn.as_ref()) {
+                if let Some(ty) = crate::types::Type::from_type_name(tn.as_ref()) {
                     return ty.family() == crate::types::TypeFamily::Async;
                 }
             }
@@ -7110,7 +7124,7 @@ impl<'a> IrBuilder<'a> {
         // (switch_subgraph would lose the current frame state).
         // Consumes sema's FuncSigInfo.return_type to determine void (builtin modules fall back to AST).
         let is_void_fn = self.sema.get_func_sig(name)
-            .map(|sig| matches!(self.type_arena.get(sig.return_type), crate::sema::Sema::Ty::Void))
+            .map(|sig| matches!(self.type_arena.get(sig.return_type), crate::sema::Sema::Type::Void))
             .unwrap_or_else(|| match return_type {
                 None => true,
                 Some(tr) => {
@@ -7249,7 +7263,7 @@ impl<'a> IrBuilder<'a> {
 
         // Compile the function body (unified entry: memoize/tail_rec/non_tail_rec apply to generic instances too)
         let is_void_fn = self.sema.get_func_sig(func_name)
-            .map(|sig| matches!(self.type_arena.get(sig.return_type), crate::sema::Sema::Ty::Void))
+            .map(|sig| matches!(self.type_arena.get(sig.return_type), crate::sema::Sema::Type::Void))
             .unwrap_or_else(|| match return_type {
                 None => true,
                 Some(tr) => {

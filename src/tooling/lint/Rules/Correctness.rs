@@ -3,7 +3,7 @@
 use crate::ast::Ast::Module;
 use crate::pass::Analyzer::AnalysisReport;
 use crate::sema::Sema::SemaResult;
-use crate::tooling::common::Diagnostic::{Diagnostic, Severity, Category, expr_range, stmt_range};
+use crate::tooling::Common::Diagnostic::{Diagnostic, Severity, Category, expr_range, stmt_range};
 
 /// K001: non-exhaustive match.
 pub fn non_exhaustive_match(report: &AnalysisReport, _sema: &SemaResult, module: &Module) -> Vec<Diagnostic> {

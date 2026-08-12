@@ -221,7 +221,7 @@ pub fn run_sema_pipeline_or_exit(
 
 use crate::ast::Ast::Span;
 use crate::ast::Parser::ParseError;
-use crate::tooling::common::Diagnostic::{Diagnostic, Range, Severity, Category};
+use crate::tooling::Common::Diagnostic::{Diagnostic, Range, Severity, Category};
 
 /// LSP parse result: always returns module (error-recovered) + diagnostics.
 pub struct ParseResult<'a> {

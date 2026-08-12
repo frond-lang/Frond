@@ -71,7 +71,6 @@ const TYPE_NAME_NULL: &str = "null";
 const TYPE_NAME_VOID: &str = "void";
 const TYPE_NAME_STR: &str = "str";
 const TYPE_NAME_ARRAY: &str = "array";
-const TYPE_NAME_UNKNOWN: &str = "unknown";
 
 // =========================================================================
 // Runtime error construction — uniformly uses ErrorVal (isomorphic to Arena::alloc_error_val).
@@ -247,14 +246,6 @@ fn utf8_decode_at(bytes: &[u8], offset: usize) -> Option<(u32, usize)> {
     }
     // Illegal leading byte
     None
-}
-
-/// Converts a `u32` codepoint to a `char`, falling back to U+0000 for invalid codepoints.
-/// Single unified helper that eliminates three duplicate
-/// `char::from_u32(x).unwrap_or('\0')` call sites.
-#[inline]
-pub fn char_from_u32_or_nul(u: u32) -> char {
-    char::from_u32(u).unwrap_or('\0')
 }
 
 // =========================================================================
@@ -1156,6 +1147,23 @@ mod ffi_common {
         let align: u32 = crate::value::reflect_layout_alignment(&v);
         Value::u32(align)
     }
+
+    /// Shared reflect FFI table entries (11 entries).
+    /// Merged into the dispatch table by both ffi_has_extern_c and ffi_no_extern_c
+    /// to avoid duplicating the reflect registration lines across two cfg branches.
+    pub(super) const REFLECT_ENTRIES: &[(&str, FfiHandler)] = &[
+        ("__reflect_kind", ffi_common::reflect_kind as FfiHandler),
+        ("__reflect_type_name", ffi_common::reflect_type_name as FfiHandler),
+        ("__reflect_array_len", ffi_common::reflect_array_len as FfiHandler),
+        ("__reflect_field_count", ffi_common::reflect_field_count as FfiHandler),
+        ("__reflect_size", ffi_common::reflect_size as FfiHandler),
+        ("__reflect_field_name", ffi_common::reflect_field_name as FfiHandler),
+        ("__reflect_field_value", ffi_common::reflect_field_value as FfiHandler),
+        ("__reflect_adt_constructor", ffi_common::reflect_adt_constructor as FfiHandler),
+        ("__reflect_kind_str", ffi_common::reflect_kind_str as FfiHandler),
+        ("__reflect_layout_size", ffi_common::reflect_layout_size as FfiHandler),
+        ("__reflect_layout_alignment", ffi_common::reflect_layout_alignment as FfiHandler),
+    ];
 }
 
 // =========================================================================
@@ -1455,12 +1463,12 @@ mod ffi_has_extern_c {
 
     // ── time ──
 
-    fn instant_now_ns(frame: &mut Frame, _inputs: &[NodeId]) -> Value {
+    fn instant_now_ns(_frame: &mut Frame, _inputs: &[NodeId]) -> Value {
         let ns = unsafe { wrapper::__instant_now_ns() };
         Value::i64(ns)
     }
 
-    fn systemtime_now_ns(frame: &mut Frame, _inputs: &[NodeId]) -> Value {
+    fn systemtime_now_ns(_frame: &mut Frame, _inputs: &[NodeId]) -> Value {
         let ns = unsafe { wrapper::__systemtime_now_ns() };
         Value::i64(ns)
     }
@@ -1471,7 +1479,7 @@ mod ffi_has_extern_c {
         Value::VOID
     }
 
-    fn localtime_offset_minutes(frame: &mut Frame, _inputs: &[NodeId]) -> Value {
+    fn localtime_offset_minutes(_frame: &mut Frame, _inputs: &[NodeId]) -> Value {
         let minutes = unsafe { wrapper::__localtime_offset_minutes() };
         Value::i32(minutes)
     }
@@ -1679,18 +1687,6 @@ mod ffi_has_extern_c {
         ("__cast_i128_to_usize", cast_i128_to_usize as FfiHandler),
         // cast: char
         ("__cast_char_to_u8", cast_char_to_u8 as FfiHandler),
-        // reflect (shared from ffi_common)
-        ("__reflect_kind", ffi_common::reflect_kind as FfiHandler),
-        ("__reflect_type_name", ffi_common::reflect_type_name as FfiHandler),
-        ("__reflect_array_len", ffi_common::reflect_array_len as FfiHandler),
-        ("__reflect_field_count", ffi_common::reflect_field_count as FfiHandler),
-        ("__reflect_size", ffi_common::reflect_size as FfiHandler),
-        ("__reflect_field_name", ffi_common::reflect_field_name as FfiHandler),
-        ("__reflect_field_value", ffi_common::reflect_field_value as FfiHandler),
-        ("__reflect_adt_constructor", ffi_common::reflect_adt_constructor as FfiHandler),
-        ("__reflect_kind_str", ffi_common::reflect_kind_str as FfiHandler),
-        ("__reflect_layout_size", ffi_common::reflect_layout_size as FfiHandler),
-        ("__reflect_layout_alignment", ffi_common::reflect_layout_alignment as FfiHandler),
         // str
         ("__str_utf8_decode_at", str_utf8_decode_at as FfiHandler),
         ("__str_utf8_char_len_at", str_utf8_char_len_at as FfiHandler),
@@ -1711,7 +1707,9 @@ mod ffi_has_extern_c {
 fn ffi_dispatch_table() -> &'static rustc_hash::FxHashMap<&'static str, FfiHandler> {
     static TABLE_MAP: OnceLock<rustc_hash::FxHashMap<&'static str, FfiHandler>> = OnceLock::new();
     TABLE_MAP.get_or_init(|| {
-        ffi_has_extern_c::TABLE.iter().copied().collect()
+        ffi_has_extern_c::TABLE.iter()
+            .chain(ffi_common::REFLECT_ENTRIES.iter())
+            .copied().collect()
     })
 }
 
@@ -1763,12 +1761,12 @@ mod ffi_no_extern_c {
 
     // ── time: implemented directly via Rust std ──
 
-    fn instant_now_ns(frame: &mut Frame, _inputs: &[NodeId]) -> Value {
+    fn instant_now_ns(_frame: &mut Frame, _inputs: &[NodeId]) -> Value {
         let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
         Value::i64(ns as i64)
     }
 
-    fn systemtime_now_ns(frame: &mut Frame, _inputs: &[NodeId]) -> Value {
+    fn systemtime_now_ns(_frame: &mut Frame, _inputs: &[NodeId]) -> Value {
         let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
         Value::i64(ns as i64)
     }
@@ -1779,7 +1777,7 @@ mod ffi_no_extern_c {
         Value::VOID
     }
 
-    fn localtime_offset_minutes(frame: &mut Frame, _inputs: &[NodeId]) -> Value {
+    fn localtime_offset_minutes(_frame: &mut Frame, _inputs: &[NodeId]) -> Value {
         Value::i32(0)
     }
 
@@ -1912,18 +1910,6 @@ mod ffi_no_extern_c {
         ("__cast_i128_to_usize", cast_i128_to_usize as FfiHandler),
         // cast: char
         ("__cast_char_to_u8", cast_char_to_u8 as FfiHandler),
-        // reflect (shared from ffi_common)
-        ("__reflect_kind", ffi_common::reflect_kind as FfiHandler),
-        ("__reflect_type_name", ffi_common::reflect_type_name as FfiHandler),
-        ("__reflect_array_len", ffi_common::reflect_array_len as FfiHandler),
-        ("__reflect_field_count", ffi_common::reflect_field_count as FfiHandler),
-        ("__reflect_size", ffi_common::reflect_size as FfiHandler),
-        ("__reflect_field_name", ffi_common::reflect_field_name as FfiHandler),
-        ("__reflect_field_value", ffi_common::reflect_field_value as FfiHandler),
-        ("__reflect_adt_constructor", ffi_common::reflect_adt_constructor as FfiHandler),
-        ("__reflect_kind_str", ffi_common::reflect_kind_str as FfiHandler),
-        ("__reflect_layout_size", ffi_common::reflect_layout_size as FfiHandler),
-        ("__reflect_layout_alignment", ffi_common::reflect_layout_alignment as FfiHandler),
         // str
         ("__str_utf8_decode_at", str_utf8_decode_at as FfiHandler),
         ("__str_utf8_char_len_at", str_utf8_char_len_at as FfiHandler),
@@ -1936,7 +1922,9 @@ mod ffi_no_extern_c {
 fn ffi_dispatch_table() -> &'static rustc_hash::FxHashMap<&'static str, FfiHandler> {
     static TABLE_MAP: OnceLock<rustc_hash::FxHashMap<&'static str, FfiHandler>> = OnceLock::new();
     TABLE_MAP.get_or_init(|| {
-        ffi_no_extern_c::TABLE.iter().copied().collect()
+        ffi_no_extern_c::TABLE.iter()
+            .chain(ffi_common::REFLECT_ENTRIES.iter())
+            .copied().collect()
     })
 }
 

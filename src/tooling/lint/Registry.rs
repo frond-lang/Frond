@@ -3,7 +3,7 @@
 use crate::ast::Ast::{Module, AstArena};
 use crate::pass::Analyzer::AnalysisReport;
 use crate::sema::Sema::SemaResult;
-use crate::tooling::common::Diagnostic::{Diagnostic, Severity, Category};
+use crate::tooling::Common::Diagnostic::{Diagnostic, Severity};
 use rustc_hash::FxHashMap;
 
 /// Lint configuration: per-rule severity overrides.
@@ -53,8 +53,6 @@ pub enum RuleRunner {
 
 struct RuleEntry {
     code: &'static str,
-    name: &'static str,
-    category: Category,
     default_severity: Severity,
     runner: RuleRunner,
 }
@@ -73,54 +71,50 @@ impl RuleRegistry {
 
     fn register_all(&mut self) {
         // Correctness rules (wrap Analyzer)
-        self.register("K001", "non-exhaustive-match", Category::Correctness, Severity::Error,
-            RuleRunner::FromAnalysis(crate::tooling::lint::Rules::Correctness::non_exhaustive_match));
-        self.register("K002", "unreachable-match-arm", Category::Correctness, Severity::Warning,
-            RuleRunner::FromAnalysis(crate::tooling::lint::Rules::Correctness::unreachable_match_arm));
-        self.register("K003", "unreachable-code", Category::Correctness, Severity::Warning,
-            RuleRunner::FromAnalysis(crate::tooling::lint::Rules::Correctness::unreachable_code));
-        self.register("K004", "dead-variable", Category::Correctness, Severity::Warning,
-            RuleRunner::FromAnalysis(crate::tooling::lint::Rules::Correctness::dead_variable));
-        self.register("K005", "dead-function", Category::Correctness, Severity::Warning,
-            RuleRunner::FromAnalysis(crate::tooling::lint::Rules::Correctness::dead_function));
-        self.register("K006", "dead-parameter", Category::Correctness, Severity::Advice,
-            RuleRunner::FromAnalysis(crate::tooling::lint::Rules::Correctness::dead_parameter));
+        self.register("K001", Severity::Error,
+            RuleRunner::FromAnalysis(crate::tooling::Lint::Rules::Correctness::non_exhaustive_match));
+        self.register("K002", Severity::Warning,
+            RuleRunner::FromAnalysis(crate::tooling::Lint::Rules::Correctness::unreachable_match_arm));
+        self.register("K003", Severity::Warning,
+            RuleRunner::FromAnalysis(crate::tooling::Lint::Rules::Correctness::unreachable_code));
+        self.register("K004", Severity::Warning,
+            RuleRunner::FromAnalysis(crate::tooling::Lint::Rules::Correctness::dead_variable));
+        self.register("K005", Severity::Warning,
+            RuleRunner::FromAnalysis(crate::tooling::Lint::Rules::Correctness::dead_function));
+        self.register("K006", Severity::Advice,
+            RuleRunner::FromAnalysis(crate::tooling::Lint::Rules::Correctness::dead_parameter));
 
         // Performance rules (wrap Analyzer)
-        self.register("PERF001", "memoizable", Category::Perf, Severity::Advice,
-            RuleRunner::FromAnalysis(crate::tooling::lint::Rules::Perf::memoizable));
-        self.register("PERF002", "inlineable", Category::Perf, Severity::Advice,
-            RuleRunner::FromAnalysis(crate::tooling::lint::Rules::Perf::inlineable));
-        self.register("PERF003", "stack-allocable", Category::Perf, Severity::Advice,
-            RuleRunner::FromAnalysis(crate::tooling::lint::Rules::Perf::stack_allocable));
+        self.register("PERF001", Severity::Advice,
+            RuleRunner::FromAnalysis(crate::tooling::Lint::Rules::Perf::memoizable));
+        self.register("PERF002", Severity::Advice,
+            RuleRunner::FromAnalysis(crate::tooling::Lint::Rules::Perf::inlineable));
+        self.register("PERF003", Severity::Advice,
+            RuleRunner::FromAnalysis(crate::tooling::Lint::Rules::Perf::stack_allocable));
 
         // Style rules (AST walk)
-        self.register("STYLE001", "naming", Category::Style, Severity::Advice,
-            RuleRunner::AstWalk(crate::tooling::lint::Rules::Style::naming));
-        self.register("STYLE002", "unused-import", Category::Style, Severity::Warning,
-            RuleRunner::AstWalk(crate::tooling::lint::Rules::Style::unused_import));
-        self.register("STYLE003", "redundant-paren", Category::Style, Severity::Advice,
-            RuleRunner::AstWalk(crate::tooling::lint::Rules::Style::redundant_paren));
+        self.register("STYLE001", Severity::Advice,
+            RuleRunner::AstWalk(crate::tooling::Lint::Rules::Style::naming));
+        self.register("STYLE002", Severity::Warning,
+            RuleRunner::AstWalk(crate::tooling::Lint::Rules::Style::unused_import));
+        self.register("STYLE003", Severity::Advice,
+            RuleRunner::AstWalk(crate::tooling::Lint::Rules::Style::redundant_paren));
 
         // Idiom rules (AST walk)
-        self.register("IDIOM001", "prefer-val", Category::Idiom, Severity::Advice,
-            RuleRunner::AstWalk(crate::tooling::lint::Rules::Idioms::prefer_val));
-        self.register("IDIOM002", "string-interp", Category::Idiom, Severity::Advice,
-            RuleRunner::AstWalk(crate::tooling::lint::Rules::Idioms::string_interpolation));
+        self.register("IDIOM001", Severity::Advice,
+            RuleRunner::AstWalk(crate::tooling::Lint::Rules::Idioms::prefer_val));
+        self.register("IDIOM002", Severity::Advice,
+            RuleRunner::AstWalk(crate::tooling::Lint::Rules::Idioms::string_interpolation));
     }
 
     fn register(
         &mut self,
         code: &'static str,
-        name: &'static str,
-        category: Category,
         default_severity: Severity,
         runner: RuleRunner,
     ) {
         self.rules.push(RuleEntry {
             code,
-            name,
-            category,
             default_severity,
             runner,
         });

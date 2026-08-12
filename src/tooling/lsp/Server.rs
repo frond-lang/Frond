@@ -10,10 +10,10 @@ use rustc_hash::FxHashSet;
 use crate::module::ModuleLoader;
 use crate::pass::Analyzer;
 use crate::sema::Sema::{SemaResult, TypeArena};
-use crate::tooling::common::Diagnostic::Diagnostic;
-use crate::tooling::common::Pipeline;
-use crate::tooling::fmt::Engine::FmtConfig;
-use crate::tooling::lint::{LintConfig, RuleRegistry};
+use crate::tooling::Common::Diagnostic::Diagnostic;
+use crate::tooling::Common::Pipeline;
+use crate::tooling::Fmt::Engine::FmtConfig;
+use crate::tooling::Lint::{LintConfig, RuleRegistry};
 
 use super::DocState::{
     extract_decl_signatures, extract_symbols, is_api_change, DocState, SymbolKind,
@@ -410,9 +410,9 @@ impl LspServer {
                     }
                 },
                 "severity": match d.severity {
-                    crate::tooling::common::Diagnostic::Severity::Error => 1,
-                    crate::tooling::common::Diagnostic::Severity::Warning => 2,
-                    crate::tooling::common::Diagnostic::Severity::Advice => 3,
+                    crate::tooling::Common::Diagnostic::Severity::Error => 1,
+                    crate::tooling::Common::Diagnostic::Severity::Warning => 2,
+                    crate::tooling::Common::Diagnostic::Severity::Advice => 3,
                 },
                 "code": d.code,
                 "source": "kuzo",
@@ -643,7 +643,7 @@ impl LspServer {
         let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
 
         if let Some(doc) = self.state.docs.get(uri) {
-            let formatted = crate::tooling::fmt::Engine::format(&doc.text, &self.state.fmt_config);
+            let formatted = crate::tooling::Fmt::Engine::format(&doc.text, &self.state.fmt_config);
 
             // Return a single TextEdit replacing the entire document
             let line_count = doc.text.lines().count() as u32;

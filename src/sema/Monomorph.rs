@@ -46,10 +46,10 @@ fn type_identity_hash(arena: &TypeArena, h: TypeHandle) -> u64 {
     }
     // User types: use name as identity
     let name: &str = match &ty {
-        Ty::Adt(_) => arena.adt_parts(resolved).0,
-        Ty::Generic(_) => arena.generic_parts(resolved).0,
-        Ty::Trait(_) => arena.trait_parts(resolved).0,
-        Ty::TraitObject(_) => arena.trait_object_parts(resolved).0,
+        Type::Adt(_) => arena.adt_parts(resolved).0,
+        Type::Generic(_) => arena.generic_parts(resolved).0,
+        Type::Trait(_) => arena.trait_parts(resolved).0,
+        Type::TraitObject(_) => arena.trait_object_parts(resolved).0,
         _ => ty.name(),
     };
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -164,7 +164,7 @@ fn infer_type_args<'a>(
                             &format!("failed to resolve type argument in {}", func_name),
                             0, 0,
                         ));
-                        arena.make(crate::types::Ty::Unknown)
+                        arena.make(crate::types::Type::Unknown)
                     });
                 args.push(h);
             }
@@ -411,7 +411,7 @@ fn get_or_create_instance<'a>(
                     &format!("failed to resolve return type of {}", func_name),
                     0, 0,
                 ));
-                arena.make(crate::types::Ty::Unknown)
+                arena.make(crate::types::Type::Unknown)
             });
 
     let mut instance = MonomorphInstance {
@@ -1026,7 +1026,7 @@ pub fn collect_monomorph_instances<'a>(
                             &format!("failed to resolve return type of {}", name),
                             0, 0,
                         ));
-                        arena.make(crate::types::Ty::Unknown)
+                        arena.make(crate::types::Type::Unknown)
                     });
 
                     let instance = MonomorphInstance {

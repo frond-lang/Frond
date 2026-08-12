@@ -7,11 +7,11 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::AtomicBool;
 
-// Re-export the type discriminant tag from the Type module
-pub use crate::types::ValueTag;
+// Re-export the type discriminant tag from the Tag submodule
+pub use super::Tag::ValueTag;
 
 // Cross-submodule: HeapObj::hash (in this file) reuses the SIMD batch hash helper from Arena.rs
-use super::arena::simd_hash_soa;
+use super::Arena::simd_hash_soa;
 
 // =========================================================================
 // Part 1: scalar primitive types (scalar.rs + char.rs)
@@ -962,7 +962,7 @@ fn f128_mant_to_i128(exp: i32, mant: u128) -> i128 {
 /// Converts F128 mantissa (113-bit with implicit 1) + unbiased exponent to u128 integer part.
 fn f128_mant_to_u128(exp: i32, mant: u128) -> u128 {
     if exp < 112 {
-        (mant >> (112 - exp))
+        mant >> (112 - exp)
     } else {
         let shift = exp - 112;
         if shift >= 128 {

@@ -1,8 +1,9 @@
 // =========================================================================
-// Ty — the unified type enum (the single source of types, Copy, no external deps).
+// Type — the unified type enum (the single source of types, Copy, no external deps).
 // =========================================================================
 
 use super::Tag::*;
+use crate::value::{builtin_info_by_name, builtin_info_by_tag, ValueTag, TypeFamily};
 use std::fmt;
 
 // ─── Builtin type name constants ───
@@ -16,43 +17,43 @@ pub const NAME_SENDER: &str = "Sender";
 pub const NAME_RECEIVER: &str = "Receiver";
 pub const NAME_TIMER: &str = "Timer";
 
-/// Mapping from builtin generic type name → Ty variant.
+/// Mapping from builtin generic type name → Type variant.
 /// All string-based type resolution for generics should go through this table.
-pub const BUILTIN_GENERIC_TABLE: &[(&str, TyKind)] = &[
-    (NAME_THROW, TyKind::Throw),
-    (NAME_CHANNEL, TyKind::Channel),
-    (NAME_ASYNC, TyKind::Async),
-    (NAME_LAZY, TyKind::Lazy),
-    (NAME_ATOMIC, TyKind::Atomic),
-    (NAME_SENDER, TyKind::Sender),
-    (NAME_RECEIVER, TyKind::Receiver),
-    (NAME_TIMER, TyKind::Timer),
+pub const BUILTIN_GENERIC_TABLE: &[(&str, TypeKind)] = &[
+    (NAME_THROW, TypeKind::Throw),
+    (NAME_CHANNEL, TypeKind::Channel),
+    (NAME_ASYNC, TypeKind::Async),
+    (NAME_LAZY, TypeKind::Lazy),
+    (NAME_ATOMIC, TypeKind::Atomic),
+    (NAME_SENDER, TypeKind::Sender),
+    (NAME_RECEIVER, TypeKind::Receiver),
+    (NAME_TIMER, TypeKind::Timer),
 ];
 
 /// The kind of a builtin generic type (used for name→variant mapping).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TyKind {
+pub enum TypeKind {
     Throw, Channel, Async, Lazy, Atomic, Sender, Receiver, Timer,
 }
 
-impl TyKind {
-    pub fn to_ty(self, detail: DetailId) -> Ty {
+impl TypeKind {
+    pub fn to_ty(self, detail: DetailId) -> Type {
         match self {
-            TyKind::Throw => Ty::Throw(detail),
-            TyKind::Channel => Ty::Channel(detail),
-            TyKind::Async => Ty::Async(detail),
-            TyKind::Lazy => Ty::Lazy(detail),
-            TyKind::Atomic => Ty::Atomic(detail),
-            TyKind::Sender => Ty::Sender(detail),
-            TyKind::Receiver => Ty::Receiver(detail),
-            TyKind::Timer => Ty::Timer(detail),
+            TypeKind::Throw => Type::Throw(detail),
+            TypeKind::Channel => Type::Channel(detail),
+            TypeKind::Async => Type::Async(detail),
+            TypeKind::Lazy => Type::Lazy(detail),
+            TypeKind::Atomic => Type::Atomic(detail),
+            TypeKind::Sender => Type::Sender(detail),
+            TypeKind::Receiver => Type::Receiver(detail),
+            TypeKind::Timer => Type::Timer(detail),
         }
     }
 }
 
 /// The unified type representation for Kuzo.
 ///
-/// **Single source of types**: both the sema and IR layers use `Ty`; there is no longer
+/// **Single source of types**: both the sema and IR layers use `Type`; there is no longer
 /// a `ConcreteType`.
 ///
 /// **Copy enum**: all payloads are `u32` (`TypeHandle` or `DetailId`), with no heap
@@ -68,7 +69,7 @@ impl TyKind {
 /// The two layers are distinguished via `is_basic()` / `is_other()`, and family
 /// dispatch is done via `family()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Ty {
+pub enum Type {
     // -- Basic: 18 scalars (no payload) --
     Bool, Char,
     I8, I16, I32, I64, I128,
@@ -136,49 +137,49 @@ pub enum Ty {
 /// Structural detail ID (a `u32` index into the `TypeArena::details` table).
 ///
 /// Structural data for composite and user types lives in the `TypeArena` side tables,
-/// indexed by this ID. All `Ty` variants carry only `TypeHandle`(u32) / `DetailId`(u32) /
-/// `u32`, so `Ty` is `Copy`.
+/// indexed by this ID. All `Type` variants carry only `TypeHandle`(u32) / `DetailId`(u32) /
+/// `u32`, so `Type` is `Copy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DetailId(pub u32);
 
-impl Ty {
+impl Type {
     /// Full type-family classification (completes all dispatch checks in a single call).
     #[inline]
     pub fn family(&self) -> TypeFamily {
         match self {
-            Ty::I8 | Ty::I16 | Ty::I32 => TypeFamily::SignedInt32,
-            Ty::I64 | Ty::Isize => TypeFamily::SignedInt64,
-            Ty::I128 => TypeFamily::SignedInt128,
-            Ty::U8 | Ty::U16 | Ty::U32 => TypeFamily::UnsignedInt32,
-            Ty::U64 | Ty::Usize => TypeFamily::UnsignedInt64,
-            Ty::U128 => TypeFamily::UnsignedInt128,
-            Ty::F16 | Ty::F32 | Ty::F64 | Ty::F128 => TypeFamily::Float,
-            Ty::Bool => TypeFamily::Bool,
-            Ty::Char => TypeFamily::Char,
-            Ty::Str => TypeFamily::Str,
-            Ty::Null => TypeFamily::Null,
-            Ty::Void => TypeFamily::Void,
-            Ty::Throw(_) => TypeFamily::Throw,
-            Ty::Channel(_) => TypeFamily::Channel,
-            Ty::Async(_) => TypeFamily::Async,
-            Ty::Lazy(_) => TypeFamily::Lazy,
-            Ty::Atomic(_) => TypeFamily::Atomic,
-            Ty::Sender(_) => TypeFamily::Sender,
-            Ty::Receiver(_) => TypeFamily::Receiver,
-            Ty::Timer(_) => TypeFamily::Timer,
-            Ty::Array(_) => TypeFamily::Array,
-            Ty::Ref(_) => TypeFamily::Ref,
-            Ty::Fn(_) => TypeFamily::Fn,
-            Ty::Nullable(_) => TypeFamily::Nullable,
-            Ty::Adt(_) => TypeFamily::Adt,
-            Ty::Record(_) => TypeFamily::Record,
-            Ty::Trait(_) => TypeFamily::Trait,
-            Ty::TraitObject(_) => TypeFamily::TraitObject,
-            Ty::ModuleRef(_) => TypeFamily::ModuleRef,
-            Ty::Generic(_) => TypeFamily::Generic,
-            Ty::Never => TypeFamily::Never,
-            Ty::TypeVar(_) => TypeFamily::TypeVar,
-            Ty::Unknown => TypeFamily::Unknown,
+            Type::I8 | Type::I16 | Type::I32 => TypeFamily::SignedInt32,
+            Type::I64 | Type::Isize => TypeFamily::SignedInt64,
+            Type::I128 => TypeFamily::SignedInt128,
+            Type::U8 | Type::U16 | Type::U32 => TypeFamily::UnsignedInt32,
+            Type::U64 | Type::Usize => TypeFamily::UnsignedInt64,
+            Type::U128 => TypeFamily::UnsignedInt128,
+            Type::F16 | Type::F32 | Type::F64 | Type::F128 => TypeFamily::Float,
+            Type::Bool => TypeFamily::Bool,
+            Type::Char => TypeFamily::Char,
+            Type::Str => TypeFamily::Str,
+            Type::Null => TypeFamily::Null,
+            Type::Void => TypeFamily::Void,
+            Type::Throw(_) => TypeFamily::Throw,
+            Type::Channel(_) => TypeFamily::Channel,
+            Type::Async(_) => TypeFamily::Async,
+            Type::Lazy(_) => TypeFamily::Lazy,
+            Type::Atomic(_) => TypeFamily::Atomic,
+            Type::Sender(_) => TypeFamily::Sender,
+            Type::Receiver(_) => TypeFamily::Receiver,
+            Type::Timer(_) => TypeFamily::Timer,
+            Type::Array(_) => TypeFamily::Array,
+            Type::Ref(_) => TypeFamily::Ref,
+            Type::Fn(_) => TypeFamily::Fn,
+            Type::Nullable(_) => TypeFamily::Nullable,
+            Type::Adt(_) => TypeFamily::Adt,
+            Type::Record(_) => TypeFamily::Record,
+            Type::Trait(_) => TypeFamily::Trait,
+            Type::TraitObject(_) => TypeFamily::TraitObject,
+            Type::ModuleRef(_) => TypeFamily::ModuleRef,
+            Type::Generic(_) => TypeFamily::Generic,
+            Type::Never => TypeFamily::Never,
+            Type::TypeVar(_) => TypeFamily::TypeVar,
+            Type::Unknown => TypeFamily::Unknown,
         }
     }
 
@@ -226,13 +227,13 @@ impl Ty {
     #[inline]
     pub fn is_atomic_unit(&self) -> bool {
         matches!(self,
-            Ty::Bool | Ty::Char
-            | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128
-            | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128
-            | Ty::Isize | Ty::Usize
-            | Ty::F16 | Ty::F32 | Ty::F64 | Ty::F128
-            | Ty::Str | Ty::Null | Ty::Void
-            | Ty::Never | Ty::Unknown
+            Type::Bool | Type::Char
+            | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128
+            | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
+            | Type::Isize | Type::Usize
+            | Type::F16 | Type::F32 | Type::F64 | Type::F128
+            | Type::Str | Type::Null | Type::Void
+            | Type::Never | Type::Unknown
         )
     }
 
@@ -242,12 +243,12 @@ impl Ty {
     #[inline]
     pub fn bit_width(&self) -> Option<u16> {
         match self {
-            Ty::I8 | Ty::U8 => Some(8),
-            Ty::I16 | Ty::U16 | Ty::F16 => Some(16),
-            Ty::I32 | Ty::U32 | Ty::F32 | Ty::Char => Some(32),
-            Ty::I64 | Ty::U64 | Ty::Isize | Ty::Usize | Ty::F64 => Some(64),
-            Ty::I128 | Ty::U128 | Ty::F128 => Some(128),
-            Ty::Bool => Some(1),
+            Type::I8 | Type::U8 => Some(8),
+            Type::I16 | Type::U16 | Type::F16 => Some(16),
+            Type::I32 | Type::U32 | Type::F32 | Type::Char => Some(32),
+            Type::I64 | Type::U64 | Type::Isize | Type::Usize | Type::F64 => Some(64),
+            Type::I128 | Type::U128 | Type::F128 => Some(128),
+            Type::Bool => Some(1),
             _ => None,
         }
     }
@@ -268,11 +269,11 @@ impl Ty {
     #[inline]
     pub fn int_rank(&self) -> Option<u8> {
         match self {
-            Ty::I8 | Ty::U8 => Some(1),
-            Ty::I16 | Ty::U16 => Some(2),
-            Ty::I32 | Ty::U32 => Some(3),
-            Ty::I64 | Ty::U64 | Ty::Isize | Ty::Usize => Some(4),
-            Ty::I128 | Ty::U128 => Some(5),
+            Type::I8 | Type::U8 => Some(1),
+            Type::I16 | Type::U16 => Some(2),
+            Type::I32 | Type::U32 => Some(3),
+            Type::I64 | Type::U64 | Type::Isize | Type::Usize => Some(4),
+            Type::I128 | Type::U128 => Some(5),
             _ => None,
         }
     }
@@ -296,35 +297,35 @@ impl Ty {
     /// arena via `TypeDetail`.
     pub fn name(&self) -> &'static str {
         match self {
-            Ty::I8 => "i8", Ty::I16 => "i16", Ty::I32 => "i32",
-            Ty::I64 => "i64", Ty::I128 => "i128",
-            Ty::U8 => "u8", Ty::U16 => "u16", Ty::U32 => "u32",
-            Ty::U64 => "u64", Ty::U128 => "u128",
-            Ty::Isize => "isize", Ty::Usize => "usize",
-            Ty::F16 => "f16", Ty::F32 => "f32", Ty::F64 => "f64", Ty::F128 => "f128",
-            Ty::Bool => "bool", Ty::Char => "char",
-            Ty::Str => "str", Ty::Null => "null", Ty::Void => "void",
-            Ty::Throw(_) => "Throw",
-            Ty::Channel(_) => "Channel",
-            Ty::Async(_) => "Async",
-            Ty::Lazy(_) => "Lazy",
-            Ty::Atomic(_) => "Atomic",
-            Ty::Sender(_) => "Sender",
-            Ty::Receiver(_) => "Receiver",
-            Ty::Timer(_) => "Timer",
-            Ty::Array(_) => "array",
-            Ty::Ref(_) => "ref",
-            Ty::Fn(_) => "fn",
-            Ty::Nullable(_) => "nullable",
-            Ty::Adt(_) => "adt",
-            Ty::Record(_) => "record",
-            Ty::Trait(_) => "trait",
-            Ty::TraitObject(_) => "trait_object",
-            Ty::ModuleRef(_) => "module_ref",
-            Ty::Generic(_) => "generic",
-            Ty::Never => "never",
-            Ty::TypeVar(_) => "_",
-            Ty::Unknown => "unknown",
+            Type::I8 => "i8", Type::I16 => "i16", Type::I32 => "i32",
+            Type::I64 => "i64", Type::I128 => "i128",
+            Type::U8 => "u8", Type::U16 => "u16", Type::U32 => "u32",
+            Type::U64 => "u64", Type::U128 => "u128",
+            Type::Isize => "isize", Type::Usize => "usize",
+            Type::F16 => "f16", Type::F32 => "f32", Type::F64 => "f64", Type::F128 => "f128",
+            Type::Bool => "bool", Type::Char => "char",
+            Type::Str => "str", Type::Null => "null", Type::Void => "void",
+            Type::Throw(_) => "Throw",
+            Type::Channel(_) => "Channel",
+            Type::Async(_) => "Async",
+            Type::Lazy(_) => "Lazy",
+            Type::Atomic(_) => "Atomic",
+            Type::Sender(_) => "Sender",
+            Type::Receiver(_) => "Receiver",
+            Type::Timer(_) => "Timer",
+            Type::Array(_) => "array",
+            Type::Ref(_) => "ref",
+            Type::Fn(_) => "fn",
+            Type::Nullable(_) => "nullable",
+            Type::Adt(_) => "adt",
+            Type::Record(_) => "record",
+            Type::Trait(_) => "trait",
+            Type::TraitObject(_) => "trait_object",
+            Type::ModuleRef(_) => "module_ref",
+            Type::Generic(_) => "generic",
+            Type::Never => "never",
+            Type::TypeVar(_) => "_",
+            Type::Unknown => "unknown",
         }
     }
 
@@ -332,18 +333,18 @@ impl Ty {
     #[inline]
     pub fn to_value_tag(&self) -> ValueTag {
         match self {
-            Ty::Bool => ValueTag::Bool,
-            Ty::Char => ValueTag::Char,
-            Ty::I8 => ValueTag::I8, Ty::I16 => ValueTag::I16,
-            Ty::I32 => ValueTag::I32, Ty::I64 => ValueTag::I64, Ty::I128 => ValueTag::I128,
-            Ty::U8 => ValueTag::U8, Ty::U16 => ValueTag::U16,
-            Ty::U32 => ValueTag::U32, Ty::U64 => ValueTag::U64, Ty::U128 => ValueTag::U128,
-            Ty::Isize => ValueTag::Isize, Ty::Usize => ValueTag::Usize,
-            Ty::F16 => ValueTag::F16, Ty::F32 => ValueTag::F32,
-            Ty::F64 => ValueTag::F64, Ty::F128 => ValueTag::F128,
-            Ty::Str => ValueTag::Ref,
-            Ty::Null => ValueTag::Null,
-            Ty::Void => ValueTag::Void,
+            Type::Bool => ValueTag::Bool,
+            Type::Char => ValueTag::Char,
+            Type::I8 => ValueTag::I8, Type::I16 => ValueTag::I16,
+            Type::I32 => ValueTag::I32, Type::I64 => ValueTag::I64, Type::I128 => ValueTag::I128,
+            Type::U8 => ValueTag::U8, Type::U16 => ValueTag::U16,
+            Type::U32 => ValueTag::U32, Type::U64 => ValueTag::U64, Type::U128 => ValueTag::U128,
+            Type::Isize => ValueTag::Isize, Type::Usize => ValueTag::Usize,
+            Type::F16 => ValueTag::F16, Type::F32 => ValueTag::F32,
+            Type::F64 => ValueTag::F64, Type::F128 => ValueTag::F128,
+            Type::Str => ValueTag::Ref,
+            Type::Null => ValueTag::Null,
+            Type::Void => ValueTag::Void,
             _ => ValueTag::Ref, // composite types are all Ref at runtime
         }
     }
@@ -352,11 +353,11 @@ impl Ty {
     #[inline]
     pub fn has_detail(&self) -> bool {
         matches!(self,
-            Ty::Throw(_) | Ty::Channel(_) | Ty::Async(_) | Ty::Lazy(_)
-            | Ty::Atomic(_) | Ty::Sender(_) | Ty::Receiver(_) | Ty::Timer(_)
-            | Ty::Array(_) | Ty::Ref(_) | Ty::Fn(_) | Ty::Nullable(_)
-            | Ty::Adt(_) | Ty::Record(_) | Ty::Trait(_)
-            | Ty::TraitObject(_) | Ty::ModuleRef(_) | Ty::Generic(_))
+            Type::Throw(_) | Type::Channel(_) | Type::Async(_) | Type::Lazy(_)
+            | Type::Atomic(_) | Type::Sender(_) | Type::Receiver(_) | Type::Timer(_)
+            | Type::Array(_) | Type::Ref(_) | Type::Fn(_) | Type::Nullable(_)
+            | Type::Adt(_) | Type::Record(_) | Type::Trait(_)
+            | Type::TraitObject(_) | Type::ModuleRef(_) | Type::Generic(_))
     }
 
     /// Construct a parameterless builtin type from a type name (scalars + str/null/void +
@@ -368,7 +369,7 @@ impl Ty {
         if let Some(info) = builtin_info_by_name(name) {
             return Some(info.value_tag.into());
         }
-        // Bare builtin generic names (both "Async" and "Async<i32>" are recognized as Ty::Async).
+        // Bare builtin generic names (both "Async" and "Async<i32>" are recognized as Type::Async).
         // DetailId uses DetailId(u32::MAX) as a placeholder (family() does not read the payload,
         // so the placeholder is safe).
         let base = name.split('<').next().unwrap_or(name);
@@ -380,150 +381,58 @@ impl Ty {
     /// Determine the exact int-to-float widening path.
     /// Platform-dependent integers are first reduced to i32/u32 or i64/u64 based on
     /// `isize::BITS` before the check.
-    pub fn int_to_float_widening(int_ty: &Ty, float_ty: &Ty) -> bool {
+    pub fn int_to_float_widening(int_ty: &Type, float_ty: &Type) -> bool {
         let platform_bits = isize::BITS as u16;
         // Reduce platform-dependent integers to their equivalent fixed-width integers first.
         let int_ty = match int_ty {
-            Ty::Isize => {
+            Type::Isize => {
                 if platform_bits <= 32 {
-                    return Self::int_to_float_widening(&Ty::I32, float_ty);
+                    return Self::int_to_float_widening(&Type::I32, float_ty);
                 } else {
-                    return Self::int_to_float_widening(&Ty::I64, float_ty);
+                    return Self::int_to_float_widening(&Type::I64, float_ty);
                 }
             }
-            Ty::Usize => {
+            Type::Usize => {
                 if platform_bits <= 32 {
-                    return Self::int_to_float_widening(&Ty::U32, float_ty);
+                    return Self::int_to_float_widening(&Type::U32, float_ty);
                 } else {
-                    return Self::int_to_float_widening(&Ty::U64, float_ty);
+                    return Self::int_to_float_widening(&Type::U64, float_ty);
                 }
             }
             other => *other,
         };
         match int_ty {
-            Ty::I8 | Ty::U8 | Ty::I16 | Ty::U16 => {
-                matches!(float_ty, Ty::F32 | Ty::F64 | Ty::F128)
+            Type::I8 | Type::U8 | Type::I16 | Type::U16 => {
+                matches!(float_ty, Type::F32 | Type::F64 | Type::F128)
             }
-            Ty::I32 | Ty::U32 => {
-                matches!(float_ty, Ty::F64 | Ty::F128)
+            Type::I32 | Type::U32 => {
+                matches!(float_ty, Type::F64 | Type::F128)
             }
-            Ty::I64 | Ty::U64 => matches!(float_ty, Ty::F128),
-            Ty::I128 | Ty::U128 => false,
+            Type::I64 | Type::U64 => matches!(float_ty, Type::F128),
+            Type::I128 | Type::U128 => false,
             _ => false,
         }
     }
 }
 
-impl From<ValueTag> for Ty {
+impl From<ValueTag> for Type {
     fn from(tag: ValueTag) -> Self {
         match tag {
-            ValueTag::Bool => Ty::Bool,
-            ValueTag::Char => Ty::Char,
-            ValueTag::I8 => Ty::I8, ValueTag::I16 => Ty::I16,
-            ValueTag::I32 => Ty::I32, ValueTag::I64 => Ty::I64, ValueTag::I128 => Ty::I128,
-            ValueTag::U8 => Ty::U8, ValueTag::U16 => Ty::U16,
-            ValueTag::U32 => Ty::U32, ValueTag::U64 => Ty::U64, ValueTag::U128 => Ty::U128,
-            ValueTag::Isize => Ty::Isize, ValueTag::Usize => Ty::Usize,
-            ValueTag::F16 => Ty::F16, ValueTag::F32 => Ty::F32,
-            ValueTag::F64 => Ty::F64, ValueTag::F128 => Ty::F128,
-            ValueTag::Ref => Ty::Str,
-            ValueTag::Null => Ty::Null,
-            ValueTag::Void => Ty::Void,
+            ValueTag::Bool => Type::Bool,
+            ValueTag::Char => Type::Char,
+            ValueTag::I8 => Type::I8, ValueTag::I16 => Type::I16,
+            ValueTag::I32 => Type::I32, ValueTag::I64 => Type::I64, ValueTag::I128 => Type::I128,
+            ValueTag::U8 => Type::U8, ValueTag::U16 => Type::U16,
+            ValueTag::U32 => Type::U32, ValueTag::U64 => Type::U64, ValueTag::U128 => Type::U128,
+            ValueTag::Isize => Type::Isize, ValueTag::Usize => Type::Usize,
+            ValueTag::F16 => Type::F16, ValueTag::F32 => Type::F32,
+            ValueTag::F64 => Type::F64, ValueTag::F128 => Type::F128,
+            ValueTag::Ref => Type::Str,
+            ValueTag::Null => Type::Null,
+            ValueTag::Void => Type::Void,
         }
     }
 }
-
-// =========================================================================
-// BUILTIN_TABLE — single source of truth for builtin type metadata.
-// =========================================================================
-
-/// Builtin type metadata (scalars + str/null/void only).
-#[derive(Debug, Clone, Copy)]
-pub struct BuiltinInfo {
-    /// Type name (e.g. "i32"); the unique key for all derived functions.
-    pub name: &'static str,
-    /// Corresponding `ValueTag` (runtime encoding).
-    pub value_tag: ValueTag,
-    /// TypeDesc-layer `type_id` (within the 1..=21 builtin range).
-    pub type_id: u16,
-    /// Byte size (scalars: 1/2/4/8/16; str: 8; null/void: 0).
-    pub byte_width: u8,
-}
-
-/// Metadata table for the 21 builtin types, sorted by `type_id` ascending.
-///
-/// **To add a new builtin type, simply append a row to this table.** All derived
-/// facilities across the codebase sync automatically:
-/// - `Ty::type_id()` / `Ty::byte_width()` / `Ty::to_value_tag()`
-/// - `TypeDesc::lookup_by_type_id`
-/// - `Reflect::__reflect_type_name` / `__reflect_layout_*`
-/// - `Sema::int_kind_from_name` / `float_kind_from_name`
-pub const BUILTIN_TABLE: &[BuiltinInfo] = &[
-    // ---- Integers (1..=12) ----
-    BuiltinInfo { name: "i8",    value_tag: ValueTag::I8,    type_id: 1,  byte_width: 1  },
-    BuiltinInfo { name: "i16",   value_tag: ValueTag::I16,   type_id: 2,  byte_width: 2  },
-    BuiltinInfo { name: "i32",   value_tag: ValueTag::I32,   type_id: 3,  byte_width: 4  },
-    BuiltinInfo { name: "i64",   value_tag: ValueTag::I64,   type_id: 4,  byte_width: 8  },
-    BuiltinInfo { name: "i128",  value_tag: ValueTag::I128,  type_id: 5,  byte_width: 16 },
-    BuiltinInfo { name: "u8",    value_tag: ValueTag::U8,    type_id: 6,  byte_width: 1  },
-    BuiltinInfo { name: "u16",   value_tag: ValueTag::U16,   type_id: 7,  byte_width: 2  },
-    BuiltinInfo { name: "u32",   value_tag: ValueTag::U32,   type_id: 8,  byte_width: 4  },
-    BuiltinInfo { name: "u64",   value_tag: ValueTag::U64,   type_id: 9,  byte_width: 8  },
-    BuiltinInfo { name: "u128",  value_tag: ValueTag::U128,  type_id: 10, byte_width: 16 },
-    BuiltinInfo { name: "isize", value_tag: ValueTag::Isize, type_id: 11, byte_width: 8  },
-    BuiltinInfo { name: "usize", value_tag: ValueTag::Usize, type_id: 12, byte_width: 8  },
-    // ---- Floats (13..=16) ----
-    BuiltinInfo { name: "f16",   value_tag: ValueTag::F16,   type_id: 13, byte_width: 2  },
-    BuiltinInfo { name: "f32",   value_tag: ValueTag::F32,   type_id: 14, byte_width: 4  },
-    BuiltinInfo { name: "f64",   value_tag: ValueTag::F64,   type_id: 15, byte_width: 8  },
-    BuiltinInfo { name: "f128",  value_tag: ValueTag::F128,  type_id: 16, byte_width: 16 },
-    // ---- Non-arithmetic scalars (17..=18) ----
-    BuiltinInfo { name: "bool",  value_tag: ValueTag::Bool,  type_id: 17, byte_width: 1  },
-    BuiltinInfo { name: "char",  value_tag: ValueTag::Char,  type_id: 18, byte_width: 4  },
-    // ---- Non-scalar builtins (19..=21) ----
-    BuiltinInfo { name: "str",   value_tag: ValueTag::Ref,   type_id: 19, byte_width: 8  },
-    BuiltinInfo { name: "null",  value_tag: ValueTag::Null,  type_id: 20, byte_width: 0  },
-    BuiltinInfo { name: "void",  value_tag: ValueTag::Void,  type_id: 21, byte_width: 0  },
-];
-
-// =========================================================================
-// Lookup functions.
-// =========================================================================
-
-/// Look up `BuiltinInfo` by name.
-#[inline]
-pub fn builtin_info_by_name(name: &str) -> Option<&'static BuiltinInfo> {
-    BUILTIN_TABLE.iter().find(|s| s.name == name)
-}
-
-/// Look up `BuiltinInfo` by `ValueTag`.
-#[inline]
-pub fn builtin_info_by_tag(tag: ValueTag) -> Option<&'static BuiltinInfo> {
-    BUILTIN_TABLE.iter().find(|s| s.value_tag == tag)
-}
-
-/// Look up `BuiltinInfo` by `type_id`.
-#[inline]
-pub fn builtin_info_by_type_id(type_id: u16) -> Option<&'static BuiltinInfo> {
-    BUILTIN_TABLE.iter().find(|s| s.type_id == type_id)
-}
-
-// =========================================================================
-// Compile-time assertions (guard table integrity).
-// =========================================================================
-
-const _: () = {
-    assert!(BUILTIN_TABLE.len() == 21, "BUILTIN_TABLE must have 21 entries");
-    // type_id uniqueness check
-    let mut seen = [false; 22];
-    let mut i = 0;
-    while i < BUILTIN_TABLE.len() {
-        let id = BUILTIN_TABLE[i].type_id as usize;
-        assert!(!seen[id], "duplicate type_id in BUILTIN_TABLE");
-        seen[id] = true;
-        i += 1;
-    }
-};
 
 // =========================================================================
 // TypeDetail — element type of the TypeArena::details table.
@@ -531,44 +440,44 @@ const _: () = {
 
 /// TypeDetail — element type of the `TypeArena::details` table.
 ///
-/// Each variant corresponds to a `Ty` variant that carries a `DetailId`, storing that
+/// Each variant corresponds to a `Type` variant that carries a `DetailId`, storing that
 /// type's structural data. All variants own their data via `Box<[T]>` / `Box<str>`;
 /// the arena centrally manages lifetimes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeDetail {
-    /// `Ty::Throw`: `Throw<V, E>`.
+    /// `Type::Throw`: `Throw<V, E>`.
     Throw { value_type: TypeHandle, error_type: TypeHandle },
-    /// `Ty::Channel`: `Channel<T>`.
+    /// `Type::Channel`: `Channel<T>`.
     Channel { elem: TypeHandle },
-    /// `Ty::Async`: `Async<T>`.
+    /// `Type::Async`: `Async<T>`.
     Async { value: TypeHandle },
-    /// `Ty::Lazy`: `Lazy<T>`.
+    /// `Type::Lazy`: `Lazy<T>`.
     Lazy { value: TypeHandle },
-    /// `Ty::Atomic`: `Atomic<T>`.
+    /// `Type::Atomic`: `Atomic<T>`.
     Atomic { elem: TypeHandle },
-    /// `Ty::Sender`: `Sender<T>`.
+    /// `Type::Sender`: `Sender<T>`.
     Sender { elem: TypeHandle },
-    /// `Ty::Receiver`: `Receiver<T>`.
+    /// `Type::Receiver`: `Receiver<T>`.
     Receiver { elem: TypeHandle },
-    /// `Ty::Array`: `[T; N]`; `size == None` denotes a slice.
+    /// `Type::Array`: `[T; N]`; `size == None` denotes a slice.
     Array { elem: TypeHandle, size: Option<u64> },
-    /// `Ty::Ref`: `&T` / `*T`.
+    /// `Type::Ref`: `&T` / `*T`.
     Ref { inner: TypeHandle, is_raw: bool },
-    /// `Ty::Fn`: `(P1, P2) -> R`.
+    /// `Type::Fn`: `(P1, P2) -> R`.
     Fn { params: Box<[TypeHandle]>, return_type: TypeHandle },
-    /// `Ty::Nullable`: `T?`.
+    /// `Type::Nullable`: `T?`.
     Nullable { inner: TypeHandle },
-    /// `Ty::Adt`: algebraic data type, e.g. `Option<T>`.
+    /// `Type::Adt`: algebraic data type, e.g. `Option<T>`.
     Adt { name: Box<str>, type_args: Box<[TypeHandle]> },
-    /// `Ty::Record`: `{ x: i32, y: i32 }`.
+    /// `Type::Record`: `{ x: i32, y: i32 }`.
     Record { fields: Box<[FieldType]>, name: Option<Box<str>> },
-    /// `Ty::Trait`: trait type `Ord<T>`.
+    /// `Type::Trait`: trait type `Ord<T>`.
     Trait { name: Box<str>, type_args: Box<[TypeHandle]> },
-    /// `Ty::TraitObject`: existential type of an `inline_trait` value.
+    /// `Type::TraitObject`: existential type of an `inline_trait` value.
     TraitObject { trait_name: Box<str>, method_sigs: Box<[TraitMethodSig]> },
-    /// `Ty::ModuleRef`: module reference (path + env).
+    /// `Type::ModuleRef`: module reference (path + env).
     ModuleRef { path: Box<str>, env: EnvId },
-    /// `Ty::Generic`: user generic application `List<i32>`.
+    /// `Type::Generic`: user generic application `List<i32>`.
     Generic { name: Box<str>, args: Box<[TypeHandle]> },
 }
 

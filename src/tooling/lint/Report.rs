@@ -1,6 +1,6 @@
 //! Lint output formatting: human-readable and JSON.
 
-use crate::tooling::common::Diagnostic::{Diagnostic, Severity};
+use crate::tooling::Common::Diagnostic::{Diagnostic, Severity};
 
 /// Format diagnostics as human-readable text.
 pub fn format_human(diagnostics: &[Diagnostic]) -> String {

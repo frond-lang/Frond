@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use pastey::paste;
 use wide::{f32x4, f64x4, i8x16, i16x8, i32x4, i64x4, u8x16, u16x8, u32x4, u64x4, CmpEq, CmpGe, CmpGt, CmpLe, CmpLt, CmpNe};
 
-pub use crate::types::ValueTag;
+pub use super::Tag::ValueTag;
 
 use super::value::*;
 
@@ -484,16 +484,6 @@ fn read_float_as_f64(tag: ValueTag, bytes: &[u8]) -> f64 {
         ValueTag::F64 => read_f64_le(bytes),
         ValueTag::F128 => read_f128(bytes).to_f64(),
         _ => 0.0,
-    }
-}
-
-fn read_float_as_f128(tag: ValueTag, bytes: &[u8]) -> F128 {
-    match tag {
-        ValueTag::F16 => { let f = read_f16(bytes); F128::from_f64(f.to_f64()) }
-        ValueTag::F32 => { let f = read_f32_le(bytes); F128::from_f64(f as f64) }
-        ValueTag::F64 => F128::from_f64(read_f64_le(bytes)),
-        ValueTag::F128 => read_f128(bytes),
-        _ => F128::from_f64(0.0),
     }
 }
 
