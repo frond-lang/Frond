@@ -127,14 +127,31 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    if: always() && !cancelled()
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+        continue-on-error: true
+
+      - name: Verify artifacts exist
+        id: check
+        run: |
+          if [ -z "$(ls -A artifacts 2>/dev/null)" ]; then
+            echo "has_artifacts=false" >> $GITHUB_OUTPUT
+            echo "::warning::No build artifacts were found — release will be skipped."
+          else
+            echo "has_artifacts=true" >> $GITHUB_OUTPUT
+            echo "Found artifacts:"
+            ls -1 artifacts/
+          fi
+        shell: bash
 
       - name: Extract tag name
         id: tag
+        if: steps.check.outputs.has_artifacts == 'true'
         run: |
           if [ -n "${{ github.event.inputs.tag }}" ]; then
             echo "name=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
@@ -144,6 +161,7 @@ jobs:
         shell: bash
 
       - name: Create GitHub Release
+        if: steps.check.outputs.has_artifacts == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
