@@ -416,6 +416,10 @@ pub fn classify_side_effect(
         Expr::Unary { operand, .. } => classify_side_effect(
             *operand, arena, module_name, sema, purity, escape, func_name_to_id,
         ),
+        // -- Type cast `expr as T`: pure (recursively classify operand) --
+        Expr::As { expr, .. } => classify_side_effect(
+            *expr, arena, module_name, sema, purity, escape, func_name_to_id,
+        ),
         Expr::RefOf(inner) | Expr::Deref(inner) | Expr::NonNullAssert(inner) => classify_side_effect(
             *inner, arena, module_name, sema, purity, escape, func_name_to_id,
         ),
@@ -684,6 +688,7 @@ fn collect_def_use_expr(expr_id: ExprId, arena: &AstArena, func: FuncId, graph: 
             collect_def_use_expr(*rhs, arena, func, graph);
         }
         Expr::Unary { operand, .. }
+        | Expr::As { expr: operand, .. }
         | Expr::RefOf(operand)
         | Expr::Deref(operand)
         | Expr::NonNullAssert(operand)
@@ -1115,6 +1120,7 @@ fn collect_call_edges(
             collect_call_edges(*rhs, arena, caller, caller_name, module_name, sema, cg);
         }
         Expr::Unary { operand, .. }
+        | Expr::As { expr: operand, .. }
         | Expr::RefOf(operand)
         | Expr::Deref(operand)
         | Expr::NonNullAssert(operand)
@@ -1655,7 +1661,7 @@ fn walk_children_expr<F: FnMut(ExprId)>(expr_id: ExprId, arena: &AstArena, mut f
         Expr::IntLit { .. } | Expr::FloatLit { .. } | Expr::BoolLit(_)
         | Expr::CharLit(_) | Expr::StrLit(_) | Expr::NullLit | Expr::VoidLit
         | Expr::Ident(_) => {}
-        Expr::Unary { operand, .. } | Expr::RefOf(operand) | Expr::Deref(operand)
+        Expr::Unary { operand, .. } | Expr::As { expr: operand, .. } | Expr::RefOf(operand) | Expr::Deref(operand)
         | Expr::NonNullAssert(operand) | Expr::Propagate(operand)
         | Expr::Atomic(operand) | Expr::Lazy(operand) => f(*operand),
         Expr::Binary { lhs, rhs, .. } => { f(*lhs); f(*rhs); }

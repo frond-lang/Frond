@@ -2207,7 +2207,65 @@ pub struct ReceiverValue {
 
 // ---- heap.rs → HeapObj enum + HeapRef + RefKind + impl ----
 
-/// Heap object: unified representation of all heap-allocated value types (23 kinds)
+/// Ownership kind of an FFI opaque pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtrKind {
+    /// C-side owned; Kuzo does not free it (e.g. a `FILE*` returned by `fopen` that the user
+    /// must `fclose` manually). v1: all pointers returned from FFI are Borrowed.
+    Borrowed,
+    /// C-allocated, Kuzo holds it; Drop invokes the destructor (e.g. a handle with a cleanup fn).
+    /// v1 unused — reserved for future RAII FFI support.
+    Owned,
+}
+
+/// Wrapper for a raw C pointer returned from or passed to FFI (`@extern("C") #{ }#` calls).
+/// Stored as a `HeapObj::OpaquePtr` so it can flow through Kuzo's `Value::Ref(Arc<HeapObj>)`.
+#[derive(Debug)]
+pub struct OpaquePointer {
+    pub ptr: *mut core::ffi::c_void,
+    pub kind: PtrKind,
+    /// Diagnostic type name (e.g. "FILE", "CURL"); used by reflect/format. `'static` to avoid
+    /// allocation overhead — callers pass string literals or `Box::leak`.
+    pub type_name: &'static str,
+    /// Optional C destructor (e.g. `curl_easy_cleanup`). Invoked on Drop iff `kind == Owned`.
+    pub destructor: Option<unsafe extern "C" fn(*mut core::ffi::c_void)>,
+}
+
+impl Clone for OpaquePointer {
+    fn clone(&self) -> Self {
+        // Cloning a Borrowed pointer is safe (shared). Cloning an Owned pointer would create
+        // double-free on Drop — v1 only produces Borrowed, so this is fine. If Owned cloning
+        // is needed later, it must semantically be a "reference clone" (no ownership transfer).
+        Self {
+            ptr: self.ptr,
+            kind: self.kind,
+            type_name: self.type_name,
+            destructor: self.destructor,
+        }
+    }
+}
+
+impl Drop for OpaquePointer {
+    fn drop(&mut self) {
+        if matches!(self.kind, PtrKind::Owned) {
+            if let Some(dtor) = self.destructor {
+                // SAFETY: caller of the constructor guaranteed ptr is a valid C handle and dtor
+                // is the matching cleanup function.
+                unsafe { dtor(self.ptr); }
+            }
+        }
+        // Borrowed: do nothing — C side owns the memory.
+    }
+}
+
+// SAFETY: OpaquePointer holds a raw C pointer. It is Send/Sync because FFI execution is
+// single-threaded (engine runs on one worker; caller frames suspend while callee runs — see
+// ffi_writeback_u8_buf safety comment in Compute.rs). The pointer itself has no thread affinity
+// for our usage patterns. This matches the existing `unsafe impl Send/Sync for Value`.
+unsafe impl Send for OpaquePointer {}
+unsafe impl Sync for OpaquePointer {}
+
+/// Heap object: unified representation of all heap-allocated value types (24 kinds)
 #[derive(Debug, Clone)]
 pub enum HeapObj {
     Str(KuzoStr),
@@ -2230,6 +2288,8 @@ pub enum HeapObj {
     SenderVal(SenderValue),
     ReceiverVal(ReceiverValue),
     CoroutineFrame,
+    /// FFI opaque pointer (@extern("C") #{ }# calls). Wraps a raw `*mut c_void`.
+    OpaquePtr(OpaquePointer),
 }
 
 /// Heap reference: a reference-counted heap object
@@ -2241,6 +2301,7 @@ pub enum RefKind {
     Str, Array, Record, Adt, Newtype, Cell, Range, Closure, Partial, Builtin,
     TraitVal, LazyVal, ErrorVal, ThrowVal,
     AtomicVal, AsyncVal, ChannelVal, SenderVal, ReceiverVal, CoroutineFrame,
+    OpaquePtr,
 }
 
 impl HeapObj {
@@ -2293,6 +2354,7 @@ impl HeapObj {
             HeapObj::SenderVal(_) => RefKind::SenderVal,
             HeapObj::ReceiverVal(_) => RefKind::ReceiverVal,
             HeapObj::CoroutineFrame => RefKind::CoroutineFrame,
+            HeapObj::OpaquePtr(_) => RefKind::OpaquePtr,
         }
     }
 
@@ -2318,6 +2380,7 @@ impl HeapObj {
             HeapObj::SenderVal(_) => "sender",
             HeapObj::ReceiverVal(_) => "receiver",
             HeapObj::CoroutineFrame => "coroutine",
+            HeapObj::OpaquePtr(op) => op.type_name,
         }
     }
 
@@ -2343,6 +2406,7 @@ impl HeapObj {
             HeapObj::SenderVal(_) => "<sender>",
             HeapObj::ReceiverVal(_) => "<receiver>",
             HeapObj::CoroutineFrame => "<coroutine>",
+            HeapObj::OpaquePtr(op) => op.type_name,
         }
     }
 
@@ -2426,7 +2490,8 @@ impl Hash for HeapObj {
             }
             HeapObj::Partial(_) | HeapObj::TraitVal(_) | HeapObj::LazyVal(_)
             | HeapObj::AtomicVal(_) | HeapObj::AsyncVal(_) | HeapObj::ChannelVal(_)
-            | HeapObj::SenderVal(_) | HeapObj::ReceiverVal(_) | HeapObj::CoroutineFrame => {}
+            | HeapObj::SenderVal(_) | HeapObj::ReceiverVal(_) | HeapObj::CoroutineFrame
+            | HeapObj::OpaquePtr(_) => {}
         }
     }
 }

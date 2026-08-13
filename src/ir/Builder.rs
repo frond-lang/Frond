@@ -143,37 +143,9 @@ pub struct IrBuilder<'a> {
 // (data-driven, eliminates special-case branches on method/type names).
 // =========================================================================
 
-/// Registry of cast conversion pairs that do not follow the default
-/// `__cast_{S}_to_{T}` naming convention.
-/// Adding a conversion pair only requires appending a row; no compile branch
-/// needs to change.
-const SPECIAL_CAST_PAIRS: &[(&str, &str, &str)] = &[
-    // (source, target, mangled_fn)
-    ("u8[]", "str", "__cast_bytes_to_str"),
-    ("bytes", "str", "__cast_bytes_to_str"),
-    ("char", "str", "__cast_char_to_str"),
-];
-
-/// FFI intrinsic registry: FFI function name -> `compute_fn`.
-/// These primitives are declared with `@extern("C")` but their `compute_fn` is bound directly
-/// to the reflect implementation, bypassing FFI dispatch (to avoid coupling lazy-force logic
-/// with FFI calls).
-/// Adding a primitive only requires appending a row; no compile branch needs to change.
-const FFI_INTRINSIC_TABLE: &[(&str, ComputeFnId)] = &[
-    ("__reflect_format", CF_REFLECT_FORMAT),
-    ("__reflect_scalar_to_str", CF_REFLECT_SCALAR_TO_STR),
-];
-
-/// Resolve a cast function name: consult the special-pair registry first, and if there is no
-/// hit, fall back to the default naming convention.
-fn cast_mangled_name(source: &str, target: &str) -> String {
-    for &(s, t, fn_name) in SPECIAL_CAST_PAIRS {
-        if s == source && t == target {
-            return fn_name.to_string();
-        }
-    }
-    format!("__cast_{}_to_{}", source, target)
-}
+// (FFI_INTRINSIC_TABLE removed: reflect primitives now lower directly to
+// CF_REFLECT_* compute_fns via reflect_top_level_cf / reflect_method_intrinsic,
+// never reaching the @extern("C") dispatch path.)
 
 // =========================================================================
 // Escape analysis has been migrated to the analyzer
@@ -200,6 +172,53 @@ const BUILTIN_CTORS: &[(&str, BuiltinCtorLower)] = &[
     ("Err", BuiltinCtorLower::Err),
     ("channel", BuiltinCtorLower::Channel),
 ];
+
+/// reflect top-level function → standalone compute_fn mapping.
+///
+/// `format(x)` / `type_name(x)` are the two reflect entry points called from
+/// generic contexts (e.g. Console.kz `print<T>`). Lowering them directly to
+/// `CF_REFLECT_*` keeps the hot path off the FFI dispatch table.
+/// The remaining reflect primitives are only reachable as trait-style method
+/// calls (`x.kind()`, `x.field_count()`, ...) and are dispatched via
+/// `lookup_intrinsic` + `try_lower_intrinsic`.
+fn reflect_top_level_cf(name: &str) -> Option<ComputeFnId> {
+    use crate::ir::Ir::*;
+    match name {
+        "format" => Some(CF_REFLECT_FORMAT),
+        "type_name" => Some(CF_REFLECT_TYPE_NAME),
+        _ => None,
+    }
+}
+
+/// reflect method-name → (IntrinsicKind, arg_count) mapping.
+///
+/// Used by `lookup_intrinsic` to give every value — regardless of its static
+/// type — access to reflect trait methods (`x.kind()`, `x.format()`, ...).
+/// This is the "auto-impl" of `trait Type` / `trait Value`: rather than
+/// synthesizing witness-table entries and method bodies for every type, the
+/// Builder recognizes reflect method names structurally and lowers them
+/// directly to the corresponding `CF_REFLECT_*` compute_fn.
+fn reflect_method_intrinsic(method: &str) -> Option<(crate::sema::Sema::IntrinsicKind, usize)> {
+    use crate::sema::Sema::IntrinsicKind;
+    // UnOp: receiver only, no extra args
+    let un = |id: u32| Some((IntrinsicKind::UnOp(id), 0));
+    // BinOp: receiver + one index arg
+    let bin = |id: u32| Some((IntrinsicKind::BinOp(id), 1));
+    match method {
+        "kind" => un(328),              // CF_REFLECT_KIND_STR (kind() returns str)
+        "type_name" => un(327),         // CF_REFLECT_TYPE_NAME
+        "size" => un(330),              // CF_REFLECT_LAYOUT_SIZE (aggregate)
+        "alignment" => un(331),         // CF_REFLECT_LAYOUT_ALIGN
+        "field_count" => un(332),       // CF_REFLECT_FIELD_COUNT
+        "format" => un(290),            // CF_REFLECT_FORMAT
+        "constructor" => un(336),       // CF_REFLECT_ADT_CTOR
+        "field_name" => bin(333),       // CF_REFLECT_FIELD_NAME
+        // field_value removed: its return type cannot be expressed without an "any"
+        // type in Kuzo's type system. CF_REFLECT_FIELD_VALUE (334) remains implemented
+        // in Compute.rs for potential future use (e.g. a typed field_value<T>(i): T).
+        _ => None,
+    }
+}
 
 /// Tail-recursion-to-iteration context: used by `compile_call` when intercepting self-calls.
 /// `self_name` is the current function name; `param_nodes` is the parameter node list.
@@ -625,14 +644,7 @@ impl<'a> IrBuilder<'a> {
             }
 
             // Function call
-            crate::ast::Ast::Expr::Call { callee, args, type_args } => {
-                // __cast_to<T>(x) / __cast_try_to<T>(x): map to a concrete cast function based on
-                // source/target types.
-                if let crate::ast::Ast::Expr::Ident(name) = &self.current_module().arena.expr(*callee).node {
-                    if matches!(*name, "__cast_to" | "__cast_try_to") {
-                        return self.compile_cast_call(*name, args, type_args.as_deref());
-                    }
-                }
+            crate::ast::Ast::Expr::Call { callee, args, type_args: _ } => {
                 // Implicit this: bare call resolved to an instance method by sema.
                 // Sema marks the callee Ident with `implicit_this = Method(name)`; synthesize an
                 // explicit `this.method(args)` dispatch using the already-bound `this` node.
@@ -739,6 +751,11 @@ impl<'a> IrBuilder<'a> {
                     self.graph.set_batch_info(node, info);
                 }
                 node
+            }
+
+            // Type cast `expr as T`: dispatch to the same codegen paths as the former cast syntax.
+            crate::ast::Ast::Expr::As { expr, target } => {
+                self.compile_as_cast(*expr, *target)
             }
 
             // String interpolation: `"text {expr} more {expr}"` -> chained `str_concat`.
@@ -2146,6 +2163,9 @@ impl<'a> IrBuilder<'a> {
             }
             crate::ast::Ast::Expr::Unary { operand, .. } => {
                 self.collect_free_idents_expr(*operand, names);
+            }
+            crate::ast::Ast::Expr::As { expr, .. } => {
+                self.collect_free_idents_expr(*expr, names);
             }
             crate::ast::Ast::Expr::Call { callee, args, .. } => {
                 self.collect_free_idents_expr(*callee, names);
@@ -5162,48 +5182,45 @@ impl<'a> IrBuilder<'a> {
         crate::value::ValueTag::from_name(ty)
     }
 
-    /// Compile a cast call: __cast_to<T>(x) / __cast_try_to<T>(x).
+    /// Compile a type cast `expr as T`.
     ///
-    /// General path:
-    ///   - scalar -> str: compute_cast_to_str single node (idx 277), covers all integer/float/bool/char
-    ///   - scalar -> scalar: compute_cast_scalar single node (idx 278), covers all integer/float conversions
-    /// Special path (FFI):
-    ///   - u8[]/bytes -> str: still goes through cast_mangled_name to look up SPECIAL_CAST_PAIRS
-    fn compile_cast_call(
+    /// Two codegen paths, both single-node:
+    ///   - target is str: `compute_cast_to_str` (idx 277) — covers scalar/char/bool/array→str
+    ///   - scalar→scalar: `compute_cast_scalar` (idx 278) — covers all int↔int/int↔float/char↔int
+    fn compile_as_cast(
         &mut self,
-        _name: &str,
-        args: &[crate::ast::Ast::ExprId],
-        type_args: Option<&[crate::ast::Ast::TypeRef]>,
+        expr: crate::ast::Ast::ExprId,
+        target: crate::ast::Ast::TypeRef,
     ) -> NodeId {
-        // Get the target type name
-        // In a generic context, target may be a type-parameter name (e.g. "T"); look up current_type_args to replace it with the concrete type name
-        let target_ty = type_args
-            .and_then(|ta| ta.first())
-            .and_then(|&tid| {
-                let spanned = &self.current_module().arena.types[tid.0 as usize];
-                if let crate::ast::Ast::TypeNode::Named { name } = &spanned.node {
-                    Some(*name)
-                } else {
-                    None
-                }
-            })
-            .map(|name| {
-                // Type-parameter replacement: look up current_type_args (monomorphization instance context)
-                if let Some((_, h)) = self.current_type_args.iter().find(|(n, _)| n == name) {
-                    if let Some(resolved) = self.type_arena.type_name(*h) {
-                        return resolved.to_string();
+        // Get the target type name.
+        // In a generic context, target may be a type-parameter name (e.g. "T"); look up
+        // current_type_args to replace it with the concrete type name.
+        let target_ty = {
+            let spanned = &self.current_module().arena.types[target.0 as usize];
+            match &spanned.node {
+                crate::ast::Ast::TypeNode::Named { name } => {
+                    let name = *name;
+                    // Type-parameter replacement (monomorphization instance context)
+                    if let Some((_, h)) = self.current_type_args.iter().find(|(n, _)| n == name) {
+                        if let Some(resolved) = self.type_arena.type_name(*h) {
+                            resolved.to_string()
+                        } else {
+                            name.to_string()
+                        }
+                    } else {
+                        name.to_string()
                     }
                 }
-                name.to_string()
-            })
-            .unwrap_or_else(|| "i64".to_string());
+                _ => "i64".to_string(),
+            }
+        };
 
         // Get the source type name (from Sema expr_types)
-        let source_ty = self.expr_type_name(args[0]).unwrap_or("i64").to_string();
+        let source_ty = self.expr_type_name(expr).unwrap_or("i64").to_string();
 
-        let input = self.compile_subexpr(args[0]);
+        let input = self.compile_subexpr(expr);
 
-        // General path 1: any type -> str
+        // Path 1: any type -> str
         if Self::type_family(&target_ty) == crate::types::TypeFamily::Str {
             let inputs_offset = self.graph.inputs_pool.push(&[input]);
             return self.graph.add_node(Node {
@@ -5214,7 +5231,7 @@ impl<'a> IrBuilder<'a> {
             });
         }
 
-        // General path 2: scalar -> scalar (int<->int, int<->float, float<->float, bool<->int, char<->int)
+        // Path 2: scalar -> scalar (int<->int, int<->float, float<->float, bool<->int, char<->int)
         if Self::ty_name_to_scalar_tag(&source_ty).is_some()
             && Self::ty_name_to_scalar_tag(&target_ty).is_some()
         {
@@ -5229,19 +5246,18 @@ impl<'a> IrBuilder<'a> {
             return node;
         }
 
-        // Special path: u8[]/bytes -> str and other FFI casts
-        let mangled = cast_mangled_name(&source_ty, &target_ty);
+        // Fallback: source or target is a generic type parameter whose concrete type is not yet
+        // known (resolved later by monomorphization). Emit a scalar cast node optimistically;
+        // `compute_cast_scalar` reads the concrete target at runtime via `cast_target_type`.
         let inputs_offset = self.graph.inputs_pool.push(&[input]);
-        let call_node = self.graph.add_node(Node {
-            kind: NodeKind::Call,
+        let node = self.graph.add_node(Node {
+            kind: NodeKind::UnOp,
             input_count: 1,
             inputs_offset,
-            compute_fn: CF_CALL_LAUNCH, // compute_call_launch
+            compute_fn: CF_CAST_SCALAR, // compute_cast_scalar
         });
-        if let Some(&target_sg) = self.func_subgraphs.get(mangled.as_str()) {
-            self.graph.set_call_target(call_node, target_sg);
-        }
-        call_node
+        self.graph.set_cast_target_type(node, target_ty.clone());
+        node
     }
 
     /// Compile a function call.
@@ -5277,6 +5293,29 @@ impl<'a> IrBuilder<'a> {
         }
 
         let callee_expr = self.current_module().arena.expr(callee);
+
+        // ── reflect top-level function interception (safety net) ──
+        // Historically `format(x)` / `type_name(x)` were top-level wrapper functions;
+        // they have been removed in favor of direct method calls (`x.format()`).
+        // This interception remains as a safety net: if a future top-level reflect
+        // wrapper is reintroduced, it lowers directly to CF_REFLECT_* without going
+        // through FFI dispatch. Today it is effectively dead code (no such functions
+        // are declared, so Sema rejects bare `format(x)` before reaching here).
+        if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
+            if let Some(cf) = reflect_top_level_cf(name) {
+                let mut inputs = Vec::with_capacity(args.len());
+                for &arg in args {
+                    inputs.push(self.compile_subexpr(arg));
+                }
+                let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                return self.graph.add_node(Node {
+                    kind: NodeKind::Call,
+                    input_count: inputs.len() as u8,
+                    inputs_offset,
+                    compute_fn: cf,
+                });
+            }
+        }
 
         // Built-in constructor detection: Ok(val) / Err(record) / channel(capacity)
         // Lowered via the BUILTIN_CTORS registry lookup; missed error types fall through to the record construction path below
@@ -5386,21 +5425,19 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // @extern("C") FFI call detection: does not launch a sub-frame; calls Ffi::wrapper directly
-        // current_effect appended at the end as an implicit dependency (ensures the FFI Call executes only after prior effects complete)
+        // @extern("C") / @builtin call detection: does not launch a sub-frame; calls Ffi::wrapper
+        // (extern C) or the Rust #[no_mangle] fn (builtin, e.g. reflect) directly via FFI dispatch.
+        // current_effect appended at the end as an implicit dependency (ensures the Call executes
+        // only after prior effects complete).
         //
-        // Special interception: __reflect_format / __reflect_scalar_to_str are split into standalone compute_fns
-        // (CF_REFLECT_FORMAT/CF_REFLECT_SCALAR_TO_STR), not going through FFI dispatch,
-        // to avoid coupling the lazy-force logic with FFI calls. These two primitives are still declared as @extern("C")
-        // (via the builtin mechanism), but compute_fn is bound directly to the reflect implementation.
+        // @extern("C") call detection: all stdlib `#{ }#` functions go through
+        // CF_DYN_FFI_CALL (dlsym self-lookup + Abi::call_dynamic). There is no longer a
+        // CF_FFI_CALL / wrapper table. The C symbol name is uniformly `kuzo_extern_<name>`
+        // (generated by build.rs).
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
             if self.is_extern_c_func(name) {
-                // Look up the FFI intrinsic registry; a hit uses the registered compute_fn, a miss goes to CF_FFI_CALL
-                let (compute_fn, need_ffi_name) = FFI_INTRINSIC_TABLE
-                    .iter()
-                    .find(|(n, _)| *n == &**name)
-                    .map(|(_, cf)| (*cf, false))
-                    .unwrap_or((CF_FFI_CALL, true));
+                let sig = self.build_abi_sig(name);
+                let c_symbol = format!("kuzo_extern_{name}");
                 let mut inputs = Vec::with_capacity(args.len() + 1);
                 for &arg in args {
                     inputs.push(self.compile_subexpr(arg));
@@ -5413,11 +5450,16 @@ impl<'a> IrBuilder<'a> {
                     kind: NodeKind::Call,
                     input_count: inputs.len() as u8,
                     inputs_offset,
-                    compute_fn,
+                    compute_fn: CF_DYN_FFI_CALL,
                 });
-                if need_ffi_name {
-                    self.graph.set_ffi_call_name(node, name.to_string());
-                }
+                self.graph.set_dyn_ffi_info(
+                    node,
+                    crate::ir::Ir::DynFfiInfo {
+                        symbol: c_symbol,
+                        sig,
+                        arg_count: args.len() as u8,
+                    },
+                );
                 return node;
             }
         }
@@ -5822,6 +5864,69 @@ impl<'a> IrBuilder<'a> {
         false
     }
 
+    // (is_builtin_func removed: @builtin attribute eliminated. Reflect primitives
+    // now lower as auto-impl trait methods / top-level wrappers to CF_REFLECT_*
+    // compute_fns, never reaching the @extern dispatch path.)
+
+    /// Build an AbiSig from a @extern("C") #{ }# function's declared params/return_type.
+    /// str params are expanded to (Ptr, Int) two slots. Unknown types fall back to Int{64}.
+    fn build_abi_sig(&self, name: &str) -> crate::ffi::Abi::AbiSig {
+        use crate::ast::Ast::Decl;
+        let mut params = Vec::new();
+        let mut ret = crate::ffi::Abi::AbiType::Void;
+        for m in std::iter::once(self.module).chain(self.builtin_modules.iter().copied()) {
+            if let Some(d) = m.find_function(name) {
+                if let Decl::FunDecl { params: decl_params, return_type, .. } = &d.node {
+                    // Use THIS module's arena (m.arena), not self.module.arena — stdlib functions
+                    // have their TypeRefs in the builtin module's arena.
+                    let arena = &m.arena;
+                    for p in decl_params.iter() {
+                        let ty_name = type_name_in_arena(p.type_annotation, arena);
+                        self.push_abi_types(&ty_name, &mut params);
+                    }
+                    if let Some(rt) = return_type {
+                        let rt_name = type_name_in_arena(Some(*rt), arena);
+                        ret = self.abi_type_of(&rt_name);
+                    }
+                    break;
+                }
+            }
+        }
+        crate::ffi::Abi::AbiSig::new(params, ret)
+    }
+
+    /// Map a Kuzo type name to AbiType. str is handled separately by push_abi_types (two slots).
+    fn abi_type_of(&self, ty_name: &str) -> crate::ffi::Abi::AbiType {
+        use crate::ffi::Abi::AbiType;
+        match ty_name {
+            "void" => AbiType::Void,
+            "i8" => AbiType::Int { bits: 8, signed: true },
+            "i16" => AbiType::Int { bits: 16, signed: true },
+            "i32" => AbiType::Int { bits: 32, signed: true },
+            "i64" | "isize" => AbiType::Int { bits: 64, signed: true },
+            "u8" | "bool" => AbiType::Int { bits: 8, signed: false },
+            "char" => AbiType::Int { bits: 32, signed: false },
+            "u16" => AbiType::Int { bits: 16, signed: false },
+            "u32" => AbiType::Int { bits: 32, signed: false },
+            "u64" | "usize" => AbiType::Int { bits: 64, signed: false },
+            "f32" => AbiType::Float32,
+            "f64" => AbiType::Float64,
+            _ if ty_name.starts_with('*') => AbiType::Ptr,
+            _ => AbiType::Int { bits: 64, signed: true }, // fallback
+        }
+    }
+
+    /// Push AbiType(s) for a Kuzo type name. str expands to (Ptr, Int) two slots.
+    fn push_abi_types(&self, ty_name: &str, out: &mut Vec<crate::ffi::Abi::AbiType>) {
+        if ty_name == "str" {
+            // str → (const char* data, size_t len)
+            out.push(crate::ffi::Abi::AbiType::Ptr);
+            out.push(crate::ffi::Abi::AbiType::Int { bits: 64, signed: false });
+        } else {
+            out.push(self.abi_type_of(ty_name));
+        }
+    }
+
     /// Compile a method call.
     ///
     /// Method dispatch uniformly goes through the (type_id, method_idx) path:
@@ -6038,6 +6143,19 @@ impl<'a> IrBuilder<'a> {
         recv: crate::ast::Ast::ExprId,
         method: &str,
     ) -> Option<crate::sema::Sema::IntrinsicKind> {
+        // First: reflect trait methods (auto-impl). Recognized structurally by
+        // method name, so every type — including builtins and generic type vars —
+        // gets reflect methods without needing witness-table registration.
+        if let Some((kind, _argc)) = reflect_method_intrinsic(method) {
+            // Guard: only lower as reflect intrinsic if the receiver's type does
+            // NOT already define a real method of the same name (user override wins).
+            let shadows = self.expr_type_name(recv)
+                .and_then(|tn| self.sema.lookup_method_idx(tn, method))
+                .is_some();
+            if !shadows {
+                return Some(kind);
+            }
+        }
         let type_name = self.expr_type_name(recv)?;
         let type_id = self.expr_type_id(recv)?;
         let method_idx = self.sema.lookup_method_idx(type_name, method)?;
@@ -7680,7 +7798,6 @@ impl<'a> IrBuilder<'a> {
         let prev_method_type = self.current_method_type.take();
         self.current_method_type = Some((type_name.into(), type_id));
         self.enter_scope();
-        let prev_param_scope_depth = self.param_scope_depth;
         self.param_scope_depth = self.scope_stack.len();
 
         for param in &params {
@@ -8155,6 +8272,9 @@ impl<'a> IrBuilder<'a> {
             crate::ast::Ast::Expr::CompoundAssign { target, value, .. } => {
                 self.collect_local_types_from_expr(*target, arena, out);
                 self.collect_local_types_from_expr(*value, arena, out);
+            }
+            crate::ast::Ast::Expr::As { expr, .. } => {
+                self.collect_local_types_from_expr(*expr, arena, out);
             }
             _ => {}
         }
@@ -9130,4 +9250,37 @@ pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
     let frac = mant & ((1u128 << 112) - 1);
     let bits = (if sign { 1u128 << 127 } else { 0 }) | frac;
     Some(bits.to_le_bytes())
+}
+
+/// Resolve a TypeRef to a type-name string using the given arena.
+/// Used by build_abi_sig to resolve types in the correct module's arena.
+fn type_name_in_arena(
+    ty: Option<crate::ast::Ast::TypeRef>,
+    arena: &crate::ast::Ast::AstArena<'_>,
+) -> String {
+    use crate::ast::Ast::TypeNode;
+    let ty_ref = match ty {
+        Some(t) => t,
+        None => return String::new(),
+    };
+    let node = match arena.types.get(ty_ref.0 as usize) {
+        Some(n) => n,
+        None => return String::new(),
+    };
+    match &node.node {
+        TypeNode::Named { name } => (*name).to_string(),
+        TypeNode::RawPtr { inner } => {
+            let inner_name = type_name_in_arena(Some(*inner), arena);
+            format!("*{inner_name}")
+        }
+        TypeNode::Array { element_type, size } => {
+            let elem_name = type_name_in_arena(Some(*element_type), arena);
+            if size.is_none() {
+                format!("{elem_name}[]")
+            } else {
+                elem_name
+            }
+        }
+        _ => String::new(),
+    }
 }

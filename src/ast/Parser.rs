@@ -2073,7 +2073,8 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         } else {
             None
         };
-        // When extern_c_body is present, use a placeholder expression as the body (Sema skips checking)
+        // When extern_c_body is present (stdlib `#{ C body }#`), use a placeholder
+        // expression as the body (Sema skips checking — the real implementation is the C body).
         let body = if extern_c_body.is_some() {
             self.alloc_expr(token_span(&fun_tok), Expr::VoidLit)
         } else {
@@ -2966,7 +2967,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
 
     /// Single Pratt parser
     fn parse_binary(&mut self, min_prec: u8) -> ParseResult<ExprRef> {
-        let mut left = self.parse_unary()?;
+        let mut left = self.parse_as_cast()?;
         // After a block/if/match expression, block when the next token is `-` (Minus) or `&` (Ampersand).
         // Because `;` is treated as whitespace and skipped, `while c { ... }; -1` is equivalent to
         // `while c { ... } -1`. Without blocking, parse_binary would treat `-1` as `{ ... } - 1`
@@ -3012,6 +3013,87 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             );
         }
         Ok(left)
+    }
+
+    /// Parse postfix `as Type` cast expressions.
+    ///
+    /// `as` binds tighter than every binary operator (like Rust), so it sits between
+    /// `parse_binary` and `parse_unary`. Left-associative: `x as T as U` == `(x as T) as U`.
+    ///
+    /// The target type is parsed with `parse_cast_type`, a restricted grammar that does NOT
+    /// consume `<` (generics) or `->` (function types). This avoids ambiguity with comparison
+    /// (`x as f64 < 0.0`) and arrow operators following the cast. Generic and function types
+    /// are not valid cast targets anyway.
+    fn parse_as_cast(&mut self) -> ParseResult<ExprRef> {
+        let mut left = self.parse_unary()?;
+        while self.match_token(TokenKind::KwAs) {
+            let as_tok = self.previous();
+            let target = self.parse_cast_type()?;
+            left = self.alloc_expr(
+                token_span(&as_tok),
+                Expr::As { expr: left, target },
+            );
+        }
+        Ok(left)
+    }
+
+    /// Parse a cast target type: a restricted type grammar for `expr as Type`.
+    ///
+    /// Accepts: reference types (`&T`, `&&T`, `*T`), `This`, named types, nullable suffix (`T?`),
+    /// and array suffix (`T[]`, `T[N]`). Does NOT accept generic args (`T<A>`) or function types
+    /// (`A -> B`) — those would conflict with `<` (less-than) and `->` (arrow) in expression
+    /// context, and are not meaningful cast targets.
+    fn parse_cast_type(&mut self) -> ParseResult<TypeRef> {
+        // Reference / raw pointer prefix: &T, &&T, *T
+        if self.match_token(TokenKind::Ampersand) {
+            let span = token_span(&self.previous());
+            let inner = self.parse_cast_type()?;
+            return Ok(self.alloc_type(span, TypeNode::RefType { inner }));
+        }
+        if self.match_token(TokenKind::AmpAmp) {
+            let span = token_span(&self.previous());
+            let inner = self.parse_cast_type()?;
+            let inner_ref = self.alloc_type(span, TypeNode::RefType { inner });
+            return Ok(self.alloc_type(span, TypeNode::RefType { inner: inner_ref }));
+        }
+        if self.match_token(TokenKind::Star) {
+            let span = token_span(&self.previous());
+            let inner = self.parse_cast_type()?;
+            return Ok(self.alloc_type(span, TypeNode::RawPtr { inner }));
+        }
+        // `This` type keyword (lowercase KwThis or capitalized Identifier).
+        let is_this_type_kw = self.check(TokenKind::KwThis)
+            || (self.check(TokenKind::Identifier) && self.peek().lexeme == "This");
+        let mut ty = if is_this_type_kw {
+            let tok = self.advance();
+            let span = token_span(&tok);
+            self.alloc_type(span, TypeNode::ThisType)
+        } else {
+            let name_tok = self.expect(TokenKind::Identifier, "expected type name after 'as'")?;
+            let span = token_span(&name_tok);
+            self.alloc_type(span, TypeNode::Named { name: name_tok.lexeme })
+        };
+        let span = self.ast.ty(ty).span;
+        // Nullable suffix T? (chained)
+        while self.match_token(TokenKind::Question) {
+            ty = self.alloc_type(span, TypeNode::Nullable { inner: ty });
+        }
+        // Array suffix T[] / T[N] (chained)
+        while self.match_token(TokenKind::LBracket) {
+            let mut size: Option<u64> = None;
+            if !self.check(TokenKind::RBracket) {
+                let size_tok = self.expect(TokenKind::IntLiteral, "expected array size")?;
+                size = Some(parse_u64(size_tok.lexeme).ok_or_else(|| {
+                    self.report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")
+                })?);
+            }
+            let _ = self.expect(TokenKind::RBracket, "expected ']'");
+            ty = self.alloc_type(span, TypeNode::Array {
+                element_type: ty,
+                size,
+            });
+        }
+        Ok(ty)
     }
 
     /// Parse a unary operation
@@ -3303,10 +3385,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         if self.match_token(TokenKind::KwSelect) {
             return self.parse_select_expr();
-        }
-        if self.check_identifier("cast") {
-            self.advance();
-            return self.parse_cast_builder();
         }
         if self.check(TokenKind::KwTrait)
             && self.tokens.len() > self.current + 1
@@ -3639,7 +3717,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                         j += 2;
                     }
                     b'0' => {
-                        // Bug #36: \0 → NUL (U+0000)
                         result.push('\0');
                         j += 2;
                     }
@@ -3730,21 +3807,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             is_async,
             return_type: Some(return_type),
         }))
-    }
-
-    impl_parse_comma_list!(parse_lambda_param_list, Param<'a>, parse_lambda_param, check(TokenKind::RParen));
-
-    fn parse_lambda_param(&mut self) -> ParseResult<Param<'a>> {
-        let name_tok = self.expect(TokenKind::Identifier, "expected parameter name")?;
-        let type_annotation = if self.match_token(TokenKind::Colon) {
-            Some(self.parse_type()?)
-        } else {
-            None
-        };
-        Ok(Param {
-            name: name_tok.lexeme,
-            type_annotation,
-        })
     }
 
     /// Parse a parenthesized expression: unit value, lambda, record literal, record extend, or grouping
@@ -3841,50 +3903,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         let _ = self.expect(TokenKind::RParen, "expected ')'");
         Ok(first_expr)
-    }
-
-    /// Parse a cast builder: `cast(expr).to(T)` / `cast(expr).try_to(T)`
-    ///
-    /// The special syntax is desugared into a plain function call:
-    ///   cast(x).to(T)      -> __cast_to<T>(x)
-    ///   cast(x).try_to(T)  -> __cast_try_to<T>(x)
-    ///
-    /// After sema infers the source type S, this resolves to a __cast_S_to_T(x) function call.
-    fn parse_cast_builder(&mut self) -> ParseResult<ExprRef> {
-        let cast_tok = self.previous();
-        let span = token_span(&cast_tok);
-        let _ = self.expect(TokenKind::LParen, "expected '(' after 'cast'");
-        let expr = self.parse_expr()?;
-        let _ = self.expect(TokenKind::RParen, "expected ')' after cast expression");
-        let _ = self.expect(TokenKind::Dot, "expected '.to(...)' or '.try_to(...)' after cast(...)");
-        if !self.check(TokenKind::Identifier) {
-            self.report_error("expected 'to' or 'try_to' after cast(...).")?;
-            unreachable!()
-        }
-        let method_tok = self.advance();
-        let callee_name = match method_tok.lexeme {
-            "to" => "__cast_to",
-            "try_to" => "__cast_try_to",
-            _ => {
-                self.report_error("expected 'to' or 'try_to' after cast(...).")?;
-                unreachable!()
-            }
-        };
-        let _ = self.expect(TokenKind::LParen, "expected '(' after cast method");
-        if !self.check(TokenKind::Identifier) {
-            self.report_error("expected type name as cast target")?;
-            unreachable!()
-        }
-        let type_tok = self.advance();
-        let target = self.alloc_type(token_span(&type_tok), TypeNode::Named { name: type_tok.lexeme });
-        let _ = self.expect(TokenKind::RParen, "expected ')' after cast target type");
-        // Desugar into a plain Call: __cast_to<T>(x) / __cast_try_to<T>(x)
-        let callee = self.alloc_expr(span, Expr::Ident(callee_name));
-        Ok(self.alloc_expr(span, Expr::Call {
-            callee,
-            args: vec![expr],
-            type_args: Some(vec![target]),
-        }))
     }
 
     /// Parse an if expression

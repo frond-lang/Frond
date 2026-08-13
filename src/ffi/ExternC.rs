@@ -247,9 +247,3 @@ pub fn extract_c_from_module<'a>(module: &Module<'a>) -> Result<String, String> 
     let funcs = extract_extern_c_funcs(module)?;
     gen::generate_c_source(&funcs)
 }
-
-/// Extract all `@extern("C")` functions from a module and generate Rust FFI code (bindings + wrapper).
-pub fn extract_rust_ffi_from_module<'a>(module: &Module<'a>) -> Result<String, String> {
-    let funcs = extract_extern_c_funcs(module)?;
-    gen::generate_rust_ffi(&funcs)
-}

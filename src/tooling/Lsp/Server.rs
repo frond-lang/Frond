@@ -778,7 +778,7 @@ fn complete_general(doc: &DocState, _index: &Option<WorkspaceIndex>) -> Vec<serd
         }));
     }
     for ctor in &[
-        "Panic", "Ok", "channel", "Value", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32",
+        "Panic", "Ok", "channel", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32",
         "u64", "u128", "isize", "usize", "f16", "f32", "f64", "f128", "bool", "char",
     ] {
         items.push(serde_json::json!({ "label": ctor, "kind": 3 }));

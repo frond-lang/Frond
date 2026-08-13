@@ -1,4 +1,4 @@
-//! build.rs — Kuzo `@extern("C")` auto-compile + FFI generation.
+//! build.rs — Kuzo `@extern("C")` stdlib C compilation.
 //!
 //! ## Design
 //!
@@ -16,10 +16,14 @@
 //! 1. Scan `.kz` files listed in `EXTERN_KUZO_FILES` (containing `@extern("C")` declarations).
 //! 2. Text-extract each into `ExternCFunc` records (shared struct from `Gen.rs`).
 //! 3. Generate `.c` source for each file via `gen::generate_c_source`.
-//! 4. Generate Rust FFI code (concatenated) via `gen::generate_rust_ffi`.
-//! 5. Compile all `.c` files into the `kuzo_extern` static library using the `cc` crate.
-//! 6. Delete intermediate `.c` artifacts from `OUT_DIR`.
-//! 7. The generated FFI code is written to `$OUT_DIR/ffi_generated.rs`, `include!`d by `Ffi.rs`.
+//! 4. Compile all `.c` files into the `kuzo_extern` static library using the `cc` crate.
+//! 5. Delete intermediate `.c` artifacts from `OUT_DIR`.
+//!
+//! Symbol resolution: no Rust FFI binding table (`bindings_addr`) is generated
+//! anymore. At runtime, kuzo resolves in-process symbols via dlsym (GetProcAddress)
+//! self-lookup (see `platform::ResolveSelfSymbol`). C functions are exported on Windows
+//! via the `KUZO_EXPORT` macro (`__declspec(dllexport)`); on Linux/macOS they are
+//! exported by default and visible to dlsym.
 
 use std::env;
 use std::fs;
@@ -53,7 +57,6 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_extern_c)");
 
     let out_dir = env::var("OUT_DIR").unwrap();
-    let ffi_path = Path::new(&out_dir).join("ffi_generated.rs");
 
     // Collect existing .kz files
     let kuzo_files: Vec<PathBuf> = EXTERN_KUZO_FILES
@@ -63,22 +66,17 @@ fn main() {
         .collect();
 
     if kuzo_files.is_empty() {
-        fs::write(&ffi_path, empty_ffi_module()).unwrap();
-        println!("cargo::rerun-if-changed={}", ffi_path.display());
         return;
     }
 
     // 1. Text-extract each .kz → ExternCFunc list, then generate .c into OUT_DIR
-    let mut all_funcs: Vec<ExternCFunc> = Vec::new();
     let mut c_files: Vec<PathBuf> = Vec::new();
-    let mut any_error = false;
 
     for kuzo_file in &kuzo_files {
         let content = match fs::read_to_string(kuzo_file) {
             Ok(c) => c,
             Err(e) => {
                 println!("cargo:warning=Read failed {}: {}", kuzo_file.display(), e);
-                any_error = true;
                 continue;
             }
         };
@@ -87,7 +85,6 @@ fn main() {
             Ok(f) => f,
             Err(e) => {
                 println!("cargo:warning=Parse failed {}: {}", kuzo_file.display(), e);
-                any_error = true;
                 continue;
             }
         };
@@ -101,7 +98,6 @@ fn main() {
             Ok(s) => s,
             Err(e) => {
                 println!("cargo:warning=C gen failed {}: {}", kuzo_file.display(), e);
-                any_error = true;
                 continue;
             }
         };
@@ -110,47 +106,30 @@ fn main() {
         let c_path = Path::new(&out_dir).join(&c_name);
         if fs::write(&c_path, &c_source).is_err() {
             println!("cargo:warning=Write .c failed: {}", c_path.display());
-            any_error = true;
             continue;
         }
         c_files.push(c_path);
 
-        // Accumulate funcs for FFI generation
-        all_funcs.extend(funcs);
-
         println!("cargo::rerun-if-changed={}", kuzo_file.display());
     }
-
-    // 2. Generate FFI code
-    let ffi_code = if !any_error && !all_funcs.is_empty() {
-        match gen::generate_rust_ffi(&all_funcs) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                println!("cargo:warning=FFI gen failed: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let ffi_ok = ffi_code.is_some();
-    fs::write(
-        &ffi_path,
-        ffi_code.unwrap_or_else(|| empty_ffi_module().to_string()),
-    )
-    .unwrap();
-    println!("cargo::rerun-if-changed={}", ffi_path.display());
 
     if c_files.is_empty() {
         return;
     }
 
-    // 3. Compile all .c files with cc::Build
+    // 2. Compile all .c files with cc::Build into the kuzo_extern static library.
+    //
+    // Key point: use cargo_metadata(false) to suppress the rustc-link-lib that cc emits
+    // automatically (a plain -l would drop unreferenced symbols). Instead we emit the
+    // whole-archive link directives ourselves, forcing every symbol in the library into
+    // the binary (otherwise dlsym could not find them — the main binary has no Rust-side
+    // extern "C" references, so the linker would not extract these symbols from the
+    // static library).
     let mut build = cc::Build::new();
+    build.cargo_metadata(false);
     // Suppress the "unused parameter" warning. The flag spelling differs by compiler:
     //   - GCC/Clang: -Wno-unused-parameter
     //   - MSVC (cl.exe): /wd4100  (C4100 = unreferenced formal parameter)
-    // cc::Build::is_flag_supported probes the active compiler, so we pick whichever it accepts.
     if build.is_flag_supported("-Wno-unused-parameter").unwrap_or(false) {
         build.flag("-Wno-unused-parameter");
     } else if build.is_flag_supported("/wd4100").unwrap_or(false) {
@@ -161,13 +140,27 @@ fn main() {
     }
     match build.try_compile("kuzo_extern") {
         Ok(_) => {
-            if ffi_ok {
-                println!("cargo::rustc-cfg=has_extern_c");
+            // Emit link directives manually: whole-archive forces full linkage.
+            // Output the library search path (try_compile already placed the .lib in
+            // OUT_DIR, but cargo_metadata(false) does not emit link-search automatically).
+            println!("cargo::rustc-link-search=native={}", out_dir);
+            // Platform-specific whole-archive wrapping.
+            let target = env::var("TARGET").unwrap_or_default();
+            if target.contains("msvc") {
+                // MSVC: /WHOLEARCHIVE:<libname>. libname has no `lib` prefix / `.lib` suffix.
+                println!("cargo::rustc-link-arg-bin=kuzo=/WHOLEARCHIVE:kuzo_extern.lib");
+            } else if target.contains("apple") || target.contains("darwin") {
+                // macOS: -force_load <path> (requires the full path; -force_load wraps a single .a).
+                let lib_path = Path::new(&out_dir).join("libkuzo_extern.a");
+                println!("cargo::rustc-link-arg-bin=kuzo=-force_load");
+                println!("cargo::rustc-link-arg-bin=kuzo={}", lib_path.display());
             } else {
-                println!(
-                    "cargo:warning=C compilation succeeded but FFI generation failed, skipping has_extern_c cfg (wrapper module empty)"
-                );
+                // Linux / other ELF: -Wl,--whole-archive -lkuzo_extern -Wl,--no-whole-archive
+                println!("cargo::rustc-link-arg-bin=kuzo=-Wl,--whole-archive");
+                println!("cargo::rustc-link-arg-bin=kuzo=-lkuzo_extern");
+                println!("cargo::rustc-link-arg-bin=kuzo=-Wl,--no-whole-archive");
             }
+            println!("cargo::rustc-cfg=has_extern_c");
             // After successful compilation, delete the .c intermediate artifacts from OUT_DIR
             for c_file in &c_files {
                 let _ = fs::remove_file(c_file);
@@ -186,18 +179,6 @@ fn kuzo_file_to_c_name(kuzo_file: &Path) -> String {
         .to_string_lossy()
         .replace('/', "_");
     format!("{}.c", stem)
-}
-
-/// Empty FFI module (used when there are no @extern("C") functions).
-fn empty_ffi_module() -> &'static str {
-    r#"// Auto-generated: no @extern("C") functions
-#[cfg(has_extern_c)]
-pub mod bindings {
-    extern "C" {}
-}
-
-pub mod wrapper {}
-"#
 }
 
 // ============ Text extraction ============

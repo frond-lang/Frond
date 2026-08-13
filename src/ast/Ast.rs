@@ -458,6 +458,8 @@ pub enum Expr<'a> {
     },
     /// Unary operation `op operand`.
     Unary { op: UnaryOp, operand: ExprRef },
+    /// Type cast `expr as Type`.
+    As { expr: ExprRef, target: TypeRef },
     /// Take reference `&expr`.
     RefOf(ExprRef),
     /// Dereference `*expr`.
@@ -998,6 +1000,10 @@ pub fn walk_expr<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, id: 
         }
         Expr::Unary { operand, .. } => {
             walk_expr(v, arena, *operand);
+        }
+        Expr::As { expr, target } => {
+            walk_expr(v, arena, *expr);
+            walk_type(v, arena, *target);
         }
         Expr::RefOf(inner) | Expr::Deref(inner) | Expr::Propagate(inner)
         | Expr::NonNullAssert(inner) | Expr::Atomic(inner) | Expr::Lazy(inner) => {
@@ -1895,6 +1901,18 @@ impl<'a> AstVisitor<'a> for Printer<'a> {
                 self.write_line("(operand");
                 self.indent();
                 self.ve(operand);
+                self.dedent();
+                self.write_line(")");
+                self.dedent();
+                self.write_line(")");
+            }
+            Expr::As { expr, target } => {
+                self.write_line("(as");
+                self.indent();
+                self.ve(expr);
+                self.write_line("(target");
+                self.indent();
+                self.vt(target);
                 self.dedent();
                 self.write_line(")");
                 self.dedent();

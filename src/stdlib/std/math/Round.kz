@@ -2,30 +2,30 @@
 //
 // Contains: floor/ceil/round/trunc/fabs/copysign/fmod/ldexp
 // Pure Kuzo implementation, no FFI dependency.
-// Generic functions use match type_name(x) to dispatch to corresponding precision implementations by type.
+// Generic functions use match x.type_name() to dispatch to corresponding precision implementations by type.
 
 // ─── trunc (truncation toward zero) ───
 // Implemented by casting to integer and back to achieve truncation
 
 fun trunc_f64_impl(x: f64): f64 {
-    cast(cast(x).to(i64)).to(f64)
+    (x as i64) as f64
 }
 fun trunc_f32_impl(x: f32): f32 {
-    cast(cast(x).to(i64)).to(f32)
+    (x as i64) as f32
 }
 fun trunc_f16_impl(x: f16): f16 {
-    cast(cast(x).to(i16)).to(f16)
+    (x as i16) as f16
 }
 fun trunc_f128_impl(x: f128): f128 {
-    cast(cast(x).to(i128)).to(f128)
+    (x as i128) as f128
 }
 
 pub fun trunc<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(trunc_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(trunc_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(trunc_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(trunc_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (trunc_f64_impl(x as f64)) as T,
+        "f32" => (trunc_f32_impl(x as f32)) as T,
+        "f16" => (trunc_f16_impl(x as f16)) as T,
+        "f128" => (trunc_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -50,11 +50,11 @@ fun floor_f128_impl(x: f128): f128 {
 }
 
 pub fun floor<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(floor_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(floor_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(floor_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(floor_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (floor_f64_impl(x as f64)) as T,
+        "f32" => (floor_f32_impl(x as f32)) as T,
+        "f16" => (floor_f16_impl(x as f16)) as T,
+        "f128" => (floor_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -79,11 +79,11 @@ fun ceil_f128_impl(x: f128): f128 {
 }
 
 pub fun ceil<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(ceil_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(ceil_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(ceil_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(ceil_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (ceil_f64_impl(x as f64)) as T,
+        "f32" => (ceil_f32_impl(x as f32)) as T,
+        "f16" => (ceil_f16_impl(x as f16)) as T,
+        "f128" => (ceil_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -120,11 +120,11 @@ fun round_f128_impl(x: f128): f128 {
 }
 
 pub fun round<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(round_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(round_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(round_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(round_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (round_f64_impl(x as f64)) as T,
+        "f32" => (round_f32_impl(x as f32)) as T,
+        "f16" => (round_f16_impl(x as f16)) as T,
+        "f128" => (round_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -132,11 +132,11 @@ pub fun round<T>(x: T): T {
 // ─── fabs (absolute value, floating point only) ───
 
 pub fun fabs<T>(x: T): T {
-    match type_name(x) {
-        "f64" => if cast(x).to(f64) < 0.0 { cast(0.0 - cast(x).to(f64)).to(T) } else { x },
-        "f32" => if cast(x).to(f32) < 0.0 { cast(0.0 - cast(x).to(f32)).to(T) } else { x },
-        "f16" => if cast(x).to(f16) < 0.0 { cast(0.0 - cast(x).to(f16)).to(T) } else { x },
-        "f128" => if cast(x).to(f128) < 0.0 { cast(0.0 - cast(x).to(f128)).to(T) } else { x },
+    match x.type_name() {
+        "f64" => if x as f64 < 0.0 { (0.0 - x as f64) as T } else { x },
+        "f32" => if x as f32 < 0.0 { (0.0 - x as f32) as T } else { x },
+        "f16" => if x as f16 < 0.0 { (0.0 - x as f16) as T } else { x },
+        "f128" => if x as f128 < 0.0 { (0.0 - x as f128) as T } else { x },
         _ => x
     }
 }
@@ -144,26 +144,26 @@ pub fun fabs<T>(x: T): T {
 // ─── copysign (take sign of y and assign to x) ───
 
 pub fun copysign<T>(x: T, y: T): T {
-    match type_name(x) {
+    match x.type_name() {
         "f64" => {
-            val xv = cast(x).to(f64)
-            val yv = cast(y).to(f64)
-            if (yv < 0.0) != (xv < 0.0) { cast(0.0 - xv).to(T) } else { x }
+            val xv = x as f64
+            val yv = y as f64
+            if (yv < 0.0) != (xv < 0.0) { (0.0 - xv) as T } else { x }
         },
         "f32" => {
-            val xv = cast(x).to(f32)
-            val yv = cast(y).to(f32)
-            if (yv < 0.0) != (xv < 0.0) { cast(0.0 - xv).to(T) } else { x }
+            val xv = x as f32
+            val yv = y as f32
+            if (yv < 0.0) != (xv < 0.0) { (0.0 - xv) as T } else { x }
         },
         "f16" => {
-            val xv = cast(x).to(f16)
-            val yv = cast(y).to(f16)
-            if (yv < 0.0) != (xv < 0.0) { cast(0.0 - xv).to(T) } else { x }
+            val xv = x as f16
+            val yv = y as f16
+            if (yv < 0.0) != (xv < 0.0) { (0.0 - xv) as T } else { x }
         },
         "f128" => {
-            val xv = cast(x).to(f128)
-            val yv = cast(y).to(f128)
-            if (yv < 0.0) != (xv < 0.0) { cast(0.0 - xv).to(T) } else { x }
+            val xv = x as f128
+            val yv = y as f128
+            if (yv < 0.0) != (xv < 0.0) { (0.0 - xv) as T } else { x }
         },
         _ => x
     }
@@ -197,11 +197,11 @@ fun fmod_f128_impl(x: f128, y: f128): f128 {
 }
 
 pub fun fmod<T>(x: T, y: T): T {
-    match type_name(x) {
-        "f64" => cast(fmod_f64_impl(cast(x).to(f64), cast(y).to(f64))).to(T),
-        "f32" => cast(fmod_f32_impl(cast(x).to(f32), cast(y).to(f32))).to(T),
-        "f16" => cast(fmod_f16_impl(cast(x).to(f16), cast(y).to(f16))).to(T),
-        "f128" => cast(fmod_f128_impl(cast(x).to(f128), cast(y).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (fmod_f64_impl(x as f64, y as f64)) as T,
+        "f32" => (fmod_f32_impl(x as f32, y as f32)) as T,
+        "f16" => (fmod_f16_impl(x as f16, y as f16)) as T,
+        "f128" => (fmod_f128_impl(x as f128, y as f128)) as T,
         _ => x
     }
 }
@@ -263,11 +263,11 @@ fun ldexp_f128_impl(x: f128, exp: i32): f128 {
 }
 
 pub fun ldexp<T>(x: T, exp: i32): T {
-    match type_name(x) {
-        "f64" => cast(ldexp_f64_impl(cast(x).to(f64), exp)).to(T),
-        "f32" => cast(ldexp_f32_impl(cast(x).to(f32), exp)).to(T),
-        "f16" => cast(ldexp_f16_impl(cast(x).to(f16), exp)).to(T),
-        "f128" => cast(ldexp_f128_impl(cast(x).to(f128), exp)).to(T),
+    match x.type_name() {
+        "f64" => (ldexp_f64_impl(x as f64, exp)) as T,
+        "f32" => (ldexp_f32_impl(x as f32, exp)) as T,
+        "f16" => (ldexp_f16_impl(x as f16, exp)) as T,
+        "f128" => (ldexp_f128_impl(x as f128, exp)) as T,
         _ => x
     }
 }
@@ -378,21 +378,21 @@ fun frexp_f128_exponent_impl(x: f128): i32 {
 }
 
 pub fun frexp_mantissa<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(frexp_f64_mantissa_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(frexp_f32_mantissa_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(frexp_f16_mantissa_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(frexp_f128_mantissa_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (frexp_f64_mantissa_impl(x as f64)) as T,
+        "f32" => (frexp_f32_mantissa_impl(x as f32)) as T,
+        "f16" => (frexp_f16_mantissa_impl(x as f16)) as T,
+        "f128" => (frexp_f128_mantissa_impl(x as f128)) as T,
         _ => x
     }
 }
 
 pub fun frexp_exponent<T>(x: T): i32 {
-    match type_name(x) {
-        "f64" => frexp_f64_exponent_impl(cast(x).to(f64)),
-        "f32" => frexp_f32_exponent_impl(cast(x).to(f32)),
-        "f16" => frexp_f16_exponent_impl(cast(x).to(f16)),
-        "f128" => frexp_f128_exponent_impl(cast(x).to(f128)),
+    match x.type_name() {
+        "f64" => frexp_f64_exponent_impl(x as f64),
+        "f32" => frexp_f32_exponent_impl(x as f32),
+        "f16" => frexp_f16_exponent_impl(x as f16),
+        "f128" => frexp_f128_exponent_impl(x as f128),
         _ => 0
     }
 }
@@ -410,21 +410,21 @@ fun modf_f128_integral_impl(x: f128): f128 { trunc_f128_impl(x) }
 fun modf_f128_fractional_impl(x: f128): f128 { x - trunc_f128_impl(x) }
 
 pub fun modf_integral<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(modf_f64_integral_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(modf_f32_integral_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(modf_f16_integral_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(modf_f128_integral_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (modf_f64_integral_impl(x as f64)) as T,
+        "f32" => (modf_f32_integral_impl(x as f32)) as T,
+        "f16" => (modf_f16_integral_impl(x as f16)) as T,
+        "f128" => (modf_f128_integral_impl(x as f128)) as T,
         _ => x
     }
 }
 
 pub fun modf_fractional<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(modf_f64_fractional_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(modf_f32_fractional_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(modf_f16_fractional_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(modf_f128_fractional_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (modf_f64_fractional_impl(x as f64)) as T,
+        "f32" => (modf_f32_fractional_impl(x as f32)) as T,
+        "f16" => (modf_f16_fractional_impl(x as f16)) as T,
+        "f128" => (modf_f128_fractional_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -498,29 +498,29 @@ fun ilogb_f128_impl(x: f128): i32 {
 }
 
 pub fun ilogb<T>(x: T): i32 {
-    match type_name(x) {
-        "f64" => ilogb_f64_impl(cast(x).to(f64)),
-        "f32" => ilogb_f32_impl(cast(x).to(f32)),
-        "f16" => ilogb_f16_impl(cast(x).to(f16)),
-        "f128" => ilogb_f128_impl(cast(x).to(f128)),
+    match x.type_name() {
+        "f64" => ilogb_f64_impl(x as f64),
+        "f32" => ilogb_f32_impl(x as f32),
+        "f16" => ilogb_f16_impl(x as f16),
+        "f128" => ilogb_f128_impl(x as f128),
         _ => 0
     }
 }
 
 // ─── logb (base-2 exponent, floating point return) ───
-// logb(x) = cast(ilogb(x)).to(T)
+// logb(x) = (ilogb(x)) as T
 
-fun logb_f64_impl(x: f64): f64 { cast(ilogb_f64_impl(x)).to(f64) }
-fun logb_f32_impl(x: f32): f32 { cast(ilogb_f32_impl(x)).to(f32) }
-fun logb_f16_impl(x: f16): f16 { cast(ilogb_f16_impl(x)).to(f16) }
-fun logb_f128_impl(x: f128): f128 { cast(ilogb_f128_impl(x)).to(f128) }
+fun logb_f64_impl(x: f64): f64 { (ilogb_f64_impl(x)) as f64 }
+fun logb_f32_impl(x: f32): f32 { (ilogb_f32_impl(x)) as f32 }
+fun logb_f16_impl(x: f16): f16 { (ilogb_f16_impl(x)) as f16 }
+fun logb_f128_impl(x: f128): f128 { (ilogb_f128_impl(x)) as f128 }
 
 pub fun logb<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(logb_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(logb_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(logb_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(logb_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (logb_f64_impl(x as f64)) as T,
+        "f32" => (logb_f32_impl(x as f32)) as T,
+        "f16" => (logb_f16_impl(x as f16)) as T,
+        "f128" => (logb_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -533,11 +533,11 @@ fun scalbn_f16_impl(x: f16, n: i32): f16 { ldexp_f16_impl(x, n) }
 fun scalbn_f128_impl(x: f128, n: i32): f128 { ldexp_f128_impl(x, n) }
 
 pub fun scalbn<T>(x: T, n: i32): T {
-    match type_name(x) {
-        "f64" => cast(scalbn_f64_impl(cast(x).to(f64), n)).to(T),
-        "f32" => cast(scalbn_f32_impl(cast(x).to(f32), n)).to(T),
-        "f16" => cast(scalbn_f16_impl(cast(x).to(f16), n)).to(T),
-        "f128" => cast(scalbn_f128_impl(cast(x).to(f128), n)).to(T),
+    match x.type_name() {
+        "f64" => (scalbn_f64_impl(x as f64, n)) as T,
+        "f32" => (scalbn_f32_impl(x as f32, n)) as T,
+        "f16" => (scalbn_f16_impl(x as f16, n)) as T,
+        "f128" => (scalbn_f128_impl(x as f128, n)) as T,
         _ => x
     }
 }

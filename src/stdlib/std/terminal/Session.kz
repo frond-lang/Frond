@@ -61,8 +61,8 @@ type Session = Session(
         if ret < 0 {
             throw TerminalError(SizeQueryFailed, "failed to get terminal size", ret)
         }
-        val rows = cast(buf[0]).to(u16) + (cast(buf[1]).to(u16) << 8)
-        val cols = cast(buf[2]).to(u16) + (cast(buf[3]).to(u16) << 8)
+        val rows = (buf[0]) as u16 + ((buf[1]) as u16 << 8)
+        val cols = (buf[2]) as u16 + ((buf[3]) as u16 << 8)
         Ok(Size(rows, cols))
     }
 
@@ -73,9 +73,9 @@ type Session = Session(
     pub fun write_bytes(bytes: u8[]): Throw<usize, TerminalError> {
         val n = __terminal_write_raw_bytes(bytes, bytes.len())
         if n < 0 {
-            throw TerminalError(WriteFailed, "failed to write to terminal", cast(n).to(i32))
+            throw TerminalError(WriteFailed, "failed to write to terminal", n as i32)
         }
-        Ok(cast(n).to(usize))
+        Ok(n as usize)
     }
 
     // Write a string to terminal output (convenience, calls write_bytes).
@@ -191,11 +191,11 @@ type Session = Session(
     // ── Colors ──
 
     pub fun set_fg(c: u16): Throw<usize, TerminalError> {
-        this.write_str("\x1b[" + cast(c).to(str) + "m")
+        this.write_str("\x1b[" + c as str + "m")
     }
 
     pub fun set_bg(c: u16): Throw<usize, TerminalError> {
-        this.write_str("\x1b[" + cast(c).to(str) + "m")
+        this.write_str("\x1b[" + c as str + "m")
     }
 
     pub fun set_fg_black(): Throw<usize, TerminalError> { this.write_str(fg_black()) }

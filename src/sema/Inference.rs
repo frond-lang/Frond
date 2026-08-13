@@ -1305,13 +1305,6 @@ impl<'a> InferContext<'a> {
 // Adds InferContext methods ported from `src/sema/type_check.zig` and `throw_check.zig`.
 // =========================================================================
 
-/// Registry of builtin cast functions: (function name, whether it is the try variant).
-/// Adding a cast variant only requires appending a row; no new name-specific branch is needed.
-const CAST_BUILTINS: &[(&str, bool)] = &[
-    ("__cast_to", false),
-    ("__cast_try_to", true),
-];
-
 impl<'a> InferContext<'a> {
     // ── Type resolution (typeFromAst) ──
 
@@ -2153,7 +2146,8 @@ impl<'a> InferContext<'a> {
             | Ast::Expr::RefOf(recv)
             | Ast::Expr::Deref(recv)
             | Ast::Expr::NonNullAssert(recv)
-            | Ast::Expr::Propagate(recv) => {
+            | Ast::Expr::Propagate(recv)
+            | Ast::Expr::As { expr: recv, .. } => {
                 self.collect_free_idents_scoped(ast, *recv, bound, out);
             }
             Ast::Expr::Index { recv, index } => {
@@ -2600,6 +2594,12 @@ impl<'a> InferContext<'a> {
                 let _ = self.infer_expr(*operand, ast, env, None);
                 // ! / ~ / - all return the operand's type.
                 self.infer_expr(*operand, ast, env, None)
+            }
+
+            // ── Type cast `expr as T` ──
+            Expr::As { expr: src, target } => {
+                let _ = self.infer_expr(*src, ast, env, None);
+                self.type_from_ast(*target, ast)
             }
 
             // ── Reference / dereference ──
@@ -3579,34 +3579,7 @@ impl<'a> InferContext<'a> {
         expected: Option<TypeHandle>,
     ) -> TypeHandle {
         match &ast.expr(expr).node {
-            Expr::Call { callee, args, type_args } => {
-                // cast call resolution: __cast_to<T>(x) / __cast_try_to<T>(x).
-                // The parser lowers cast(x).to(T) into an ordinary __cast_to<T>(x) Call;
-                // sema infers the source type S and returns T (or Throw<T, CastError> for try_to).
-                // Lookup goes through the CAST_BUILTINS registry, avoiding name-specific branches.
-                if let Expr::Ident(name) = &ast.expr(*callee).node {
-                    if let Some(is_try) = CAST_BUILTINS
-                        .iter()
-                        .find_map(|(n, t)| (*n == *name).then_some(*t))
-                    {
-                        // Infer the source expression's type.
-                        let _ = self.infer_expr(args[0], ast, env, None);
-                        // Take the target type T from type_args.
-                        let target_ty = match type_args {
-                            Some(ta) if !ta.is_empty() => self.type_from_ast(ta[0], ast),
-                            _ => self.arena.fresh_type_var(),
-                        };
-                        if is_try {
-                            let err_ty = self.arena.make_adt(
-                                "CastError".into(),
-                                Box::new([]),
-                            );
-                            return self.arena.make_throw(target_ty, err_ty);
-                        }
-                        return target_ty;
-                    }
-                }
-
+            Expr::Call { callee, args, .. } => {
                 // ── Constructor multi-mapping disambiguation ──
                 // When callee is an Ident that maps to multiple same-named constructors, disambiguate by priority:
                 //   1. Type-oriented: when expected_ty is an Adt, select by type_name
@@ -4051,6 +4024,19 @@ impl<'a> InferContext<'a> {
                     return self.make_builtin(Type::Void);
                 }
 
+                // reflect trait methods (auto-impl): any receiver type gets reflect methods
+                // (format/type_name/kind/field_count/...) without explicit trait declaration.
+                // This is the Sema-side recognition that pairs with Builder::lookup_intrinsic +
+                // reflect_method_intrinsic — the method call type-checks here, and lowers to a
+                // CF_REFLECT_* compute_fn at IR build time.
+                if let Some(ret_ty) = self.reflect_method_return_type(*method, args.len()) {
+                    // Infer args (for type-checking side effects) but discard their constraints.
+                    for &a in args.iter() {
+                        let _ = self.infer_expr(a, ast, env, None);
+                    }
+                    return ret_ty;
+                }
+
                 // Fallback: infer arguments and return a fresh var.
                 // For a receiver whose type is already determined (not TypeVar/Unknown/Never), report "method does not exist"
                 // to help the user locate the problem; for a TypeVar receiver, silently return a fresh var (inference pending, deferred to the solver).
@@ -4082,6 +4068,35 @@ impl<'a> InferContext<'a> {
             }
             _ => unreachable!("infer_method_call_expr called on non-MethodCall expression"),
         }
+    }
+
+    /// Return type for an auto-impl reflect trait method, or `None` if `method`
+    /// is not a reflect method. This pairs with `Builder::reflect_method_intrinsic`
+    /// to give every type access to reflect methods without explicit trait impl.
+    ///
+    /// Must stay in sync with:
+    /// - `ir/Builder.rs::reflect_method_intrinsic` (method-name → IntrinsicKind)
+    /// - `ir/Compute.rs` compute_reflect_* (the runtime implementation)
+    fn reflect_method_return_type(&mut self, method: &str, arg_count: usize) -> Option<TypeHandle> {
+        // Nullary reflect methods (receiver only, arg_count == 0).
+        let nullary: Option<TypeHandle> = match method {
+            "format" | "type_name" | "kind" | "constructor" => Some(self.make_builtin(Type::Str)),
+            "size" | "alignment" => Some(self.make_builtin(Type::U32)),
+            "field_count" => Some(self.make_builtin(Type::U16)),
+            _ => None,
+        };
+        if let Some(ty) = nullary {
+            return (arg_count == 0).then_some(ty);
+        }
+        // Unary-index reflect methods (receiver + index, arg_count == 1).
+        let unary: Option<TypeHandle> = match method {
+            "field_name" => Some(self.make_builtin(Type::Str)),
+            _ => None,
+        };
+        if let Some(ty) = unary {
+            return (arg_count == 1).then_some(ty);
+        }
+        None
     }
 
     /// Integer suffix → corresponding integer TypeHandle (derived from `BUILTIN_TABLE`; returns `None` on miss).
@@ -5033,16 +5048,6 @@ impl<'a> InferContext<'a> {
             chan_ret,
         );
         self.env.define(env, "channel", chan_fn);
-
-        // Value: builtin opaque type (ValueHandle, u32).
-        // Reflection primitives receive a Value, internally look up the ValueArena to fetch
-        // the HeapObj and match directly.
-        // Opaque to Sema (internal structure not exposed); size 4B.
-        let value_ty = self.arena.make_generic(
-            "Value".into(),
-            Box::new([]),
-        );
-        self.env.define(env, "Value", value_ty);
     }
 
     // ── check_module ──
@@ -5778,7 +5783,38 @@ impl<'a> InferContext<'a> {
     /// the caller supplies it from the enclosing Stmt.
     fn check_decl(&mut self, decl: &Decl<'_>, decl_span: crate::ast::Ast::Span, ast: &AstArena<'_>, env: EnvId) {
         match decl {
-            Decl::FunDecl { name, type_params, params, return_type, body, extern_c_body, is_async, .. } => {
+            Decl::FunDecl { name, type_params, params, return_type, body, extern_c_body, is_async, attributes, .. } => {
+                // ── FFI permission check ──
+                // `@extern` / `@c_include` / `#{ }#` are only allowed in builtin (stdlib) modules;
+                // `@internal` is a reserved attribute and may not appear in any user code.
+                // The builtin check is based on the module-name path prefix
+                // (`current_module_name` is set from `module.name` in `check_module_with_env`;
+                // builtin module names look like "builtin/io/Raw.kz").
+                let is_builtin = self.current_module_name.starts_with("builtin/");
+                if !is_builtin {
+                    for attr in attributes {
+                        match attr.name {
+                            crate::ffi::ATTR_INTERNAL => self.add_error_at(
+                                "attribute '@internal' is reserved for the language implementation",
+                                decl_span.line,
+                                decl_span.column,
+                            ),
+                            crate::ffi::ATTR_EXTERN | crate::ffi::ATTR_C_INCLUDE => self.add_error_at(
+                                &format!("attribute '@{}' is only allowed in builtin (stdlib) modules", attr.name),
+                                decl_span.line,
+                                decl_span.column,
+                            ),
+                            _ => {}
+                        }
+                    }
+                    if extern_c_body.is_some() {
+                        self.add_error_at(
+                            "inline C body (#{ }#) is only allowed in builtin (stdlib) modules",
+                            decl_span.line,
+                            decl_span.column,
+                        );
+                    }
+                }
                 // Top-level functions disallow a self parameter (detected via the ThisType type
                 // node, not by parameter name; self is only allowed inside type/trait block methods).
                 if !params.is_empty() && self.is_this_param(params[0].type_annotation, ast) {

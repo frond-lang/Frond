@@ -805,6 +805,7 @@ fn walk_expr<'a>(
             walk_expr(*rhs, ctx, sema_result, arena);
         }
         Expr::Unary { operand, .. } => walk_expr(*operand, ctx, sema_result, arena),
+        Expr::As { expr, .. } => walk_expr(*expr, ctx, sema_result, arena),
         Expr::RefOf(operand) => walk_expr(*operand, ctx, sema_result, arena),
         Expr::Deref(operand) => walk_expr(*operand, ctx, sema_result, arena),
         Expr::Assign { target, value } => {

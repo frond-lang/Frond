@@ -9,8 +9,7 @@
 //! src/stdlib/
 //! ├── builtin/          # builtin modules (visible by default, no import needed)
 //! │   ├── {io,net,time}/Raw.kz  # @extern("C") primitives (split by domain)
-//! │   ├── error/        # Err/Error/CastError/IOError/TimeError
-//! │   ├── cast/         # Raw.kz (@extern primitives) + Cast.kz (kuzo wrapper)
+//! │   ├── error/        # Err/Error/IOError/TimeError
 //! │   ├── reflect/      # runtime reflection formatting (Reflect.format)
 //! │   ├── io/           # Reader/Writer trait + Console(print/println/scan...)
 //! │   └── iter/         # Iterator<T> iterator
@@ -26,9 +25,9 @@ pub type StdlibFile = (&'static str, &'static str);
 /// Builtin module file manifest (visible by default, no import needed).
 ///
 /// Ordered by dependency:
-///   Raw(@extern primitives) → error → cast(Raw+Cast) → reflect → io(Reader/Writer/Console) → net → time → iter
+///   Raw(@extern primitives) → error → reflect → io(Reader/Writer/Console) → net → time → iter
 /// @extern("C") primitives load first: globally visible, available to builtin/std wrappers
-/// cast/Raw.kz and {io,net,time}/Raw.kz are loaded together at the primitive layer
+/// {io,net,time}/Raw.kz are loaded together at the primitive layer
 pub const BUILTIN_FILES: &[StdlibFile] = &[
     // @extern("C") primitive modules (globally visible, split by domain into Raw.kz)
     ("builtin/io/Raw.kz", include_str!("../stdlib/builtin/io/Raw.kz")),
@@ -39,14 +38,9 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     ("builtin/error/pack.kz", include_str!("../stdlib/builtin/error/pack.kz")),
     ("builtin/error/Err.kz", include_str!("../stdlib/builtin/error/Err.kz")),
     ("builtin/error/Error.kz", include_str!("../stdlib/builtin/error/Error.kz")),
-    ("builtin/error/CastError.kz", include_str!("../stdlib/builtin/error/CastError.kz")),
     ("builtin/error/IOError.kz", include_str!("../stdlib/builtin/error/IOError.kz")),
     ("builtin/error/TimeError.kz", include_str!("../stdlib/builtin/error/TimeError.kz")),
     ("builtin/error/TerminalError.kz", include_str!("../stdlib/builtin/error/TerminalError.kz")),
-    // cast module (type conversion primitives + kuzo wrapper)
-    ("builtin/cast/pack.kz", include_str!("../stdlib/builtin/cast/pack.kz")),
-    ("builtin/cast/Raw.kz", include_str!("../stdlib/builtin/cast/Raw.kz")),
-    ("builtin/cast/Cast.kz", include_str!("../stdlib/builtin/cast/Cast.kz")),
     // reflect module (runtime reflection, Raw.kz primitives + Reflect.kz wrapper)
     ("builtin/reflect/pack.kz", include_str!("../stdlib/builtin/reflect/pack.kz")),
     ("builtin/reflect/Raw.kz", include_str!("../stdlib/builtin/reflect/Raw.kz")),

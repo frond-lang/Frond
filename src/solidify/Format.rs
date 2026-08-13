@@ -1085,6 +1085,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         field_access_infos,
         record_lit_infos,
         ffi_call_names,
+        dyn_ffi_infos: Vec::new(), // v1: DynFfiInfo .kzo serialization not yet supported
         field_set_names,
         vtable_call_methods,
         await_event_sources,
@@ -1134,6 +1135,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
 pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
     let n = mem.header().node_count as usize;
 
+    // Load inline C machine code (mmap executable)
     // SubGraphs (eager-load: includes variable-length fields upvalue_nodes/nested_ranges/event_decls/defer_table/reset_plan)
     // upvalue_outer_nodes / nested_ranges use zerocopy CSR accessors and are not parsed into owned Vecs.
     let (subgraphs, sg_uv_offsets, sg_nr_offsets) = {
@@ -1381,6 +1383,7 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         field_access_infos: Vec::new(),
         record_lit_infos,
         ffi_call_names: Vec::new(),
+        dyn_ffi_infos: Vec::new(), // v1: DynFfiInfo .kzo serialization not yet supported
         field_set_names: Vec::new(),
         vtable_call_methods: Vec::new(),
         await_event_sources: Vec::new(),

@@ -45,9 +45,9 @@ fun __net_resolve(host: str): Throw<IpAddr[], IOError> {
         // Parse buffer to assemble IpAddr[]
         var addrs: IpAddr[] = []
         var idx: usize = 0
-        while idx < cast(count).to(usize) {
+        while idx < count as usize {
             val base = idx * 17
-            val family = cast(buf[base + 16]).to(i32)
+            val family = (buf[base + 16]) as i32
             if family == 4 {
                 // IPv4: first 4 bytes are the u32 address
                 val bits = __dns_read_u32_le(buf, base)

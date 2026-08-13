@@ -1,71 +1,15 @@
-// builtin/reflect/Raw.kz — reflection @extern("C") primitives (builtin, visible by default)
+// builtin/reflect/Raw.kz — reflect primitive declarations (placeholder).
 //
-// All primitives receive Value (ValueHandle, u32), implemented on the Rust side as extern "C" fn,
-// directly matching HeapObj to read the already-carried type information.
+// Historically this file declared @builtin primitives whose implementations
+// were Rust-side #[no_mangle] fns dispatched via FFI (REFLECT_ENTRIES + CF_FFI_CALL).
 //
-// No type_table, no type_id injection, no lookup. Zero metadata memory, zero extra overhead.
+// That entire path has been eliminated. Reflect operations are now:
+//   1. Auto-impl trait methods on every value (trait Type / trait Value),
+//      recognized structurally at Sema (Inference) and lowered at IR build
+//      (Builder::reflect_method_intrinsic → CF_REFLECT_* compute_fns).
+//   2. No top-level wrappers — call sites use the method form directly
+//      (e.g. Console.kz `print<T>` writes `x.format()`).
 //
-// Reflection data flow:
-//   1. Value system is self-describing (RecordValue.type_name and other fields already carry type information)
-//   2. Raw.kz: @extern("C") declarations, C ABI calling convention
-//   3. Reflect.rs: Rust extern "C" fn implementation, matches HeapObj and returns reflection info
-//
-// Memory layout convention:
-//   - Value (ValueHandle) is u32, C ABI directly passes uint32_t
-//   - The C side does not need to understand the HeapObj layout, only stores u32
-//   - str return uses the out-parameter pattern (C cannot directly return a fat pointer)
-//
-// Note: body is empty, implementation is on the Rust side #[no_mangle] extern "C" fn.
-// Raw.kz does not participate in emit-c (not in build.rs EXTERN_KUZO_FILES).
-
-@extern("C")
-fun __reflect_kind(v: Value): u8 #{
-}#
-
-@extern("C")
-fun __reflect_type_name(v: Value): str #{
-}#
-
-@extern("C")
-fun __reflect_size(v: Value): u8 #{
-}#
-
-@extern("C")
-fun __reflect_field_count(v: Value): u16 #{
-}#
-
-@extern("C")
-fun __reflect_field_name(v: Value, i: u16): str #{
-}#
-
-@extern("C")
-fun __reflect_field_value(v: Value, i: u16): Value #{
-}#
-
-@extern("C")
-fun __reflect_array_len(v: Value): usize #{
-}#
-
-@extern("C")
-fun __reflect_adt_constructor(v: Value): str #{
-}#
-
-@extern("C")
-fun __reflect_scalar_to_str(v: Value): str #{
-}#
-
-@extern("C")
-fun __reflect_format(v: Value): str #{
-}#
-
-@extern("C")
-fun __reflect_kind_str(v: Value): str #{
-}#
-
-@extern("C")
-fun __reflect_layout_size(v: Value): u32 #{
-}#
-
-@extern("C")
-fun __reflect_layout_alignment(v: Value): u32 #{
-}#
+// No @builtin declarations remain. This file is kept as an empty placeholder
+// so the `builtin/reflect/` module layout stays stable; it contributes no
+// declarations to the environment.

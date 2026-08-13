@@ -222,6 +222,19 @@ impl DataFlowGraph {
         }
     }
 
+    /// stdlib @extern("C") #{ }# inline FFI call info.
+    /// Build path: clone from Vec. Load path: v1 unsupported (returns None) — .kzo serialization
+    /// of DynFfiInfo (containing String + Vec) is deferred to a later phase.
+    #[inline]
+    pub fn dyn_ffi_info(&self, idx: usize) -> Option<DynFfiInfo> {
+        if self.mem.is_some() {
+            // TODO: implement zerocopy load path for DynFfiInfo (symbol/sig/arg_count).
+            None
+        } else {
+            self.dyn_ffi_infos[idx].clone()
+        }
+    }
+
     #[inline]
     pub fn partial_info(&self, idx: usize) -> Option<PartialInfo> {
         if let Some(ref mem) = self.mem {

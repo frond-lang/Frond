@@ -17,8 +17,6 @@
 #[path = "Value.rs"]
 mod value;
 
-// `#[macro_use]` makes the read_int_as! / write_int_bytes! macros defined in Arena.rs
-// visible to the subsequent Ops.rs module.
 #[macro_use]
 pub mod Arena;
 

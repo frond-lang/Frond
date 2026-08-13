@@ -59,16 +59,16 @@ fun __dir_list(path: str): Throw<DirEntry[], IOError> {
     // Parse buffer to assemble DirEntry[]
     var entries: DirEntry[] = []
     var idx: usize = 0
-    while idx < cast(count).to(usize) {
+    while idx < count as usize {
         // Read kind (1 byte, offset = idx)
-        val kind_int = cast(kinds_buf[idx]).to(i32)
+        val kind_int = (kinds_buf[idx]) as i32
         val kind = __kind_from_int(kind_int)
         // Read name start offset (u32 LE, offset = idx * 4)
         val off_base = idx * 4
-        val name_start = cast(__read_i32_le(name_offsets, off_base)).to(usize)
+        val name_start = (__read_i32_le(name_offsets, off_base)) as usize
         // Read next entry's start offset (or buffer end) as name end
-        val name_end = if idx + 1 < cast(count).to(usize) {
-            cast(__read_i32_le(name_offsets, off_base + 4)).to(usize)
+        val name_end = if idx + 1 < count as usize {
+            (__read_i32_le(name_offsets, off_base + 4)) as usize
         } else {
             // Last entry: scan to first 0 byte
             var end_pos = name_start

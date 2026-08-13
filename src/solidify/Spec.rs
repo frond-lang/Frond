@@ -184,6 +184,9 @@ pub enum SectionKind {
     // Shared region
     StringPool = 60,
     Downstreams = 61,
+    // Inline C FFI (compiled by kuzo build → cc → object extraction)
+    CMachineCode = 70,
+    CSymbols = 71,
 }
 
 impl SectionKind {

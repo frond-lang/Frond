@@ -44,20 +44,20 @@ fun __stdin_readln(): Throw<str?, IOError> {
     if n == 1 {
         Ok(null)
     } else {
-        Ok(cast(buf[0..cast(n).to(usize)]).to(str))
+        Ok((buf[0..n as usize]) as str)
     }
 }
 
 // ─── Standard output ──────────────────────────────────────────────────────
 
 pub fun print<T>(x: T): Throw<void, IOError> {
-    val s = format(x)
+    val s = x.format()
     __stdout_write(s)?
     Ok(void)
 }
 
 pub fun println<T>(x: T): Throw<void, IOError> {
-    val s = format(x)
+    val s = x.format()
     __stdout_write(s)?
     __stdout_write("\n")?
     Ok(void)
@@ -66,13 +66,13 @@ pub fun println<T>(x: T): Throw<void, IOError> {
 // ─── Standard error ──────────────────────────────────────────────────────
 
 pub fun eprint<T>(x: T): Throw<void, IOError> {
-    val s = format(x)
+    val s = x.format()
     __stderr_write(s)?
     Ok(void)
 }
 
 pub fun eprintln<T>(x: T): Throw<void, IOError> {
-    val s = format(x)
+    val s = x.format()
     __stderr_write(s)?
     __stderr_write("\n")?
     Ok(void)

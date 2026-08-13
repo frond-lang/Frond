@@ -77,7 +77,7 @@ pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, 
         if n < 0 {
             throw IOError(ConnectionReset, "tcp read failed", 0, null)
         }
-        Ok(buf[0..cast(n).to(usize)])
+        Ok(buf[0..n as usize])
     }
 
     // Writes data to the stream, returns the actual number of bytes written.
@@ -89,7 +89,7 @@ pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, 
         if n < 0 {
             throw IOError(BrokenPipe, "tcp write failed", 0, null)
         }
-        Ok(cast(n).to(usize))
+        Ok(n as usize)
     }
 
     // Closes the stream. Idempotent: repeated close does not error.

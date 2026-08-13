@@ -39,7 +39,7 @@ pub enum Commands {
         /// Entry file (defaults to the manifest; `-` means stdin).
         file: Option<String>,
         /// Diagnostic stage: tokens (lex only), ast (print AST after parsing),
-        /// check (type check only), emit-c (extract C code), emit-ffi (generate FFI bindings),
+        /// check (type check only), emit-c (extract C code),
         /// full (default: full pipeline + execution statistics).
         #[arg(long)]
         stage: Option<DebugStage>,
@@ -92,8 +92,6 @@ pub enum DebugStage {
     Check,
     /// Extract @extern("C") functions and emit .c to stdout.
     EmitC,
-    /// Generate Rust FFI bindings + wrapper to stdout.
-    EmitFfi,
     /// Full pipeline + execution statistics (default).
     Full,
 }

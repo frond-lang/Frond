@@ -433,6 +433,25 @@ compute_fn_ids! {
     323 => CF_DEFER_RUN,
     // Block-scoped defer registration (324): like CF_DEFER_REGISTER but input[0] is an effect dep.
     324 => CF_BLOCK_DEFER_REGISTER,
+    // stdlib @extern("C") #{ }# inline FFI call (325): resolves a self-symbol (kuzo_extern_<name>)
+    // via dlsym/GetProcAddress + Abi::call_dynamic. Inputs are the call arguments + a trailing
+    // effect dep; dyn_ffi_info metadata carries (symbol, sig, arg_count).
+    325 => CF_DYN_FFI_CALL,
+    // ── reflect compute_fns (326-340): standalone reflect primitives.
+    // Replaces the former @builtin + REFLECT_ENTRIES + CF_FFI_CALL dispatch path.
+    // Each takes the receiver value as input[0] (+ optional index as input[1])
+    // and calls the pure-Rust helper in value/Reflect.rs directly — no FFI.
+    326 => CF_REFLECT_KIND,           // v.kind()        -> u8
+    327 => CF_REFLECT_TYPE_NAME,      // v.type_name()   -> str
+    328 => CF_REFLECT_KIND_STR,       // v.kind_str()    -> str
+    329 => CF_REFLECT_SIZE,           // v.size()        -> u8  (scalar byte width)
+    330 => CF_REFLECT_LAYOUT_SIZE,    // v.size()        -> u32 (aggregate layout size)
+    331 => CF_REFLECT_LAYOUT_ALIGN,   // v.alignment()   -> u32
+    332 => CF_REFLECT_FIELD_COUNT,    // v.field_count() -> u16
+    333 => CF_REFLECT_FIELD_NAME,     // v.field_name(i) -> str
+    334 => CF_REFLECT_FIELD_VALUE,    // v.field_value(i)-> Value
+    335 => CF_REFLECT_ARRAY_LEN,      // v.array_len()   -> usize
+    336 => CF_REFLECT_ADT_CTOR,       // v.adt_constructor() -> str
 }
 
 // =========================================================================
@@ -1345,6 +1364,22 @@ pub struct ClosureInfo {
     pub self_upvalue_idx: i32,
 }
 
+/// Carries the FFI symbol info + ABI signature for `@extern("C")` stdlib C calls.
+///
+/// At runtime, `compute_dyn_ffi_call` reads this metadata, resolves the symbol address
+/// via `ffi::Symbols` (dlsym self-lookup + cache), and invokes via
+/// `Abi::CallDynamic::call_dynamic`.
+#[derive(Debug, Clone, Hash)]
+pub struct DynFfiInfo {
+    /// C symbol name (e.g. "kuzo_extern___file_open_raw").
+    pub symbol: String,
+    /// ABI signature (parameter types + return type); str params are pre-expanded to (Ptr, Int).
+    pub sig: crate::ffi::Abi::AbiSig,
+    /// Number of Kuzo-level argument values (not counting the trailing effect dependency).
+    /// Used by compute_dyn_ffi_call to separate args from the effect input.
+    pub arg_count: u8,
+}
+
 /// Partial application construction node info (compute_fn = 286).
 ///
 /// When compile_call detects that the number of actual arguments < the target function's parameter count,
@@ -1664,7 +1699,7 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         43  => super::Compute::noop_compute_real, // compute_select_gate — new signature, table override
         44  => super::Compute::compute_throw_ok,
         45  => super::Compute::compute_throw_err,
-        46  => super::Compute::compute_ffi_call,
+        46  => super::Compute::noop_compute_real, // CF_FFI_CALL is deprecated (wrapper table deleted); the slot is kept to avoid renumbering.
         47  => super::Compute::noop_compute_real, // compute_propagate — new signature, table override
         48  => super::Compute::compute_seq,
         49  => super::Compute::noop_compute_real, // compute_writeback — new signature, table override
@@ -1990,6 +2025,20 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         322 => super::Compute::noop_compute_real, // compute_defer_register
         323 => super::Compute::noop_compute_real, // compute_defer_run
         324 => super::Compute::noop_compute_real, // compute_block_defer_register
+        325 => super::Compute::compute_dyn_ffi_call,
+        // reflect compute_fns (326-336): standalone reflect primitives.
+        // Replaces @builtin + REFLECT_ENTRIES + CF_FFI_CALL dispatch.
+        326 => super::Compute::compute_reflect_kind,
+        327 => super::Compute::compute_reflect_type_name,
+        328 => super::Compute::compute_reflect_kind_str,
+        329 => super::Compute::compute_reflect_size,
+        330 => super::Compute::compute_reflect_layout_size,
+        331 => super::Compute::compute_reflect_layout_align,
+        332 => super::Compute::compute_reflect_field_count,
+        333 => super::Compute::compute_reflect_field_name,
+        334 => super::Compute::compute_reflect_field_value,
+        335 => super::Compute::compute_reflect_array_len,
+        336 => super::Compute::compute_reflect_adt_ctor,
     };
     // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
     // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values
@@ -2100,6 +2149,7 @@ macro_rules! node_metadata {
             opt(field_access_infos, u16, set_field_access_info)
             opt(record_lit_infos, RecordLitInfo, set_record_lit_info)
             opt(ffi_call_names, String, set_ffi_call_name)
+            opt(dyn_ffi_infos, DynFfiInfo, set_dyn_ffi_info)
             opt(field_set_names, String, set_field_set_name)
             opt(vtable_call_methods, u16, set_vtable_call)
             opt(await_event_sources, NodeId, set_await_event_source)
@@ -2135,6 +2185,7 @@ macro_rules! node_metadata {
             opt(field_access_infos, u16, set_field_access_info)
             opt(record_lit_infos, RecordLitInfo, set_record_lit_info)
             opt(ffi_call_names, String, set_ffi_call_name)
+            opt(dyn_ffi_infos, DynFfiInfo, set_dyn_ffi_info)
             opt(field_set_names, String, set_field_set_name)
             opt(vtable_call_methods, u16, set_vtable_call)
             opt(await_event_sources, NodeId, set_await_event_source)
@@ -2251,6 +2302,8 @@ pub struct DataFlowGraph {
     pub record_lit_infos: Vec<Option<RecordLitInfo>>,
     /// @extern("C") function name for FFI call nodes (used for compute_ffi_call dispatch).
     pub ffi_call_names: Vec<Option<String>>,
+    /// stdlib @extern("C") #{ }# inline FFI call info (used by compute_dyn_ffi_call dispatch).
+    pub dyn_ffi_infos: Vec<Option<DynFfiInfo>>,
     /// Field assignment info (indexed by NodeId; stores field name; used by compute_record_field_set).
     pub field_set_names: Vec<Option<String>>,
     /// Method idx for vtable dynamic dispatch Call nodes (indexed by NodeId; None = static call).
@@ -2361,6 +2414,7 @@ impl DataFlowGraph {
             field_access_infos: Vec::new(),
             record_lit_infos: Vec::new(),
             ffi_call_names: Vec::new(),
+            dyn_ffi_infos: Vec::new(),
             field_set_names: Vec::new(),
             vtable_call_methods: Vec::new(),
             await_event_sources: Vec::new(),
@@ -2603,6 +2657,7 @@ impl DataFlowGraph {
         hash_opt!(field_access_infos);
         hash_opt!(record_lit_infos);
         hash_opt!(ffi_call_names);
+        hash_opt!(dyn_ffi_infos);
         hash_opt!(field_set_names);
         hash_opt!(vtable_call_methods);
         hash_opt!(await_event_sources);
@@ -2856,6 +2911,7 @@ impl DataFlowGraph {
         compress_opt!(field_access_infos);
         compress_opt!(record_lit_infos);
         compress_opt!(ffi_call_names);
+        compress_opt!(dyn_ffi_infos);
         compress_opt!(field_set_names);
         compress_opt!(vtable_call_methods);
         compress_opt!(closure_infos);

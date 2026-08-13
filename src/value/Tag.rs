@@ -226,7 +226,7 @@ pub struct BuiltinInfo {
 /// facilities across the codebase sync automatically:
 /// - `Type::type_id()` / `Type::byte_width()` / `Type::to_value_tag()`
 /// - `TypeDesc::lookup_by_type_id`
-/// - `Reflect::__reflect_type_name` / `__reflect_layout_*`
+/// - `Compute::reflect_type_name` / `value::reflect_layout_*`
 /// - `Sema::int_kind_from_name` / `float_kind_from_name`
 pub const BUILTIN_TABLE: &[BuiltinInfo] = &[
     // ---- Integers (1..=12) ----

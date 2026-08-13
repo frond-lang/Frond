@@ -46,29 +46,29 @@ pub type DateTime = DateTime(year: i32, month: u8, day: u8, hour: u8, minute: u8
                 }
                 val spec = pattern[i]
                 val piece = match spec {
-                    'Y' => pad_int(cast(year).to(i64), 4),
-                    'm' => pad_int(cast(month).to(i64), 2),
-                    'd' => pad_int(cast(day).to(i64), 2),
-                    'H' => pad_int(cast(hour).to(i64), 2),
-                    'M' => pad_int(cast(minute).to(i64), 2),
-                    'S' => pad_int(cast(second).to(i64), 2),
-                    'y' => pad_int(cast(year % 100).to(i64), 2),
-                    'j' => pad_int(cast(day_of_year).to(i64), 3),
+                    'Y' => pad_int(year as i64, 4),
+                    'm' => pad_int(month as i64, 2),
+                    'd' => pad_int(day as i64, 2),
+                    'H' => pad_int(hour as i64, 2),
+                    'M' => pad_int(minute as i64, 2),
+                    'S' => pad_int(second as i64, 2),
+                    'y' => pad_int((year % 100) as i64, 2),
+                    'j' => pad_int(day_of_year as i64, 3),
                     'A' => weekday_name(weekday),
                     'a' => weekday_abbr(weekday),
                     'B' => month_name(month),
                     'b' => month_abbr(month),
                     'e' => if day < 10 {
-                        " " + pad_int(cast(day).to(i64), 1)
+                        " " + pad_int(day as i64, 1)
                     } else {
-                        pad_int(cast(day).to(i64), 2)
+                        pad_int(day as i64, 2)
                     },
                     '%' => "%",
-                    _ => "%" + cast(spec).to(str),
+                    _ => "%" + spec as str,
                 }
                 pieces = pieces ++ [piece]
             } else {
-                pieces = pieces ++ [cast(c).to(str)]
+                pieces = pieces ++ [c as str]
             }
             i = i + 1
         }
@@ -78,12 +78,12 @@ pub type DateTime = DateTime(year: i32, month: u8, day: u8, hour: u8, minute: u8
     // ─── ISO 8601 ─────────────────────────────────────────────────────
 
     pub fun to_iso8601(): str {
-        pad_int(cast(year).to(i64), 4) + "-" +
-        pad_int(cast(month).to(i64), 2) + "-" +
-        pad_int(cast(day).to(i64), 2) + "T" +
-        pad_int(cast(hour).to(i64), 2) + ":" +
-        pad_int(cast(minute).to(i64), 2) + ":" +
-        pad_int(cast(second).to(i64), 2)
+        pad_int(year as i64, 4) + "-" +
+        pad_int(month as i64, 2) + "-" +
+        pad_int(day as i64, 2) + "T" +
+        pad_int(hour as i64, 2) + ":" +
+        pad_int(minute as i64, 2) + ":" +
+        pad_int(second as i64, 2)
     }
 }
 

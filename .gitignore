@@ -22,5 +22,3 @@ Cargo.lock
 *.log
 .env
 .env.local
-
-NUL
