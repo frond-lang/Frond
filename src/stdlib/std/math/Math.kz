@@ -2,7 +2,7 @@
 //
 // Pure Kuzo implementation, zero FFI dependency.
 // NaN/Inf constructed using IEEE 754 floating point division by zero semantics.
-// Generic functions use match type_name(x) to dispatch to corresponding precision implementations by type.
+// Generic functions use match x.type_name() to dispatch to corresponding precision implementations by type.
 
 // ─── f64 constants (hexadecimal floating point literals, IEEE 754 exact bit patterns) ───
 pub val PI: f64      = 0x1.921fb54442d18p+1
@@ -74,17 +74,17 @@ fun abs_f64_impl(x: f64): f64 { if x < 0.0 { 0.0 - x } else { x } }
 fun abs_f128_impl(x: f128): f128 { if x < 0.0 { 0.0 - x } else { x } }
 
 pub fun abs<T>(x: T): T {
-    match type_name(x) {
-        "i8" => cast(abs_i8_impl(cast(x).to(i8))).to(T),
-        "i16" => cast(abs_i16_impl(cast(x).to(i16))).to(T),
-        "i32" => cast(abs_i32_impl(cast(x).to(i32))).to(T),
-        "i64" => cast(abs_i64_impl(cast(x).to(i64))).to(T),
-        "i128" => cast(abs_i128_impl(cast(x).to(i128))).to(T),
-        "isize" => cast(abs_isize_impl(cast(x).to(isize))).to(T),
-        "f16" => cast(abs_f16_impl(cast(x).to(f16))).to(T),
-        "f32" => cast(abs_f32_impl(cast(x).to(f32))).to(T),
-        "f64" => cast(abs_f64_impl(cast(x).to(f64))).to(T),
-        "f128" => cast(abs_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "i8" => (abs_i8_impl(x as i8)) as T,
+        "i16" => (abs_i16_impl(x as i16)) as T,
+        "i32" => (abs_i32_impl(x as i32)) as T,
+        "i64" => (abs_i64_impl(x as i64)) as T,
+        "i128" => (abs_i128_impl(x as i128)) as T,
+        "isize" => (abs_isize_impl(x as isize)) as T,
+        "f16" => (abs_f16_impl(x as f16)) as T,
+        "f32" => (abs_f32_impl(x as f32)) as T,
+        "f64" => (abs_f64_impl(x as f64)) as T,
+        "f128" => (abs_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -108,17 +108,17 @@ pub fun clamp<T>(x: T, lo: T, hi: T): T {
 // ─── sign (generic, return -1/0/1 of same type) ───
 
 pub fun sign<T>(x: T): T {
-    match type_name(x) {
-        "i8" => if cast(x).to(i8) > 0 { cast(1).to(T) } else if cast(x).to(i8) < 0 { cast(0 - 1).to(T) } else { cast(0).to(T) },
-        "i16" => if cast(x).to(i16) > 0 { cast(1).to(T) } else if cast(x).to(i16) < 0 { cast(0 - 1).to(T) } else { cast(0).to(T) },
-        "i32" => if cast(x).to(i32) > 0 { cast(1).to(T) } else if cast(x).to(i32) < 0 { cast(0 - 1).to(T) } else { cast(0).to(T) },
-        "i64" => if cast(x).to(i64) > 0 { cast(1).to(T) } else if cast(x).to(i64) < 0 { cast(0 - 1).to(T) } else { cast(0).to(T) },
-        "i128" => if cast(x).to(i128) > 0 { cast(1).to(T) } else if cast(x).to(i128) < 0 { cast(0 - 1).to(T) } else { cast(0).to(T) },
-        "isize" => if cast(x).to(isize) > 0 { cast(1).to(T) } else if cast(x).to(isize) < 0 { cast(0 - 1).to(T) } else { cast(0).to(T) },
-        "f32" => if cast(x).to(f32) > 0.0 { cast(1.0).to(T) } else if cast(x).to(f32) < 0.0 { cast(0.0 - 1.0).to(T) } else { cast(0.0).to(T) },
-        "f64" => if cast(x).to(f64) > 0.0 { cast(1.0).to(T) } else if cast(x).to(f64) < 0.0 { cast(0.0 - 1.0).to(T) } else { cast(0.0).to(T) },
-        "f16" => if cast(x).to(f16) > 0.0 { cast(1.0).to(T) } else if cast(x).to(f16) < 0.0 { cast(0.0 - 1.0).to(T) } else { cast(0.0).to(T) },
-        "f128" => if cast(x).to(f128) > 0.0 { cast(1.0).to(T) } else if cast(x).to(f128) < 0.0 { cast(0.0 - 1.0).to(T) } else { cast(0.0).to(T) },
+    match x.type_name() {
+        "i8" => if x as i8 > 0 { 1 as T } else if x as i8 < 0 { (0 - 1) as T } else { 0 as T },
+        "i16" => if x as i16 > 0 { 1 as T } else if x as i16 < 0 { (0 - 1) as T } else { 0 as T },
+        "i32" => if x as i32 > 0 { 1 as T } else if x as i32 < 0 { (0 - 1) as T } else { 0 as T },
+        "i64" => if x as i64 > 0 { 1 as T } else if x as i64 < 0 { (0 - 1) as T } else { 0 as T },
+        "i128" => if x as i128 > 0 { 1 as T } else if x as i128 < 0 { (0 - 1) as T } else { 0 as T },
+        "isize" => if x as isize > 0 { 1 as T } else if x as isize < 0 { (0 - 1) as T } else { 0 as T },
+        "f32" => if x as f32 > 0.0 { 1.0 as T } else if x as f32 < 0.0 { (0.0 - 1.0) as T } else { 0.0 as T },
+        "f64" => if x as f64 > 0.0 { 1.0 as T } else if x as f64 < 0.0 { (0.0 - 1.0) as T } else { 0.0 as T },
+        "f16" => if x as f16 > 0.0 { 1.0 as T } else if x as f16 < 0.0 { (0.0 - 1.0) as T } else { 0.0 as T },
+        "f128" => if x as f128 > 0.0 { 1.0 as T } else if x as f128 < 0.0 { (0.0 - 1.0) as T } else { 0.0 as T },
         "u8" => x,
         "u16" => x,
         "u32" => x,
@@ -133,21 +133,21 @@ pub fun sign<T>(x: T): T {
 
 // isfinite: NaN/Inf → false, others → true (integers always true)
 pub fun isfinite<T>(x: T): bool {
-    match type_name(x) {
+    match x.type_name() {
         "f64" => {
-            val v = cast(x).to(f64)
+            val v = x as f64
             !is_nan_f64(v) && !is_inf_f64(v)
         },
         "f32" => {
-            val v = cast(x).to(f32)
+            val v = x as f32
             !is_nan_f32(v) && !is_inf_f32(v)
         },
         "f16" => {
-            val v = cast(x).to(f16)
+            val v = x as f16
             !is_nan_f16(v) && !is_inf_f16(v)
         },
         "f128" => {
-            val v = cast(x).to(f128)
+            val v = x as f128
             !is_nan_f128(v) && !is_inf_f128(v)
         },
         _ => true
@@ -169,17 +169,17 @@ fun signbit_f128_impl(x: f128): bool {
 }
 
 pub fun signbit<T>(x: T): bool {
-    match type_name(x) {
-        "f64" => signbit_f64_impl(cast(x).to(f64)),
-        "f32" => signbit_f32_impl(cast(x).to(f32)),
-        "f16" => signbit_f16_impl(cast(x).to(f16)),
-        "f128" => signbit_f128_impl(cast(x).to(f128)),
-        "i8" => cast(x).to(i8) < 0,
-        "i16" => cast(x).to(i16) < 0,
-        "i32" => cast(x).to(i32) < 0,
-        "i64" => cast(x).to(i64) < 0,
-        "i128" => cast(x).to(i128) < 0,
-        "isize" => cast(x).to(isize) < 0,
+    match x.type_name() {
+        "f64" => signbit_f64_impl(x as f64),
+        "f32" => signbit_f32_impl(x as f32),
+        "f16" => signbit_f16_impl(x as f16),
+        "f128" => signbit_f128_impl(x as f128),
+        "i8" => x as i8 < 0,
+        "i16" => x as i16 < 0,
+        "i32" => x as i32 < 0,
+        "i64" => x as i64 < 0,
+        "i128" => x as i128 < 0,
+        "isize" => x as isize < 0,
         _ => false
     }
 }
@@ -248,12 +248,12 @@ fun isnormal_f128_impl(x: f128): bool {
 }
 
 pub fun isnormal<T>(x: T): bool {
-    match type_name(x) {
-        "f64" => isnormal_f64_impl(cast(x).to(f64)),
-        "f32" => isnormal_f32_impl(cast(x).to(f32)),
-        "f16" => isnormal_f16_impl(cast(x).to(f16)),
-        "f128" => isnormal_f128_impl(cast(x).to(f128)),
-        _ => x != cast(0).to(T)
+    match x.type_name() {
+        "f64" => isnormal_f64_impl(x as f64),
+        "f32" => isnormal_f32_impl(x as f32),
+        "f16" => isnormal_f16_impl(x as f16),
+        "f128" => isnormal_f128_impl(x as f128),
+        _ => x != 0 as T
     }
 }
 
@@ -274,19 +274,19 @@ fun is_pow2_64_impl(x: u64): bool { x != 0 && (x & (x - 1)) == 0 }
 fun is_pow2_128_impl(x: u128): bool { x != 0 && (x & (x - 1)) == 0 }
 
 pub fun is_power_of_two<T>(x: T): bool {
-    match type_name(x) {
-        "i8" => is_pow2_8_impl(cast(x).to(u8)),
-        "u8" => is_pow2_8_impl(cast(x).to(u8)),
-        "i16" => is_pow2_16_impl(cast(x).to(u16)),
-        "u16" => is_pow2_16_impl(cast(x).to(u16)),
-        "i32" => is_pow2_32_impl(cast(x).to(u32)),
-        "u32" => is_pow2_32_impl(cast(x).to(u32)),
-        "i64" => is_pow2_64_impl(cast(x).to(u64)),
-        "u64" => is_pow2_64_impl(cast(x).to(u64)),
-        "i128" => is_pow2_128_impl(cast(x).to(u128)),
-        "u128" => is_pow2_128_impl(cast(x).to(u128)),
-        "isize" => is_pow2_64_impl(cast(x).to(u64)),
-        "usize" => is_pow2_64_impl(cast(x).to(u64)),
+    match x.type_name() {
+        "i8" => is_pow2_8_impl(x as u8),
+        "u8" => is_pow2_8_impl(x as u8),
+        "i16" => is_pow2_16_impl(x as u16),
+        "u16" => is_pow2_16_impl(x as u16),
+        "i32" => is_pow2_32_impl(x as u32),
+        "u32" => is_pow2_32_impl(x as u32),
+        "i64" => is_pow2_64_impl(x as u64),
+        "u64" => is_pow2_64_impl(x as u64),
+        "i128" => is_pow2_128_impl(x as u128),
+        "u128" => is_pow2_128_impl(x as u128),
+        "isize" => is_pow2_64_impl(x as u64),
+        "usize" => is_pow2_64_impl(x as u64),
         _ => false
     }
 }
@@ -339,20 +339,20 @@ fun count_ones_128_impl(x: u128): u128 {
 }
 
 pub fun count_ones<T>(x: T): T {
-    match type_name(x) {
-        "i8" => cast(count_ones_8_impl(cast(x).to(u8))).to(T),
-        "u8" => cast(count_ones_8_impl(cast(x).to(u8))).to(T),
-        "i16" => cast(count_ones_16_impl(cast(x).to(u16))).to(T),
-        "u16" => cast(count_ones_16_impl(cast(x).to(u16))).to(T),
-        "i32" => cast(count_ones_32_impl(cast(x).to(u32))).to(T),
-        "u32" => cast(count_ones_32_impl(cast(x).to(u32))).to(T),
-        "i64" => cast(count_ones_64_impl(cast(x).to(u64))).to(T),
-        "u64" => cast(count_ones_64_impl(cast(x).to(u64))).to(T),
-        "i128" => cast(count_ones_128_impl(cast(x).to(u128))).to(T),
-        "u128" => cast(count_ones_128_impl(cast(x).to(u128))).to(T),
-        "isize" => cast(count_ones_64_impl(cast(x).to(u64))).to(T),
-        "usize" => cast(count_ones_64_impl(cast(x).to(u64))).to(T),
-        _ => cast(0).to(T)
+    match x.type_name() {
+        "i8" => (count_ones_8_impl(x as u8)) as T,
+        "u8" => (count_ones_8_impl(x as u8)) as T,
+        "i16" => (count_ones_16_impl(x as u16)) as T,
+        "u16" => (count_ones_16_impl(x as u16)) as T,
+        "i32" => (count_ones_32_impl(x as u32)) as T,
+        "u32" => (count_ones_32_impl(x as u32)) as T,
+        "i64" => (count_ones_64_impl(x as u64)) as T,
+        "u64" => (count_ones_64_impl(x as u64)) as T,
+        "i128" => (count_ones_128_impl(x as u128)) as T,
+        "u128" => (count_ones_128_impl(x as u128)) as T,
+        "isize" => (count_ones_64_impl(x as u64)) as T,
+        "usize" => (count_ones_64_impl(x as u64)) as T,
+        _ => 0 as T
     }
 }
 
@@ -409,20 +409,20 @@ fun leading_zeros_128_impl(x: u128): u128 {
 }
 
 pub fun leading_zeros<T>(x: T): T {
-    match type_name(x) {
-        "i8" => cast(leading_zeros_8_impl(cast(x).to(u8))).to(T),
-        "u8" => cast(leading_zeros_8_impl(cast(x).to(u8))).to(T),
-        "i16" => cast(leading_zeros_16_impl(cast(x).to(u16))).to(T),
-        "u16" => cast(leading_zeros_16_impl(cast(x).to(u16))).to(T),
-        "i32" => cast(leading_zeros_32_impl(cast(x).to(u32))).to(T),
-        "u32" => cast(leading_zeros_32_impl(cast(x).to(u32))).to(T),
-        "i64" => cast(leading_zeros_64_impl(cast(x).to(u64))).to(T),
-        "u64" => cast(leading_zeros_64_impl(cast(x).to(u64))).to(T),
-        "i128" => cast(leading_zeros_128_impl(cast(x).to(u128))).to(T),
-        "u128" => cast(leading_zeros_128_impl(cast(x).to(u128))).to(T),
-        "isize" => cast(leading_zeros_64_impl(cast(x).to(u64))).to(T),
-        "usize" => cast(leading_zeros_64_impl(cast(x).to(u64))).to(T),
-        _ => cast(0).to(T)
+    match x.type_name() {
+        "i8" => (leading_zeros_8_impl(x as u8)) as T,
+        "u8" => (leading_zeros_8_impl(x as u8)) as T,
+        "i16" => (leading_zeros_16_impl(x as u16)) as T,
+        "u16" => (leading_zeros_16_impl(x as u16)) as T,
+        "i32" => (leading_zeros_32_impl(x as u32)) as T,
+        "u32" => (leading_zeros_32_impl(x as u32)) as T,
+        "i64" => (leading_zeros_64_impl(x as u64)) as T,
+        "u64" => (leading_zeros_64_impl(x as u64)) as T,
+        "i128" => (leading_zeros_128_impl(x as u128)) as T,
+        "u128" => (leading_zeros_128_impl(x as u128)) as T,
+        "isize" => (leading_zeros_64_impl(x as u64)) as T,
+        "usize" => (leading_zeros_64_impl(x as u64)) as T,
+        _ => 0 as T
     }
 }
 
@@ -479,20 +479,20 @@ fun trailing_zeros_128_impl(x: u128): u128 {
 }
 
 pub fun trailing_zeros<T>(x: T): T {
-    match type_name(x) {
-        "i8" => cast(trailing_zeros_8_impl(cast(x).to(u8))).to(T),
-        "u8" => cast(trailing_zeros_8_impl(cast(x).to(u8))).to(T),
-        "i16" => cast(trailing_zeros_16_impl(cast(x).to(u16))).to(T),
-        "u16" => cast(trailing_zeros_16_impl(cast(x).to(u16))).to(T),
-        "i32" => cast(trailing_zeros_32_impl(cast(x).to(u32))).to(T),
-        "u32" => cast(trailing_zeros_32_impl(cast(x).to(u32))).to(T),
-        "i64" => cast(trailing_zeros_64_impl(cast(x).to(u64))).to(T),
-        "u64" => cast(trailing_zeros_64_impl(cast(x).to(u64))).to(T),
-        "i128" => cast(trailing_zeros_128_impl(cast(x).to(u128))).to(T),
-        "u128" => cast(trailing_zeros_128_impl(cast(x).to(u128))).to(T),
-        "isize" => cast(trailing_zeros_64_impl(cast(x).to(u64))).to(T),
-        "usize" => cast(trailing_zeros_64_impl(cast(x).to(u64))).to(T),
-        _ => cast(0).to(T)
+    match x.type_name() {
+        "i8" => (trailing_zeros_8_impl(x as u8)) as T,
+        "u8" => (trailing_zeros_8_impl(x as u8)) as T,
+        "i16" => (trailing_zeros_16_impl(x as u16)) as T,
+        "u16" => (trailing_zeros_16_impl(x as u16)) as T,
+        "i32" => (trailing_zeros_32_impl(x as u32)) as T,
+        "u32" => (trailing_zeros_32_impl(x as u32)) as T,
+        "i64" => (trailing_zeros_64_impl(x as u64)) as T,
+        "u64" => (trailing_zeros_64_impl(x as u64)) as T,
+        "i128" => (trailing_zeros_128_impl(x as u128)) as T,
+        "u128" => (trailing_zeros_128_impl(x as u128)) as T,
+        "isize" => (trailing_zeros_64_impl(x as u64)) as T,
+        "usize" => (trailing_zeros_64_impl(x as u64)) as T,
+        _ => 0 as T
     }
 }
 
@@ -549,19 +549,19 @@ fun next_pow2_128_impl(x: u128): u128 {
 }
 
 pub fun next_power_of_two<T>(x: T): T {
-    match type_name(x) {
-        "i8" => cast(next_pow2_8_impl(cast(x).to(u8))).to(T),
-        "u8" => cast(next_pow2_8_impl(cast(x).to(u8))).to(T),
-        "i16" => cast(next_pow2_16_impl(cast(x).to(u16))).to(T),
-        "u16" => cast(next_pow2_16_impl(cast(x).to(u16))).to(T),
-        "i32" => cast(next_pow2_32_impl(cast(x).to(u32))).to(T),
-        "u32" => cast(next_pow2_32_impl(cast(x).to(u32))).to(T),
-        "i64" => cast(next_pow2_64_impl(cast(x).to(u64))).to(T),
-        "u64" => cast(next_pow2_64_impl(cast(x).to(u64))).to(T),
-        "i128" => cast(next_pow2_128_impl(cast(x).to(u128))).to(T),
-        "u128" => cast(next_pow2_128_impl(cast(x).to(u128))).to(T),
-        "isize" => cast(next_pow2_64_impl(cast(x).to(u64))).to(T),
-        "usize" => cast(next_pow2_64_impl(cast(x).to(u64))).to(T),
+    match x.type_name() {
+        "i8" => (next_pow2_8_impl(x as u8)) as T,
+        "u8" => (next_pow2_8_impl(x as u8)) as T,
+        "i16" => (next_pow2_16_impl(x as u16)) as T,
+        "u16" => (next_pow2_16_impl(x as u16)) as T,
+        "i32" => (next_pow2_32_impl(x as u32)) as T,
+        "u32" => (next_pow2_32_impl(x as u32)) as T,
+        "i64" => (next_pow2_64_impl(x as u64)) as T,
+        "u64" => (next_pow2_64_impl(x as u64)) as T,
+        "i128" => (next_pow2_128_impl(x as u128)) as T,
+        "u128" => (next_pow2_128_impl(x as u128)) as T,
+        "isize" => (next_pow2_64_impl(x as u64)) as T,
+        "usize" => (next_pow2_64_impl(x as u64)) as T,
         _ => x
     }
 }
@@ -574,19 +574,19 @@ fun rotate_left_64_impl(x: u64, n: u64): u64 { (x << n) | (x >> (64 - n)) }
 fun rotate_left_128_impl(x: u128, n: u128): u128 { (x << n) | (x >> (128 - n)) }
 
 pub fun rotate_left<T>(x: T, n: T): T {
-    match type_name(x) {
-        "i8" => cast(rotate_left_8_impl(cast(x).to(u8), cast(n).to(u8))).to(T),
-        "u8" => cast(rotate_left_8_impl(cast(x).to(u8), cast(n).to(u8))).to(T),
-        "i16" => cast(rotate_left_16_impl(cast(x).to(u16), cast(n).to(u16))).to(T),
-        "u16" => cast(rotate_left_16_impl(cast(x).to(u16), cast(n).to(u16))).to(T),
-        "i32" => cast(rotate_left_32_impl(cast(x).to(u32), cast(n).to(u32))).to(T),
-        "u32" => cast(rotate_left_32_impl(cast(x).to(u32), cast(n).to(u32))).to(T),
-        "i64" => cast(rotate_left_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
-        "u64" => cast(rotate_left_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
-        "i128" => cast(rotate_left_128_impl(cast(x).to(u128), cast(n).to(u128))).to(T),
-        "u128" => cast(rotate_left_128_impl(cast(x).to(u128), cast(n).to(u128))).to(T),
-        "isize" => cast(rotate_left_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
-        "usize" => cast(rotate_left_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
+    match x.type_name() {
+        "i8" => (rotate_left_8_impl(x as u8, n as u8)) as T,
+        "u8" => (rotate_left_8_impl(x as u8, n as u8)) as T,
+        "i16" => (rotate_left_16_impl(x as u16, n as u16)) as T,
+        "u16" => (rotate_left_16_impl(x as u16, n as u16)) as T,
+        "i32" => (rotate_left_32_impl(x as u32, n as u32)) as T,
+        "u32" => (rotate_left_32_impl(x as u32, n as u32)) as T,
+        "i64" => (rotate_left_64_impl(x as u64, n as u64)) as T,
+        "u64" => (rotate_left_64_impl(x as u64, n as u64)) as T,
+        "i128" => (rotate_left_128_impl(x as u128, n as u128)) as T,
+        "u128" => (rotate_left_128_impl(x as u128, n as u128)) as T,
+        "isize" => (rotate_left_64_impl(x as u64, n as u64)) as T,
+        "usize" => (rotate_left_64_impl(x as u64, n as u64)) as T,
         _ => x
     }
 }
@@ -599,19 +599,19 @@ fun rotate_right_64_impl(x: u64, n: u64): u64 { (x >> n) | (x << (64 - n)) }
 fun rotate_right_128_impl(x: u128, n: u128): u128 { (x >> n) | (x << (128 - n)) }
 
 pub fun rotate_right<T>(x: T, n: T): T {
-    match type_name(x) {
-        "i8" => cast(rotate_right_8_impl(cast(x).to(u8), cast(n).to(u8))).to(T),
-        "u8" => cast(rotate_right_8_impl(cast(x).to(u8), cast(n).to(u8))).to(T),
-        "i16" => cast(rotate_right_16_impl(cast(x).to(u16), cast(n).to(u16))).to(T),
-        "u16" => cast(rotate_right_16_impl(cast(x).to(u16), cast(n).to(u16))).to(T),
-        "i32" => cast(rotate_right_32_impl(cast(x).to(u32), cast(n).to(u32))).to(T),
-        "u32" => cast(rotate_right_32_impl(cast(x).to(u32), cast(n).to(u32))).to(T),
-        "i64" => cast(rotate_right_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
-        "u64" => cast(rotate_right_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
-        "i128" => cast(rotate_right_128_impl(cast(x).to(u128), cast(n).to(u128))).to(T),
-        "u128" => cast(rotate_right_128_impl(cast(x).to(u128), cast(n).to(u128))).to(T),
-        "isize" => cast(rotate_right_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
-        "usize" => cast(rotate_right_64_impl(cast(x).to(u64), cast(n).to(u64))).to(T),
+    match x.type_name() {
+        "i8" => (rotate_right_8_impl(x as u8, n as u8)) as T,
+        "u8" => (rotate_right_8_impl(x as u8, n as u8)) as T,
+        "i16" => (rotate_right_16_impl(x as u16, n as u16)) as T,
+        "u16" => (rotate_right_16_impl(x as u16, n as u16)) as T,
+        "i32" => (rotate_right_32_impl(x as u32, n as u32)) as T,
+        "u32" => (rotate_right_32_impl(x as u32, n as u32)) as T,
+        "i64" => (rotate_right_64_impl(x as u64, n as u64)) as T,
+        "u64" => (rotate_right_64_impl(x as u64, n as u64)) as T,
+        "i128" => (rotate_right_128_impl(x as u128, n as u128)) as T,
+        "u128" => (rotate_right_128_impl(x as u128, n as u128)) as T,
+        "isize" => (rotate_right_64_impl(x as u64, n as u64)) as T,
+        "usize" => (rotate_right_64_impl(x as u64, n as u64)) as T,
         _ => x
     }
 }

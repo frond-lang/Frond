@@ -86,6 +86,10 @@ pub struct IrBuilder<'a> {
     /// call (the function body itself). Nested blocks see `false`, so only they extract
     /// block-scoped defers — function-level defers stay in `defer_table` for function-exit execution.
     pub in_function_top_block: bool,
+    /// Depth of the scope_stack at function entry (the parameter scope). Used by defer body
+    /// compilation to resolve external variables to parameter nodes (authoritative) rather than
+    /// body-local rebindings (which carry stale values in copied defer frames).
+    pub param_scope_depth: usize,
     /// Whether the current `compile_block` call is inside a loop body subgraph.
     /// Set to `true` by `compile_loop_body_subgraph`; reset to `false` by `compile_block`
     /// (so nested blocks within the loop body see `false`). When `true`, `defer` statements
@@ -139,37 +143,9 @@ pub struct IrBuilder<'a> {
 // (data-driven, eliminates special-case branches on method/type names).
 // =========================================================================
 
-/// Registry of cast conversion pairs that do not follow the default
-/// `__cast_{S}_to_{T}` naming convention.
-/// Adding a conversion pair only requires appending a row; no compile branch
-/// needs to change.
-const SPECIAL_CAST_PAIRS: &[(&str, &str, &str)] = &[
-    // (source, target, mangled_fn)
-    ("u8[]", "str", "__cast_bytes_to_str"),
-    ("bytes", "str", "__cast_bytes_to_str"),
-    ("char", "str", "__cast_char_to_str"),
-];
-
-/// FFI intrinsic registry: FFI function name -> `compute_fn`.
-/// These primitives are declared with `@extern("C")` but their `compute_fn` is bound directly
-/// to the reflect implementation, bypassing FFI dispatch (to avoid coupling lazy-force logic
-/// with FFI calls).
-/// Adding a primitive only requires appending a row; no compile branch needs to change.
-const FFI_INTRINSIC_TABLE: &[(&str, ComputeFnId)] = &[
-    ("__reflect_format", CF_REFLECT_FORMAT),
-    ("__reflect_scalar_to_str", CF_REFLECT_SCALAR_TO_STR),
-];
-
-/// Resolve a cast function name: consult the special-pair registry first, and if there is no
-/// hit, fall back to the default naming convention.
-fn cast_mangled_name(source: &str, target: &str) -> String {
-    for &(s, t, fn_name) in SPECIAL_CAST_PAIRS {
-        if s == source && t == target {
-            return fn_name.to_string();
-        }
-    }
-    format!("__cast_{}_to_{}", source, target)
-}
+// (FFI_INTRINSIC_TABLE removed: reflect primitives now lower directly to
+// CF_REFLECT_* compute_fns via reflect_top_level_cf / reflect_method_intrinsic,
+// never reaching the @extern("C") dispatch path.)
 
 // =========================================================================
 // Escape analysis has been migrated to the analyzer
@@ -196,6 +172,53 @@ const BUILTIN_CTORS: &[(&str, BuiltinCtorLower)] = &[
     ("Err", BuiltinCtorLower::Err),
     ("channel", BuiltinCtorLower::Channel),
 ];
+
+/// reflect top-level function → standalone compute_fn mapping.
+///
+/// `format(x)` / `type_name(x)` are the two reflect entry points called from
+/// generic contexts (e.g. Console.kz `print<T>`). Lowering them directly to
+/// `CF_REFLECT_*` keeps the hot path off the FFI dispatch table.
+/// The remaining reflect primitives are only reachable as trait-style method
+/// calls (`x.kind()`, `x.field_count()`, ...) and are dispatched via
+/// `lookup_intrinsic` + `try_lower_intrinsic`.
+fn reflect_top_level_cf(name: &str) -> Option<ComputeFnId> {
+    use crate::ir::Ir::*;
+    match name {
+        "format" => Some(CF_REFLECT_FORMAT),
+        "type_name" => Some(CF_REFLECT_TYPE_NAME),
+        _ => None,
+    }
+}
+
+/// reflect method-name → (IntrinsicKind, arg_count) mapping.
+///
+/// Used by `lookup_intrinsic` to give every value — regardless of its static
+/// type — access to reflect trait methods (`x.kind()`, `x.format()`, ...).
+/// This is the "auto-impl" of `trait Type` / `trait Value`: rather than
+/// synthesizing witness-table entries and method bodies for every type, the
+/// Builder recognizes reflect method names structurally and lowers them
+/// directly to the corresponding `CF_REFLECT_*` compute_fn.
+fn reflect_method_intrinsic(method: &str) -> Option<(crate::sema::Sema::IntrinsicKind, usize)> {
+    use crate::sema::Sema::IntrinsicKind;
+    // UnOp: receiver only, no extra args
+    let un = |id: u32| Some((IntrinsicKind::UnOp(id), 0));
+    // BinOp: receiver + one index arg
+    let bin = |id: u32| Some((IntrinsicKind::BinOp(id), 1));
+    match method {
+        "kind" => un(328),              // CF_REFLECT_KIND_STR (kind() returns str)
+        "type_name" => un(327),         // CF_REFLECT_TYPE_NAME
+        "size" => un(330),              // CF_REFLECT_LAYOUT_SIZE (aggregate)
+        "alignment" => un(331),         // CF_REFLECT_LAYOUT_ALIGN
+        "field_count" => un(332),       // CF_REFLECT_FIELD_COUNT
+        "format" => un(290),            // CF_REFLECT_FORMAT
+        "constructor" => un(336),       // CF_REFLECT_ADT_CTOR
+        "field_name" => bin(333),       // CF_REFLECT_FIELD_NAME
+        // field_value removed: its return type cannot be expressed without an "any"
+        // type in Kuzo's type system. CF_REFLECT_FIELD_VALUE (334) remains implemented
+        // in Compute.rs for potential future use (e.g. a typed field_value<T>(i): T).
+        _ => None,
+    }
+}
 
 /// Tail-recursion-to-iteration context: used by `compile_call` when intercepting self-calls.
 /// `self_name` is the current function name; `param_nodes` is the parameter node list.
@@ -266,6 +289,7 @@ impl<'a> IrBuilder<'a> {
             current_effect: None,
             in_tail_position: false,
             in_function_top_block: false,
+            param_scope_depth: 0,
             in_loop_body: false,
             tail_rec_ctx: None,
             non_tail_rec_ctx: None,
@@ -443,6 +467,20 @@ impl<'a> IrBuilder<'a> {
         None
     }
 
+    /// Look up the capture list recorded by Sema for a nested scope (lambda /
+    /// defer / nested function). `scope_expr_id` is the entry expression's
+    /// ExprId (the Lambda expr, the defer body expr, or the nested-fun body).
+    /// Returns an empty slice when no captures are recorded (the scope captures
+    /// nothing, or capture data is unavailable in instantiation mode).
+    ///
+    /// This is the single source of truth for captures, replacing the builder's
+    /// own `collect_free_idents_expr` re-scan.
+    fn lookup_captures(&self, scope_expr_id: crate::ast::Ast::ExprId) -> &[crate::sema::Sema::CaptureInfo] {
+        let module_name = self.current_module().name;
+        let key = crate::sema::Sema::module_expr_key(module_name, scope_expr_id.0 as u64);
+        self.sema.get_captures(key)
+    }
+
     /// Check whether a name is a global variable and return its slot index.
     fn lookup_global_var(&self, name: &str) -> Option<u32> {
         self.global_var_slots.get(name).copied()
@@ -606,14 +644,7 @@ impl<'a> IrBuilder<'a> {
             }
 
             // Function call
-            crate::ast::Ast::Expr::Call { callee, args, type_args } => {
-                // __cast_to<T>(x) / __cast_try_to<T>(x): map to a concrete cast function based on
-                // source/target types.
-                if let crate::ast::Ast::Expr::Ident(name) = &self.current_module().arena.expr(*callee).node {
-                    if matches!(*name, "__cast_to" | "__cast_try_to") {
-                        return self.compile_cast_call(*name, args, type_args.as_deref());
-                    }
-                }
+            crate::ast::Ast::Expr::Call { callee, args, type_args: _ } => {
                 // Implicit this: bare call resolved to an instance method by sema.
                 // Sema marks the callee Ident with `implicit_this = Method(name)`; synthesize an
                 // explicit `this.method(args)` dispatch using the already-bound `this` node.
@@ -720,6 +751,11 @@ impl<'a> IrBuilder<'a> {
                     self.graph.set_batch_info(node, info);
                 }
                 node
+            }
+
+            // Type cast `expr as T`: dispatch to the same codegen paths as the former cast syntax.
+            crate::ast::Ast::Expr::As { expr, target } => {
+                self.compile_as_cast(*expr, *target)
             }
 
             // String interpolation: `"text {expr} more {expr}"` -> chained `str_concat`.
@@ -948,6 +984,7 @@ impl<'a> IrBuilder<'a> {
                     compute_fn: CF_RECORD_FIELD_SET, // record_field_set
                 });
                 self.graph.set_field_set_name(set_node, field.to_string());
+                self.current_effect = Some(self.chain_effects(self.current_effect, set_node));
             }
             // `recv?.field = value`: skip the assignment when `obj` is null.
             crate::ast::Ast::Expr::SafeAccess { recv: obj, field } => {
@@ -961,17 +998,19 @@ impl<'a> IrBuilder<'a> {
                 });
                 self.graph.set_field_set_name(set_node, field.to_string());
                 self.graph.set_safe_op(set_node);
+                self.current_effect = Some(self.chain_effects(self.current_effect, set_node));
             }
             // `*ref = value` → compute_deref_write(282)
             crate::ast::Ast::Expr::Deref(ref_inner) => {
                 let ref_node = self.compile_subexpr(*ref_inner);
                 let off = self.graph.inputs_pool.push(&[ref_node, val_node]);
-                let _write_node = self.graph.add_node(Node {
+                let write_node = self.graph.add_node(Node {
                     kind: NodeKind::BinOp,
                     input_count: 2,
                     inputs_offset: off,
                     compute_fn: CF_DEREF_WRITE, // compute_deref_write
                 });
+                self.current_effect = Some(self.chain_effects(self.current_effect, write_node));
             }
             _ => {}
         }
@@ -1047,6 +1086,9 @@ impl<'a> IrBuilder<'a> {
                     inputs_offset: get_off,
                     compute_fn: CF_RECORD_FIELD_GET, // record_field_get
                 });
+                // The field_get node needs the field name metadata to know which field to extract.
+                // compute_record_field_get reads the name via field_set_name (same metadata as field_set).
+                self.graph.set_field_set_name(get_node, field.to_string());
                 // Operation.
                 let bin_off = self.graph.inputs_pool.push(&[get_node, val_node]);
                 let result_node = self.graph.add_node(Node {
@@ -1055,7 +1097,8 @@ impl<'a> IrBuilder<'a> {
                     inputs_offset: bin_off,
                     compute_fn: bin_compute,
                 });
-                // Write back.
+                // Write back. The set_node MUST be chained into the effect graph,
+                // otherwise DCE drops it and the field mutation never executes.
                 let set_off = self.graph.inputs_pool.push(&[obj_node, result_node]);
                 let set_node = self.graph.add_node(Node {
                     kind: NodeKind::BinOp,
@@ -1064,7 +1107,7 @@ impl<'a> IrBuilder<'a> {
                     compute_fn: CF_RECORD_FIELD_SET, // record_field_set
                 });
                 self.graph.set_field_set_name(set_node, field.to_string());
-                result_node
+                self.chain_effects(self.current_effect, set_node)
             }
             // `*ref op= value` -> read Cell + operation + write back to Cell.
             crate::ast::Ast::Expr::Deref(ref_inner) => {
@@ -1368,7 +1411,15 @@ impl<'a> IrBuilder<'a> {
             .map(|sg| sg.event_source_decls.len())
             .unwrap_or(0);
 
-        let return_node = self.compile_expr(expr);
+        let raw_return = self.compile_expr(expr);
+        // Link any pending effect into the return node so side-effecting expressions
+        // (e.g. `defer b.v = 77` compiles to an Assign with a field_set in current_effect)
+        // are not orphaned. Without this, the set_node has no consumer and is dropped by DCE.
+        // Only chain when there IS a pending effect (avoids spurious seq nodes for pure branches).
+        let return_node = match self.current_effect {
+            Some(eff) if eff != raw_return => self.chain_effects(Some(eff), raw_return),
+            _ => raw_return,
+        };
         self.current_sg_start = prev_sg_start;
         self.exit_scope();
 
@@ -1522,8 +1573,8 @@ impl<'a> IrBuilder<'a> {
         let mut branches = Vec::with_capacity(arms.len());
 
         for arm in arms {
-            let (event_kind, event_source_node, body_expr) = match arm {
-                crate::ast::Ast::SelectArm::Receive { channel_expr, body, .. } => {
+            let (event_kind, event_source_node, body_expr, binding) = match arm {
+                crate::ast::Ast::SelectArm::Receive { channel_expr, body, binding } => {
                     // `channel_expr` is of the form `ch.recv()`: at compile time we must take the
                     // receiver of `recv` (the channel value), not the entire method call
                     // (`recv()` returns the received value, not the channel itself).
@@ -1546,11 +1597,11 @@ impl<'a> IrBuilder<'a> {
                         }
                         _ => self.compile_subexpr(*channel_expr),
                     };
-                    (EventSourceKind::Channel, ch_node, *body)
+                    (EventSourceKind::Channel, ch_node, *body, *binding)
                 }
                 crate::ast::Ast::SelectArm::Timeout { duration, body } => {
                     let dur_node = self.compile_subexpr(*duration);
-                    (EventSourceKind::Timer, dur_node, *body)
+                    (EventSourceKind::Timer, dur_node, *body, None)
                 }
             };
 
@@ -1582,6 +1633,23 @@ impl<'a> IrBuilder<'a> {
             self.current_function_sg = Some(sg_id);
             self.enter_scope();
 
+            // When the arm has a binding (`ch.recv() => v => body`), the received value is bound
+            // to `binding` inside the body. Emit a 0-input parameter node as the FIRST node of the
+            // branch subgraph; the runtime injects the recv'd value into it (param_count=1) when the
+            // branch is selected. The body then references `binding` via this node.
+            let mut branch_param_count: u8 = 0;
+            if let Some(name) = binding {
+                let off = self.graph.inputs_pool.push(&[]);
+                let param_node = self.graph.add_node(Node {
+                    kind: NodeKind::Const,
+                    input_count: 0,
+                    inputs_offset: off,
+                    compute_fn: CF_NOOP,
+                });
+                self.bind_var(name, param_node);
+                branch_param_count = 1;
+            }
+
             // Compile the body (variable bindings inside the body live in the subgraph scope).
             let result_node = self.compile_expr(body_expr);
 
@@ -1592,6 +1660,7 @@ impl<'a> IrBuilder<'a> {
             let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
             sg.node_range = (NodeId(node_start), NodeId(node_end));
             sg.return_node = result_node;
+            sg.param_count = branch_param_count;
 
             branches.push(SelectBranch {
                 subgraph_id: sg_id,
@@ -1638,12 +1707,25 @@ impl<'a> IrBuilder<'a> {
         fn_name: Option<&str>,
         lambda_expr_id: Option<crate::ast::Ast::ExprId>,
     ) -> NodeId {
-        // 1. Free-variable analysis: collect outer variables referenced in the body (excluding the
-        //    lambda's own parameters).
+        // 1. Capture analysis (unified): consume Sema's authoritative capture
+        //    table for this nested scope. This replaces the builder's own
+        //    `collect_free_idents_expr` re-scan. Each CaptureInfo carries the
+        //    variable name and a by-val (Snapshot) / by-ref (Reference) mode.
+        //
+        //    Node resolution still uses `lookup_var` + the `captured_scopes`
+        //    chain (unchanged): the Sema table is the single source of truth for
+        //    *which* variables are captured and *how*, but the NodeId is an IR
+        //    concept that only the builder can resolve.
         let param_names: rustc_hash::FxHashSet<&str> =
             params.iter().map(|p| p.name).collect();
-        let mut ident_names: Vec<String> = Vec::new();
-        self.collect_free_idents_expr(body_expr, &mut ident_names);
+        // Lookup Sema's capture table. For Lambda expressions the key is the
+        // Lambda's own ExprId; for nested function declarations (Stmt::LocalDecl)
+        // there is no Lambda expr, so Sema records captures under the *body*
+        // expression's ExprId — fall back to that.
+        let sema_captures: Vec<crate::sema::Sema::CaptureInfo> = {
+            let key_id = lambda_expr_id.unwrap_or(body_expr);
+            self.lookup_captures(key_id).to_vec()
+        };
         let mut captured: Vec<(String, NodeId)> = Vec::new();
 
         // Self-reference detection: a named function that references itself in its body becomes an
@@ -1652,7 +1734,7 @@ impl<'a> IrBuilder<'a> {
         // recursive calls.
         let self_upvalue_idx = if let Some(fname) = fn_name {
             if !param_names.contains(fname)
-                && ident_names.iter().any(|n| n == fname)
+                && sema_captures.iter().any(|c| c.name.as_ref() == fname)
             {
                 let void_node = self.compile_void_const();
                 let idx = captured.len();
@@ -1665,16 +1747,17 @@ impl<'a> IrBuilder<'a> {
             -1
         };
 
-        for ident in &ident_names {
-            if param_names.contains(ident.as_str()) {
+        for cap in &sema_captures {
+            let ident = cap.name.as_ref();
+            if param_names.contains(ident) {
                 continue;
             }
             // Skip the self-reference name (already added as a placeholder upvalue).
-            if Some(ident.as_str()) == fn_name && self_upvalue_idx >= 0 {
+            if Some(ident) == fn_name && self_upvalue_idx >= 0 {
                 continue;
             }
             if let Some(node) = self.lookup_var(ident) {
-                if !captured.iter().any(|(n, _)| n == ident) {
+                if !captured.iter().any(|(n, _)| n.as_str() == ident) {
                     // If the variable has already been captured by an outer lambda, use the outer
                     // original node.
                     // This ensures the WriteBack target points to the outermost defining node (root
@@ -1682,13 +1765,20 @@ impl<'a> IrBuilder<'a> {
                     // intermediate-frame copy).
                     let outer_node = self.captured_scopes.iter().rev()
                         .find_map(|scope| scope.iter()
-                            .find(|(n, _)| n.as_str() == ident.as_str())
+                            .find(|(n, _)| n.as_str() == ident)
                             .map(|(_, node)| *node))
-                        .unwrap_or(node);
-                    captured.push((ident.clone(), outer_node));
+                            .unwrap_or(node);
+                    captured.push((ident.to_string(), outer_node));
                 }
             }
         }
+
+        // No Step 7: the declaring frame keeps its original variable bindings.
+        // Cross-function upvalue visibility is handled at runtime: compute_closure_construct
+        // wraps upvalues in Cells, compute_closure_call preserves Cell references, and
+        // compute_writeback's Path 3 writes to Cell upvalues for escaped closures.
+        // For defer bodies (same-function branch frames), WriteBack's frame-chain paths
+        // (Path 0/1) propagate upvalue mutations within the function's frame chain.
 
         let param_count = (params.len() + captured.len()) as u8;
 
@@ -2073,6 +2163,9 @@ impl<'a> IrBuilder<'a> {
             }
             crate::ast::Ast::Expr::Unary { operand, .. } => {
                 self.collect_free_idents_expr(*operand, names);
+            }
+            crate::ast::Ast::Expr::As { expr, .. } => {
+                self.collect_free_idents_expr(*expr, names);
             }
             crate::ast::Ast::Expr::Call { callee, args, .. } => {
                 self.collect_free_idents_expr(*callee, names);
@@ -5089,48 +5182,45 @@ impl<'a> IrBuilder<'a> {
         crate::value::ValueTag::from_name(ty)
     }
 
-    /// Compile a cast call: __cast_to<T>(x) / __cast_try_to<T>(x).
+    /// Compile a type cast `expr as T`.
     ///
-    /// General path:
-    ///   - scalar -> str: compute_cast_to_str single node (idx 277), covers all integer/float/bool/char
-    ///   - scalar -> scalar: compute_cast_scalar single node (idx 278), covers all integer/float conversions
-    /// Special path (FFI):
-    ///   - u8[]/bytes -> str: still goes through cast_mangled_name to look up SPECIAL_CAST_PAIRS
-    fn compile_cast_call(
+    /// Two codegen paths, both single-node:
+    ///   - target is str: `compute_cast_to_str` (idx 277) — covers scalar/char/bool/array→str
+    ///   - scalar→scalar: `compute_cast_scalar` (idx 278) — covers all int↔int/int↔float/char↔int
+    fn compile_as_cast(
         &mut self,
-        _name: &str,
-        args: &[crate::ast::Ast::ExprId],
-        type_args: Option<&[crate::ast::Ast::TypeRef]>,
+        expr: crate::ast::Ast::ExprId,
+        target: crate::ast::Ast::TypeRef,
     ) -> NodeId {
-        // Get the target type name
-        // In a generic context, target may be a type-parameter name (e.g. "T"); look up current_type_args to replace it with the concrete type name
-        let target_ty = type_args
-            .and_then(|ta| ta.first())
-            .and_then(|&tid| {
-                let spanned = &self.current_module().arena.types[tid.0 as usize];
-                if let crate::ast::Ast::TypeNode::Named { name } = &spanned.node {
-                    Some(*name)
-                } else {
-                    None
-                }
-            })
-            .map(|name| {
-                // Type-parameter replacement: look up current_type_args (monomorphization instance context)
-                if let Some((_, h)) = self.current_type_args.iter().find(|(n, _)| n == name) {
-                    if let Some(resolved) = self.type_arena.type_name(*h) {
-                        return resolved.to_string();
+        // Get the target type name.
+        // In a generic context, target may be a type-parameter name (e.g. "T"); look up
+        // current_type_args to replace it with the concrete type name.
+        let target_ty = {
+            let spanned = &self.current_module().arena.types[target.0 as usize];
+            match &spanned.node {
+                crate::ast::Ast::TypeNode::Named { name } => {
+                    let name = *name;
+                    // Type-parameter replacement (monomorphization instance context)
+                    if let Some((_, h)) = self.current_type_args.iter().find(|(n, _)| n == name) {
+                        if let Some(resolved) = self.type_arena.type_name(*h) {
+                            resolved.to_string()
+                        } else {
+                            name.to_string()
+                        }
+                    } else {
+                        name.to_string()
                     }
                 }
-                name.to_string()
-            })
-            .unwrap_or_else(|| "i64".to_string());
+                _ => "i64".to_string(),
+            }
+        };
 
         // Get the source type name (from Sema expr_types)
-        let source_ty = self.expr_type_name(args[0]).unwrap_or("i64").to_string();
+        let source_ty = self.expr_type_name(expr).unwrap_or("i64").to_string();
 
-        let input = self.compile_subexpr(args[0]);
+        let input = self.compile_subexpr(expr);
 
-        // General path 1: any type -> str
+        // Path 1: any type -> str
         if Self::type_family(&target_ty) == crate::types::TypeFamily::Str {
             let inputs_offset = self.graph.inputs_pool.push(&[input]);
             return self.graph.add_node(Node {
@@ -5141,7 +5231,7 @@ impl<'a> IrBuilder<'a> {
             });
         }
 
-        // General path 2: scalar -> scalar (int<->int, int<->float, float<->float, bool<->int, char<->int)
+        // Path 2: scalar -> scalar (int<->int, int<->float, float<->float, bool<->int, char<->int)
         if Self::ty_name_to_scalar_tag(&source_ty).is_some()
             && Self::ty_name_to_scalar_tag(&target_ty).is_some()
         {
@@ -5156,19 +5246,18 @@ impl<'a> IrBuilder<'a> {
             return node;
         }
 
-        // Special path: u8[]/bytes -> str and other FFI casts
-        let mangled = cast_mangled_name(&source_ty, &target_ty);
+        // Fallback: source or target is a generic type parameter whose concrete type is not yet
+        // known (resolved later by monomorphization). Emit a scalar cast node optimistically;
+        // `compute_cast_scalar` reads the concrete target at runtime via `cast_target_type`.
         let inputs_offset = self.graph.inputs_pool.push(&[input]);
-        let call_node = self.graph.add_node(Node {
-            kind: NodeKind::Call,
+        let node = self.graph.add_node(Node {
+            kind: NodeKind::UnOp,
             input_count: 1,
             inputs_offset,
-            compute_fn: CF_CALL_LAUNCH, // compute_call_launch
+            compute_fn: CF_CAST_SCALAR, // compute_cast_scalar
         });
-        if let Some(&target_sg) = self.func_subgraphs.get(mangled.as_str()) {
-            self.graph.set_call_target(call_node, target_sg);
-        }
-        call_node
+        self.graph.set_cast_target_type(node, target_ty.clone());
+        node
     }
 
     /// Compile a function call.
@@ -5204,6 +5293,29 @@ impl<'a> IrBuilder<'a> {
         }
 
         let callee_expr = self.current_module().arena.expr(callee);
+
+        // ── reflect top-level function interception (safety net) ──
+        // Historically `format(x)` / `type_name(x)` were top-level wrapper functions;
+        // they have been removed in favor of direct method calls (`x.format()`).
+        // This interception remains as a safety net: if a future top-level reflect
+        // wrapper is reintroduced, it lowers directly to CF_REFLECT_* without going
+        // through FFI dispatch. Today it is effectively dead code (no such functions
+        // are declared, so Sema rejects bare `format(x)` before reaching here).
+        if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
+            if let Some(cf) = reflect_top_level_cf(name) {
+                let mut inputs = Vec::with_capacity(args.len());
+                for &arg in args {
+                    inputs.push(self.compile_subexpr(arg));
+                }
+                let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                return self.graph.add_node(Node {
+                    kind: NodeKind::Call,
+                    input_count: inputs.len() as u8,
+                    inputs_offset,
+                    compute_fn: cf,
+                });
+            }
+        }
 
         // Built-in constructor detection: Ok(val) / Err(record) / channel(capacity)
         // Lowered via the BUILTIN_CTORS registry lookup; missed error types fall through to the record construction path below
@@ -5313,21 +5425,19 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
-        // @extern("C") FFI call detection: does not launch a sub-frame; calls Ffi::wrapper directly
-        // current_effect appended at the end as an implicit dependency (ensures the FFI Call executes only after prior effects complete)
+        // @extern("C") / @builtin call detection: does not launch a sub-frame; calls Ffi::wrapper
+        // (extern C) or the Rust #[no_mangle] fn (builtin, e.g. reflect) directly via FFI dispatch.
+        // current_effect appended at the end as an implicit dependency (ensures the Call executes
+        // only after prior effects complete).
         //
-        // Special interception: __reflect_format / __reflect_scalar_to_str are split into standalone compute_fns
-        // (CF_REFLECT_FORMAT/CF_REFLECT_SCALAR_TO_STR), not going through FFI dispatch,
-        // to avoid coupling the lazy-force logic with FFI calls. These two primitives are still declared as @extern("C")
-        // (via the builtin mechanism), but compute_fn is bound directly to the reflect implementation.
+        // @extern("C") call detection: all stdlib `#{ }#` functions go through
+        // CF_DYN_FFI_CALL (dlsym self-lookup + Abi::call_dynamic). There is no longer a
+        // CF_FFI_CALL / wrapper table. The C symbol name is uniformly `kuzo_extern_<name>`
+        // (generated by build.rs).
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
             if self.is_extern_c_func(name) {
-                // Look up the FFI intrinsic registry; a hit uses the registered compute_fn, a miss goes to CF_FFI_CALL
-                let (compute_fn, need_ffi_name) = FFI_INTRINSIC_TABLE
-                    .iter()
-                    .find(|(n, _)| *n == &**name)
-                    .map(|(_, cf)| (*cf, false))
-                    .unwrap_or((CF_FFI_CALL, true));
+                let sig = self.build_abi_sig(name);
+                let c_symbol = format!("kuzo_extern_{name}");
                 let mut inputs = Vec::with_capacity(args.len() + 1);
                 for &arg in args {
                     inputs.push(self.compile_subexpr(arg));
@@ -5340,11 +5450,16 @@ impl<'a> IrBuilder<'a> {
                     kind: NodeKind::Call,
                     input_count: inputs.len() as u8,
                     inputs_offset,
-                    compute_fn,
+                    compute_fn: CF_DYN_FFI_CALL,
                 });
-                if need_ffi_name {
-                    self.graph.set_ffi_call_name(node, name.to_string());
-                }
+                self.graph.set_dyn_ffi_info(
+                    node,
+                    crate::ir::Ir::DynFfiInfo {
+                        symbol: c_symbol,
+                        sig,
+                        arg_count: args.len() as u8,
+                    },
+                );
                 return node;
             }
         }
@@ -5749,6 +5864,69 @@ impl<'a> IrBuilder<'a> {
         false
     }
 
+    // (is_builtin_func removed: @builtin attribute eliminated. Reflect primitives
+    // now lower as auto-impl trait methods / top-level wrappers to CF_REFLECT_*
+    // compute_fns, never reaching the @extern dispatch path.)
+
+    /// Build an AbiSig from a @extern("C") #{ }# function's declared params/return_type.
+    /// str params are expanded to (Ptr, Int) two slots. Unknown types fall back to Int{64}.
+    fn build_abi_sig(&self, name: &str) -> crate::ffi::Abi::AbiSig {
+        use crate::ast::Ast::Decl;
+        let mut params = Vec::new();
+        let mut ret = crate::ffi::Abi::AbiType::Void;
+        for m in std::iter::once(self.module).chain(self.builtin_modules.iter().copied()) {
+            if let Some(d) = m.find_function(name) {
+                if let Decl::FunDecl { params: decl_params, return_type, .. } = &d.node {
+                    // Use THIS module's arena (m.arena), not self.module.arena — stdlib functions
+                    // have their TypeRefs in the builtin module's arena.
+                    let arena = &m.arena;
+                    for p in decl_params.iter() {
+                        let ty_name = type_name_in_arena(p.type_annotation, arena);
+                        self.push_abi_types(&ty_name, &mut params);
+                    }
+                    if let Some(rt) = return_type {
+                        let rt_name = type_name_in_arena(Some(*rt), arena);
+                        ret = self.abi_type_of(&rt_name);
+                    }
+                    break;
+                }
+            }
+        }
+        crate::ffi::Abi::AbiSig::new(params, ret)
+    }
+
+    /// Map a Kuzo type name to AbiType. str is handled separately by push_abi_types (two slots).
+    fn abi_type_of(&self, ty_name: &str) -> crate::ffi::Abi::AbiType {
+        use crate::ffi::Abi::AbiType;
+        match ty_name {
+            "void" => AbiType::Void,
+            "i8" => AbiType::Int { bits: 8, signed: true },
+            "i16" => AbiType::Int { bits: 16, signed: true },
+            "i32" => AbiType::Int { bits: 32, signed: true },
+            "i64" | "isize" => AbiType::Int { bits: 64, signed: true },
+            "u8" | "bool" => AbiType::Int { bits: 8, signed: false },
+            "char" => AbiType::Int { bits: 32, signed: false },
+            "u16" => AbiType::Int { bits: 16, signed: false },
+            "u32" => AbiType::Int { bits: 32, signed: false },
+            "u64" | "usize" => AbiType::Int { bits: 64, signed: false },
+            "f32" => AbiType::Float32,
+            "f64" => AbiType::Float64,
+            _ if ty_name.starts_with('*') => AbiType::Ptr,
+            _ => AbiType::Int { bits: 64, signed: true }, // fallback
+        }
+    }
+
+    /// Push AbiType(s) for a Kuzo type name. str expands to (Ptr, Int) two slots.
+    fn push_abi_types(&self, ty_name: &str, out: &mut Vec<crate::ffi::Abi::AbiType>) {
+        if ty_name == "str" {
+            // str → (const char* data, size_t len)
+            out.push(crate::ffi::Abi::AbiType::Ptr);
+            out.push(crate::ffi::Abi::AbiType::Int { bits: 64, signed: false });
+        } else {
+            out.push(self.abi_type_of(ty_name));
+        }
+    }
+
     /// Compile a method call.
     ///
     /// Method dispatch uniformly goes through the (type_id, method_idx) path:
@@ -5882,15 +6060,22 @@ impl<'a> IrBuilder<'a> {
             // Path 1: trait object dynamic dispatch (vtable)
             if self.is_trait_object_recv(recv) {
                 // Look up method_idx from trait_def.methods (consistent with TraitValue.method_values index)
-                let trait_name = self.expr_type_name(recv).unwrap_or("");
-                let method_idx = self.sema.get_trait_def(trait_name)
+                let trait_name = self.expr_type_name(recv).unwrap_or("").to_string();
+                let method_idx = self.sema.get_trait_def(&trait_name)
                     .and_then(|td| td.methods.iter().position(|m| m.name.as_ref() == method))
                     .map(|i| i as u16);
                 match method_idx {
-                    Some(idx) => self.graph.set_vtable_call(call_node, idx),
+                    Some(idx) => {
+                        self.graph.set_vtable_call(call_node, idx);
+                        // Populate the vtable_fallback_dispatch table so that when a concrete
+                        // record (not a TraitVal) is passed as a trait-typed parameter, the
+                        // runtime can statically dispatch via (method_idx, type_name) → SubGraphId.
+                        // Enumerate all types implementing this trait via the witness table.
+                        self.populate_vtable_fallback(&trait_name, idx, method);
+                    }
                     None => self.errors.push(format!(
                         "internal: trait method '{}' not found in trait '{}' for vtable dispatch",
-                        method, trait_name)),
+                        method, &trait_name)),
                 }
                 return call_node;
             }
@@ -5958,6 +6143,19 @@ impl<'a> IrBuilder<'a> {
         recv: crate::ast::Ast::ExprId,
         method: &str,
     ) -> Option<crate::sema::Sema::IntrinsicKind> {
+        // First: reflect trait methods (auto-impl). Recognized structurally by
+        // method name, so every type — including builtins and generic type vars —
+        // gets reflect methods without needing witness-table registration.
+        if let Some((kind, _argc)) = reflect_method_intrinsic(method) {
+            // Guard: only lower as reflect intrinsic if the receiver's type does
+            // NOT already define a real method of the same name (user override wins).
+            let shadows = self.expr_type_name(recv)
+                .and_then(|tn| self.sema.lookup_method_idx(tn, method))
+                .is_some();
+            if !shadows {
+                return Some(kind);
+            }
+        }
         let type_name = self.expr_type_name(recv)?;
         let type_id = self.expr_type_id(recv)?;
         let method_idx = self.sema.lookup_method_idx(type_name, method)?;
@@ -6040,6 +6238,62 @@ impl<'a> IrBuilder<'a> {
             }
         }
         false
+    }
+
+    /// Populate the vtable_fallback_dispatch table for a trait method call site.
+    ///
+    /// For every concrete type that implements `trait_name`, resolve the method's
+    /// subgraph via `(type_id, method_idx_in_type_def)` and store it keyed by
+    /// `(vtable_method_idx, type_name)`. At runtime, when a vtable call receives a
+    /// concrete record (not a TraitVal), `compute_call_launch` looks up the value's
+    /// `type_name` here to statically dispatch.
+    fn populate_vtable_fallback(&mut self, trait_name: &str, vtable_idx: u16, method_name: &str) {
+        // Approach: scan all TypeDecls in the user module (top-level + local) for types that
+        // have a method matching `method_name`. For each, register the method subgraph keyed by
+        // (vtable_idx, type_name). This handles both explicit trait declarations (`: Trait`) and
+        // structural trait implementations (methods present without explicit declaration).
+        //
+        // First try the witness table (explicit declarations); if empty, fall back to scanning
+        // all types with a matching method name.
+        let mut entries: Vec<(u16, u16)> = Vec::new();
+        for entry in self.sema.witness_table.entries() {
+            if entry.trait_name.as_ref() != trait_name {
+                continue;
+            }
+            if let Some(type_method_idx) = self.sema.witness_table.resolve_method(trait_name, entry.type_id, method_name) {
+                entries.push((entry.type_id, type_method_idx));
+            }
+        }
+        // Structural fallback: if witness table has no entries for this trait, scan all types
+        // that have a method with the matching name. This supports `type Dog { fun name(): str }`
+        // being passed as `Animal` without an explicit `: Animal` declaration.
+        if entries.is_empty() {
+            for (&type_idx, type_def) in &self.sema.type_defs {
+                for (m_idx, m) in type_def.methods.iter().enumerate() {
+                    if m.name.as_ref() == method_name {
+                        entries.push((crate::types::dynamic_type_id(type_idx), m_idx as u16));
+                        break;
+                    }
+                }
+            }
+        }
+        for (type_id, type_method_idx) in entries {
+            if let Some(&sg) = self.method_subgraphs.get(&(type_id, type_method_idx)) {
+                if let Some(name) = self.type_name_from_id(type_id) {
+                    self.graph.vtable_fallback_dispatch.insert((vtable_idx, name.into_boxed_str()), sg);
+                }
+            }
+        }
+    }
+
+    /// Reverse-lookup a type_name from a dynamic type_id.
+    fn type_name_from_id(&self, type_id: u16) -> Option<String> {
+        for (&type_idx, type_def) in &self.sema.type_defs {
+            if crate::types::dynamic_type_id(type_idx) == type_id {
+                return Some(type_def.name.as_ref().to_string());
+            }
+        }
+        None
     }
 
     /// Determine whether recv is a trait object (needs runtime dynamic dispatch).
@@ -6537,23 +6791,73 @@ impl<'a> IrBuilder<'a> {
         // Extract block-scoped defers (drain entries after defer_mark).
         let block_defers: Vec<crate::ir::Ir::DeferEntry> =
             defer_table.drain(defer_mark..).collect();
-        // Generate LIFO cleanup: each defer body is called via make_call with its captured inputs.
-        // The cleanup is chained after the block result via CF_SEQ, preserving the result value.
-        // CF_SEQ returns the value of its last input, so we chain: SEQ(result, defer1) -> SEQ(that, defer2) -> ...
-        // The final SEQ node returns the last defer's value, but the block result is preserved
-        // through the SEQ chain's first input (data dependency).
-        let mut cleanup_chain = result;
+        // Generate cleanup by reusing the loop-defer machinery (CF_DEFER_REGISTER + CF_DEFER_RUN).
+        // Each block-scoped defer is registered onto the runtime defer_stack via a
+        // CF_DEFER_REGISTER node (which snapshots the defer's captured values), then a single
+        // CF_DEFER_RUN node drains the stack in LIFO order, executing each defer body as a proper
+        // defer frame (with parent_frame_ptr/root_frame_ptr set so the body can read/write outer
+        // variables via the frame chain). This mirrors how loops run defer-in-loop bodies and
+        // fixes two issues:
+        //   - The defer body must run as a defer frame (NOT a regular Call via make_call, which
+        //     gives a node_offset=0 frame that cannot reach outer scope via the frame chain).
+        //   - The block result value must be preserved: cleanup nodes are chained BEFORE `result`
+        //     via CF_SEQ (which returns its LAST input's value), so the final node yields `result`.
+        // Generate cleanup by reusing the loop-defer machinery (CF_BLOCK_DEFER_REGISTER +
+        // CF_DEFER_RUN). Each block-scoped defer is registered onto the runtime defer_stack via a
+        // CF_BLOCK_DEFER_REGISTER node (which snapshots the defer's captured values), then a single
+        // CF_DEFER_RUN node drains the stack in LIFO order, executing each defer body as a proper
+        // defer frame (with parent_frame_ptr/root_frame_ptr set so the body can read/write outer
+        // variables via the frame chain). This mirrors how loops run defer-in-loop bodies.
+        //
+        // ORDERING (critical): in the dataflow scheduler every node is scheduled independently
+        // based on its OWN inputs. A node with zero inputs is enqueued at frame start and would
+        // fire before prior effects (e.g. global-var initialization) complete, causing the defer
+        // body's reads of outer/global variables to observe stale/null values. To prevent this,
+        // each register/run node takes the accumulated effect chain as a DIRECT input:
+        //   - CF_BLOCK_DEFER_REGISTER treats input[0] as an effect-ordering dependency and uses
+        //     inputs[1..] as the captured NodeIds.
+        //   - CF_DEFER_RUN ignores all inputs (it reads defer_stack) but still requires them ready.
+        // The block result value is preserved by wrapping the final run node + `result` in a
+        // CF_SEQ (which returns its LAST input's value, i.e. `result`).
         let mut last_defer_call: Option<NodeId> = None;
-        for entry in block_defers.iter().rev() {
-            let call_node = self.make_call(entry.body_subgraph, &entry.captured_inputs);
-            cleanup_chain = self.chain_effects(Some(cleanup_chain), call_node);
-            last_defer_call = Some(call_node);
+        let mut effect_dep: NodeId = result;
+        // Iterate in source (registration) order so the register nodes push onto defer_stack in
+        // the same order; CF_DEFER_RUN then drains in LIFO (rev) order, running the
+        // last-declared defer first — matching the function-level defer semantics.
+        for entry in block_defers.iter() {
+            // Build inputs: [effect_dep] ++ captured_inputs.
+            let mut reg_inputs: Vec<NodeId> = Vec::with_capacity(entry.captured_inputs.len() + 1);
+            reg_inputs.push(effect_dep);
+            reg_inputs.extend_from_slice(&entry.captured_inputs);
+            let inputs_off = self.graph.inputs_pool.push(&reg_inputs);
+            let reg_node = self.graph.add_node(Node {
+                kind: NodeKind::Call,
+                input_count: reg_inputs.len() as u8,
+                inputs_offset: inputs_off,
+                compute_fn: CF_BLOCK_DEFER_REGISTER,
+            });
+            self.graph.set_call_target(reg_node, entry.body_subgraph);
+            effect_dep = reg_node;
+            last_defer_call = Some(reg_node);
         }
-        // Return the block result (preserved through SEQ chain) and the last defer call as effect.
-        // Note: cleanup_chain is the final SEQ node; its value is the last defer's return value,
-        // but subsequent statements use it as an effect dependency, not as a data value.
-        // The block's actual result value flows through the SEQ chain's first input (result).
-        (cleanup_chain, last_defer_call)
+        // CF_DEFER_RUN node: drains defer_stack in LIFO order and runs each defer body as a defer
+        // frame. Give it `effect_dep` as a direct input so it cannot fire before the register
+        // nodes (and thus before the block's prior effects) complete.
+        let run_off = self.graph.inputs_pool.push(&[effect_dep]);
+        let run_node = self.graph.add_node(Node {
+            kind: NodeKind::Call,
+            input_count: 1,
+            inputs_offset: run_off,
+            compute_fn: CF_DEFER_RUN,
+        });
+        if last_defer_call.is_none() {
+            last_defer_call = Some(run_node);
+        }
+        // Wrap run_node + result in CF_SEQ so the block's value is `result` (CF_SEQ returns its
+        // last input's value). Both inputs must be ready before the SEQ computes, so the defer
+        // cleanup side effects are guaranteed to complete before any consumer reads the value.
+        let result_node = self.chain_effects(Some(run_node), result);
+        (result_node, last_defer_call)
     }
 
     /// Compile a statement, returning an effect node (to be sequentially linked into the block result node).
@@ -6641,7 +6945,6 @@ impl<'a> IrBuilder<'a> {
                             .find(|(n, _)| n.as_str() == *name)
                             .map(|(_, node)| *node));
                     if let Some(source) = captured_source {
-                        // Captured variable -> WriteBack to the outer node
                         let wb_node = self.compile_writeback_node(val_node, source);
                         self.bind_var(name, val_node);
                         return Some(wb_node);
@@ -6656,9 +6959,7 @@ impl<'a> IrBuilder<'a> {
                             self.bind_var(name, val_node);
                             return Some(wb_node);
                         } else if let Some(&captured_node) = self.captured_vars.get(*name) {
-                            // Local variable captured by an inner lambda -> WriteBack to the original node
-                            // captured at that time, so same_function closure calls can read the latest value
-                            // from the parent frame (by-reference capture semantics).
+                            // Local variable captured by an inner lambda -> WriteBack
                             let wb_node = self.compile_writeback_node(val_node, captured_node);
                             self.bind_var(name, val_node);
                             return Some(wb_node);
@@ -6708,10 +7009,10 @@ impl<'a> IrBuilder<'a> {
                 Some(set_node)
             }
             crate::ast::Ast::Stmt::CompoundAssignment { target, op, value } => {
-                let val_node = self.compile_subexpr(*value);
                 let target_expr = &self.current_module().arena.expr(*target).node;
-                let bin_compute = self.compound_assign_op_to_compute_fn(*op, *target);
                 if let crate::ast::Ast::Expr::Ident(name) = target_expr {
+                    let val_node = self.compile_subexpr(*value);
+                    let bin_compute = self.compound_assign_op_to_compute_fn(*op, *target);
                     // Implicit-this field compound assignment: `field op= value` inside a
                     // method body resolves to `this.field op= value`.
                     if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) = self.expr_implicit_this(*target).cloned() {
@@ -6726,6 +7027,7 @@ impl<'a> IrBuilder<'a> {
                             inputs_offset: get_off,
                             compute_fn: CF_RECORD_FIELD_GET,
                         });
+                        self.graph.set_field_set_name(get_node, field.to_string());
                         // Operation.
                         let bin_off = self.graph.inputs_pool.push(&[get_node, val_node]);
                         let raw_result = self.graph.add_node(Node {
@@ -6769,27 +7071,37 @@ impl<'a> IrBuilder<'a> {
                     // Link current_effect: prevents a compound assignment after continue from running early
                     let result_node = self.chain_effects(self.current_effect, raw_result);
                     if captured_source.is_some() {
-                        // Captured variable -> WriteBack to the outer node + bind a local reference
                         self.compile_writeback_node(result_node, captured_source.unwrap());
                         self.bind_var(name, result_node);
+                        None
                     } else if self.lookup_global_var(name).is_some() && self.lookup_var(name).is_none() {
-                        // Global variable -> global_store
+                        // Global variable -> global_store. Return the store node so it is chained
+                        // into the block's effect chain (last_effect), otherwise the store would be
+                        // orphaned and dropped (the global has no local binding to keep it alive).
                         let slot = self.lookup_global_var(name).unwrap();
                         let store_node = self.compile_global_store(result_node, slot);
                         self.current_effect = Some(store_node);
+                        Some(store_node)
                     } else if !self.is_in_current_subgraph(cur_node) {
                         // Outer variable -> WriteBack + bind a local reference
                         self.compile_writeback_node(result_node, cur_node);
                         self.bind_var(name, result_node);
+                        None
                     } else if let Some(&captured_node) = self.captured_vars.get(*name) {
-                        // Local variable captured by an inner lambda -> WriteBack to the original node
                         self.compile_writeback_node(result_node, captured_node);
                         self.bind_var(name, result_node);
+                        None
                     } else {
                         self.bind_var(name, result_node);
+                        None
                     }
+                } else {
+                    // Non-Ident target (FieldAccess/Index/Deref): delegate to
+                    // compile_compound_assign which handles read-modify-write for these.
+                    let set_node = self.compile_compound_assign(*op, *target, *value);
+                    self.current_effect = Some(set_node);
+                    Some(set_node)
                 }
-                None
             }
             crate::ast::Ast::Stmt::Return { value } => {
                 let prev_effect = self.current_effect;
@@ -6897,18 +7209,37 @@ impl<'a> IrBuilder<'a> {
             crate::ast::Ast::Stmt::Defer { expr } => {
                 if self.in_loop_body {
                     // Defer-in-loop: compile as CF_DEFER_REGISTER node.
-                    // The defer body subgraph + captured loop-variable value are pushed onto
+                    // The defer body subgraph + captured values are pushed onto
                     // the loop frame's defer_stack at runtime; CF_DEFER_RUN (in void_sg) drains
                     // it in LIFO order at loop exit.
                     let (body_sg, _captured_inputs) = self.compile_branch_subgraph(*expr);
-                    // Capture the loop variable (if any) so each defer body reads the
-                    // per-iteration value rather than the final loop-variable value.
+                    // Unified capture model: snapshot the loop variable (if any)
+                    // and any Snapshot-mode captures, so each defer body reads
+                    // per-iteration values rather than final values.
+                    // Reference-mode captures (var bindings like an accumulator)
+                    // are NOT snapshotted here — they are read live via the
+                    // frame chain at defer-run time, so successive loop
+                    // iterations' defers accumulate correctly (LIFO over the
+                    // shared latest value).
                     let loop_var = self.loop_stack.last().and_then(|lc| lc.loop_var_node);
-                    let inputs: &[NodeId] = match &loop_var {
-                        Some(n) => &[*n],
-                        None => &[],
-                    };
-                    let inputs_off = self.graph.inputs_pool.push(inputs);
+                    let sema_captures = self.lookup_captures(*expr);
+                    let mut inputs: Vec<NodeId> = Vec::new();
+                    if let Some(n) = loop_var {
+                        inputs.push(n);
+                    }
+                    for cap in sema_captures {
+                        // Only Snapshot-mode captures need per-iteration
+                        // snapshotting; Reference-mode captures are read live.
+                        if cap.mode != crate::sema::Sema::CaptureMode::Snapshot {
+                            continue;
+                        }
+                        if let Some(node) = self.lookup_var(cap.name.as_ref()) {
+                            if !inputs.contains(&node) {
+                                inputs.push(node);
+                            }
+                        }
+                    }
+                    let inputs_off = self.graph.inputs_pool.push(&inputs);
                     let reg_node = self.graph.add_node(Node {
                         kind: NodeKind::Call,
                         input_count: inputs.len() as u8,
@@ -6918,8 +7249,23 @@ impl<'a> IrBuilder<'a> {
                     self.graph.set_call_target(reg_node, body_sg);
                     Some(reg_node)
                 } else {
-                    // defer expr -> compile expr as an independent subgraph and register it in the current function subgraph's defer_table
-                    let (body_sg, captured_inputs) = self.compile_branch_subgraph(*expr);
+                    // defer expr -> compile expr as an independent subgraph and register it in the
+                    // current function subgraph's defer_table.
+                    let (body_sg, _branch_captures) = self.compile_branch_subgraph(*expr);
+                    // Unified capture model: resolve the defer's capture list from
+                    // Sema (all entries are Reference mode for defer — defer
+                    // semantics read the value at function/block exit). Each
+                    // captured variable's current NodeId is resolved via
+                    // `lookup_var` and stored in `DeferEntry.captured_inputs`.
+                    // At runtime, the defer frame injects these snapshot values
+                    // into its value table, mirroring the loop-defer path.
+                    let sema_captures = self.lookup_captures(*expr);
+                    let mut captured_inputs: Vec<NodeId> = Vec::new();
+                    for cap in sema_captures {
+                        if let Some(node) = self.lookup_var(cap.name.as_ref()) {
+                            captured_inputs.push(node);
+                        }
+                    }
                     let trigger = self.compile_void_const();
                     if let Some(cur_sg) = self.current_function_sg {
                         let entry = DeferEntry {
@@ -7077,6 +7423,10 @@ impl<'a> IrBuilder<'a> {
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
         self.enter_scope();
+        // Record the parameter scope depth so defer body compilation can truncate
+        // body-local rebindings and resolve external vars to parameter nodes.
+        let prev_param_scope_depth = self.param_scope_depth;
+        self.param_scope_depth = self.scope_stack.len();
 
         // Create parameter nodes (Const placeholders; values are injected at runtime by start_subgraph)
         // These nodes must be the first param_count nodes of the subgraph
@@ -7139,6 +7489,7 @@ impl<'a> IrBuilder<'a> {
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
+        self.param_scope_depth = prev_param_scope_depth;
         self.current_function_sg = None;
         self.compiling_builtin = prev_builtin;
 
@@ -7248,6 +7599,8 @@ impl<'a> IrBuilder<'a> {
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
         self.enter_scope();
+        let prev_param_scope_depth = self.param_scope_depth;
+        self.param_scope_depth = self.scope_stack.len();
 
         // Create parameter nodes (Const placeholders; values are injected at runtime by start_subgraph)
         for param in &params {
@@ -7278,6 +7631,7 @@ impl<'a> IrBuilder<'a> {
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
+        self.param_scope_depth = prev_param_scope_depth;
         self.current_function_sg = None;
         self.compiling_builtin = prev_builtin;
 
@@ -7350,6 +7704,8 @@ impl<'a> IrBuilder<'a> {
         let prev_method_type = self.current_method_type.take();
         self.current_method_type = Some((type_name.into(), type_id));
         self.enter_scope();
+        let prev_param_scope_depth = self.param_scope_depth;
+        self.param_scope_depth = self.scope_stack.len();
 
         for param in &params {
             let inputs_offset = self.graph.inputs_pool.push(&[]);
@@ -7374,6 +7730,7 @@ impl<'a> IrBuilder<'a> {
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
+        self.param_scope_depth = prev_param_scope_depth;
         self.current_function_sg = None;
         self.current_method_type = prev_method_type;
         self.compiling_builtin = prev;
@@ -7389,7 +7746,8 @@ impl<'a> IrBuilder<'a> {
 
     /// Compile a TypeDecl method in the user module (looked up in method_subgraphs via (type_id, method_idx)).
     fn compile_user_method(&mut self, type_name: &str, method_idx: usize) {
-        // Look up the method data in the user module (indexed directly by method_idx)
+        // Look up the method data in the user module (indexed directly by method_idx).
+        // Search top-level declarations first, then local types declared inside function bodies.
         let found = self.module.declarations.iter().find_map(|d| {
             if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &d.node {
                 if *name == type_name {
@@ -7408,6 +7766,11 @@ impl<'a> IrBuilder<'a> {
             }
             None
         });
+        // Fallback: search local types (declared inside function bodies via Stmt::LocalDecl)
+        let found = match found {
+            Some(x) => Some(x),
+            None => self.find_type_method_full(type_name, method_idx),
+        };
 
         let (method_name, body_expr, is_async, params, return_type) = match found {
             Some(x) => x,
@@ -7435,6 +7798,7 @@ impl<'a> IrBuilder<'a> {
         let prev_method_type = self.current_method_type.take();
         self.current_method_type = Some((type_name.into(), type_id));
         self.enter_scope();
+        self.param_scope_depth = self.scope_stack.len();
 
         for param in &params {
             let inputs_offset = self.graph.inputs_pool.push(&[]);
@@ -7554,6 +7918,368 @@ impl<'a> IrBuilder<'a> {
         sg.has_suspend = is_async;
         sg.function_id = sg_id.0;
     }
+
+    /// Find a TypeDecl method by `(type_name, method_idx)`, searching both top-level
+    /// declarations AND local types declared inside function bodies. Returns
+    /// `(method_name, params_count, is_async)`.
+    ///
+    /// This is used by the IR build to pre-register and compile local type methods
+    /// (step 0a-local / step 2b-local), complementing `compile_user_method` which only
+    /// searches `self.module.declarations`.
+    fn find_type_method(
+        &self,
+        type_name: &str,
+        method_idx: usize,
+    ) -> Option<(&'static str, u8, bool)> {
+        let module = self.module;
+        let arena = &module.arena;
+        // 1. Top-level declarations
+        for decl in &module.declarations {
+            if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &decl.node {
+                if *name == type_name {
+                    if let Some(method) = methods.get(method_idx) {
+                        if method.body.is_some() {
+                            return Some((
+                            // SAFETY: method.name is &'a str tied to module lifetime; leak to 'static
+                            // (acceptable: the module outlives the entire build).
+                            Box::leak(method.name.to_string().into_boxed_str()),
+                            method.params.len() as u8,
+                            method.is_async,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        // 2. Recurse into function bodies
+        let mut found: Option<(&'static str, u8, bool)> = None;
+        for decl in &module.declarations {
+            match &decl.node {
+                crate::ast::Ast::Decl::FunDecl { body, .. } => {
+                    if self.find_type_method_in_expr(*body, arena, type_name, method_idx, &mut found) {
+                        return found;
+                    }
+                }
+                crate::ast::Ast::Decl::TypeDecl { methods, .. }
+                | crate::ast::Ast::Decl::TraitDecl { methods, .. } => {
+                    for m in methods.iter() {
+                        if let Some(body) = m.body {
+                            if self.find_type_method_in_expr(body, arena, type_name, method_idx, &mut found) {
+                                return found;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    fn find_type_method_in_expr(
+        &self,
+        expr_id: crate::ast::Ast::ExprId,
+        arena: &crate::ast::Ast::AstArena<'_>,
+        type_name: &str,
+        method_idx: usize,
+        found: &mut Option<(&'static str, u8, bool)>,
+    ) -> bool {
+        let expr = &arena.expr(expr_id).node;
+        match expr {
+            crate::ast::Ast::Expr::Block { stmts, trailing } => {
+                for s in stmts {
+                    if self.find_type_method_in_stmt(*s, arena, type_name, method_idx, found) {
+                        return true;
+                    }
+                }
+                if let Some(t) = trailing {
+                    return self.find_type_method_in_expr(*t, arena, type_name, method_idx, found);
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn find_type_method_in_stmt(
+        &self,
+        stmt_id: crate::ast::Ast::StmtId,
+        arena: &crate::ast::Ast::AstArena<'_>,
+        type_name: &str,
+        method_idx: usize,
+        found: &mut Option<(&'static str, u8, bool)>,
+    ) -> bool {
+        let stmt = &arena.stmt(stmt_id).node;
+        if let crate::ast::Ast::Stmt::LocalDecl { decl } = stmt {
+            if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = decl.as_ref() {
+                if *name == type_name {
+                    if let Some(method) = methods.get(method_idx) {
+                        if method.body.is_some() {
+                            *found = Some((
+                                Box::leak(method.name.to_string().into_boxed_str()),
+                                method.params.len() as u8,
+                                method.is_async,
+                            ));
+                            return true;
+                        }
+                    }
+                }
+                // Recurse into the type's method bodies
+                for m in methods.iter() {
+                    if let Some(body) = m.body {
+                        if self.find_type_method_in_expr(body, arena, type_name, method_idx, found) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            if let crate::ast::Ast::Decl::FunDecl { body, .. } = decl.as_ref() {
+                return self.find_type_method_in_expr(*body, arena, type_name, method_idx, found);
+            }
+        }
+        false
+    }
+
+    /// Full version of find_type_method that returns the complete method data needed by
+    /// `compile_user_method`: `(method_name, body_expr, is_async, params, return_type)`.
+    /// Searches top-level then local types. Used as the fallback in compile_user_method.
+    fn find_type_method_full(
+        &self,
+        type_name: &str,
+        method_idx: usize,
+    ) -> Option<(&'static str, crate::ast::Ast::ExprId, bool, Vec<crate::ast::Ast::Param<'static>>, Option<crate::ast::Ast::TypeId>)> {
+        let module = self.module;
+        let arena = &module.arena;
+        // Collect from a local helper that returns full method data
+        let mut result: Option<(&'static str, crate::ast::Ast::ExprId, bool, Vec<crate::ast::Ast::Param<'static>>, Option<crate::ast::Ast::TypeId>)> = None;
+        for decl in &module.declarations {
+            match &decl.node {
+                crate::ast::Ast::Decl::FunDecl { body, .. } => {
+                    self.find_type_method_full_in_expr(*body, arena, type_name, method_idx, &mut result);
+                }
+                crate::ast::Ast::Decl::TypeDecl { methods, .. }
+                | crate::ast::Ast::Decl::TraitDecl { methods, .. } => {
+                    for m in methods.iter() {
+                        if let Some(body) = m.body {
+                            self.find_type_method_full_in_expr(body, arena, type_name, method_idx, &mut result);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if result.is_some() { return result; }
+        }
+        result
+    }
+
+    fn find_type_method_full_in_expr(
+        &self,
+        expr_id: crate::ast::Ast::ExprId,
+        arena: &crate::ast::Ast::AstArena<'_>,
+        type_name: &str,
+        method_idx: usize,
+        found: &mut Option<(&'static str, crate::ast::Ast::ExprId, bool, Vec<crate::ast::Ast::Param<'static>>, Option<crate::ast::Ast::TypeId>)>,
+    ) {
+        let expr = &arena.expr(expr_id).node;
+        if let crate::ast::Ast::Expr::Block { stmts, .. } = expr {
+            for s in stmts {
+                let stmt = &arena.stmt(*s).node;
+                if let crate::ast::Ast::Stmt::LocalDecl { decl } = stmt {
+                    if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = decl.as_ref() {
+                        if *name == type_name {
+                            if let Some(method) = methods.get(method_idx) {
+                                if method.body.is_some() {
+                                    // SAFETY: leak method fields to 'static (module outlives build)
+                                    let m_name: &'static str = Box::leak(method.name.to_string().into_boxed_str());
+                                    let m_params: Vec<crate::ast::Ast::Param<'static>> = method.params.iter()
+                                        .map(|p| crate::ast::Ast::Param {
+                                            name: Box::leak(p.name.to_string().into_boxed_str()),
+                                            type_annotation: p.type_annotation,
+                                        })
+                                        .collect();
+                                    *found = Some((m_name, method.body.unwrap(), method.is_async, m_params, method.return_type));
+                                    return;
+                                }
+                            }
+                        }
+                        // Recurse into method bodies
+                        for m in methods.iter() {
+                            if let Some(body) = m.body {
+                                self.find_type_method_full_in_expr(body, arena, type_name, method_idx, found);
+                                if found.is_some() { return; }
+                            }
+                        }
+                    }
+                    if let crate::ast::Ast::Decl::FunDecl { body, .. } = decl.as_ref() {
+                        self.find_type_method_full_in_expr(*body, arena, type_name, method_idx, found);
+                        if found.is_some() { return; }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Recursively collect all local `TypeDecl`s declared inside function bodies
+    /// (`Stmt::LocalDecl(TypeDecl)`) across the user module.
+    ///
+    /// Local types are registered by Sema into `type_def_index` (so `type_id` is available),
+    /// and their methods are checked, but the IR build's step 0a / step 2b only scanned
+    /// top-level `m.declarations`. This collector walks into Block expressions, match arms,
+    /// if branches, lambda bodies, loops, etc. to surface nested type declarations so their
+    /// method subgraphs get pre-registered and compiled.
+    ///
+    /// Returns `Vec<(type_name, method_idx)>` pairs mirroring the step 2b format.
+    fn collect_local_type_methods(&self) -> Vec<(String, usize)> {
+        let mut result = Vec::new();
+        let module = self.module;
+        let arena = &module.arena;
+        // Scan top-level declarations for function/method bodies that may contain local types.
+        for decl in &module.declarations {
+            match &decl.node {
+                crate::ast::Ast::Decl::FunDecl { body, .. } => {
+                    self.collect_local_types_from_expr(*body, arena, &mut result);
+                }
+                crate::ast::Ast::Decl::TypeDecl { methods, .. }
+                | crate::ast::Ast::Decl::TraitDecl { methods, .. } => {
+                    for m in methods.iter() {
+                        if let Some(body) = m.body {
+                            self.collect_local_types_from_expr(body, arena, &mut result);
+                        }
+                    }
+                }
+                crate::ast::Ast::Decl::ExprDecl { expr, stmt, .. } => {
+                    self.collect_local_types_from_expr(*expr, arena, &mut result);
+                    if let Some(s) = stmt {
+                        self.collect_local_types_from_stmt(*s, arena, &mut result);
+                    }
+                }
+                _ => {}
+            }
+        }
+        result
+    }
+
+    fn collect_local_types_from_stmt(
+        &self,
+        stmt_id: crate::ast::Ast::StmtId,
+        arena: &crate::ast::Ast::AstArena<'_>,
+        out: &mut Vec<(String, usize)>,
+    ) {
+        let stmt = &arena.stmt(stmt_id).node;
+        match stmt {
+            crate::ast::Ast::Stmt::LocalDecl { decl } => {
+                if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = decl.as_ref() {
+                    for (idx, m) in methods.iter().enumerate() {
+                        if m.body.is_some() {
+                            out.push((name.to_string(), idx));
+                        }
+                    }
+                    // Recurse into the type's own method bodies (nested local types)
+                    for m in methods.iter() {
+                        if let Some(body) = m.body {
+                            self.collect_local_types_from_expr(body, arena, out);
+                        }
+                    }
+                }
+                // Also recurse into local FunDecl bodies (functions can nest types)
+                if let crate::ast::Ast::Decl::FunDecl { body, .. } = decl.as_ref() {
+                    self.collect_local_types_from_expr(*body, arena, out);
+                }
+            }
+            crate::ast::Ast::Stmt::ValDecl { value, .. }
+            | crate::ast::Ast::Stmt::VarDecl { value, .. }
+            | crate::ast::Ast::Stmt::Expression { expr: value, .. }
+            | crate::ast::Ast::Stmt::Return { value: Some(value), .. }
+            | crate::ast::Ast::Stmt::Throw { expr: value, .. }
+            | crate::ast::Ast::Stmt::Defer { expr: value, .. } => {
+                self.collect_local_types_from_expr(*value, arena, out);
+            }
+            crate::ast::Ast::Stmt::Assignment { target, value, .. }
+            | crate::ast::Ast::Stmt::CompoundAssignment { target, value, .. } => {
+                self.collect_local_types_from_expr(*target, arena, out);
+                self.collect_local_types_from_expr(*value, arena, out);
+            }
+            crate::ast::Ast::Stmt::FieldAssignment { object, value, .. } => {
+                self.collect_local_types_from_expr(*object, arena, out);
+                self.collect_local_types_from_expr(*value, arena, out);
+            }
+            crate::ast::Ast::Stmt::For { body, .. }
+            | crate::ast::Ast::Stmt::While { body, .. }
+            | crate::ast::Ast::Stmt::Loop { body } => {
+                self.collect_local_types_from_expr(*body, arena, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_local_types_from_expr(
+        &self,
+        expr_id: crate::ast::Ast::ExprId,
+        arena: &crate::ast::Ast::AstArena<'_>,
+        out: &mut Vec<(String, usize)>,
+    ) {
+        let expr = &arena.expr(expr_id).node;
+        match expr {
+            crate::ast::Ast::Expr::Block { stmts, trailing } => {
+                for s in stmts {
+                    self.collect_local_types_from_stmt(*s, arena, out);
+                }
+                if let Some(t) = trailing {
+                    self.collect_local_types_from_expr(*t, arena, out);
+                }
+            }
+            crate::ast::Ast::Expr::If { cond, then_branch, else_branch } => {
+                self.collect_local_types_from_expr(*cond, arena, out);
+                self.collect_local_types_from_expr(*then_branch, arena, out);
+                if let Some(e) = else_branch {
+                    self.collect_local_types_from_expr(*e, arena, out);
+                }
+            }
+            crate::ast::Ast::Expr::Match { scrutinee, arms } => {
+                self.collect_local_types_from_expr(*scrutinee, arena, out);
+                for arm in arms {
+                    if let Some(g) = arm.guard {
+                        self.collect_local_types_from_expr(g, arena, out);
+                    }
+                    self.collect_local_types_from_expr(arm.body, arena, out);
+                }
+            }
+            crate::ast::Ast::Expr::Lambda { body, .. } => match body {
+                crate::ast::Ast::LambdaBody::Block(e) | crate::ast::Ast::LambdaBody::Expression(e) => {
+                    self.collect_local_types_from_expr(*e, arena, out);
+                }
+            },
+            // Expressions that contain sub-expressions
+            crate::ast::Ast::Expr::Call { callee, args, .. } => {
+                self.collect_local_types_from_expr(*callee, arena, out);
+                for a in args {
+                    self.collect_local_types_from_expr(*a, arena, out);
+                }
+            }
+            crate::ast::Ast::Expr::MethodCall { recv, args, .. }
+            | crate::ast::Ast::Expr::SafeMethodCall { recv, args, .. } => {
+                self.collect_local_types_from_expr(*recv, arena, out);
+                for a in args {
+                    self.collect_local_types_from_expr(*a, arena, out);
+                }
+            }
+            crate::ast::Ast::Expr::Binary { lhs, rhs, .. }
+            | crate::ast::Ast::Expr::Assign { target: lhs, value: rhs }
+            | crate::ast::Ast::Expr::Elvis { lhs, rhs } => {
+                self.collect_local_types_from_expr(*lhs, arena, out);
+                self.collect_local_types_from_expr(*rhs, arena, out);
+            }
+            crate::ast::Ast::Expr::CompoundAssign { target, value, .. } => {
+                self.collect_local_types_from_expr(*target, arena, out);
+                self.collect_local_types_from_expr(*value, arena, out);
+            }
+            crate::ast::Ast::Expr::As { expr, .. } => {
+                self.collect_local_types_from_expr(*expr, arena, out);
+            }
+            _ => {}
+        }
+    }
+
     pub fn build(mut self) -> DataFlowGraph {
         // 0. Pre-register all functions (builtin + std + dep + user) into func_subgraphs to solve forward references:
         //    When function A calls function B, B may not yet be compiled (not registered in func_subgraphs),
@@ -7608,6 +8334,31 @@ impl<'a> IrBuilder<'a> {
                             }
                         }
                     }
+                }
+            }
+        }
+        // 0a-local. Pre-register LOCAL type method subgraphs (types declared inside function
+        // bodies via `Stmt::LocalDecl(TypeDecl)`). Sema registers these into type_def_index
+        // during check_decl, but the loop above only scans top-level declarations. The collector
+        // recursively walks function bodies to surface nested type declarations.
+        {
+            let local_type_methods = self.collect_local_type_methods();
+            for (type_name, method_idx) in &local_type_methods {
+                // Look up the TypeDecl (top-level or local) to get method info.
+                let method_info = self.find_type_method(type_name, *method_idx);
+                if let Some((method_name, params_count, is_async)) = method_info {
+                    let type_id = match self.sema.type_def_index.get(type_name.as_str()) {
+                        Some(&idx) => crate::types::dynamic_type_id(idx),
+                        None => continue,
+                    };
+                    // Skip if already registered (top-level scan covered it)
+                    if self.method_subgraphs.contains_key(&(type_id, *method_idx as u16)) {
+                        continue;
+                    }
+                    let mangled = format!("{}.{}", type_name, method_name);
+                    let sg_id = self.register_subgraph_placeholder(&mangled, params_count, is_async);
+                    self.method_subgraphs.insert((type_id, *method_idx as u16), sg_id);
+                    self.func_subgraphs.insert(mangled, sg_id);
                 }
             }
         }
@@ -7870,6 +8621,12 @@ impl<'a> IrBuilder<'a> {
             })
             .collect();
         for (type_name, method_idx) in &user_methods {
+            self.compile_user_method(type_name, *method_idx);
+        }
+        // 2b-local. Compile LOCAL type methods (types declared inside function bodies).
+        // These were pre-registered in step 0a-local; compile their bodies now.
+        let local_methods = self.collect_local_type_methods();
+        for (type_name, method_idx) in &local_methods {
             self.compile_user_method(type_name, *method_idx);
         }
 
@@ -8493,4 +9250,37 @@ pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
     let frac = mant & ((1u128 << 112) - 1);
     let bits = (if sign { 1u128 << 127 } else { 0 }) | frac;
     Some(bits.to_le_bytes())
+}
+
+/// Resolve a TypeRef to a type-name string using the given arena.
+/// Used by build_abi_sig to resolve types in the correct module's arena.
+fn type_name_in_arena(
+    ty: Option<crate::ast::Ast::TypeRef>,
+    arena: &crate::ast::Ast::AstArena<'_>,
+) -> String {
+    use crate::ast::Ast::TypeNode;
+    let ty_ref = match ty {
+        Some(t) => t,
+        None => return String::new(),
+    };
+    let node = match arena.types.get(ty_ref.0 as usize) {
+        Some(n) => n,
+        None => return String::new(),
+    };
+    match &node.node {
+        TypeNode::Named { name } => (*name).to_string(),
+        TypeNode::RawPtr { inner } => {
+            let inner_name = type_name_in_arena(Some(*inner), arena);
+            format!("*{inner_name}")
+        }
+        TypeNode::Array { element_type, size } => {
+            let elem_name = type_name_in_arena(Some(*element_type), arena);
+            if size.is_none() {
+                format!("{elem_name}[]")
+            } else {
+                elem_name
+            }
+        }
+        _ => String::new(),
+    }
 }

@@ -75,31 +75,31 @@ pub fun now(): SystemTime {
 
 // i128 nanoseconds → UTC TimeComponents (pure Kuzo algorithm)
 pub fun to_utc_components(ns: i128): TimeComponents {
-    val ns_per_sec: i128 = cast(1_000_000_000).to(i128)
-    val secs_per_day: i128 = cast(86400).to(i128)
+    val ns_per_sec: i128 = (1_000_000_000) as i128
+    val secs_per_day: i128 = 86400 as i128
 
     val total_sec = Calendar.floor_div_i128(ns, ns_per_sec)
     val sub_ns = Calendar.floor_mod_i128(ns, ns_per_sec)
     val days_i128 = Calendar.floor_div_i128(total_sec, secs_per_day)
     val secs_of_day = Calendar.floor_mod_i128(total_sec, secs_per_day)
 
-    val days = cast(days_i128).to(i64)
+    val days = days_i128 as i64
     val ymd = Calendar.civil_from_days(days)
     val weekday = Calendar.weekday_from_days(days)
     val doy = Calendar.day_of_year(ymd.year, ymd.month, ymd.day)
 
-    val hour = secs_of_day / cast(3600).to(i128)
-    val minute = (secs_of_day % cast(3600).to(i128)) / cast(60).to(i128)
-    val second = secs_of_day % cast(60).to(i128)
+    val hour = secs_of_day / 3600 as i128
+    val minute = (secs_of_day % 3600 as i128) / 60 as i128
+    val second = secs_of_day % 60 as i128
 
     TimeComponents(
         ymd.year,
         ymd.month,
         ymd.day,
-        cast(hour).to(u8),
-        cast(minute).to(u8),
-        cast(second).to(u8),
-        cast(sub_ns).to(u32),
+        hour as u8,
+        minute as u8,
+        second as u8,
+        sub_ns as u32,
         weekday,
         doy,
     )
@@ -109,7 +109,7 @@ pub fun to_utc_components(ns: i128): TimeComponents {
 // Only __localtime_offset_minutes remains as a syscall (depends on libc/kernel32)
 pub fun to_local_components(ns: i128): TimeComponents {
     val offset_min = __localtime_offset_minutes()
-    val offset_ns = cast(offset_min).to(i128) * cast(60_000_000_000i128).to(i128)
+    val offset_ns = offset_min as i128 * (60_000_000_000i128) as i128
     to_utc_components(ns + offset_ns)
 }
 
@@ -131,14 +131,14 @@ pub fun components_to_ns_utc(comp: TimeComponents): Throw<i128, TimeError> {
     }
 
     val days = Calendar.days_from_civil(comp.year, comp.month, comp.day)
-    val epoch_secs = cast(days).to(i128) * cast(86400).to(i128) +
-        cast(comp.hour).to(i128) * cast(3600).to(i128) +
-        cast(comp.minute).to(i128) * cast(60).to(i128) +
-        cast(comp.second).to(i128)
+    val epoch_secs = days as i128 * 86400 as i128 +
+        (comp.hour) as i128 * 3600 as i128 +
+        (comp.minute) as i128 * 60 as i128 +
+        (comp.second) as i128
     if epoch_secs < 0 {
         throw TimeError(OutOfRange, "before 1970", "")
     }
-    val ns = epoch_secs * cast(1_000_000_000).to(i128) + cast(comp.nanos).to(i128)
+    val ns = epoch_secs * (1_000_000_000) as i128 + (comp.nanos) as i128
     Ok(ns)
 }
 

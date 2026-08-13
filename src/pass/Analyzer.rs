@@ -416,6 +416,10 @@ pub fn classify_side_effect(
         Expr::Unary { operand, .. } => classify_side_effect(
             *operand, arena, module_name, sema, purity, escape, func_name_to_id,
         ),
+        // -- Type cast `expr as T`: pure (recursively classify operand) --
+        Expr::As { expr, .. } => classify_side_effect(
+            *expr, arena, module_name, sema, purity, escape, func_name_to_id,
+        ),
         Expr::RefOf(inner) | Expr::Deref(inner) | Expr::NonNullAssert(inner) => classify_side_effect(
             *inner, arena, module_name, sema, purity, escape, func_name_to_id,
         ),
@@ -684,6 +688,7 @@ fn collect_def_use_expr(expr_id: ExprId, arena: &AstArena, func: FuncId, graph: 
             collect_def_use_expr(*rhs, arena, func, graph);
         }
         Expr::Unary { operand, .. }
+        | Expr::As { expr: operand, .. }
         | Expr::RefOf(operand)
         | Expr::Deref(operand)
         | Expr::NonNullAssert(operand)
@@ -875,7 +880,16 @@ fn collect_def_use_stmt(stmt_id: StmtId, arena: &AstArena, func: FuncId, graph: 
         Stmt::Loop { body } => {
             collect_def_use_expr(*body, arena, func, graph);
         }
-        Stmt::LocalDecl { .. } => {}
+        Stmt::LocalDecl { decl } => match decl.as_ref() {
+            // Nested function declaration: scan the body for references to outer
+            // variables (same as Lambda). Without this, a var captured only by a
+            // nested function would be misidentified as dead and skipped by the
+            // IR builder, causing the nested function to read `void`.
+            crate::ast::Ast::Decl::FunDecl { body, .. } => {
+                collect_def_use_expr(*body, arena, func, graph);
+            }
+            _ => {}
+        },
         Stmt::Break | Stmt::Continue => {}
     }
 }
@@ -1106,6 +1120,7 @@ fn collect_call_edges(
             collect_call_edges(*rhs, arena, caller, caller_name, module_name, sema, cg);
         }
         Expr::Unary { operand, .. }
+        | Expr::As { expr: operand, .. }
         | Expr::RefOf(operand)
         | Expr::Deref(operand)
         | Expr::NonNullAssert(operand)
@@ -1646,7 +1661,7 @@ fn walk_children_expr<F: FnMut(ExprId)>(expr_id: ExprId, arena: &AstArena, mut f
         Expr::IntLit { .. } | Expr::FloatLit { .. } | Expr::BoolLit(_)
         | Expr::CharLit(_) | Expr::StrLit(_) | Expr::NullLit | Expr::VoidLit
         | Expr::Ident(_) => {}
-        Expr::Unary { operand, .. } | Expr::RefOf(operand) | Expr::Deref(operand)
+        Expr::Unary { operand, .. } | Expr::As { expr: operand, .. } | Expr::RefOf(operand) | Expr::Deref(operand)
         | Expr::NonNullAssert(operand) | Expr::Propagate(operand)
         | Expr::Atomic(operand) | Expr::Lazy(operand) => f(*operand),
         Expr::Binary { lhs, rhs, .. } => { f(*lhs); f(*rhs); }
@@ -2033,7 +2048,14 @@ fn collect_lambda_vars_stmt(
         Stmt::Loop { body } => {
             collect_lambda_vars(*body, arena, out);
         }
-        // Break/Continue/LocalDecl do not contain lambda variables
+        // Nested function body may bind lambda variables.
+        Stmt::LocalDecl { decl } => match decl.as_ref() {
+            crate::ast::Ast::Decl::FunDecl { body, .. } => {
+                collect_lambda_vars(*body, arena, out);
+            }
+            _ => {}
+        },
+        // Break/Continue do not contain lambda variables
         _ => {}
     }
 }
@@ -2323,6 +2345,16 @@ fn collect_free_idents_stmt(stmt_id: StmtId, arena: &AstArena, names: &mut Vec<S
 /// 2. Use collect_free_idents_expr to collect all identifiers in the lambda body
 /// 3. Exclude the lambda's own parameter names; the remaining are free variables
 /// 4. Check whether any free variable is in any layer of loop_body_vars_stack -> loop body capture escape
+///
+/// NOTE: This scan is intentionally kept separate from Sema's unified capture
+/// table (`SemaResult.captures`). The two serve different purposes:
+/// - Sema captures: per-capture mode (Snapshot/Reference) for IR codegen.
+/// - Analyzer escape: per-lambda escape classification (loop_body_capture) for
+///   function_id allocation.
+/// A future cleanup could unify them (the Analyzer could read
+/// `SemaResult.captures` instead of re-scanning), but the current duplication
+/// is harmless (both produce consistent results) and avoids coupling the
+/// Analyzer's AST-only pass to Sema's tables.
 fn scan_lambda_escapes_in_expr(
     expr_id: ExprId,
     arena: &AstArena,
@@ -2744,6 +2776,15 @@ fn collect_reads_stmt(stmt_id: StmtId, arena: &AstArena, report: &DeadCodeReport
             }
             collect_reads_expr(*value, arena, report, reads);
         }
+        // Nested function declaration: traverse the body to collect outer-variable
+        // reads (same as Lambda). Without this, a variable captured only by a
+        // nested function would be misidentified as dead.
+        Stmt::LocalDecl { decl } => match decl.as_ref() {
+            crate::ast::Ast::Decl::FunDecl { body, .. } => {
+                collect_reads_expr(*body, arena, report, reads);
+            }
+            _ => {}
+        },
         _ => walk_children_stmt(stmt_id, arena, |e| collect_reads_expr(e, arena, report, reads)),
     }
 }
@@ -2823,13 +2864,17 @@ fn mark_dead_decls_stmt(
         // the new definition site created by assignment has no use site in the def-use graph, but closures read the latest value when called.
         // Implicit-this field assignments (`field = value` resolving to `this.field = value`) are
         // NEVER dead: they mutate instance state visible to other methods and callers.
+        // Global-variable assignments are NEVER dead: they write to process-wide shared storage
+        // (`global_var_storage[slot]`) visible to all functions/callers, so the store is an observable
+        // side effect even when the variable is not read again within this function.
         Stmt::Assignment { target, value } => {
             if let Expr::Ident(name) = &arena.expr(*target).node {
                 let key = module_expr_key(module_name, target.0 as u64);
                 let is_implicit_this = sema.expr_types.get(&key)
                     .and_then(|info| info.implicit_this.as_ref())
                     .is_some();
-                if !is_implicit_this && !reads.contains(*name) {
+                let is_global = def_use.global_vars.contains(*name);
+                if !is_implicit_this && !is_global && !reads.contains(*name) {
                     let se = classify_side_effect(*value, arena, module_name, sema, purity, escape, func_name_to_id);
                     if is_side_effect_free(se) {
                         report.dead_stmts.insert(stmt_id);
@@ -2841,12 +2886,15 @@ fn mark_dead_decls_stmt(
         Stmt::CompoundAssignment { target, value, .. } => {
             // Compound assignment x += v: if x is never read within the function and v has no side effects, the whole statement is a dead store
             // Implicit-this field compound assignments are NEVER dead (same rationale as Assignment).
+            // Global-variable compound assignments are NEVER dead (the store writes shared storage
+            // observable by other functions/callers; see `Stmt::Assignment` above).
             if let Expr::Ident(name) = &arena.expr(*target).node {
                 let key = module_expr_key(module_name, target.0 as u64);
                 let is_implicit_this = sema.expr_types.get(&key)
                     .and_then(|info| info.implicit_this.as_ref())
                     .is_some();
-                if !is_implicit_this && !reads.contains(*name) {
+                let is_global = def_use.global_vars.contains(*name);
+                if !is_implicit_this && !is_global && !reads.contains(*name) {
                     let se = classify_side_effect(*value, arena, module_name, sema, purity, escape, func_name_to_id);
                     if is_side_effect_free(se) {
                         report.dead_stmts.insert(stmt_id);
@@ -2855,6 +2903,13 @@ fn mark_dead_decls_stmt(
             }
             mark_dead_decls_expr(*value, arena, module_name, sema, purity, escape, func_name_to_id, func, def_use, reads, report);
         }
+        // Recurse into nested function bodies so dead code inside them is also detected.
+        Stmt::LocalDecl { decl } => match decl.as_ref() {
+            crate::ast::Ast::Decl::FunDecl { body, .. } => {
+                mark_dead_decls_expr(*body, arena, module_name, sema, purity, escape, func_name_to_id, func, def_use, reads, report);
+            }
+            _ => {}
+        },
         _ => walk_children_stmt(stmt_id, arena, |e| {
             mark_dead_decls_expr(e, arena, module_name, sema, purity, escape, func_name_to_id, func, def_use, reads, report)
         }),

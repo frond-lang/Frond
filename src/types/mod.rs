@@ -18,8 +18,15 @@
 //! - `Display`: type display formatting (`TypeDisplay`)
 //! - `Ops`: `TypeOps` trait + scalar/reference ops implementations + ops lookup table +
 //!   `DynamicOpsRegistry`
+//! - `Ctype` (file `Ctype.rs`): Kuzo basic type ↔ C type mapping table (pure data,
+//!   no `crate::` dependency, can be `include!`d by `build.rs`)
 
 pub mod Tag;
+
+/// `kind` — single source of truth for reflect TypeKind constants (0–23).
+/// Re-exported here so `crate::types::kind::RECORD` etc. are available directly.
+pub mod Kind;
+pub use Kind::kind;
 
 // Re-export value::Tag contents (ValueTag, TypeFamily, BuiltinInfo, etc.) so that
 // `crate::types::ValueTag` etc. remain available. ValueTag lives in the value
@@ -31,6 +38,10 @@ pub use crate::value::{ValueTag, TypeFamily, BuiltinInfo, BUILTIN_TABLE, builtin
 // `crate::types::Type` resolves to the enum via glob re-export, and `crate::types::Ty`
 // resolves to the module.
 pub mod Ty;
+
+/// Kuzo basic type ↔ C type mapping (pure data, no `crate::` dependency, can be
+/// `include!`d by `build.rs`).
+pub mod Ctype;
 
 pub mod Arena;
 pub mod Display;

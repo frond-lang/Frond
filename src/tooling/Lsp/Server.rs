@@ -763,7 +763,7 @@ fn complete_type_name(doc: &DocState, _index: &Option<WorkspaceIndex>) -> Vec<se
 /// General completion: keywords + document symbols + builtin constructors.
 fn complete_general(doc: &DocState, _index: &Option<WorkspaceIndex>) -> Vec<serde_json::Value> {
     let keywords = [
-        "fun", "type", "trait", "override", "pack", "pub", "import", "with", "as", "val", "var",
+        "fun", "type", "trait", "override", "pack", "pub", "import", "as", "val", "var",
         "match", "if", "else", "async", "channel", "select", "atomic", "loop", "for", "in",
         "while", "break", "continue", "return", "throw", "lazy", "defer", "this",
     ];
@@ -778,7 +778,7 @@ fn complete_general(doc: &DocState, _index: &Option<WorkspaceIndex>) -> Vec<serd
         }));
     }
     for ctor in &[
-        "Panic", "Ok", "channel", "Value", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32",
+        "Panic", "Ok", "channel", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32",
         "u64", "u128", "isize", "usize", "f16", "f32", "f64", "f128", "bool", "char",
     ] {
         items.push(serde_json::json!({ "label": ctor, "kind": 3 }));

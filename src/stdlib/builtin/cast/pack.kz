@@ -1,9 +1,0 @@
-// builtin cast package declaration
-//
-// Exposes the cast conversion module to all Kuzo user code as visible by default (builtin is fully visible by default).
-// Raw: @extern("C") type cast primitives (widen/narrow/special)
-// Cast: Kuzo wrapper (two-step relay combining primitives)
-// cast(x).to(T) is desugared at the parser layer into a __cast_to<T>(x) normal function call,
-// after sema infers the source type S it resolves to __cast_S_to_T(x).
-pub pack Raw
-pub pack Cast

@@ -10,7 +10,7 @@ use crate::ast::Ast::{
     InterpolationPart, Kind, LambdaBody, MatchArm, MethodDecl, Module, Param,
     Pattern, PatternLiteral, PatternRecordField, PatternRef,
     RecordFieldExpr, RecordFieldType, SelectArm, Span, Spanned, Stmt,
-    StmtRef, TraitBound, TypeConstraint, TypeDef, TypeNode, TypeParam,
+    StmtRef, TraitBound, TypeDef, TypeNode, TypeParam,
     TypeRef, UnaryOp, Visibility,
 };
 // BinaryOp precedence table
@@ -278,7 +278,6 @@ pub enum TokenKind {
     KwPack,
     KwPub,
     KwImport,
-    KwWith,
     KwAs,
     KwVal,
     KwVar,
@@ -1383,7 +1382,6 @@ fn keyword_type(text: &str) -> TokenKind {
         "pack" => TokenKind::KwPack,
         "pub" => TokenKind::KwPub,
         "import" => TokenKind::KwImport,
-        "with" => TokenKind::KwWith,
         "as" => TokenKind::KwAs,
         "val" => TokenKind::KwVal,
         "var" => TokenKind::KwVar,
@@ -2044,7 +2042,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     // Declaration parsing
     // =====================================================================
 
-    /// Parse a function declaration: `fun name<TParams>(params): ReturnType with bounds { body }`
+    /// Parse a function declaration: `fun name<TParams>(params): ReturnType { body }`
     fn parse_fun_decl(&mut self, visibility: Visibility, is_async: bool, attributes: Vec<Attribute<'a>>) -> ParseResult<Spanned<Decl<'a>>> {
         let fun_tok = self.advance(); // 'fun'
         let name_tok = self.expect(TokenKind::Identifier, "expected function name")?;
@@ -2068,10 +2066,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 "function declaration must explicitly annotate the return type (use ': void' for no return value)",
             ));
         };
-        let mut bounds = Vec::new();
-        if self.match_token(TokenKind::KwWith) {
-            self.parse_trait_bound_list(&mut bounds)?;
-        }
         // @extern("C") function: body is a #{ }# raw block rather than a Kuzo expression
         let extern_c_body = if self.check(TokenKind::RawBlock) {
             let tok = self.advance();
@@ -2079,7 +2073,8 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         } else {
             None
         };
-        // When extern_c_body is present, use a placeholder expression as the body (Sema skips checking)
+        // When extern_c_body is present (stdlib `#{ C body }#`), use a placeholder
+        // expression as the body (Sema skips checking — the real implementation is the C body).
         let body = if extern_c_body.is_some() {
             self.alloc_expr(token_span(&fun_tok), Expr::VoidLit)
         } else {
@@ -2093,7 +2088,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 type_params,
                 params,
                 return_type,
-                bounds,
                 body,
                 is_async,
                 is_entry: name_tok.lexeme == "main",
@@ -2103,7 +2097,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         ))
     }
 
-    /// Parse a type declaration: `type Name<TParams> : traits = def with constraints { methods }`
+    /// Parse a type declaration: `type Name<TParams> : traits = def { methods }`
     fn parse_type_decl(&mut self, visibility: Visibility) -> ParseResult<Spanned<Decl<'a>>> {
         let type_tok = self.advance(); // 'type'
         let name_tok = self.expect(TokenKind::Identifier, "expected type name")?;
@@ -2125,10 +2119,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         let _ = self.expect(TokenKind::Eq, "expected '=' to define type body");
         let def = self.parse_type_def()?;
-        let mut type_constraints = Vec::new();
-        if self.match_token(TokenKind::KwWith) {
-            self.parse_type_constraints(&mut type_constraints)?;
-        }
         let mut methods = Vec::new();
         if self.match_token(TokenKind::LBrace) {
             self.parse_method_block(&mut methods)?;
@@ -2141,7 +2131,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 name: name_tok.lexeme,
                 type_params,
                 implemented_traits,
-                type_constraints,
                 def,
                 methods,
             },
@@ -2597,8 +2586,13 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         let mut kind = None;
         let mut bounds = Vec::new();
         if self.match_token(TokenKind::Colon) {
-            if self.check(TokenKind::Identifier) {
-                let has_paren = self.check(TokenKind::LParen);
+            // Bug H: a parenthesized trait-bound list `(Named, Counted)` must be detected
+            // before the kind-vs-trait decision. Previously the code checked for `Identifier`
+            // first, so when the next token was `(` it fell through to `parse_kind` and
+            // reported "expected kind (* or arrow kind)". Mirror parse_type_decl: check for
+            // `LParen` first, then a single `Identifier` trait bound, else a kind annotation.
+            let has_paren = self.check(TokenKind::LParen);
+            if has_paren || self.check(TokenKind::Identifier) {
                 if has_paren {
                     self.advance();
                 }
@@ -2623,9 +2617,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             } else {
                 kind = Some(Box::new(self.parse_kind()?));
             }
-        }
-        if self.match_token(TokenKind::KwWith) {
-            self.parse_trait_bound_list_inner(&mut bounds)?;
         }
         Ok(TypeParam {
             name: name_tok.lexeme,
@@ -2695,18 +2686,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         Ok(TraitBound {
             trait_name: name_tok.lexeme,
             type_args,
-        })
-    }
-
-    impl_parse_comma_list!(parse_type_constraints, TypeConstraint<'a>, parse_type_constraint, check(TokenKind::LBrace));
-
-    fn parse_type_constraint(&mut self) -> ParseResult<TypeConstraint<'a>> {
-        let type_param_tok = self.expect(TokenKind::Identifier, "expected type parameter name")?;
-        self.expect(TokenKind::Colon, "expected ':' after type parameter")?;
-        let concrete_type = self.parse_type()?;
-        Ok(TypeConstraint {
-            type_param: type_param_tok.lexeme,
-            concrete_type,
         })
     }
 
@@ -2988,7 +2967,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
 
     /// Single Pratt parser
     fn parse_binary(&mut self, min_prec: u8) -> ParseResult<ExprRef> {
-        let mut left = self.parse_unary()?;
+        let mut left = self.parse_as_cast()?;
         // After a block/if/match expression, block when the next token is `-` (Minus) or `&` (Ampersand).
         // Because `;` is treated as whitespace and skipped, `while c { ... }; -1` is equivalent to
         // `while c { ... } -1`. Without blocking, parse_binary would treat `-1` as `{ ... } - 1`
@@ -3034,6 +3013,87 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             );
         }
         Ok(left)
+    }
+
+    /// Parse postfix `as Type` cast expressions.
+    ///
+    /// `as` binds tighter than every binary operator (like Rust), so it sits between
+    /// `parse_binary` and `parse_unary`. Left-associative: `x as T as U` == `(x as T) as U`.
+    ///
+    /// The target type is parsed with `parse_cast_type`, a restricted grammar that does NOT
+    /// consume `<` (generics) or `->` (function types). This avoids ambiguity with comparison
+    /// (`x as f64 < 0.0`) and arrow operators following the cast. Generic and function types
+    /// are not valid cast targets anyway.
+    fn parse_as_cast(&mut self) -> ParseResult<ExprRef> {
+        let mut left = self.parse_unary()?;
+        while self.match_token(TokenKind::KwAs) {
+            let as_tok = self.previous();
+            let target = self.parse_cast_type()?;
+            left = self.alloc_expr(
+                token_span(&as_tok),
+                Expr::As { expr: left, target },
+            );
+        }
+        Ok(left)
+    }
+
+    /// Parse a cast target type: a restricted type grammar for `expr as Type`.
+    ///
+    /// Accepts: reference types (`&T`, `&&T`, `*T`), `This`, named types, nullable suffix (`T?`),
+    /// and array suffix (`T[]`, `T[N]`). Does NOT accept generic args (`T<A>`) or function types
+    /// (`A -> B`) — those would conflict with `<` (less-than) and `->` (arrow) in expression
+    /// context, and are not meaningful cast targets.
+    fn parse_cast_type(&mut self) -> ParseResult<TypeRef> {
+        // Reference / raw pointer prefix: &T, &&T, *T
+        if self.match_token(TokenKind::Ampersand) {
+            let span = token_span(&self.previous());
+            let inner = self.parse_cast_type()?;
+            return Ok(self.alloc_type(span, TypeNode::RefType { inner }));
+        }
+        if self.match_token(TokenKind::AmpAmp) {
+            let span = token_span(&self.previous());
+            let inner = self.parse_cast_type()?;
+            let inner_ref = self.alloc_type(span, TypeNode::RefType { inner });
+            return Ok(self.alloc_type(span, TypeNode::RefType { inner: inner_ref }));
+        }
+        if self.match_token(TokenKind::Star) {
+            let span = token_span(&self.previous());
+            let inner = self.parse_cast_type()?;
+            return Ok(self.alloc_type(span, TypeNode::RawPtr { inner }));
+        }
+        // `This` type keyword (lowercase KwThis or capitalized Identifier).
+        let is_this_type_kw = self.check(TokenKind::KwThis)
+            || (self.check(TokenKind::Identifier) && self.peek().lexeme == "This");
+        let mut ty = if is_this_type_kw {
+            let tok = self.advance();
+            let span = token_span(&tok);
+            self.alloc_type(span, TypeNode::ThisType)
+        } else {
+            let name_tok = self.expect(TokenKind::Identifier, "expected type name after 'as'")?;
+            let span = token_span(&name_tok);
+            self.alloc_type(span, TypeNode::Named { name: name_tok.lexeme })
+        };
+        let span = self.ast.ty(ty).span;
+        // Nullable suffix T? (chained)
+        while self.match_token(TokenKind::Question) {
+            ty = self.alloc_type(span, TypeNode::Nullable { inner: ty });
+        }
+        // Array suffix T[] / T[N] (chained)
+        while self.match_token(TokenKind::LBracket) {
+            let mut size: Option<u64> = None;
+            if !self.check(TokenKind::RBracket) {
+                let size_tok = self.expect(TokenKind::IntLiteral, "expected array size")?;
+                size = Some(parse_u64(size_tok.lexeme).ok_or_else(|| {
+                    self.report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")
+                })?);
+            }
+            let _ = self.expect(TokenKind::RBracket, "expected ']'");
+            ty = self.alloc_type(span, TypeNode::Array {
+                element_type: ty,
+                size,
+            });
+        }
+        Ok(ty)
     }
 
     /// Parse a unary operation
@@ -3325,10 +3385,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         if self.match_token(TokenKind::KwSelect) {
             return self.parse_select_expr();
-        }
-        if self.check_identifier("cast") {
-            self.advance();
-            return self.parse_cast_builder();
         }
         if self.check(TokenKind::KwTrait)
             && self.tokens.len() > self.current + 1
@@ -3661,7 +3717,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                         j += 2;
                     }
                     b'0' => {
-                        // Bug #36: \0 → NUL (U+0000)
                         result.push('\0');
                         j += 2;
                     }
@@ -3742,67 +3797,16 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             self.parse_param_list(&mut params)?;
         }
         let _ = self.expect(TokenKind::RParen, "expected ')'");
+        // Lambda requires an explicit return type annotation: fun(params): T { body }
+        let _ = self.expect(TokenKind::Colon, "expected ':' followed by return type in lambda");
+        let return_type = self.parse_type()?;
         let body_expr = self.parse_expr()?;
         Ok(self.alloc_expr(span, Expr::Lambda {
             params,
             body: LambdaBody::Block(body_expr),
             is_async,
-            return_type: None,
+            return_type: Some(return_type),
         }))
-    }
-
-    /// Attempt to parse a lambda: `(params) => expr` (backtracks on failure)
-    fn try_parse_lambda(&mut self, saved: usize, span: Span) -> Option<ExprRef> {
-        let saved_error_count = self.handler.errors().len();
-        let mut params = Vec::new();
-        if !self.check(TokenKind::RParen)
-            && self.parse_lambda_param_list(&mut params).is_err()
-        {
-            self.handler.truncate_errors(saved_error_count);
-            self.current = saved;
-            return None;
-        }
-        if !self.check(TokenKind::RParen) {
-            self.handler.truncate_errors(saved_error_count);
-            self.current = saved;
-            return None;
-        }
-        self.advance(); // ')'
-        if !self.check(TokenKind::EqGt) {
-            self.current = saved;
-            self.handler.truncate_errors(saved_error_count);
-            return None;
-        }
-        self.advance(); // '=>'
-        let body_expr = match self.parse_expr() {
-            Ok(e) => e,
-            Err(_) => {
-                self.current = saved;
-                self.handler.truncate_errors(saved_error_count);
-                return None;
-            }
-        };
-        Some(self.alloc_expr(span, Expr::Lambda {
-            params,
-            body: LambdaBody::Expression(body_expr),
-            is_async: false,
-            return_type: None,
-        }))
-    }
-
-    impl_parse_comma_list!(parse_lambda_param_list, Param<'a>, parse_lambda_param, check(TokenKind::RParen));
-
-    fn parse_lambda_param(&mut self) -> ParseResult<Param<'a>> {
-        let name_tok = self.expect(TokenKind::Identifier, "expected parameter name")?;
-        let type_annotation = if self.match_token(TokenKind::Colon) {
-            Some(self.parse_type()?)
-        } else {
-            None
-        };
-        Ok(Param {
-            name: name_tok.lexeme,
-            type_annotation,
-        })
     }
 
     /// Parse a parenthesized expression: unit value, lambda, record literal, record extend, or grouping
@@ -3813,10 +3817,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             return Ok(self.alloc_expr(span, Expr::VoidLit));
         }
         let saved = self.current;
-        if let Some(lambda) = self.try_parse_lambda(saved, span) {
-            return Ok(lambda);
-        }
-        self.current = saved;
         // Record extend: (...base, field: value)
         if self.peek().kind == TokenKind::Ellipsis {
             self.advance();
@@ -3903,50 +3903,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         let _ = self.expect(TokenKind::RParen, "expected ')'");
         Ok(first_expr)
-    }
-
-    /// Parse a cast builder: `cast(expr).to(T)` / `cast(expr).try_to(T)`
-    ///
-    /// The special syntax is desugared into a plain function call:
-    ///   cast(x).to(T)      -> __cast_to<T>(x)
-    ///   cast(x).try_to(T)  -> __cast_try_to<T>(x)
-    ///
-    /// After sema infers the source type S, this resolves to a __cast_S_to_T(x) function call.
-    fn parse_cast_builder(&mut self) -> ParseResult<ExprRef> {
-        let cast_tok = self.previous();
-        let span = token_span(&cast_tok);
-        let _ = self.expect(TokenKind::LParen, "expected '(' after 'cast'");
-        let expr = self.parse_expr()?;
-        let _ = self.expect(TokenKind::RParen, "expected ')' after cast expression");
-        let _ = self.expect(TokenKind::Dot, "expected '.to(...)' or '.try_to(...)' after cast(...)");
-        if !self.check(TokenKind::Identifier) {
-            self.report_error("expected 'to' or 'try_to' after cast(...).")?;
-            unreachable!()
-        }
-        let method_tok = self.advance();
-        let callee_name = match method_tok.lexeme {
-            "to" => "__cast_to",
-            "try_to" => "__cast_try_to",
-            _ => {
-                self.report_error("expected 'to' or 'try_to' after cast(...).")?;
-                unreachable!()
-            }
-        };
-        let _ = self.expect(TokenKind::LParen, "expected '(' after cast method");
-        if !self.check(TokenKind::Identifier) {
-            self.report_error("expected type name as cast target")?;
-            unreachable!()
-        }
-        let type_tok = self.advance();
-        let target = self.alloc_type(token_span(&type_tok), TypeNode::Named { name: type_tok.lexeme });
-        let _ = self.expect(TokenKind::RParen, "expected ')' after cast target type");
-        // Desugar into a plain Call: __cast_to<T>(x) / __cast_try_to<T>(x)
-        let callee = self.alloc_expr(span, Expr::Ident(callee_name));
-        Ok(self.alloc_expr(span, Expr::Call {
-            callee,
-            args: vec![expr],
-            type_args: Some(vec![target]),
-        }))
     }
 
     /// Parse an if expression
@@ -4263,10 +4219,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             } else {
                 None
             };
-            let mut bounds = Vec::new();
-            if self.match_token(TokenKind::KwWith) {
-                self.parse_trait_bound_list(&mut bounds)?;
-            }
             let body = self.parse_expr()?;
             let decl = Decl::FunDecl {
                 visibility: Visibility::Private,
@@ -4274,7 +4226,6 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 type_params,
                 params,
                 return_type,
-                bounds,
                 body,
                 is_async: false,
                 is_entry: false,
@@ -4290,12 +4241,15 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             self.parse_param_list(&mut params)?;
         }
         let _ = self.expect(TokenKind::RParen, "expected ')'");
+        // Lambda requires an explicit return type annotation: fun(params): T { body }
+        let _ = self.expect(TokenKind::Colon, "expected ':' followed by return type in lambda");
+        let return_type = self.parse_type()?;
         let body_expr = self.parse_expr()?;
         let lambda = self.alloc_expr(span, Expr::Lambda {
             params,
             body: LambdaBody::Block(body_expr),
             is_async: false,
-            return_type: None,
+            return_type: Some(return_type),
         });
         Ok(self.alloc_stmt(span, Stmt::Expression { expr: lambda }))
     }

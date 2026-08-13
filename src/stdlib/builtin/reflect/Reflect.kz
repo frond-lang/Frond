@@ -1,108 +1,43 @@
 // builtin/reflect/Reflect.kz — runtime reflection (builtin, visible by default)
 //
-// Two-layer reflection API:
-//   1. Value reflection: reflect(x)/format(x)/type_name(x) — receives a value, matches HeapObj at runtime
-//   2. Type reflection: typeof(Type) — receives a type name, generates a TypeInfo record at compile time
-//      typeof is intercepted by Sema (does not go through normal function lookup), the parameter is resolved as a type rather than a value variable
+// Go-style reflection via two auto-impl trait concepts:
+//   - trait Type  : type-metadata queries (type_name/kind/size/field_count/...) — auto-impl'd for every type
+//   - trait Value : value-level operations (format/constructor) — auto-impl'd for every type
+//
+// "Auto-impl" here is structural: the compiler recognizes reflect method names
+// at both the Sema layer (Inference: any receiver type passes type-check) and
+// the IR layer (Builder: `lookup_intrinsic` + `reflect_method_intrinsic` lower
+// the call directly to a CF_REFLECT_* compute_fn). No witness-table entry, no
+// method body, no @builtin — the method name *is* the dispatch.
 //
 // Usage (builtin visible by default, no import needed):
-//   val r = reflect(x)            // any value → Reflect
-//   val s = format(x)             // any value → str
-//   val tn = type_name(x)         // any value → type name (str)
-//   val info = typeof(Point)      // type → TypeInfo record (compile-time reflection)
-//   val info = typeof(T)          // generic parameter → TypeInfo (lookup after monomorphization)
-//   val info = typeof(This)       // in trait default → TypeInfo
-//   val info = typeof(T?)         // nullable → TypeInfo (kind="Nullable")
+//   val p = Point(1, 2)
+//   p.type_name()      // -> "Point"        (trait Type)
+//   p.kind()           // -> "Adt"          (trait Type)
+//   p.format()         // -> "Point(x: 1, y: 2)"  (trait Value)
+//   p.field_count()    // -> 2              (trait Type)
+//   p.field_name(0)    // -> "x"            (trait Type)
+//   p.constructor()    // -> ctor name      (trait Value, ADTs only)
+//   p.size()           // -> layout size    (trait Type)
+//   p.alignment()      // -> layout align   (trait Type)
+//
+// There are no top-level format()/type_name() wrappers — call sites use the
+// method form directly (e.g. Console.kz `print<T>` writes `x.format()`).
 
-// ─── Type reflection type definitions ─────────────────────────────────────────────
-
-// Type layout information
-type LayoutInfo = LayoutInfo(size: u32, alignment: u32)
-
-// trait implementation information
-type TraitImplInfo = TraitImplInfo(
-    parent_traits: str[],
-    implemented_traits: str[],
-    methods: str[],
-    associated_types: str[]
-)
-
-// Type metadata (typeof return value)
-// The structure field is of Value type, at runtime it is a record value (type_name returns "record")
-type TypeInfo = TypeInfo(
-    name: str,
-    module: str,
-    kind: str,
-    layout: LayoutInfo,
-    impls: TraitImplInfo,
-    structure: Value,
-    type_params: str[]
-)
-
-// ─── Reflect builtin type: wraps Value ──────────────────────────────
-type Reflect = Reflect(inner: Value) {
-    // ─── Type metadata methods ───────────────────────────────────────────
-    pub fun kind(): u8 {
-        __reflect_kind(inner)
-    }
-
-    pub fun type_name(): str {
-        __reflect_type_name(inner)
-    }
-
-    pub fun size(): u8 {
-        __reflect_size(inner)
-    }
-
-    pub fun field_count(): u16 {
-        __reflect_field_count(inner)
-    }
-
-    // ─── Field metadata methods ───────────────────────────────────────────
-    pub fun field_name(index: u16): str {
-        __reflect_field_name(inner, index)
-    }
-
-    pub fun field_value(index: u16): Reflect {
-        Reflect(__reflect_field_value(inner, index))
-    }
-
-    // ─── Array length ─────────────────────────────────────────────────
-    pub fun array_len(): usize {
-        __reflect_array_len(inner)
-    }
-
-    // ─── ADT constructor name ─────────────────────────────────────────────
-    pub fun adt_constructor(): str {
-        __reflect_adt_constructor(inner)
-    }
+// ─── trait Type: type-metadata queries (auto-impl for every type) ───────────────
+trait Type {
+    fun type_name(): str
+    fun kind(): str
+    fun size(): u32
+    fun alignment(): u32
+    fun field_count(): u16
+    fun field_name(index: u16): str
 }
 
-// ─── Top-level reflection entry ─────────────────────────────────────────────────
-// reflect(x): wraps Value as Reflect, no Sema interception, no type_id injection
-pub fun reflect(x: Value): Reflect {
-    Reflect(x)
-}
-
-// typeof(x: Value): value reflection, returns full TypeInfo record
-pub fun typeof(x: Value): TypeInfo {
-    val name = __reflect_type_name(x)
-    val kind = __reflect_kind_str(x)
-    val module = ""
-    val size = __reflect_layout_size(x)
-    val alignment = __reflect_layout_alignment(x)
-    val layout = LayoutInfo(size, alignment)
-    val empty_strs: str[] = []
-    val impls = TraitImplInfo(empty_strs, empty_strs, empty_strs, empty_strs)
-    val type_params: str[] = []
-    val structure = x
-    TypeInfo(name, module, kind, layout, impls, structure, type_params)
-}
-
-pub fun type_name(x: Value): str {
-    __reflect_type_name(x)
-}
-
-pub fun format(x: Value): str {
-    __reflect_format(x)
+// ─── trait Value: runtime value-level operations (auto-impl for every type) ─────
+// Note: array length is NOT here — arrays already have a builtin `.len()` method
+// (IntrinsicKind::UnOp(35)). Adding `array_len()` would duplicate it.
+trait Value {
+    fun format(): str
+    fun constructor(): str
 }

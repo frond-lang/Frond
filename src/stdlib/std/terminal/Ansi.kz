@@ -16,52 +16,52 @@
 
 // ESC[{row};{column}H → move cursor to (row, column) (1-based)
 pub fun cursor_move_to(row: u16, column: u16): str {
-    "\x1b[" + cast(row).to(str) + ";" + cast(column).to(str) + "H"
+    "\x1b[" + row as str + ";" + column as str + "H"
 }
 
 // ESC[{row};{column}f → same as H (HPA/VPR variant)
 pub fun cursor_position(row: u16, column: u16): str {
-    "\x1b[" + cast(row).to(str) + ";" + cast(column).to(str) + "f"
+    "\x1b[" + row as str + ";" + column as str + "f"
 }
 
 // ESC[{n}A → move cursor up n rows (default 1)
 pub fun cursor_up(n: u16): str {
-    if n == 0 { "\x1b[A" } else { "\x1b[" + cast(n).to(str) + "A" }
+    if n == 0 { "\x1b[A" } else { "\x1b[" + n as str + "A" }
 }
 
 // ESC[{n}B → move cursor down n rows (default 1)
 pub fun cursor_down(n: u16): str {
-    if n == 0 { "\x1b[B" } else { "\x1b[" + cast(n).to(str) + "B" }
+    if n == 0 { "\x1b[B" } else { "\x1b[" + n as str + "B" }
 }
 
 // ESC[{n}C → move cursor right n columns (default 1)
 pub fun cursor_right(n: u16): str {
-    if n == 0 { "\x1b[C" } else { "\x1b[" + cast(n).to(str) + "C" }
+    if n == 0 { "\x1b[C" } else { "\x1b[" + n as str + "C" }
 }
 
 // ESC[{n}D → move cursor left n columns (default 1)
 pub fun cursor_left(n: u16): str {
-    if n == 0 { "\x1b[D" } else { "\x1b[" + cast(n).to(str) + "D" }
+    if n == 0 { "\x1b[D" } else { "\x1b[" + n as str + "D" }
 }
 
 // ESC[{n}E → move cursor to beginning of line, n rows down (default 1)
 pub fun cursor_down_to_line_start(n: u16): str {
-    if n == 0 { "\x1b[E" } else { "\x1b[" + cast(n).to(str) + "E" }
+    if n == 0 { "\x1b[E" } else { "\x1b[" + n as str + "E" }
 }
 
 // ESC[{n}F → move cursor to beginning of line, n rows up (default 1)
 pub fun cursor_up_to_line_start(n: u16): str {
-    if n == 0 { "\x1b[F" } else { "\x1b[" + cast(n).to(str) + "F" }
+    if n == 0 { "\x1b[F" } else { "\x1b[" + n as str + "F" }
 }
 
 // ESC[{n}G → move cursor to column n (1-based)
 pub fun cursor_to_column(n: u16): str {
-    "\x1b[" + cast(n).to(str) + "G"
+    "\x1b[" + n as str + "G"
 }
 
 // ESC[{n}d → move cursor to row n (1-based)
 pub fun cursor_to_row(n: u16): str {
-    "\x1b[" + cast(n).to(str) + "d"
+    "\x1b[" + n as str + "d"
 }
 
 // ESC[?25l → hide cursor
@@ -217,7 +217,7 @@ pub fun bg_default(): str { "\x1b[49m" }
 
 // ESC[{top};{bottom}r → set scroll region (DECSTBM), 1-based rows
 pub fun set_scroll_region(top: u16, bottom: u16): str {
-    "\x1b[" + cast(top).to(str) + ";" + cast(bottom).to(str) + "r"
+    "\x1b[" + top as str + ";" + bottom as str + "r"
 }
 
 // ESC[r → reset scroll region to full screen
@@ -225,12 +225,12 @@ pub fun reset_scroll_region(): str { "\x1b[r" }
 
 // ESC[{n}S → scroll up n lines (default 1)
 pub fun scroll_up(n: u16): str {
-    if n == 0 { "\x1b[S" } else { "\x1b[" + cast(n).to(str) + "S" }
+    if n == 0 { "\x1b[S" } else { "\x1b[" + n as str + "S" }
 }
 
 // ESC[{n}T → scroll down n lines (default 1)
 pub fun scroll_down(n: u16): str {
-    if n == 0 { "\x1b[T" } else { "\x1b[" + cast(n).to(str) + "T" }
+    if n == 0 { "\x1b[T" } else { "\x1b[" + n as str + "T" }
 }
 
 // ─── Alternative screen buffer ───

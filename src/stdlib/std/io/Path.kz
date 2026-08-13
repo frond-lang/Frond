@@ -59,7 +59,7 @@ pub type Path = Path(segments: str[], is_absolute: bool) {
                 if dot <= 0 {
                     null
                 } else {
-                    val dot_idx = cast(dot).to(usize)
+                    val dot_idx = dot as usize
                     name[dot_idx + 1..name.len()]
                 }
             },
@@ -75,7 +75,7 @@ pub type Path = Path(segments: str[], is_absolute: bool) {
                 if dot <= 0 {
                     name
                 } else {
-                    val dot_idx = cast(dot).to(usize)
+                    val dot_idx = dot as usize
                     name[0..dot_idx]
                 }
             },
@@ -163,7 +163,7 @@ pub fun last_index_of(s: str, ch: char): i64 {
     while i > 0 {
         i = i - 1
         if s[i] == ch {
-            return cast(i).to(i64)
+            return i as i64
         }
     }
     return -1

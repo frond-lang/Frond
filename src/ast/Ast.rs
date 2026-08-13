@@ -235,13 +235,6 @@ pub struct TraitBound<'a> {
     pub type_args: Vec<TypeRef>,
 }
 
-/// Type constraint: binds a type parameter to a concrete type.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TypeConstraint<'a> {
-    pub type_param: &'a str,
-    pub concrete_type: TypeRef,
-}
-
 /// Record type field: field name and field type.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordFieldType<'a> {
@@ -465,6 +458,8 @@ pub enum Expr<'a> {
     },
     /// Unary operation `op operand`.
     Unary { op: UnaryOp, operand: ExprRef },
+    /// Type cast `expr as Type`.
+    As { expr: ExprRef, target: TypeRef },
     /// Take reference `&expr`.
     RefOf(ExprRef),
     /// Dereference `*expr`.
@@ -679,7 +674,6 @@ pub enum Decl<'a> {
         type_params: Vec<TypeParam<'a>>,
         params: Vec<Param<'a>>,
         return_type: Option<TypeRef>,
-        bounds: Vec<TraitBound<'a>>,
         body: ExprRef,
         is_async: bool,
         is_entry: bool,
@@ -692,7 +686,6 @@ pub enum Decl<'a> {
         name: &'a str,
         type_params: Vec<TypeParam<'a>>,
         implemented_traits: Vec<TraitBound<'a>>,
-        type_constraints: Vec<TypeConstraint<'a>>,
         def: TypeDef<'a>,
         methods: Vec<MethodDecl<'a>>,
     },
@@ -799,7 +792,6 @@ pub fn walk_decl<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, decl
             type_params,
             params,
             return_type,
-            bounds,
             body,
             ..
         } => {
@@ -812,15 +804,11 @@ pub fn walk_decl<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, decl
             if let Some(rt) = return_type {
                 walk_type(v, arena, *rt);
             }
-            for b in bounds {
-                walk_trait_bound(v, arena, b);
-            }
             walk_expr(v, arena, *body);
         }
         Decl::TypeDecl {
             type_params,
             implemented_traits,
-            type_constraints,
             def,
             methods,
             ..
@@ -830,9 +818,6 @@ pub fn walk_decl<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, decl
             }
             for b in implemented_traits {
                 walk_trait_bound(v, arena, b);
-            }
-            for c in type_constraints {
-                walk_type_constraint(v, arena, c);
             }
             walk_type_def(v, arena, def);
             for m in methods {
@@ -1015,6 +1000,10 @@ pub fn walk_expr<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, id: 
         }
         Expr::Unary { operand, .. } => {
             walk_expr(v, arena, *operand);
+        }
+        Expr::As { expr, target } => {
+            walk_expr(v, arena, *expr);
+            walk_type(v, arena, *target);
         }
         Expr::RefOf(inner) | Expr::Deref(inner) | Expr::Propagate(inner)
         | Expr::NonNullAssert(inner) | Expr::Atomic(inner) | Expr::Lazy(inner) => {
@@ -1250,10 +1239,6 @@ fn walk_trait_bound<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, b
     }
 }
 
-fn walk_type_constraint<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, c: &'a TypeConstraint<'a>) {
-    walk_type(v, arena, c.concrete_type);
-}
-
 fn walk_param<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, p: &'a Param<'a>) {
     if let Some(ty) = &p.type_annotation {
         walk_type(v, arena, *ty);
@@ -1470,7 +1455,6 @@ impl<'a> AstVisitor<'a> for Printer<'a> {
                 type_params,
                 params,
                 return_type,
-                bounds,
                 body,
                 is_async,
                 is_entry,
@@ -1491,7 +1475,6 @@ impl<'a> AstVisitor<'a> for Printer<'a> {
                 self.print_type_params(type_params);
                 self.print_params(params);
                 self.print_return_type(return_type);
-                self.print_bounds(bounds);
                 self.write_line(&format!("(is_async {})(is_entry {})", is_async, is_entry));
                 self.write_line("(body");
                 self.indent();
@@ -1513,7 +1496,6 @@ impl<'a> AstVisitor<'a> for Printer<'a> {
                 name,
                 type_params,
                 implemented_traits,
-                type_constraints,
                 def,
                 methods,
             } => {
@@ -1522,7 +1504,6 @@ impl<'a> AstVisitor<'a> for Printer<'a> {
                 self.print_visibility(*visibility);
                 self.print_type_params(type_params);
                 self.print_bounds(implemented_traits);
-                self.print_type_constraints(type_constraints);
                 self.visit_type_def(def);
                 self.print_methods(methods);
                 self.dedent();
@@ -1920,6 +1901,18 @@ impl<'a> AstVisitor<'a> for Printer<'a> {
                 self.write_line("(operand");
                 self.indent();
                 self.ve(operand);
+                self.dedent();
+                self.write_line(")");
+                self.dedent();
+                self.write_line(")");
+            }
+            Expr::As { expr, target } => {
+                self.write_line("(as");
+                self.indent();
+                self.ve(expr);
+                self.write_line("(target");
+                self.indent();
+                self.vt(target);
                 self.dedent();
                 self.write_line(")");
                 self.dedent();
@@ -2733,24 +2726,6 @@ impl<'a> Printer<'a> {
                 }
                 None => self.write_line("(kind (none))"),
             }
-            self.dedent();
-            self.write_line(")");
-        }
-        self.dedent();
-        self.write_line(")");
-    }
-
-    fn print_type_constraints(&mut self, constraints: &[TypeConstraint<'_>]) {
-        if constraints.is_empty() {
-            self.write_line("(type_constraints ())");
-            return;
-        }
-        self.write_line("(type_constraints");
-        self.indent();
-        for c in constraints {
-            self.write_line(&format!("(constraint \"{}\"", c.type_param));
-            self.indent();
-            self.vt(&c.concrete_type);
             self.dedent();
             self.write_line(")");
         }

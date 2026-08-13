@@ -1305,13 +1305,6 @@ impl<'a> InferContext<'a> {
 // Adds InferContext methods ported from `src/sema/type_check.zig` and `throw_check.zig`.
 // =========================================================================
 
-/// Registry of builtin cast functions: (function name, whether it is the try variant).
-/// Adding a cast variant only requires appending a row; no new name-specific branch is needed.
-const CAST_BUILTINS: &[(&str, bool)] = &[
-    ("__cast_to", false),
-    ("__cast_try_to", true),
-];
-
 impl<'a> InferContext<'a> {
     // ── Type resolution (typeFromAst) ──
 
@@ -2078,6 +2071,400 @@ impl<'a> InferContext<'a> {
         }
     }
 
+    // ── Unified capture analysis ──
+    //
+    // Computes the capture list (outer variables referenced by a nested scope:
+    // lambda / defer / nested function) with per-capture mutability. This is the
+    // single source of truth consumed by the IR builder (replacing its own
+    // `collect_free_idents_expr` re-scan) and by the assignment-decision-tree
+    // simplification.
+    //
+    // Capture mode rules:
+    //   - `var` binding            → Reference (reads/writes reflect latest value)
+    //   - `val` binding            → Snapshot  (captures declaration-time value)
+    //   - parameter                → Snapshot  (params are immutable; no `var param`)
+    //   - `this`                   → Reference (receiver is shared; mutations via it)
+    //   - defer bodies             → ALL captures forced to Reference (defer semantics
+    //                                require reading the value at exit, not at defer-site;
+    //                                this directly resolves the Bug #49 tension where a
+    //                                `val` snapshot and defer-latest conflicted on the
+    //                                same node).
+    //
+    // The walk is scope-aware: bindings introduced *inside* the nested scope
+    // (block ValDecl/VarDecl, for-loop binders, nested lambda params, pattern
+    // binders) are excluded — only names resolved from the enclosing scope count
+    // as captures. This correctly handles nested lambdas/defers whose own
+    // captures are computed independently.
+
+    /// Collect free identifier names referenced by a nested-scope body, excluding
+    /// names bound *inside* the body. `bound` is seeded with the nested scope's
+    /// own parameter names (plus `self`-reference for named functions); the walk
+    /// adds inner bindings as it descends.
+    fn collect_free_idents_scoped(
+        &self,
+        ast: &AstArena<'_>,
+        expr: ExprId,
+        bound: &mut rustc_hash::FxHashSet<String>,
+        out: &mut rustc_hash::FxHashSet<String>,
+    ) {
+        use crate::ast::Ast;
+        let node = &ast.expr(expr).node;
+        match node {
+            Ast::Expr::Ident(name) => {
+                if !bound.contains(*name) {
+                    out.insert(name.to_string());
+                }
+            }
+            Ast::Expr::Assign { target, value } => {
+                self.collect_free_idents_scoped(ast, *target, bound, out);
+                self.collect_free_idents_scoped(ast, *value, bound, out);
+            }
+            Ast::Expr::Binary { lhs, rhs, .. } => {
+                self.collect_free_idents_scoped(ast, *lhs, bound, out);
+                self.collect_free_idents_scoped(ast, *rhs, bound, out);
+            }
+            Ast::Expr::CompoundAssign { target, value, .. } => {
+                self.collect_free_idents_scoped(ast, *target, bound, out);
+                self.collect_free_idents_scoped(ast, *value, bound, out);
+            }
+            Ast::Expr::Unary { operand, .. } => {
+                self.collect_free_idents_scoped(ast, *operand, bound, out);
+            }
+            Ast::Expr::Call { callee, args, .. } => {
+                self.collect_free_idents_scoped(ast, *callee, bound, out);
+                for &a in args {
+                    self.collect_free_idents_scoped(ast, a, bound, out);
+                }
+            }
+            Ast::Expr::MethodCall { recv, args, .. } => {
+                self.collect_free_idents_scoped(ast, *recv, bound, out);
+                for &a in args {
+                    self.collect_free_idents_scoped(ast, a, bound, out);
+                }
+            }
+            Ast::Expr::FieldAccess { recv, .. }
+            | Ast::Expr::RefOf(recv)
+            | Ast::Expr::Deref(recv)
+            | Ast::Expr::NonNullAssert(recv)
+            | Ast::Expr::Propagate(recv)
+            | Ast::Expr::As { expr: recv, .. } => {
+                self.collect_free_idents_scoped(ast, *recv, bound, out);
+            }
+            Ast::Expr::Index { recv, index } => {
+                self.collect_free_idents_scoped(ast, *recv, bound, out);
+                self.collect_free_idents_scoped(ast, *index, bound, out);
+            }
+            Ast::Expr::SafeAccess { recv, .. } => {
+                self.collect_free_idents_scoped(ast, *recv, bound, out);
+            }
+            Ast::Expr::SafeMethodCall { recv, args, .. } => {
+                self.collect_free_idents_scoped(ast, *recv, bound, out);
+                for &a in args {
+                    self.collect_free_idents_scoped(ast, a, bound, out);
+                }
+            }
+            Ast::Expr::Slice { recv, start, end, .. } => {
+                self.collect_free_idents_scoped(ast, *recv, bound, out);
+                self.collect_free_idents_scoped(ast, *start, bound, out);
+                self.collect_free_idents_scoped(ast, *end, bound, out);
+            }
+            Ast::Expr::Elvis { lhs, rhs } => {
+                self.collect_free_idents_scoped(ast, *lhs, bound, out);
+                self.collect_free_idents_scoped(ast, *rhs, bound, out);
+            }
+            Ast::Expr::If { cond, then_branch, else_branch } => {
+                self.collect_free_idents_scoped(ast, *cond, bound, out);
+                self.collect_free_idents_scoped(ast, *then_branch, bound, out);
+                if let Some(eb) = else_branch {
+                    self.collect_free_idents_scoped(ast, *eb, bound, out);
+                }
+            }
+            Ast::Expr::Block { stmts, trailing } => {
+                // Block introduces a new lexical scope: snapshot `bound`, recurse
+                // (inner ValDecl/VarDecl names are added to `bound` by the stmt
+                // walker), then restore.
+                let snapshot = bound.clone();
+                for &s in stmts {
+                    self.collect_free_idents_stmt_scoped(ast, s, bound, out);
+                }
+                if let Some(t) = trailing {
+                    self.collect_free_idents_scoped(ast, *t, bound, out);
+                }
+                *bound = snapshot;
+            }
+            Ast::Expr::Match { scrutinee, arms } => {
+                self.collect_free_idents_scoped(ast, *scrutinee, bound, out);
+                for arm in arms {
+                    let snapshot = bound.clone();
+                    self.collect_pattern_binders(ast, arm.pattern, bound);
+                    if let Some(g) = arm.guard {
+                        self.collect_free_idents_scoped(ast, g, bound, out);
+                    }
+                    self.collect_free_idents_scoped(ast, arm.body, bound, out);
+                    *bound = snapshot;
+                }
+            }
+            Ast::Expr::Lambda { params, body, .. } => {
+                // Nested lambda: its params belong to it, not to the outer scope.
+                let snapshot = bound.clone();
+                for p in params {
+                    bound.insert(p.name.to_string());
+                }
+                match body {
+                    Ast::LambdaBody::Block(b) => self.collect_free_idents_scoped(ast, *b, bound, out),
+                    Ast::LambdaBody::Expression(e) => self.collect_free_idents_scoped(ast, *e, bound, out),
+                }
+                *bound = snapshot;
+            }
+            Ast::Expr::ArrayLit { elements, fill } => {
+                for &e in elements {
+                    self.collect_free_idents_scoped(ast, e, bound, out);
+                }
+                if let Some((v, c)) = fill {
+                    self.collect_free_idents_scoped(ast, *v, bound, out);
+                    self.collect_free_idents_scoped(ast, *c, bound, out);
+                }
+            }
+            Ast::Expr::RecordLit(fields) => {
+                for f in fields {
+                    self.collect_free_idents_scoped(ast, f.value, bound, out);
+                }
+            }
+            Ast::Expr::RecordExtend { base, updates } => {
+                self.collect_free_idents_scoped(ast, *base, bound, out);
+                for f in updates {
+                    self.collect_free_idents_scoped(ast, f.value, bound, out);
+                }
+            }
+            Ast::Expr::StrInterp(parts) => {
+                for part in parts {
+                    if let Ast::InterpolationPart::Expression(e) = part {
+                        self.collect_free_idents_scoped(ast, *e, bound, out);
+                    }
+                }
+            }
+            Ast::Expr::Select(arms) => {
+                for arm in arms {
+                    match arm {
+                        Ast::SelectArm::Receive { channel_expr, binding, body } => {
+                            self.collect_free_idents_scoped(ast, *channel_expr, bound, out);
+                            // The `binding` name is local to the arm body.
+                            let snapshot = bound.clone();
+                            if let Some(b) = binding {
+                                bound.insert(b.to_string());
+                            }
+                            self.collect_free_idents_scoped(ast, *body, bound, out);
+                            *bound = snapshot;
+                        }
+                        Ast::SelectArm::Timeout { duration, body } => {
+                            self.collect_free_idents_scoped(ast, *duration, bound, out);
+                            self.collect_free_idents_scoped(ast, *body, bound, out);
+                        }
+                    }
+                }
+            }
+            Ast::Expr::Atomic(inner) | Ast::Expr::Lazy(inner) => {
+                self.collect_free_idents_scoped(ast, *inner, bound, out);
+            }
+            Ast::Expr::InlineTrait(methods) => {
+                for m in methods {
+                    if let Some(body_expr) = m.body {
+                        self.collect_free_idents_scoped(ast, body_expr, bound, out);
+                    }
+                }
+            }
+            // Literals and other leaf variants: no sub-expressions.
+            _ => {}
+        }
+    }
+
+    /// Statement-level scoped free-identifier collection (companion to
+    /// `collect_free_idents_scoped`).
+    fn collect_free_idents_stmt_scoped(
+        &self,
+        ast: &AstArena<'_>,
+        stmt: StmtId,
+        bound: &mut rustc_hash::FxHashSet<String>,
+        out: &mut rustc_hash::FxHashSet<String>,
+    ) {
+        use crate::ast::Ast;
+        let node = &ast.stmt(stmt).node;
+        match node {
+            Ast::Stmt::ValDecl { name, value, .. }
+            | Ast::Stmt::VarDecl { name, value, .. } => {
+                self.collect_free_idents_scoped(ast, *value, bound, out);
+                bound.insert(name.to_string());
+            }
+            Ast::Stmt::Expression { expr } => {
+                self.collect_free_idents_scoped(ast, *expr, bound, out);
+            }
+            Ast::Stmt::Assignment { target, value } => {
+                self.collect_free_idents_scoped(ast, *target, bound, out);
+                self.collect_free_idents_scoped(ast, *value, bound, out);
+            }
+            Ast::Stmt::FieldAssignment { object, value, .. } => {
+                self.collect_free_idents_scoped(ast, *object, bound, out);
+                self.collect_free_idents_scoped(ast, *value, bound, out);
+            }
+            Ast::Stmt::CompoundAssignment { target, value, .. } => {
+                self.collect_free_idents_scoped(ast, *target, bound, out);
+                self.collect_free_idents_scoped(ast, *value, bound, out);
+            }
+            Ast::Stmt::Return { value } => {
+                if let Some(v) = value {
+                    self.collect_free_idents_scoped(ast, *v, bound, out);
+                }
+            }
+            Ast::Stmt::Throw { expr } => {
+                self.collect_free_idents_scoped(ast, *expr, bound, out);
+            }
+            Ast::Stmt::For { name, iterable, body } => {
+                self.collect_free_idents_scoped(ast, *iterable, bound, out);
+                let snapshot = bound.clone();
+                bound.insert(name.to_string());
+                self.collect_free_idents_scoped(ast, *body, bound, out);
+                *bound = snapshot;
+            }
+            Ast::Stmt::While { condition, body } => {
+                self.collect_free_idents_scoped(ast, *condition, bound, out);
+                self.collect_free_idents_scoped(ast, *body, bound, out);
+            }
+            Ast::Stmt::Loop { body } => {
+                self.collect_free_idents_scoped(ast, *body, bound, out);
+            }
+            Ast::Stmt::Defer { expr } => {
+                self.collect_free_idents_scoped(ast, *expr, bound, out);
+            }
+            Ast::Stmt::Break | Ast::Stmt::Continue => {}
+            Ast::Stmt::LocalDecl { decl } => match decl.as_ref() {
+                Ast::Decl::FunDecl { name, params, body, .. } => {
+                    // A nested function declaration binds its own name in the
+                    // current scope. Its params belong to it. References inside
+                    // its body that resolve to the *current* scope are captures
+                    // of the current scope — record them, treating the nested
+                    // function's name + params as bound.
+                    bound.insert(name.to_string());
+                    let snapshot = bound.clone();
+                    for p in params {
+                        bound.insert(p.name.to_string());
+                    }
+                    self.collect_free_idents_scoped(ast, *body, bound, out);
+                    *bound = snapshot;
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// Add pattern-bound variable names to `bound`.
+    fn collect_pattern_binders(
+        &self,
+        ast: &AstArena<'_>,
+        pat: PatternId,
+        bound: &mut rustc_hash::FxHashSet<String>,
+    ) {
+        use crate::ast::Ast;
+        let node = &ast.pattern(pat).node;
+        match node {
+            Ast::Pattern::Variable { name } => {
+                bound.insert(name.to_string());
+            }
+            Ast::Pattern::Wildcard | Ast::Pattern::Literal(_) => {}
+            Ast::Pattern::Constructor { patterns, .. } => {
+                for &p in patterns {
+                    self.collect_pattern_binders(ast, p, bound);
+                }
+            }
+            Ast::Pattern::Record { fields } => {
+                for f in fields {
+                    self.collect_pattern_binders(ast, f.pattern, bound);
+                }
+            }
+            Ast::Pattern::OrPattern { left, right } => {
+                self.collect_pattern_binders(ast, *left, bound);
+                self.collect_pattern_binders(ast, *right, bound);
+            }
+            Ast::Pattern::Guard { pattern, .. } => {
+                self.collect_pattern_binders(ast, *pattern, bound);
+            }
+        }
+    }
+
+    /// Compute the capture list for a nested scope.
+    ///
+    /// `body_expr` is the scope's body expression; `param_names` are the scope's
+    /// own parameter names (excluded from captures); `force_reference` overrides
+    /// all captures to `Reference` mode (used for defer).
+    fn compute_captures(
+        &self,
+        ast: &AstArena<'_>,
+        body_expr: ExprId,
+        param_names: &[&str],
+        force_reference: bool,
+    ) -> Vec<crate::sema::Sema::CaptureInfo> {
+        use crate::sema::Sema::{CaptureInfo, CaptureMode};
+
+        let mut bound: rustc_hash::FxHashSet<String> = param_names.iter().map(|s| s.to_string()).collect();
+        let mut free: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+        self.collect_free_idents_scoped(ast, body_expr, &mut bound, &mut free);
+
+        // Implicit-this: if we're inside a method body and any free identifier
+        // is not a known local/var (i.e. it resolves to an implicit `this.field`),
+        // the nested scope needs to capture `this` so escaped closures can reach
+        // the receiver. Add `this` to the capture set.
+        if self.current_this_type().is_some() && !free.contains("this") {
+            let any_implicit = free.iter().any(|name| {
+                name.as_str() != "this"
+                    && !self.local_mutability.iter().any(|((_, n), _)| n.as_str() == name.as_str())
+            });
+            if any_implicit {
+                free.insert("this".to_string());
+            }
+        }
+
+        // Deterministic order for stable output.
+        let mut names: Vec<String> = free.into_iter().collect();
+        names.sort();
+
+        names
+            .into_iter()
+            .map(|name| {
+                let mode = if force_reference {
+                    CaptureMode::Reference
+                } else {
+                    self.capture_mode_for(&name)
+                };
+                CaptureInfo {
+                    name: name.into_boxed_str(),
+                    decl_key: 0, // resolved by name on the IR side (lookup_var)
+                    mode,
+                }
+            })
+            .collect()
+    }
+
+    /// Decide the capture mode for a referenced variable based on its declared
+    /// mutability. `this` is always `Reference` (shared receiver). `var`
+    /// bindings are `Reference`; `val`/params/unresolved default to `Snapshot`.
+    fn capture_mode_for(&self, name: &str) -> crate::sema::Sema::CaptureMode {
+        use crate::sema::Sema::CaptureMode;
+        if name == "this" {
+            return CaptureMode::Reference;
+        }
+        // Search local_mutability for any entry with this name (the env_id
+        // component is not known here; a `var` binding will have an entry with
+        // `is_mutable == true` somewhere in the table).
+        let is_var = self
+            .local_mutability
+            .iter()
+            .any(|((_, n), mutable)| n.as_str() == name && *mutable);
+        if is_var {
+            CaptureMode::Reference
+        } else {
+            CaptureMode::Snapshot
+        }
+    }
+
     // ── infer_expr ──
 
     /// Infers the type of an expression. This is the core entry point of type checking and recursively handles all expression variants.
@@ -2168,7 +2555,22 @@ impl<'a> InferContext<'a> {
             Expr::VoidLit => self.make_builtin(Type::Void),
 
             // ── Identifiers ──
-            Expr::Ident(_) => self.infer_ident_expr(expr, ast, env),
+            Expr::Ident(_) => {
+                // Bug K: a bare nullary constructor (e.g. `None` for `type Opt<T> = | Some(T) | None`)
+                // is registered in the env as the ADT value `Opt<rigid_T>`. Because `freshen_type`
+                // deliberately skips rigid TypeVars, looking it up leaves the rigid `T` unbound, so
+                // `val x: Opt<i32> = None` fails to infer `T = i32`. When an `expected` type is a
+                // concrete generic ADT matching this constructor's owning type, instantiate the
+                // constructor with the expected type's type arguments directly.
+                if let Some(expected) = expected {
+                    if let Expr::Ident(name) = &ast.expr(expr).node {
+                        if let Some(ty) = self.infer_nullary_ctor_with_expected(name, expected) {
+                            return ty;
+                        }
+                    }
+                }
+                self.infer_ident_expr(expr, ast, env)
+            }
 
             // ── Assignment ──
             Expr::Assign { target, value } => {
@@ -2192,6 +2594,12 @@ impl<'a> InferContext<'a> {
                 let _ = self.infer_expr(*operand, ast, env, None);
                 // ! / ~ / - all return the operand's type.
                 self.infer_expr(*operand, ast, env, None)
+            }
+
+            // ── Type cast `expr as T` ──
+            Expr::As { expr: src, target } => {
+                let _ = self.infer_expr(*src, ast, env, None);
+                self.type_from_ast(*target, ast)
             }
 
             // ── Reference / dereference ──
@@ -2414,6 +2822,10 @@ impl<'a> InferContext<'a> {
 
             // ── Lambda ──
             Expr::Lambda { params, body, is_async, return_type } => {
+                // Lambda requires an explicit return type annotation.
+                if return_type.is_none() {
+                    self.add_error("lambda requires an explicit return type annotation: fun(params): T { ... }");
+                }
                 let child_env = self.env.child(env);
                 let param_types: Vec<TypeHandle> = params
                     .iter()
@@ -2430,6 +2842,32 @@ impl<'a> InferContext<'a> {
                     LambdaBody::Block(b) => self.infer_expr(*b, ast, child_env, None),
                     LambdaBody::Expression(e) => self.infer_expr(*e, ast, child_env, None),
                 };
+                // ── Unified capture analysis ──
+                // Record the capture list for this lambda scope. The IR builder
+                // consumes this (replacing its own `collect_free_idents_expr`
+                // re-scan); the per-capture mode drives by-val vs by-ref at
+                // runtime. Self-reference detection: a named nested function
+                // referencing its own name is excluded from captures.
+                {
+                    let body_expr_id = match body {
+                        LambdaBody::Block(b) => *b,
+                        LambdaBody::Expression(e) => *e,
+                    };
+                    let mut param_names: Vec<&str> = params.iter().map(|p| p.name).collect();
+                    // No name available at the Lambda expr level (named nested
+                    // functions go through `Stmt::LocalDecl`); self-upvalue is
+                    // handled there.
+                    let _ = &mut param_names;
+                    let captures = self.compute_captures(ast, body_expr_id, &param_names, false);
+                    if !captures.is_empty() || self.instantiation_ctx.is_none() {
+                        // Only record during the HM pass (instantiation mode
+                        // reuses the HM-pass capture table).
+                        if self.instantiation_ctx.is_none() {
+                            let key = module_expr_key(&self.current_module_name, expr.0 as u64);
+                            self.sema_result.put_captures(key, &self.current_module_name, captures);
+                        }
+                    }
+                }
                 let effective_body_ty = if let Some(rt) = return_type {
                     let annot_ty = self.type_from_ast(*rt, ast);
                     if let Err(e) = self.try_widen_unify(annot_ty, body_ty) {
@@ -2593,7 +3031,10 @@ impl<'a> InferContext<'a> {
                             let body_ty = self.infer_expr(*body, ast, child_env, None);
                             arm_tys.push(body_ty);
                         }
-                        crate::ast::Ast::SelectArm::Timeout { body, .. } => {
+                        crate::ast::Ast::SelectArm::Timeout { duration, body } => {
+                            // Infer the duration expression too — without this, its ExprInfo
+                            // is never written and the IR builder reports "missing ExprInfo".
+                            let _ = self.infer_expr(*duration, ast, child_env, None);
                             let body_ty = self.infer_expr(*body, ast, child_env, None);
                             arm_tys.push(body_ty);
                         }
@@ -2610,6 +3051,60 @@ impl<'a> InferContext<'a> {
             // ── inline_trait values: construct a TraitObject type ──
             Expr::InlineTrait(_) => self.infer_inline_trait_expr(expr, ast, env, expected),
         }
+    }
+
+    /// Bug K: when a bare nullary constructor (e.g. `None`) is used in a context with a
+    /// concrete expected ADT type (e.g. `val x: Opt<i32> = None`), instantiate the
+    /// constructor's owning type with the expected type's type arguments so the generic
+    /// parameter is inferred (rather than left as an unbound rigid var).
+    ///
+    /// Returns `Some(ty)` when `name` is a registered nullary constructor and `expected`
+    /// is a concrete `Type::Adt` whose name matches the constructor's owning type;
+    /// otherwise returns `None` so the caller falls back to normal identifier inference.
+    fn infer_nullary_ctor_with_expected(
+        &mut self,
+        name: &str,
+        expected: TypeHandle,
+    ) -> Option<TypeHandle> {
+        // Only consider names registered as constructors.
+        let ctors = self.sema_result.get_ctor_defs(name);
+        if ctors.is_empty() {
+            return None;
+        }
+        // Only nullary constructors (zero fields) are bare values; constructors with
+        // fields go through the Call path and infer via argument unification.
+        let is_nullary = ctors.iter().any(|c| c.field_type_reprs.is_empty());
+        if !is_nullary {
+            return None;
+        }
+        let exp_resolved = self.arena.resolve(expected);
+        let (exp_type_name, exp_args) = match self.arena.get(exp_resolved) {
+            Type::Adt(_) => self.arena.adt_parts(exp_resolved),
+            // Generic is the alias/parameterized form used for some type aliases; treat it
+            // like Adt for instantiation purposes.
+            Type::Generic(_) => self.arena.generic_parts(exp_resolved),
+            _ => return None,
+        };
+        // Disambiguate same-named nullary constructors across types: require the owning
+        // type name to match the expected type name.
+        let matching = ctors
+            .iter()
+            .find(|c| c.field_type_reprs.is_empty() && c.type_name.as_ref() == exp_type_name);
+        let type_name = match matching {
+            Some(c) => c.type_name.clone(),
+            // No name match: only safe to instantiate when there is a single candidate,
+            // to avoid guessing among ambiguous same-named constructors.
+            None => {
+                if ctors.len() == 1 {
+                    ctors[0].type_name.clone()
+                } else {
+                    return None;
+                }
+            }
+        };
+        // Build the concrete instantiation: OwnerType<expected_args...>.
+        // exp_args is already resolved/concrete (it came from the type annotation).
+        Some(self.arena.make_adt(type_name, exp_args.to_vec().into_boxed_slice()))
     }
 
     /// Infer an `Expr::Ident` expression (extracted from `infer_expr_inner`).
@@ -2728,6 +3223,22 @@ impl<'a> InferContext<'a> {
                     BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
                         let rl = self.arena.resolve(left_unwrapped);
                         let rr = self.arena.resolve(right_unwrapped);
+                        // Bug I: arrays must use `++` (ConcatList) for concatenation, not `+`.
+                        // `+` on arrays previously type-checked (returning an array type) but produced
+                        // garbage at runtime (len=0). Note: `*` is a legitimate array-repeat idiom
+                        // (e.g. `[0u8] * 4096`), so only `Add` is rejected here.
+                        if *op == BinaryOp::Add {
+                            let left_is_array = matches!(self.arena.get(rl), Type::Array(_));
+                            let right_is_array = matches!(self.arena.get(rr), Type::Array(_));
+                            if left_is_array || right_is_array {
+                                self.add_error_at(
+                                    "cannot use + on arrays; use ++ for concatenation",
+                                    bin_span.line,
+                                    bin_span.column,
+                                );
+                                return left_unwrapped;
+                            }
+                        }
                         if self.arena.get(rl).is_numeric() && self.arena.get(rr).is_numeric() {
                             // Bug #73/#74: strict numeric type checking.
                             // - Bare literals (no suffix) can be promoted freely.
@@ -3068,34 +3579,7 @@ impl<'a> InferContext<'a> {
         expected: Option<TypeHandle>,
     ) -> TypeHandle {
         match &ast.expr(expr).node {
-            Expr::Call { callee, args, type_args } => {
-                // cast call resolution: __cast_to<T>(x) / __cast_try_to<T>(x).
-                // The parser lowers cast(x).to(T) into an ordinary __cast_to<T>(x) Call;
-                // sema infers the source type S and returns T (or Throw<T, CastError> for try_to).
-                // Lookup goes through the CAST_BUILTINS registry, avoiding name-specific branches.
-                if let Expr::Ident(name) = &ast.expr(*callee).node {
-                    if let Some(is_try) = CAST_BUILTINS
-                        .iter()
-                        .find_map(|(n, t)| (*n == *name).then_some(*t))
-                    {
-                        // Infer the source expression's type.
-                        let _ = self.infer_expr(args[0], ast, env, None);
-                        // Take the target type T from type_args.
-                        let target_ty = match type_args {
-                            Some(ta) if !ta.is_empty() => self.type_from_ast(ta[0], ast),
-                            _ => self.arena.fresh_type_var(),
-                        };
-                        if is_try {
-                            let err_ty = self.arena.make_adt(
-                                "CastError".into(),
-                                Box::new([]),
-                            );
-                            return self.arena.make_throw(target_ty, err_ty);
-                        }
-                        return target_ty;
-                    }
-                }
-
+            Expr::Call { callee, args, .. } => {
                 // ── Constructor multi-mapping disambiguation ──
                 // When callee is an Ident that maps to multiple same-named constructors, disambiguate by priority:
                 //   1. Type-oriented: when expected_ty is an Adt, select by type_name
@@ -3540,6 +4024,19 @@ impl<'a> InferContext<'a> {
                     return self.make_builtin(Type::Void);
                 }
 
+                // reflect trait methods (auto-impl): any receiver type gets reflect methods
+                // (format/type_name/kind/field_count/...) without explicit trait declaration.
+                // This is the Sema-side recognition that pairs with Builder::lookup_intrinsic +
+                // reflect_method_intrinsic — the method call type-checks here, and lowers to a
+                // CF_REFLECT_* compute_fn at IR build time.
+                if let Some(ret_ty) = self.reflect_method_return_type(*method, args.len()) {
+                    // Infer args (for type-checking side effects) but discard their constraints.
+                    for &a in args.iter() {
+                        let _ = self.infer_expr(a, ast, env, None);
+                    }
+                    return ret_ty;
+                }
+
                 // Fallback: infer arguments and return a fresh var.
                 // For a receiver whose type is already determined (not TypeVar/Unknown/Never), report "method does not exist"
                 // to help the user locate the problem; for a TypeVar receiver, silently return a fresh var (inference pending, deferred to the solver).
@@ -3571,6 +4068,35 @@ impl<'a> InferContext<'a> {
             }
             _ => unreachable!("infer_method_call_expr called on non-MethodCall expression"),
         }
+    }
+
+    /// Return type for an auto-impl reflect trait method, or `None` if `method`
+    /// is not a reflect method. This pairs with `Builder::reflect_method_intrinsic`
+    /// to give every type access to reflect methods without explicit trait impl.
+    ///
+    /// Must stay in sync with:
+    /// - `ir/Builder.rs::reflect_method_intrinsic` (method-name → IntrinsicKind)
+    /// - `ir/Compute.rs` compute_reflect_* (the runtime implementation)
+    fn reflect_method_return_type(&mut self, method: &str, arg_count: usize) -> Option<TypeHandle> {
+        // Nullary reflect methods (receiver only, arg_count == 0).
+        let nullary: Option<TypeHandle> = match method {
+            "format" | "type_name" | "kind" | "constructor" => Some(self.make_builtin(Type::Str)),
+            "size" | "alignment" => Some(self.make_builtin(Type::U32)),
+            "field_count" => Some(self.make_builtin(Type::U16)),
+            _ => None,
+        };
+        if let Some(ty) = nullary {
+            return (arg_count == 0).then_some(ty);
+        }
+        // Unary-index reflect methods (receiver + index, arg_count == 1).
+        let unary: Option<TypeHandle> = match method {
+            "field_name" => Some(self.make_builtin(Type::Str)),
+            _ => None,
+        };
+        if let Some(ty) = unary {
+            return (arg_count == 1).then_some(ty);
+        }
+        None
     }
 
     /// Integer suffix → corresponding integer TypeHandle (derived from `BUILTIN_TABLE`; returns `None` on miss).
@@ -4263,6 +4789,16 @@ impl<'a> InferContext<'a> {
             }
             Stmt::Defer { expr } => {
                 let _ = self.infer_expr(*expr, ast, env, None);
+                // Record the defer's capture list. Defer semantics require
+                // observing values at function/block exit, so ALL captures are
+                // forced to Reference mode (this directly resolves Bug #49:
+                // the `val`-snapshot vs defer-latest tension is eliminated
+                // because defer never snapshots).
+                if self.instantiation_ctx.is_none() {
+                    let captures = self.compute_captures(ast, *expr, &[], true);
+                    let key = module_expr_key(&self.current_module_name, expr.0 as u64);
+                    self.sema_result.put_captures(key, &self.current_module_name, captures);
+                }
                 None
             }
             Stmt::Throw { expr } => {
@@ -4349,6 +4885,18 @@ impl<'a> InferContext<'a> {
                 // Route through check_decl uniformly: nested function/type/trait declarations
                 // share the same processing path.
                 // LocalDecl's Box<Decl> has no span; the enclosing Stmt provides it.
+                // For nested function declarations, record the capture list (the
+                // nested function captures outer-scope variables; self-reference
+                // to its own name is excluded).
+                if let crate::ast::Ast::Decl::FunDecl { name, params, body, .. } = decl.as_ref() {
+                    if self.instantiation_ctx.is_none() {
+                        let mut param_names: Vec<&str> = params.iter().map(|p| p.name).collect();
+                        param_names.push(name); // self-reference is not a capture
+                        let captures = self.compute_captures(ast, *body, &param_names, false);
+                        let key = module_expr_key(&self.current_module_name, body.0 as u64);
+                        self.sema_result.put_captures(key, &self.current_module_name, captures);
+                    }
+                }
                 self.check_decl(decl.as_ref(), ast.stmt(stmt).span, ast, env);
                 None
             }
@@ -4500,16 +5048,6 @@ impl<'a> InferContext<'a> {
             chan_ret,
         );
         self.env.define(env, "channel", chan_fn);
-
-        // Value: builtin opaque type (ValueHandle, u32).
-        // Reflection primitives receive a Value, internally look up the ValueArena to fetch
-        // the HeapObj and match directly.
-        // Opaque to Sema (internal structure not exposed); size 4B.
-        let value_ty = self.arena.make_generic(
-            "Value".into(),
-            Box::new([]),
-        );
-        self.env.define(env, "Value", value_ty);
     }
 
     // ── check_module ──
@@ -5245,7 +5783,38 @@ impl<'a> InferContext<'a> {
     /// the caller supplies it from the enclosing Stmt.
     fn check_decl(&mut self, decl: &Decl<'_>, decl_span: crate::ast::Ast::Span, ast: &AstArena<'_>, env: EnvId) {
         match decl {
-            Decl::FunDecl { name, type_params, params, return_type, body, extern_c_body, is_async, .. } => {
+            Decl::FunDecl { name, type_params, params, return_type, body, extern_c_body, is_async, attributes, .. } => {
+                // ── FFI permission check ──
+                // `@extern` / `@c_include` / `#{ }#` are only allowed in builtin (stdlib) modules;
+                // `@internal` is a reserved attribute and may not appear in any user code.
+                // The builtin check is based on the module-name path prefix
+                // (`current_module_name` is set from `module.name` in `check_module_with_env`;
+                // builtin module names look like "builtin/io/Raw.kz").
+                let is_builtin = self.current_module_name.starts_with("builtin/");
+                if !is_builtin {
+                    for attr in attributes {
+                        match attr.name {
+                            crate::ffi::ATTR_INTERNAL => self.add_error_at(
+                                "attribute '@internal' is reserved for the language implementation",
+                                decl_span.line,
+                                decl_span.column,
+                            ),
+                            crate::ffi::ATTR_EXTERN | crate::ffi::ATTR_C_INCLUDE => self.add_error_at(
+                                &format!("attribute '@{}' is only allowed in builtin (stdlib) modules", attr.name),
+                                decl_span.line,
+                                decl_span.column,
+                            ),
+                            _ => {}
+                        }
+                    }
+                    if extern_c_body.is_some() {
+                        self.add_error_at(
+                            "inline C body (#{ }#) is only allowed in builtin (stdlib) modules",
+                            decl_span.line,
+                            decl_span.column,
+                        );
+                    }
+                }
                 // Top-level functions disallow a self parameter (detected via the ThisType type
                 // node, not by parameter name; self is only allowed inside type/trait block methods).
                 if !params.is_empty() && self.is_this_param(params[0].type_annotation, ast) {
@@ -5337,6 +5906,12 @@ impl<'a> InferContext<'a> {
                 // Register the nested type definition into sema_result (so constructor calls are
                 // recognized during type checking).
                 ast_type_decl_to_type_def(self.arena, self.sema_result, *name, type_params, def, ast, decl_span, &self.current_module_name);
+                // Register methods into TypeDefInfo.methods (indexed by method_idx).
+                // This mirrors what `populate_module` does for top-level TypeDecls. Without this,
+                // `lookup_method_idx` cannot find local-type methods and IR dispatch returns void.
+                for method in methods.iter() {
+                    crate::sema::Sema::ast_method_to_func_sig_pub(self.arena, self.sema_result, *name, method, ast);
+                }
                 // Type parameter bindings (including kind registration): so references to the
                 // generic parameter T inside the type block can be resolved from
                 // type_binding_stack.

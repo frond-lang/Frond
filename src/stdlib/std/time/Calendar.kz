@@ -68,10 +68,10 @@ pub fun day_of_year(year: i32, month: u8, day: u8): u16 {
     var total: u16 = 0
     var m: u8 = 1
     while m < month {
-        total = total + cast(days_in_month(year, m)).to(u16)
+        total = total + (days_in_month(year, m)) as u16
         m = m + 1
     }
-    total + cast(day).to(u16)
+    total + day as u16
 }
 
 // ─── Julian day (Howard Hinnant algorithm) ────────────────────────────────
@@ -80,15 +80,15 @@ pub fun day_of_year(year: i32, month: u8, day: u8): u16 {
 // Algorithm reference: http://howardhinnant.github.io/date_algorithms.html
 pub fun to_julian_day(year: i32, month: u8, day: u8): i64 {
     var y = year
-    var m = cast(month).to(i32)
+    var m = month as i32
     if m <= 2 {
         y = y - 1
         m = m + 12
     }
     val era = if y >= 0 { y } else { y - 399 }
-    val era_div = floor_div(cast(era).to(i64), 400)
-    val yoe = cast(era).to(i64) - era_div * 400
-    val doy = floor_div(cast(153 * (m - 3) + 2).to(i64), 5) + cast(day).to(i64) - 1
+    val era_div = floor_div(era as i64, 400)
+    val yoe = era as i64 - era_div * 400
+    val doy = floor_div((153 * (m - 3) + 2) as i64, 5) + day as i64 - 1
     val doe = yoe * 365 + floor_div(yoe, 4) - floor_div(yoe, 100) + doy
     era_div * 146097 + doe + 1721120
 }
@@ -99,11 +99,11 @@ pub fun from_julian_day(jd: i64): (year: i32, month: u8, day: u8) {
     val era = floor_div(if z >= 0 { z } else { z - 146096 }, 146097)
     val doe = z - era * 146097
     val yoe = floor_div(doe - floor_div(doe, 1460) + floor_div(doe, 36524) - floor_div(doe, 146096), 365)
-    val y = cast(yoe).to(i32) + cast(era).to(i32) * 400
+    val y = yoe as i32 + era as i32 * 400
     val doy = doe - (365 * yoe + floor_div(yoe, 4) - floor_div(yoe, 100))
     val mp = floor_div(5 * doy + 2, 153)
-    val d = cast(doy - floor_div(153 * mp + 2, 5) + 1).to(u8)
-    val m = cast(if mp < 10 { mp + 3 } else { mp - 9 }).to(u8)
+    val d = (doy - floor_div(153 * mp + 2, 5) + 1) as u8
+    val m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u8
     val final_year = if m <= 2 { y + 1 } else { y }
     return (year: final_year, month: m, day: d)
 }
@@ -128,7 +128,7 @@ pub fun civil_from_days(days: i64): (year: i32, month: u8, day: u8) {
 
 // Days since 1970-01-01 → weekday (0=Sunday, 1970-01-01 is Thursday)
 pub fun weekday_from_days(days: i64): u8 {
-    cast(floor_mod(days + 4, 7)).to(u8)
+    floor_mod(days + 4, 7) as u8
 }
 
 // ─── Weekday ─────────────────────────────────────────────────────────
@@ -136,7 +136,7 @@ pub fun weekday_from_days(days: i64): u8 {
 // Gregorian date → weekday (0=Sunday, 1=Monday, ..., 6=Saturday)
 pub fun weekday_of(year: i32, month: u8, day: u8): u8 {
     val jd = to_julian_day(year, month, day)
-    cast(floor_mod(jd + 1, 7)).to(u8)
+    floor_mod(jd + 1, 7) as u8
 }
 
 // ─── Date arithmetic ─────────────────────────────────────────────────────

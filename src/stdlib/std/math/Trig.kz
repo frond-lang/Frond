@@ -2,7 +2,7 @@
 //
 // Pure Kuzo implementation, algorithm: Taylor series + argument reduction.
 // Depends on Round.kz for fmod implementation, Power.kz for exp/log/sqrt implementation.
-// Generic functions use match type_name(x) to dispatch to the corresponding precision implementation.
+// Generic functions use match x.type_name() to dispatch to the corresponding precision implementation.
 
 // ─── sin (sine, argument reduction + Taylor) ───
 // r = fmod(x, 2π), reduced to [-π,π]; sin(r) = r - r³/3! + r⁵/5! - ...
@@ -19,7 +19,7 @@ fun sin_f64_impl(x: f64): f64 {
     var f1 = 2
     var f2 = 3
     while f2 <= 29 {
-        term = (0.0 - term * r2) / cast(f1).to(f64) / cast(f2).to(f64)
+        term = (0.0 - term * r2) / f1 as f64 / f2 as f64
         sum = sum + term
         f1 = f1 + 2
         f2 = f2 + 2
@@ -38,7 +38,7 @@ fun sin_f32_impl(x: f32): f32 {
     var f1 = 2
     var f2 = 3
     while f2 <= 19 {
-        term = (0.0 - term * r2) / cast(f1).to(f32) / cast(f2).to(f32)
+        term = (0.0 - term * r2) / f1 as f32 / f2 as f32
         sum = sum + term
         f1 = f1 + 2
         f2 = f2 + 2
@@ -57,7 +57,7 @@ fun sin_f16_impl(x: f16): f16 {
     var f1 = 2
     var f2 = 3
     while f2 <= 9 {
-        term = (0.0 - term * r2) / cast(f1).to(f16) / cast(f2).to(f16)
+        term = (0.0 - term * r2) / f1 as f16 / f2 as f16
         sum = sum + term
         f1 = f1 + 2
         f2 = f2 + 2
@@ -76,7 +76,7 @@ fun sin_f128_impl(x: f128): f128 {
     var f1 = 2
     var f2 = 3
     while f2 <= 59 {
-        term = (0.0 - term * r2) / cast(f1).to(f128) / cast(f2).to(f128)
+        term = (0.0 - term * r2) / f1 as f128 / f2 as f128
         sum = sum + term
         f1 = f1 + 2
         f2 = f2 + 2
@@ -85,11 +85,11 @@ fun sin_f128_impl(x: f128): f128 {
 }
 
 pub fun sin<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(sin_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(sin_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(sin_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(sin_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (sin_f64_impl(x as f64)) as T,
+        "f32" => (sin_f32_impl(x as f32)) as T,
+        "f16" => (sin_f16_impl(x as f16)) as T,
+        "f128" => (sin_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -114,11 +114,11 @@ fun cos_f128_impl(x: f128): f128 {
 }
 
 pub fun cos<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(cos_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(cos_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(cos_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(cos_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (cos_f64_impl(x as f64)) as T,
+        "f32" => (cos_f32_impl(x as f32)) as T,
+        "f16" => (cos_f16_impl(x as f16)) as T,
+        "f128" => (cos_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -151,11 +151,11 @@ fun tan_f128_impl(x: f128): f128 {
 }
 
 pub fun tan<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(tan_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(tan_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(tan_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(tan_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (tan_f64_impl(x as f64)) as T,
+        "f32" => (tan_f32_impl(x as f32)) as T,
+        "f16" => (tan_f16_impl(x as f16)) as T,
+        "f128" => (tan_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -188,11 +188,11 @@ fun sinh_f128_impl(x: f128): f128 {
 }
 
 pub fun sinh<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(sinh_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(sinh_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(sinh_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(sinh_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (sinh_f64_impl(x as f64)) as T,
+        "f32" => (sinh_f32_impl(x as f32)) as T,
+        "f16" => (sinh_f16_impl(x as f16)) as T,
+        "f128" => (sinh_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -225,11 +225,11 @@ fun cosh_f128_impl(x: f128): f128 {
 }
 
 pub fun cosh<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(cosh_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(cosh_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(cosh_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(cosh_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (cosh_f64_impl(x as f64)) as T,
+        "f32" => (cosh_f32_impl(x as f32)) as T,
+        "f16" => (cosh_f16_impl(x as f16)) as T,
+        "f128" => (cosh_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -266,11 +266,11 @@ fun tanh_f128_impl(x: f128): f128 {
 }
 
 pub fun tanh<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(tanh_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(tanh_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(tanh_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(tanh_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (tanh_f64_impl(x as f64)) as T,
+        "f32" => (tanh_f32_impl(x as f32)) as T,
+        "f16" => (tanh_f16_impl(x as f16)) as T,
+        "f128" => (tanh_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -294,7 +294,7 @@ fun atan_f64_impl(x: f64): f64 {
     var d = 3
     while d <= 39 {
         term = term * x2
-        val t = term / cast(d).to(f64)
+        val t = term / d as f64
         if d % 4 == 3 { sum = sum - t } else { sum = sum + t }
         d = d + 2
     }
@@ -318,7 +318,7 @@ fun atan_f32_impl(x: f32): f32 {
     var d = 3
     while d <= 29 {
         term = term * x2
-        val t = term / cast(d).to(f32)
+        val t = term / d as f32
         if d % 4 == 3 { sum = sum - t } else { sum = sum + t }
         d = d + 2
     }
@@ -342,7 +342,7 @@ fun atan_f16_impl(x: f16): f16 {
     var d = 3
     while d <= 15 {
         term = term * x2
-        val t = term / cast(d).to(f16)
+        val t = term / d as f16
         if d % 4 == 3 { sum = sum - t } else { sum = sum + t }
         d = d + 2
     }
@@ -366,7 +366,7 @@ fun atan_f128_impl(x: f128): f128 {
     var d = 3
     while d <= 79 {
         term = term * x2
-        val t = term / cast(d).to(f128)
+        val t = term / d as f128
         if d % 4 == 3 { sum = sum - t } else { sum = sum + t }
         d = d + 2
     }
@@ -377,11 +377,11 @@ fun atan_f128_impl(x: f128): f128 {
 }
 
 pub fun atan<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(atan_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(atan_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(atan_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(atan_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (atan_f64_impl(x as f64)) as T,
+        "f32" => (atan_f32_impl(x as f32)) as T,
+        "f16" => (atan_f16_impl(x as f16)) as T,
+        "f128" => (atan_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -419,11 +419,11 @@ fun asin_f128_impl(x: f128): f128 {
 }
 
 pub fun asin<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(asin_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(asin_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(asin_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(asin_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (asin_f64_impl(x as f64)) as T,
+        "f32" => (asin_f32_impl(x as f32)) as T,
+        "f16" => (asin_f16_impl(x as f16)) as T,
+        "f128" => (asin_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -448,11 +448,11 @@ fun acos_f128_impl(x: f128): f128 {
 }
 
 pub fun acos<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(acos_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(acos_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(acos_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(acos_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (acos_f64_impl(x as f64)) as T,
+        "f32" => (acos_f32_impl(x as f32)) as T,
+        "f16" => (acos_f16_impl(x as f16)) as T,
+        "f128" => (acos_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -510,11 +510,11 @@ fun atan2_f128_impl(y: f128, x: f128): f128 {
 }
 
 pub fun atan2<T>(y: T, x: T): T {
-    match type_name(x) {
-        "f64" => cast(atan2_f64_impl(cast(y).to(f64), cast(x).to(f64))).to(T),
-        "f32" => cast(atan2_f32_impl(cast(y).to(f32), cast(x).to(f32))).to(T),
-        "f16" => cast(atan2_f16_impl(cast(y).to(f16), cast(x).to(f16))).to(T),
-        "f128" => cast(atan2_f128_impl(cast(y).to(f128), cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (atan2_f64_impl(y as f64, x as f64)) as T,
+        "f32" => (atan2_f32_impl(y as f32, x as f32)) as T,
+        "f16" => (atan2_f16_impl(y as f16, x as f16)) as T,
+        "f128" => (atan2_f128_impl(y as f128, x as f128)) as T,
         _ => x
     }
 }
@@ -535,11 +535,11 @@ fun asinh_f128_impl(x: f128): f128 {
 }
 
 pub fun asinh<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(asinh_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(asinh_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(asinh_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(asinh_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (asinh_f64_impl(x as f64)) as T,
+        "f32" => (asinh_f32_impl(x as f32)) as T,
+        "f16" => (asinh_f16_impl(x as f16)) as T,
+        "f128" => (asinh_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -565,11 +565,11 @@ fun acosh_f128_impl(x: f128): f128 {
 }
 
 pub fun acosh<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(acosh_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(acosh_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(acosh_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(acosh_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (acosh_f64_impl(x as f64)) as T,
+        "f32" => (acosh_f32_impl(x as f32)) as T,
+        "f16" => (acosh_f16_impl(x as f16)) as T,
+        "f128" => (acosh_f128_impl(x as f128)) as T,
         _ => x
     }
 }
@@ -595,11 +595,11 @@ fun atanh_f128_impl(x: f128): f128 {
 }
 
 pub fun atanh<T>(x: T): T {
-    match type_name(x) {
-        "f64" => cast(atanh_f64_impl(cast(x).to(f64))).to(T),
-        "f32" => cast(atanh_f32_impl(cast(x).to(f32))).to(T),
-        "f16" => cast(atanh_f16_impl(cast(x).to(f16))).to(T),
-        "f128" => cast(atanh_f128_impl(cast(x).to(f128))).to(T),
+    match x.type_name() {
+        "f64" => (atanh_f64_impl(x as f64)) as T,
+        "f32" => (atanh_f32_impl(x as f32)) as T,
+        "f16" => (atanh_f16_impl(x as f16)) as T,
+        "f128" => (atanh_f128_impl(x as f128)) as T,
         _ => x
     }
 }

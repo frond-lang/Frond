@@ -79,10 +79,6 @@ pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
             let graph_node = graph.node(offset + i);
             if graph_node.kind == NodeKind::EventSource {
                 frame.pending_inputs[i] = PENDING_EXTERNAL;
-            } else if graph_node.kind == NodeKind::Gate
-                && graph.has_select_info(offset + i)
-            {
-                frame.pending_inputs[i] = 0;
             } else {
                 let inputs = graph.inputs(
                     graph_node.inputs_offset,
@@ -499,7 +495,8 @@ impl<S: LockStrategy> Engine<S> {
                     let info = graph.select_info_at(graph_node_id.0 as usize);
 
                     if let Some(info) = info {
-                        let mut ready_branch: Option<SubGraphId> = None;
+                        // Tracks the selected branch: (subgraph_id, event_kind, channel value if Channel).
+                        let mut ready_branch: Option<(SubGraphId, EventSourceKind, Option<Value>)> = None;
                         for (branch_idx, branch) in info.branches.iter().enumerate() {
                             let event_val =
                                 frame.get_value_by_global(branch.event_source_node);
@@ -534,14 +531,35 @@ impl<S: LockStrategy> Engine<S> {
                                 _ => false,
                             };
                             if is_ready {
-                                ready_branch = Some(branch.subgraph_id);
+                                // For a Channel branch, consume the value now (recv) so it is bound
+                                // to the arm's binding inside the body. The branch subgraph's first
+                                // param node receives this value. A closed/empty channel yields Null.
+                                let recv_val = if branch.event_kind == EventSourceKind::Channel {
+                                    Some(
+                                        event_val
+                                            .heap_obj()
+                                            .and_then(|h| h.channel())
+                                            .and_then(|ch| ch.recv())
+                                            .unwrap_or(Value::Null),
+                                    )
+                                } else {
+                                    None
+                                };
+                                ready_branch = Some((branch.subgraph_id, branch.event_kind, recv_val));
                                 break;
                             }
                         }
 
-                        if let Some(sg_id) = ready_branch {
+                        if let Some((sg_id, ev_kind, recv_val)) = ready_branch {
+                            // Channel branch: pass the recv'd value as arg[0] (bound to the arm's
+                            // binding). Timer/other branches: no args.
+                            let args: Vec<Value> = if ev_kind == EventSourceKind::Channel {
+                                vec![recv_val.unwrap_or(Value::Null)]
+                            } else {
+                                Vec::new()
+                            };
                             let child_fid =
-                                self.start_subgraph(fid, gate_local, sg_id, &[], frame, None);
+                                self.start_subgraph(fid, gate_local, sg_id, &args, frame, None);
                             queue.push(child_fid);
                             self.event_waiters.lock().push((
                                 RuntimeEvent::SubgraphComplete(child_fid),

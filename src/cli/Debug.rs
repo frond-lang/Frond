@@ -1,4 +1,4 @@
-//! debug subcommand — diagnostic mode (tokens/ast/check/emit-c/emit-ffi/full).
+//! debug subcommand — diagnostic mode (tokens/ast/check/emit-c/full).
 
 use std::process;
 
@@ -19,7 +19,6 @@ pub fn cmd_debug(file: Option<String>, stage: Option<DebugStage>) {
         DebugStage::Tokens => debug_tokens(&source),
         DebugStage::Ast => debug_ast(&source),
         DebugStage::EmitC => debug_emit_c(&source),
-        DebugStage::EmitFfi => debug_emit_ffi(&source),
         DebugStage::Check => debug_check(&source, &entry_path),
         DebugStage::Full => run_from_project(crate::pass::Optimizer::OptLevel::default(), true),
     }
@@ -90,39 +89,6 @@ fn debug_emit_c(source: &str) {
                 Ok(c_code) => print!("{}", c_code),
                 Err(e) => {
                     eprintln!("Error extracting C: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Err(err) => {
-            eprintln!("Parse error at {}:{}: {}", err.line, err.column, err.message);
-            process::exit(1);
-        }
-    }
-}
-
-/// Generate Rust FFI bindings + wrapper to stdout.
-fn debug_emit_ffi(source: &str) {
-    let arena = bumpalo::Bump::new();
-    let mut lexer = Lexer::new(source);
-    let mut sink = TokenCollector::new();
-    lexer.tokenize_into(&mut sink);
-    let tokens: Vec<Token<'_>> = sink.into_tokens();
-    let tokens_ref = arena.alloc_slice_copy(&tokens);
-    let mut parser = KuzoParser::new(tokens_ref, &arena, ErrorCollector::new());
-
-    match parser.parse_module("stdin") {
-        Ok(module) => {
-            if !parser.errors().is_empty() {
-                for err in parser.errors() {
-                    eprintln!("Error: parse error at {}:{}: {}", err.line, err.column, err.message);
-                }
-                process::exit(1);
-            }
-            match crate::ffi::ExternC::extract_rust_ffi_from_module(&module) {
-                Ok(ffi_code) => print!("{}", ffi_code),
-                Err(e) => {
-                    eprintln!("Error generating FFI: {}", e);
                     process::exit(1);
                 }
             }

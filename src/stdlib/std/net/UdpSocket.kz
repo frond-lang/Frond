@@ -42,14 +42,14 @@ fun __net_udp_send_to(fd: i64, ip: IpAddr, port: u16, buf: u8[]): Throw<usize, I
             if n < 0 {
                 throw IOError(Other, "udp send_to failed", 0, null)
             }
-            Ok(cast(n).to(usize))
+            Ok(n as usize)
         },
         V6(v6_addr) => {
             val n = __net_udp_send_to_v6(fd, v6_addr.hi, v6_addr.lo, port, buf, buf.len())
             if n < 0 {
                 throw IOError(Other, "udp send_to failed", 0, null)
             }
-            Ok(cast(n).to(usize))
+            Ok(n as usize)
         },
     }
 }
@@ -97,7 +97,7 @@ pub type UdpSocket = UdpSocket(fd: i64, local_addr: SocketAddr, is_closed: bool)
         if n < 0 {
             throw IOError(ConnectionReset, "udp recv_from failed", 0, null)
         }
-        Ok(RecvFromResult(buf[0..cast(n).to(usize)], local_addr))
+        Ok(RecvFromResult(buf[0..n as usize], local_addr))
     }
 
     // Closes the socket. Idempotent: repeated close does not error.

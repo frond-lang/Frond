@@ -1716,6 +1716,8 @@ pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
         (HeapObj::SenderVal(x), HeapObj::SenderVal(y)) => std::sync::Arc::ptr_eq(&x.channel, &y.channel),
         (HeapObj::ReceiverVal(x), HeapObj::ReceiverVal(y)) => std::sync::Arc::ptr_eq(&x.channel, &y.channel),
         (HeapObj::CoroutineFrame, HeapObj::CoroutineFrame) => false,
+        // FFI opaque pointers: equal iff raw pointer value matches
+        (HeapObj::OpaquePtr(x), HeapObj::OpaquePtr(y)) => x.ptr == y.ptr,
         // Different HeapObj variants are never equal
         _ => false,
     }
@@ -1964,6 +1966,7 @@ fn deep_clone_heap(
         HeapObj::SenderVal(s) => HeapObj::SenderVal(s.clone()),
         HeapObj::ReceiverVal(r) => HeapObj::ReceiverVal(r.clone()),
         HeapObj::CoroutineFrame => HeapObj::CoroutineFrame,
+        HeapObj::OpaquePtr(op) => HeapObj::OpaquePtr(op.clone()),
     }
 }
 
@@ -2270,66 +2273,4 @@ impl ValueArena {
     }
 }
 
-// `read_int_as!` reads an integer from bytes by tag and promotes it to i128 / u128.
-// Integer types (including Isize/Usize) are sign-extended before conversion to the target type;
-// non-integer tags fall back to 0.
-// Signed sources go through i128 when converting to u128, preserving the semantics of the original per-arm code.
-macro_rules! read_int_as {
-    ($tag:expr, $bytes:expr, i128) => {
-        match $tag {
-            ValueTag::I8    => $bytes.first().copied().unwrap_or(0) as i8 as i128,
-            ValueTag::U8    => $bytes.first().copied().unwrap_or(0) as u8 as i128,
-            ValueTag::I16   => read_i16_le($bytes) as i128,
-            ValueTag::U16   => read_u16_le($bytes) as i128,
-            ValueTag::I32   => read_i32_le($bytes) as i128,
-            ValueTag::U32   => read_u32_le($bytes) as i128,
-            ValueTag::I64   => read_i64_le($bytes) as i128,
-            ValueTag::U64   => read_u64_le($bytes) as i128,
-            ValueTag::I128  => read_i128_le($bytes),
-            ValueTag::U128  => read_u128_le($bytes) as i128,
-            ValueTag::Isize => read_i64_le($bytes) as isize as i128,
-            ValueTag::Usize => read_u64_le($bytes) as usize as i128,
-            _ => 0,
-        }
-    };
-    ($tag:expr, $bytes:expr, u128) => {
-        match $tag {
-            ValueTag::I8    => $bytes.first().copied().unwrap_or(0) as i8 as i128 as u128,
-            ValueTag::U8    => $bytes.first().copied().unwrap_or(0) as u8 as u128,
-            ValueTag::I16   => read_i16_le($bytes) as i128 as u128,
-            ValueTag::U16   => read_u16_le($bytes) as u128,
-            ValueTag::I32   => read_i32_le($bytes) as i128 as u128,
-            ValueTag::U32   => read_u32_le($bytes) as u128,
-            ValueTag::I64   => read_i64_le($bytes) as i128 as u128,
-            ValueTag::U64   => read_u64_le($bytes) as u128,
-            ValueTag::I128  => read_i128_le($bytes) as u128,
-            ValueTag::U128  => read_u128_le($bytes),
-            ValueTag::Isize => read_i64_le($bytes) as isize as i128 as u128,
-            ValueTag::Usize => read_u64_le($bytes) as usize as u128,
-            _ => 0,
-        }
-    };
-}
-
-// `write_int_bytes!` writes an integer (i128 or u128) into the destination byte buffer by dst_tag,
-// reusing the existing write_*_le helpers to preserve the truncation/padding semantics of the original per-arm code.
-macro_rules! write_int_bytes {
-    ($val:expr, $tag:expr, $dst:expr) => {
-        match $tag {
-            ValueTag::I8    => write_i8($val as i8, $dst),
-            ValueTag::U8    => write_u8($val as u8, $dst),
-            ValueTag::I16   => write_i16_le($val as i16, $dst),
-            ValueTag::U16   => write_u16_le($val as u16, $dst),
-            ValueTag::I32   => write_i32_le($val as i32, $dst),
-            ValueTag::U32   => write_u32_le($val as u32, $dst),
-            ValueTag::I64   => write_i64_le($val as i64, $dst),
-            ValueTag::U64   => write_u64_le($val as u64, $dst),
-            ValueTag::I128  => write_i128_le($val as i128, $dst),
-            ValueTag::U128  => write_u128_le($val as u128, $dst),
-            ValueTag::Isize => write_i64_le($val as isize as i64, $dst),
-            ValueTag::Usize => write_u64_le($val as usize as u64, $dst),
-            _ => {}
-        }
-    };
-}
 

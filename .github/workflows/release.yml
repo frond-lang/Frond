@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and release (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: kuzo
+            archive: tar.gz
+            cc: clang
+            cxx: clang++
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: kuzo
+            archive: tar.gz
+            cc: clang
+            cxx: clang++
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: kuzo
+            archive: tar.gz
+            cc: clang
+            cxx: clang++
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: kuzo
+            archive: tar.gz
+            cc: clang
+            cxx: clang++
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: kuzo.exe
+            archive: zip
+            cc: cl
+            cxx: cl
+
+    runs-on: ${{ matrix.os }}
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # ── C/C++ toolchain setup ─────────────────────────────────────────
+      - name: Install C toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm build-essential
+          clang --version
+
+      - name: Verify C toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          clang --version
+          xcrun --find clang
+
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Verify C toolchain (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cl 2>&1 | head -1
+          where cl
+        shell: bash
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../kuzo-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../kuzo-${{ matrix.target }}.zip ${{ matrix.artifact }}
+
+      - name: Generate checksum
+        run: |
+          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
+            shasum -a 256 kuzo-${{ matrix.target }}.tar.gz > kuzo-${{ matrix.target }}.tar.gz.sha256
+          else
+            sha256sum kuzo-${{ matrix.target }}.zip > kuzo-${{ matrix.target }}.zip.sha256
+          fi
+        shell: bash
+
+      # ── 上传当前平台产物到 Release ────────────────────────────────────
+      # 每个 matrix job 成功后立即上传自己的 artifact；
+      # softprops/action-gh-release@v2 会在 release 不存在时自动创建，
+      # 已存在时只追加 files，内置并发冲突重试，无需独立 release job。
+      - name: Extract tag name
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
+          files: |
+            kuzo-${{ matrix.target }}.*

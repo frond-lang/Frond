@@ -8,6 +8,7 @@
 @c_include("unistd.h")
 @c_include("sys/ioctl.h")
 @c_include("string.h")
+@c_include("windows.h")
 @extern("C")
 fun __terminal_enable_raw_mode(orig_buf: u8[]): i32 #{
     #if defined(_WIN32) || defined(_WIN64)

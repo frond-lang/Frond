@@ -9,6 +9,9 @@
 @c_include("unistd.h")
 @c_include("stdio.h")
 @c_include("string.h")
+@c_include("windows.h")
+@c_include("io.h")
+@c_include("direct.h")
 @extern("C")
 fun __file_open_raw(path: str, flags: i32, mode: i32): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -124,18 +127,30 @@ fun __stderr_write_raw(s: str): i32 #{
 // Reads one line into buffer, returns number of bytes read (>=0 success, 1 EOF, -1 error)
 // buf_data/buf_len are automatically provided by u8[] marshal
 @c_include("unistd.h")
+@c_include("io.h")
 @extern("C")
 fun __stdin_readln_into(buf: u8[]): i64 #{
     size_t total = 0;
     char ch;
-    ssize_t n;
-    while (total < buf_len) {
-        n = read(STDIN_FILENO, &ch, 1);
-        if (n < 0) return -1;
-        if (n == 0) return total == 0 ? 1 : (int64_t)total;
-        if (ch == '\n') return (int64_t)total;
-        buf_data[total++] = ch;
-    }
+    #if defined(_WIN32) || defined(_WIN64)
+        int n;
+        while (total < buf_len) {
+            n = _read(0, &ch, 1);
+            if (n < 0) return -1;
+            if (n == 0) return total == 0 ? 1 : (int64_t)total;
+            if (ch == '\n') return (int64_t)total;
+            buf_data[total++] = ch;
+        }
+    #else
+        ssize_t n;
+        while (total < buf_len) {
+            n = read(STDIN_FILENO, &ch, 1);
+            if (n < 0) return -1;
+            if (n == 0) return total == 0 ? 1 : (int64_t)total;
+            if (ch == '\n') return (int64_t)total;
+            buf_data[total++] = ch;
+        }
+    #endif
     return (int64_t)total;
 }#
 

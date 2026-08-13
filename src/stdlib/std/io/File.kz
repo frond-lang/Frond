@@ -77,7 +77,7 @@ pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
         if n < 0 {
             throw IOError(Other, "file read failed", 0, path)
         }
-        Ok(buf[0..cast(n).to(usize)])
+        Ok(buf[0..n as usize])
     }
 
     pub async fun write(buf: u8[], len: usize): Async<Throw<usize, IOError>> {
@@ -88,7 +88,7 @@ pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
         if n < 0 {
             throw IOError(Other, "file write failed", 0, path)
         }
-        Ok(cast(n).to(usize))
+        Ok(n as usize)
     }
 
     pub async fun seek(from: SeekFrom): Async<Throw<i64, IOError>> {
@@ -138,7 +138,7 @@ pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
             if chunk.len() == 0 {
                 throw IOError(UnexpectedEof, "read_exact: unexpected EOF", 0, path)
             }
-            result = result + cast(chunk).to(str)
+            result = result + chunk as str
             total = total + chunk.len()
         }
         Ok(result.bytes())
@@ -292,14 +292,14 @@ fun __read_u64_le(buf: u8[], offset: usize): u64 {
 }
 
 fun __read_i64_le(buf: u8[], offset: usize): i64 {
-    cast(__read_u64_le(buf, offset)).to(i64)
+    (__read_u64_le(buf, offset)) as i64
 }
 
 fun __read_i32_le(buf: u8[], offset: usize): i32 {
-    cast(u32(buf[offset])
+    (u32(buf[offset])
         | (u32(buf[offset + 1]) << 8u32)
         | (u32(buf[offset + 2]) << 16u32)
-        | (u32(buf[offset + 3]) << 24u32)).to(i32)
+        | (u32(buf[offset + 3]) << 24u32)) as i32
 }
 
 fun __kind_from_int(kind_int: i32): FileKind {

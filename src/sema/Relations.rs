@@ -185,7 +185,7 @@ impl SubtypeRule for NullToNullableRule {
     }
 }
 
-/// `sub <: Nullable(inner)` ⟹ `sub <: inner`。
+/// `sub <: Nullable(inner)` ⟹ `sub <: inner`.
 struct NullableInnerRule;
 impl SubtypeRule for NullableInnerRule {
     fn check(&self, arena: &TypeArena, sub: TypeHandle, sup: TypeHandle) -> Option<bool> {
@@ -237,7 +237,7 @@ impl SubtypeRule for AdtNameRule {
     }
 }
 
-/// `Throw<V1, E1> <: Throw<V2, E2>` ⟹ `V1 <: V2 ∧ E1 <: E2`。
+/// `Throw<V1, E1> <: Throw<V2, E2>` ⟹ `V1 <: V2 ∧ E1 <: E2`.
 struct ThrowSubtypeRule;
 impl SubtypeRule for ThrowSubtypeRule {
     fn check(&self, arena: &TypeArena, sub: TypeHandle, sup: TypeHandle) -> Option<bool> {

@@ -22,7 +22,7 @@ pub type Timer = Timer(duration_ns: i64)
 // Sleeps for the specified Duration (suspends the current coroutine, does not block the thread)
 // Duration.as_nanos() returns i128, Timer.duration_ns is i64 (sufficient to cover the practical range)
 pub async fun sleep(d: Duration): Async<void> {
-    Timer(cast(d.as_nanos()).to(i64)).await()
+    Timer((d.as_nanos()) as i64).await()
 }
 
 // Sleeps for the specified number of seconds (convenience overload)

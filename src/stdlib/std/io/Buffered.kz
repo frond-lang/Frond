@@ -32,7 +32,7 @@ pub type BufReader = BufReader(inner: File, buf: u8[], pos: usize, cap: usize) {
             while pos < cap {
                 val b = buf[pos]
                 pos = pos + 1
-                if b == cast('\n').to(u8) {
+                if b == '\n' as u8 {
                     found_newline = true
                     break
                 }
@@ -40,7 +40,7 @@ pub type BufReader = BufReader(inner: File, buf: u8[], pos: usize, cap: usize) {
             // Append this segment (without '\n') to result
             val seg_end = if found_newline { pos - 1 } else { pos }
             if seg_end > seg_start {
-                result = result + cast(buf[seg_start..seg_end]).to(str)
+                result = result + (buf[seg_start..seg_end]) as str
             }
             if found_newline {
                 return Ok(result)
@@ -62,7 +62,7 @@ pub type BufReader = BufReader(inner: File, buf: u8[], pos: usize, cap: usize) {
                 }
             }
             val chunk = buf[pos..cap]
-            result = result + cast(chunk).to(str)
+            result = result + chunk as str
             pos = cap
         }
     }
@@ -70,7 +70,7 @@ pub type BufReader = BufReader(inner: File, buf: u8[], pos: usize, cap: usize) {
     // Read all remaining bytes and decode as str using UTF-8
     pub async fun read_to_string(): Async<Throw<str, IOError>> {
         val bytes = read_to_end().await()?
-        cast(bytes).to(str)
+        bytes as str
     }
 
     // Read a single byte; return null at EOF

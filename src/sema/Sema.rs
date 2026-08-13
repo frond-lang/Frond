@@ -517,6 +517,39 @@ pub struct CoroutineMeta {
     pub segment_count: u16,
 }
 
+/// Capture mode for a variable referenced from a nested scope (lambda / defer /
+/// nested function).
+///
+/// This is the single unified descriptor for "how does a nested scope access an
+/// outer local variable", replacing the three parallel mechanisms (frame-chain
+/// for defer/non-escaping closures, Cell-upvalues for escaping closures, and the
+/// Bug #49 WriteBack-to-original hack) with one explicit per-capture decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// by-val snapshot: the nested scope captures the value at the declaration
+    /// site (the `val` copy-node provides this naturally). Reads return the
+    /// declaration-time value and never observe later mutations.
+    Snapshot,
+    /// by-ref reference: the nested scope captures a reference to the mutable
+    /// slot. Reads reflect the latest value and writes propagate back. Used for
+    /// `var` bindings and always forced for `defer` bodies (defer semantics
+    /// require observing the value at function/block exit, not at defer-site).
+    Reference,
+}
+
+/// Description of a single captured variable for a nested scope.
+#[derive(Debug, Clone)]
+pub struct CaptureInfo {
+    /// Variable name (e.g. `x`, `this`).
+    pub name: Box<str>,
+    /// Module-unique key of the *declaration site* (ValDecl/VarDecl/Param expr
+    /// or stmt handle, via `module_expr_key`). The IR builder uses this to
+    /// locate the original NodeId so WriteBacks target the root-frame slot.
+    pub decl_key: u64,
+    /// by-val or by-ref.
+    pub mode: CaptureMode,
+}
+
 // =========================================================================
 // SemaError — semantic errors.
 // =========================================================================
@@ -579,6 +612,8 @@ pub struct ModuleOwnership {
     pub field_id_keys: FxHashMap<String, FxHashSet<String>>,
     /// expr_types u64 keys owned by each module (reverse map for purge)
     pub expr_type_keys: FxHashMap<String, FxHashSet<u64>>,
+    /// captures u64 keys (nested-scope entry expressions) owned by each module.
+    pub capture_keys: FxHashMap<String, FxHashSet<u64>>,
 }
 
 // =========================================================================
@@ -684,6 +719,13 @@ pub struct SemaResult {
     /// Stored by sema when multiple types share the same constructor name; the IR
     /// builder queries this to set `pattern_type_names` for runtime disambiguation.
     pub pattern_ctor_types: FxHashMap<(String, u32), Box<str>>,
+    /// Unified capture table: for each nested scope (lambda / defer / nested
+    /// function), the list of outer variables it captures and the capture mode.
+    /// Key = module-unique key of the nested-scope entry expression
+    /// (`module_expr_key`). Produced by Sema as the single source of truth;
+    /// consumed by the IR builder (replaces its `collect_free_idents_expr` scan
+    /// and the 7-branch assignment decision tree).
+    pub captures: FxHashMap<u64, Vec<CaptureInfo>>,
     /// Phase 2: module-origin index for incremental purge
     pub module_ownership: ModuleOwnership,
 }
@@ -759,6 +801,7 @@ impl SemaResult {
             module_func_recv_exprs: FxHashSet::default(),
             module_const_recv_exprs: FxHashMap::default(),
             pattern_ctor_types: FxHashMap::default(),
+            captures: FxHashMap::default(),
             module_ownership: ModuleOwnership::default(),
         }
     }
@@ -768,6 +811,23 @@ impl SemaResult {
     /// Record the type of an expression.
     pub fn put_expr(&mut self, expr_id: u64, info: ExprInfo) {
         self.expr_types.insert(expr_id, info);
+    }
+
+    /// Record the capture list for a nested scope (lambda / defer / nested
+    /// function). `scope_key` is the module-unique key of the nested-scope entry
+    /// expression; `module_name` is the owning module (for incremental purge).
+    pub fn put_captures(&mut self, scope_key: u64, module_name: &str, captures: Vec<CaptureInfo>) {
+        self.captures.insert(scope_key, captures);
+        self.module_ownership.capture_keys
+            .entry(module_name.to_string())
+            .or_default()
+            .insert(scope_key);
+    }
+
+    /// Look up the capture list for a nested scope. Returns an empty slice if
+    /// none recorded (the scope captures nothing).
+    pub fn get_captures(&self, scope_key: u64) -> &[CaptureInfo] {
+        self.captures.get(&scope_key).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Look up the type of an expression.
@@ -1070,6 +1130,14 @@ impl SemaResult {
         }
         // pattern_ctor_types: key is (String, u32), filter by module name
         self.pattern_ctor_types.retain(|(m, _), _| m.as_str() != module_name);
+
+        // captures: u64-key table (nested-scope entry expr keys), tracked via
+        // the dedicated capture_keys reverse map.
+        if let Some(keys) = self.module_ownership.capture_keys.remove(module_name) {
+            for k in keys {
+                self.captures.remove(&k);
+            }
+        }
 
         // === Category B: global definition tables ===
         // Truly remove entries from both the index HashMap and the value HashMap.
@@ -1844,6 +1912,17 @@ fn build_method_sig_info<'a>(
     }
 }
 
+/// Public entry point for local type method registration (called from Inference check_decl).
+pub fn ast_method_to_func_sig_pub<'a>(
+    arena: &mut TypeArena,
+    sema_result: &mut SemaResult,
+    type_name: &str,
+    method: &crate::ast::Ast::MethodDecl<'a>,
+    ast: &AstArena<'a>,
+) -> bool {
+    ast_method_to_func_sig(arena, sema_result, type_name, method, ast)
+}
+
 /// type-block method → MethodSigInfo, stored into TypeDefInfo.methods (indexed
 /// by method_idx).
 ///
@@ -2109,9 +2188,19 @@ pub(crate) fn concretize_type<'a>(
             arena.make_ref(inner, true)
         }
         TypeNode::Record { .. } => arena.make_record(Vec::<FieldType>::new().into_boxed_slice(), None),
-        TypeNode::Function { .. } => {
-            let ret = arena.make(Type::Unknown);
-            arena.make_fn(Vec::<TypeHandle>::new().into_boxed_slice(), ret)
+        TypeNode::Function { params, return_type } => {
+            // Recursively concretize the parameter and return types so a function
+            // type used as an alias target (e.g. `type IntToInt = (i32) -> i32`)
+            // preserves its arity and signature. Previously this discarded both,
+            // producing a 0-arity `Fn` returning Unknown, which caused callers to
+            // skip argument inference and left argument expressions without ExprInfo
+            // (surfacing as "missing ExprInfo" ICEs in the IR builder).
+            let param_tys: Vec<TypeHandle> = params
+                .iter()
+                .map(|&p| concretize_type(arena, p, type_args, ast, sema_result))
+                .collect();
+            let ret_ty = concretize_type(arena, *return_type, type_args, ast, sema_result);
+            arena.make_fn(param_tys.into_boxed_slice(), ret_ty)
         }
         TypeNode::Array { element_type, size } => {
             let elem = concretize_type(arena, *element_type, type_args, ast, sema_result);
