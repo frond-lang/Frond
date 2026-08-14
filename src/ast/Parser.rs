@@ -36,16 +36,20 @@ pub struct OpMapping {
 }
 
 // Precedence constants (from low to high)
+//
+// C-family ordering: `* /` > `+ -` > shifts > comparisons > equality > `&` > `^` > `|`.
+// Shifts must bind TIGHTER than `==`/`<` (otherwise `1 << flag == MASK` silently
+// parses as `1 << (flag == MASK)`).
 pub const ELVIS_PREC: u8 = 1;
 pub const OR_PREC: u8 = 2;
 pub const AND_PREC: u8 = 3;
 pub const BIT_OR_PREC: u8 = 4;
 pub const BIT_XOR_PREC: u8 = 5;
 pub const BIT_AND_PREC: u8 = 6;
-pub const SHIFT_PREC: u8 = 7;
-pub const EQUALITY_PREC: u8 = 8;
-pub const COMPARISON_PREC: u8 = 9;
-pub const RANGE_PREC: u8 = 10;
+pub const EQUALITY_PREC: u8 = 7;
+pub const COMPARISON_PREC: u8 = 8;
+pub const RANGE_PREC: u8 = 9;
+pub const SHIFT_PREC: u8 = 10;
 pub const ADDITION_PREC: u8 = 11;
 pub const MULTIPLICATION_PREC: u8 = 12;
 
@@ -2797,14 +2801,45 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         false
     }
 
-    /// Parse a nullable type: `T?` (chained)
+    /// Parse nullable and array suffixes as one interleaved chain: `?` (nullable;
+    /// a `??` token counts as two `?`s — the lexer produces `??` whenever two `?`
+    /// are adjacent), and `[]` / `[N]` (array). Suffixes apply left-to-right, so
+    /// `i32?[]` is an array of nullable i32 (element-level nullable) while
+    /// `i32[]?` is a nullable array; `i32?[]?` composes both. Chained `?`
+    /// collapses to a single nullable layer in sema (no Some-constructor).
     fn parse_nullable_type(&mut self) -> ParseResult<TypeRef> {
         let mut ty = self.parse_primary_type()?;
-        while self.match_token(TokenKind::Question) {
-            let span = self.ast.ty(ty).span;
-            ty = self.alloc_type(span, TypeNode::Nullable { inner: ty });
+        loop {
+            if self.match_token(TokenKind::Question) {
+                let span = self.ast.ty(ty).span;
+                ty = self.alloc_type(span, TypeNode::Nullable { inner: ty });
+            } else if self.match_token(TokenKind::QuestionQuestion) {
+                let span = self.ast.ty(ty).span;
+                ty = self.alloc_type(span, TypeNode::Nullable { inner: ty });
+                let span = self.ast.ty(ty).span;
+                ty = self.alloc_type(span, TypeNode::Nullable { inner: ty });
+            } else if self.check(TokenKind::LBracket) {
+                ty = self.parse_array_type_suffix(ty)?;
+            } else {
+                break;
+            }
         }
         Ok(ty)
+    }
+
+    /// Parses one `[]` / `[N]` array suffix onto `ty` (already at `[`).
+    fn parse_array_type_suffix(&mut self, ty: TypeRef) -> ParseResult<TypeRef> {
+        let bracket = self.advance();
+        let mut size: Option<u64> = None;
+        if !self.check(TokenKind::RBracket) {
+            let size_tok = self.expect(TokenKind::IntLiteral, "expected array size")?;
+            size = Some(parse_u64(size_tok.lexeme).ok_or_else(|| {
+                self.report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")
+            })?);
+        }
+        let _ = self.expect(TokenKind::RBracket, "expected ']'");
+        let span = token_span(&bracket);
+        Ok(self.alloc_type(span, TypeNode::Array { element_type: ty, size }))
     }
 
     /// Parse a primary type: named/generic, with suffix array `[N]`
@@ -3003,6 +3038,14 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     break;
                 }
             }
+            // `-` / `&` at the start of a new line are statement boundaries, not
+            // binary operators: `val x = 5` newline `-3` must not merge into `5 - 3`.
+            // (Same-line ambiguity after block/if/match is handled by the guard above.)
+            if matches!(self.peek().kind, TokenKind::Minus | TokenKind::Ampersand)
+                && self.postfix_opens_new_statement()
+            {
+                break;
+            }
             let op_tok = self.advance();
             let next_min = if mapping.right_assoc {
                 mapping.precedence
@@ -3080,25 +3123,22 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             let span = token_span(&name_tok);
             self.alloc_type(span, TypeNode::Named { name: name_tok.lexeme })
         };
-        let span = self.ast.ty(ty).span;
-        // Nullable suffix T? (chained)
-        while self.match_token(TokenKind::Question) {
-            ty = self.alloc_type(span, TypeNode::Nullable { inner: ty });
-        }
-        // Array suffix T[] / T[N] (chained)
-        while self.match_token(TokenKind::LBracket) {
-            let mut size: Option<u64> = None;
-            if !self.check(TokenKind::RBracket) {
-                let size_tok = self.expect(TokenKind::IntLiteral, "expected array size")?;
-                size = Some(parse_u64(size_tok.lexeme).ok_or_else(|| {
-                    self.report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")
-                })?);
+        // Interleaved suffix chain (`?` / `??` / `[]` / `[N]`), same grammar as
+        // parse_nullable_type: supports `x as i32?[]`, `x as i32[]?`, `x as i32??`.
+        loop {
+            if self.match_token(TokenKind::Question) {
+                let span = self.ast.ty(ty).span;
+                ty = self.alloc_type(span, TypeNode::Nullable { inner: ty });
+            } else if self.match_token(TokenKind::QuestionQuestion) {
+                let span = self.ast.ty(ty).span;
+                ty = self.alloc_type(span, TypeNode::Nullable { inner: ty });
+                let span = self.ast.ty(ty).span;
+                ty = self.alloc_type(span, TypeNode::Nullable { inner: ty });
+            } else if self.check(TokenKind::LBracket) {
+                ty = self.parse_array_type_suffix(ty)?;
+            } else {
+                break;
             }
-            let _ = self.expect(TokenKind::RBracket, "expected ']'");
-            ty = self.alloc_type(span, TypeNode::Array {
-                element_type: ty,
-                size,
-            });
         }
         Ok(ty)
     }
@@ -3157,6 +3197,15 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         self.parse_postfix()
     }
 
+    /// True when the upcoming postfix/binary token sits on a new line relative to
+    /// the last consumed token. Since `;` is whitespace, a newline is the only
+    /// statement separator for tokens that are ambiguous between a suffix on the
+    /// previous expression (`f(args)`, `arr[i]`, `a - b`) and the start of a new
+    /// statement (`(grouping)`, `[array literal]`, `-negation`, `&ref`).
+    fn postfix_opens_new_statement(&self) -> bool {
+        self.current > 0 && self.peek().line != self.tokens[self.current - 1].line
+    }
+
     /// Parse a postfix operation
     fn parse_postfix(&mut self) -> ParseResult<ExprRef> {
         let mut expr = self.parse_primary()?;
@@ -3201,8 +3250,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                         field: field_tok.lexeme,
                     });
                 }
-            } else if self.check(TokenKind::LParen) {
+            } else if self.check(TokenKind::LParen) && !self.postfix_opens_new_statement() {
                 // Function call f(args)
+                // A `(` at the start of a new line is NOT a call suffix: since `;` is
+                // whitespace, `val a = 5` newline `(a + 1)` must stay two statements
+                // (otherwise it merges into `5(a + 1)` — a call — and `a` resolves
+                // against the wrong scope). Keep the `(` on the callee's line to call.
                 if matches!(self.ast.expr(expr).node, Expr::Call { .. }) {
                     self.report_error(
                         "chained call f(a)(b) is not allowed; use default currying: bind the partial result to a variable first",
@@ -3246,9 +3299,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     args,
                     type_args: Some(type_args),
                 });
-            } else if self.match_token(TokenKind::LBracket) {
+            } else if self.check(TokenKind::LBracket) && !self.postfix_opens_new_statement() {
                 // Index or slice
-                let bracket_tok = self.previous();
+                // Like `(` above: a `[` at the start of a new line is an array
+                // literal statement, not an index suffix (`val n = 2` newline
+                // `[n, n + 1]` must not merge into `2[n, n + 1]`).
+                let bracket_tok = self.advance();
                 let start = self.parse_binary(ADDITION_PREC)?;
                 if self.match_token(TokenKind::DotDotEq) || self.match_token(TokenKind::DotDot) {
                     let inclusive = self.previous().kind == TokenKind::DotDotEq;
@@ -3790,8 +3846,14 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 result.push('}');
                 j += 2;
             } else {
-                result.push(bytes[j] as char);
-                j += 1;
+                // Bug #101: decode a full UTF-8 scalar — pushing raw bytes as Latin-1
+                // chars double-encodes multibyte content in any string that takes the
+                // slow path (i.e. contains an escape anywhere): 你好 in a string with
+                // escaped quotes became U+00E4 U+00BD U+00A0 re-encoded to 6 bytes.
+                let rest = &text[j..];
+                let c = rest.chars().next().unwrap_or(char::REPLACEMENT_CHARACTER);
+                result.push(c);
+                j += c.len_utf8();
             }
         }
         result.into_bump_str()

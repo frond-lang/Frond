@@ -149,6 +149,11 @@ pub fn compile_graph(entry_path: &str, opt_level: crate::pass::Optimizer::OptLev
     // Driven by opt_level: O0 skips, O1 fixed-point only, O2 full, O3 full + raised iteration limit.
     crate::pass::Optimizer::optimize_with_analysis(&mut graph, Some(&analysis_report), opt_level);
 
+    // W5: optimization compaction (rebuild) invalidates the build-time
+    // condition-tree reset plans — recompute them on the final graph so the
+    // engine applies the mechanical fast path.
+    graph.precompute_reset_plans();
+
     if debug {
         eprintln!("  IR (after opt):  {} nodes, {} subgraphs, {} compute_fns",
             graph.nodes.len(), graph.subgraphs.len(), graph.compute_fns.len());

@@ -13,6 +13,32 @@ impl<'a> IrBuilder<'a> {
     /// The mangled-name format matches how methods are registered in `build_call_graph`
     /// (`"Type.method"`).
     /// `memo_pass` already makes the unique decision; a function has at most one strategy.
+
+/// AST-level check: does this return type node denote Throw (unfolding one Async layer)?
+/// Used for method/lambda bodies whose sema FuncSigInfo is not registered under a plain name.
+pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: Option<crate::ast::Ast::TypeRef>) -> bool {
+    let mut t = match rt {
+        Some(t) => t,
+        None => return false,
+    };
+    for _ in 0..2 {
+        match &arena.ty(t).node {
+            crate::ast::Ast::TypeNode::Generic { name, args }
+                if &**name == "Async" =>
+            {
+                match args.first() {
+                    Some(inner) => t = *inner,
+                    None => return false,
+                }
+            }
+            crate::ast::Ast::TypeNode::Generic { name, .. }
+                if &**name == "Throw" => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
     pub(super) fn lookup_memo_strategy(
         &self,
         name: &str,
@@ -55,9 +81,15 @@ impl<'a> IrBuilder<'a> {
         params: &[crate::ast::Ast::Param<'_>],
         is_void_fn: bool,
         is_async: bool,
+        fn_returns_throw: bool,
     ) -> NodeId {
         let prev_tail = self.in_tail_position;
         self.in_tail_position = !is_void_fn;
+        let prev_fn_throw = self.fn_returns_throw;
+        self.fn_returns_throw = fn_returns_throw;
+        // Bug #100: var homes are per-function (the same name in different functions
+        // maps to unrelated nodes); save/clear on entry, restore on exit.
+        let prev_var_home = std::mem::take(&mut self.var_home);
         // Bug #66: Mark that the next compile_block call is the function body's top-level block.
         // compile_block reads and resets this flag so that only nested blocks extract
         // block-scoped defers; function-level defers stay in defer_table for function-exit execution.
@@ -92,6 +124,8 @@ impl<'a> IrBuilder<'a> {
             }
         };
         self.in_tail_position = prev_tail;
+        self.fn_returns_throw = prev_fn_throw;
+        self.var_home = prev_var_home;
         self.in_function_top_block = prev_top_block;
         r
     }
@@ -277,6 +311,7 @@ impl<'a> IrBuilder<'a> {
         self.graph.set_gate_branches(
             gate_node,
             crate::ir::Ir::GateBranches {
+                capture: false,
                 condition_input: hit_node,
                 branches: vec![
                     (true, hit_sg, vec![]),
@@ -431,7 +466,11 @@ impl<'a> IrBuilder<'a> {
         let fn_is_async = self.sema.get_func_sig(name)
             .map(|sig| sig.is_async)
             .unwrap_or(is_async);
-        let return_node = self.compile_function_body(name, None, body_expr, &params, is_void_fn, fn_is_async);
+        // Bug #97: tail `expr?` must re-wrap into Ok when the function returns Throw.
+        let fn_returns_throw = self.sema.get_func_sig(name)
+            .map(|sig| self.handle_returns_throw(sig.return_type))
+            .unwrap_or_else(|| Self::type_ref_returns_throw(&module.arena, return_type));
+        let return_node = self.compile_function_body(name, None, body_expr, &params, is_void_fn, fn_is_async, fn_returns_throw);
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
@@ -573,7 +612,10 @@ impl<'a> IrBuilder<'a> {
         let fn_is_async = self.sema.get_func_sig(func_name)
             .map(|sig| sig.is_async)
             .unwrap_or(is_async);
-        let return_node = self.compile_function_body(func_name, None, body_expr, &params, is_void_fn, fn_is_async);
+        let fn_returns_throw = self.sema.get_func_sig(func_name)
+            .map(|sig| self.handle_returns_throw(sig.return_type))
+            .unwrap_or_else(|| Self::type_ref_returns_throw(&module.arena, return_type));
+        let return_node = self.compile_function_body(func_name, None, body_expr, &params, is_void_fn, fn_is_async, fn_returns_throw);
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
@@ -672,7 +714,8 @@ impl<'a> IrBuilder<'a> {
                 matches!(m.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
             }
         };
-        let return_node = self.compile_function_body(method_name, Some(type_name), body_expr, &params, is_void_fn, is_async);
+        let fn_returns_throw = Self::type_ref_returns_throw(&m.arena, return_type);
+        let return_node = self.compile_function_body(method_name, Some(type_name), body_expr, &params, is_void_fn, is_async, fn_returns_throw);
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
@@ -765,7 +808,8 @@ impl<'a> IrBuilder<'a> {
                 matches!(self.module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
             }
         };
-        let return_node = self.compile_function_body(method_name, Some(type_name), body_expr, &params, is_void_fn, is_async);
+        let fn_returns_throw = Self::type_ref_returns_throw(&self.module.arena, return_type);
+        let return_node = self.compile_function_body(method_name, Some(type_name), body_expr, &params, is_void_fn, is_async, fn_returns_throw);
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;

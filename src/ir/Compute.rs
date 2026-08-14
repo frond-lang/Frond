@@ -1679,7 +1679,26 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId) -> Value {
         Some(crate::value::HeapObj::Newtype(n)) => n.type_name == ctor_name,
         Some(crate::value::HeapObj::ThrowVal(tv)) => match &tv.payload {
             crate::value::ThrowPayload::Ok(_) => ctor_name == CTOR_OK,
-            crate::value::ThrowPayload::Err(_) => ctor_name == CTOR_ERR || ctor_name == CTOR_ERR_ALT,
+            crate::value::ThrowPayload::Err(payload) => {
+                if ctor_name == CTOR_ERR || ctor_name == CTOR_ERR_ALT {
+                    true
+                } else {
+                    // User error-type constructor pattern (e.g. a `MyErr(e)` arm on
+                    // Throw<T, MyErr>): match against the THROWN PAYLOAD's constructor
+                    // (consistent with `Error(v)` arms, whose sub-patterns bind the
+                    // payload). Without this, any error arm not spelled Error/Err
+                    // could never match at runtime and fell into the fallback panic.
+                    match payload.heap_obj() {
+                        Some(crate::value::HeapObj::Adt(a)) => {
+                            a.constructor == ctor_name
+                                && type_name.map_or(true, |tn| a.type_name == tn)
+                        }
+                        Some(crate::value::HeapObj::Newtype(n)) => n.type_name == ctor_name,
+                        Some(crate::value::HeapObj::Record(r)) => r.type_name == ctor_name,
+                        _ => false,
+                    }
+                }
+            }
         },
         _ => false,
     };
@@ -2008,7 +2027,7 @@ pub fn compute_record_field_set(frame: &mut Frame, node: NodeId) -> Value {
                     crate::value::HeapObj::Record(r) => {
                         if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(field_name)) {
                             if idx < r.fields.len() {
-                                r.fields[idx] = new_value.clone();
+                                    r.fields[idx] = new_value.clone();
                             }
                         }
                     }
@@ -2968,9 +2987,25 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 // Control-flow propagation for Gate branches / loop frames is handled
                 // below (consistent with the async path in Subgraph.rs).
 
-                // Propagate the Gate branch control signal.
+                // Shared propagation matrix (Ir::should_propagate_control_signal).
+                // child_loop_kind = None here: on the sync path, Gate branches are
+                // ordinary branch subgraphs, and loop-frame completions are handled
+                // by the LoopBody protocol below — so only the Gate column applies.
+                // W4c capture gates: the Return is the inlined value (data), never
+                // a signal.
                 let is_gate = graph.node(graph_node_id.0 as usize).kind == NodeKind::Gate;
-                if is_gate && !matches!(child_signal, ControlSignal::None) {
+                let capture_gate = is_gate
+                    && graph
+                        .gate_branches_at(graph_node_id.0 as usize)
+                        .map(|gb| gb.capture)
+                        .unwrap_or(false);
+                if !capture_gate
+                    && crate::ir::Ir::should_propagate_control_signal(
+                        &child_signal,
+                        is_gate,
+                        LoopKind::None,
+                    )
+                {
                     frame.control_signal = child_signal;
                     continue;
                 }

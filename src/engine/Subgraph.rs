@@ -114,6 +114,18 @@ impl<S: LockStrategy> Engine<S> {
 
             let mut child = self.acquire_frame(child_fid, subgraph_id, parent_node_count);
             child.node_offset = parent_start;
+            // Bug #100 (residual): connect the frame chain IMMEDIATELY from the in-hand
+            // parent frame. The old "set later by setup_frame_chain in process_frame"
+            // never fires when the caller is mid-processing (absent from the map), so a
+            // while-frame created inside a branch/loop had a null chain — its body's
+            // WriteBacks stopped at the while frame and the enclosing frames kept stale
+            // values (negative-exponent residual). Box addresses are stable.
+            child.parent_frame_ptr = parent_frame as *const Frame as *mut Frame;
+            child.root_frame_ptr = if !parent_frame.root_frame_ptr.is_null() {
+                parent_frame.root_frame_ptr
+            } else {
+                child.parent_frame_ptr
+            };
 
             // Copy the parent frame's ready values (refcount set to 0 = never reclaimed; released
             // all at once when the frame ends).
@@ -540,20 +552,23 @@ impl<S: LockStrategy> Engine<S> {
                 let child_loop_kind = self.graph.subgraphs[child_sg_id.0 as usize].loop_kind;
                 let is_gate = self.graph.node(call_graph_id.0 as usize).kind
                     == crate::ir::Ir::NodeKind::Gate;
-                let should_propagate = match child_signal {
-                    ControlSignal::Return(_) => {
-                        // Return: propagate from Gate branches + loop frames; not from
-                        // Lambda/function calls.
-                        is_gate || child_loop_kind != crate::ir::Ir::LoopKind::None
-                    }
-                    ControlSignal::Break | ControlSignal::Continue => {
-                        // Break/Continue: propagate from Gate branches only (penetrate to
-                        // LoopBody). A loop frame's Break/Continue has already been consumed by the
-                        // loop.
-                        is_gate
-                    }
-                    ControlSignal::None => false,
-                };
+                // W4c capture gate: the branch's Return is the inlined
+                // function's value — extract as data (already done via
+                // extract_child_return) and never propagate the signal.
+                let capture_gate = is_gate
+                    && self
+                        .graph
+                        .gate_branches_at(call_graph_id.0 as usize)
+                        .map(|gb| gb.capture)
+                        .unwrap_or(false);
+                // Single shared propagation matrix (see Ir::should_propagate_control_signal
+                // for the full rationale, including the cases that must NOT propagate).
+                let should_propagate = !capture_gate
+                    && crate::ir::Ir::should_propagate_control_signal(
+                        &child_signal,
+                        is_gate,
+                        child_loop_kind,
+                    );
                 if should_propagate {
                     let child_fn_id = self.graph.subgraphs[child_sg_id.0 as usize].function_id;
                     let caller_fn_id =

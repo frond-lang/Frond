@@ -382,7 +382,10 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
             match v {
                 None => { write_u8(&mut buf, 0); write_u32(&mut buf, 0); write_u32(&mut buf, 0); }
                 Some(gb) => {
-                    write_u8(&mut buf, 1);
+                    // Validity byte doubles as the W4c capture flag carrier:
+                    // 2 = valid + capture (old files wrote 1; new readers
+                    // default capture=false for them).
+                    write_u8(&mut buf, if gb.capture { 2 } else { 1 });
                     write_u32(&mut buf, gb.condition_input.0);
                     write_u32(&mut buf, gb.branches.len() as u32);
                     for (cond, sg, inputs) in &gb.branches {
@@ -736,7 +739,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
                 let reset_to_one: Vec<NodeId> = (0..ro_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
                 let rc_len = read_u32(&mut rp_r) as usize;
                 let reset_condition_tree: Vec<NodeId> = (0..rc_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
-                Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree })
+                Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree, condition_tree_plan: Vec::new() })
             } else {
                 None
             };
@@ -906,6 +909,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
                 let _ = read_u32(&mut r); let _ = read_u32(&mut r);
                 None
             } else {
+                let capture = valid == 2;
                 let condition_input = NodeId(read_u32(&mut r));
                 let branch_count = read_u32(&mut r) as usize;
                 let mut branches = Vec::with_capacity(branch_count);
@@ -919,7 +923,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
                     }
                     branches.push((cond, sg, inputs));
                 }
-                Some(GateBranches { condition_input, branches })
+                Some(GateBranches { condition_input, branches, capture })
             }
         }).collect()
     };
@@ -1072,7 +1076,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     // Load the string pool bytes from the StringPool section; ConstValue::Str { offset, len } references this pool.
     let string_pool: Arc<[u8]> = Arc::from(mem.section(SectionKind::StringPool).to_vec());
 
-    Ok(DataFlowGraph {
+    let mut graph = DataFlowGraph {
         nodes,
         inputs_pool,
         subgraphs,
@@ -1123,7 +1127,11 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         select_info_offsets: Vec::new(),
         trait_construct_info_offsets: Vec::new(),
         record_extend_info_offsets: Vec::new(),
-    })
+    };
+    // W5: rebuild the flattened condition-tree reset plans (kept out of the
+    // .kzo format; recomputed at load).
+    graph.precompute_reset_plans();
+    Ok(graph)
 }
 
 /// Loads a `DataFlowGraph` from a `GraphMemory` via zerocopy (production path).
@@ -1217,7 +1225,7 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
                 let reset_to_one: Vec<NodeId> = (0..ro_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
                 let rc_len = read_u32(&mut rp_r) as usize;
                 let reset_condition_tree: Vec<NodeId> = (0..rc_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
-                Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree })
+                Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree, condition_tree_plan: Vec::new() })
             } else {
                 let _ = read_u32(&mut sr_r); // skip placeholder
                 None
@@ -1370,7 +1378,7 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
     // The field stays an empty Arc (unused on the load path).
     let string_pool: Arc<[u8]> = Arc::from(Vec::new());
 
-    Ok(DataFlowGraph {
+    let mut graph = DataFlowGraph {
         nodes: Vec::new(),
         inputs_pool: InputsPool::new(),
         subgraphs,
@@ -1421,7 +1429,12 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         select_info_offsets,
         trait_construct_info_offsets,
         record_extend_info_offsets,
-    })
+    };
+    // W5: rebuild the flattened condition-tree reset plans (kept out of the
+    // .kzo format; recomputed at load). Works through the mem-agnostic
+    // accessors on the zerocopy backing.
+    graph.precompute_reset_plans();
+    Ok(graph)
 }
 
 /// Loads zerocopy from a byte stream (for the serialize->load->run path; no file needed).

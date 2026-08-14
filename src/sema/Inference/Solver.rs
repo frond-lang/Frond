@@ -413,6 +413,42 @@ impl ConstraintSolver {
                     arena.type_vars[idx as usize].bound = Some(resolved);
                 }
                 _ => {
+                    // null-join rule: a null LITERAL's inferred type is either Null or
+                    // Nullable<fresh-var> (unconstrained inner). A candidate set of
+                    // {nullish, X} resolves to X? — a null literal is compatible with
+                    // any nullable, so it must not make inference ambiguous
+                    // (`pick(null, 5)` infers T = i32?). A Nullable with a CONCRETE
+                    // inner (a nullable variable) does NOT join — variables never
+                    // implicitly lift (#60 strictness).
+                    if unique.len() == 2 {
+                        let is_nullish = |arena: &TypeArena, h: TypeHandle| {
+                            let r = arena.resolve(h);
+                            match arena.get(r) {
+                                Type::Null => true,
+                                Type::Nullable(_) => {
+                                    let inner = arena.nullable_inner(r);
+                                    matches!(arena.get(inner), Type::TypeVar(_))
+                                }
+                                _ => false,
+                            }
+                        };
+                        let a = unique[0];
+                        let b = unique[1];
+                        let base = if is_nullish(arena, a) && !is_nullish(arena, b) {
+                            Some(b)
+                        } else if is_nullish(arena, b) && !is_nullish(arena, a) {
+                            Some(a)
+                        } else {
+                            None
+                        };
+                        if let Some(base) = base {
+                            let base_r = arena.resolve(base);
+                            let nullable = arena.make_nullable(base_r);
+                            self.subst.insert(idx, nullable);
+                            arena.type_vars[idx as usize].bound = Some(nullable);
+                            continue;
+                        }
+                    }
                     // Multiple distinct candidates: ambiguity.
                     // Pick the arena's actual solution (unify picked the first successful one)
                     // and write it into subst to avoid cascading false positives.

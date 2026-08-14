@@ -19,7 +19,23 @@ impl<'a> IrBuilder<'a> {
             compute_fn: CF_NOOP, // noop
         });
         let event_kind = self.infer_event_source_kind(recv);
-        let current_sg = self.current_function_sg;
+        // W3C: register into the INNERMOST subgraph being compiled (branch /
+        // loop body) so `compute_await`'s `frame.subgraph_id` lookup finds the
+        // declaration (Bug #24 class, fixed structurally instead of by
+        // post-hoc migration). The branch context only applies when it belongs
+        // to the function being compiled — a lambda compiled inside a branch
+        // arm switches current_function_id, so awaits in its body register to
+        // the lambda's own subgraph instead.
+        let current_sg = self
+            .current_branch_sg
+            .filter(|b| {
+                self.graph
+                    .subgraphs
+                    .get(b.0 as usize)
+                    .map(|sg| sg.function_id == self.current_function_id)
+                    .unwrap_or(false)
+            })
+            .or(self.current_function_sg);
         if let Some(sg_id) = current_sg {
             if let Some(sg) = self.graph.subgraphs.get_mut(sg_id.0 as usize) {
                 sg.event_source_decls.push(EventSourceDecl {

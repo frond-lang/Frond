@@ -352,7 +352,25 @@ impl<S: LockStrategy> Engine<S> {
                                     notify_downstream(bf, &graph, local_id, global_id, NodeId(parent_start));
                                 }
                                 bf.caller = Some((fid, pending.call_node_local));
-                                bf.parent_frame_ptr = std::ptr::null_mut();
+                                // Bug #100: keep the frame chain connected on reuse.
+                                // Nulling parent_frame_ptr here orphaned the body's
+                                // WriteBacks (setup_frame_chain cannot restore them:
+                                // the caller is mid-processing, absent from the map),
+                                // so loop-variable updates never reached the loop frame
+                                // and the condition re-read a stale snapshot forever.
+                                // Box addresses are stable across remove/insert (see
+                                // process_frame), so the in-hand frame pointer is safe.
+                                if std::env::var("KUZO_NO_REUSECHAIN").is_ok() {
+                                    bf.parent_frame_ptr = std::ptr::null_mut();
+                                } else {
+                                    let parent_ptr = frame as *const Frame as *mut Frame;
+                                    bf.parent_frame_ptr = parent_ptr;
+                                    bf.root_frame_ptr = if !frame.root_frame_ptr.is_null() {
+                                        frame.root_frame_ptr
+                                    } else {
+                                        parent_ptr
+                                    };
+                                }
                                 bf.state = FrameState::Ready;
                             }
                             if let Some(bf) = body_frame {
@@ -763,8 +781,20 @@ impl<S: LockStrategy> Engine<S> {
                         // normal path in complete_and_wake_caller).
                         // Bug #78: propagate control_signal for all call nodes (not just Gate),
                         // because LoopBody completion may also arrive via pending_completions when
-                        // the loop_frame is being processed by another worker.
-                        if !matches!(child_signal, ControlSignal::None) {
+                        // the loop_frame is being processed by another worker. This is deliberately
+                        // BROADER than Ir::should_propagate_control_signal: on this race path a
+                        // dropped signal cannot be recovered later, so any non-None signal is
+                        // forwarded and the receiver's loop/Gate protocol sorts it out.
+                        // W4c exception: capture gates must never propagate — the Return is the
+                        // inlined value (already written above), not a signal.
+                        let capture_gate = self.graph.node(call_graph_id.0 as usize).kind
+                            == crate::ir::Ir::NodeKind::Gate
+                            && self
+                                .graph
+                                .gate_branches_at(call_graph_id.0 as usize)
+                                .map(|gb| gb.capture)
+                                .unwrap_or(false);
+                        if !capture_gate && !matches!(child_signal, ControlSignal::None) {
                             frame.control_signal = child_signal;
                         }
                         notify_downstream(

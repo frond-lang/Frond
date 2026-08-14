@@ -43,6 +43,13 @@ pub struct IrBuilder<'a> {
     pub current_trait_default_idx: Option<usize>,
     /// The subgraph id of the function currently being compiled (used for `defer` registration).
     pub current_function_sg: Option<SubGraphId>,
+    /// W3C region context: the INNERMOST branch/loop-body subgraph currently
+    /// being compiled (None at function level). `build_await_node` registers
+    /// EventSourceDecls here first — structurally correct scoping that made
+    /// the post-hoc "drain decls from the function sg into the branch sg"
+    /// migrations (Bug #24) unnecessary. Save/restore around nested bodies;
+    /// cleared on function/lambda entry (their bodies are new function scopes).
+    pub current_branch_sg: Option<SubGraphId>,
     /// Loop context stack: the top entry is the current loop's context
     /// (continue jump target + For iterator node).
     pub loop_stack: Vec<LoopContext>,
@@ -76,6 +83,18 @@ pub struct IrBuilder<'a> {
     /// inherited by `Block` trailing expressions and by `If`/`Match` branches;
     /// set to `false` for arguments, conditions, and assignment right-hand sides.
     pub in_tail_position: bool,
+    /// Bug #97: whether the current function's return type is Throw (one Async layer
+    /// unfolded). A tail-position `expr?` must produce the FUNCTION's return value:
+    /// the propagate node yields the UNWRAPPED value (statement/value use), so the
+    /// Propagate lowering re-wraps it with `compute_throw_ok` when this is set.
+    pub fn_returns_throw: bool,
+    /// Bug #100: canonical "home" slot per variable name (the first node the name was
+    /// bound to — the var-decl node, which is also every WriteBack's target). A loop
+    /// condition must read loop-modified variables through their HOME node (the slot
+    /// WriteBacks keep current across iterations), not through the mid-chain node of a
+    /// previous assignment — otherwise the condition re-evaluates against a stale
+    /// snapshot every iteration and the loop never terminates.
+    pub var_home: rustc_hash::FxHashMap<String, (NodeId, bool)>,
     /// Bug #66: Whether the current `compile_block` call is the function body's top-level block.
     /// Set to `true` at `compile_function_body` entry; reset to `false` by the first `compile_block`
     /// call (the function body itself). Nested blocks see `false`, so only they extract
@@ -275,6 +294,7 @@ impl<'a> IrBuilder<'a> {
             trait_default_subgraphs: rustc_hash::FxHashMap::default(),
             current_trait_default_idx: None,
             current_function_sg: None,
+            current_branch_sg: None,
             loop_stack: Vec::new(),
             scope_stack: Vec::new(),
             captured_scopes: Vec::new(),
@@ -283,6 +303,8 @@ impl<'a> IrBuilder<'a> {
             current_sg_start: 0,
             current_effect: None,
             in_tail_position: false,
+            fn_returns_throw: false,
+            var_home: rustc_hash::FxHashMap::default(),
             in_function_top_block: false,
             param_scope_depth: 0,
             in_loop_body: false,
@@ -431,10 +453,58 @@ impl<'a> IrBuilder<'a> {
     }
 
     /// Bind a variable name to a NodeId (in the current scope).
+
+    /// Bug #100 residual: a (re)declaration creates a FRESH home slot. bind_var keeps
+    /// the first home per name (loop-body WriteBack rebinds must not move it), so a
+    /// sequential redeclaration of the same name in one function (`var si` in an early
+    /// section, then `var si` again later) must reset the home explicitly — otherwise
+    /// the second declaration's initial value never reaches the home slot and later
+    /// loops reading through home start from the first declaration's stale final value.
+    pub(super) fn declare_var(&mut self, name: &str, node_id: NodeId) {
+        self.bind_var(name, node_id);
+        let fn_level = self.loop_stack.is_empty();
+        self.var_home.insert(name.to_string(), (node_id, fn_level));
+    }
+
+    /// Bug #100: rebind every loop-body-modified variable to its canonical HOME node
+    /// before compiling a while-loop condition. The condition re-evaluates every
+    /// iteration; WriteBacks update the home slot in the loop frame (via the frame
+    /// chain), so reading the home gives the current value. Reading the mid-chain node
+    /// of a pre-loop assignment instead freezes the condition at loop entry.
+    pub(super) fn rebind_modified_vars_to_home(&mut self, body: crate::ast::Ast::ExprId) {
+        let mut names = rustc_hash::FxHashSet::default();
+        let m = self.current_module();
+        collect_assigned_names(&m.arena, body, &mut names);
+        for name in names {
+            if let Some(&(home, fn_level)) = self.var_home.get(name.as_str()) {
+                if fn_level {
+                    // Rebind in the scope WHERE the name is bound (not the innermost
+                    // scope): a rebind performed inside an if-branch scope would be
+                    // discarded when the branch scope pops, leaving post-branch code
+                    // reading the stale pre-loop chain binding.
+                    for scope in self.scope_stack.iter_mut().rev() {
+                        if scope.contains_key(name.as_str()) {
+                            scope.insert(name.clone(), home);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn bind_var(&mut self, name: &str, node_id: NodeId) {
         if let Some(scope) = self.scope_stack.last_mut() {
             scope.insert(name.to_string(), node_id);
         }
+        // Bug #100: record the canonical home slot (first binding). Later re-bindings
+        // (loop-body WriteBacks) update the current binding but keep the home stable.
+        // The bool marks function-level declarations (bound outside any loop body):
+        // only those get rebound in loop conditions — a variable declared INSIDE an
+        // enclosing loop body is fresh each iteration and its binding chain is already
+        // correct (rebinding it broke nested-loop shapes like bubble sort).
+        let fn_level = self.loop_stack.is_empty();
+        self.var_home.entry(name.to_string()).or_insert((node_id, fn_level));
     }
 
     /// Look up the NodeId bound to a variable (searching from inner to outer scope).
@@ -721,12 +791,26 @@ impl<'a> IrBuilder<'a> {
             crate::ast::Ast::Expr::Propagate(inner) => {
                 let inner_node = self.compile_subexpr(*inner);
                 let inputs_offset = self.graph.inputs_pool.push(&[inner_node]);
-                let n = self.graph.add_node(Node {
+                let mut n = self.graph.add_node(Node {
                     kind: NodeKind::UnOp,
                     input_count: 1,
                     inputs_offset,
                     compute_fn: CF_PROPAGATE, // compute_propagate
                 });
+                // Bug #97: at the tail of a function whose return type is Throw, the
+                // propagate node's UNWRAPPED value would leak out as the function's
+                // return value (callers matching Ok/Err then hit the fallback panic).
+                // Re-wrap with Ok: the Err path has already exited via the Return
+                // control signal, so only the Ok path flows through this node.
+                if self.in_tail_position && self.fn_returns_throw {
+                    let off = self.graph.inputs_pool.push(&[n]);
+                    n = self.graph.add_node(Node {
+                        kind: NodeKind::Call,
+                        input_count: 1,
+                        inputs_offset: off,
+                        compute_fn: CF_THROW_OK, // compute_throw_ok
+                    });
+                }
                 n
             }
 
@@ -845,6 +929,33 @@ impl<'a> IrBuilder<'a> {
     /// of the callee function; the expr_types key must use the instance's module_name (not the call-site
     /// module name), otherwise cross-module generic calls fail type lookup (e.g. when Math.abs calls
     /// cast(x).to(i32), source_ty resolves to void).
+    /// Bug #97 helper: does this (possibly Async-wrapped) type denote a Throw return?
+    /// Guards against invalid/placeholder handles (u32::MAX) seen on some sig entries.
+    pub(super) fn handle_returns_throw(&self, t0: crate::sema::Sema::TypeHandle) -> bool {
+        let mut t = t0;
+        for _ in 0..3 {
+            if (t.0 as usize) >= self.type_arena.len() {
+                return false;
+            }
+            match self.type_arena.get(t) {
+                crate::sema::Sema::Type::Fn(id) | crate::sema::Sema::Type::Async(id) => {
+                    // Some predeclared async signatures carry a placeholder detail id
+                    // (u32::MAX); treat them as "not a Throw return".
+                    if (id.0 as usize) >= self.type_arena.details_len() {
+                        return false;
+                    }
+                    t = match self.type_arena.get(t) {
+                        crate::sema::Sema::Type::Fn(_) => self.type_arena.fn_parts(t).1,
+                        _ => self.type_arena.async_value(t),
+                    };
+                }
+                crate::sema::Sema::Type::Throw(_) => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     pub(super) fn expr_key_module(&self) -> &'a str {
         if let Some(inst_id) = self.current_instance_id {
             if let Some(inst) = self.sema.monomorph_instances.get(inst_id as usize) {
@@ -1359,6 +1470,11 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
+        // W2: storage versioning needs nested_ranges first; downstreams must
+        // reflect the version edges appended by the versioning pass.
+        self.graph.compute_nested_ranges();
+        self.apply_storage_versioning();
+
         // Compute fan-out
         self.graph.compute_downstreams();
 
@@ -1397,6 +1513,13 @@ impl<'a> IrBuilder<'a> {
         // Pre-compute nested_ranges for all subgraphs; runtime O(len) lookup replaces full-graph scans
         self.graph.compute_nested_ranges();
 
+        // W5: flatten loop condition-tree reset plans once, so the engine's
+        // per-iteration reset is mechanical (no per-iteration DFS).
+        self.graph.precompute_reset_plans();
+
+        // W0: structural invariant verification (debug builds / KUZO_VERIFY=1).
+        crate::pass::Verifier::verify_and_report(&self.graph, "build");
+
         // Move the build-time string_pool into graph.string_pool (ConstValue::Str references this pool)
         let pool = std::mem::take(&mut self.string_pool);
         self.graph.string_pool = Arc::from(pool);
@@ -1404,4 +1527,72 @@ impl<'a> IrBuilder<'a> {
         self.graph
     }
 
+}
+
+/// Bug #100 helper: collects the names assigned inside a loop body (Assignment /
+/// CompoundAssignment with an Ident target). Over-approximation is safe (rebinding a
+/// non-modified variable to its home is a no-op when home == current binding).
+/// Recurses through Block/If/Match/While/Loop/For and expression blocks; skips lambda
+/// bodies (their assignments are scoped to the nested function).
+fn collect_assigned_names(
+    arena: &crate::ast::Ast::AstArena<'_>,
+    expr: crate::ast::Ast::ExprId,
+    out: &mut rustc_hash::FxHashSet<String>,
+) {
+    use crate::ast::Ast::Expr;
+    match &arena.expr(expr).node {
+        Expr::Block { stmts, trailing } => {
+            for &st in stmts {
+                collect_assigned_names_stmt(arena, st, out);
+            }
+            if let Some(t) = trailing {
+                collect_assigned_names(arena, *t, out);
+            }
+        }
+        Expr::If { cond, then_branch, else_branch } => {
+            collect_assigned_names(arena, *cond, out);
+            collect_assigned_names(arena, *then_branch, out);
+            if let Some(e) = else_branch {
+                collect_assigned_names(arena, *e, out);
+            }
+        }
+        Expr::Match { scrutinee, arms } => {
+            collect_assigned_names(arena, *scrutinee, out);
+            for arm in arms {
+                collect_assigned_names(arena, arm.body, out);
+            }
+        }
+        // Skip nested functions/lambdas: their assignments bind their own scopes.
+        Expr::Lambda { .. } => {}
+        _ => {}
+    }
+}
+
+fn collect_assigned_names_stmt(
+    arena: &crate::ast::Ast::AstArena<'_>,
+    stmt: crate::ast::Ast::StmtId,
+    out: &mut rustc_hash::FxHashSet<String>,
+) {
+    use crate::ast::Ast::Stmt;
+    match &arena.stmt(stmt).node {
+        Stmt::Assignment { target, .. } | Stmt::CompoundAssignment { target, .. } => {
+            if let crate::ast::Ast::Expr::Ident(name) = &arena.expr(*target).node {
+                out.insert(name.to_string());
+            }
+        }
+        Stmt::Expression { expr } => collect_assigned_names(arena, *expr, out),
+        // Nested loops' own conditions rebind at their own registration; recursing
+        // here would rebind OUTER loop variables in the INNER condition (e.g. `si`
+        // in bubble sort's inner loop), which breaks nested-loop shapes.
+        Stmt::While { condition, .. } => {
+            collect_assigned_names(arena, *condition, out);
+        }
+        Stmt::Loop { .. } => {}
+        Stmt::For { iterable, .. } => {
+            collect_assigned_names(arena, *iterable, out);
+        }
+        Stmt::Return { value: Some(v) } => collect_assigned_names(arena, *v, out),
+        Stmt::Throw { expr } => collect_assigned_names(arena, *expr, out),
+        _ => {}
+    }
 }

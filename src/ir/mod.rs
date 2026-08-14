@@ -11,3 +11,4 @@
 pub mod Ir;
 pub mod Builder;
 pub mod Compute;
+pub mod Region;

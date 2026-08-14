@@ -635,10 +635,72 @@ impl<'a> IrBuilder<'a> {
             let arg_node = self.compile_subexpr(arg);
             self.bind_var(param.name, arg_node);
         }
+        // W4c: bodies with early `return` / `?` cannot be compiled straight into
+        // the caller (the Return signal is function-scoped and would terminate
+        // the CALLER — the old has_return/has_propagate inline blacklist).
+        // Instead compile the body as a branch subgraph launched by a CAPTURE
+        // Gate: the branch's Return signal is captured as the Gate's value
+        // (exactly what a non-inlined call does — throw values flow as data,
+        // Bug #65 semantics) and the caller keeps executing.
+        let early_exit = {
+            let arena = &self.current_module().arena;
+            crate::pass::Analyzer::has_return(body, arena)
+                || crate::pass::Analyzer::has_propagate(body, arena)
+        };
+        if early_exit {
+            let body_node = self.compile_inline_wrap(body);
+            self.exit_scope();
+            return body_node;
+        }
         // Compile the callee body (non-tail position; inline expansion does not preserve tail-call semantics)
         let body_node = self.compile_subexpr(body);
         self.exit_scope();
         body_node
+    }
+
+    /// W4c: capture-Gate inline wrap — `Gate(true -> body_sg, false -> void)`
+    /// with `capture: true`. The body branch's Return signal becomes the
+    /// Gate's value instead of propagating to the caller frame.
+    fn compile_inline_wrap(&mut self, body: crate::ast::Ast::ExprRef) -> NodeId {
+        // Non-tail: a tail call inside the wrapped body must not get the
+        // caller's tail-call treatment (branch frames cannot tail-switch into
+        // cross-function subgraphs).
+        let prev_tail = self.in_tail_position;
+        self.in_tail_position = false;
+        let prev_effect = self.current_effect;
+        self.current_effect = None;
+        let (body_sg, body_inputs) = self.compile_branch_subgraph(body);
+        let void_sg = self.compile_void_subgraph();
+        self.current_effect = prev_effect;
+        self.in_tail_position = prev_tail;
+
+        let cond_node = self.compile_bool_const(true);
+        let gate_inputs: Vec<NodeId> = match self.current_effect {
+            Some(eff) => vec![cond_node, eff],
+            None => vec![cond_node],
+        };
+        let inputs_offset = self.graph.inputs_pool.push(&gate_inputs);
+        let gate_node = self.graph.add_node(Node {
+            kind: NodeKind::Gate,
+            input_count: gate_inputs.len() as u8,
+            inputs_offset,
+            compute_fn: CF_GATE_LAUNCH,
+        });
+        self.graph.set_gate_branches(
+            gate_node,
+            GateBranches {
+                condition_input: cond_node,
+                branches: vec![
+                    (true, body_sg, body_inputs),
+                    (false, void_sg, Vec::new()),
+                ],
+                capture: true,
+            },
+        );
+        // Order subsequent statements after the inlined body (the call-site
+        // analogue of chaining a Call node into the effect chain).
+        self.current_effect = Some(self.chain_effects(self.current_effect, gate_node));
+        gate_node
     }
 
     /// Look up a type declaration's field info (by type name).

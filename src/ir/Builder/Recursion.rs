@@ -110,6 +110,7 @@ impl<'a> IrBuilder<'a> {
         self.graph.set_gate_branches(
             gate_node,
             GateBranches {
+                capture: false,
                 condition_input: cond_node,
                 branches: vec![
                     (true, body_sg, Vec::new()),
@@ -454,6 +455,7 @@ impl<'a> IrBuilder<'a> {
         self.graph.set_gate_branches(
             gate_node,
             GateBranches {
+                capture: false,
                 condition_input: cond_node,
                 branches: vec![
                     (true, body_sg, Vec::new()),
@@ -474,6 +476,7 @@ impl<'a> IrBuilder<'a> {
             reset_to_zero: vec![],
             reset_to_one: vec![],
             reset_condition_tree: vec![cond_node],
+            condition_tree_plan: Vec::new(),
         });
 
         // 10. Create the Call node to launch while_sg
@@ -515,11 +518,31 @@ impl<'a> IrBuilder<'a> {
             loop_var_node: None,
         });
 
-        // Record the function subgraph's event_source_decls length before compilation (same as compile_loop_body_subgraph)
-        let prev_decl_count = self.current_function_sg
-            .and_then(|sg_id| self.graph.subgraphs.get(sg_id.0 as usize))
-            .map(|sg| sg.event_source_decls.len())
-            .unwrap_or(0);
+        // W3C: pre-register the outer body subgraph (registered at the end of
+        // this function); awaits compiled in the pop/frame-read section below
+        // register their EventSourceDecls directly into it.
+        let body_sg = SubGraphId(self.graph.subgraphs.len() as u32);
+        self.graph.add_subgraph(SubGraph {
+            id: body_sg,
+            node_range: (NodeId(body_node_start), NodeId(body_node_start)),
+            param_count: 0,
+            entry_node: NodeId(body_node_start),
+            return_node: NodeId(body_node_start),
+            has_suspend: false,
+            event_source_decls: Vec::new(),
+            defer_table: Vec::new(),
+            loop_kind: LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: self.current_function_id,
+            iter_next_node: None,
+            upvalue_count: 0,
+            upvalue_outer_nodes: Vec::new(),
+            nested_ranges: Vec::new(),
+            reset_plan: None,
+        });
+        let prev_branch_sg_outer = self.current_branch_sg;
+        self.current_branch_sg = Some(body_sg);
 
         // 1. Pop: sp = sp - 1 (WriteBack to sp_node)
         let one_pop = self.make_i32_const(1);
@@ -605,6 +628,31 @@ impl<'a> IrBuilder<'a> {
             let prev_sg_start_inner = self.current_sg_start;
             self.current_sg_start = sg_node_start;
 
+            // W3C: pre-register THIS state's subgraph so awaits in the body
+            // register their EventSourceDecls directly into it.
+            let state_sg = SubGraphId(self.graph.subgraphs.len() as u32);
+            self.graph.add_subgraph(SubGraph {
+                id: state_sg,
+                node_range: (NodeId(sg_node_start), NodeId(sg_node_start)),
+                param_count: 0,
+                entry_node: NodeId(sg_node_start),
+                return_node: NodeId(sg_node_start),
+                has_suspend: false,
+                event_source_decls: Vec::new(),
+                defer_table: Vec::new(),
+                loop_kind: LoopKind::None,
+                loop_parent_sg: None,
+                cond_node: None,
+                function_id: self.current_function_id,
+                iter_next_node: None,
+                upvalue_count: 0,
+                upvalue_outer_nodes: Vec::new(),
+                nested_ranges: Vec::new(),
+                reset_plan: None,
+            });
+            let prev_branch_sg = self.current_branch_sg;
+            self.current_branch_sg = Some(state_sg);
+
             self.enter_scope();
             // Bind parameter names to param_cur nodes (instead of the function's param nodes)
             for (i, param) in params.iter().enumerate() {
@@ -633,38 +681,12 @@ impl<'a> IrBuilder<'a> {
             let return_node = self.compile_writeback_node(body_node, result_node);
 
             let sg_node_end = self.graph.nodes.len() as u32;
-
-            // Migrate event_source_decls (same as compile_branch_subgraph)
-            let state_decls: Vec<_> = if let Some(func_sg_id) = self.current_function_sg {
-                if let Some(func_sg) = self.graph.subgraphs.get_mut(func_sg_id.0 as usize) {
-                    func_sg.event_source_decls.drain(prev_decl_count..).collect()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
-
-            let state_sg = SubGraphId(self.graph.subgraphs.len() as u32);
-            self.graph.add_subgraph(SubGraph {
-                id: state_sg,
-                node_range: (NodeId(sg_node_start), NodeId(sg_node_end)),
-                param_count: 0,
-                entry_node: NodeId(sg_node_start),
-                return_node,
-                has_suspend: false,
-                event_source_decls: state_decls,
-                defer_table: Vec::new(),
-                loop_kind: LoopKind::None,
-                loop_parent_sg: None,
-                cond_node: None,
-                function_id: self.current_function_id,
-                iter_next_node: None,
-                upvalue_count: 0,
-                upvalue_outer_nodes: Vec::new(),
-            nested_ranges: Vec::new(),
-            reset_plan: None,
-            });
+            self.current_branch_sg = prev_branch_sg;
+            {
+                let sgm = &mut self.graph.subgraphs[state_sg.0 as usize];
+                sgm.node_range = (NodeId(sg_node_start), NodeId(sg_node_end));
+                sgm.return_node = return_node;
+            }
             state_sgs.push(state_sg);
         }
 
@@ -698,6 +720,7 @@ impl<'a> IrBuilder<'a> {
             self.graph.set_gate_branches(
                 gate_node,
                 GateBranches {
+                capture: false,
                     condition_input: cmp_eff,
                     branches: vec![
                         (true, state_sgs[i], Vec::new()),
@@ -739,40 +762,16 @@ impl<'a> IrBuilder<'a> {
         // 5. Pop the loop context and register body_sg
         self.loop_stack.pop();
         self.current_sg_start = prev_sg_start;
+        self.current_branch_sg = prev_branch_sg_outer;
 
         let body_node_end = self.graph.nodes.len() as u32;
-
-        // Migrate body_sg's own event_source_decls
-        let body_decls: Vec<_> = if let Some(func_sg_id) = self.current_function_sg {
-            if let Some(func_sg) = self.graph.subgraphs.get_mut(func_sg_id.0 as usize) {
-                func_sg.event_source_decls.drain(prev_decl_count..).collect()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        let body_sg = SubGraphId(self.graph.subgraphs.len() as u32);
-        self.graph.add_subgraph(SubGraph {
-            id: body_sg,
-            node_range: (NodeId(body_node_start), NodeId(body_node_end)),
-            param_count: 0,
-            entry_node: NodeId(body_node_start),
-            return_node: dispatch_gate,
-            has_suspend: false,
-            event_source_decls: body_decls,
-            defer_table: Vec::new(),
-            loop_kind: LoopKind::LoopBody,
-            loop_parent_sg: Some(while_sg_id),
-            cond_node: None,
-            function_id: self.current_function_id,
-            iter_next_node: None,
-            upvalue_count: 0,
-            upvalue_outer_nodes: Vec::new(),
-            nested_ranges: Vec::new(),
-            reset_plan: None,
-        });
+        {
+            let sgm = &mut self.graph.subgraphs[body_sg.0 as usize];
+            sgm.node_range = (NodeId(body_node_start), NodeId(body_node_end));
+            sgm.return_node = dispatch_gate;
+            sgm.loop_kind = LoopKind::LoopBody;
+            sgm.loop_parent_sg = Some(while_sg_id);
+        }
         body_sg
     }
 
@@ -831,6 +830,7 @@ impl<'a> IrBuilder<'a> {
         self.graph.set_gate_branches(
             gate_node,
             GateBranches {
+                capture: false,
                 condition_input: cond_node,
                 branches: vec![
                     (true, body_sg, vec![]),
@@ -850,6 +850,7 @@ impl<'a> IrBuilder<'a> {
             reset_to_zero: vec![],
             reset_to_one: vec![],
             reset_condition_tree: vec![cond_node],
+            condition_tree_plan: Vec::new(),
         });
         sg_id
     }
@@ -881,41 +882,19 @@ impl<'a> IrBuilder<'a> {
         // intermediate node produced by the loop body's bind_var).
         self.enter_scope();
 
-        // Record the function subgraph's event_source_decls length before compilation (same as compile_branch_subgraph, Bug #24)
-        let prev_decl_count = self.current_function_sg
-            .and_then(|sg_id| self.graph.subgraphs.get(sg_id.0 as usize))
-            .map(|sg| sg.event_source_decls.len())
-            .unwrap_or(0);
-
-        let prev_in_loop = self.in_loop_body;
-        self.in_loop_body = true;
-        let body_last = self.compile_expr(body);
-        self.in_loop_body = prev_in_loop;
-        self.loop_stack.pop();
-        self.exit_scope();
-        self.current_sg_start = prev_sg_start;
-        let node_end = self.graph.nodes.len() as u32;
+        // W3C: pre-register the body subgraph (stable id across the body
+        // compile) and make it the innermost region so build_await_node
+        // registers EventSourceDecls directly here (Bug #24 class, structural
+        // fix — replaces the post-hoc drain from the function sg).
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
-
-        // Migrate the event_source_decls added during loop-body compilation from the function subgraph to the loop body subgraph
-        let body_decls: Vec<_> = if let Some(func_sg_id) = self.current_function_sg {
-            if let Some(func_sg) = self.graph.subgraphs.get_mut(func_sg_id.0 as usize) {
-                func_sg.event_source_decls.drain(prev_decl_count..).collect()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
         self.graph.add_subgraph(SubGraph {
             id: sg_id,
-            node_range: (NodeId(node_start), NodeId(node_end)),
+            node_range: (NodeId(node_start), NodeId(node_start)),
             param_count: 0,
             entry_node: NodeId(node_start),
-            return_node: body_last,
+            return_node: NodeId(node_start),
             has_suspend: false,
-            event_source_decls: body_decls,
+            event_source_decls: Vec::new(),
             defer_table: Vec::new(),
             loop_kind: LoopKind::LoopBody,
             loop_parent_sg: Some(loop_sg),
@@ -927,6 +906,23 @@ impl<'a> IrBuilder<'a> {
             nested_ranges: Vec::new(),
             reset_plan: None,
         });
+        let prev_branch_sg = self.current_branch_sg;
+        self.current_branch_sg = Some(sg_id);
+
+        let prev_in_loop = self.in_loop_body;
+        self.in_loop_body = true;
+        let body_last = self.compile_expr(body);
+        self.in_loop_body = prev_in_loop;
+        self.loop_stack.pop();
+        self.exit_scope();
+        self.current_sg_start = prev_sg_start;
+        self.current_branch_sg = prev_branch_sg;
+        let node_end = self.graph.nodes.len() as u32;
+        {
+            let sgm = &mut self.graph.subgraphs[sg_id.0 as usize];
+            sgm.node_range = (NodeId(node_start), NodeId(node_end));
+            sgm.return_node = body_last;
+        }
         sg_id
     }
 

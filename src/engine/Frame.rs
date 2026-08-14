@@ -324,8 +324,24 @@ impl<S: LockStrategy> Engine<S> {
                 let local = NodeId(nid.0.wrapping_sub(loop_offset));
                 Self::reset_node_pending(loop_frame, local, 1);
             }
-            for &nid in &plan.reset_condition_tree {
-                self.reset_condition_tree(loop_frame, loop_sg_id, nid, loop_offset);
+            // W5: apply the precomputed condition-tree plan mechanically —
+            // same (node, pending) pairs the DFS below would produce, flattened
+            // once at build/load time. Falls back to the DFS when the plan was
+            // not precomputed.
+            if !plan.condition_tree_plan.is_empty() {
+                for &(gid, pending) in &plan.condition_tree_plan {
+                    let local = NodeId(gid.0.wrapping_sub(loop_offset));
+                    Self::reset_node_pending(loop_frame, local, pending);
+                }
+                for &(gid, pending) in &plan.condition_tree_plan {
+                    if pending == 0 {
+                        loop_frame.push_ready(NodeId(gid.0.wrapping_sub(loop_offset)));
+                    }
+                }
+            } else {
+                for &nid in &plan.reset_condition_tree {
+                    self.reset_condition_tree(loop_frame, loop_sg_id, nid, loop_offset);
+                }
             }
         } else {
             // Fallback: LoopKind branch (subgraphs without a ResetPlan, e.g. TailRec).
@@ -379,9 +395,17 @@ impl<S: LockStrategy> Engine<S> {
         // Rebind the body_sg frame's caller.
         body_frame.caller =
             Some((loop_fid, NodeId(return_node.0.wrapping_sub(loop_offset))));
-        // Frame-chain pointers set to null (HashMap addresses are unstable).
-        body_frame.root_frame_ptr = std::ptr::null_mut();
-        body_frame.parent_frame_ptr = std::ptr::null_mut();
+        // Bug #100: keep the frame chain connected across iterations. The loop frame is
+        // in hand here and Box addresses are stable (process_frame reuses the Box), so
+        // pointing the body at it is safe; nulling the pointers orphaned the body's
+        // WriteBacks (loop-variable updates never reached the loop frame).
+        let loop_ptr = loop_frame as *const Frame as *mut Frame;
+        body_frame.parent_frame_ptr = loop_ptr;
+        body_frame.root_frame_ptr = if !loop_frame.root_frame_ptr.is_null() {
+            loop_frame.root_frame_ptr
+        } else {
+            loop_ptr
+        };
 
         // 5. Reset the loop frame state.
         loop_frame.control_signal = ControlSignal::None;

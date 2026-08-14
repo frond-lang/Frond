@@ -308,9 +308,21 @@ impl<'a> InferContext<'a> {
         };
         // Record the current module env for use by check_decl (e.g. let-bindings).
         self.current_module_env = Some(module_env);
+        // Same-module duplicate function definitions: `define` is first-wins and
+        // silently ignores the second registration, so a redefinition used to
+        // compile quietly with confusing resolution (Bug #94). Track names within
+        // this predeclare pass (immune to any module being processed twice).
+        let mut seen_fns: FxHashSet<&str> = FxHashSet::default();
         for decl in module.declarations.iter() {
             match &decl.node {
                 Decl::FunDecl { name, type_params, params, return_type, is_async, .. } => {
+                    if !seen_fns.insert(name) {
+                        self.add_error_at(
+                            &format!("duplicate definition of function '{}' in this module", name),
+                            decl.span.line,
+                            decl.span.column,
+                        );
+                    }
                     // Top-level functions disallow a self parameter (detected via the ThisType
                     // type node, not by parameter name).
                     if !params.is_empty() && self.is_this_param(params[0].type_annotation, &module.arena) {
@@ -663,6 +675,18 @@ impl<'a> InferContext<'a> {
                 } else if self.unify_return_type(ret_ty, body_ty).is_err() {
                     self.solver.add_equality(ret_ty, body_ty);
                 }
+                // Non-void declared return type with no trailing expression and no
+                // return/throw would silently return garbage at runtime — reject it.
+                if return_type.is_some() {
+                    self.check_missing_return_value(
+                        &format!("function '{}'", name),
+                        ret_ty,
+                        *body,
+                        ast,
+                        decl_span.line,
+                        decl_span.column,
+                    );
+                }
                 if !type_params.is_empty() {
                     self.pop_type_bindings();
                 }
@@ -798,6 +822,18 @@ impl<'a> InferContext<'a> {
                         self.expected_return = ret_ty;
                         let body_ty = self.infer_expr(body, ast, method_env, ret_ty);
                         self.expected_return = prev_return;
+                        // Non-void declared return type with no trailing expression and no
+                        // return/throw would silently return garbage at runtime — reject it.
+                        if let Some(r) = ret_ty {
+                            self.check_missing_return_value(
+                                &format!("method '{}'", method.name),
+                                r,
+                                body,
+                                ast,
+                                decl_span.line,
+                                decl_span.column,
+                            );
+                        }
                         // Unify the method body type with the declared return type (aligned with
                         // FunDecl):
                         // - Unannotated return type: ret_ty is None → fresh_type_var; bind via
@@ -861,6 +897,18 @@ impl<'a> InferContext<'a> {
                         self.expected_return = ret_ty;
                         let body_ty = self.infer_expr(body, ast, method_env, ret_ty);
                         self.expected_return = prev_return;
+                        // Non-void declared return type with no trailing expression and no
+                        // return/throw would silently return garbage at runtime — reject it.
+                        if let Some(r) = ret_ty {
+                            self.check_missing_return_value(
+                                &format!("method '{}'", method.name),
+                                r,
+                                body,
+                                ast,
+                                decl_span.line,
+                                decl_span.column,
+                            );
+                        }
                         // Unify the method body type with the declared return type (aligned with
                         // FunDecl):
                         // - Unannotated return type: ret_ty is None → fresh_type_var; bind via

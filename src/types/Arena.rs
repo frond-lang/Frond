@@ -43,6 +43,10 @@ impl TypeArena {
     // -- Basic access --
 
     #[inline]
+    pub fn details_len(&self) -> usize {
+        self.details.len()
+    }
+
     pub fn len(&self) -> usize {
         self.types.len()
     }
@@ -129,6 +133,13 @@ impl TypeArena {
         self.make(Type::Fn(id))
     }
     pub fn make_nullable(&mut self, inner: TypeHandle) -> TypeHandle {
+        // `T??` collapses to `T?`: Kuzo nullable has no Some-constructor, so a
+        // "wrapped null" value is unrepresentable — Nullable<Nullable<T>> carries
+        // no additional information over Nullable<T> (Kotlin/TypeScript-style).
+        let inner = self.resolve(inner);
+        if matches!(self.get(inner), Type::Nullable(_)) {
+            return inner;
+        }
         let id = self.make_detail(TypeDetail::Nullable { inner });
         self.make(Type::Nullable(id))
     }

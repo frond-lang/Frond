@@ -3825,14 +3825,10 @@ pub fn inline_pass(
         if has_nested_function(body, arena) {
             continue;
         }
-        // Functions containing the `?` propagation operator are not inlined
-        if has_propagate(body, arena) {
-            continue;
-        }
-        // Functions containing return statements are not inlined
-        if has_return(body, arena) {
-            continue;
-        }
+        // W4c: bodies with early `return` / `?` ARE now inlinable — the Builder
+        // wraps them in a capture Gate (branch subgraph whose Return becomes
+        // the call-site value instead of leaking into the caller frame). The
+        // Builder re-detects them with the same helpers to pick the wrap path.
         // Functions containing defer statements are not inlined
         if has_defer(body, arena) {
             continue;
@@ -3896,7 +3892,7 @@ fn has_nested_function_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
 /// Functions with `?` should not be inlined: compute_propagate implements early return via
 /// ControlSignal::Return, which is function-scoped; inlining would incorrectly terminate the
 /// caller function.
-fn has_propagate(expr_id: ExprId, arena: &AstArena) -> bool {
+pub(crate) fn has_propagate(expr_id: ExprId, arena: &AstArena) -> bool {
     if matches!(arena.expr(expr_id).node, Expr::Propagate(_)) {
         return true;
     }
@@ -3977,7 +3973,7 @@ fn has_defer_stmt(stmt_id: StmtId, arena: &AstArena) -> bool {
 /// Detects whether an expression contains return statements (function-scoped).
 /// Return within lambda bodies is not counted (scoped to the lambda).
 /// Return within defer bodies is not counted (defer body is compiled into a separate sub-graph).
-fn has_return(expr_id: ExprId, arena: &AstArena) -> bool {
+pub(crate) fn has_return(expr_id: ExprId, arena: &AstArena) -> bool {
     let mut found = false;
     walk_children_stmts_of_expr(expr_id, arena, |s| {
         if !found {
@@ -4316,8 +4312,8 @@ pub fn analyze(module: &Module, arena: &AstArena, sema: &SemaResult) -> Analysis
 // =========================================================================
 
 use crate::ir::Ir::{
-    ComputeFnId, ConstValue, DataFlowGraph, LoopKind, NodeId, NodeKind, SubGraphId,
-    CF_CALL_LAUNCH, CF_RANGE, CF_RANGE_INCLUSIVE, pure_compute_fn_set,
+    ComputeFnId, ConstValue, DataFlowGraph, LoopKind, NodeId, SubGraphId,
+    CF_CALL_LAUNCH, CF_RANGE, CF_RANGE_INCLUSIVE,
 };
 
 /// Maximum number of body nodes to unroll
@@ -4332,7 +4328,8 @@ const MAX_UNROLL: u32 = 8;
 /// so loop_analysis must be populated by main.rs calling this function after IR construction.
 pub fn analyze_loops(graph: &DataFlowGraph) -> LoopAnalysisReport {
     let mut report = LoopAnalysisReport::default();
-    let pure_set = pure_compute_fn_set();
+    // W1: single derivation point (Bug #99 aliasing-read subtraction included).
+    let pure_set = crate::ir::Ir::graph_pure_set(graph);
 
     // Collect all loop sub-graphs (loop_kind != None and != LoopBody)
     let loop_sgs: Vec<SubGraphId> = graph
@@ -4433,11 +4430,8 @@ fn find_invariants(
 
             let node = graph.nodes[idx];
 
-            // Must not be a control-flow/call/event node
-            if matches!(
-                node.kind,
-                NodeKind::Gate | NodeKind::Call | NodeKind::Await | NodeKind::EventSource
-            ) {
+            // Must not be a launch kind (Gate/Call/Await/EventSource — W1 shared predicate)
+            if crate::ir::Ir::is_launch_kind(node.kind) {
                 continue;
             }
 

@@ -11,7 +11,7 @@
 //!
 //! Design principles (see docs/superpowers/specs/2026-07-31-dataflow-engine-design.md):
 //! - Nodes are fixed 16B and store only topological references; the output is implicitly the node's own id.
-//! - `kind` has only 6 variants, used solely for scheduler readiness checks, not for operation dispatch.
+//! - `kind` has 9 variants, used solely for scheduler readiness checks, not for operation dispatch.
 //! - `compute_fn` is a function index bound at build time via type specialization, looked up at runtime by array index.
 //! - Value table slots use the `Value` enum from Value.rs (scalars and `Arc<HeapObj>` references).
 //! - The standalone input pool stores all node inputs contiguously for cache friendliness.
@@ -454,8 +454,17 @@ compute_fn_ids! {
     336 => CF_REFLECT_ADT_CTOR,       // v.adt_constructor() -> str
 }
 
+/// Number of entries in `build_compute_fn_table()`.
+///
+/// Single source of truth for the solidify header's `compute_fn_count`
+/// compatibility check (`solidify::Spec::COMPUTE_FN_COUNT`): a `.kzo` written
+/// by a binary with a different table length is rejected at load instead of
+/// silently mis-dispatching node compute fns. `build_compute_fn_table()`
+/// asserts equality so this constant cannot drift silently.
+pub const COMPUTE_FN_TABLE_LEN: u32 = 337;
+
 // =========================================================================
-// NodeKind — node category (not an op; only 8 variants for readiness checks)
+// NodeKind — node category (not an op; 9 variants for readiness checks)
 // =========================================================================
 
 /// Node category: used solely by the scheduler to determine readiness, not for operation dispatch.
@@ -868,6 +877,13 @@ pub struct GateBranches {
     pub condition_input: NodeId,
     /// Branch list: (condition value, subgraph id, parameter node list).
     pub branches: Vec<(bool, SubGraphId, Vec<NodeId>)>,
+    /// W4c capture gate: the selected branch's Return signal is CAPTURED as
+    /// the Gate's value instead of propagating to the caller frame. Used by
+    /// inline expansion of bodies with early `return`/`?` — the captured
+    /// value flows as data to the call site (exactly what a non-inlined call
+    /// does), and the caller keeps executing. Serialized in the section's
+    /// validity byte (2 = valid + capture).
+    pub capture: bool,
 }
 
 /// select expression branch info (indexed by Gate node NodeId into select_infos).
@@ -915,8 +931,45 @@ pub enum ControlSignal {
 /// Replaces the old control_signal_nodes table check: control-flow semantics are now
 /// expressed directly via compute_fn (CF_RETURN/CF_BREAK/CF_CONTINUE/CF_THROW_WRAP_ERR)
 /// returning NodeResult::Return/Break/Continue.
+///
+/// NOTE: this is the narrow "produces a non-local exit signal" predicate, kept
+/// exact for behavior preservation. The broader dispatch classification lives
+/// in `effect_class` (whose ControlFlow class additionally contains Gate launch
+/// and match fallback).
 pub fn is_control_flow_compute_fn(cf: ComputeFnId) -> bool {
     cf == CF_RETURN || cf == CF_BREAK || cf == CF_CONTINUE || cf == CF_THROW_WRAP_ERR
+}
+
+/// Control-signal propagation matrix (single source of truth).
+///
+/// Decides whether a completing child subgraph's control signal propagates to
+/// the caller frame on the normal (non-LoopBody) completion path. Shared by
+/// the async engine (`engine/Subgraph.rs` `complete_and_wake_caller`) and the
+/// sync interpreter (`ir/Compute.rs`); the `pending_completions` race path in
+/// `engine/Schedule.rs` intentionally propagates more broadly (see the
+/// comment there — a dropped signal cannot be recovered on that path).
+///
+/// - `Return`: propagates from Gate branches (if/match arm) and loop frames
+///   (while/loop/for/tailrec sg); NOT from cross-function or lambda calls —
+///   their return value has already been extracted as data (Bug #65/#97
+///   class: propagating would make the caller exit prematurely).
+/// - `Break`/`Continue`: propagate from Gate branches only — they must
+///   penetrate to the enclosing LoopBody frame; a loop frame's own
+///   Break/Continue has already been consumed by the loop.
+/// - `None`: never propagates.
+///
+/// Both engines additionally gate propagation on `child.function_id ==
+/// caller.function_id` (in-function only).
+pub fn should_propagate_control_signal(
+    child_signal: &ControlSignal,
+    call_node_is_gate: bool,
+    child_loop_kind: LoopKind,
+) -> bool {
+    match child_signal {
+        ControlSignal::Return(_) => call_node_is_gate || child_loop_kind != LoopKind::None,
+        ControlSignal::Break | ControlSignal::Continue => call_node_is_gate,
+        ControlSignal::None => false,
+    }
 }
 
 // =========================================================================
@@ -1546,6 +1599,12 @@ pub struct ResetPlan {
     pub reset_to_one: Vec<NodeId>,
     /// Condition tree root nodes requiring recursive reset (While/Loop's cond_node).
     pub reset_condition_tree: Vec<NodeId>,
+    /// W5: `reset_condition_tree` flattened ONCE at build/load time into
+    /// (node, pending) pairs (topological order), so the engine applies the
+    /// per-iteration reset mechanically instead of re-running the DFS (which
+    /// also rescanned every subgraph for nested ranges) each iteration.
+    /// Empty when there is nothing to precompute or before `precompute_reset_plans`.
+    pub condition_tree_plan: Vec<(NodeId, u16)>,
 }
 
 /// Loop subgraph kind.
@@ -2063,61 +2122,197 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
     table[322] = super::Compute::compute_defer_register;
     table[323] = super::Compute::compute_defer_run;
     table[324] = super::Compute::compute_block_defer_register;
+    assert_eq!(
+        table.len() as u32, COMPUTE_FN_TABLE_LEN,
+        "build_compute_fn_table(): table length drifted from COMPUTE_FN_TABLE_LEN; update the constant"
+    );
     table
 }
 
 /// Set of pure compute_fn (no side effects; eligible for CSE/DCE).
 ///
-/// Includes: all arithmetic and comparison (1-27, 50-91, 92-259), pure reads (30/32/34/35),
-/// pure semantic operations (260/261/265/274-276/278/279/287), stack-allocated construction (288-289).
-/// Excludes: call/gate/await (36-49), heap allocation (29/31), mutation (33/271/282),
-/// channel (283-285), global_store (271), throw (28/47), ffi (46).
+/// Derived from `effect_class` (W1); the derivation's equivalence with the
+/// pre-W1 hand-written set is asserted by the unit test at the bottom of this
+/// file. Aliasing heap reads are folded in by `aliasing_read_cfs`; their
+/// movement safety is guaranteed by W2 storage-version edges (see
+/// `graph_pure_set`), not by subtracting them from this set.
+///
+/// The four aliased heap reads (`is_versioned_read_cf` subset) folded into the
+/// CSE/LICM pure set by `pure_compute_fn_set`. Their movement safety no longer
+/// relies on purity subtraction (the pre-W2 Bug #99 stopgap, removed): the
+/// storage-versioning pass (`Builder::Versioning`) attaches version edges that
+/// make CSE/LICM see mutations through shared Arcs directly.
+pub fn aliasing_read_cfs() -> [ComputeFnId; 4] {
+    [CF_RECORD_FIELD_GET, CF_ARRAY_INDEX, CF_ARRAY_LEN, CF_PATTERN_ADT_FIELD_GET]
+}
+
+// =========================================================================
+// EffectClass — single source of truth for per-CF effect classification (W1)
+// =========================================================================
+
+/// Effect classification of a compute function: the ONE place every pass asks
+/// "what can be done with a node of this cf" (move / merge / duplicate /
+/// delete / reorder). Adding a new CF means adding one classification here —
+/// the pass layer must not keep its own lists.
+///
+/// `pure_compute_fn_set()` (CSE/LICM/DCE eligibility) is derived from this
+/// classification; the derivation is equivalence-tested against the previous
+/// hand-written set (see `effect_classification_tests`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EffectClass {
+    /// No side effects, deterministic per input: reorder/merge/duplicate/delete
+    /// freely.
+    Pure,
+    /// Pure value-metadata reads (reflect kind/type-name/size/...). Semantically
+    /// pure, but kept OUT of the CSE/LICM set to preserve pre-W1 behavior until
+    /// interning/metadata-hash stability is validated (W2).
+    PureMeta,
+    /// Allocates a distinct object per run (record/array/closure/range/slice/
+    /// string builds): not CSE/LICM-able — sharing one instance across loop
+    /// iterations would pollute state.
+    Alloc,
+    /// Reads mutable state that is NOT tracked as a dataflow input edge (heap
+    /// field/array/deref/global/atomic/memo-cache reads). Pure only in graphs
+    /// without writers to the same state (see `aliasing_read_cfs`).
+    ReadMutable,
+    /// In-place write to mutable state (field set / array store / deref write /
+    /// atomic RMW / memo store).
+    WriteMutable,
+    /// Writes a graph location: WriteBack / TailRec WriteBack / global store.
+    WriteLocal,
+    /// Produces a non-local control signal or dispatches control (return/break/
+    /// continue/throw/propagate/match-fallback, Gate launch).
+    ControlFlow,
+    /// Effect-chain ordering node (CF_SEQ): value-transparent sequencer.
+    Seq,
+    /// Interacts with the async runtime (await/async launch/select/channel
+    /// send/close/cancel).
+    Async,
+    /// Launches a subgraph/closure; effect depends on the callee.
+    Call,
+    /// Foreign function call: assume ANY effect.
+    Ffi,
+    /// Engine/frame-level effect (defer register/run).
+    Runtime,
+}
+
+/// Classify a compute function. Panics on unclassified ids so a newly added CF
+/// cannot silently default to a wrong class — extend this match (and, if the
+/// table grew, `COMPUTE_FN_TABLE_LEN`) in the same commit.
+pub fn effect_class(cf: ComputeFnId) -> EffectClass {
+    use EffectClass::*;
+    match cf.0 {
+        // ── Pure: legacy arithmetic/comparison ranges (equivalence-tested) ──
+        1..=27 | 50..=91 | 92..=259 => Pure,
+        34 | 260 | 261 | 265 | 274 | 276 | 278 | 279 | 287 => Pure, // reads/queries
+        292..=300 | 302..=307 => Pure, // string/obj/bool/f128 comparison
+        // ── Reads of mutable state (aliasing) ──
+        30 | 32 | 35 | 275 => ReadMutable,      // field/array/pattern-ADT reads (aliasing_read_cfs)
+        270 | 281 | 308 | 315 | 334 | 335 => ReadMutable, // global/deref/memo/atomic/reflect-value reads
+        // ── In-place writes ──
+        33 | 282 | 301 | 309 | 316 | 317 | 318 => WriteMutable,
+        // ── Graph-location writes ──
+        49 | 271 | 310 => WriteLocal, // writeback / global_store / tailrec writeback
+        // ── Control flow / dispatch ──
+        28 | 37 | 47 | 311 | 312 | 313 | 314 => ControlFlow,
+        // ── Ordering ──
+        48 => Seq, // CF_SEQ
+        // ── Async runtime ──
+        38 | 39 | 42 | 43 | 284 | 285 => Async,
+        // ── Launches ──
+        36 | 41 => Call, // call_launch / closure_call
+        // ── FFI ──
+        46 | 325 => Ffi,
+        // ── Engine/frame effects ──
+        322 | 323 | 324 => Runtime, // defer register/run/block-register
+        // ── Allocation (distinct object per run) ──
+        29 | 31 | 40 | 44 | 45 | 262 | 263 | 264 | 266 | 267 | 268 | 269 | 272 | 273
+        | 277 | 280 | 283 | 286 | 288 | 289 | 290 | 291 | 319 | 320 | 321 => Alloc,
+        // ── Pure value metadata (kept out of CSE/LICM pending W2 validation) ──
+        326..=333 | 336 => PureMeta,
+        // CF_NOOP: parameter placeholder passthrough.
+        0 => Pure,
+        other => panic!(
+            "effect_class: unclassified compute fn {} — classify it in Ir::effect_class",
+            other
+        ),
+    }
+}
+
+/// Aliased heap reads that participate in storage versioning (W2): the read's
+/// storage root is always `inputs[0]`. Shared between the Builder versioning
+/// pass and the Verifier's V6 completeness check.
+pub fn is_versioned_read_cf(cf: ComputeFnId) -> bool {
+    matches!(
+        cf,
+        CF_RECORD_FIELD_GET
+            | CF_ARRAY_INDEX
+            | CF_ARRAY_LEN
+            | CF_PATTERN_ADT_FIELD_GET
+            | CF_DEREF_READ
+            | CF_ATOMIC_LOAD
+            | CF_REFLECT_FIELD_VALUE
+            | CF_REFLECT_ARRAY_LEN
+    )
+}
+
+/// In-place heap writes that participate in storage versioning (W2): the
+/// write's storage root is always `inputs[0]`; the write node becomes the
+/// root's new version.
+pub fn is_versioned_write_cf(cf: ComputeFnId) -> bool {
+    matches!(
+        cf,
+        CF_RECORD_FIELD_SET
+            | CF_ARRAY_STORE
+            | CF_DEREF_WRITE
+            | CF_ATOMIC_STORE
+            | CF_ATOMIC_SWAP
+            | CF_ATOMIC_COMPARE_EXCHANGE
+    )
+}
+
+/// The CSE/LICM/DCE-pure set for a specific graph.
+///
+/// W2: aliased heap reads stay eligible — their correctness when moved is
+/// guaranteed by storage-version edges attached at build time
+/// (`Builder::Versioning`): reads inside mutating loop bodies carry a
+/// loop-internal input (cond_node), so LICM cannot hoist them and CSE cannot
+/// merge reads across a write (their version inputs differ). The pre-W2
+/// blanket subtraction of aliasing reads (Bug #99 stopgap) is gone.
+pub fn graph_pure_set(_graph: &DataFlowGraph) -> rustc_hash::FxHashSet<ComputeFnId> {
+    pure_compute_fn_set()
+}
+
+/// Scheduler-visible node kinds that launch or gate runtime work. Passes must
+/// not freely move/delete/merge these regardless of purity. The complement
+/// (Const/BinOp/TriOp/UnOp/FieldAccess) is the "pure computation" kind set.
+pub fn is_launch_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Gate | NodeKind::Call | NodeKind::Await | NodeKind::EventSource
+    )
+}
+
 pub fn pure_compute_fn_set() -> rustc_hash::FxHashSet<ComputeFnId> {
+    // Derived from effect_class (W1). Equivalence with the pre-W1 hand-written
+    // set is asserted by the unit test at the bottom of this file.
+    // CF_NOOP is excluded: it is the parameter-placeholder passthrough, and
+    // CSE-merging two 0-input NOOP nodes would merge distinct parameters.
     let mut s = rustc_hash::FxHashSet::default();
-    // ── Legacy i32/f64/bool arithmetic and comparison (1-27) ──
-    for id in 1..=27u32 { s.insert(ComputeFnId(id)); }
-    // ── i64/i128 arithmetic comparison + bitwise operations (50-91) ──
-    for id in 50..=91u32 { s.insert(ComputeFnId(id)); }
-    // ── All primitive type arithmetic (92-259: 12 integer types × 12 ops + 4 float types × 6 ops) ──
-    for id in 92..=259u32 { s.insert(ComputeFnId(id)); }
-    // ── Pure reads and queries ──
-    s.insert(CF_RECORD_FIELD_GET); // record_field_get
-    s.insert(CF_ARRAY_INDEX); // array_index
-    s.insert(CF_IS_NULL); // is_null
-    s.insert(CF_ARRAY_LEN); // array_len
-    // ── Pure semantic operations ──
-    s.insert(CF_REF_EQ); // ref_eq
-    s.insert(CF_REF_NEQ); // ref_neq
-    s.insert(CF_ELVIS); // elvis
-    s.insert(CF_PATTERN_CTOR_MATCH); // pattern_ctor_match
-    s.insert(CF_PATTERN_ADT_FIELD_GET); // pattern_adt_field_get
-    s.insert(CF_PATTERN_STR_EQ); // pattern_str_eq
-    s.insert(CF_CAST_SCALAR); // cast_scalar
-    s.insert(CF_NON_NULL_ASSERT); // non_null_assert
-    s.insert(CF_STR_BYTES); // str_bytes
-    // ── String comparison (pure functions, eligible for CSE) ──
-    s.insert(CF_EQ_STR);
-    s.insert(CF_NE_STR);
-    s.insert(CF_LT_STR);
-    s.insert(CF_GT_STR);
-    s.insert(CF_LE_STR);
-    s.insert(CF_GE_STR);
-    // ── Semantic equality/inequality for composite types (pure functions, deep comparison, eligible for CSE) ──
-    s.insert(CF_EQ_OBJ);
-    s.insert(CF_NE_OBJ);
-    // ── Boolean inequality (pure comparison, symmetric with CF_EQ_BOOL) ──
-    s.insert(CF_NE_BOOL);
-    // ── f128 comparison (pure comparison, dedicated bit-pattern path) ──
-    s.insert(CF_EQ_F128);
-    s.insert(CF_NE_F128);
-    s.insert(CF_LT_F128);
-    s.insert(CF_GT_F128);
-    s.insert(CF_LE_F128);
-    s.insert(CF_GE_F128);
-    // Note: CF_RECORD_CONSTRUCT_STACK / CF_ARRAY_CONSTRUCT_STACK are not added to the pure set.
-    // Although they have no externally observable side effects, each execution produces a distinct
-    // object (different memory address). If hoisted by LICM or eliminated by CSE, loop iterations
-    // would share the same object, causing state pollution.
+    for id in 0..COMPUTE_FN_TABLE_LEN {
+        let cf = ComputeFnId(id);
+        if cf == CF_NOOP {
+            continue;
+        }
+        if effect_class(cf) == EffectClass::Pure {
+            s.insert(cf);
+        }
+    }
+    // Aliasing heap reads are pure ONLY in graphs without in-place mutators;
+    // the mutator-aware subtraction lives in graph_pure_set.
+    for cf in aliasing_read_cfs() {
+        s.insert(cf);
+    }
     s
 }
 
@@ -2980,6 +3175,7 @@ impl DataFlowGraph {
                     branches: gb.branches.iter().map(|(b, sg, params)| {
                         (*b, *sg, params.iter().map(|&n| remap_n(n)).collect())
                     }).collect(),
+                    capture: gb.capture,
                 }));
             }
             self.gate_branches = v;
@@ -3157,6 +3353,11 @@ impl DataFlowGraph {
                 plan.reset_to_zero = plan.reset_to_zero.iter().map(|&n| remap_n(n)).collect();
                 plan.reset_to_one = plan.reset_to_one.iter().map(|&n| remap_n(n)).collect();
                 plan.reset_condition_tree = plan.reset_condition_tree.iter().map(|&n| remap_n(n)).collect();
+                // W5: the flattened condition-tree plan is stale after
+                // compaction (node ids AND tree membership changed). Clear it;
+                // the engine falls back to the runtime DFS until the pipeline
+                // recomputes it post-optimization.
+                plan.condition_tree_plan = Vec::new();
             }
         }
 
@@ -3231,6 +3432,81 @@ impl DataFlowGraph {
         }
         // Avoid unused warning.
         let _ = subgraph_count;
+    }
+
+    /// W5: flatten every loop subgraph's `reset_condition_tree` roots into the
+    /// mechanical `condition_tree_plan` — the same DFS the engine's
+    /// `reset_condition_tree` performs, done ONCE at build/load time instead
+    /// of on every loop iteration. Uses the mem-agnostic accessors so both the
+    /// built and the loaded (zerocopy) graphs can run it.
+    pub fn precompute_reset_plans(&mut self) {
+        let plans: Vec<(usize, Vec<(NodeId, u16)>)> = self
+            .subgraphs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, sg)| {
+                let plan = sg.reset_plan.as_ref()?;
+                if plan.reset_condition_tree.is_empty() {
+                    return None;
+                }
+                Some((i, self.compute_condition_tree_plan(i, sg, &plan.reset_condition_tree)))
+            })
+            .collect();
+        for (i, computed) in plans {
+            if let Some(plan) = self.subgraphs[i].reset_plan.as_mut() {
+                plan.condition_tree_plan = computed;
+            }
+        }
+    }
+
+    /// The condition-tree flattening shared semantics with
+    /// `Engine::reset_condition_tree`: DFS over the cond roots' inputs, keeping
+    /// nodes inside the loop subgraph but outside every nested subgraph range
+    /// (Gate nodes included — Bug #38); each node's pending count is the number
+    /// of its inputs that are also inside the collected tree.
+    fn compute_condition_tree_plan(
+        &self,
+        loop_sg_idx: usize,
+        loop_sg: &SubGraph,
+        roots: &[NodeId],
+    ) -> Vec<(NodeId, u16)> {
+        let (sg_start, sg_end) = loop_sg.node_range;
+        // Mem-agnostic nested ranges (zerocopy graphs keep them in the mmap
+        // CSR section rather than the owned Vec).
+        let nested = self.sg_nested_ranges(loop_sg_idx);
+        let is_nested = |gid: u32| nested.iter().any(|&(s, e)| gid >= s && gid < e);
+        let is_in_sg = |gid: u32| gid >= sg_start.0 && gid < sg_end.0 && !is_nested(gid);
+
+        let mut visited: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+        let mut stack: Vec<NodeId> = roots.to_vec();
+        let mut cond_nodes: Vec<NodeId> = Vec::new();
+        while let Some(gid) = stack.pop() {
+            if !visited.insert(gid.0) {
+                continue;
+            }
+            if !is_in_sg(gid.0) {
+                continue;
+            }
+            cond_nodes.push(gid);
+            let node = self.node(gid.0 as usize);
+            let inputs = self.inputs(node.inputs_offset, node.input_count);
+            for &inp in inputs {
+                stack.push(inp);
+            }
+        }
+
+        cond_nodes
+            .into_iter()
+            .map(|gid| {
+                let node = self.node(gid.0 as usize);
+                let inputs = self.inputs(node.inputs_offset, node.input_count);
+                let pending = inputs
+                    .iter()
+                    .filter(|&&inp| visited.contains(&inp.0) && is_in_sg(inp.0))
+                    .count() as u16;
+                (gid, pending)
+            })
+            .collect()
     }
 }
 
@@ -3346,4 +3622,88 @@ pub const fn scalar_meta(tag: crate::value::ValueTag) -> Option<ScalarMeta> {
         // Non-scalar tag: no arithmetic metadata.
         _ => return None,
     })
+}
+
+// =========================================================================
+// Effect classification tests (W1)
+// =========================================================================
+
+#[cfg(test)]
+mod effect_classification_tests {
+    use super::*;
+
+    /// Verbatim copy of the PRE-W1 hand-written pure set (the behavior W1 must
+    /// preserve exactly). Keep frozen; if `pure_compute_fn_set()` drifts from
+    /// this, the equivalence guarantee is broken.
+    fn legacy_pure_set() -> rustc_hash::FxHashSet<ComputeFnId> {
+        let mut s = rustc_hash::FxHashSet::default();
+        for id in 1..=27u32 { s.insert(ComputeFnId(id)); }
+        for id in 50..=91u32 { s.insert(ComputeFnId(id)); }
+        for id in 92..=259u32 { s.insert(ComputeFnId(id)); }
+        s.insert(CF_RECORD_FIELD_GET);
+        s.insert(CF_ARRAY_INDEX);
+        s.insert(CF_IS_NULL);
+        s.insert(CF_ARRAY_LEN);
+        s.insert(CF_REF_EQ);
+        s.insert(CF_REF_NEQ);
+        s.insert(CF_ELVIS);
+        s.insert(CF_PATTERN_CTOR_MATCH);
+        s.insert(CF_PATTERN_ADT_FIELD_GET);
+        s.insert(CF_PATTERN_STR_EQ);
+        s.insert(CF_CAST_SCALAR);
+        s.insert(CF_NON_NULL_ASSERT);
+        s.insert(CF_STR_BYTES);
+        s.insert(CF_EQ_STR);
+        s.insert(CF_NE_STR);
+        s.insert(CF_LT_STR);
+        s.insert(CF_GT_STR);
+        s.insert(CF_LE_STR);
+        s.insert(CF_GE_STR);
+        s.insert(CF_EQ_OBJ);
+        s.insert(CF_NE_OBJ);
+        s.insert(CF_NE_BOOL);
+        s.insert(CF_EQ_F128);
+        s.insert(CF_NE_F128);
+        s.insert(CF_LT_F128);
+        s.insert(CF_GT_F128);
+        s.insert(CF_LE_F128);
+        s.insert(CF_GE_F128);
+        s
+    }
+
+    /// The derived set must equal the legacy set member-for-member.
+    #[test]
+    fn pure_set_equivalence_with_legacy() {
+        let new = pure_compute_fn_set();
+        let old = legacy_pure_set();
+        let missing: Vec<_> = old.difference(&new).collect();
+        let added: Vec<_> = new.difference(&old).collect();
+        assert!(
+            missing.is_empty() && added.is_empty(),
+            "pure set drift: lost {:?}, gained {:?}",
+            missing,
+            added
+        );
+    }
+
+    /// Every compute fn id in the table must be classified (effect_class
+    /// panics otherwise — this test turns that into a named failure).
+    #[test]
+    fn classification_covers_all_cfs() {
+        for id in 0..COMPUTE_FN_TABLE_LEN {
+            let _ = effect_class(ComputeFnId(id));
+        }
+    }
+
+    /// Aliasing reads are classified ReadMutable; in-place mutators are
+    /// WriteMutable (the graph_pure_set contract depends on this).
+    #[test]
+    fn aliasing_contract() {
+        for cf in aliasing_read_cfs() {
+            assert_eq!(effect_class(cf), EffectClass::ReadMutable, "cf {}", cf.0);
+        }
+        for cf in [CF_RECORD_FIELD_SET, CF_ARRAY_STORE, CF_DEREF_WRITE] {
+            assert_eq!(effect_class(cf), EffectClass::WriteMutable, "cf {}", cf.0);
+        }
+    }
 }

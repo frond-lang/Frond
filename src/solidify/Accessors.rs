@@ -472,6 +472,8 @@ impl DataFlowGraph {
             let mut r = &section[off as usize..];
             let valid = super::Spec::read_u8(&mut r);
             if valid == 0 { return None; }
+            // Validity byte encodes the W4c capture flag: 2 = valid + capture.
+            let capture = valid == 2;
             let condition_input = NodeId(super::Spec::read_u32(&mut r));
             let branch_count = super::Spec::read_u32(&mut r) as usize;
             let mut branches = Vec::with_capacity(branch_count);
@@ -485,7 +487,7 @@ impl DataFlowGraph {
                 }
                 branches.push((cond, sg, inputs));
             }
-            Some(GateBranches { condition_input, branches })
+            Some(GateBranches { condition_input, branches, capture })
         } else {
             self.gate_branches[idx].clone()
         }

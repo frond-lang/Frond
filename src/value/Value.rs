@@ -494,16 +494,16 @@ impl F128 {
         }
         let sign = x < 0;
         let abs = x.unsigned_abs();
-        // abs is u128; MSB is the position of the implicit 1. exp = msb, mant = abs.
-        // pack aligns the MSB to bit 112 and handles rounding (no rounding here, abs is fully preserved).
-        Self::pack(sign, 0, abs, false)
+        // pack's contract is value = mant × 2^(exp - 112), so exp must be 112
+        // for the integer value abs × 2^0 (passing 0 scales by 2^-112).
+        Self::pack(sign, 112, abs, false)
     }
     /// Constructs an F128 from a u128 exactly (no f64 intermediate).
     pub fn from_u128(x: u128) -> Self {
         if x == 0 {
             return Self::zero_val(false);
         }
-        Self::pack(false, 0, x, false)
+        Self::pack(false, 112, x, false)
     }
 
     /// Extracts the integer part of an F128 value as i128 (lossless for values within i128 range).
@@ -884,8 +884,12 @@ impl F128 {
         // pack semantics: value = mant * 2^(exp - 112)
         // true quotient = (ma/mb) * 2^result_exp = quot * 2^(result_exp - 114)
         // so exp = result_exp - 114 + 112 = result_exp - 2
+        // 256-bit split of ma * 2^114: hi = ma >> 14, lo = (low 14 bits of ma) << 114.
+        // (The previous `ma << 14` for lo put ma's middle bits in the wrong positions,
+        // leaving garbage in the quotient's low mantissa bits: 6.0/4.0 printed 1.5
+        // but differed from the 1.5f128 literal at bit level.)
         let numer_hi = ma >> 14;
-        let numer_lo = ma << 14;
+        let numer_lo = (ma & 0x3FFF) << 114;
         let (quot, stk) = Self::div_256_by_113(numer_hi, numer_lo, mb);
         Self::pack(result_sign, result_exp - 2, quot, stk)
     }
@@ -1246,6 +1250,7 @@ impl Value {
                     ValueTag::Isize => F128::from_i128(v.isize_val as i128),
                     ValueTag::Usize => F128::from_u128(v.usize_val as u128),
                     ValueTag::Char => F128::from_u128(v.char_val as u128),
+                    ValueTag::Bool => F128::from_f64(if v.bool_val { 1.0 } else { 0.0 }),
                     _ => F128::from_f64(0.0),
                 }
             },

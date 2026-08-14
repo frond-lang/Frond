@@ -341,3 +341,112 @@ pub(super) fn numeric_builtin_names() -> Vec<(&'static str, Type)> {
         .collect()
 }
 
+
+// ── Missing return value check (Bug: non-void function with no tail expression) ──
+
+/// A `return value` or `throw` anywhere in the function body (outside nested
+/// lambdas/defer bodies) means the body may exit with a value. An unconditional
+/// `loop { ... }` that contains no `break` never exits normally (diverging),
+/// which also satisfies "the function cannot fall off the end".
+fn body_stmt_has_exit(ast: &AstArena<'_>, stmt: StmtId) -> bool {
+    match &ast.stmt(stmt).node {
+        Stmt::Return { value } => value.is_some(),
+        Stmt::Throw { .. } => true,
+        // A nested function's returns belong to it, not the enclosing function.
+        Stmt::LocalDecl { .. } => false,
+        Stmt::Defer { .. } => false,
+        Stmt::Loop { body } => {
+            body_expr_has_exit(ast, *body) || !stmt_tree_has_break(ast, *body)
+        }
+        Stmt::For { body, .. } | Stmt::While { body, .. } => body_expr_has_exit(ast, *body),
+        Stmt::Expression { expr } => body_expr_has_exit(ast, *expr),
+        _ => false,
+    }
+}
+
+fn body_expr_has_exit(ast: &AstArena<'_>, expr: ExprId) -> bool {
+    match &ast.expr(expr).node {
+        // Stop at lambda boundaries: their returns/throws are their own.
+        Expr::Lambda { .. } => false,
+        Expr::Block { stmts, trailing } => {
+            stmts.iter().any(|s| body_stmt_has_exit(ast, *s))
+                || trailing.map(|t| body_expr_has_exit(ast, t)).unwrap_or(false)
+        }
+        Expr::If { then_branch, else_branch, .. } => {
+            body_expr_has_exit(ast, *then_branch)
+                || else_branch.map(|e| body_expr_has_exit(ast, e)).unwrap_or(false)
+        }
+        Expr::Match { arms, .. } => arms.iter()
+            .any(|arm| body_expr_has_exit(ast, arm.body)),
+        _ => false,
+    }
+}
+
+fn stmt_tree_has_break(ast: &AstArena<'_>, expr: ExprId) -> bool {
+    match &ast.expr(expr).node {
+        Expr::Lambda { .. } => false,
+        Expr::Block { stmts, trailing } => {
+            stmts.iter().any(|s| match &ast.stmt(*s).node {
+                Stmt::Break => true,
+                Stmt::Expression { expr } => stmt_tree_has_break(ast, *expr),
+                Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::Loop { body } =>
+                    stmt_tree_has_break(ast, *body),
+                _ => false,
+            }) || trailing.map(|t| stmt_tree_has_break(ast, t)).unwrap_or(false)
+        }
+        Expr::If { then_branch, else_branch, .. } => {
+            stmt_tree_has_break(ast, *then_branch)
+                || else_branch.map(|e| stmt_tree_has_break(ast, e)).unwrap_or(false)
+        }
+        Expr::Match { arms, .. } => arms.iter()
+            .any(|arm| stmt_tree_has_break(ast, arm.body)),
+        _ => false,
+    }
+}
+
+impl<'a> InferContext<'a> {
+    /// Rejects a function/lambda whose declared return type is non-void but whose
+    /// body is a block with no trailing expression and no `return value`/`throw`
+    /// statement. Such a body previously compiled silently and returned garbage
+    /// at runtime (e.g. an i32 function returning `2.71875f16`, or a str function
+    /// leaking `Ok(void)`).
+    pub(super) fn check_missing_return_value(
+        &mut self,
+        what: &str,
+        ret_ty: TypeHandle,
+        body: ExprId,
+        ast: &AstArena<'_>,
+        line: u32,
+        column: u32,
+    ) {
+        // Async<X> carries X as its produced value: Async<void> needs no value.
+        let mut ret_ty = ret_ty;
+        loop {
+            let resolved = self.arena.resolve(ret_ty);
+            match self.arena.get(resolved) {
+                Type::Void => return,
+                Type::Async(_) => ret_ty = self.arena.async_value(resolved),
+                _ => break,
+            }
+        }
+        let (stmts, trailing) = match &ast.expr(body).node {
+            Expr::Block { stmts, trailing } => (stmts, trailing),
+            // A non-block body expression is itself the return value.
+            _ => return,
+        };
+        if trailing.is_some() {
+            return;
+        }
+        if stmts.iter().any(|s| body_stmt_has_exit(ast, *s)) {
+            return;
+        }
+        let ret_str = format!("{}", self.arena.display(ret_ty));
+        self.add_error_at(
+            &format!(
+                "missing return value: {what} declares return type '{ret_str}' but its body has no trailing expression and no 'return'/'throw' statement"
+            ),
+            line,
+            column,
+        );
+    }
+}

@@ -269,6 +269,11 @@ impl<'a> IrBuilder<'a> {
                 let rhs_node = self.compile_subexpr(rhs);
                 let inclusive = matches!(op, crate::ast::Ast::BinaryOp::RangeInclusive);
                 let bool_node = self.compile_bool_const(inclusive);
+                // RangeIterator is i64-based; operands of any integer width are
+                // widened explicitly here (implicit promotion was removed
+                // language-wide, Bug #60).
+                let lhs_node = self.make_i64_cast_node(lhs_node);
+                let rhs_node = self.make_i64_cast_node(rhs_node);
                 self.make_call_by_name("range_iter", &[lhs_node, rhs_node, bool_node])
             }
             // Bug #38: &&/|| short-circuit evaluation -- lowered to a Gate conditional branch, ensuring RHS is
@@ -372,6 +377,7 @@ impl<'a> IrBuilder<'a> {
         self.graph.set_gate_branches(
             gate_node,
             GateBranches {
+                capture: false,
                 condition_input: cond_node,
                 branches: vec![
                     (true, then_sg, then_inputs),
@@ -484,6 +490,20 @@ impl<'a> IrBuilder<'a> {
     /// Map a type name to a ValueTag (delegates to `ValueTag::from_name`, single-point sync with Value).
     pub(super) fn ty_name_to_scalar_tag(ty: &str) -> Option<crate::value::ValueTag> {
         crate::value::ValueTag::from_name(ty)
+    }
+
+    /// Wraps a node in an explicit scalar cast node targeting i64
+    /// (used by range lowering: RangeIterator is i64-based).
+    fn make_i64_cast_node(&mut self, input: NodeId) -> NodeId {
+        let inputs_offset = self.graph.inputs_pool.push(&[input]);
+        let node = self.graph.add_node(Node {
+            kind: NodeKind::UnOp,
+            input_count: 1,
+            inputs_offset,
+            compute_fn: CF_CAST_SCALAR, // compute_cast_scalar
+        });
+        self.graph.set_cast_target_type(node, "i64".to_string());
+        node
     }
 
     /// Compile a type cast `expr as T`.

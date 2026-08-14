@@ -22,7 +22,13 @@ pub const SOLIDIFY_SCHEMA_VERSION: u16 = 1;
 /// Runtime ABI version (compute_fn table version).
 pub const SOLIDIFY_ABI_VERSION: u16 = 1;
 /// Number of compute_fn entries (used for ABI validation).
-pub const COMPUTE_FN_COUNT: u32 = 314;
+///
+/// Derived from the actual table length (`ir::Ir::COMPUTE_FN_TABLE_LEN`,
+/// asserted at table build) — was previously a hand-maintained `314` that had
+/// drifted 23 entries behind the real table, defeating the load-time check.
+/// `.kzo` files written by binaries with a different count are rejected;
+/// rebuilding the source regenerates them.
+pub const COMPUTE_FN_COUNT: u32 = crate::ir::Ir::COMPUTE_FN_TABLE_LEN;
 
 // ==================== Header (64B) ====================
 

@@ -195,12 +195,12 @@ impl<'a> IrBuilder<'a> {
                     inputs_offset: copy_off,
                     compute_fn: CF_SEQ,
                 });
-                self.bind_var(name, copy_node);
+                self.declare_var(name, copy_node);
                 Some(copy_node)
             }
             crate::ast::Ast::Stmt::VarDecl { name, value, .. } => {
                 let value_node = self.compile_subexpr(*value);
-                self.bind_var(name, value_node);
+                self.declare_var(name, value_node);
                 Some(value_node)
             }
             crate::ast::Ast::Stmt::Expression { expr } => {
@@ -486,11 +486,17 @@ impl<'a> IrBuilder<'a> {
             crate::ast::Ast::Stmt::While { condition, body } => {
                 let while_sg = self.register_while_subgraph(*condition, *body);
                 let call_node = self.compile_recursive_call(while_sg);
+                // Bug #100 (residual): statements AFTER the loop must read loop-assigned
+                // variables through their home slot (kept current by WriteBacks), not
+                // through the loop-body chain node whose enclosing-frame slot is a stale
+                // snapshot (e.g. `if exp != 0` after the exponent loop always saw 0).
+                self.rebind_modified_vars_to_home(*body);
                 Some(call_node)
             }
             crate::ast::Ast::Stmt::Loop { body } => {
                 let loop_sg = self.register_loop_subgraph(*body);
                 let call_node = self.compile_recursive_call(loop_sg);
+                self.rebind_modified_vars_to_home(*body);
                 Some(call_node)
             }
             crate::ast::Ast::Stmt::For {
@@ -511,6 +517,7 @@ impl<'a> IrBuilder<'a> {
                 );
                 // Start the loop: Call(for_sg, [iterable_node])
                 let call_node = self.make_call(for_sg, &[iterable_node]);
+                self.rebind_modified_vars_to_home(*body);
                 Some(call_node)
             }
             crate::ast::Ast::Stmt::Defer { expr } => {

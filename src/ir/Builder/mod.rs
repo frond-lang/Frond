@@ -24,6 +24,7 @@ mod Ops;
 mod Recursion;
 mod Stmt;
 mod Literal;
+mod Versioning;
 use Core::*;
 pub use Core::IrBuilder;
 use Literal::*;

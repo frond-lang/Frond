@@ -446,44 +446,21 @@ pub fn pass_const_fold(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext) {
 // Pass: CSE — common subexpression elimination
 // =========================================================================
 
-/// Pre-computes the starting NodeId of the innermost sub-graph for each node.
-/// CSE only merges nodes within the same innermost sub-graph, preventing cross if-else/match
-/// branch sub-graph merges that would cause branch frames to incorrectly compute merged nodes
-/// (Bug #45).
-fn compute_innermost_sg_starts(graph: &DataFlowGraph) -> Vec<u32> {
-    let n = graph.nodes.len();
-    // Default 0 = function body sub-graph start (or no sub-graph)
-    let mut starts: Vec<u32> = vec![0; n];
-    // Sort by sub-graph range size descending: large ranges filled first, small ranges overwrite later
-    let mut sgs: Vec<(u32, u32)> = graph
-        .subgraphs
-        .iter()
-        .map(|sg| (sg.node_range.0 .0, sg.node_range.1 .0))
-        .collect();
-    sgs.sort_by_key(|&(_, end)| std::cmp::Reverse(end));
-    // Descending by end is not enough: need descending by range size to ensure small ranges overwrite large ones
-    sgs.sort_by_key(|&(start, end)| std::cmp::Reverse(end - start));
-    for (start, end) in &sgs {
-        for i in *start..*end {
-            if (i as usize) < n {
-                starts[i as usize] = *start;
-            }
-        }
-    }
-    starts
-}
-
-/// CSE pass: pure nodes with the same (compute_fn, resolved_inputs, metadata_hash, innermost_sg) → merge.
-/// The first occurrence is kept; subsequent ones are redirected to it.
-/// The key includes the innermost sub-graph start ID, ensuring identical computations across
-/// if-else/match branches are not merged (branch sub-graphs are mutually exclusive; merging would
-/// lose node references in non-executed branches, Bug #45).
-/// The metadata hash ensures nodes with different per-node metadata
-/// (pattern_field_indices/pattern_ctor_names/field_access_infos, etc.) are not incorrectly merged.
+/// CSE pass: pure nodes with the same (compute_fn, resolved_inputs, metadata_hash) → merge.
+/// The first occurrence is kept; subsequent ones are redirected to it — but ONLY
+/// when the kept node's region structurally dominates the duplicate's (W3:
+/// region-dominance legality replacing the innermost_sg_start key from Bug #45).
+/// Sibling branch sub-graphs (if-else/match arms) never dominate each other, so
+/// mutually-exclusive computations are still never merged; a function-level
+/// computation dominating an identical one inside a branch/loop body IS now
+/// merged (previously blocked). The metadata hash ensures nodes with different
+/// per-node metadata (pattern_field_indices/pattern_ctor_names/field_access_infos,
+/// etc.) are not incorrectly merged.
 pub fn pass_cse(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &FxHashSet<ComputeFnId>) {
-    let mut seen: FxHashMap<(ComputeFnId, Vec<NodeId>, u64, u32), NodeId> = FxHashMap::default();
+    let mut seen: FxHashMap<(ComputeFnId, Vec<NodeId>, u64), NodeId> = FxHashMap::default();
     let wb_targets = collect_writeback_targets(graph);
-    let sg_starts = compute_innermost_sg_starts(graph);
+    let regions = crate::ir::Region::RegionTree::build(graph);
+    let innermost = regions.innermost_all(graph.nodes.len());
 
     for (idx, node) in graph.nodes.iter().enumerate() {
         let id = NodeId(idx as u32);
@@ -500,10 +477,39 @@ pub fn pass_cse(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &Fx
         let inputs = graph.inputs_pool.get(node.inputs_offset, node.input_count);
         let resolved: Vec<NodeId> = inputs.iter().map(|&i| ctx.resolve(i)).collect();
         let meta_hash = graph.cse_metadata_hash(idx);
-        let sg_start = sg_starts[idx];
-        let key = (node.compute_fn, resolved, meta_hash, sg_start);
+        let key = (node.compute_fn, resolved, meta_hash);
         if let Some(&existing) = seen.get(&key) {
-            ctx.redirect.insert(id, existing);
+            // W3 dominance check. Same-subgraph merges keep the historical
+            // (innermost-key) behavior. Cross-subgraph merges are NEW and must
+            // respect two runtime invariants the old key implicitly preserved:
+            // - the loop reset machinery re-evaluates every cond-tree node each
+            //   iteration, so a node inside ANY loop subgraph (While/Loop/For/
+            //   TailRec/LoopBody) must never be redirected away (a redirected
+            //   cond-tree node left ResetPlan pointing at dead nodes → hang);
+            // - a branch subgraph's entry/return nodes are anchor points; a
+            //   cross-sg redirect would move them outside the sg range.
+            let ex_sg = innermost[existing.0 as usize];
+            let du_sg = innermost[idx];
+            let legal = match (ex_sg, du_sg) {
+                (None, None) => true,
+                (Some(e), Some(d)) => {
+                    if e == d {
+                        true // same subgraph — historical behavior
+                    } else {
+                        let dup_in_loop =
+                            graph.subgraphs[d.0 as usize].loop_kind != crate::ir::Ir::LoopKind::None;
+                        let dup_is_anchor = {
+                            let sg = &graph.subgraphs[d.0 as usize];
+                            sg.entry_node == id || sg.return_node == id
+                        };
+                        !dup_in_loop && !dup_is_anchor && regions.dominates(e, d)
+                    }
+                }
+                _ => false,
+            };
+            if legal {
+                ctx.redirect.insert(id, existing);
+            }
         } else {
             seen.insert(key, id);
         }
@@ -585,12 +591,14 @@ pub fn pass_dce(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &Fx
         let id = NodeId(idx as u32);
         if live.contains(&id) { continue; }
         if !ctx.is_live(id) { continue; }
-        let is_pure_calc = match node.kind {
-            NodeKind::BinOp | NodeKind::TriOp | NodeKind::UnOp | NodeKind::FieldAccess => {
-                pure_set.contains(&node.compute_fn)
-            }
-            NodeKind::Const | NodeKind::Call | NodeKind::Gate
-            | NodeKind::Await | NodeKind::EventSource => false,
+        // W1: kind gate via is_launch_kind — launch kinds and Const are never
+        // deletable; the pure-computation kinds go through the pure set.
+        let is_pure_calc = if crate::ir::Ir::is_launch_kind(node.kind)
+            || node.kind == NodeKind::Const
+        {
+            false
+        } else {
+            pure_set.contains(&node.compute_fn)
         };
         if is_pure_calc {
             ctx.dead.insert(id);
@@ -919,12 +927,18 @@ pub fn pass_strength_reduction(graph: &mut DataFlowGraph, ctx: &mut OptimizerCon
 
 /// Determines whether a node is a store-class side-effecting node (WriteBack/FieldSet/ArrayStore/GlobalStore).
 /// Uses compute_fn for unified determination, consistent with the node's actual computation semantics.
+///
+/// W1 note: deliberately NOT derived from `Ir::effect_class` (WriteLocal|WriteMutable
+/// would additionally admit TailRec writeback, deref write, atomic RMW and memo
+/// stores). Eliminating those is not yet validated — TailRec writeback drives the
+/// loop-continue signal and atomic stores are synchronization effects. Revisit
+/// under W2 together with storage versioning.
 fn is_store_node(graph: &DataFlowGraph, idx: usize) -> bool {
     let cf = graph.nodes[idx].compute_fn;
     cf == CF_WRITEBACK
-    || cf == CF_RECORD_FIELD_SET
-    || cf == CF_ARRAY_STORE
-    || cf == CF_GLOBAL_STORE
+        || cf == CF_RECORD_FIELD_SET
+        || cf == CF_ARRAY_STORE
+        || cf == CF_GLOBAL_STORE
 }
 
 /// DSE pass: eliminates store nodes whose results are not consumed.
@@ -1145,7 +1159,9 @@ pub fn optimize_with_analysis(
         return;
     }
 
-    let pure_set = crate::ir::Ir::pure_compute_fn_set();
+    // W1: single derivation point (pure CFs minus aliasing reads when the
+    // graph contains in-place mutators — Bug #99).
+    let pure_set = crate::ir::Ir::graph_pure_set(graph);
     let no_fold = std::env::var("KUZO_NO_FOLD").is_ok();
     let no_cse = std::env::var("KUZO_NO_CSE").is_ok();
     let no_copy = std::env::var("KUZO_NO_COPY").is_ok();
@@ -1168,6 +1184,7 @@ pub fn optimize_with_analysis(
             check_gate_in_branch(graph, "BEFORE phase1 rebuild");
             graph.rebuild(&ctx.dead, &ctx.redirect);
             check_gate_in_branch(graph, "AFTER phase1 rebuild");
+            crate::pass::Verifier::verify_and_report(graph, "opt-phase1");
         }
     }
 
@@ -1197,6 +1214,7 @@ pub fn optimize_with_analysis(
         check_gate_in_branch(graph, "BEFORE phase2 rebuild");
         let _old_to_new = graph.rebuild(&ctx.dead, &ctx.redirect);
         check_gate_in_branch(graph, "AFTER phase2 rebuild");
+        crate::pass::Verifier::verify_and_report(graph, "opt-phase2");
         if dbg_iter {
             eprintln!("[OPT-ITER] iter={} nodes={} after rebuild", 51 - max_iter, graph.nodes.len());
         }
@@ -1612,16 +1630,14 @@ fn collect_inline_candidates(graph: &DataFlowGraph) -> Vec<InlineCandidate> {
             continue;
         }
 
-        // The body must contain only Const/BinOp/UnOp/FieldAccess nodes whose compute_fn is in pure_set
+        // The body must contain only pure-computation kinds (W1: !is_launch_kind,
+        // i.e. Const/BinOp/TriOp/UnOp/FieldAccess) whose compute_fn is in pure_set
         // (this condition simultaneously guarantees: pure function + no recursion + no control flow + no construction side effects)
         let (cs, ce) = callee_sg.node_range;
         let mut safe_body = true;
         for cidx in (cs.0 as usize)..(ce.0 as usize) {
             let cn = &graph.nodes[cidx];
-            if !matches!(
-                cn.kind,
-                NodeKind::Const | NodeKind::BinOp | NodeKind::TriOp | NodeKind::UnOp | NodeKind::FieldAccess
-            ) {
+            if crate::ir::Ir::is_launch_kind(cn.kind) {
                 safe_body = false;
                 break;
             }
