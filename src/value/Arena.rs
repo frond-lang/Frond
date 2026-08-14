@@ -437,10 +437,10 @@ impl ValueArena {
 
     // ---- Heap object convenience constructors ----
     pub fn alloc_str(&mut self, s: impl Into<String>) -> ValueHandle {
-        self.alloc_ref(HeapObj::Str(KuzoStr::new(s)))
+        self.alloc_ref(HeapObj::Str(Str::new(s)))
     }
     pub fn alloc_str_from(&mut self, s: &str) -> ValueHandle {
-        self.alloc_ref(HeapObj::Str(KuzoStr::from_rust_str(s)))
+        self.alloc_ref(HeapObj::Str(Str::from_rust_str(s)))
     }
     pub fn alloc_array(&mut self, arr: ArrayValue) -> ValueHandle {
         self.alloc_ref(HeapObj::Array(arr))
@@ -746,7 +746,7 @@ pub trait ValueTrait: Sized + Clone + Copy + PartialEq + Eq + Hash {
     fn as_f128(&self, arena: &ValueArena) -> Option<F128>;
 
     // ---- Heap accessors ----
-    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a KuzoStr>;
+    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a Str>;
     fn as_array<'a>(&self, arena: &'a ValueArena) -> Option<&'a ArrayValue>;
     fn as_record<'a>(&self, arena: &'a ValueArena) -> Option<&'a RecordValue>;
     fn as_adt<'a>(&self, arena: &'a ValueArena) -> Option<&'a AdtValue>;
@@ -1022,7 +1022,7 @@ impl ValueTrait for ValueHandle {
 
     // ---- Heap accessors ----
     #[inline]
-    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a KuzoStr> {
+    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a Str> {
         match arena.heap_obj_opt(*self)? {
             HeapObj::Str(s) => Some(s),
             _ => None,
@@ -2068,12 +2068,12 @@ impl ValueArena {
 
     // ---- Heap object convenience constructors ----
     pub fn str(&mut self, s: impl Into<String>) -> ValueHandle {
-        self.alloc_ref(HeapObj::Str(KuzoStr::new(s)))
+        self.alloc_ref(HeapObj::Str(Str::new(s)))
     }
     pub fn str_from(&mut self, s: &str) -> ValueHandle {
-        self.alloc_ref(HeapObj::Str(KuzoStr::from_rust_str(s)))
+        self.alloc_ref(HeapObj::Str(Str::from_rust_str(s)))
     }
-    pub fn from_kuzo_str(&mut self, s: KuzoStr) -> ValueHandle {
+    pub fn from_str(&mut self, s: Str) -> ValueHandle {
         self.alloc_ref(HeapObj::Str(s))
     }
     pub fn heap(&mut self, obj: HeapObj) -> ValueHandle {

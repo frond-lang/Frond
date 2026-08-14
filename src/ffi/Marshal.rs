@@ -30,7 +30,7 @@ use crate::value::{HeapObj, OpaquePointer, PtrKind, Value};
 /// Returns `Err(msg)` on a type mismatch.
 pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> {
     // NULL-ended buffers for str args; must outlive the call (C functions like strlen/printf
-    // require NULL-terminated strings, but KuzoStr's Arc<str> has no trailing NULL).
+    // require NULL-terminated strings, but Str's Arc<str> has no trailing NULL).
     let mut str_buffers: Vec<Vec<u8>> = Vec::new();
     let mut slots = Vec::with_capacity(sig.params.len());
     let mut arg_idx = 0usize;

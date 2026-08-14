@@ -1112,11 +1112,11 @@ pub fn pass_dse(graph: &DataFlowGraph, ctx: &mut OptimizerContext) {
 
 /// Optimization level.
 ///
-/// Drives pass selection and iteration limits for `optimize_with_analysis`:
+/// Drives pass selection and the fixpoint stall window for `optimize_with_analysis`:
 /// - `O0`: no optimization, only Build output
 /// - `O1`: skip structural transforms, only fixpoint iteration (Inline + traditional optimization)
 /// - `O2`: full (structural transforms + fixpoint iteration), standard level
-/// - `O3`: full + increased iteration limit (200), aggressive optimization
+/// - `O3`: full + wider fixpoint stall window (30 vs 10), aggressive optimization
 ///
 /// The `KUZO_NO_*` environment variables can still disable individual passes (for debugging),
 /// taking priority over the level.
@@ -1190,12 +1190,31 @@ pub fn optimize_with_analysis(
 
     // ── Phase 2: fixpoint iteration (Inline + traditional optimization, level >= 1) ──
     let dbg_iter = std::env::var("KUZO_INLINE_DBG").is_ok();
-    // O3 increases the iteration limit; the KUZO_OPT_MAX_ITER environment variable takes priority (for debugging)
-    let default_max_iter = if level >= OptLevel::O3 { 200 } else { 50 };
-    let mut max_iter = std::env::var("KUZO_OPT_MAX_ITER")
+    // Termination guard (replaces the former fixed 50/200-round cap): the loop stops
+    // after `stall_window` consecutive rounds without a strict decrease of the
+    // progress measure `(call sites, nodes)`, lexicographic. Every productive round
+    // strictly decreases it — Inline removes a call site (even when it grows the node
+    // count), CF/CSE/CopyProp/DCE/DSE only remove or simplify nodes. Redirect-only
+    // churn (CopyProp rewiring with nothing dead yet) can hold the measure flat for a
+    // few rounds, hence a window rather than a per-round requirement. Because the
+    // measure is well-ordered and starts finite, improvements can only happen finitely
+    // often, so the loop always terminates — no round cap is needed.
+    // Legitimately long optimization chains keep improving and are never cut short;
+    // only pass oscillations (flat/increasing forever) hit the window.
+    // O3 gets a wider window (aggressive settings stretch flat stretches).
+    // KUZO_OPT_STALL_WINDOW overrides; KUZO_OPT_MAX_ITER still imposes a hard round
+    // cap when set (debugging aid, off by default).
+    let default_window: u32 = if level >= OptLevel::O3 { 30 } else { 10 };
+    let stall_window = std::env::var("KUZO_OPT_STALL_WINDOW")
         .ok().and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(default_max_iter);
+        .unwrap_or(default_window);
+    let hard_cap: Option<u32> = std::env::var("KUZO_OPT_MAX_ITER")
+        .ok().and_then(|s| s.parse::<u32>().ok());
+    let mut best = fixpoint_measure(graph);
+    let mut stalled: u32 = 0;
+    let mut round: u32 = 0;
     loop {
+        round += 1;
         let mut ctx = OptimizerContext::default();
 
         if !no_inline { pass_inline(graph, &mut ctx, None); }
@@ -1209,21 +1228,45 @@ pub fn optimize_with_analysis(
         if !ctx.has_changes() { break; }
 
         if dbg_iter {
-            eprintln!("[OPT-ITER] iter={} nodes={} before rebuild", 51 - max_iter, graph.nodes.len());
+            eprintln!("[OPT-ITER] round={} nodes={} before rebuild", round, graph.nodes.len());
         }
         check_gate_in_branch(graph, "BEFORE phase2 rebuild");
         let _old_to_new = graph.rebuild(&ctx.dead, &ctx.redirect);
         check_gate_in_branch(graph, "AFTER phase2 rebuild");
         crate::pass::Verifier::verify_and_report(graph, "opt-phase2");
-        if dbg_iter {
-            eprintln!("[OPT-ITER] iter={} nodes={} after rebuild", 51 - max_iter, graph.nodes.len());
-        }
 
-        max_iter -= 1;
-        if max_iter == 0 {
+        let m = fixpoint_measure(graph);
+        if m < best {
+            best = m;
+            stalled = 0;
+        } else {
+            stalled += 1;
+        }
+        if dbg_iter {
+            eprintln!("[OPT-ITER] round={} calls={} nodes={} stalled={}/{}", round, m.0, m.1, stalled, stall_window);
+        }
+        if stalled >= stall_window {
+            eprintln!(
+                "[OPT] fixpoint stalled: no measure improvement in {stalled} rounds (calls={}, nodes={}) — stopping; pass oscillation suspected",
+                m.0, m.1
+            );
             break;
         }
+        if let Some(cap) = hard_cap {
+            if round >= cap { break; }
+        }
     }
+}
+
+/// Progress measure for the phase-2 fixpoint loop (see `optimize_with_analysis`):
+/// `(call-site count, total node count)`, compared lexicographically.
+fn fixpoint_measure(graph: &DataFlowGraph) -> (usize, usize) {
+    let calls = graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == crate::ir::Ir::NodeKind::Call)
+        .count();
+    (calls, graph.nodes.len())
 }
 
 /// Debug helper: check if any Gate node is inside its branch subgraph's node_range.

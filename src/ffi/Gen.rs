@@ -22,21 +22,21 @@ pub struct CParam {
 }
 
 /// Kuzo parameter (used in wrapper signatures).
-pub struct KuzoParam {
+pub struct Param {
     pub name: String,
-    pub kuzo_type: String,
+    pub type_name: String,
 }
 
 /// Extraction result: complete information for one `@extern("C")` function.
 pub struct ExternCFunc {
-    pub kuzo_name: String,
+    pub name: String,
     pub c_return: String,
     pub c_name: String,
     pub c_params: Vec<CParam>,
     pub c_body: String,
     pub c_includes: Vec<String>,
-    pub kuzo_params: Vec<KuzoParam>,
-    pub kuzo_return: String,
+    pub params: Vec<Param>,
+    pub return_ty: String,
 }
 
 /// Kuzo type → C/Rust mapping entry (single source of truth, eliminates scalar
@@ -47,10 +47,10 @@ pub struct ExternCFunc {
 ///   `i128`/`u128`/`f128` split into `lo`/`hi`, `str`/`u8[]` split into `data`/`len`)
 ///
 /// NOTE: the C type for a Kuzo scalar is NOT stored here — it lives in the base
-/// table `KUZO_TO_C_TYPE` (`src/types/Ctype.rs`), queried via `kuzo_to_c_type`.
-/// `KuzoTypeMapping` only carries FFI-strategy data (how to pass the parameter,
+/// table `TO_C_TYPE` (`src/types/Ctype.rs`), queried via `to_c_type`.
+/// `TypeMapping` only carries FFI-strategy data (how to pass the parameter,
 /// what Rust wrapper type to use).
-pub struct KuzoTypeMapping {
+pub struct TypeMapping {
     /// Rust wrapper parameter/return type. Rust FFI generation has been removed;
     /// this field is retained for potential future introspection/tooling use and
     /// currently has no consumer.
@@ -62,7 +62,7 @@ pub struct KuzoTypeMapping {
 /// C parameter construction mode.
 #[derive(Clone, Copy)]
 pub enum CParamKind {
-    /// Single parameter, using the C type for the corresponding `kuzo_name`.
+    /// Single parameter, using the C type for the corresponding `name`.
     Single(&'static str),
     /// Two parameters `lo`/`hi` (`i128`/`u128`/`f128`).
     LoHi,
@@ -72,72 +72,72 @@ pub enum CParamKind {
 
 /// Complete Kuzo FFI-strategy mapping table (scalars + `str`/`void`/pointers/arrays).
 ///
-/// The C type for each Kuzo scalar is looked up via `kuzo_to_c_type`
-/// (`KUZO_TO_C_TYPE` in `src/types/Ctype.rs`); this table only carries FFI
+/// The C type for each Kuzo scalar is looked up via `to_c_type`
+/// (`TO_C_TYPE` in `src/types/Ctype.rs`); this table only carries FFI
 /// strategy data (Rust wrapper type + C parameter passing mode).
-pub const KUZO_TYPE_MAP: &[(&str, KuzoTypeMapping)] = &[
+pub const TYPE_MAP: &[(&str, TypeMapping)] = &[
     // Scalar integers
-    ("i8",    KuzoTypeMapping { rust_wrapper: Some("i8"),    c_param_kind: CParamKind::Single("int8_t") }),
-    ("i16",   KuzoTypeMapping { rust_wrapper: Some("i16"),   c_param_kind: CParamKind::Single("int16_t") }),
-    ("i32",   KuzoTypeMapping { rust_wrapper: Some("i32"),   c_param_kind: CParamKind::Single("int32_t") }),
-    ("i64",   KuzoTypeMapping { rust_wrapper: Some("i64"),   c_param_kind: CParamKind::Single("int64_t") }),
-    ("i128",  KuzoTypeMapping { rust_wrapper: Some("i128"), c_param_kind: CParamKind::LoHi }),
-    ("u8",    KuzoTypeMapping { rust_wrapper: Some("u8"),    c_param_kind: CParamKind::Single("uint8_t") }),
-    ("u16",   KuzoTypeMapping { rust_wrapper: Some("u16"), c_param_kind: CParamKind::Single("uint16_t") }),
-    ("u32",   KuzoTypeMapping { rust_wrapper: Some("u32"), c_param_kind: CParamKind::Single("uint32_t") }),
-    ("u64",   KuzoTypeMapping { rust_wrapper: Some("u64"), c_param_kind: CParamKind::Single("uint64_t") }),
-    ("u128",  KuzoTypeMapping { rust_wrapper: Some("u128"), c_param_kind: CParamKind::LoHi }),
-    ("isize", KuzoTypeMapping { rust_wrapper: Some("isize"), c_param_kind: CParamKind::Single("ssize_t") }),
-    ("usize", KuzoTypeMapping { rust_wrapper: Some("usize"), c_param_kind: CParamKind::Single("size_t") }),
+    ("i8",    TypeMapping { rust_wrapper: Some("i8"),    c_param_kind: CParamKind::Single("int8_t") }),
+    ("i16",   TypeMapping { rust_wrapper: Some("i16"),   c_param_kind: CParamKind::Single("int16_t") }),
+    ("i32",   TypeMapping { rust_wrapper: Some("i32"),   c_param_kind: CParamKind::Single("int32_t") }),
+    ("i64",   TypeMapping { rust_wrapper: Some("i64"),   c_param_kind: CParamKind::Single("int64_t") }),
+    ("i128",  TypeMapping { rust_wrapper: Some("i128"), c_param_kind: CParamKind::LoHi }),
+    ("u8",    TypeMapping { rust_wrapper: Some("u8"),    c_param_kind: CParamKind::Single("uint8_t") }),
+    ("u16",   TypeMapping { rust_wrapper: Some("u16"), c_param_kind: CParamKind::Single("uint16_t") }),
+    ("u32",   TypeMapping { rust_wrapper: Some("u32"), c_param_kind: CParamKind::Single("uint32_t") }),
+    ("u64",   TypeMapping { rust_wrapper: Some("u64"), c_param_kind: CParamKind::Single("uint64_t") }),
+    ("u128",  TypeMapping { rust_wrapper: Some("u128"), c_param_kind: CParamKind::LoHi }),
+    ("isize", TypeMapping { rust_wrapper: Some("isize"), c_param_kind: CParamKind::Single("ssize_t") }),
+    ("usize", TypeMapping { rust_wrapper: Some("usize"), c_param_kind: CParamKind::Single("size_t") }),
     // Scalar floating-point
-    ("f32",   KuzoTypeMapping { rust_wrapper: Some("f32"),   c_param_kind: CParamKind::Single("float") }),
-    ("f64",   KuzoTypeMapping { rust_wrapper: Some("f64"),   c_param_kind: CParamKind::Single("double") }),
-    ("f16",   KuzoTypeMapping { rust_wrapper: Some("u16"),  c_param_kind: CParamKind::Single("uint16_t") }),
-    ("f128",  KuzoTypeMapping { rust_wrapper: Some("u128"), c_param_kind: CParamKind::LoHi }),
+    ("f32",   TypeMapping { rust_wrapper: Some("f32"),   c_param_kind: CParamKind::Single("float") }),
+    ("f64",   TypeMapping { rust_wrapper: Some("f64"),   c_param_kind: CParamKind::Single("double") }),
+    ("f16",   TypeMapping { rust_wrapper: Some("u16"),  c_param_kind: CParamKind::Single("uint16_t") }),
+    ("f128",  TypeMapping { rust_wrapper: Some("u128"), c_param_kind: CParamKind::LoHi }),
     // Non-arithmetic scalars
-    ("bool",  KuzoTypeMapping { rust_wrapper: Some("bool"),  c_param_kind: CParamKind::Single("int") }),
-    ("char",  KuzoTypeMapping { rust_wrapper: Some("char"), c_param_kind: CParamKind::Single("uint32_t") }),
+    ("bool",  TypeMapping { rust_wrapper: Some("bool"),  c_param_kind: CParamKind::Single("int") }),
+    ("char",  TypeMapping { rust_wrapper: Some("char"), c_param_kind: CParamKind::Single("uint32_t") }),
     // Special types
-    ("str",   KuzoTypeMapping { rust_wrapper: Some("&str"),  c_param_kind: CParamKind::DataLen { c_data_type: "const char*" } }),
-    ("void",  KuzoTypeMapping { rust_wrapper: Some("()"),    c_param_kind: CParamKind::Single("void") }),
-    ("u8[]",  KuzoTypeMapping { rust_wrapper: Some("&[u8]"), c_param_kind: CParamKind::DataLen { c_data_type: "uint8_t*" } }),
+    ("str",   TypeMapping { rust_wrapper: Some("&str"),  c_param_kind: CParamKind::DataLen { c_data_type: "const char*" } }),
+    ("void",  TypeMapping { rust_wrapper: Some("()"),    c_param_kind: CParamKind::Single("void") }),
+    ("u8[]",  TypeMapping { rust_wrapper: Some("&[u8]"), c_param_kind: CParamKind::DataLen { c_data_type: "uint8_t*" } }),
     // Pointer types
-    ("*u8",   KuzoTypeMapping { rust_wrapper: Some("*mut u8"),  c_param_kind: CParamKind::Single("uint8_t*") }),
-    ("*i8",   KuzoTypeMapping { rust_wrapper: Some("*mut i8"),  c_param_kind: CParamKind::Single("int8_t*") }),
-    ("*u16",  KuzoTypeMapping { rust_wrapper: Some("*mut u16"), c_param_kind: CParamKind::Single("uint16_t*") }),
-    ("*i16",  KuzoTypeMapping { rust_wrapper: Some("*mut i16"), c_param_kind: CParamKind::Single("int16_t*") }),
-    ("*u32",  KuzoTypeMapping { rust_wrapper: Some("*mut u32"), c_param_kind: CParamKind::Single("uint32_t*") }),
-    ("*i32",  KuzoTypeMapping { rust_wrapper: Some("*mut i32"), c_param_kind: CParamKind::Single("int32_t*") }),
-    ("*u64",  KuzoTypeMapping { rust_wrapper: Some("*mut u64"), c_param_kind: CParamKind::Single("uint64_t*") }),
-    ("*i64",  KuzoTypeMapping { rust_wrapper: Some("*mut i64"), c_param_kind: CParamKind::Single("int64_t*") }),
-    ("*void", KuzoTypeMapping { rust_wrapper: Some("*mut core::ffi::c_void"), c_param_kind: CParamKind::Single("void*") }),
+    ("*u8",   TypeMapping { rust_wrapper: Some("*mut u8"),  c_param_kind: CParamKind::Single("uint8_t*") }),
+    ("*i8",   TypeMapping { rust_wrapper: Some("*mut i8"),  c_param_kind: CParamKind::Single("int8_t*") }),
+    ("*u16",  TypeMapping { rust_wrapper: Some("*mut u16"), c_param_kind: CParamKind::Single("uint16_t*") }),
+    ("*i16",  TypeMapping { rust_wrapper: Some("*mut i16"), c_param_kind: CParamKind::Single("int16_t*") }),
+    ("*u32",  TypeMapping { rust_wrapper: Some("*mut u32"), c_param_kind: CParamKind::Single("uint32_t*") }),
+    ("*i32",  TypeMapping { rust_wrapper: Some("*mut i32"), c_param_kind: CParamKind::Single("int32_t*") }),
+    ("*u64",  TypeMapping { rust_wrapper: Some("*mut u64"), c_param_kind: CParamKind::Single("uint64_t*") }),
+    ("*i64",  TypeMapping { rust_wrapper: Some("*mut i64"), c_param_kind: CParamKind::Single("int64_t*") }),
+    ("*void", TypeMapping { rust_wrapper: Some("*mut core::ffi::c_void"), c_param_kind: CParamKind::Single("void*") }),
 ];
 
 // ============ Type lookup ============
 
 /// Look up the mapping table by Kuzo type name.
 #[inline]
-pub fn lookup_kuzo_type(kuzo_name: &str) -> Option<&'static KuzoTypeMapping> {
-    KUZO_TYPE_MAP.iter().find(|(n, _)| *n == kuzo_name).map(|(_, m)| m)
+pub fn lookup_type(name: &str) -> Option<&'static TypeMapping> {
+    TYPE_MAP.iter().find(|(n, _)| *n == name).map(|(_, m)| m)
 }
 
 /// Kuzo type name → C return type.
 ///
-/// For most types this delegates to the base table `kuzo_to_c_type`
+/// For most types this delegates to the base table `to_c_type`
 /// (see `src/types/Ctype.rs`). The exceptions are `str` and `u8[]`, which use
 /// the out-parameter pattern and therefore return `None` here (the C function
 /// becomes `void` and trailing out-pointers carry the result).
-pub fn kuzo_type_to_c_return(kuzo_name: &str) -> Option<&'static str> {
+pub fn type_to_c_return(name: &str) -> Option<&'static str> {
     // str / u8[] returns are delivered via out-parameters, not a value return.
-    if matches!(kuzo_name, "str" | "u8[]") {
+    if matches!(name, "str" | "u8[]") {
         return None;
     }
-    kuzo_to_c_type(kuzo_name)
+    to_c_type(name)
 }
 
 /// Kuzo type name → C parameter list (one Kuzo parameter may map to multiple C parameters).
-pub fn kuzo_type_to_c_params(kuzo_name: &str, param_name: &str) -> Option<Vec<CParam>> {
-    let m = lookup_kuzo_type(kuzo_name)?;
+pub fn type_to_c_params(name: &str, param_name: &str) -> Option<Vec<CParam>> {
+    let m = lookup_type(name)?;
     Some(match m.c_param_kind {
         CParamKind::Single(c_type) => vec![CParam { name: param_name.to_string(), c_type: c_type.to_string() }],
         CParamKind::LoHi => vec![
@@ -153,8 +153,8 @@ pub fn kuzo_type_to_c_params(kuzo_name: &str, param_name: &str) -> Option<Vec<CP
 
 /// Returns true if the Kuzo return type uses the str out-parameter pattern.
 #[inline]
-pub fn is_str_return(kuzo_return: &str) -> bool {
-    kuzo_return == "str"
+pub fn is_str_return(return_ty: &str) -> bool {
+    return_ty == "str"
 }
 
 /// Returns true if the Kuzo return type is a 128-bit integer/float that MSVC
@@ -166,8 +166,8 @@ pub fn is_str_return(kuzo_return: &str) -> bool {
 /// the low/high 64 bits. GCC/Clang also accept this path uniformly, so the
 /// generated C is portable across all three compilers.
 #[inline]
-pub fn is_i128_return(kuzo_return: &str) -> bool {
-    matches!(kuzo_return, "i128" | "u128" | "f128")
+pub fn is_i128_return(return_ty: &str) -> bool {
+    matches!(return_ty, "i128" | "u128" | "f128")
 }
 
 // ============ C source generation ============
@@ -305,8 +305,8 @@ pub fn generate_c_source(funcs: &[ExternCFunc]) -> Result<String, String> {
         // On MSVC x64, `__int128` is not a usable type (no conversion/arithmetic
         // operators), so the reconstruction is guarded out — the C body must use
         // the raw `{n}_lo` / `{n}_hi` variables directly on that platform.
-        for p in &func.kuzo_params {
-            match p.kuzo_type.as_str() {
+        for p in &func.params {
+            match p.type_name.as_str() {
                 "i128" => {
                     out.push_str(&format!(
                         "#if !defined(_WIN32) && !defined(_WIN64)\n    __int128 {n} = (__int128)((unsigned __int128){n}_lo | ((unsigned __int128){n}_hi << 64));\n#endif\n",

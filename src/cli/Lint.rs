@@ -83,7 +83,7 @@ fn lint_dir(dir: &str, config: &LintConfig) -> Vec<crate::tooling::Common::Diagn
 /// Lint a source string directly (for --stdin).
 fn lint_file_string(filename: &str, source: &str, config: &LintConfig) -> Vec<crate::tooling::Common::Diagnostic::Diagnostic> {
     // Write to a temp file, then lint it
-    let temp_path = format!("/tmp/kuzo_lint_{}.kz", std::process::id());
+    let temp_path = format!("/tmp/lint_{}.kz", std::process::id());
     let _ = fs::write(&temp_path, source);
     let result = lint_file(&temp_path, config);
     let _ = fs::remove_file(&temp_path);

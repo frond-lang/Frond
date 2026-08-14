@@ -13,7 +13,7 @@
 //!
 //! ## Kuzo → C type mapping
 //!
-//! See `gen::KUZO_TYPE_MAP` for the full mapping table.
+//! See `gen::TYPE_MAP` for the full mapping table.
 //!
 //! ## `str` return (out-parameter pattern)
 //!
@@ -28,7 +28,7 @@ mod gen;
 use crate::ast::Ast::{Attribute, Decl, Module, TypeNode};
 use std::borrow::Cow;
 
-use gen::{is_i128_return, is_str_return, kuzo_type_to_c_params, kuzo_type_to_c_return, ExternCFunc};
+use gen::{is_i128_return, is_str_return, type_to_c_params, type_to_c_return, ExternCFunc};
 
 // ============ Attribute recognition ============
 
@@ -151,13 +151,13 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
             // `str` and 128-bit returns both use the out-parameter pattern: the C
             // function returns void and trailing out-pointers carry the result.
             let ret_name = extract_type_name(*return_type, arena);
-            let kuzo_return = ret_name.as_deref().unwrap_or("void").to_string();
-            let is_str_ret = is_str_return(&kuzo_return);
-            let is_i128_ret = is_i128_return(&kuzo_return);
+            let return_ty = ret_name.as_deref().unwrap_or("void").to_string();
+            let is_str_ret = is_str_return(&return_ty);
+            let is_i128_ret = is_i128_return(&return_ty);
             let c_return = if is_str_ret || is_i128_ret {
                 "void".to_string()
             } else {
-                match ret_name.as_deref().and_then(kuzo_type_to_c_return) {
+                match ret_name.as_deref().and_then(type_to_c_return) {
                     Some(c) => c.to_string(),
                     None => {
                         let ty_str = ret_name.as_deref().unwrap_or("<unknown>");
@@ -172,12 +172,12 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
 
             // Map parameters.
             let mut c_params = Vec::new();
-            let mut kuzo_params = Vec::new();
+            let mut lang_params = Vec::new();
             let mut param_ok = true;
             for param in params.iter() {
                 let param_ty_name = extract_type_name(param.type_annotation, arena);
-                let kuzo_type = param_ty_name.as_deref().unwrap_or("<unknown>").to_string();
-                match param_ty_name.as_deref().and_then(|n| kuzo_type_to_c_params(n, param.name)) {
+                let type_name = param_ty_name.as_deref().unwrap_or("<unknown>").to_string();
+                match param_ty_name.as_deref().and_then(|n| type_to_c_params(n, param.name)) {
                     Some(ps) => c_params.extend(ps),
                     None => {
                         let ty_str = param_ty_name.as_deref().unwrap_or("<unknown>");
@@ -189,9 +189,9 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
                         break;
                     }
                 }
-                kuzo_params.push(gen::KuzoParam {
+                lang_params.push(gen::Param {
                     name: param.name.to_string(),
-                    kuzo_type,
+                    type_name,
                 });
             }
             if !param_ok {
@@ -225,14 +225,14 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
             }
 
             funcs.push(ExternCFunc {
-                kuzo_name: name.to_string(),
+                name: name.to_string(),
                 c_return,
                 c_name: format!("kuzo_extern_{}", name),
                 c_params,
                 c_body,
                 c_includes,
-                kuzo_params,
-                kuzo_return,
+                params: lang_params,
+                return_ty,
             });
         }
     }

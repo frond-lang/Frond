@@ -10,7 +10,7 @@ use bumpalo::Bump;
 use rustc_hash::FxHashSet;
 
 use crate::ast::Ast::Module;
-use crate::ast::Parser::{ErrorCollector, Lexer, Parser as KuzoParser, Token, TokenCollector};
+use crate::ast::Parser::{ErrorCollector, Lexer, Parser, Token, TokenCollector};
 use crate::module::{Error::LoadError, ModuleLoader};
 use crate::sema::Inference::InferContext;
 use crate::sema::Sema::{populate_module, SemaResult, TypeArena};
@@ -26,7 +26,7 @@ pub fn parse_entry_module_or_exit<'a>(
     lexer.tokenize_into(&mut sink);
     let tokens: Vec<Token<'_>> = sink.into_tokens();
     let tokens_ref = arena.alloc_slice_copy(&tokens);
-    let mut parser = KuzoParser::new(tokens_ref, arena, ErrorCollector::new());
+    let mut parser = Parser::new(tokens_ref, arena, ErrorCollector::new());
 
     let module = match parser.parse_module(filename) {
         Ok(m) => m,
@@ -253,7 +253,7 @@ pub fn parse_entry_module_lsp<'a>(
     lexer.tokenize_into(&mut sink);
     let tokens: Vec<Token<'_>> = sink.into_tokens();
     let tokens_ref = arena.alloc_slice_copy(&tokens);
-    let mut parser = KuzoParser::new(tokens_ref, arena, ErrorCollector::new());
+    let mut parser = Parser::new(tokens_ref, arena, ErrorCollector::new());
 
     let mut diagnostics = Vec::new();
 

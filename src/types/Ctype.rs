@@ -27,7 +27,7 @@
 /// argument position; this table gives "the corresponding C type name for that type",
 /// and the concrete passing strategy at the FFI layer is decided by Gen.rs's
 /// `CParamKind`.
-pub const KUZO_TO_C_TYPE: &[(&str, &str)] = &[
+pub const TO_C_TYPE: &[(&str, &str)] = &[
     // ── scalar integers ──
     ("i8",    "int8_t"),
     ("i16",   "int16_t"),
@@ -70,9 +70,9 @@ pub const KUZO_TO_C_TYPE: &[(&str, &str)] = &[
 /// Returns `None` to indicate that the type has no direct C counterpart (e.g. a
 /// user-defined type).
 #[inline]
-pub fn kuzo_to_c_type(kuzo_name: &str) -> Option<&'static str> {
-    KUZO_TO_C_TYPE
+pub fn to_c_type(name: &str) -> Option<&'static str> {
+    TO_C_TYPE
         .iter()
-        .find(|(n, _)| *n == kuzo_name)
+        .find(|(n, _)| *n == name)
         .map(|(_, c)| *c)
 }

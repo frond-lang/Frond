@@ -1077,6 +1077,11 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     let string_pool: Arc<[u8]> = Arc::from(mem.section(SectionKind::StringPool).to_vec());
 
     let mut graph = DataFlowGraph {
+        const_cache: Vec::new(),
+        sg_initial_pending: Vec::new(),
+        sg_initial_seed: Vec::new(),
+        downstream_counts: Vec::new(),
+        linear_plans: Vec::new(),
         nodes,
         inputs_pool,
         subgraphs,
@@ -1131,6 +1136,8 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     // W5: rebuild the flattened condition-tree reset plans (kept out of the
     // .kzo format; recomputed at load).
     graph.precompute_reset_plans();
+    // E0 perf: materialize GateBranches once (borrowed access on every Gate execution).
+    graph.materialize_gate_branches();
     Ok(graph)
 }
 
@@ -1379,6 +1386,11 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
     let string_pool: Arc<[u8]> = Arc::from(Vec::new());
 
     let mut graph = DataFlowGraph {
+        const_cache: Vec::new(),
+        sg_initial_pending: Vec::new(),
+        sg_initial_seed: Vec::new(),
+        downstream_counts: Vec::new(),
+        linear_plans: Vec::new(),
         nodes: Vec::new(),
         inputs_pool: InputsPool::new(),
         subgraphs,
@@ -1434,6 +1446,8 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
     // .kzo format; recomputed at load). Works through the mem-agnostic
     // accessors on the zerocopy backing.
     graph.precompute_reset_plans();
+    // E0 perf: materialize GateBranches once (borrowed access on every Gate execution).
+    graph.materialize_gate_branches();
     Ok(graph)
 }
 

@@ -3,7 +3,7 @@
 use std::process;
 
 use crate::ast::Ast::Printer;
-use crate::ast::Parser::{ErrorCollector, Lexer, Parser as KuzoParser, Token, TokenCollector};
+use crate::ast::Parser::{ErrorCollector, Lexer, Parser, Token, TokenCollector};
 use crate::tooling::Common::Pipeline;
 
 use super::Args::DebugStage;
@@ -49,7 +49,7 @@ fn debug_ast(source: &str) {
     lexer.tokenize_into(&mut sink);
     let tokens: Vec<Token<'_>> = sink.into_tokens();
     let tokens_ref = arena.alloc_slice_copy(&tokens);
-    let mut parser = KuzoParser::new(tokens_ref, &arena, ErrorCollector::new());
+    let mut parser = Parser::new(tokens_ref, &arena, ErrorCollector::new());
 
     match parser.parse_module("stdin") {
         Ok(module) => {
@@ -75,7 +75,7 @@ fn debug_emit_c(source: &str) {
     lexer.tokenize_into(&mut sink);
     let tokens: Vec<Token<'_>> = sink.into_tokens();
     let tokens_ref = arena.alloc_slice_copy(&tokens);
-    let mut parser = KuzoParser::new(tokens_ref, &arena, ErrorCollector::new());
+    let mut parser = Parser::new(tokens_ref, &arena, ErrorCollector::new());
 
     match parser.parse_module("stdin") {
         Ok(module) => {

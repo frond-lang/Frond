@@ -376,6 +376,17 @@ impl DataFlowGraph {
         }
     }
 
+    /// E4 perf: flat per-node downstream consumer count (materialized once at engine start).
+    /// Replaces the `downstream_slice(idx).len()` CSR arithmetic on every set_value.
+    #[inline]
+    pub fn downstream_count(&self, idx: usize) -> u16 {
+        if !self.downstream_counts.is_empty() {
+            self.downstream_counts[idx]
+        } else {
+            self.downstream_slice(idx).len() as u16
+        }
+    }
+
     // ---- String Pool (zerocopy: load path references mmap directly, avoiding .to_vec() copies) ----
 
     /// Returns the string pool byte slice.
@@ -464,33 +475,63 @@ impl DataFlowGraph {
     }
 
     /// Parses GateBranches on demand (load path parses a single entry from the mmap section).
-    pub fn gate_branches_at(&self, idx: usize) -> Option<GateBranches> {
-        if let Some(ref mem) = self.mem {
-            let off = self.gate_branch_offsets.get(idx).copied()?;
-            if off == u32::MAX { return None; }
-            let section = mem.section(SectionKind::GateBranches);
-            let mut r = &section[off as usize..];
-            let valid = super::Spec::read_u8(&mut r);
-            if valid == 0 { return None; }
-            // Validity byte encodes the W4c capture flag: 2 = valid + capture.
-            let capture = valid == 2;
-            let condition_input = NodeId(super::Spec::read_u32(&mut r));
-            let branch_count = super::Spec::read_u32(&mut r) as usize;
-            let mut branches = Vec::with_capacity(branch_count);
-            for _ in 0..branch_count {
-                let cond = super::Spec::read_u8(&mut r) != 0;
-                let sg = SubGraphId(super::Spec::read_u32(&mut r));
-                let input_count = super::Spec::read_u32(&mut r) as usize;
-                let mut inputs = Vec::with_capacity(input_count);
-                for _ in 0..input_count {
-                    inputs.push(NodeId(super::Spec::read_u32(&mut r)));
-                }
-                branches.push((cond, sg, inputs));
-            }
-            Some(GateBranches { condition_input, branches, capture })
-        } else {
-            self.gate_branches[idx].clone()
+    ///
+    /// E0 perf note: returns a borrowed entry. The mmap (zerocopy) path relies on the one-time
+    /// `materialize_gate_branches()` pass at load (see Format.rs) — every Gate execution and every
+    /// call-completion capture check read the materialized entry without deep-cloning branch Vecs.
+    pub fn gate_branches_at(&self, idx: usize) -> Option<&GateBranches> {
+        self.gate_branches.get(idx).and_then(|g| g.as_ref())
+    }
+
+    /// One-time eager materialization of all GateBranches entries for zerocopy (mmap) graphs.
+    /// Build-path graphs already own `gate_branches` (no-op when already populated).
+    /// Must run while the graph is still owned (before Arc wrap), i.e. at the end of both loaders.
+    pub fn materialize_gate_branches(&mut self) {
+        if self.mem.is_none() || !self.gate_branches.is_empty() {
+            return;
         }
+        let offsets = std::mem::take(&mut self.gate_branch_offsets);
+        let mut table: Vec<Option<GateBranches>> = Vec::with_capacity(offsets.len());
+        for i in 0..offsets.len() {
+            table.push(self.parse_gate_branches_entry(i, &offsets));
+        }
+        self.gate_branch_offsets = offsets;
+        self.gate_branches = table;
+    }
+
+    /// Parses a single GateBranches entry from the mmap GateBranches section (by offsets table).
+    fn parse_gate_branches_entry(
+        &self,
+        idx: usize,
+        offsets: &[u32],
+    ) -> Option<GateBranches> {
+        let mem = self.mem.as_ref()?;
+        let off = offsets.get(idx).copied()?;
+        if off == u32::MAX {
+            return None;
+        }
+        let section = mem.section(SectionKind::GateBranches);
+        let mut r = &section[off as usize..];
+        let valid = super::Spec::read_u8(&mut r);
+        if valid == 0 {
+            return None;
+        }
+        // Validity byte encodes the W4c capture flag: 2 = valid + capture.
+        let capture = valid == 2;
+        let condition_input = NodeId(super::Spec::read_u32(&mut r));
+        let branch_count = super::Spec::read_u32(&mut r) as usize;
+        let mut branches = Vec::with_capacity(branch_count);
+        for _ in 0..branch_count {
+            let cond = super::Spec::read_u8(&mut r) != 0;
+            let sg = SubGraphId(super::Spec::read_u32(&mut r));
+            let input_count = super::Spec::read_u32(&mut r) as usize;
+            let mut inputs = Vec::with_capacity(input_count);
+            for _ in 0..input_count {
+                inputs.push(NodeId(super::Spec::read_u32(&mut r)));
+            }
+            branches.push((cond, sg, inputs));
+        }
+        Some(GateBranches { condition_input, branches, capture })
     }
 
     /// Parses RecordLitInfo on demand (load path parses from the mmap section + string_pool).

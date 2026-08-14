@@ -37,7 +37,7 @@ mod gen {
     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ffi/Gen.rs"));
 }
 
-use gen::{is_i128_return, is_str_return, kuzo_type_to_c_params, kuzo_type_to_c_return, ExternCFunc};
+use gen::{is_i128_return, is_str_return, type_to_c_params, type_to_c_return, ExternCFunc};
 
 /// List of `.kz` files containing `@extern("C")` declarations.
 ///
@@ -468,9 +468,9 @@ fn build_extern_c_func(
     body: &str,
     c_includes: &[String],
 ) -> Option<ExternCFunc> {
-    let kuzo_return = ret_type.to_string();
-    let is_str_ret = is_str_return(&kuzo_return);
-    let is_i128_ret = is_i128_return(&kuzo_return);
+    let return_ty = ret_type.to_string();
+    let is_str_ret = is_str_return(&return_ty);
+    let is_i128_ret = is_i128_return(&return_ty);
 
     // Map return type. Both `str` and 128-bit returns use the out-parameter
     // pattern (the C function becomes `void` and trailing out-pointers carry
@@ -478,7 +478,7 @@ fn build_extern_c_func(
     let c_return = if is_str_ret || is_i128_ret {
         "void".to_string()
     } else {
-        match kuzo_type_to_c_return(&kuzo_return) {
+        match type_to_c_return(&return_ty) {
             Some(c) => c.to_string(),
             None => {
                 eprintln!(
@@ -492,9 +492,9 @@ fn build_extern_c_func(
 
     // Map parameters
     let mut c_params = Vec::new();
-    let mut kuzo_params = Vec::new();
+    let mut lang_params = Vec::new();
     for (p_name, p_type) in params {
-        match kuzo_type_to_c_params(p_type, p_name) {
+        match type_to_c_params(p_type, p_name) {
             Some(ps) => c_params.extend(ps),
             None => {
                 eprintln!(
@@ -504,9 +504,9 @@ fn build_extern_c_func(
                 return None;
             }
         }
-        kuzo_params.push(gen::KuzoParam {
+        lang_params.push(gen::Param {
             name: p_name.clone(),
-            kuzo_type: p_type.clone(),
+            type_name: p_type.clone(),
         });
     }
 
@@ -538,13 +538,13 @@ fn build_extern_c_func(
     }
 
     Some(ExternCFunc {
-        kuzo_name: name.to_string(),
+        name: name.to_string(),
         c_return,
         c_name: format!("kuzo_extern_{}", name),
         c_params,
         c_body: body.to_string(),
         c_includes: c_includes.to_vec(),
-        kuzo_params,
-        kuzo_return,
+        params: lang_params,
+        return_ty,
     })
 }

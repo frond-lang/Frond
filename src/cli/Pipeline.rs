@@ -146,7 +146,7 @@ pub fn compile_graph(entry_path: &str, opt_level: crate::pass::Optimizer::OptLev
     }
 
     // Post-IR optimization: LICM/Unroll/Inline + ConstFold/CSE/CopyProp/DCE fixed-point iteration.
-    // Driven by opt_level: O0 skips, O1 fixed-point only, O2 full, O3 full + raised iteration limit.
+    // Driven by opt_level: O0 skips, O1 fixed-point only, O2 full, O3 full + wider stall window.
     crate::pass::Optimizer::optimize_with_analysis(&mut graph, Some(&analysis_report), opt_level);
 
     // W5: optimization compaction (rebuild) invalidates the build-time

@@ -365,7 +365,7 @@ impl<S: LockStrategy> Engine<S> {
         } else {
             // Ordinary await frame: inject the event value into the await node.
             let consumer_count =
-                self.graph.downstream_slice(await_graph_id.0 as usize).len() as u16;
+                self.graph.downstream_count(await_graph_id.0 as usize);
             frame.set_value(await_node, value, consumer_count);
             frame.state = FrameState::Ready;
             frame.suspend_state = SuspendState::NotSuspended;

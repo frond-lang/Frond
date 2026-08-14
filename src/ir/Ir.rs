@@ -750,7 +750,7 @@ impl std::fmt::Debug for ValueTable {
 /// At frame initialization, Engine allocates a ValueHandle via ValueArena and pre-fills the value_table.
 ///
 /// The `Str` variant stores an (offset, len) reference into `DataFlowGraph.string_pool`.
-/// Access via `to_value(&pool)` passes the string pool slice to construct a KuzoStr on the fly.
+/// Access via `to_value(&pool)` passes the string pool slice to construct a Str on the fly.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConstValue {
     I8(i8),
@@ -807,7 +807,7 @@ impl ConstValue {
                 let end = off + *len as usize;
                 let s = std::str::from_utf8(&pool[off..end]).unwrap_or("");
                 crate::value::Value::ref_val(
-                    crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(s)),
+                    crate::value::HeapObj::Str(crate::value::Str::from_rust_str(s)),
                 )
             }
             ConstValue::Null => crate::value::Value::NULL,
@@ -1119,12 +1119,18 @@ pub enum NodeResult {
 ///
 /// Does not borrow frame data (to avoid conflicts with &mut Frame borrows).
 /// collect_batch_candidates receives &Frame as a parameter to access ready_queue.
-pub struct EvalContext {
+///
+/// `graph` carries a shared borrow of the DataFlowGraph supplied by the driver (engine loop /
+/// sync interpreter), so compute_fns never need `frame.graph.clone()` (a per-node atomic RMW
+/// pair) to obtain graph access.
+pub struct EvalContext<'a> {
     /// Subgraph node start offset (used for local NodeId → global NodeId conversion).
     pub node_start: u32,
+    /// The executing graph (shared borrow, outlives the current node execution).
+    pub graph: &'a DataFlowGraph,
 }
 
-impl EvalContext {
+impl<'a> EvalContext<'a> {
     /// Scans ready_queue after the current node, collecting nodes of the same type as the current node.
     ///
     /// compute_fn uses this method to decide whether to do SIMD batching.
@@ -1204,6 +1210,21 @@ pub struct Frame {
     pub parent_frame_ptr: *mut Frame,
     /// Generic cached child frame ID (loop-body frame reuse: while_sg/loop_sg/for_sg/tailrec frames cache the body_sg child frame).
     pub cached_child_frame: Option<FrameId>,
+    /// E2 loop hot path: the loop-body frame carried in hand across iterations. While set, the
+    /// Gate drives the body directly on the current stack (no queue round-trip per iteration).
+    /// The stash is dropped on frame reuse (acquire_frame); a suspending body is handed back to
+    /// the frames map (fallback to the queue protocol) and the stash cleared.
+    pub hot_body: Option<(FrameId, Box<Frame>)>,
+    /// E3 perf: steady-state cache for same_function branch-frame preparation. Holds
+    /// (parent-ready bitmap snapshot at derivation time, derived pending_inputs, seed list).
+    /// When the copied-in ready bitmap matches the snapshot, the derivation is skipped and the
+    /// cached pending/seed reused (memcpy). Cleared on frame reuse / subgraph switch; length
+    /// mismatches (resize) also invalidate via the comparison.
+    pub same_fn_prep_cache: Option<Box<(Vec<u8>, Vec<u16>, Vec<NodeId>)>>,
+    /// E5: set by prepare paths when the frame starts fresh (all own slots unready except
+    /// injected params). One-shot: the dispatch wrapper consumes it to enter run_linear once;
+    /// a bail or resume falls back to the dataflow engine permanently for this frame.
+    pub linear_fresh: bool,
     /// Stores the Closure value for escaping closure calls, used to write back upvalues to the Closure after the child frame completes.
     /// None = ordinary function call or same_function closure call.
     pub closure_val: Option<Value>,
@@ -1230,6 +1251,9 @@ impl Frame {
             root_frame_ptr: std::ptr::null_mut(),
             parent_frame_ptr: std::ptr::null_mut(),
             cached_child_frame: None,
+            hot_body: None,
+            same_fn_prep_cache: None,
+            linear_fresh: false,
             closure_val: None,
         }
     }
@@ -1650,11 +1674,11 @@ macro_rules! wrap_fn {
         fn wrapper(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
             // safe_op short-circuit: nodes marked with ?. return Null when the receiver (inputs[0]) is null,
             // without executing subsequent computation (field access/method call/intrinsic, etc.).
-            // This is a unified data-driven short-circuit logic, triggered by the compile-time set_safe_op flag.
+            // A unified data-driven short-circuit logic, triggered by the compile-time set_safe_op flag.
             if frame.graph.safe_op_flag(node.0 as usize) {
-                let n = frame.graph.node(node.0 as usize);
+                let n = ctx.graph.node(node.0 as usize);
                 if n.input_count > 0 {
-                    let inputs = frame.graph.inputs(n.inputs_offset, n.input_count);
+                    let inputs = ctx.graph.inputs(n.inputs_offset, n.input_count);
                     let recv = frame.get_value_by_global(inputs[0]);
                     if recv.is_null() {
                         return NodeResult::Value(Value::Null);
@@ -1662,8 +1686,8 @@ macro_rules! wrap_fn {
                 }
             }
             // SIMD batch decision: check batch_infos; if there are same-type ready nodes, compute in batch
-            if let Some(info) = frame.graph.batch_info(node.0 as usize) {
-                let graph = frame.graph.clone();
+            if let Some(info) = ctx.graph.batch_info(node.0 as usize) {
+                let graph = ctx.graph;
                 let candidates = ctx.collect_batch_candidates(frame, node, |gid| {
                     graph.batch_info(gid.0 as usize) == Some(info)
                 });
@@ -1680,7 +1704,7 @@ macro_rules! wrap_fn {
                     }
                 }
             }
-            NodeResult::Value($f(frame, node))
+            NodeResult::Value($f(frame, node, ctx))
         }
         wrapper as ComputeFn
     }};
@@ -2487,6 +2511,23 @@ pub struct DataFlowGraph {
     pub downstreams: Vec<Vec<NodeId>>,
     /// Raw values for constant nodes (indexed by NodeId; None for non-Const nodes).
     pub const_values: Vec<Option<ConstValue>>,
+    /// E0 perf: one-time materialized Const values, parallel to `nodes` (empty until the engine
+    /// populates it at startup — see EngineRef::new). Non-const slots hold `Value::VOID`.
+    /// Derived data: never serialized; recomputed at engine start (after build/optimize/load),
+    /// so optimizer `rebuild` renumbering cannot invalidate it.
+    pub const_cache: Vec<crate::value::Value>,
+    /// E3 perf: per-subgraph initial pending_inputs templates for cross-function frames
+    /// (indexed by sg idx; includes PENDING_EXTERNAL sentinels for nested/EventSource nodes).
+    /// Derived data: populated at EngineRef::new (after build/optimize/load) — never serialized.
+    pub sg_initial_pending: Vec<Vec<u16>>,
+    /// E3 perf: per-subgraph ready-queue seed lists (local NodeIds of 0-input non-Param
+    /// non-nested nodes), parallel to sg_initial_pending.
+    pub sg_initial_seed: Vec<Vec<NodeId>>,
+    pub downstream_counts: Vec<u16>,
+    /// E5 perf: per-subgraph linearized execution plans (topological order of sg-own
+    /// nodes; None = not linearizable: EventSource present or cyclic). Populated once at
+    /// EngineRef::new — derived data, never serialized (F-7 safe by construction).
+    pub linear_plans: Vec<Option<Vec<NodeId>>>,
     /// Target subgraph for Call nodes (indexed by NodeId; None for non-Call nodes).
     pub call_targets: Vec<Option<SubGraphId>>,
     /// Branch info for Gate nodes (indexed by NodeId; None for non-Gate nodes).
@@ -2593,9 +2634,20 @@ pub struct DataFlowGraph {
 }
 
 impl DataFlowGraph {
+    /// E5: linearized execution plan for subgraph `sg_idx` (None = not linearizable or the
+    /// engine has not materialized plans). Global NodeIds in topological order.
+    pub fn linear_plan(&self, sg_idx: usize) -> Option<&[NodeId]> {
+        self.linear_plans.get(sg_idx).and_then(|p| p.as_deref())
+    }
+
     /// Creates an empty graph.
     pub fn new() -> Self {
         Self {
+            const_cache: Vec::new(),
+            sg_initial_pending: Vec::new(),
+            sg_initial_seed: Vec::new(),
+            downstream_counts: Vec::new(),
+            linear_plans: Vec::new(),
             nodes: Vec::new(),
             inputs_pool: InputsPool::new(),
             subgraphs: Vec::new(),

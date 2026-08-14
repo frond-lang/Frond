@@ -1567,15 +1567,15 @@ impl From<char> for Char {
 // Part 2: heap object types (merges 6 files)
 // =========================================================================
 
-// ---- str.rs → KuzoStr ----
+// ---- str.rs → Str ----
 
 /// Kuzo string: a reference-counted immutable UTF-8 string
 #[derive(Debug, Clone)]
-pub struct KuzoStr {
+pub struct Str {
     inner: Arc<str>,
 }
 
-impl KuzoStr {
+impl Str {
     pub fn new(s: impl Into<String>) -> Self {
         Self { inner: Arc::from(s.into().as_str()) }
     }
@@ -1615,20 +1615,20 @@ impl KuzoStr {
     }
 }
 
-impl PartialEq for KuzoStr {
+impl PartialEq for Str {
     fn eq(&self, other: &Self) -> bool {
         self.inner == other.inner
     }
 }
-impl Eq for KuzoStr {}
+impl Eq for Str {}
 
-impl Hash for KuzoStr {
+impl Hash for Str {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.inner.hash(state);
     }
 }
 
-impl fmt::Display for KuzoStr {
+impl fmt::Display for Str {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.inner)
     }
@@ -2273,7 +2273,7 @@ unsafe impl Sync for OpaquePointer {}
 /// Heap object: unified representation of all heap-allocated value types (24 kinds)
 #[derive(Debug, Clone)]
 pub enum HeapObj {
-    Str(KuzoStr),
+    Str(Str),
     Array(ArrayValue),
     Record(RecordValue),
     Adt(AdtValue),
