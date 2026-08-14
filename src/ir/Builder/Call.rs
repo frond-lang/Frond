@@ -1,0 +1,1193 @@
+//! Call — Call machinery: direct / vtable / method calls, intrinsics, extern-C ABI. Mechanically split from Builder.rs (no logic changes).
+
+use super::*;
+
+impl<'a> IrBuilder<'a> {
+    /// Create a sequence node: after `prev_effect` completes, returns `current_node`'s value.
+    ///
+    /// Used for statement-order chaining: ensures nodes depending on `current_node` execute only
+    /// after `prev_effect` completes.
+    /// `compute_seq` (idx 48) takes all inputs and returns the value of the last input.
+    pub(super) fn chain_effects(&mut self, prev: Option<NodeId>, current: NodeId) -> NodeId {
+        match prev {
+            Some(prev_node) => {
+                let off = self.graph.inputs_pool.push(&[prev_node, current]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 2,
+                    inputs_offset: off,
+                    compute_fn: CF_SEQ, // compute_seq
+                })
+            }
+            None => current,
+        }
+    }
+
+    /// Create a Call node targeting `target_sg` (no input dependency; immediately ready).
+    ///
+    /// Used for the initial call of a loop and for `continue` jumps.
+    pub(super) fn compile_recursive_call(&mut self, target_sg: SubGraphId) -> NodeId {
+        // Append `current_effect` as an implicit dependency (consistent with `compile_call`),
+        // ensuring the while/loop recursive Call executes only after prior statements (e.g. an
+        // array literal) complete.
+        // Otherwise the Call node has no input dependency and could launch the subgraph frame
+        // before the `arr` value is ready, preventing the frame from copying `arr`'s Ref value
+        // and causing `arr[0]` inside the loop body to return `<non-scalar>`.
+        let mut inputs: Vec<NodeId> = Vec::new();
+        if let Some(eff) = self.current_effect {
+            inputs.push(eff);
+        }
+        let input_count = inputs.len() as u8;
+        let inputs_offset = self.graph.inputs_pool.push(&inputs);
+        let call_node = self.graph.add_node(Node {
+            kind: NodeKind::Call,
+            input_count,
+            inputs_offset,
+            compute_fn: CF_CALL_LAUNCH,
+        });
+        self.graph.set_call_target(call_node, target_sg);
+        call_node
+    }
+
+    /// Create a Call node targeting `target_sg`, passing the given argument nodes.
+    pub(super) fn make_call(&mut self, target_sg: SubGraphId, arg_nodes: &[NodeId]) -> NodeId {
+        let inputs_offset = self.graph.inputs_pool.push(arg_nodes);
+        let call_node = self.graph.add_node(Node {
+            kind: NodeKind::Call,
+            input_count: arg_nodes.len() as u8,
+            inputs_offset,
+            compute_fn: CF_CALL_LAUNCH,
+        });
+        self.graph.set_call_target(call_node, target_sg);
+        call_node
+    }
+
+    /// Create a Call node targeting a function name (looked up via `func_subgraphs`).
+    pub(super) fn make_call_by_name(&mut self, name: &str, arg_nodes: &[NodeId]) -> NodeId {
+        let inputs_offset = self.graph.inputs_pool.push(arg_nodes);
+        let call_node = self.graph.add_node(Node {
+            kind: NodeKind::Call,
+            input_count: arg_nodes.len() as u8,
+            inputs_offset,
+            compute_fn: CF_CALL_LAUNCH,
+        });
+        if let Some(&target_sg) = self.func_subgraphs.get(name) {
+            self.graph.set_call_target(call_node, target_sg);
+        }
+        call_node
+    }
+
+    /// Create a vtable dynamic-dispatch Call node (method call on a trait value).
+    ///
+    /// Unlike `make_call_by_name`: the target subgraph id is looked up at runtime from the
+    /// TraitVal's vtable rather than bound at compile time. Used when a For-loop iterable is a
+    /// trait value (`Iterator<T>`).
+    pub(super) fn make_vtable_call(&mut self, recv_node: NodeId, trait_name: &str, method_name: &str) -> NodeId {
+        let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
+        let call_node = self.graph.add_node(Node {
+            kind: NodeKind::Call,
+            input_count: 1,
+            inputs_offset,
+            compute_fn: CF_CALL_LAUNCH,
+        });
+        let method_idx = self.sema.get_trait_def(trait_name)
+            .and_then(|td| td.methods.iter().position(|m| m.name.as_ref() == method_name))
+            .map(|i| i as u16);
+        match method_idx {
+            Some(idx) => self.graph.set_vtable_call(call_node, idx),
+            None => self.errors.push(format!(
+                "internal: trait method '{}' not found in trait '{}' for vtable dispatch",
+                method_name, trait_name)),
+        }
+        call_node
+    }
+
+    /// Compile a function call.
+    ///
+    /// If the callee is a known function name -> Call node + set_call_target.
+    /// If the callee is a type name (e.g. `Iterator(arr, 0)`) -> compile into a record-construction node.
+    pub(super) fn compile_call(
+        &mut self,
+        call_expr_id: crate::ast::Ast::ExprId,
+        callee: crate::ast::Ast::ExprId,
+        args: &[crate::ast::Ast::ExprId],
+    ) -> NodeId {
+        // Generic calls prefer the monomorphization-instance path: inline expansion does not handle
+        // type-parameter substitution, so inlining a generic function would leave type parameter T
+        // unresolved to a concrete type in the body.
+        let call_inst_key = crate::sema::Sema::module_expr_key(
+            self.expr_key_module(),
+            call_expr_id.0 as u64,
+        );
+        let is_generic_call = self.sema.call_instantiations.contains_key(&call_inst_key);
+
+        // -- Inline expansion: call sites flagged by the analyzer compile the callee body directly instead of launching a subgraph --
+        // pure function + small body + non-recursive -> bind actuals to formals, compile body, avoid call overhead
+        // generic calls skip inlining (type parameters need replacement via the monomorph instance subgraph)
+        if !is_generic_call {
+            if let Some(callee_func) = self.inline_target(call_expr_id) {
+                if let crate::ast::Ast::Decl::FunDecl { params, body, .. } =
+                    &self.current_module().declarations[callee_func.0 as usize].node
+                {
+                    return self.compile_inline_expansion(*body, params, args);
+                }
+            }
+        }
+
+        let callee_expr = self.current_module().arena.expr(callee);
+
+        // ── reflect top-level function interception (safety net) ──
+        // Historically `format(x)` / `type_name(x)` were top-level wrapper functions;
+        // they have been removed in favor of direct method calls (`x.format()`).
+        // This interception remains as a safety net: if a future top-level reflect
+        // wrapper is reintroduced, it lowers directly to CF_REFLECT_* without going
+        // through FFI dispatch. Today it is effectively dead code (no such functions
+        // are declared, so Sema rejects bare `format(x)` before reaching here).
+        if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
+            if let Some(cf) = reflect_top_level_cf(name) {
+                let mut inputs = Vec::with_capacity(args.len());
+                for &arg in args {
+                    inputs.push(self.compile_subexpr(arg));
+                }
+                let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                return self.graph.add_node(Node {
+                    kind: NodeKind::Call,
+                    input_count: inputs.len() as u8,
+                    inputs_offset,
+                    compute_fn: cf,
+                });
+            }
+        }
+
+        // Built-in constructor detection: Ok(val) / Err(record) / channel(capacity)
+        // Lowered via the BUILTIN_CTORS registry lookup; missed error types fall through to the record construction path below
+        if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
+            if !self.func_subgraphs.contains_key(*name) {
+                if let Some(lower) = BUILTIN_CTORS.iter().find_map(|(n, l)| (*n == *name).then_some(l)) {
+                    return match lower {
+                        // Ok(val) -> compute_throw_ok (idx 44), input = val
+                        BuiltinCtorLower::Ok => {
+                            let mut inputs = Vec::with_capacity(args.len());
+                            for &arg in args {
+                                inputs.push(self.compile_subexpr(arg));
+                            }
+                            let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                            self.graph.add_node(Node {
+                                kind: NodeKind::Call,
+                                input_count: inputs.len() as u8,
+                                inputs_offset,
+                                compute_fn: CF_THROW_OK, // throw_ok
+                            })
+                        }
+                        // Err(...) -> first record_construct, then wrap with throw_err (idx 45)
+                        BuiltinCtorLower::Err => {
+                            let inner = self.compile_record_like(crate::ir::Compute::CTOR_ERR, args);
+                            let inputs_offset = self.graph.inputs_pool.push(&[inner]);
+                            self.graph.add_node(Node {
+                                kind: NodeKind::Call,
+                                input_count: 1,
+                                inputs_offset,
+                                compute_fn: CF_THROW_ERR, // throw_err
+                            })
+                        }
+                        // channel(capacity) -> compute_channel_create (idx 283), input = args
+                        BuiltinCtorLower::Channel => {
+                            let mut inputs = Vec::with_capacity(args.len());
+                            for &arg in args {
+                                inputs.push(self.compile_subexpr(arg));
+                            }
+                            let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                            self.graph.add_node(Node {
+                                kind: NodeKind::BinOp,
+                                input_count: inputs.len() as u8,
+                                inputs_offset,
+                                compute_fn: CF_CHANNEL_CREATE, // compute_channel_create
+                            })
+                        }
+                    };
+                }
+            }
+        }
+
+        // Type constructor / ADT / Newtype constructor detection: callee is an Ident and not a known function
+        if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
+            if !self.func_subgraphs.contains_key(*name) {
+                // First look up the type name (Record or single-constructor ADT), then the constructor name of a multi-constructor ADT
+                let tf_info = self.lookup_type_field_names(name)
+                    .or_else(|| self.lookup_constructor_field_names(name));
+                if let Some(info) = tf_info {
+                    // Compile into a construction node (compute_record_construct = 29, dispatches to HeapObj by kind)
+                    let mut inputs = Vec::with_capacity(args.len());
+                    for &arg in args {
+                        inputs.push(self.compile_subexpr(arg));
+                    }
+                    let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                    let node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: inputs.len() as u8,
+                        inputs_offset,
+                        compute_fn: CF_RECORD_CONSTRUCT, // record_construct
+                    });
+                    self.graph.set_record_lit_info(node, RecordLitInfo {
+                        type_name: info.type_name.clone(),
+                        field_names: info.field_names.into_iter().map(Some).collect(),
+                        constructor: name.to_string(),
+                        kind: info.kind,
+                    });
+                    return node;
+                }
+            }
+        }
+
+        // Closure call detection: callee is an Ident, not a known function, but bound in scope (variable holds a Closure/Partial)
+        // -> use compute_closure_call (idx 41); inputs[0] = callable value node, inputs[1..1+arg_count] = call arguments
+        // current_effect appended at the end as an implicit dependency (ensures Call executes only after prior effects complete)
+        // arg_count metadata records the actual argument count (excluding closure value and effect), used for chained partial-application detection
+        if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
+            if !self.func_subgraphs.contains_key(*name) {
+                if let Some(closure_node) = self.lookup_var(name) {
+                    let mut inputs = Vec::with_capacity(args.len() + 2);
+                    inputs.push(closure_node);
+                    for &arg in args {
+                        inputs.push(self.compile_subexpr(arg));
+                    }
+                    if let Some(eff) = self.current_effect {
+                        inputs.push(eff);
+                    }
+                    let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                    let call_node = self.graph.add_node(Node {
+                        kind: NodeKind::Call,
+                        input_count: inputs.len() as u8,
+                        inputs_offset,
+                        compute_fn: CF_CLOSURE_CALL, // compute_closure_call
+                    });
+                    self.graph.set_closure_call_arg_count(call_node, args.len() as u8);
+                    return call_node;
+                }
+            }
+        }
+
+        // @extern("C") / @builtin call detection: does not launch a sub-frame; calls Ffi::wrapper
+        // (extern C) or the Rust #[no_mangle] fn (builtin, e.g. reflect) directly via FFI dispatch.
+        // current_effect appended at the end as an implicit dependency (ensures the Call executes
+        // only after prior effects complete).
+        //
+        // @extern("C") call detection: all stdlib `#{ }#` functions go through
+        // CF_DYN_FFI_CALL (dlsym self-lookup + Abi::call_dynamic). There is no longer a
+        // CF_FFI_CALL / wrapper table. The C symbol name is uniformly `kuzo_extern_<name>`
+        // (generated by build.rs).
+        if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
+            if self.is_extern_c_func(name) {
+                let sig = self.build_abi_sig(name);
+                let c_symbol = format!("kuzo_extern_{name}");
+                let mut inputs = Vec::with_capacity(args.len() + 1);
+                for &arg in args {
+                    inputs.push(self.compile_subexpr(arg));
+                }
+                if let Some(eff) = self.current_effect {
+                    inputs.push(eff);
+                }
+                let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                let node = self.graph.add_node(Node {
+                    kind: NodeKind::Call,
+                    input_count: inputs.len() as u8,
+                    inputs_offset,
+                    compute_fn: CF_DYN_FFI_CALL,
+                });
+                self.graph.set_dyn_ffi_info(
+                    node,
+                    crate::ir::Ir::DynFfiInfo {
+                        symbol: c_symbol,
+                        sig,
+                        arg_count: args.len() as u8,
+                    },
+                );
+                return node;
+            }
+        }
+
+        // Partial application detection: callee is a known function name, but actual count < target function formal count
+        // -> generate a partial_construct node (idx 286), producing a HeapObj::Partial
+        // bound_args = the already-supplied actuals (binding leading parameters in the original function's parameter order)
+        if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
+            if let Some(&target_sg) = self.func_subgraphs.get(*name) {
+                if let Some(sg) = self.graph.subgraphs.get(target_sg.0 as usize) {
+                    let param_count = sg.param_count as usize;
+                    if args.len() < param_count {
+                        let mut bound_inputs = Vec::with_capacity(args.len());
+                        for &arg in args {
+                            bound_inputs.push(self.compile_subexpr(arg));
+                        }
+                        let inputs_offset = self.graph.inputs_pool.push(&bound_inputs);
+                        let partial_node = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: bound_inputs.len() as u8,
+                            inputs_offset,
+                            compute_fn: CF_PARTIAL_CONSTRUCT, // compute_partial_construct
+                        });
+                        self.graph.set_partial_info(partial_node, PartialInfo {
+                            subgraph_id: target_sg,
+                            bound_count: args.len() as u8,
+                        });
+                        return partial_node;
+                    }
+                }
+            }
+        }
+
+        // Dynamic closure call: callee is a non-Ident expression (e.g. arr[i], field.access,
+        // a closure literal invoked directly fun() {...}(), etc.), evaluated at runtime to a Closure/Partial.
+        // Use compute_closure_call (idx 41) for dynamic invocation; inputs[0] = callable value node.
+        // current_effect appended at the end as an implicit dependency (consistent with the Ident closure call path).
+        if !matches!(&callee_expr.node, crate::ast::Ast::Expr::Ident(_)) {
+            let callable_node = self.compile_subexpr(callee);
+            let mut inputs = Vec::with_capacity(args.len() + 2);
+            inputs.push(callable_node);
+            for &arg in args {
+                inputs.push(self.compile_subexpr(arg));
+            }
+            if let Some(eff) = self.current_effect {
+                inputs.push(eff);
+            }
+            let inputs_offset = self.graph.inputs_pool.push(&inputs);
+            let call_node = self.graph.add_node(Node {
+                kind: NodeKind::Call,
+                input_count: inputs.len() as u8,
+                inputs_offset,
+                compute_fn: CF_CLOSURE_CALL, // compute_closure_call
+            });
+            self.graph.set_closure_call_arg_count(call_node, args.len() as u8);
+            return call_node;
+        }
+
+        // Tail-recursion-to-iteration interception: currently compiling in a TailRecToLoop body and callee is self_name,
+        // and in tail position (to avoid recursive calls in arguments being mistakenly intercepted),
+        // generate WriteBack(param, actual) instead of Call(self).
+        // body_sg is a LoopBody; after it completes, reset_loop_iteration automatically jumps back to while_sg to re-evaluate cond.
+        if self.in_tail_position && self.tail_rec_ctx.is_some() {
+            // Tail-recursion interception: generate WriteBack(param, actual) instead of Call(self)
+        }
+        if self.in_tail_position {
+            if let Some(ctx) = &self.tail_rec_ctx.clone() {
+                if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
+                    if *name == ctx.self_name {
+                    // Compile all actual-argument expressions (evaluate first, then WriteBack, to avoid races between parameters)
+                    let arg_nodes: Vec<NodeId> = args
+                        .iter()
+                        .map(|&a| self.compile_subexpr(a))
+                        .collect();
+                    // Perform a WriteBack for each parameter (writing back to the function-level param nodes).
+                    // Barrier mechanism: the first WriteBack depends on all arg_nodes;
+                    // subsequent WriteBacks chain-depend on the previous WriteBack.
+                    // This ensures all actual-argument expressions finish evaluating before any WriteBack executes,
+                    // preventing a+b from reading the already-WriteBack-updated value of a.
+                    //
+                    // Only the last WriteBack uses CF_TAILREC_WRITEBACK (sets Continue);
+                    // non-last WriteBacks use CF_WRITEBACK (do not set Continue).
+                    // Reason: the Continue signal causes the frame to exit immediately and skip notify_downstream;
+                    // if every WriteBack set Continue, subsequent chained WriteBacks would never become ready to execute.
+                    let wb_count = arg_nodes.len().min(ctx.param_nodes.len());
+                    let mut last_wb: Option<NodeId> = None;
+                    for (i, &arg_node) in arg_nodes.iter().enumerate() {
+                        if i < ctx.param_nodes.len() {
+                            let mut wb_inputs = vec![arg_node];
+                            if i == 0 {
+                                // First WB: a barrier depending on all other arg_nodes
+                                for &other in &arg_nodes[1..] {
+                                    wb_inputs.push(other);
+                                }
+                            } else if let Some(prev_wb) = last_wb {
+                                // Subsequent WBs: depend on the previous WB (chain ordering)
+                                wb_inputs.push(prev_wb);
+                            }
+                            let is_last = i + 1 == wb_count;
+                            let compute_fn = if is_last {
+                                CF_TAILREC_WRITEBACK
+                            } else {
+                                CF_WRITEBACK
+                            };
+                            let wb_off = self.graph.inputs_pool.push(&wb_inputs);
+                            let wb_node = self.graph.add_node(Node {
+                                kind: NodeKind::Call,
+                                input_count: wb_inputs.len() as u8,
+                                inputs_offset: wb_off,
+                                compute_fn,
+                            });
+                            self.graph.set_writeback_target(wb_node, ctx.param_nodes[i]);
+                            self.current_effect = Some(wb_node);
+                            last_wb = Some(wb_node);
+                        }
+                    }
+                    // Return the last WriteBack node (after body_sg completes, reset_loop_iteration automatically jumps back)
+                    return last_wb.unwrap_or_else(|| {
+                        let off = self.graph.inputs_pool.push(&[]);
+                        self.graph.add_node(Node {
+                            kind: NodeKind::Const,
+                            input_count: 0,
+                            inputs_offset: off,
+                            compute_fn: CF_NOOP,
+                        })
+                    });
+                    }
+                }
+            }
+        }
+
+        // Non-tail-recursion-to-iteration interception: a self-call in non-tail position is replaced with push continuation + push sub-task + barrier(Continue)
+        // Only intercepted when non_tail_rec_ctx is set (during state_N_sg compilation in compile_non_tail_rec_body_sg)
+        if !self.in_tail_position && self.non_tail_rec_ctx.is_some() {
+            let ctx_clone = self.non_tail_rec_ctx.clone();
+            if let Some(ctx) = &ctx_clone {
+                if let crate::ast::Ast::Expr::Ident(callee_name) = &callee_expr.node {
+                    if *callee_name == ctx.self_name {
+                        // 1. Check call_result_map: if the current call is already in the map, return the mapped node
+                        if let Some(&mapped) = ctx.call_result_map.get(&call_expr_id) {
+                            return mapped;
+                        }
+                        // 2. If already truncated, return a void constant (no Call node generated)
+                        if ctx.truncated {
+                            return self.compile_void_const();
+                        }
+                        // 3. Intercept: push continuation frame + push sub-task frame + barrier(Continue)
+
+                        // Save current_effect: compile_subexpr may modify it;
+                        // restore after compiling the actuals to ensure the store chain starts from the correct effect.
+                        let saved_effect = self.current_effect;
+                        let arg_nodes: Vec<NodeId> = args
+                            .iter()
+                            .map(|&a| self.compile_subexpr(a))
+                            .collect();
+                        self.current_effect = saved_effect;
+
+                        let stride = ctx.stride;
+                        let param_count = ctx.param_count;
+                        let max_saved = ctx.max_saved;
+                        let current_state = ctx.current_state as usize;
+                        let stack_node = ctx.stack_node;
+                        let sp_node = ctx.sp_node;
+                        let result_node = ctx.result_node;
+
+                        // Compute stack indices: base_cont = sp * stride, base_task = (sp + 1) * stride
+                        // sp has already been decremented by pop (sp_node = original_sp - 1)
+                        // cont writes to the slot freed by pop (overwriting the consumed frame); task writes to the next slot
+                        // sp_new = sp + 2; on pop, sp-1 reads task first (LIFO), then cont
+                        let one_const = self.make_i32_const(1);
+                        let sp_plus_1 = self.make_binop(sp_node, one_const, CF_ADD_I32);
+                        let two_const = self.make_i32_const(2);
+                        let sp_plus_2 = self.make_binop(sp_node, two_const, CF_ADD_I32);
+                        let stride_val = self.make_i32_const(stride as i32);
+                        let base_cont = self.make_binop(sp_node, stride_val, CF_MUL_I32);
+                        let base_task = self.make_binop(sp_plus_1, stride_val, CF_MUL_I32);
+
+                        // Push continuation frame (write to the slot freed by pop)
+                        // stack[base_cont + 0..P] = current parameters (param_cur nodes)
+                        // All stores must be chained into the effect chain via chain_effects,
+                        // ensuring the barrier triggers Continue only after all stores complete.
+                        for i in 0..param_count {
+                            let offset = self.make_i32_const(i as i32);
+                            let idx = self.make_binop(base_cont, offset, CF_ADD_I32);
+                            let store = self.make_array_store(stack_node, idx, ctx.param_nodes[i]);
+                            self.current_effect = Some(self.chain_effects(self.current_effect, store));
+                        }
+                        // stack[base_cont + P] = state_after (current state + 1)
+                        let state_after = self.make_i32_const((current_state + 1) as i32);
+                        let state_offset_cont = self.make_i32_const(param_count as i32);
+                        let state_idx_cont = self.make_binop(base_cont, state_offset_cont, CF_ADD_I32);
+                        let state_store_cont =
+                            self.make_array_store(stack_node, state_idx_cont, state_after);
+                        self.current_effect = Some(self.chain_effects(self.current_effect, state_store_cont));
+                        // stack[base_cont + P + 1..P + 1 + num_saved] = saved values
+                        // For state S: slot j = saved_nodes[j] (j < S-1), result_node (j == S-1), 0 (j >= S)
+                        let zero_saved = self.make_i32_const(0);
+                        for j in 0..max_saved {
+                            let offset = self.make_i32_const((param_count + 1 + j) as i32);
+                            let idx = self.make_binop(base_cont, offset, CF_ADD_I32);
+                            let val = if j < current_state {
+                                if j + 1 < current_state {
+                                    ctx.saved_nodes[j]
+                                } else {
+                                    // j == current_state - 1
+                                    result_node
+                                }
+                            } else {
+                                zero_saved
+                            };
+                            let store = self.make_array_store(stack_node, idx, val);
+                            self.current_effect = Some(self.chain_effects(self.current_effect, store));
+                        }
+
+                        // Push sub-task frame (top of stack; read first on pop)
+                        // stack[base_task + 0..P] = actuals (arg_nodes)
+                        for i in 0..param_count {
+                            let offset = self.make_i32_const(i as i32);
+                            let idx = self.make_binop(base_task, offset, CF_ADD_I32);
+                            let store = self.make_array_store(stack_node, idx, arg_nodes[i]);
+                            self.current_effect = Some(self.chain_effects(self.current_effect, store));
+                        }
+                        // stack[base_task + P] = 0 (INIT state)
+                        let state_offset_task = self.make_i32_const(param_count as i32);
+                        let state_idx_task = self.make_binop(base_task, state_offset_task, CF_ADD_I32);
+                        let state_store_task =
+                            self.make_array_store(stack_node, state_idx_task, zero_saved);
+                        self.current_effect = Some(self.chain_effects(self.current_effect, state_store_task));
+                        // stack[base_task + P + 1..P + 1 + max_saved] = 0
+                        for j in 0..max_saved {
+                            let offset = self.make_i32_const((param_count + 1 + j) as i32);
+                            let idx = self.make_binop(base_task, offset, CF_ADD_I32);
+                            let store = self.make_array_store(stack_node, idx, zero_saved);
+                            self.current_effect = Some(self.chain_effects(self.current_effect, store));
+                        }
+
+                        // WriteBack sp = sp + 2 (chained into effect to ensure it runs after all stores)
+                        let sp_new = self.chain_effects(self.current_effect, sp_plus_2);
+                        let sp_wb = self.compile_writeback_node(sp_new, sp_node);
+                        self.current_effect = Some(sp_wb);
+
+                        // Create the barrier node (Continue signal; blocks subsequent expression execution)
+                        let barrier = self.make_continue_barrier(sp_wb);
+                        self.current_effect = Some(barrier);
+
+                        // Set the truncated flag
+                        if let Some(ctx) = &mut self.non_tail_rec_ctx {
+                            ctx.truncated = true;
+                        }
+
+                        return barrier;
+                    }
+                }
+            }
+        }
+
+        // Regular function call
+        // current_effect appended at the end as an implicit dependency (ensures Call executes only after prior effects complete)
+        let mut inputs = Vec::with_capacity(args.len() + 1);
+        for &arg in args {
+            inputs.push(self.compile_subexpr(arg));
+        }
+        if let Some(eff) = self.current_effect {
+            inputs.push(eff);
+        }
+        let inputs_offset = self.graph.inputs_pool.push(&inputs);
+        // Default sync call compute_fn (idx 36); async functions use compute_async_call_launch (idx 39)
+        let call_node = self.graph.add_node(Node {
+            kind: NodeKind::Call,
+            input_count: inputs.len() as u8,
+            inputs_offset,
+            compute_fn: CF_CALL_LAUNCH, // compute_call_launch (sync)
+        });
+
+        // Bind the target subgraph (if the callee is a known function name)
+        // Prefer call_instantiations lookup: generic call site -> monomorphization instance, bind the specialized subgraph by mangled name
+        if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
+            let inst_id = self.sema.call_instantiations.get(&call_inst_key);
+            let mangled = inst_id.map(|&id| format!("{}#{}", name, id));
+            let target_key: &str = mangled.as_deref().unwrap_or(name);
+            // Try mangled name first; fall back to bare name if not found.
+            // This handles: (a) non-generic instances with empty type_args that were
+            // never registered under the mangled name, and (b) cross-module calls
+            // compiled before step 2d pre-registers the instance placeholder.
+            let resolved_sg = self.func_subgraphs.get(target_key)
+                .or_else(|| self.func_subgraphs.get(*name));
+            if std::env::var("KUZO_DEBUG_BUILD").is_ok() {
+                let sg_info = resolved_sg.map(|&sg_id| {
+                    let sg = &self.graph.subgraphs[sg_id.0 as usize];
+                    let (s, e) = sg.node_range;
+                    format!("sg={} nodes=[{},{})", sg_id.0, s.0, e.0)
+                }).unwrap_or_else(|| "NOT FOUND".to_string());
+                let used_key = if self.func_subgraphs.get(target_key).is_some() {
+                    target_key
+                } else {
+                    *name
+                };
+                eprintln!("[CALL-BIND] callee={:?} target_key={:?} resolved_key={:?} inst_id={:?} sg_info={} cur_mod={:?}",
+                    name, target_key, used_key, inst_id, sg_info,
+                    self.current_module().name);
+            }
+            if let Some(&target_sg) = resolved_sg {
+                self.graph.set_call_target(call_node, target_sg);
+                // is_async is derived at runtime by compute_call_launch from has_suspend;
+                // here we only check has_suspend to decide whether the call can be marked tail.
+                let is_async = self.graph.subgraphs.get(target_sg.0 as usize)
+                    .is_some_and(|sg| sg.has_suspend);
+                // Tail-call marker: tail position + sync function + has call_target -> runtime switch_subgraph frame reuse
+                if self.in_tail_position && !is_async {
+                    self.graph.set_tail_call(call_node);
+                }
+            }
+        }
+
+        call_node
+    }
+
+    /// Inline expansion: compile the callee body with formals bound to actual nodes.
+    ///
+    /// Enter a new scope -> compile actuals -> bind formal names -> compile body (non-tail position) -> exit scope.
+    /// Does not generate a Call node or launch a subgraph; embeds the body's IR directly into the current function.
+    pub(super) fn compile_inline_expansion(
+        &mut self,
+        body: crate::ast::Ast::ExprRef,
+        params: &[crate::ast::Ast::Param<'_>],
+        args: &[crate::ast::Ast::ExprId],
+    ) -> NodeId {
+        self.enter_scope();
+        // Compile actuals and bind to formal names (actual nodes are compiled in the current scope context)
+        for (param, &arg) in params.iter().zip(args.iter()) {
+            let arg_node = self.compile_subexpr(arg);
+            self.bind_var(param.name, arg_node);
+        }
+        // Compile the callee body (non-tail position; inline expansion does not preserve tail-call semantics)
+        let body_node = self.compile_subexpr(body);
+        self.exit_scope();
+        body_node
+    }
+
+    /// Look up a type declaration's field info (by type name).
+    ///
+    /// Uniformly searches layer by layer through type_scope_stack (top-level + nested types share the same lookup path).
+    pub(super) fn lookup_type_field_names(&self, type_name: &str) -> Option<TypeFieldInfo> {
+        self.lookup_type_fields(type_name)
+    }
+
+    /// Look up the field info of a specified constructor in a multi-constructor ADT.
+    ///
+    /// Uniformly searches layer by layer through type_scope_stack (top-level + nested types share the same lookup path).
+    pub(super) fn lookup_constructor_field_names(&self, constructor_name: &str) -> Option<TypeFieldInfo> {
+        self.lookup_type_fields(constructor_name)
+    }
+
+    /// Check if `Type.Ctor` is a qualified constructor access (IR-side).
+    /// Returns `(type_name, ctor_name, field_names, kind, is_nullary)` for
+    /// constructing the IR node.
+    pub(super) fn check_qualified_ctor_ir(
+        &self,
+        type_name: &str,
+        ctor_name: &str,
+    ) -> Option<(String, String, Vec<Option<String>>, RecordLitKind, bool)> {
+        let &type_idx = self.sema.type_def_index.get(type_name)?;
+        let type_def = &self.sema.type_defs[&type_idx];
+        let ctor = type_def
+            .constructors
+            .iter()
+            .find(|c| c.name.as_ref() == ctor_name)?;
+        let field_names: Vec<Option<String>> = ctor
+            .field_names
+            .iter()
+            .map(|n| n.as_deref().map(String::from))
+            .collect();
+        let is_nullary = ctor.field_type_reprs.is_empty();
+        let kind = match type_def.kind {
+            crate::sema::Sema::TypeDefKind::Adt => RecordLitKind::Adt,
+            crate::sema::Sema::TypeDefKind::Record => RecordLitKind::Record,
+            crate::sema::Sema::TypeDefKind::Newtype => RecordLitKind::Newtype,
+            crate::sema::Sema::TypeDefKind::Alias => RecordLitKind::Record,
+        };
+        Some((
+            ctor.type_name.to_string(),
+            ctor.name.to_string(),
+            field_names,
+            kind,
+            is_nullary,
+        ))
+    }
+
+    /// Check whether a function name is an @extern("C") function (has extern_c_body).
+    pub(super) fn is_extern_c_func(&self, name: &str) -> bool {
+        let modules: Vec<&crate::ast::Ast::Module<'_>> =
+            std::iter::once(self.module).chain(self.builtin_modules.iter().copied()).collect();
+        for m in modules {
+            if let Some(d) = m.find_function(name) {
+                if let crate::ast::Ast::Decl::FunDecl { extern_c_body, .. } = &d.node {
+                    if extern_c_body.is_some() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    // (is_builtin_func removed: @builtin attribute eliminated. Reflect primitives
+    // now lower as auto-impl trait methods / top-level wrappers to CF_REFLECT_*
+    // compute_fns, never reaching the @extern dispatch path.)
+
+    /// Build an AbiSig from a @extern("C") #{ }# function's declared params/return_type.
+    /// str params are expanded to (Ptr, Int) two slots. Unknown types fall back to Int{64}.
+    pub(super) fn build_abi_sig(&self, name: &str) -> crate::ffi::Abi::AbiSig {
+        use crate::ast::Ast::Decl;
+        let mut params = Vec::new();
+        let mut ret = crate::ffi::Abi::AbiType::Void;
+        for m in std::iter::once(self.module).chain(self.builtin_modules.iter().copied()) {
+            if let Some(d) = m.find_function(name) {
+                if let Decl::FunDecl { params: decl_params, return_type, .. } = &d.node {
+                    // Use THIS module's arena (m.arena), not self.module.arena — stdlib functions
+                    // have their TypeRefs in the builtin module's arena.
+                    let arena = &m.arena;
+                    for p in decl_params.iter() {
+                        let ty_name = type_name_in_arena(p.type_annotation, arena);
+                        self.push_abi_types(&ty_name, &mut params);
+                    }
+                    if let Some(rt) = return_type {
+                        let rt_name = type_name_in_arena(Some(*rt), arena);
+                        ret = self.abi_type_of(&rt_name);
+                    }
+                    break;
+                }
+            }
+        }
+        crate::ffi::Abi::AbiSig::new(params, ret)
+    }
+
+    /// Map a Kuzo type name to AbiType. str is handled separately by push_abi_types (two slots).
+    pub(super) fn abi_type_of(&self, ty_name: &str) -> crate::ffi::Abi::AbiType {
+        use crate::ffi::Abi::AbiType;
+        match ty_name {
+            "void" => AbiType::Void,
+            "i8" => AbiType::Int { bits: 8, signed: true },
+            "i16" => AbiType::Int { bits: 16, signed: true },
+            "i32" => AbiType::Int { bits: 32, signed: true },
+            "i64" | "isize" => AbiType::Int { bits: 64, signed: true },
+            "u8" | "bool" => AbiType::Int { bits: 8, signed: false },
+            "char" => AbiType::Int { bits: 32, signed: false },
+            "u16" => AbiType::Int { bits: 16, signed: false },
+            "u32" => AbiType::Int { bits: 32, signed: false },
+            "u64" | "usize" => AbiType::Int { bits: 64, signed: false },
+            "f32" => AbiType::Float32,
+            "f64" => AbiType::Float64,
+            _ if ty_name.starts_with('*') => AbiType::Ptr,
+            _ => AbiType::Int { bits: 64, signed: true }, // fallback
+        }
+    }
+
+    /// Push AbiType(s) for a Kuzo type name. str expands to (Ptr, Int) two slots.
+    pub(super) fn push_abi_types(&self, ty_name: &str, out: &mut Vec<crate::ffi::Abi::AbiType>) {
+        if ty_name == "str" {
+            // str → (const char* data, size_t len)
+            out.push(crate::ffi::Abi::AbiType::Ptr);
+            out.push(crate::ffi::Abi::AbiType::Int { bits: 64, signed: false });
+        } else {
+            out.push(self.abi_type_of(ty_name));
+        }
+    }
+
+    /// Compile a method call.
+    ///
+    /// Method dispatch uniformly goes through the (type_id, method_idx) path:
+    /// - intrinsic methods (await/len/send/recv/close/bytes/cancel etc.) are flagged via
+    ///   MethodSigInfo.intrinsic and lowered directly to a compute_fn node
+    /// - type/trait methods are compiled into Call nodes, looking up method_subgraphs via (type_id, method_idx)
+    pub(super) fn compile_method_call(
+        &mut self,
+        call_expr_id: crate::ast::Ast::ExprId,
+        recv: crate::ast::Ast::ExprId,
+        method: &str,
+        args: &[crate::ast::Ast::ExprId],
+        recv_node_override: Option<NodeId>,
+    ) -> NodeId {
+        // Qualified-name constructor: Type.Ctor(args) (constructor with parameters)
+        if let crate::ast::Ast::Expr::Ident(type_name) = &self.current_module().arena.expr(recv).node {
+            if let Some((ctor_type_name, ctor_name, field_names, kind, is_nullary)) =
+                self.check_qualified_ctor_ir(type_name, method)
+            {
+                if !is_nullary {
+                    let mut inputs = Vec::with_capacity(args.len());
+                    for &arg in args {
+                        inputs.push(self.compile_subexpr(arg));
+                    }
+                    let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                    let node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: inputs.len() as u8,
+                        inputs_offset,
+                        compute_fn: CF_RECORD_CONSTRUCT,
+                    });
+                    self.graph.set_record_lit_info(node, RecordLitInfo {
+                        type_name: ctor_type_name,
+                        field_names,
+                        constructor: ctor_name,
+                        kind,
+                    });
+                    return node;
+                }
+            }
+        }
+
+        // When the caller supplies a pre-compiled receiver node (e.g. implicit-this method
+        // calls where `this` is already bound), skip re-compiling the recv expression.
+        let recv_node = match recv_node_override {
+            Some(n) => n,
+            None => self.compile_subexpr(recv),
+        };
+
+        // -- intrinsic lowering --
+        // First look up the language-level intrinsic flag in sema method_dispatches (await/recv);
+        // on miss, fall back to (type_id, method_idx) lookup of MethodSigInfo.intrinsic (send/close/len etc.).
+        // When conditions are not met (e.g. argument count mismatch), fall through to the Call node path.
+        let dispatch_intrinsic = {
+            let key = crate::sema::Sema::module_expr_key(
+                self.expr_key_module(),
+                call_expr_id.0 as u64,
+            );
+            self.sema.method_dispatches.get(&key).and_then(|d| d.intrinsic)
+        };
+        let intrinsic = dispatch_intrinsic.or_else(|| self.lookup_intrinsic(recv, method));
+        if let Some(intrinsic) = intrinsic {
+            if let Some(node) = self.try_lower_intrinsic(recv, recv_node, args, intrinsic) {
+                return node;
+            }
+        }
+
+        // Path 0: module function call (recv is a constructor/module namespace; recv is not passed)
+        // recv flagged by sema MethodCall path 0a/0b: ModuleRef.free_func(args) / TypeName.free_func(args)
+        // recv is not passed as an argument (free_func is a free function; it does not take recv)
+        // Generic calls prefer call_instantiations lookup to bind the specialized subgraph by mangled name;
+        // non-generic calls fall back to the bare name (same mangled-lookup logic as compile_call)
+        {
+            let recv_key = crate::sema::Sema::module_expr_key(
+                self.expr_key_module(),
+                recv.0 as u64,
+            );
+            if self.sema.module_func_recv_exprs.contains(&recv_key) {
+                let call_inst_key = crate::sema::Sema::module_expr_key(
+                    self.expr_key_module(),
+                    call_expr_id.0 as u64,
+                );
+                let inst_id = self.sema.call_instantiations.get(&call_inst_key);
+                let mangled = inst_id.map(|&id| format!("{}#{}", method, id));
+                let target_key: &str = mangled.as_deref().unwrap_or(method);
+                if let Some(&target_sg) = self.func_subgraphs.get(target_key) {
+                    let mut inputs = Vec::with_capacity(args.len() + 1);
+                    for &arg in args {
+                        inputs.push(self.compile_subexpr(arg));
+                    }
+                    if let Some(eff) = self.current_effect {
+                        inputs.push(eff);
+                    }
+                    let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                    let call_node = self.graph.add_node(Node {
+                        kind: NodeKind::Call,
+                        input_count: inputs.len() as u8,
+                        inputs_offset,
+                        compute_fn: CF_CALL_LAUNCH,
+                    });
+                    self.graph.set_call_target(call_node, target_sg);
+                    return call_node;
+                }
+            }
+        }
+
+        {
+            // Type-driven method dispatch: (type_id, method_idx) structured key lookup into method_subgraphs
+            // current_effect appended at the end as an implicit dependency (ensures Call executes only after prior effects complete)
+            let mut inputs = Vec::with_capacity(2 + args.len());
+            inputs.push(recv_node);
+            for &arg in args {
+                inputs.push(self.compile_subexpr(arg));
+            }
+            if let Some(eff) = self.current_effect {
+                inputs.push(eff);
+            }
+            let inputs_offset = self.graph.inputs_pool.push(&inputs);
+            let call_node = self.graph.add_node(Node {
+                kind: NodeKind::Call,
+                input_count: inputs.len() as u8,
+                inputs_offset,
+                compute_fn: CF_CALL_LAUNCH,
+            });
+
+            // Dispatch priority (semantic priority, not fallback):
+            //   1. trait object dynamic dispatch (recv type is a trait -> vtable runtime dispatch)
+            //   2. type's own method / trait method override: (type_id, method_idx) lookup into method_subgraphs
+            //   3. trait default method: (type_id, trait_def_idx, method_idx_in_trait) lookup into trait_default_subgraphs
+
+            // Path 1: trait object dynamic dispatch (vtable)
+            if self.is_trait_object_recv(recv) {
+                // Look up method_idx from trait_def.methods (consistent with TraitValue.method_values index)
+                let trait_name = self.expr_type_name(recv).unwrap_or("").to_string();
+                let method_idx = self.sema.get_trait_def(&trait_name)
+                    .and_then(|td| td.methods.iter().position(|m| m.name.as_ref() == method))
+                    .map(|i| i as u16);
+                match method_idx {
+                    Some(idx) => {
+                        self.graph.set_vtable_call(call_node, idx);
+                        // Populate the vtable_fallback_dispatch table so that when a concrete
+                        // record (not a TraitVal) is passed as a trait-typed parameter, the
+                        // runtime can statically dispatch via (method_idx, type_name) → SubGraphId.
+                        // Enumerate all types implementing this trait via the witness table.
+                        self.populate_vtable_fallback(&trait_name, idx, method);
+                    }
+                    None => self.errors.push(format!(
+                        "internal: trait method '{}' not found in trait '{}' for vtable dispatch",
+                        method, &trait_name)),
+                }
+                return call_node;
+            }
+
+            // Path 2: type's own method / trait method override
+            // When recv_node_override is set (implicit-this call), the callee ExprId does not carry
+            // the receiver's type info; use current_method_type (set by the enclosing method compile).
+            let recv_type: Option<(&str, u16)> = if recv_node_override.is_some() {
+                self.current_method_type.as_ref().map(|(n, id)| (n.as_ref(), *id))
+            } else {
+                self.expr_type_name(recv).zip(self.expr_type_id(recv))
+            };
+            if let Some((type_name, type_id)) = recv_type {
+                if let Some(method_idx) = self.sema.lookup_method_idx(type_name, method) {
+                    if let Some(&target_sg) = self.method_subgraphs.get(&(type_id, method_idx)) {
+                        self.graph.set_call_target(call_node, target_sg);
+                        return call_node;
+                    }
+                }
+            }
+
+            // Path 3: trait default method (type does not override; fall back to the monomorphized specialized version of the trait default impl)
+            let path3_type_id = if recv_node_override.is_some() {
+                self.current_method_type.as_ref().map(|(_, id)| *id)
+            } else {
+                self.expr_type_id(recv)
+            };
+            if let Some(type_id) = path3_type_id {
+                for trait_def in self.sema.trait_defs.values() {
+                    if !self.type_implements_trait(type_id, &trait_def.name) {
+                        continue;
+                    }
+                    if let Some(method_idx) = trait_def
+                        .methods
+                        .iter()
+                        .position(|m| m.name.as_ref() == method && m.has_body)
+                    {
+                        if let Some(&trait_idx) = self.sema.trait_def_index.get(trait_def.name.as_ref()) {
+                            if let Some(&target_sg) = self.trait_default_subgraphs.get(&(type_id, trait_idx, method_idx as u16)) {
+                                self.graph.set_call_target(call_node, target_sg);
+                                return call_node;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Path 4: free-function method call (recv.method(args) -> method(recv, args))
+            // When the method name matches a top-level free function, recv is passed as the first argument
+            if let Some(&target_sg) = self.func_subgraphs.get(method) {
+                self.graph.set_call_target(call_node, target_sg);
+                return call_node;
+            }
+
+            call_node
+        }
+    }
+
+    /// Look up MethodSigInfo.intrinsic via (type_id, method_idx) and return the lowering strategy.
+    ///
+    /// Intrinsic methods of built-in types (e.g. Async.await, Channel.send, Array.len) have the intrinsic
+    /// field annotated when Sema registers the synthetic TypeDefInfo; this lookups uniformly, without special-casing by method name.
+    pub(super) fn lookup_intrinsic(
+        &self,
+        recv: crate::ast::Ast::ExprId,
+        method: &str,
+    ) -> Option<crate::sema::Sema::IntrinsicKind> {
+        // First: reflect trait methods (auto-impl). Recognized structurally by
+        // method name, so every type — including builtins and generic type vars —
+        // gets reflect methods without needing witness-table registration.
+        if let Some((kind, _argc)) = reflect_method_intrinsic(method) {
+            // Guard: only lower as reflect intrinsic if the receiver's type does
+            // NOT already define a real method of the same name (user override wins).
+            let shadows = self.expr_type_name(recv)
+                .and_then(|tn| self.sema.lookup_method_idx(tn, method))
+                .is_some();
+            if !shadows {
+                return Some(kind);
+            }
+        }
+        let type_name = self.expr_type_name(recv)?;
+        let type_id = self.expr_type_id(recv)?;
+        let method_idx = self.sema.lookup_method_idx(type_name, method)?;
+        let sig = self.sema.get_method_sig(type_id, method_idx)?;
+        sig.intrinsic
+    }
+
+    /// Try to lower to a compute_fn node based on IntrinsicKind.
+    ///
+    /// Returns None when conditions are not met (e.g. argument count mismatch, recv type mismatch);
+    /// the caller should fall through to the Call node path.
+    pub(super) fn try_lower_intrinsic(
+        &mut self,
+        recv: crate::ast::Ast::ExprId,
+        recv_node: NodeId,
+        args: &[crate::ast::Ast::ExprId],
+        kind: crate::sema::Sema::IntrinsicKind,
+    ) -> Option<NodeId> {
+        use crate::sema::Sema::IntrinsicKind;
+        match kind {
+            // await: unconditionally lower to Await (EventSource + Await dual node)
+            IntrinsicKind::Await if args.is_empty() => {
+                Some(self.build_await_node(recv, recv_node))
+            }
+            // recv: only lower to Await when recv's type is Channel/Receiver
+            IntrinsicKind::ChannelAwait if args.is_empty() => {
+                if self.infer_event_source_kind(recv) == crate::ir::Ir::EventSourceKind::Channel {
+                    Some(self.build_await_node(recv, recv_node))
+                } else {
+                    None
+                }
+            }
+            // cancel/len/close/bytes: single-node unary op (no arguments)
+            IntrinsicKind::UnOp(idx) if args.is_empty() => {
+                let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
+                Some(self.graph.add_node(Node {
+                    kind: NodeKind::UnOp,
+                    input_count: 1,
+                    inputs_offset,
+                    compute_fn: ComputeFnId(idx),
+                }))
+            }
+            // send(value): binary op, inputs = [recv, value]
+            IntrinsicKind::BinOp(idx) => {
+                let mut inputs = vec![recv_node];
+                for &arg in args {
+                    inputs.push(self.compile_subexpr(arg));
+                }
+                let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                Some(self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: inputs.len() as u8,
+                    inputs_offset,
+                    compute_fn: ComputeFnId(idx),
+                }))
+            }
+            // compare_exchange(expected, new): ternary op, inputs = [recv, expected, new]
+            IntrinsicKind::TriOp(idx) => {
+                let mut inputs = vec![recv_node];
+                for &arg in args {
+                    inputs.push(self.compile_subexpr(arg));
+                }
+                let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                Some(self.graph.add_node(Node {
+                    kind: NodeKind::TriOp,
+                    input_count: inputs.len() as u8,
+                    inputs_offset,
+                    compute_fn: ComputeFnId(idx),
+                }))
+            }
+            _ => None, // argument mismatch; fall through to the Call node path
+        }
+    }
+
+    /// Check whether a type implements a specified trait (queries any method slot via witness_table).
+    pub(super) fn type_implements_trait(&self, type_id: u16, trait_name: &str) -> bool {
+        for entry in self.sema.witness_table.entries() {
+            if entry.trait_name.as_ref() == trait_name && entry.type_id == type_id {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Populate the vtable_fallback_dispatch table for a trait method call site.
+    ///
+    /// For every concrete type that implements `trait_name`, resolve the method's
+    /// subgraph via `(type_id, method_idx_in_type_def)` and store it keyed by
+    /// `(vtable_method_idx, type_name)`. At runtime, when a vtable call receives a
+    /// concrete record (not a TraitVal), `compute_call_launch` looks up the value's
+    /// `type_name` here to statically dispatch.
+    pub(super) fn populate_vtable_fallback(&mut self, trait_name: &str, vtable_idx: u16, method_name: &str) {
+        // Approach: scan all TypeDecls in the user module (top-level + local) for types that
+        // have a method matching `method_name`. For each, register the method subgraph keyed by
+        // (vtable_idx, type_name). This handles both explicit trait declarations (`: Trait`) and
+        // structural trait implementations (methods present without explicit declaration).
+        //
+        // First try the witness table (explicit declarations); if empty, fall back to scanning
+        // all types with a matching method name.
+        let mut entries: Vec<(u16, u16)> = Vec::new();
+        for entry in self.sema.witness_table.entries() {
+            if entry.trait_name.as_ref() != trait_name {
+                continue;
+            }
+            if let Some(type_method_idx) = self.sema.witness_table.resolve_method(trait_name, entry.type_id, method_name) {
+                entries.push((entry.type_id, type_method_idx));
+            }
+        }
+        // Structural fallback: if witness table has no entries for this trait, scan all types
+        // that have a method with the matching name. This supports `type Dog { fun name(): str }`
+        // being passed as `Animal` without an explicit `: Animal` declaration.
+        if entries.is_empty() {
+            for (&type_idx, type_def) in &self.sema.type_defs {
+                for (m_idx, m) in type_def.methods.iter().enumerate() {
+                    if m.name.as_ref() == method_name {
+                        entries.push((crate::types::dynamic_type_id(type_idx), m_idx as u16));
+                        break;
+                    }
+                }
+            }
+        }
+        for (type_id, type_method_idx) in entries {
+            if let Some(&sg) = self.method_subgraphs.get(&(type_id, type_method_idx)) {
+                if let Some(name) = self.type_name_from_id(type_id) {
+                    self.graph.vtable_fallback_dispatch.insert((vtable_idx, name.into_boxed_str()), sg);
+                }
+            }
+        }
+    }
+
+    /// Reverse-lookup a type_name from a dynamic type_id.
+    pub(super) fn type_name_from_id(&self, type_id: u16) -> Option<String> {
+        for (&type_idx, type_def) in &self.sema.type_defs {
+            if crate::types::dynamic_type_id(type_idx) == type_id {
+                return Some(type_def.name.as_ref().to_string());
+            }
+        }
+        None
+    }
+
+    /// Determine whether recv is a trait object (needs runtime dynamic dispatch).
+    ///
+    /// Look up recv's type name; if it is a trait name registered in sema.trait_defs, it needs vtable dynamic dispatch.
+    pub(super) fn is_trait_object_recv(&self, recv: crate::ast::Ast::ExprId) -> bool {
+        let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), recv.0 as u64);
+        if let Some(info) = self.sema.expr_types.get(&key) {
+            if let Some(tn) = &info.type_name {
+                return self
+                    .sema
+                    .trait_defs
+                    .values()
+                    .any(|td| td.name.as_ref() == tn.as_ref());
+            }
+        }
+        false
+    }
+
+    /// Get the type_id of an expression (looked up from SemaResult.expr_types).
+    ///
+    /// type_id computation is consistent with populate_witness_table: type_def_index[name] + FIRST_DYNAMIC_TYPE_ID.
+    /// When Sema has no record (self in a specialized trait default method version), look up sema's
+    /// TraitDefaultInstance.type_name to get the concrete implementation type name, then query type_def_index.
+    pub(super) fn expr_type_id(&self, expr: crate::ast::Ast::ExprId) -> Option<u16> {
+        // self in a specialized trait default method version: consume sema's TraitDefaultInstance.type_name
+        if let Some(idx) = self.current_trait_default_idx {
+            if let crate::ast::Ast::Expr::Ident(name) = &self.module.arena.expr(expr).node {
+                if *name == "this" {
+                    if let Some(inst) = self.sema.trait_default_instances.get(idx) {
+                        return self
+                            .sema
+                            .type_def_index
+                            .get(inst.type_name.as_ref())
+                            .map(|&idx| crate::types::dynamic_type_id(idx));
+                    }
+                }
+            }
+        }
+        let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr.0 as u64);
+        let info = self.sema.expr_types.get(&key)?;
+        // Consistent with expr_type_name: prefer type_name, fall back to Type::name()
+        // (built-in structural variants like array/nullable/str/Throw return their registered name via Type::name();
+        // "unknown" only appears in degenerate paths where Adt/Record arena lookup fails).
+        let type_name = info
+            .type_name
+            .as_deref()
+            .unwrap_or_else(|| self.type_arena.get(info.ty).name());
+        self.sema
+            .type_def_index
+            .get(type_name)
+            .map(|&idx| crate::types::dynamic_type_id(idx))
+    }
+
+}
