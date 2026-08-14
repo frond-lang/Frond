@@ -788,25 +788,36 @@ impl<'a> IrBuilder<'a> {
     /// concrete type information, allowing self.method() calls to statically bind to the correct
     /// method subgraph via path 2 (the type's own methods).
     pub(super) fn compile_trait_default_method(&mut self, trait_name: &str, method_idx: usize, impl_type_name: &str, instance_idx: usize) {
-        // Look up the TraitDecl method with a body in the user module (indexed directly by method_idx)
-        let found = self.module.declarations.iter().find_map(|d| {
-            if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
-                if *name == trait_name {
-                    if let Some(method) = methods.get(method_idx) {
-                        if method.body.is_some() {
-                            return Some((
-                                method.body.unwrap(),
-                                method.is_async,
-                                method.params.clone(),
-                            ));
+        // Look up the TraitDecl method with a body, searching builtin modules AND
+        // the current module (the trait may live in an embedded stdlib module).
+        // Returns (body, is_async, params, module) — the module is needed to
+        // switch the AST arena context while compiling the body.
+        let found = self
+            .builtin_modules
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.module))
+            .find_map(|m| {
+                m.declarations.iter().find_map(|d| {
+                    if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
+                        if *name == trait_name {
+                            if let Some(method) = methods.get(method_idx) {
+                                if method.body.is_some() {
+                                    return Some((
+                                        method.body.unwrap(),
+                                        method.is_async,
+                                        method.params.clone(),
+                                        m,
+                                    ));
+                                }
+                            }
                         }
                     }
-                }
-            }
-            None
-        });
+                    None
+                })
+            });
 
-        let (body_expr, is_async, params) = match found {
+        let (body_expr, is_async, params, decl_module) = match found {
             Some(x) => x,
             None => return,
         };
@@ -826,6 +837,15 @@ impl<'a> IrBuilder<'a> {
         };
 
         let node_start = self.graph.nodes.len() as u32;
+
+        // Switch the AST arena context to the trait's declaring module while
+        // compiling the body (compile_expr reads the arena via current_module()).
+        let prev_builtin = self.compiling_builtin;
+        self.compiling_builtin = if std::ptr::eq(decl_module, self.module) {
+            None
+        } else {
+            Some(decl_module)
+        };
 
         self.current_function_sg = Some(sg_id);
         self.current_function_id = sg_id.0;
@@ -855,6 +875,7 @@ impl<'a> IrBuilder<'a> {
         self.current_function_sg = None;
         self.current_trait_default_idx = None;
         self.current_method_type = prev_method_type;
+        self.compiling_builtin = prev_builtin;
 
         let node_end = self.graph.nodes.len() as u32;
         let sg = &mut self.graph.subgraphs[sg_id.0 as usize];

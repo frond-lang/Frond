@@ -299,6 +299,7 @@ pub enum TokenKind {
     KwLazy,
     KwDefer,
     KwThis,
+    KwSuper,
 
     // Identifier
     Identifier,
@@ -1403,6 +1404,7 @@ fn keyword_type(text: &str) -> TokenKind {
         "lazy" => TokenKind::KwLazy,
         "defer" => TokenKind::KwDefer,
         "this" => TokenKind::KwThis,
+        "super" => TokenKind::KwSuper,
         "true" => TokenKind::TrueLiteral,
         "false" => TokenKind::FalseLiteral,
         "null" => TokenKind::NullLiteral,
@@ -2482,7 +2484,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         } else {
             None
         };
-        let body = if delegate.is_none() && self.check(TokenKind::LBrace) {
+        // Body: allowed with or without a delegate.
+        // - `fun m(): R = A.m` — pure delegation: the type's method slot binds to
+        //   trait A's default implementation (no body of its own).
+        // - `override fun m(): R = A.m { ... }` — binding annotation + body: the
+        //   body overrides, and `super.m()` inside it statically targets A's default.
+        let body = if self.check(TokenKind::LBrace) {
             Some(self.parse_expr()?)
         } else {
             None
@@ -3415,6 +3422,13 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         if self.check(TokenKind::KwThis) {
             let tok = self.advance();
             return Ok(self.alloc_expr(token_span(&tok), Expr::Ident("this")));
+        }
+        // `super` keyword in expression position: resolves as the identifier "super".
+        // Not a value: sema only accepts it as the receiver of a method call
+        // (`super.method(...)` — static dispatch to the bound trait default).
+        if self.check(TokenKind::KwSuper) {
+            let tok = self.advance();
+            return Ok(self.alloc_expr(token_span(&tok), Expr::Ident("super")));
         }
         if matches!(
             self.peek().kind,

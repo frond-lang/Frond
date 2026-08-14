@@ -675,7 +675,7 @@ impl<'a> InferContext<'a> {
                     let _ = self.infer_expr(*expr, ast, env, None);
                 }
             }
-            Decl::TypeDecl { name, type_params, def, methods, .. } => {
+            Decl::TypeDecl { name, type_params, def, implemented_traits, methods, .. } => {
                 // Register the nested type definition into sema_result (so constructor calls are
                 // recognized during type checking).
                 ast_type_decl_to_type_def(self.arena, self.sema_result, *name, type_params, def, ast, decl_span, &self.current_module_name);
@@ -742,6 +742,12 @@ impl<'a> InferContext<'a> {
                 }
                 // Type method checking.
                 self.push_this_type(self_ty);
+                // Expose the implemented trait names to method-body inference:
+                // `super.method(...)` resolves against the trait-default layer of
+                // these traits (see infer_super_method_call).
+                self.current_type_decl_traits = Some(
+                    implemented_traits.iter().map(|t| t.trait_name.into()).collect(),
+                );
                 // First register all methods as functions into env (supports bare-name method
                 // call syntax `method(recv, args)`), then check method bodies (avoids
                 // forward-reference issues).
@@ -810,6 +816,7 @@ impl<'a> InferContext<'a> {
                         }
                     }
                 }
+                self.current_type_decl_traits = None;
                 self.pop_this_type();
                 if !type_params.is_empty() {
                     self.pop_type_bindings();

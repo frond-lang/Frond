@@ -1206,37 +1206,218 @@ fn resolve_instance_body_types<'a>(
 
 // ====== New trait-default-method monomorphization logic below ======
 
-/// Whether a type explicitly implements a method at the AST level (has a body).
+/// Reflect auto-impl method names: every receiver type gets these regardless of
+/// implemented traits, so `override fun type_name()` etc. may legitimately have
+/// no trait default to override.
+fn is_reflect_method_name(name: &str) -> bool {
+    matches!(
+        name,
+        "format" | "type_name" | "kind" | "constructor" | "size" | "alignment" | "field_count" | "field_name"
+    )
+}
+
+/// Validate the method ↔ trait-default bindings of every type declaration in
+/// the module. Enforces the override/delegate system:
 ///
-/// Used to skip trait-default-method specialization: when the type already
-/// explicitly overrides the method, no specialized subgraph is needed.
-/// Matches the condition used in Ir.rs step 0 for registering `method_subgraphs`
-/// (`method.body.is_some()`).
-fn type_has_explicit_method<'a>(module: &'a Module<'a>, type_name: &str, method_name: &str) -> bool {
+/// - R1: a declared method with a body that shadows an implemented trait's
+///   default must carry `override` (shadowing by accident is an error).
+/// - R2: `override` must target an implemented trait's *default* (a method with
+///   a body); implementing an abstract trait method is not overriding. Reflect
+///   auto-impl names are exempt (they override an implicit builtin, not a trait).
+/// - R3: a method name inherited from multiple implemented traits' defaults
+///   without any declaration is ambiguous — it must be resolved by an explicit
+///   override or a delegate (`fun m(...): R = A.m`).
+/// - R4: a delegate `= A.m` must name an implemented trait, use the same method
+///   name, target a defaulted method, and a pure delegation (no body) must not
+///   carry `override`.
+///
+/// Runs after all declarations of the module are checked (trait definitions are
+/// registered regardless of declaration order), before
+/// `collect_trait_default_instances`.
+pub fn validate_trait_method_bindings<'a>(
+    module: &'a Module<'a>,
+    sema_result: &mut SemaResult,
+) {
+    struct Finding(Box<str>, u32, u32);
+    let mut findings: Vec<Finding> = Vec::new();
+
     for decl in &module.declarations {
-        if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &decl.node {
-            if *name == type_name {
-                return methods.iter().any(|m| &*m.name == method_name && m.body.is_some());
+        let crate::ast::Ast::Decl::TypeDecl { name, implemented_traits, methods, .. } = &decl.node
+        else {
+            continue;
+        };
+        // Implemented trait names, deduped in declaration order.
+        let mut traits: Vec<Box<str>> = Vec::new();
+        for it in implemented_traits.iter() {
+            let t: Box<str> = it.trait_name.into();
+            if !traits.iter().any(|x| x.as_ref() == t.as_ref()) {
+                traits.push(t);
+            }
+        }
+        // Union of method names across the implemented traits (owned, to release
+        // the sema_result borrow before reporting).
+        let method_names: Vec<String> = {
+            let mut ns: Vec<String> = Vec::new();
+            for t in &traits {
+                if let Some(td) = sema_result.get_trait_def(t) {
+                    for m in td.methods.iter() {
+                        if !ns.iter().any(|x| x == m.name.as_ref()) {
+                            ns.push(m.name.to_string());
+                        }
+                    }
+                }
+            }
+            ns
+        };
+
+        for m_name in &method_names {
+            let declared = methods.iter().find(|m| m.name == m_name.as_str());
+            // Implemented traits providing a default (bodied) method of this name.
+            let providers: Vec<String> = traits
+                .iter()
+                .filter(|t| {
+                    sema_result
+                        .get_trait_def(t)
+                        .map(|td| {
+                            td.methods
+                                .iter()
+                                .any(|m| m.name.as_ref() == m_name.as_str() && m.has_body)
+                        })
+                        .unwrap_or(false)
+                })
+                .map(|t| t.to_string())
+                .collect();
+            let (line, column) = (decl.span.line, decl.span.column);
+
+            if let Some(m) = declared {
+                let (has_body, is_override) = (m.body.is_some(), m.is_override);
+
+                // R4: delegate target validation.
+                if let Some(d) = m.delegate.as_ref() {
+                    if !traits.iter().any(|t| t.as_ref() == d.trait_name) {
+                        findings.push(Finding(
+                            format!(
+                                "type '{}' does not implement trait '{}'; cannot delegate '{}'",
+                                name, d.trait_name, m_name
+                            )
+                            .into(),
+                            line,
+                            column,
+                        ));
+                    } else if d.method_name != m_name.as_str() {
+                        findings.push(Finding(
+                            format!(
+                                "delegate target must use the same method name: '{}.{}' on '{}.{}'",
+                                d.trait_name, d.method_name, name, m_name
+                            )
+                            .into(),
+                            line,
+                            column,
+                        ));
+                    } else {
+                        let has_default = sema_result
+                            .get_trait_def(d.trait_name)
+                            .map(|td| {
+                                td.methods
+                                    .iter()
+                                    .any(|m| m.name.as_ref() == m_name.as_str() && m.has_body)
+                            })
+                            .unwrap_or(false);
+                        if !has_default {
+                            findings.push(Finding(
+                                format!(
+                                    "trait '{}' has no default implementation of '{}'; a delegate must target a trait default",
+                                    d.trait_name, m_name
+                                )
+                                .into(),
+                                line,
+                                column,
+                            ));
+                        }
+                    }
+                    if is_override && !has_body {
+                        findings.push(Finding(
+                            format!(
+                                "pure delegation of '{}.{}' inherits the default; remove 'override'",
+                                name, m_name
+                            )
+                            .into(),
+                            line,
+                            column,
+                        ));
+                    }
+                }
+
+                // R2: `override` must target an implemented trait default.
+                if is_override && providers.is_empty() && !is_reflect_method_name(m_name) {
+                    findings.push(Finding(
+                        format!(
+                            "'override' on '{}.{}' but no implemented trait provides a default '{}'",
+                            name, m_name, m_name
+                        )
+                        .into(),
+                        line,
+                        column,
+                    ));
+                }
+
+                // R1: shadowing a default with a body requires `override`.
+                if has_body && !is_override && !providers.is_empty() {
+                    findings.push(Finding(
+                        format!(
+                            "'{}.{}' overrides a trait default (from [{}]); mark it 'override'",
+                            name,
+                            m_name,
+                            providers.join(", ")
+                        )
+                        .into(),
+                        line,
+                        column,
+                    ));
+                }
+            } else if providers.len() > 1 {
+                // R3: ambiguous inherited default.
+                findings.push(Finding(
+                    format!(
+                        "ambiguous trait default '{}': type '{}' inherits conflicting defaults from [{}]; resolve with an explicit override or a delegate ('fun {}(...): ... = {}.{}')",
+                        m_name,
+                        name,
+                        providers.join(", "),
+                        m_name,
+                        providers[0],
+                        m_name
+                    )
+                    .into(),
+                    line,
+                    column,
+                ));
             }
         }
     }
-    false
+
+    for f in findings {
+        sema_result.add_error(crate::sema::Sema::SemaError {
+            message: f.0,
+            line: f.1,
+            column: f.2,
+            file_path: None,
+        });
+    }
 }
 
 /// Collect trait-default-method monomorphization instances.
 ///
-/// Generates a `TraitDefaultInstance` entry for each type that implements a
-/// trait but does not explicitly override the method. The IR layer (IrBuilder)
-/// consumes this table to pre-register and compile specialized subgraphs.
+/// Generates a `TraitDefaultInstance` entry for each type whose *bound* trait
+/// default needs a specialized subgraph. The binding comes from
+/// `SemaResult::resolve_method_binding` (explicit delegate `= A.m` or unique
+/// provider); instances are emitted only for the bound trait, which makes
+/// multi-trait same-name conflicts deterministic instead of resolved by
+/// trait-table iteration order.
 ///
-/// Algorithm:
-/// 1. Walk the module's `TraitDecl`s and obtain the `trait_idx`.
-/// 2. Collect all types implementing the trait (type_id, type_name) from the
-///    `witness_table`.
-/// 3. For each default method with a body, generate a specialized instance
-///    for each implementing type.
-/// 4. Skip types that explicitly override the method (checked at the AST level
-///    via `type_has_explicit_method`).
+/// An overriding type normally gets no instance (its own method_subgraphs entry
+/// wins dispatch); the exception is `super`: when sema recorded the
+/// (type, trait, method) triple in `super_targets`, the default subgraph must
+/// exist even though the type overrides it.
 pub fn collect_trait_default_instances<'a>(
     module: &'a Module<'a>,
     sema_result: &mut SemaResult,
@@ -1268,17 +1449,38 @@ pub fn collect_trait_default_instances<'a>(
                 }
                 let method_name: &str = method.name.as_ref();
                 for (type_id, type_name) in &impl_entries {
-                    // Skip types that explicitly override this method.
-                    if type_has_explicit_method(module, type_name, method_name) {
-                        continue;
+                    // The type's implemented trait names (witness table).
+                    let traits: Vec<Box<str>> = sema_result
+                        .witness_table
+                        .entries()
+                        .filter(|e| e.type_id == *type_id)
+                        .map(|e| e.trait_name.clone())
+                        .collect();
+                    match sema_result.resolve_method_binding(&traits, type_name, method_name) {
+                        crate::sema::Sema::MethodBinding::Bound { trait_name, overridden }
+                            if trait_name.as_ref() == *name =>
+                        {
+                            if overridden
+                                && !sema_result.super_targets.contains(&(
+                                    type_name.as_str().into(),
+                                    trait_name.clone(),
+                                    method_name.into(),
+                                ))
+                            {
+                                // The type overrides the default and never calls
+                                // super into it — no specialized default needed.
+                                continue;
+                            }
+                            sema_result.trait_default_instances.push(TraitDefaultInstance {
+                                type_id: *type_id,
+                                type_name: type_name.as_str().into(),
+                                trait_idx,
+                                trait_name: (*name).into(),
+                                method_idx: method_idx as u16,
+                            });
+                        }
+                        _ => continue,
                     }
-                    sema_result.trait_default_instances.push(TraitDefaultInstance {
-                        type_id: *type_id,
-                        type_name: type_name.as_str().into(),
-                        trait_idx,
-                        trait_name: (*name).into(),
-                        method_idx: method_idx as u16,
-                    });
                 }
             }
         }

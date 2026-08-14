@@ -251,6 +251,13 @@ impl<'a> InferContext<'a> {
         match &ast.expr(expr).node {
             Expr::MethodCall { recv, method, args, .. }
             | Expr::SafeMethodCall { recv, method, args, .. } => {
+                // super.method(args): static dispatch to the bound trait-default
+                // layer of the enclosing type. Must be handled before anything
+                // that infers the receiver (`super` is not a value and resolves
+                // in no environment).
+                if let Expr::Ident("super") = &ast.expr(*recv).node {
+                    return self.infer_super_method_call(expr, ast, env, expected, method, args);
+                }
                 // Qualified-name syntax: Type.Ctor(args) (qualified call of a constructor with arguments)
                 if let Expr::Ident(type_name) = &ast.expr(*recv).node {
                     if let Some((ctor_type_name, field_type_reprs)) =
@@ -591,6 +598,173 @@ impl<'a> InferContext<'a> {
     }
 
     /// Looks up the method signature for an object type (returns a function type whose first parameter is self).
+    /// Infer `super.method(args)` — static dispatch to the bound trait-default
+    /// implementation of the enclosing type.
+    ///
+    /// `super` is a layer view of `this`, not a value: the call resolves to the
+    /// trait default that `method` is bound to on the enclosing type (explicit
+    /// delegate `= A.m` or unique provider), bypassing the type's own override.
+    /// The resolved `(trait_idx, method_idx)` is recorded into
+    /// `sema_result.super_dispatches` for the IR builder, and the
+    /// (type, trait, method) triple into `super_targets` so the monomorph phase
+    /// generates the specialized default subgraph even for overriding types.
+    fn infer_super_method_call(
+        &mut self,
+        expr: ExprId,
+        ast: &AstArena<'_>,
+        env: EnvId,
+        expected: Option<TypeHandle>,
+        method: &str,
+        args: &[ExprId],
+    ) -> TypeHandle {
+        use crate::sema::Sema::MethodBinding;
+        let span = ast.expr(expr).span;
+
+        // Inside a trait default method, `super` would mean the parent trait's
+        // default — trait parents are not implemented yet.
+        if self.current_trait_name.is_some() {
+            self.add_error_at(
+                "super is not allowed inside a trait default method (trait parents are not implemented yet)",
+                span.line,
+                span.column,
+            );
+            return self.arena.fresh_type_var();
+        }
+        let traits: Vec<Box<str>> = match self.current_type_decl_traits.clone() {
+            Some(t) => t,
+            None => {
+                self.add_error_at(
+                    "super is only valid inside a type method",
+                    span.line,
+                    span.column,
+                );
+                return self.arena.fresh_type_var();
+            }
+        };
+        // The enclosing type's name (from the pushed `this` type) — needed to
+        // consult the declared methods' delegate annotations.
+        let type_name: Box<str> = self
+            .current_this_type()
+            .and_then(|t| {
+                let r = self.arena.resolve(t);
+                match self.arena.get(r) {
+                    Type::Adt(_) => {
+                        let (n, _) = self.arena.adt_parts(r);
+                        Some(n.into())
+                    }
+                    _ => None,
+                }
+            })
+            .unwrap_or_default();
+        if type_name.is_empty() {
+            self.add_error_at(
+                "super: the enclosing type could not be determined",
+                span.line,
+                span.column,
+            );
+            return self.arena.fresh_type_var();
+        }
+
+        let binding = self
+            .sema_result
+            .resolve_method_binding(&traits, &type_name, method);
+        let trait_name: Box<str> = match binding {
+            MethodBinding::Bound { trait_name, .. } => trait_name,
+            MethodBinding::Ambiguous(list) => {
+                self.add_error_at(
+                    &format!(
+                        "ambiguous super: '{}' has default implementations from [{}]; bind it explicitly on the method ('... = Trait.{}')",
+                        method,
+                        list.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(", "),
+                        method,
+                    ),
+                    span.line,
+                    span.column,
+                );
+                return self.arena.fresh_type_var();
+            }
+            MethodBinding::Unbound => {
+                self.add_error_at(
+                    &format!(
+                        "no trait default '{}' is available via super on type '{}'",
+                        method, type_name
+                    ),
+                    span.line,
+                    span.column,
+                );
+                return self.arena.fresh_type_var();
+            }
+        };
+
+        // Trait method signature (position + shape) for type-checking the call.
+        let trait_idx = self.sema_result.trait_def_index.get(trait_name.as_ref()).copied();
+        let sig = self.sema_result.get_trait_def(trait_name.as_ref()).and_then(|td| {
+            td.methods
+                .iter()
+                .enumerate()
+                .find(|(_, m)| m.name.as_ref() == method)
+                .map(|(i, m)| (i as u16, m.param_count, m.return_type, m.has_body))
+        });
+        let (trait_idx, method_idx, param_count, return_type, has_body) =
+            match (trait_idx, sig) {
+                (Some(t), Some((mi, pc, rt, hb))) => (t, mi, pc, rt, hb),
+                _ => {
+                    self.add_error_at(
+                        &format!(
+                            "super: trait '{}' or its method '{}' could not be resolved",
+                            trait_name, method
+                        ),
+                        span.line,
+                        span.column,
+                    );
+                    return self.arena.fresh_type_var();
+                }
+            };
+        if !has_body {
+            self.add_error_at(
+                &format!(
+                    "super: trait '{}' method '{}' has no default body to call",
+                    trait_name, method
+                ),
+                span.line,
+                span.column,
+            );
+            return self.arena.fresh_type_var();
+        }
+
+        // Build the callable type (mirror of the trait-typed receiver path):
+        // params[0] is `this`; the remaining parameters are inferred from args.
+        let this_ty = self.current_this_type().unwrap_or_else(|| self.arena.fresh_type_var());
+        let params: Vec<TypeHandle> = (0..param_count)
+            .map(|i| if i == 0 { this_ty } else { self.arena.fresh_type_var() })
+            .collect();
+        let fn_ty = self.arena.make_fn(params.into_boxed_slice(), return_type);
+        let inst_fn = self.instantiate_fn_type(fn_ty);
+        if let Type::Fn(_) = self.arena.get(inst_fn) {
+            let (param_types, ret_ty) = self.arena.fn_parts(inst_fn);
+            let param_types: Vec<TypeHandle> = param_types.to_vec();
+            let n = param_types.len().min(args.len() + 1);
+            for i in 1..n {
+                let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(param_types[i]));
+                self.unify_or_constrain(param_types[i], arg_ty);
+            }
+            if let Some(exp) = expected {
+                self.unify_or_constrain(ret_ty, exp);
+            }
+            // Record the static dispatch target for the IR builder and mark the
+            // (type, trait, method) triple as needing a default subgraph.
+            let key = module_expr_key(&self.current_module_name, expr.0 as u64);
+            self.sema_result.super_dispatches.insert(key, (trait_idx, method_idx));
+            self.sema_result.super_targets.insert((
+                type_name.clone(),
+                trait_name.clone(),
+                method.into(),
+            ));
+            return ret_ty;
+        }
+        self.arena.fresh_type_var()
+    }
+
     pub(super) fn lookup_method_type(
         &mut self,
         recv_ty: TypeHandle,

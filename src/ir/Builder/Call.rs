@@ -811,6 +811,15 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
+        // super.method(args): static dispatch to the bound trait-default
+        // subgraph. Bypasses the vtable (Path 1) and the type's own override
+        // (Path 2) entirely — sema resolved the target at inference time
+        // (super_dispatches) and the monomorph phase guarantees the default
+        // subgraph exists (super_targets).
+        if let crate::ast::Ast::Expr::Ident("super") = &self.current_module().arena.expr(recv).node {
+            return self.compile_super_method_call(call_expr_id, method, args);
+        }
+
         // When the caller supplies a pre-compiled receiver node (e.g. implicit-this method
         // calls where `this` is already bound), skip re-compiling the recv expression.
         let recv_node = match recv_node_override {
@@ -974,6 +983,93 @@ impl<'a> IrBuilder<'a> {
 
             call_node
         }
+    }
+
+    /// Compile `super.method(args)` — a static call to the specialized
+    /// trait-default subgraph of the enclosing type.
+    ///
+    /// The receiver is the in-scope `this` binding (super is a layer view of
+    /// `this`, not a value); the target comes from sema's `super_dispatches`
+    /// keyed by this call expression. On any lookup miss (which sema should
+    /// have prevented) an error is recorded and a no-op node is returned rather
+    /// than falling through — the normal paths would re-dispatch to the
+    /// override and recurse infinitely.
+    fn compile_super_method_call(
+        &mut self,
+        call_expr_id: crate::ast::Ast::ExprId,
+        method: &str,
+        args: &[crate::ast::Ast::ExprId],
+    ) -> NodeId {
+        let key = crate::sema::Sema::module_expr_key(
+            self.expr_key_module(),
+            call_expr_id.0 as u64,
+        );
+        let dispatch = self.sema.super_dispatches.get(&key).copied();
+        let type_id = self.current_method_type.as_ref().map(|(_, id)| *id);
+        let target_sg = dispatch
+            .zip(type_id)
+            .and_then(|((trait_idx, method_idx), tid)| {
+                self.trait_default_subgraphs
+                    .get(&(tid, trait_idx, method_idx))
+                    .copied()
+            });
+
+        let noop = |this: &mut Self| -> NodeId {
+            let inputs_offset = this.graph.inputs_pool.push(&[]);
+            this.graph.add_node(Node {
+                kind: NodeKind::Const,
+                input_count: 0,
+                inputs_offset,
+                compute_fn: CF_NOOP,
+            })
+        };
+
+        let target_sg = match target_sg {
+            Some(sg) => sg,
+            None => {
+                let type_name = self
+                    .current_method_type
+                    .as_ref()
+                    .map(|(n, _)| n.to_string())
+                    .unwrap_or_default();
+                self.errors.push(format!(
+                    "super call '{}' could not be resolved to a trait-default subgraph (type '{}')",
+                    method, type_name
+                ));
+                return noop(self);
+            }
+        };
+
+        // `this` of the enclosing method is the receiver argument.
+        let recv_node = match self.lookup_var("this") {
+            Some(n) => n,
+            None => {
+                self.errors.push(
+                    "super call: the receiver 'this' is not in scope here (super is only \
+                     supported in the direct body of a type method)"
+                        .into(),
+                );
+                return noop(self);
+            }
+        };
+
+        let mut inputs = Vec::with_capacity(2 + args.len());
+        inputs.push(recv_node);
+        for &arg in args {
+            inputs.push(self.compile_subexpr(arg));
+        }
+        if let Some(eff) = self.current_effect {
+            inputs.push(eff);
+        }
+        let inputs_offset = self.graph.inputs_pool.push(&inputs);
+        let call_node = self.graph.add_node(Node {
+            kind: NodeKind::Call,
+            input_count: inputs.len() as u8,
+            inputs_offset,
+            compute_fn: CF_CALL_LAUNCH,
+        });
+        self.graph.set_call_target(call_node, target_sg);
+        call_node
     }
 
     /// Look up MethodSigInfo.intrinsic via (type_id, method_idx) and return the lowering strategy.

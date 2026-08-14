@@ -1036,23 +1036,33 @@ impl<'a> IrBuilder<'a> {
         // 0a-trait. Pre-register trait default method monomorphization subgraphs:
         //   (type_id, trait_def_idx, method_idx) -> SubGraphId
         //   Consumes trait_default_instances collected in the Sema post-phase; registers a dedicated subgraph for each specialization instance.
-        //   Instance collection (including skipping explicit overrides) is already done by Monomorph::collect_trait_default_instances.
+        //   Instance collection (binding-driven: only the bound trait, plus overrides that
+        //   call super) is already done by Monomorph::collect_trait_default_instances.
         for inst in &self.sema.trait_default_instances {
-            // Look up the AST info for the trait default method (method_name, params_count, is_async)
-            let method_info = self.module.declarations.iter().find_map(|d| {
-                if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
-                    if *name == inst.trait_name.as_ref() {
-                        if let Some(method) = methods.get(inst.method_idx as usize) {
-                            return Some((
-                                method.name.to_string(),
-                                method.params.len() as u8,
-                                method.is_async,
-                            ));
+            // Look up the AST info for the trait default method (method_name, params_count,
+            // is_async). Search builtin modules AND the current module: a type may implement
+            // a trait declared in an embedded stdlib module.
+            let method_info = self
+                .builtin_modules
+                .iter()
+                .copied()
+                .chain(std::iter::once(self.module))
+                .find_map(|m| {
+                    m.declarations.iter().find_map(|d| {
+                        if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
+                            if *name == inst.trait_name.as_ref() {
+                                if let Some(method) = methods.get(inst.method_idx as usize) {
+                                    return Some((
+                                        method.name.to_string(),
+                                        method.params.len() as u8,
+                                        method.is_async,
+                                    ));
+                                }
+                            }
                         }
-                    }
-                }
-                None
-            });
+                        None
+                    })
+                });
             let (method_name, params_count, is_async) = match method_info {
                 Some(info) => info,
                 None => continue,

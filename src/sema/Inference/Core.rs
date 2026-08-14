@@ -85,6 +85,11 @@ pub struct InferContext<'a> {
     /// Used by lookup_method_type to resolve bare method calls (implicit this) inside trait default
     /// methods, where current_this_type() is a rigid TypeVar that has no method table of its own.
     pub current_trait_name: Option<Box<str>>,
+    /// Trait names implemented by the type declaration whose methods are currently
+    /// being inferred (None outside a type block). Drives `super.method(...)`
+    /// resolution: super statically targets the bound trait-default layer of the
+    /// enclosing type (explicit delegate or unique provider).
+    pub current_type_decl_traits: Option<Vec<Box<str>>>,
 }
 
 /// Checks whether a type references any unresolved TypeVar (in unresolved_set).
@@ -112,6 +117,7 @@ impl<'a> InferContext<'a> {
             instantiation_ctx: None,
             local_mutability: FxHashMap::default(),
             current_trait_name: None,
+            current_type_decl_traits: None,
         }
     }
 
@@ -146,6 +152,7 @@ impl<'a> InferContext<'a> {
             instantiation_ctx: None,
             local_mutability: FxHashMap::default(),
             current_trait_name: None,
+            current_type_decl_traits: None,
         }
     }
 
@@ -604,8 +611,11 @@ impl<'a> InferContext<'a> {
         // witness_table accumulates across modules; sync the latest state after each check.
         self.sema_result.witness_table = witness_table.clone();
 
-        // 10a. Collect trait default-method monomorphization instances (depends on the mirrored
-        // witness_table).
+        // 10a. Validate the override/delegate bindings of this module's type
+        // declarations (override keyword semantics, ambiguous inherited
+        // defaults, delegate targets), then collect trait default-method
+        // monomorphization instances (depends on the mirrored witness_table).
+        crate::sema::Monomorph::validate_trait_method_bindings(module, self.sema_result);
         crate::sema::Monomorph::collect_trait_default_instances(module, self.sema_result);
 
         // 11. Report global residual TypeVar diagnostics.

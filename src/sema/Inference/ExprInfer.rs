@@ -617,6 +617,17 @@ impl<'a> InferContext<'a> {
     ) -> TypeHandle {
         match &ast.expr(expr).node {
             Expr::Ident(name) => {
+                // `super` is a dispatch qualifier, not a value: only legal as the
+                // receiver of a method call (handled in infer_method_call_expr).
+                if *name == "super" {
+                    let span = ast.expr(expr).span;
+                    self.add_error_at(
+                        "super is not a value; use it as a method-call receiver (super.method(...))",
+                        span.line,
+                        span.column,
+                    );
+                    return self.arena.fresh_type_var();
+                }
                 // sema v2: prefer the flow-narrowing result (path-sensitive type refinement).
                 if let Some(narrowed_ty) = self.flow_ctx.lookup_narrowed(name) {
                     return narrowed_ty;
