@@ -1,4 +1,4 @@
-//! Value.rs — Kuzo unified value system (merges 14 submodules)
+//! Value.rs — Frond unified value system (merges 14 submodules)
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
@@ -1088,9 +1088,9 @@ pub union ScalarValue {
     pub f128_val: [u64; 2],
 }
 
-// ---- Value — Kuzo runtime unified value representation (spec §3.3) ----
+// ---- Value — Frond runtime unified value representation (spec §3.3) ----
 
-/// Kuzo runtime unified value representation (spec §3.3).
+/// Frond runtime unified value representation (spec §3.3).
 /// `Value` is self-contained: scalars are inline; heap objects are shared across workers via `Arc`.
 #[derive(Clone)]
 pub enum Value {
@@ -1360,7 +1360,7 @@ impl Hash for Value {
 
 // ---- ValueHandle — 4B index handle ----
 
-/// Unique handle for a Kuzo value: a 4B index encoding the type bucket + index within the bucket.
+/// Unique handle for a Frond value: a 4B index encoding the type bucket + index within the bucket.
 /// High 8 bits = ValueTag, low 24 bits = index within the bucket.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueHandle(u32);
@@ -1569,7 +1569,7 @@ impl From<char> for Char {
 
 // ---- str.rs → Str ----
 
-/// Kuzo string: a reference-counted immutable UTF-8 string
+/// Frond string: a reference-counted immutable UTF-8 string
 #[derive(Debug, Clone)]
 pub struct Str {
     inner: Arc<str>,
@@ -2013,8 +2013,8 @@ pub struct ThrowValue {
     pub payload: ThrowPayload,
 }
 
-// ---- iterator.rs → fully migrated to Kuzo builtin (Iterator.kz) ----
-// Note: ArrayIterator / StringIterator / RangeIterator have all been migrated to the Kuzo builtin.
+// ---- iterator.rs → fully migrated to Frond builtin (Iterator.kz) ----
+// Note: ArrayIterator / StringIterator / RangeIterator have all been migrated to the Frond builtin.
 
 // ---- concurrent.rs → AtomicValue, AsyncStatus, AsyncHandle, ChannelValue, SenderValue, ReceiverValue ----
 
@@ -2215,16 +2215,16 @@ pub struct ReceiverValue {
 /// Ownership kind of an FFI opaque pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PtrKind {
-    /// C-side owned; Kuzo does not free it (e.g. a `FILE*` returned by `fopen` that the user
+    /// C-side owned; Frond does not free it (e.g. a `FILE*` returned by `fopen` that the user
     /// must `fclose` manually). v1: all pointers returned from FFI are Borrowed.
     Borrowed,
-    /// C-allocated, Kuzo holds it; Drop invokes the destructor (e.g. a handle with a cleanup fn).
+    /// C-allocated, Frond holds it; Drop invokes the destructor (e.g. a handle with a cleanup fn).
     /// v1 unused — reserved for future RAII FFI support.
     Owned,
 }
 
 /// Wrapper for a raw C pointer returned from or passed to FFI (`@extern("C") #{ }#` calls).
-/// Stored as a `HeapObj::OpaquePtr` so it can flow through Kuzo's `Value::Ref(Arc<HeapObj>)`.
+/// Stored as a `HeapObj::OpaquePtr` so it can flow through Frond's `Value::Ref(Arc<HeapObj>)`.
 #[derive(Debug)]
 pub struct OpaquePointer {
     pub ptr: *mut core::ffi::c_void,

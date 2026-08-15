@@ -1,5 +1,5 @@
-//! kuzo CLI entry point — delegates to kuzo::cli.
+//! frond CLI entry point — delegates to frond::cli.
 
 fn main() {
-    kuzo::cli::run();
+    frond::cli::run();
 }

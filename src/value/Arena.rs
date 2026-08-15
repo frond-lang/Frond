@@ -235,7 +235,7 @@ impl_scalar_bucket_methods! {
 
 impl ValueArena {
     // ─── Global arena access (for extern "C" reflection primitives) ──────────────
-    // Kuzo is a single-threaded compiler; thread_local is sufficient.
+    // Frond is a single-threaded compiler; thread_local is sufficient.
     thread_local! {
         static GLOBAL_ARENA: RefCell<ValueArena> = RefCell::new(ValueArena::new());
     }
@@ -699,7 +699,7 @@ fn arena_debug(arena: &ValueArena, h: ValueHandle, f: &mut fmt::Formatter) -> fm
 // ValueTrait — unified external interface (methods carry &ValueArena)
 // =========================================================================
 
-/// Kuzo unified value trait: the external interface for all value types.
+/// Frond unified value trait: the external interface for all value types.
 pub trait ValueTrait: Sized + Clone + Copy + PartialEq + Eq + Hash {
     // ---- Predicates (tag only, no arena needed) ----
     fn is_null(&self) -> bool;

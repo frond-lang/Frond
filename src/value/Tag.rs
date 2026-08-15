@@ -138,7 +138,7 @@ impl ValueTag {
 // TypeFamily — family classification for all types (replaces string-based family).
 // =========================================================================
 
-/// Family classification for all Kuzo types.
+/// Family classification for all Frond types.
 ///
 /// Replaces the previous fragmented checks:
 /// - `Ir.rs`'s `family: &'static str` (scalars only: "i32"/"i64"/"i128"/"float"/"bool")

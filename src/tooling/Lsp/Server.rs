@@ -214,7 +214,7 @@ impl LspServer {
                 "documentFormattingProvider": true,
             },
             "serverInfo": {
-                "name": "kuzo-lsp",
+                "name": "frond-lsp",
                 "version": "0.1.0"
             }
         });
@@ -415,7 +415,7 @@ impl LspServer {
                     crate::tooling::Common::Diagnostic::Severity::Advice => 3,
                 },
                 "code": d.code,
-                "source": "kuzo",
+                "source": "frond",
                 "message": d.message,
             })
         }).collect();
@@ -712,7 +712,7 @@ fn extract_word_at(text: &str, line: u32, character: u32) -> Option<String> {
     Some(line_str[start..end].to_string())
 }
 
-/// Map a Kuzo SymbolKind to an LSP SymbolKind integer.
+/// Map a Frond SymbolKind to an LSP SymbolKind integer.
 fn symbol_kind_to_lsp(kind: SymbolKind) -> i64 {
     match kind {
         SymbolKind::Function => 12,
