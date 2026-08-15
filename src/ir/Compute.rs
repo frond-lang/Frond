@@ -903,9 +903,15 @@ pub fn compute_dyn_ffi_call(frame: &mut Frame, node: NodeId, ctx: &EvalContext) 
     }
 
     // Marshal Value → AbiSlot
-    let marshaled = match crate::ffi::Marshal::encode_args(&info.sig, &args) {
+    let mut marshaled = match crate::ffi::Marshal::encode_args(&info.sig, &args) {
         Ok(m) => m,
-        Err(e) => return make_error_throw("FfiError", &e),
+        Err(e) => {
+            if env_flag("KUZO_DEBUG_FFI") {
+                eprintln!("[FFI-ENCODE-ERR] symbol={} frame.sg={} err={} args={:?}",
+                    info.symbol, frame.subgraph_id.0, e, args);
+            }
+            return make_error_throw("FfiError", &e);
+        }
     };
 
     // Resolve the symbol address by name (dlsym self-lookup + cache).
@@ -917,9 +923,18 @@ pub fn compute_dyn_ffi_call(frame: &mut Frame, node: NodeId, ctx: &EvalContext) 
         ),
     };
 
+    if env_flag("KUZO_DEBUG_FFI") {
+        eprintln!("[FFI] symbol={} frame.sg={} frame.offset={} arg_count={} slots={}",
+            info.symbol, frame.subgraph_id.0, frame.node_offset, info.arg_count,
+            marshaled.slots.len());
+    }
     // ABI dynamic call (marshaled must outlive this call for str NULL buffers)
     let result = match crate::ffi::Abi::CallDynamic::call_dynamic(&info.sig, fn_ptr, &marshaled.slots) {
-        Ok(ret) => crate::ffi::Marshal::decode_ret(&info.sig.ret, ret),
+        Ok(ret) => {
+            // u8[] out-params: copy C-side mutations back into the array heap objects.
+            crate::ffi::Marshal::apply_writebacks(&mut marshaled);
+            crate::ffi::Marshal::decode_ret(&info.sig.ret, ret)
+        }
         Err(e) => make_error_throw("FfiError", e),
     };
     // Explicitly hold marshaled until after the call completes.
@@ -2346,12 +2361,15 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
         });
     }
 
-    // Neither present: the compiler guarantees a Call node has at least one; no panic here, kept fault-tolerant.
-    if env_flag("KUZO_DEBUG_CALL") {
-        eprintln!("[CALL-FALLTHROUGH] node={:?} frame.sg={} frame.offset={} — NO call_target and NO vtable_method! Returning VOID.",
-            node, frame.subgraph_id.0, frame.node_offset);
-    }
-    NodeResult::Value(Value::VOID)
+    // Neither present: the compiler guarantees a Call node has a binding (static
+    // target or vtable dispatch). A missing binding is a broken invariant — fail
+    // loudly instead of silently producing VOID (which masked target-less Call
+    // nodes compiled from unknown callees, e.g. scalar-constructor typos like
+    // `u64(x)`, for months).
+    panic!(
+        "call node {:?} (sg {}) has no call_target and no vtable dispatch — broken compiler invariant",
+        node, frame.subgraph_id.0
+    );
 }
 
 /// compute_fn: Gate node selects a branch + returns `NodeResult::Call`.

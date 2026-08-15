@@ -35,6 +35,7 @@ pub(super) fn env_flag(name: &str) -> bool {
         "KUZO_DEBUG_MEMO",
         "KUZO_VERIFY",
         "KUZO_VERIFY_STRICT",
+        "KUZO_EXEC_COVERAGE",
     ];
     let flags = FLAGS.get_or_init(|| {
         let mut m = hashbrown::HashMap::with_capacity(KNOWN_FLAGS.len());
@@ -47,6 +48,62 @@ pub(super) fn env_flag(name: &str) -> bool {
         Some(&v) => v,
         None => std::env::var(name).is_ok(),
     }
+}
+
+// =========================================================================
+// Execution coverage (KUZO_EXEC_COVERAGE=1)
+// =========================================================================
+
+/// Process-global per-sg frame-start counters — the class-level detector for
+/// "std paths that exist in the final graph but are NEVER executed by any
+/// test". Every incident in this family (u64(x) silent void, `[0u8]*len` empty
+/// array, open-flags abort, File.remove deleting nothing) lived for months in
+/// exactly such paths. Instrumented at `start_subgraph_frame` (both the queue
+/// and the inline sync path) and at `switch_subgraph` (tail-call frame reuse);
+/// reported by `exec_cov_dump` keyed by the graph's debug name sidecar.
+static EXEC_COV: OnceLock<Vec<std::sync::atomic::AtomicU32>> = OnceLock::new();
+
+/// Bumps the execution counter for `sg`; initializes the counter table on
+/// first use (sized to the graph). No-op unless KUZO_EXEC_COVERAGE is set.
+pub(super) fn exec_cov_bump(sg: crate::ir::Ir::SubGraphId, total_sgs: usize) {
+    if !env_flag("KUZO_EXEC_COVERAGE") {
+        return;
+    }
+    let cov = EXEC_COV.get_or_init(|| {
+        (0..total_sgs).map(|_| std::sync::atomic::AtomicU32::new(0)).collect()
+    });
+    if let Some(slot) = cov.get(sg.0 as usize) {
+        slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// End-of-run report, keyed by the qualified debug names (`sg_debug_names`):
+///   EXECCOV-INV <name>  — std.* function present in the final graph
+///   EXECCOV-RUN <name>  — …and actually frame-started at least once
+/// Aggregated across the whole test suite by tests/scripts/run_execcov.sh
+/// (names are stable across processes; sg ids are not).
+pub fn exec_cov_dump(graph: &crate::ir::Ir::DataFlowGraph) {
+    if !env_flag("KUZO_EXEC_COVERAGE") {
+        return;
+    }
+    let Some(cov) = EXEC_COV.get() else { return };
+    let mut inv = 0usize;
+    let mut ran = 0usize;
+    for (idx, name) in graph.sg_debug_names.iter().enumerate() {
+        let Some(name) = name else { continue };
+        if !name.starts_with("std.") {
+            continue;
+        }
+        inv += 1;
+        eprintln!("EXECCOV-INV {name}");
+        if graph.subgraphs.get(idx).is_some()
+            && cov.get(idx).map_or(false, |c| c.load(std::sync::atomic::Ordering::Relaxed) > 0)
+        {
+            ran += 1;
+            eprintln!("EXECCOV-RUN {name}");
+        }
+    }
+    eprintln!("EXECCOV-SUMMARY std_inv={inv} std_ran={ran}");
 }
 
 // =========================================================================
@@ -360,9 +417,15 @@ impl EngineRef {
 
     /// Runs the engine and returns the result value.
     pub fn run(self) -> Value {
-        match self {
+        let graph = match &self {
+            Self::Single(e) => e.graph.clone(),
+            Self::Multi(e) => e.graph.clone(),
+        };
+        let result = match self {
             Self::Single(e) => e.run_single(),
             Self::Multi(e) => Engine::<Multi>::run_multi(e),
-        }
+        };
+        exec_cov_dump(&graph);
+        result
     }
 }

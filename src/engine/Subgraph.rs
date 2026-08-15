@@ -1,6 +1,7 @@
 //! Subgraph invocation and return: switch_subgraph + start_subgraph + complete_and_wake_caller.
 
 use super::*;
+use super::EngineCore::exec_cov_bump;
 use crate::ir::Ir::*;
 use crate::ir::Ir::Frame;
 use crate::value::Value;
@@ -8,6 +9,7 @@ use crate::value::Value;
 /// Tail-call graph jump: reuses the current frame to execute the target subgraph (zero pool
 /// allocation).
 pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubGraphId, args: &[Value]) {
+    exec_cov_bump(target_sg, graph.subgraphs.len());
     let (node_start, node_end) = graph.subgraphs[target_sg.0 as usize].node_range;
     let node_count = (node_end.0 - node_start.0) as usize;
 
@@ -78,6 +80,18 @@ pub(super) fn finish_call_in_caller(
         eprintln!("[COMPLETE-INLINE] child_sg={} call_node_local={} call_graph_id={} caller_offset={} return_value={:?} child_loop_kind={:?} caller_sg={}",
             child_sg_id.0, call_node.0, call_graph_id.0, caller_offset.0,
             return_value, child_sg.loop_kind, caller_frame.subgraph_id.0);
+        if super::env_flag("KUZO_DEBUG_STALL") {
+            let (bs, be) = child_sg.node_range;
+            let mut unready: Vec<u32> = Vec::new();
+            for i in 0..child.value_table.len() {
+                let gid = (child.node_offset as usize + i) as u32;
+                if gid >= bs.0 && gid < be.0 && !child.value_table.is_ready(i) {
+                    unready.push(gid);
+                }
+            }
+            eprintln!("[COMPLETE-INLINE-UNREADY] child_sg={} unready={:?}",
+                child_sg_id.0, &unready[..unready.len().min(12)]);
+        }
     }
 
     caller_frame.set_value(call_node, return_value, consumer_count);
@@ -94,6 +108,10 @@ pub(super) fn finish_call_in_caller(
     let child_loop_kind = graph.subgraphs[child_sg_id.0 as usize].loop_kind;
     let should_propagate = !capture_gate
         && crate::ir::Ir::should_propagate_control_signal(&child_signal, is_gate, child_loop_kind);
+    if super::env_flag("KUZO_DEBUG_SIGNAL") {
+        eprintln!("[SIG-PROP-I] child_sg={} caller_sg={} signal={:?} propagate={} capture={}",
+            child_sg_id.0, caller_frame.subgraph_id.0, child_signal, should_propagate, capture_gate);
+    }
     if should_propagate {
         let child_fn_id = graph.subgraphs[child_sg_id.0 as usize].function_id;
         let caller_fn_id = graph.subgraphs[caller_frame.subgraph_id.0 as usize].function_id;
@@ -154,6 +172,7 @@ impl<S: LockStrategy> Engine<S> {
         parent_frame: &Frame,
         closure_val: Option<Value>,
     ) -> (FrameId, Box<Frame>) {
+        exec_cov_bump(subgraph_id, self.graph.subgraphs.len());
         let child_fid = self.alloc_frame_id();
         let parent_sg = &self.graph.subgraphs[parent_frame.subgraph_id.0 as usize];
         let child_sg = &self.graph.subgraphs[subgraph_id.0 as usize];
@@ -650,6 +669,10 @@ impl<S: LockStrategy> Engine<S> {
                         is_gate,
                         child_loop_kind,
                     );
+                if super::env_flag("KUZO_DEBUG_SIGNAL") {
+                    eprintln!("[SIG-PROP-Q] child_sg={} caller_sg={} signal_ok={} capture={} is_gate={}",
+                        child_sg_id.0, caller_frame.subgraph_id.0, should_propagate, capture_gate, is_gate);
+                }
                 if should_propagate {
                     let child_fn_id = self.graph.subgraphs[child_sg_id.0 as usize].function_id;
                     let caller_fn_id =

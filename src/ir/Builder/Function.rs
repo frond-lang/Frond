@@ -348,7 +348,19 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
                 return self.register_subgraph_placeholder(name, 0, false);
             }
         };
+        self.compile_function_in(location, name)
+    }
 
+    /// Compiles the function `name` declared IN the given module
+    /// (`None` = the user entry module, `Some(i)` = builtin_modules[i]).
+    ///
+    /// The compile scheduler MUST go through here with the declaring module:
+    /// re-resolving a bare name across all modules (`find_function_location`)
+    /// picks the FIRST same-named function, so when two modules declare the
+    /// same name (File.chmod / Fs.chmod) one body gets compiled twice and the
+    /// other is NEVER compiled — every qualified key pointing at its
+    /// placeholder is then a call into an empty subgraph.
+    pub fn compile_function_in(&mut self, location: Option<usize>, name: &str) -> SubGraphId {
         let module = match location {
             None => self.module,
             Some(i) => self.builtin_modules[i],
@@ -385,12 +397,21 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         };
         let param_count = params.len();
 
-        // Reuse the pre-registered sg_id (created by the build() pre-registration pass) to avoid duplicate subgraphs
-        let sg_id = if let Some(&existing) = self.func_subgraphs.get(name) {
+        // Reuse the pre-registered sg_id (created by the build() pre-registration
+        // pass) to avoid duplicate subgraphs. The lookup key is the function's
+        // OWN module-mangled name — the same key family pre-registration
+        // created. A bare-name lookup would miss std functions (they have no
+        // bare slot) and mint a duplicate sg, leaving every qualified key
+        // pointing at the never-compiled placeholder: an empty-sg call target
+        // and, worse, a silently re-introduced bare key.
+        let own_mangled = crate::sema::Sema::module_logical_path(module.name)
+            .map(|mp| format!("{}.{}", mp, name));
+        let lookup_key = own_mangled.as_deref().unwrap_or(name);
+        let sg_id = if let Some(&existing) = self.func_subgraphs.get(lookup_key) {
             existing
         } else {
             let new_id = self.register_subgraph_placeholder(name, param_count as u8, is_async);
-            self.func_subgraphs.insert(name.to_string(), new_id);
+            self.func_subgraphs.insert(lookup_key.to_string(), new_id);
             new_id
         };
         let node_start = self.graph.nodes.len() as u32;
@@ -495,8 +516,13 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         // Consumes sema's FuncSigInfo.is_async (builtin modules fall back to AST is_async)
         sg.has_suspend = fn_is_async;
         sg.function_id = sg_id.0;
-
-        self.func_subgraphs.insert(name.to_string(), sg_id);
+        // NOTE: no bare-name registration here. Historically this line
+        // re-inserted `name` (bare) for EVERY compiled function — including
+        // std modules, whose bare slots the registration policy deliberately
+        // omits — with last-compiled-wins semantics. That silently reintroduced
+        // the exact wrong-callee class the resolver guards against. Every key
+        // this function needs was registered at placeholder creation
+        // (lookup_key above) or during pre-registration.
         sg_id
     }
 

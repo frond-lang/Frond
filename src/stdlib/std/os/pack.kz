@@ -1,0 +1,10 @@
+// std/os package declaration
+//
+// Exposes the OS submodules to user code: import std.os.Env etc. to access
+// public symbols. Process-environment domain only — file-system management
+// lives in std.io (File/Dir/Path/Fs).
+pub pack Env
+pub pack Tty
+pub pack Proc
+pub pack Info
+pub pack Os

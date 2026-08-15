@@ -9,15 +9,22 @@
 @c_include("sys/ioctl.h")
 @c_include("string.h")
 @c_include("windows.h")
+@internal
 @extern("C")
 fun __terminal_enable_raw_mode(orig_buf: u8[]): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
+        #ifndef ENABLE_VIRTUAL_TERMINAL_INPUT
+        #define ENABLE_VIRTUAL_TERMINAL_INPUT 0x0200
+        #endif
         HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
         DWORD mode;
         if (!GetConsoleMode(h, &mode)) return -1;
         memcpy(orig_buf_data, &mode, sizeof(DWORD));
         DWORD new_mode = mode & ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT
                                   | ENABLE_PROCESSED_INPUT);
+        // Deliver arrow/Home/End/Page/F-keys as VT escape sequences (ESC[A etc.)
+        // instead of char-less key events that ReadFile never returns.
+        new_mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
         if (!SetConsoleMode(h, new_mode)) return -1;
         return 0;
     #else
@@ -40,6 +47,7 @@ fun __terminal_enable_raw_mode(orig_buf: u8[]): i32 #{
 @c_include("termios.h")
 @c_include("unistd.h")
 @c_include("string.h")
+@internal
 @extern("C")
 fun __terminal_disable_raw_mode(orig_buf: u8[]): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -57,6 +65,7 @@ fun __terminal_disable_raw_mode(orig_buf: u8[]): i32 #{
 }#
 
 @c_include("unistd.h")
+@internal
 @extern("C")
 fun __terminal_read_key_bytes(buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -73,6 +82,7 @@ fun __terminal_read_key_bytes(buf: u8[]): i64 #{
 
 @c_include("sys/ioctl.h")
 @c_include("string.h")
+@internal
 @extern("C")
 fun __terminal_get_size_into(buf: u8[]): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -98,6 +108,7 @@ fun __terminal_get_size_into(buf: u8[]): i32 #{
 @c_include("unistd.h")
 @c_include("termios.h")
 @c_include("sys/ioctl.h")
+@internal
 @extern("C")
 fun __terminal_write_raw_bytes(buf: u8[], len: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)

@@ -6,6 +6,7 @@
 
 @c_include("time.h")
 @c_include("windows.h")
+@internal
 @extern("C")
 fun __instant_now_ns(): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -22,6 +23,7 @@ fun __instant_now_ns(): i64 #{
 }#
 
 @c_include("time.h")
+@internal
 @extern("C")
 fun __systemtime_now_ns(): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -39,6 +41,7 @@ fun __systemtime_now_ns(): i64 #{
 }#
 
 @c_include("time.h")
+@internal
 @extern("C")
 fun __sleep_ns(ns: i64): void #{
     if (ns <= 0) return;
@@ -54,6 +57,7 @@ fun __sleep_ns(ns: i64): void #{
 }#
 
 @c_include("time.h")
+@internal
 @extern("C")
 fun __localtime_offset_minutes(): i32 #{
     #if defined(_WIN32) || defined(_WIN64)

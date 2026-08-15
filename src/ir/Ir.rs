@@ -559,6 +559,7 @@ pub struct BatchInfo {
 ///
 /// Node N's inputs = `data[N.inputs_offset .. N.inputs_offset + N.input_count]`.
 /// Contiguous storage ensures cache friendliness and enables batch SIMD scanning of readiness.
+#[derive(Clone)]
 pub struct InputsPool {
     pub data: Vec<NodeId>,
 }
@@ -1631,6 +1632,18 @@ pub struct ResetPlan {
     pub condition_tree_plan: Vec<(NodeId, u16)>,
 }
 
+/// Which side of the NodeRef door a reference came from: per-node metadata
+/// (`owner` = node index) or a subgraph anchor (`owner` = subgraph index).
+/// Diagnostic label for the door's consumers (see `for_each_node_ref` /
+/// `map_node_refs` in the `rebuild` impl block).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRefSite {
+    /// await source / writeback target / gate cond+params / select sources.
+    NodeMeta,
+    /// sg anchors / defer registration / event decls / upvalues / reset plan.
+    SgAnchor,
+}
+
 /// Loop subgraph kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::TryFromPrimitive)]
 #[repr(u8)]
@@ -2600,6 +2613,13 @@ pub struct DataFlowGraph {
     pub memo_infos: Vec<Option<MemoInfo>>,
     /// Memoization cache table runtime storage (one HashMap<u64, Value> per memoized function).
     pub memo_tables: Arc<Vec<std::sync::Mutex<rustc_hash::FxHashMap<u64, Value>>>>,
+    /// Debug-only sg → qualified function name (e.g. "std.io.File.remove"),
+    /// parallel to `subgraphs`. Filled by the builder from its registration
+    /// table, remapped by `rebuild`'s sg compaction, NEVER serialized (the
+    /// .kzo artifact carries no name table — loads leave this empty).
+    /// Consumed by the execution-coverage instrumentation
+    /// (`KUZO_EXEC_COVERAGE=1`): the "never-executed std path" detector.
+    pub sg_debug_names: Vec<Option<Box<str>>>,
     /// Vtable fallback dispatch: (vtable_method_idx, type_name) → SubGraphId.
     /// When a vtable call receives a concrete record (not a TraitVal), the runtime looks up
     /// the method subgraph by the value's type_name here, enabling static dispatch on the
@@ -2617,11 +2637,6 @@ pub struct DataFlowGraph {
     /// Build path is empty (accessor falls back to SubGraph.upvalue_outer_nodes Vec).
     /// Load path (zerocopy) is filled; SubGraph.upvalue_outer_nodes Vec is set to empty.
     pub sg_uv_offsets: Vec<(u32, u32)>,
-    /// CSR offset table for SubGraph nested_ranges (load path).
-    /// Each element = (byte_offset_into_SgNestedRanges, count).
-    /// Build path is empty (accessor falls back to SubGraph.nested_ranges Vec).
-    /// Load path (zerocopy) is filled; SubGraph.nested_ranges Vec is set to empty.
-    pub sg_nr_offsets: Vec<(u32, u32)>,
     /// Per-Node byte offset tables for the 5 complex variable-length tables (load path).
     /// u32::MAX = None (no data for this node in that table); other values = byte offset within the section.
     /// Build path is empty (accessor falls back to owned Vec fields).
@@ -2642,6 +2657,82 @@ pub struct DataFlowGraph {
     /// Build path: empty (owned `downstreams` Vec is authoritative).
     pub downstream_csr_offsets: Vec<u32>,
     pub downstream_csr_flat: Vec<NodeId>,
+}
+
+impl Clone for DataFlowGraph {
+    /// Deep clone with runtime-shared storage (global vars / memo tables stay
+    /// shared via their Arcs). Used by the optimizer's per-round snapshot for
+    /// the never-corrupt fallback policy: any optimization-round failure
+    /// restores the snapshot instead of propagating a panic.
+    ///
+    /// Only build-path graphs (`mem = None`) are cloned; mmap-backed loaded
+    /// graphs are never snapshotted (optimization never runs on them).
+    fn clone(&self) -> Self {
+        debug_assert!(
+            self.mem.is_none(),
+            "cloning a mmap-backed (loaded) graph is not supported"
+        );
+        Self {
+            nodes: self.nodes.clone(),
+            inputs_pool: self.inputs_pool.clone(),
+            subgraphs: self.subgraphs.clone(),
+            entry_subgraph: self.entry_subgraph,
+            compute_fns: self.compute_fns.clone(),
+            downstreams: self.downstreams.clone(),
+            const_values: self.const_values.clone(),
+            const_cache: self.const_cache.clone(),
+            sg_initial_pending: self.sg_initial_pending.clone(),
+            sg_initial_seed: self.sg_initial_seed.clone(),
+            downstream_counts: self.downstream_counts.clone(),
+            linear_plans: self.linear_plans.clone(),
+            call_targets: self.call_targets.clone(),
+            gate_branches: self.gate_branches.clone(),
+            field_access_infos: self.field_access_infos.clone(),
+            record_lit_infos: self.record_lit_infos.clone(),
+            ffi_call_names: self.ffi_call_names.clone(),
+            dyn_ffi_infos: self.dyn_ffi_infos.clone(),
+            field_set_names: self.field_set_names.clone(),
+            vtable_call_methods: self.vtable_call_methods.clone(),
+            await_event_sources: self.await_event_sources.clone(),
+            closure_infos: self.closure_infos.clone(),
+            partial_infos: self.partial_infos.clone(),
+            closure_call_arg_counts: self.closure_call_arg_counts.clone(),
+            select_infos: self.select_infos.clone(),
+            writeback_targets: self.writeback_targets.clone(),
+            tail_call_flags: self.tail_call_flags.clone(),
+            safe_op_flags: self.safe_op_flags.clone(),
+            hoisted_node: self.hoisted_node.clone(),
+            hoisted_owners: self.hoisted_owners.clone(),
+            batch_infos: self.batch_infos.clone(),
+            ir_errors: self.ir_errors.clone(),
+            trait_construct_infos: self.trait_construct_infos.clone(),
+            lazy_construct_infos: self.lazy_construct_infos.clone(),
+            record_extend_infos: self.record_extend_infos.clone(),
+            slice_inclusive: self.slice_inclusive.clone(),
+            global_var_storage: self.global_var_storage.clone(),
+            global_load_slots: self.global_load_slots.clone(),
+            global_store_slots: self.global_store_slots.clone(),
+            pattern_ctor_names: self.pattern_ctor_names.clone(),
+            pattern_type_names: self.pattern_type_names.clone(),
+            pattern_field_indices: self.pattern_field_indices.clone(),
+            cast_target_types: self.cast_target_types.clone(),
+            memo_infos: self.memo_infos.clone(),
+            memo_tables: self.memo_tables.clone(),
+            vtable_fallback_dispatch: self.vtable_fallback_dispatch.clone(),
+            sg_debug_names: self.sg_debug_names.clone(),
+            string_pool: self.string_pool.clone(),
+            mem: None,
+            sg_uv_offsets: self.sg_uv_offsets.clone(),
+            gate_branch_offsets: self.gate_branch_offsets.clone(),
+            record_lit_info_offsets: self.record_lit_info_offsets.clone(),
+            select_info_offsets: self.select_info_offsets.clone(),
+            trait_construct_info_offsets: self.trait_construct_info_offsets.clone(),
+            record_extend_info_offsets: self.record_extend_info_offsets.clone(),
+            node_input_offsets: self.node_input_offsets.clone(),
+            downstream_csr_offsets: self.downstream_csr_offsets.clone(),
+            downstream_csr_flat: self.downstream_csr_flat.clone(),
+        }
+    }
 }
 
 impl DataFlowGraph {
@@ -2701,10 +2792,10 @@ impl DataFlowGraph {
             memo_infos: Vec::new(),
             memo_tables: Arc::new(Vec::new()),
             vtable_fallback_dispatch: rustc_hash::FxHashMap::default(),
+            sg_debug_names: Vec::new(),
             string_pool: Arc::from(Vec::new()),
             mem: None,
             sg_uv_offsets: Vec::new(),
-            sg_nr_offsets: Vec::new(),
             gate_branch_offsets: Vec::new(),
             record_lit_info_offsets: Vec::new(),
             select_info_offsets: Vec::new(),
@@ -3037,6 +3128,186 @@ impl DataFlowGraph {
         self.downstream_csr_flat = flat;
     }
 
+    // ------------------------------------------------------------------
+    // NodeRef door — the single enumeration of out-of-band NodeId refs
+    // ------------------------------------------------------------------
+    // Every NodeId the graph stores OUTSIDE `inputs_pool` is enumerated
+    // through this door ONLY. Three consumers must see the identical list:
+    // liveness seeding (Optimizer `compute_liveness`), preserve propagation
+    // (`collect_refs`) and remapping (`rebuild` via `map_node_refs`). Before
+    // the door existed each consumer hand-rolled its own list and they had
+    // already diverged (`upvalue_outer_nodes` / `reset_plan` were remapped by
+    // rebuild but never seeded as live → `remap_n` panics). Known non-door
+    // consumer: `pass_dse`'s read/write ref sets intentionally enumerate a
+    // subset (store analysis, not liveness).
+    //
+    // Adding a new metadata field that stores NodeIds: add it to
+    // `each_node_ref` + `each_sg_anchor_ref` below (and only there).
+
+    /// Per-node metadata NodeId refs of `idx`: await source, writeback target,
+    /// gate condition + branch params, select event sources. Inputs are NOT
+    /// included — they are structural edges every traversal already walks.
+    /// Load-path safe (the complex tables are materialized at load).
+    pub fn node_meta_refs(&self, idx: usize, out: &mut Vec<NodeId>) {
+        self.each_node_ref(idx, |id| out.push(id));
+    }
+
+    #[inline]
+    fn each_node_ref(&self, idx: usize, mut f: impl FnMut(NodeId)) {
+        if let Some(src) = self.await_event_sources.get(idx).and_then(|o| *o) {
+            f(src);
+        }
+        if let Some(t) = self.writeback_targets.get(idx).and_then(|o| *o) {
+            f(t);
+        }
+        if let Some(gb) = self.gate_branches.get(idx).and_then(|o| o.as_ref()) {
+            f(gb.condition_input);
+            for (_, _, params) in &gb.branches {
+                for &p in params {
+                    f(p);
+                }
+            }
+        }
+        if let Some(si) = self.select_infos.get(idx).and_then(|o| o.as_ref()) {
+            for sb in &si.branches {
+                f(sb.event_source_node);
+            }
+        }
+    }
+
+    /// Anchor NodeId refs of subgraph `si`: everything that must stay live for
+    /// the sg to remain structurally valid (anchors, defer registration,
+    /// event declarations, upvalues, loop reset plan). Load-path safe via
+    /// `sg_upvalue_outer_nodes`.
+    pub fn sg_anchor_refs(&self, si: usize, out: &mut Vec<NodeId>) {
+        self.each_sg_anchor_ref(si, |id| out.push(id));
+    }
+
+    #[inline]
+    fn each_sg_anchor_ref(&self, si: usize, mut f: impl FnMut(NodeId)) {
+        let sg = &self.subgraphs[si];
+        f(sg.entry_node);
+        f(sg.return_node);
+        if let Some(c) = sg.cond_node {
+            f(c);
+        }
+        if let Some(n) = sg.iter_next_node {
+            f(n);
+        }
+        for decl in &sg.event_source_decls {
+            f(decl.node);
+        }
+        for e in &sg.defer_table {
+            f(e.trigger_node);
+            for &c in &e.captured_inputs {
+                f(c);
+            }
+        }
+        for &u in self.sg_upvalue_outer_nodes(si) {
+            f(u);
+        }
+        if let Some(plan) = &sg.reset_plan {
+            for &n in &plan.reset_to_zero {
+                f(n);
+            }
+            for &n in &plan.reset_to_one {
+                f(n);
+            }
+            for &n in &plan.reset_condition_tree {
+                f(n);
+            }
+            // plan.condition_tree_plan is deliberately NOT enumerated: rebuild
+            // clears it (W5) and the pipeline recomputes it post-compaction.
+        }
+    }
+
+    /// Read door over EVERY metadata NodeId in the graph (per-node tables +
+    /// per-sg anchors). Used by liveness seeding and the Verifier.
+    pub fn for_each_node_ref(&self, mut f: impl FnMut(NodeRefSite, u32, NodeId)) {
+        for idx in 0..self.nodes.len() {
+            self.each_node_ref(idx, |id| f(NodeRefSite::NodeMeta, idx as u32, id));
+        }
+        for si in 0..self.subgraphs.len() {
+            self.each_sg_anchor_ref(si, |id| f(NodeRefSite::SgAnchor, si as u32, id));
+        }
+    }
+
+    /// Write door: remaps EVERY metadata NodeId in place. Build path only —
+    /// load-path graphs are never rebuilt (upvalues live in the CSR section).
+    /// Replaces rebuild's scattered per-field remap blocks so the write list
+    /// can never diverge from the read list above.
+    pub fn map_node_refs(&mut self, mut f: impl FnMut(NodeRefSite, u32, NodeId) -> NodeId) {
+        debug_assert!(self.mem.is_none() && self.sg_uv_offsets.is_empty());
+        for idx in 0..self.nodes.len() {
+            if let Some(src) = self.await_event_sources.get(idx).and_then(|o| *o) {
+                self.await_event_sources[idx] =
+                    Some(f(NodeRefSite::NodeMeta, idx as u32, src));
+            }
+            if let Some(t) = self.writeback_targets.get(idx).and_then(|o| *o) {
+                self.writeback_targets[idx] =
+                    Some(f(NodeRefSite::NodeMeta, idx as u32, t));
+            }
+            if let Some(gb) = self.gate_branches.get(idx).and_then(|o| o.as_ref()) {
+                let new_cond = f(NodeRefSite::NodeMeta, idx as u32, gb.condition_input);
+                let mut branches = gb.branches.clone();
+                for (_, _, params) in &mut branches {
+                    for p in params.iter_mut() {
+                        *p = f(NodeRefSite::NodeMeta, idx as u32, *p);
+                    }
+                }
+                let new_gb = GateBranches {
+                    condition_input: new_cond,
+                    branches,
+                    capture: gb.capture,
+                };
+                self.gate_branches[idx] = Some(new_gb);
+            }
+            if let Some(si) = self.select_infos.get(idx).and_then(|o| o.as_ref()) {
+                let mut branches = si.branches.clone();
+                for sb in &mut branches {
+                    sb.event_source_node =
+                        f(NodeRefSite::NodeMeta, idx as u32, sb.event_source_node);
+                }
+                self.select_infos[idx] = Some(SelectInfo { branches });
+            }
+        }
+        for si in 0..self.subgraphs.len() {
+            let sg = &mut self.subgraphs[si];
+            sg.entry_node = f(NodeRefSite::SgAnchor, si as u32, sg.entry_node);
+            sg.return_node = f(NodeRefSite::SgAnchor, si as u32, sg.return_node);
+            if let Some(c) = sg.cond_node {
+                sg.cond_node = Some(f(NodeRefSite::SgAnchor, si as u32, c));
+            }
+            if let Some(n) = sg.iter_next_node {
+                sg.iter_next_node = Some(f(NodeRefSite::SgAnchor, si as u32, n));
+            }
+            for decl in &mut sg.event_source_decls {
+                decl.node = f(NodeRefSite::SgAnchor, si as u32, decl.node);
+            }
+            for e in &mut sg.defer_table {
+                e.trigger_node = f(NodeRefSite::SgAnchor, si as u32, e.trigger_node);
+                for c in e.captured_inputs.iter_mut() {
+                    *c = f(NodeRefSite::SgAnchor, si as u32, *c);
+                }
+            }
+            for u in sg.upvalue_outer_nodes.iter_mut() {
+                *u = f(NodeRefSite::SgAnchor, si as u32, *u);
+            }
+            if let Some(plan) = &mut sg.reset_plan {
+                for n in plan.reset_to_zero.iter_mut() {
+                    *n = f(NodeRefSite::SgAnchor, si as u32, *n);
+                }
+                for n in plan.reset_to_one.iter_mut() {
+                    *n = f(NodeRefSite::SgAnchor, si as u32, *n);
+                }
+                for n in plan.reset_condition_tree.iter_mut() {
+                    *n = f(NodeRefSite::SgAnchor, si as u32, *n);
+                }
+                // condition_tree_plan: cleared by rebuild (W5), never remapped.
+            }
+        }
+    }
+
     /// Late compaction rebuild: rebuilds the graph from the `dead` set,
     /// `redirect` map and `dead_sgs` set. Compacts `nodes`/`inputs_pool`,
     /// remaps all `NodeId` references and per-NodeId metadata vectors, removes
@@ -3051,12 +3322,19 @@ impl DataFlowGraph {
         redirect: &rustc_hash::FxHashMap<NodeId, NodeId>,
         dead_sgs: &rustc_hash::FxHashSet<SubGraphId>,
     ) -> Vec<Option<NodeId>> {
+        // Test hook for the optimizer stability policy (run_guarded snapshot
+        // rollback): simulates an invariant violation inside rebuild.
+        if std::env::var("KUZO_TEST_INJECT_REBUILD_FAIL").is_ok() {
+            panic!("rebuild: injected invariant failure (KUZO_TEST_INJECT_REBUILD_FAIL)");
+        }
         // ── Recursively resolve redirects ──
         let resolve = |id: NodeId| -> NodeId {
             let mut cur = id;
             while let Some(&next) = redirect.get(&cur) { cur = next; }
             cur
         };
+
+
 
         // ── 1. Arrange live nodes grouped by function-level subgraph ──
         // Hoisted nodes appended by the pass layer (LICM/inline) live at the end
@@ -3214,10 +3492,9 @@ impl DataFlowGraph {
 
         // ── 3. Compact per-NodeId metadata vectors ──
         // Collect metadata in new-index order using the new_to_old map.
-        let remap_n = |id: NodeId| -> NodeId {
-            let r = resolve(id);
-            old_to_new[r.0 as usize].expect("rebuild: ref node not live")
-        };
+        // NodeId VALUES are not remapped here — every metadata NodeId remap
+        // happens in one place after step 6, through `map_node_refs` (the
+        // write door), so this list can never diverge from liveness seeding.
 
         // 3a. Compact Vec<Option<T: Clone>> (no interior NodeId).
         macro_rules! compress_opt {
@@ -3276,74 +3553,41 @@ impl DataFlowGraph {
             self.hoisted_owners = v;
         }
 
-        // 3c. Compact vectors containing NodeId.
-        // await_event_sources: Vec<Option<NodeId>>
+        // 3c. Compact vectors containing NodeId (plain clone — remap happens
+        // once, after step 6, via `map_node_refs`).
+        // await_event_sources / writeback_targets: Vec<Option<NodeId>>
         {
             let mut v: Vec<Option<NodeId>> = Vec::with_capacity(new_to_old.len());
             for &old_idx in &new_to_old {
-                v.push(self.await_event_sources[old_idx].map(&remap_n));
+                v.push(self.await_event_sources[old_idx]);
             }
             self.await_event_sources = v;
         }
-        // writeback_targets: Vec<Option<NodeId>>
         {
             let mut v: Vec<Option<NodeId>> = Vec::with_capacity(new_to_old.len());
             for &old_idx in &new_to_old {
-                v.push(self.writeback_targets[old_idx].map(&remap_n));
+                v.push(self.writeback_targets[old_idx]);
             }
             self.writeback_targets = v;
         }
-        // gate_branches: Vec<Option<GateBranches>> — interior NodeId needs remap.
+        // gate_branches / select_infos: interior NodeIds remapped by the door.
         {
             let mut v: Vec<Option<GateBranches>> = Vec::with_capacity(new_to_old.len());
             for &old_idx in &new_to_old {
-                let opt = &self.gate_branches[old_idx];
-                v.push(opt.as_ref().map(|gb| GateBranches {
-                    condition_input: remap_n(gb.condition_input),
-                    branches: gb.branches.iter().map(|(b, sg, params)| {
-                        (*b, *sg, params.iter().map(|&n| remap_n(n)).collect())
-                    }).collect(),
-                    capture: gb.capture,
-                }));
+                v.push(self.gate_branches[old_idx].clone());
             }
             self.gate_branches = v;
         }
-        // select_infos: Vec<Option<SelectInfo>> — SelectBranch.event_source_node needs remap.
         {
             let mut v: Vec<Option<SelectInfo>> = Vec::with_capacity(new_to_old.len());
             for &old_idx in &new_to_old {
-                let opt = &self.select_infos[old_idx];
-                v.push(opt.as_ref().map(|si| SelectInfo {
-                    branches: si.branches.iter().map(|sb| SelectBranch {
-                        subgraph_id: sb.subgraph_id,
-                        event_kind: sb.event_kind,
-                        event_source_node: remap_n(sb.event_source_node),
-                    }).collect(),
-                }));
+                v.push(self.select_infos[old_idx].clone());
             }
             self.select_infos = v;
         }
 
-        // ── 4. Rebuild downstreams (including Gate condition_input edges) ──
-        let n = self.nodes.len();
-        self.downstreams = vec![Vec::new(); n];
-        for node_idx in 0..n {
-            let node = self.nodes[node_idx];
-            let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
-            for &input in inputs {
-                self.downstreams[input.0 as usize].push(NodeId(node_idx as u32));
-            }
-        }
-        // Gate condition_input → Gate edge (aligned with compute_downstreams).
-        for nid in 0..n {
-            if let Some(gb) = &self.gate_branches[nid] {
-                let node = self.nodes[nid];
-                let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
-                if !inputs.contains(&gb.condition_input) {
-                    self.downstreams[gb.condition_input.0 as usize].push(NodeId(nid as u32));
-                }
-            }
-        }
+        // ── 4. (moved) Rebuild downstreams AFTER the NodeId door remap below —
+        // gate condition_input must already be new-indexed when this runs.
 
         // ── 5. Remap NodeId references inside subgraphs ──
         // node_range is recomputed by scanning live nodes within the old range
@@ -3432,6 +3676,19 @@ impl DataFlowGraph {
                     if referenced.contains(&sg.id) {
                         remove_sg[i] = false;
                         changed = true;
+                        // Tripwire: a NON-EMPTY subgraph needing this veto
+                        // means the liveness closure (compute_liveness, which
+                        // seeds callee anchors from live call/closure edges)
+                        // missed a cross-sg edge kind — the function should
+                        // have stayed reachable in the first place. Empty
+                        // placeholders (analyzer-dead branches) are the only
+                        // legitimate veto saves.
+                        debug_assert!(
+                            sg.node_range.0 == sg.node_range.1,
+                            "rebuild: non-empty sg {} (fn={} range=[{},{}) survived only via \
+                             the removal veto — liveness closure missed an edge to it",
+                            sg.id.0, sg.function_id, sg.node_range.0.0, sg.node_range.1.0
+                        );
                         referenced.insert(SubGraphId(sg.function_id));
                         if let Some(p) = sg.loop_parent_sg {
                             referenced.insert(p);
@@ -3571,33 +3828,17 @@ impl DataFlowGraph {
                 Some(ns) => (NodeId(ns), NodeId(new_end)),
                 None => (NodeId(0), NodeId(0)), // All dead; range collapses.
             };
-            sg.entry_node = remap_n(sg.entry_node);
-            sg.return_node = remap_n(sg.return_node);
-            if let Some(c) = sg.cond_node { sg.cond_node = Some(remap_n(c)); }
-            if let Some(n) = sg.iter_next_node { sg.iter_next_node = Some(remap_n(n)); }
-            // event_source_decls: EventSourceDecl.node
-            for decl in &mut sg.event_source_decls {
-                decl.node = remap_n(decl.node);
-            }
-            // defer_table: DeferEntry.trigger_node + captured_inputs
-            for entry in &mut sg.defer_table {
-                entry.trigger_node = remap_n(entry.trigger_node);
-                entry.captured_inputs = entry.captured_inputs.iter().map(|&n| remap_n(n)).collect();
-            }
-            // upvalue_outer_nodes: captured-variable outer nodes need remap.
-            sg.upvalue_outer_nodes = sg.upvalue_outer_nodes.iter().map(|&n| remap_n(n)).collect();
-            // nested_ranges: NOT remapped here — remapping a child range that
-            // collapsed this round would panic on dead ids. Step 6 recomputes
-            // every kept subgraph's nested_ranges from the final ranges.
-            // reset_plan: NodeIds inside ResetPlan need remap (synced with cond_node/iter_next_node).
+            // Anchor/metadata NodeId remapping for kept subgraphs no longer
+            // happens here — it happens in ONE place after step 6, through
+            // `map_node_refs` (the write door), for per-node tables and
+            // per-sg anchors alike.
+            // nested_ranges: NOT remapped here — step 6 recomputes every kept
+            // subgraph's nested_ranges from the final ranges.
+            // W5: the flattened condition-tree plan is stale after compaction
+            // (node ids AND tree membership changed). Clear it; the engine
+            // falls back to the runtime DFS until the pipeline recomputes it
+            // post-optimization.
             if let Some(ref mut plan) = sg.reset_plan {
-                plan.reset_to_zero = plan.reset_to_zero.iter().map(|&n| remap_n(n)).collect();
-                plan.reset_to_one = plan.reset_to_one.iter().map(|&n| remap_n(n)).collect();
-                plan.reset_condition_tree = plan.reset_condition_tree.iter().map(|&n| remap_n(n)).collect();
-                // W5: the flattened condition-tree plan is stale after
-                // compaction (node ids AND tree membership changed). Clear it;
-                // the engine falls back to the runtime DFS until the pipeline
-                // recomputes it post-optimization.
                 plan.condition_tree_plan = Vec::new();
             }
         }
@@ -3629,6 +3870,19 @@ impl DataFlowGraph {
                     for e in &mut sg.defer_table {
                         e.body_subgraph = map_sg(e.body_subgraph);
                     }
+                }
+                // Debug-only name sidecar follows the same renumbering
+                // (entries are parallel to `subgraphs`).
+                if !self.sg_debug_names.is_empty() {
+                    let mut new_names: Vec<Option<Box<str>>> =
+                        Vec::with_capacity(new_sgs.len());
+                    for (i, keep) in remove_sg.iter().enumerate() {
+                        if *keep {
+                            continue;
+                        }
+                        new_names.push(self.sg_debug_names.get(i).cloned().flatten());
+                    }
+                    self.sg_debug_names = new_names;
                 }
                 self.subgraphs = new_sgs;
                 if let Some(e) = self.entry_subgraph {
@@ -3682,7 +3936,7 @@ impl DataFlowGraph {
                 // EngineRef::new recomputes it after build/optimize/load.
                 // (Load-path CSR offset tables only exist on loaded graphs,
                 // which are never rebuilt.)
-                debug_assert!(self.sg_uv_offsets.is_empty() && self.sg_nr_offsets.is_empty());
+                debug_assert!(self.sg_uv_offsets.is_empty());
                 self.sg_initial_pending = Vec::new();
                 self.sg_initial_seed = Vec::new();
                 self.linear_plans = Vec::new();
@@ -3693,6 +3947,50 @@ impl DataFlowGraph {
                         removed_count,
                         self.subgraphs.len()
                     );
+                }
+            }
+        }
+
+        // ── 6b. Remap every metadata NodeId through the single write door ──
+        // Per-node tables were compacted in step 3 (new-indexed, values still
+        // old ids) and removed subgraphs are gone after step 6, so the door
+        // sees exactly the kept structures. Any metadata NodeId not in
+        // old_to_new here means the liveness seeding (Optimizer's
+        // compute_liveness, which seeds through the READ door) diverged from
+        // this enumeration — an invariant violation, not a salvage case.
+        {
+            let remap_ref = |site: NodeRefSite, owner: u32, id: NodeId| -> NodeId {
+                let r = resolve(id);
+                old_to_new[r.0 as usize].unwrap_or_else(|| panic!(
+                    "rebuild: node-ref door {:?} (owner {}) ref node {} not live — \
+                     liveness seeding diverged from the door enumeration",
+                    site, owner, r.0
+                ))
+            };
+            self.map_node_refs(remap_ref);
+        }
+
+        // ── 4. Rebuild downstreams (including Gate condition_input edges) ──
+        // Runs after the door remap so every NodeId (inputs pool since step 2,
+        // gate condition_input since 6b) is new-indexed.
+        {
+            let n = self.nodes.len();
+            self.downstreams = vec![Vec::new(); n];
+            for node_idx in 0..n {
+                let node = self.nodes[node_idx];
+                let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
+                for &input in inputs {
+                    self.downstreams[input.0 as usize].push(NodeId(node_idx as u32));
+                }
+            }
+            // Gate condition_input → Gate edge (aligned with compute_downstreams).
+            for nid in 0..n {
+                if let Some(gb) = &self.gate_branches[nid] {
+                    let node = self.nodes[nid];
+                    let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
+                    if !inputs.contains(&gb.condition_input) {
+                        self.downstreams[gb.condition_input.0 as usize].push(NodeId(nid as u32));
+                    }
                 }
             }
         }
@@ -3752,29 +4050,46 @@ impl DataFlowGraph {
         old_to_new
     }
 
-    /// Computes `nested_ranges` for all subgraphs: for each subgraph, collects
-    /// the ranges of subgraphs directly nested within its `node_range`. Called
-    /// at build time and after every optimizer `rebuild` so runtime can query
-    /// in O(len) instead of scanning the whole graph. Empty ranges (collapsed
-    /// or placeholder subgraphs) are never nested children — filtering them
-    /// keeps the table free of zero-length residue.
-    pub fn compute_nested_ranges(&mut self) {
-        // Pre-collect all non-empty subgraph ranges to avoid repeatedly
-        // borrowing self.subgraphs inside the loop.
-        let ranges: Vec<(SubGraphId, u32, u32)> = self.subgraphs.iter()
-            .filter(|sg| sg.node_range.0 .0 < sg.node_range.1 .0)
-            .map(|sg| (sg.id, sg.node_range.0 .0, sg.node_range.1 .0))
-            .collect();
-        for sg in &mut self.subgraphs {
-            let (sg_id, branch_start, branch_end) = (sg.id, sg.node_range.0 .0, sg.node_range.1 .0);
-            sg.nested_ranges = ranges.iter()
-                .filter(|(id, s, e)| {
-                    *id != sg_id && *s >= branch_start && *e <= branch_end
-                })
-                .map(|(_, s, e)| (*s, *e))
-                .collect();
+/// Computes `nested_ranges` for all subgraphs: for each subgraph, the ranges
+/// of subgraphs DIRECTLY nested within its `node_range`. Called at build
+/// time, after every optimizer `rebuild`, and at `.kzo` load (v3: the section
+/// is no longer serialized — this is the derived source of truth). Empty
+/// ranges (collapsed or placeholder subgraphs) are never children.
+///
+/// O(SG.log SG): sort non-empty ranges by (start asc, end desc) and walk with
+/// a stack of open ancestors — each range's direct parent is the stack top
+/// after popping everything that has ended or does not contain it.
+pub fn compute_nested_ranges(&mut self) {
+    let mut ranges: Vec<(u32, u32, usize)> = self
+        .subgraphs
+        .iter()
+        .enumerate()
+        .filter(|(_, sg)| sg.node_range.0 .0 < sg.node_range.1 .0)
+        .map(|(i, sg)| (sg.node_range.0 .0, sg.node_range.1 .0, i))
+        .collect();
+    ranges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+
+    let mut children: Vec<Vec<(u32, u32)>> = vec![Vec::new(); self.subgraphs.len()];
+    // Stack of (end, idx) of currently open ancestors (outermost first).
+    let mut stack: Vec<(u32, usize)> = Vec::new();
+    for &(start, end, idx) in &ranges {
+        // Pop everything that cannot contain this range.
+        while let Some(&(top_end, _)) = stack.last() {
+            if top_end <= start || end > top_end {
+                stack.pop();
+            } else {
+                break;
+            }
         }
+        if let Some(&(_, parent_idx)) = stack.last() {
+            children[parent_idx].push((start, end));
+        }
+        stack.push((end, idx));
     }
+    for (i, sg) in self.subgraphs.iter_mut().enumerate() {
+        sg.nested_ranges = std::mem::take(&mut children[i]);
+    }
+}
 
     /// W5: flatten every loop subgraph's `reset_condition_tree` roots into the
     /// mechanical `condition_tree_plan` — the same DFS the engine's

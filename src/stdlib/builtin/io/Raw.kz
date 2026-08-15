@@ -12,22 +12,34 @@
 @c_include("windows.h")
 @c_include("io.h")
 @c_include("direct.h")
+@internal
 @extern("C")
 fun __file_open_raw(path: str, flags: i32, mode: i32): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         int posix_flags = 0;
-        if (flags & 1) posix_flags |= _O_RDONLY;
-        if (flags & 2) posix_flags |= _O_WRONLY;
-        if ((flags & 1) && (flags & 2)) posix_flags |= _O_RDWR;
+        // Access mode must be decided MUTUALLY EXCLUSIVELY: OR-ing _O_WRONLY with
+        // _O_RDWR (what the old bit-by-bit mapping produced for READ|WRITE) is an
+        // invalid combination that makes MSVCRT abort the process.
+        if ((flags & 3) == 3) {
+            posix_flags |= _O_RDWR;
+        } else if (flags & 2) {
+            posix_flags |= _O_WRONLY;
+        } else {
+            posix_flags |= _O_RDONLY;
+        }
         if (flags & 4) posix_flags |= _O_CREAT;
         if (flags & 8) posix_flags |= _O_TRUNC;
         if (flags & 16) posix_flags |= _O_APPEND;
         return _open(path_data, posix_flags | _O_BINARY, mode);
     #else
         int posix_flags = 0;
-        if (flags & 1) posix_flags |= O_RDONLY;
-        if (flags & 2) posix_flags |= O_WRONLY;
-        if ((flags & 1) && (flags & 2)) posix_flags |= O_RDWR;
+        if ((flags & 3) == 3) {
+            posix_flags |= O_RDWR;
+        } else if (flags & 2) {
+            posix_flags |= O_WRONLY;
+        } else {
+            posix_flags |= O_RDONLY;
+        }
         if (flags & 4) posix_flags |= O_CREAT;
         if (flags & 8) posix_flags |= O_TRUNC;
         if (flags & 16) posix_flags |= O_APPEND;
@@ -36,6 +48,7 @@ fun __file_open_raw(path: str, flags: i32, mode: i32): i64 #{
 }#
 
 @c_include("unistd.h")
+@internal
 @extern("C")
 fun __file_close_raw(fd: i64): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -46,6 +59,7 @@ fun __file_close_raw(fd: i64): i32 #{
 }#
 
 @c_include("unistd.h")
+@internal
 @extern("C")
 fun __file_read_into(fd: i64, buf: u8[], len: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -56,6 +70,7 @@ fun __file_read_into(fd: i64, buf: u8[], len: usize): i64 #{
 }#
 
 @c_include("unistd.h")
+@internal
 @extern("C")
 fun __file_write(fd: i64, buf: u8[], len: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -66,6 +81,7 @@ fun __file_write(fd: i64, buf: u8[], len: usize): i64 #{
 }#
 
 @c_include("unistd.h")
+@internal
 @extern("C")
 fun __file_seek_raw(fd: i64, offset: i64, whence: i32): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -81,6 +97,7 @@ fun __file_seek_raw(fd: i64, offset: i64, whence: i32): i64 #{
 }#
 
 @c_include("unistd.h")
+@internal
 @extern("C")
 fun __file_remove_raw(path: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -91,12 +108,14 @@ fun __file_remove_raw(path: str): i32 #{
 }#
 
 @c_include("stdio.h")
+@internal
 @extern("C")
 fun __file_rename_raw(old: str, new: str): i32 #{
     return rename(old_data, new_data);
 }#
 
 @c_include("unistd.h")
+@internal
 @extern("C")
 fun __stdout_write_raw(s: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -111,6 +130,7 @@ fun __stdout_write_raw(s: str): i32 #{
 }#
 
 @c_include("unistd.h")
+@internal
 @extern("C")
 fun __stderr_write_raw(s: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -128,6 +148,7 @@ fun __stderr_write_raw(s: str): i32 #{
 // buf_data/buf_len are automatically provided by u8[] marshal
 @c_include("unistd.h")
 @c_include("io.h")
+@internal
 @extern("C")
 fun __stdin_readln_into(buf: u8[]): i64 #{
     size_t total = 0;
@@ -155,6 +176,7 @@ fun __stdin_readln_into(buf: u8[]): i64 #{
 }#
 
 @c_include("sys/stat.h")
+@internal
 @extern("C")
 fun __dir_create_raw(path: str, recursive: bool): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -185,6 +207,7 @@ fun __dir_create_raw(path: str, recursive: bool): i32 #{
 }#
 
 @c_include("unistd.h")
+@internal
 @extern("C")
 fun __dir_remove_raw(path: str, recursive: bool): i32 #{
     (void)recursive;
@@ -198,6 +221,7 @@ fun __dir_remove_raw(path: str, recursive: bool): i32 #{
 // ─── chmod ───────────────────────────────────────────────────────
 
 @c_include("sys/stat.h")
+@internal
 @extern("C")
 fun __file_chmod_raw(path: str, mode: i32): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -218,6 +242,7 @@ fun __file_chmod_raw(path: str, mode: i32): i32 #{
 // Returns 0=success, -1=failure
 
 @c_include("sys/stat.h")
+@internal
 @extern("C")
 fun __file_stat_into(path: str, buf: u8[]): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -260,6 +285,7 @@ fun __file_stat_into(path: str, buf: u8[]): i32 #{
 }#
 
 @c_include("sys/stat.h")
+@internal
 @extern("C")
 fun __file_fstat_into(fd: i64, buf: u8[]): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -317,6 +343,7 @@ fun __file_fstat_into(fd: i64, buf: u8[]): i32 #{
 //   -2   some buffer capacity insufficient
 //   -3   max_count insufficient (number of entries exceeds upper limit)
 @c_include("string.h")
+@internal
 @extern("C")
 fun __dir_list_into(path: str, names_buf: u8[], name_offsets: u8[], kinds_buf: u8[], max_count: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -384,5 +411,49 @@ fun __dir_list_into(path: str, names_buf: u8[], name_offsets: u8[], kinds_buf: u
         }
         closedir(d);
         return (int64_t)count;
+    #endif
+}#
+
+// ─── Existence / copy ──────────────────────────────────────────────────────
+
+// Whether the path exists (file, directory, or otherwise). 1=yes, 0=no.
+@c_include("windows.h")
+@c_include("unistd.h")
+@internal
+@extern("C")
+fun __file_exists_raw(path: str): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        DWORD attr = GetFileAttributesA(path_data);
+        return attr != INVALID_FILE_ATTRIBUTES ? 1 : 0;
+    #else
+        return access(path_data, F_OK) == 0 ? 1 : 0;
+    #endif
+}#
+
+// Copy a file (overwrites dst). Windows: CopyFileA; POSIX: read/write loop.
+@c_include("windows.h")
+@c_include("fcntl.h")
+@c_include("unistd.h")
+@internal
+@extern("C")
+fun __file_copy_raw(src: str, dst: str): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        return CopyFileA(src_data, dst_data, FALSE) ? 0 : -1;
+    #else
+        int in = open(src_data, O_RDONLY);
+        if (in < 0) return -1;
+        int out = open(dst_data, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (out < 0) { close(in); return -1; }
+        char buf[65536];
+        for (;;) {
+            ssize_t n = read(in, buf, sizeof(buf));
+            if (n < 0) { close(in); close(out); return -1; }
+            if (n == 0) break;
+            ssize_t w = write(out, buf, (size_t)n);
+            if (w != n) { close(in); close(out); return -1; }
+        }
+        close(in);
+        close(out);
+        return 0;
     #endif
 }#

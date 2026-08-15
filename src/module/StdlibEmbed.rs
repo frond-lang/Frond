@@ -41,6 +41,7 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     ("builtin/error/IOError.kz", include_str!("../stdlib/builtin/error/IOError.kz")),
     ("builtin/error/TimeError.kz", include_str!("../stdlib/builtin/error/TimeError.kz")),
     ("builtin/error/TerminalError.kz", include_str!("../stdlib/builtin/error/TerminalError.kz")),
+    ("builtin/error/OsError.kz", include_str!("../stdlib/builtin/error/OsError.kz")),
     // reflect module (runtime reflection, Raw.kz primitives + Reflect.kz wrapper)
     ("builtin/reflect/pack.kz", include_str!("../stdlib/builtin/reflect/pack.kz")),
     ("builtin/reflect/Raw.kz", include_str!("../stdlib/builtin/reflect/Raw.kz")),
@@ -62,6 +63,8 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     ("builtin/iter/Iterator.kz", include_str!("../stdlib/builtin/iter/Iterator.kz")),
     // terminal module (pack declaration; Raw already loaded at the primitive layer)
     ("builtin/terminal/pack.kz", include_str!("../stdlib/builtin/terminal/pack.kz")),
+    ("builtin/os/pack.kz", include_str!("../stdlib/builtin/os/pack.kz")),
+    ("builtin/os/Raw.kz", include_str!("../stdlib/builtin/os/Raw.kz")),
 ];
 
 /// Standard library module file manifest (requires `import std.xxx` to load).
@@ -70,6 +73,12 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
 /// reflect has moved to builtin/reflect (visible by default); Console has moved to builtin/io (visible by default)
 pub const STD_FILES: &[StdlibFile] = &[
     // io module (Console has moved to builtin/io)
+    ("std/os/pack.kz", include_str!("../stdlib/std/os/pack.kz")),
+    ("std/os/Env.kz", include_str!("../stdlib/std/os/Env.kz")),
+    ("std/os/Tty.kz", include_str!("../stdlib/std/os/Tty.kz")),
+    ("std/os/Proc.kz", include_str!("../stdlib/std/os/Proc.kz")),
+    ("std/os/Info.kz", include_str!("../stdlib/std/os/Info.kz")),
+    ("std/os/Os.kz", include_str!("../stdlib/std/os/Os.kz")),
     ("std/io/pack.kz", include_str!("../stdlib/std/io/pack.kz")),
     ("std/io/Path.kz", include_str!("../stdlib/std/io/Path.kz")),
     ("std/io/File.kz", include_str!("../stdlib/std/io/File.kz")),

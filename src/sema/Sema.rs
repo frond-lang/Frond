@@ -2262,11 +2262,37 @@ pub(crate) fn concretize_type<'a>(
             let mut visiting = FxHashSet::default();
             resolve_named_type_resolved(arena, name, type_args, sema_result, &mut visiting)
         }
-        TypeNode::Generic { name, .. } => {
-            if let Some(ty) = Type::from_type_name(name) {
-                arena.make(ty)
-            } else {
-                arena.make_generic((*name).into(), Box::new([]))
+        TypeNode::Generic { name, args } => {
+            // Builtin generics must carry their REAL type arguments. The old
+            // code called `Type::from_type_name(name)`, which returns a
+            // placeholder (`DetailId(u32::MAX)`) that DISCARDS the args — so
+            // every signature declaring `Async<X>` / `Throw<X, E>` /
+            // `Channel<T>`… was registered with an opaque placeholder type.
+            // Downstream consumers of `func_sigs` then silently
+            // mis-handled them (the await value-propagation bug family:
+            // #97's tail-`?` Ok re-wrap sees Async<placeholder> instead of
+            // Async<Throw<…>> and skips the re-wrap; the raw payload leaks
+            // out and `match f().await() { Ok/Err }` hits the fallback
+            // panic). Construction mirrors InferContext::make_builtin_generic.
+            let resolved: Vec<TypeHandle> = args.iter()
+                .map(|&a| concretize_type(arena, a, type_args, ast, sema_result))
+                .collect();
+            match (*name, resolved.as_slice()) {
+                ("Throw", [v, e]) => arena.make_throw(*v, *e),
+                ("Channel", [t]) => arena.make_channel(*t),
+                ("Async", [t]) => arena.make_async(*t),
+                ("Lazy", [t]) => arena.make_lazy(*t),
+                ("Atomic", [t]) => arena.make_atomic(*t),
+                ("Sender", [t]) => arena.make_sender(*t),
+                ("Receiver", [t]) => arena.make_receiver(*t),
+                _ => {
+                    if let Some(ty) = Type::from_type_name(name) {
+                        // Bare builtin generic name written without args.
+                        arena.make(ty)
+                    } else {
+                        arena.make_generic((*name).into(), Box::new([]))
+                    }
+                }
             }
         }
         TypeNode::Nullable { inner } => {

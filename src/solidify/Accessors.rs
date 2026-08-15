@@ -247,7 +247,9 @@ impl DataFlowGraph {
             let b = blob_start + off;
             let tag = r[b];
             if tag == 0 { return None; }
-            Some(super::Format::parse_const_value(tag, &r[b + 1..b + 17]))
+            // v3: variable-width payload.
+            let w = super::Spec::const_payload_len(tag);
+            Some(super::Format::parse_const_value(tag, &r[b + 1..b + 1 + w]))
         } else {
             self.const_values[idx].clone()
         }
@@ -330,26 +332,12 @@ impl DataFlowGraph {
 
     /// Returns the `nested_ranges` slice for subgraph `sg_idx`.
     ///
-    /// Load path: returns a `&[(u32, u32)]` slice directly from the mmap
-    /// SgNestedRanges section with no heap allocation.
-    ///
-    /// Build path: returns a reference to `self.subgraphs[sg_idx].nested_ranges`.
+    /// v3: nested_ranges are derived data (recomputed by
+    /// `compute_nested_ranges` at build, after every optimizer rebuild, and
+    /// at load) — both paths read the owned Vec.
     #[inline]
     pub fn sg_nested_ranges(&self, sg_idx: usize) -> &[(u32, u32)] {
-        if let Some(ref mem) = self.mem {
-            let (off, len) = self.sg_nr_offsets[sg_idx];
-            let r = mem.section(SectionKind::SgNestedRanges);
-            let byte_start = off as usize;
-            let count = len as usize;
-            // SAFETY: (u32, u32) is 8 bytes under repr(Rust) (two consecutive u32s), 4-byte aligned.
-            // The SgNestedRanges section is 4-byte aligned, and offset is a multiple of 4.
-            // During serialization each element is written as two u32s (8 bytes), matching the (u32, u32) layout.
-            unsafe {
-                std::slice::from_raw_parts(r.as_ptr().add(byte_start) as *const (u32, u32), count)
-            }
-        } else {
-            &self.subgraphs[sg_idx].nested_ranges
-        }
+        &self.subgraphs[sg_idx].nested_ranges
     }
 
     // ---- Five complex variable-length table on-demand accessors (zerocopy: eliminates Vec<Option<T>> arrays) ----

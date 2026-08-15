@@ -15,6 +15,7 @@
 // ─── Kuzo wrapper: @extern("C") raw return value → Throw ──────────────
 
 // __net_udp_bind(ip: IpAddr, port: u16, reuse_addr: bool): Throw<i64, IOError>
+@internal
 fun __net_udp_bind(ip: IpAddr, port: u16, reuse_addr: bool): Throw<i64, IOError> {
     match ip {
         V4(v4_addr) => {
@@ -35,6 +36,7 @@ fun __net_udp_bind(ip: IpAddr, port: u16, reuse_addr: bool): Throw<i64, IOError>
 }
 
 // __net_udp_send_to(fd: i64, ip: IpAddr, port: u16, buf: u8[]): Throw<usize, IOError>
+@internal
 fun __net_udp_send_to(fd: i64, ip: IpAddr, port: u16, buf: u8[]): Throw<usize, IOError> {
     match ip {
         V4(v4_addr) => {

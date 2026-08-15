@@ -20,6 +20,7 @@
 // __net_tcp_connect(ip: IpAddr, port: u16, timeout_ns: i64): Throw<i64, IOError>
 // Extracts v4 bits from IpAddr, calls __net_tcp_connect_v4
 // IPv6 is not yet supported, throws NotSupported
+@internal
 fun __net_tcp_connect(ip: IpAddr, port: u16, timeout_ns: i64): Throw<i64, IOError> {
     match ip {
         V4(v4_addr) => {
@@ -41,6 +42,7 @@ fun __net_tcp_connect(ip: IpAddr, port: u16, timeout_ns: i64): Throw<i64, IOErro
 
 // __net_tcp_close(fd: i64): Throw<void, IOError>
 // Shared close for TCP/UDP (both are close(fd) underneath)
+@internal
 fun __net_tcp_close(fd: i64): Throw<void, IOError> {
     val rc = __net_tcp_close_raw(fd)
     if rc < 0 {

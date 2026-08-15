@@ -94,97 +94,88 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
         sections.push((SectionKind::Inputs, buf));
     }
 
-    // 3. SubGraphs + variable-length regions (unchanged v1 encoding)
+    // 3. SubGraphs + variable-length regions (v3 packed layout).
+    //    Per-sg fixed record ~45B: `id` elided (== vector index); boolean
+    //    fields merged into one flags byte; the reset-plan region uses
+    //    explicit slice starts (plans can be large) while the other four
+    //    regions append in sg order with per-sg u16 lengths only.
+    //    nested_ranges are DERIVED at load (compute_nested_ranges) and are
+    //    not serialized.
     {
         let mut sg_buf = Vec::new();
         let mut upvalue_nodes_buf = Vec::new();
-        let mut nested_ranges_buf = Vec::new();
         let mut event_decls_buf = Vec::new();
         let mut defer_entries_buf = Vec::new();
         let mut defer_captured_buf = Vec::new();
         let mut reset_plan_buf = Vec::new();
 
         for sg in &graph.subgraphs {
-            // Main structure fixed-width fields
-            write_u32(&mut sg_buf, sg.id.0);
+            let loop_kind = loop_kind_to_u8(sg.loop_kind);
+            debug_assert!(loop_kind <= 0b1111);
+            let mut flags: u8 = sg.has_suspend as u8;
+            flags |= (sg.reset_plan.is_some() as u8) << 1;
+            flags |= loop_kind << 4;
+
             write_u32(&mut sg_buf, sg.node_range.0.0);
             write_u32(&mut sg_buf, sg.node_range.1.0);
             write_u8(&mut sg_buf, sg.param_count);
             write_u32(&mut sg_buf, sg.entry_node.0);
             write_u32(&mut sg_buf, sg.return_node.0);
-            write_u8(&mut sg_buf, sg.has_suspend as u8);
-            write_u8(&mut sg_buf, loop_kind_to_u8(sg.loop_kind));
+            write_u8(&mut sg_buf, flags);
+            write_u8(&mut sg_buf, sg.upvalue_count);
             write_u32(&mut sg_buf, sg.loop_parent_sg.map(|s| s.0).unwrap_or(u32::MAX));
             write_u32(&mut sg_buf, sg.cond_node.map(|s| s.0).unwrap_or(u32::MAX));
             write_u32(&mut sg_buf, sg.function_id);
             write_u32(&mut sg_buf, sg.iter_next_node.map(|s| s.0).unwrap_or(u32::MAX));
-            write_u8(&mut sg_buf, sg.upvalue_count);
+            // Per-sg variable-region lengths (offsets implicit, append order).
+            debug_assert!(sg.upvalue_outer_nodes.len() <= u16::MAX as usize);
+            debug_assert!(sg.event_source_decls.len() <= u16::MAX as usize);
+            debug_assert!(sg.defer_table.len() <= u16::MAX as usize);
+            write_u16(&mut sg_buf, sg.upvalue_outer_nodes.len() as u16);
+            write_u16(&mut sg_buf, sg.event_source_decls.len() as u16);
+            write_u16(&mut sg_buf, sg.defer_table.len() as u16);
+            write_u32(&mut sg_buf, reset_plan_buf.len() as u32); // reset-plan slice start
 
             // upvalue_outer_nodes
-            let uv_off = upvalue_nodes_buf.len() as u32;
-            write_u32(&mut sg_buf, uv_off);
-            write_u32(&mut sg_buf, sg.upvalue_outer_nodes.len() as u32);
             for nid in &sg.upvalue_outer_nodes {
                 write_u32(&mut upvalue_nodes_buf, nid.0);
             }
 
-            // nested_ranges
-            let nr_off = nested_ranges_buf.len() as u32;
-            write_u32(&mut sg_buf, nr_off);
-            write_u32(&mut sg_buf, sg.nested_ranges.len() as u32);
-            for &(start, end) in &sg.nested_ranges {
-                write_u32(&mut nested_ranges_buf, start);
-                write_u32(&mut nested_ranges_buf, end);
-            }
-
             // event_source_decls
-            let ed_off = event_decls_buf.len() as u32;
-            write_u32(&mut sg_buf, ed_off);
-            write_u32(&mut sg_buf, sg.event_source_decls.len() as u32);
             for decl in &sg.event_source_decls {
                 write_u32(&mut event_decls_buf, decl.node.0);
                 write_u8(&mut event_decls_buf, event_kind_to_u8(decl.kind));
-                write_u8(&mut event_decls_buf, 0); // padding
+                write_u8(&mut event_decls_buf, 0); // padding to 8B stride
                 write_u8(&mut event_decls_buf, 0);
                 write_u8(&mut event_decls_buf, 0);
             }
 
-            // defer_table
-            let df_off = defer_entries_buf.len() as u32;
-            write_u32(&mut sg_buf, df_off);
-            write_u32(&mut sg_buf, sg.defer_table.len() as u32);
+            // defer_table (10B/entry: trigger + body_sg + captured count u16;
+            // captured ids are appended to defer_captured_buf in entry order)
             for de in &sg.defer_table {
-                let ci_off = defer_captured_buf.len() as u32;
+                debug_assert!(de.captured_inputs.len() <= u16::MAX as usize);
                 write_u32(&mut defer_entries_buf, de.trigger_node.0);
                 write_u32(&mut defer_entries_buf, de.body_subgraph.0);
-                write_u32(&mut defer_entries_buf, ci_off);
-                write_u32(&mut defer_entries_buf, de.captured_inputs.len() as u32);
+                write_u16(&mut defer_entries_buf, de.captured_inputs.len() as u16);
                 // `registered` is runtime state and is not serialized.
                 for nid in &de.captured_inputs {
                     write_u32(&mut defer_captured_buf, nid.0);
                 }
             }
 
-            // reset_plan
-            write_u8(&mut sg_buf, sg.reset_plan.is_some() as u8);
+            // reset_plan region slice [start .. next sg's start)
             if let Some(rp) = &sg.reset_plan {
-                let rp_off = reset_plan_buf.len() as u32;
-                write_u32(&mut sg_buf, rp_off);
-                // ResetPlan: 3 Vec<NodeId>
                 write_u32(&mut reset_plan_buf, rp.reset_to_zero.len() as u32);
                 for nid in &rp.reset_to_zero { write_u32(&mut reset_plan_buf, nid.0); }
                 write_u32(&mut reset_plan_buf, rp.reset_to_one.len() as u32);
                 for nid in &rp.reset_to_one { write_u32(&mut reset_plan_buf, nid.0); }
                 write_u32(&mut reset_plan_buf, rp.reset_condition_tree.len() as u32);
                 for nid in &rp.reset_condition_tree { write_u32(&mut reset_plan_buf, nid.0); }
-            } else {
-                write_u32(&mut sg_buf, 0); // placeholder
             }
         }
 
         sections.push((SectionKind::SubGraphs, sg_buf));
         sections.push((SectionKind::SgUpvalueNodes, upvalue_nodes_buf));
-        sections.push((SectionKind::SgNestedRanges, nested_ranges_buf));
         sections.push((SectionKind::SgEventDecls, event_decls_buf));
         sections.push((SectionKind::SgDeferEntries, defer_entries_buf));
         sections.push((SectionKind::SgDeferCapturedInputs, defer_captured_buf));
@@ -374,7 +365,9 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
                         }
                         ConstValue::Null | ConstValue::Void => {}
                     }
-                    write_bytes(b, &payload);
+                    // v3: variable-width payload (bool 1B, i32 4B ... i128 16B).
+                    let w = const_payload_len(const_tag_to_u8(cv));
+                    write_bytes(b, &payload[..w]);
                 });
             }
         }
@@ -726,105 +719,115 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         InputsPool { data: data_vec }
     };
 
-    // 3. SubGraphs (v1 encoding unchanged)
+    // 3. SubGraphs (v3 packed layout; nested_ranges derived after assembly)
     let subgraphs = {
         let sr = mem.section(SectionKind::SubGraphs);
         let upv = mem.section(SectionKind::SgUpvalueNodes);
-        let nr2 = mem.section(SectionKind::SgNestedRanges);
         let ed = mem.section(SectionKind::SgEventDecls);
         let df = mem.section(SectionKind::SgDeferEntries);
         let dc = mem.section(SectionKind::SgDeferCapturedInputs);
         let rp = mem.section(SectionKind::SgResetPlan);
 
-        let mut subgraphs = Vec::with_capacity(mem.header().subgraph_count as usize);
+        let sg_count = mem.header().subgraph_count as usize;
+        let mut subgraphs = Vec::with_capacity(sg_count);
         let mut sr_r = sr;
-        for _ in 0..mem.header().subgraph_count {
-            let id = SubGraphId(read_u32(&mut sr_r));
+        // Implicit CSR cursors: the four small regions append in sg order;
+        // reset plans use explicit slice starts (last sg's slice ends at the
+        // region's total length, known after the loop).
+        let mut uv_cur = 0usize;
+        let mut ed_cur = 0usize;
+        let mut df_cur = 0usize;
+        let mut dc_cur = 0usize;
+        let mut rp_starts: Vec<u32> = Vec::with_capacity(sg_count + 1);
+        for i in 0..sg_count {
             let node_range = (NodeId(read_u32(&mut sr_r)), NodeId(read_u32(&mut sr_r)));
             let param_count = read_u8(&mut sr_r);
             let entry_node = NodeId(read_u32(&mut sr_r));
             let return_node = NodeId(read_u32(&mut sr_r));
-            let has_suspend = read_u8(&mut sr_r) != 0;
-            let loop_kind = u8_to_loop_kind(read_u8(&mut sr_r));
+            let flags = read_u8(&mut sr_r);
+            let has_suspend = flags & 1 != 0;
+            let has_rp = flags & 0b10 != 0;
+            let loop_kind = u8_to_loop_kind(flags >> 4);
+            let upvalue_count = read_u8(&mut sr_r);
             let loop_parent_sg = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(SubGraphId(v)) } };
             let cond_node = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(NodeId(v)) } };
             let function_id = read_u32(&mut sr_r);
             let iter_next_node = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(NodeId(v)) } };
-            let upvalue_count = read_u8(&mut sr_r);
+            let uv_len = read_u16(&mut sr_r) as usize;
+            let ed_len = read_u16(&mut sr_r) as usize;
+            let df_len = read_u16(&mut sr_r) as usize;
+            rp_starts.push(read_u32(&mut sr_r));
 
-            // upvalue_outer_nodes
-            let uv_off = read_u32(&mut sr_r) as usize;
-            let uv_len = read_u32(&mut sr_r) as usize;
             let upvalue_outer_nodes: Vec<NodeId> = (0..uv_len)
-                .map(|i| {
-                    let base = uv_off + i * 4;
+                .map(|j| {
+                    let base = (uv_cur + j) * 4;
                     NodeId(u32::from_le_bytes([upv[base], upv[base+1], upv[base+2], upv[base+3]]))
                 })
                 .collect();
+            uv_cur += uv_len;
 
-            // nested_ranges
-            let nr_off = read_u32(&mut sr_r) as usize;
-            let nr_len = read_u32(&mut sr_r) as usize;
-            let nested_ranges: Vec<(u32, u32)> = (0..nr_len)
-                .map(|i| {
-                    let base = nr_off + i * 8;
-                    (u32::from_le_bytes([nr2[base], nr2[base+1], nr2[base+2], nr2[base+3]]),
-                     u32::from_le_bytes([nr2[base+4], nr2[base+5], nr2[base+6], nr2[base+7]]))
-                })
-                .collect();
-
-            // event_source_decls
-            let ed_off = read_u32(&mut sr_r) as usize;
-            let ed_len = read_u32(&mut sr_r) as usize;
             let event_source_decls: Vec<EventSourceDecl> = (0..ed_len)
-                .map(|i| {
-                    let base = ed_off + i * 8;
+                .map(|j| {
+                    let base = (ed_cur + j) * 8;
                     EventSourceDecl {
                         node: NodeId(u32::from_le_bytes([ed[base], ed[base+1], ed[base+2], ed[base+3]])),
                         kind: u8_to_event_kind(ed[base+4]),
                     }
                 })
                 .collect();
+            ed_cur += ed_len;
 
-            // defer_table
-            let df_off = read_u32(&mut sr_r) as usize;
-            let df_len = read_u32(&mut sr_r) as usize;
-            let defer_table: Vec<DeferEntry> = (0..df_len)
-                .map(|i| {
-                    let base = df_off + i * 16; // 4*4 bytes per entry
-                    let trigger_node = NodeId(u32::from_le_bytes([df[base], df[base+1], df[base+2], df[base+3]]));
-                    let body_subgraph = SubGraphId(u32::from_le_bytes([df[base+4], df[base+5], df[base+6], df[base+7]]));
-                    let ci_off = u32::from_le_bytes([df[base+8], df[base+9], df[base+10], df[base+11]]) as usize;
-                    let ci_len = u32::from_le_bytes([df[base+12], df[base+13], df[base+14], df[base+15]]) as usize;
-                    let captured_inputs: Vec<NodeId> = (0..ci_len)
-                        .map(|j| NodeId(u32::from_le_bytes([dc[ci_off + j*4], dc[ci_off + j*4 + 1], dc[ci_off + j*4 + 2], dc[ci_off + j*4 + 3]])))
-                        .collect();
-                    DeferEntry { trigger_node, body_subgraph, captured_inputs, registered: false }
-                })
-                .collect();
+            // defer_table: 10B/entry; captured ids continue the dc cursor.
+            let mut defer_table = Vec::with_capacity(df_len);
+            for _ in 0..df_len {
+                let base = df_cur * 10;
+                df_cur += 1;
+                let trigger_node = NodeId(u32::from_le_bytes([df[base], df[base+1], df[base+2], df[base+3]]));
+                let body_subgraph = SubGraphId(u32::from_le_bytes([df[base+4], df[base+5], df[base+6], df[base+7]]));
+                let ci_len = u16::from_le_bytes([df[base+8], df[base+9]]) as usize;
+                let captured_inputs: Vec<NodeId> = (0..ci_len)
+                    .map(|j| {
+                        let b2 = (dc_cur + j) * 4;
+                        NodeId(u32::from_le_bytes([dc[b2], dc[b2+1], dc[b2+2], dc[b2+3]]))
+                    })
+                    .collect();
+                dc_cur += ci_len;
+                defer_table.push(DeferEntry { trigger_node, body_subgraph, captured_inputs, registered: false });
+            }
 
-            // reset_plan
-            let has_rp = read_u8(&mut sr_r) != 0;
-            let rp_off = read_u32(&mut sr_r) as usize;
-            let reset_plan = if has_rp {
-                let mut rp_r = &rp[rp_off..];
+            subgraphs.push(SubGraph {
+                id: SubGraphId(i as u32),
+                node_range, param_count, entry_node, return_node, has_suspend,
+                event_source_decls, defer_table, loop_kind, loop_parent_sg, cond_node,
+                function_id, iter_next_node, upvalue_count, upvalue_outer_nodes,
+                nested_ranges: Vec::new(), // derived post-assembly (v3)
+                reset_plan: None,           // filled below once slice ends are known
+            });
+
+            // Reset plans parse in the pass below (a plan's slice ends where
+            // the next sg's slice starts); park a marker on the struct now.
+            if has_rp {
+                subgraphs[i].reset_plan = Some(ResetPlan {
+                    reset_to_zero: Vec::new(), reset_to_one: Vec::new(),
+                    reset_condition_tree: Vec::new(), condition_tree_plan: Vec::new(),
+                });
+            }
+        }
+        rp_starts.push(rp.len() as u32);
+        // Fill reset plans with their slice [start_i, start_{i+1}).
+        for (i, sg) in subgraphs.iter_mut().enumerate() {
+            if sg.reset_plan.is_some() {
+                let s = rp_starts[i] as usize;
+                let e = rp_starts[i + 1] as usize;
+                let mut rp_r = &rp[s..e];
                 let rz_len = read_u32(&mut rp_r) as usize;
                 let reset_to_zero: Vec<NodeId> = (0..rz_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
                 let ro_len = read_u32(&mut rp_r) as usize;
                 let reset_to_one: Vec<NodeId> = (0..ro_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
                 let rc_len = read_u32(&mut rp_r) as usize;
                 let reset_condition_tree: Vec<NodeId> = (0..rc_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
-                Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree, condition_tree_plan: Vec::new() })
-            } else {
-                None
-            };
-
-            subgraphs.push(SubGraph {
-                id, node_range, param_count, entry_node, return_node, has_suspend,
-                event_source_decls, defer_table, loop_kind, loop_parent_sg, cond_node,
-                function_id, iter_next_node, upvalue_count, upvalue_outer_nodes,
-                nested_ranges, reset_plan,
-            });
+                sg.reset_plan = Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree, condition_tree_plan: Vec::new() });
+            }
         }
         subgraphs
     };
@@ -971,7 +974,8 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         for (idx, off) in pairs {
             let b = off as usize;
             let tag = blob[b];
-            let payload = &blob[b + 1..b + 17];
+            let w = const_payload_len(tag);
+            let payload = &blob[b + 1..b + 1 + w];
             v[idx as usize] = Some(parse_const_value(tag, payload));
         }
         v
@@ -1160,10 +1164,10 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         memo_infos,
         memo_tables,
         vtable_fallback_dispatch: rustc_hash::FxHashMap::default(),
+        sg_debug_names: Vec::new(),
         string_pool,
         mem: None,
         sg_uv_offsets: Vec::new(),
-        sg_nr_offsets: Vec::new(),
         gate_branch_offsets: Vec::new(),
         record_lit_info_offsets: Vec::new(),
         select_info_offsets: Vec::new(),
@@ -1175,6 +1179,9 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     };
     // W5: rebuild the flattened condition-tree reset plans (kept out of the
     // .kzo format; recomputed at load).
+    // v3: nested_ranges are derived (no longer serialized) — must run BEFORE
+    // precompute_reset_plans, whose condition-tree walk reads them.
+    graph.compute_nested_ranges();
     graph.precompute_reset_plans();
     // E0 perf: materialize GateBranches once (no-op on the owned path, which
     // already owns them).
@@ -1194,9 +1201,10 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
     let n = mem.header().node_count as usize;
     let offsets_elided = mem.header().flags & FLAG_NODE_INPUT_OFFSETS_ELIDED != 0;
 
-    // SubGraphs eager-load (includes variable-length fields; upvalue_nodes and
-    // nested_ranges stay zerocopy CSR via offset tables).
-    let (subgraphs, sg_uv_offsets, sg_nr_offsets) = {
+    // SubGraphs eager-load (v3 packed layout — same scheme as the eager
+    // loader; upvalue_outer_nodes stay zerocopy CSR, nested_ranges are
+    // derived post-assembly, reset plans parse from explicit slice starts).
+    let (subgraphs, sg_uv_offsets) = {
         let sr = mem.section(SectionKind::SubGraphs);
         let ed = mem.section(SectionKind::SgEventDecls);
         let df = mem.section(SectionKind::SgDeferEntries);
@@ -1206,89 +1214,96 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         let sg_count = mem.header().subgraph_count as usize;
         let mut subgraphs = Vec::with_capacity(sg_count);
         let mut sg_uv_offsets = Vec::with_capacity(sg_count);
-        let mut sg_nr_offsets = Vec::with_capacity(sg_count);
         let mut sr_r = sr;
-        for _ in 0..sg_count {
-            let id = SubGraphId(read_u32(&mut sr_r));
+        let mut uv_cur = 0usize;
+        let mut ed_cur = 0usize;
+        let mut df_cur = 0usize;
+        let mut dc_cur = 0usize;
+        let mut rp_starts: Vec<u32> = Vec::with_capacity(sg_count + 1);
+        for i in 0..sg_count {
             let node_range = (NodeId(read_u32(&mut sr_r)), NodeId(read_u32(&mut sr_r)));
             let param_count = read_u8(&mut sr_r);
             let entry_node = NodeId(read_u32(&mut sr_r));
             let return_node = NodeId(read_u32(&mut sr_r));
-            let has_suspend = read_u8(&mut sr_r) != 0;
-            let loop_kind = u8_to_loop_kind(read_u8(&mut sr_r));
+            let flags = read_u8(&mut sr_r);
+            let has_suspend = flags & 1 != 0;
+            let has_rp = flags & 0b10 != 0;
+            let loop_kind = u8_to_loop_kind(flags >> 4);
+            let upvalue_count = read_u8(&mut sr_r);
             let loop_parent_sg = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(SubGraphId(v)) } };
             let cond_node = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(NodeId(v)) } };
             let function_id = read_u32(&mut sr_r);
             let iter_next_node = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(NodeId(v)) } };
-            let upvalue_count = read_u8(&mut sr_r);
+            let uv_len = read_u16(&mut sr_r) as usize;
+            let ed_len = read_u16(&mut sr_r) as usize;
+            let df_len = read_u16(&mut sr_r) as usize;
+            rp_starts.push(read_u32(&mut sr_r));
 
-            // upvalue_outer_nodes: zerocopy CSR — store offset/len, do not parse into a Vec.
-            let uv_off = read_u32(&mut sr_r);
-            let uv_len = read_u32(&mut sr_r);
-            sg_uv_offsets.push((uv_off, uv_len));
+            // upvalue_outer_nodes: zerocopy CSR — store byte offset/len (u32 elements).
+            sg_uv_offsets.push(((uv_cur * 4) as u32, uv_len as u32));
+            uv_cur += uv_len;
             let upvalue_outer_nodes: Vec<NodeId> = Vec::new();
 
-            // nested_ranges: zerocopy CSR — store offset/len, do not parse into a Vec.
-            let nr_off = read_u32(&mut sr_r);
-            let nr_len = read_u32(&mut sr_r);
-            sg_nr_offsets.push((nr_off, nr_len));
-            let nested_ranges: Vec<(u32, u32)> = Vec::new();
-
-            let ed_off = read_u32(&mut sr_r) as usize;
-            let ed_len = read_u32(&mut sr_r) as usize;
             let event_source_decls: Vec<EventSourceDecl> = (0..ed_len)
-                .map(|i| {
-                    let base = ed_off + i * 8;
+                .map(|j| {
+                    let base = (ed_cur + j) * 8;
                     EventSourceDecl {
                         node: NodeId(u32::from_le_bytes([ed[base], ed[base+1], ed[base+2], ed[base+3]])),
                         kind: u8_to_event_kind(ed[base+4]),
                     }
                 })
                 .collect();
+            ed_cur += ed_len;
 
-            let df_off = read_u32(&mut sr_r) as usize;
-            let df_len = read_u32(&mut sr_r) as usize;
-            let defer_table: Vec<DeferEntry> = (0..df_len)
-                .map(|i| {
-                    let base = df_off + i * 16;
-                    let trigger_node = NodeId(u32::from_le_bytes([df[base], df[base+1], df[base+2], df[base+3]]));
-                    let body_subgraph = SubGraphId(u32::from_le_bytes([df[base+4], df[base+5], df[base+6], df[base+7]]));
-                    let ci_off = u32::from_le_bytes([df[base+8], df[base+9], df[base+10], df[base+11]]) as usize;
-                    let ci_len = u32::from_le_bytes([df[base+12], df[base+13], df[base+14], df[base+15]]) as usize;
-                    let captured_inputs: Vec<NodeId> = (0..ci_len)
-                        .map(|j| {
-                            let b2 = ci_off + j * 4;
-                            NodeId(u32::from_le_bytes([dc[b2], dc[b2+1], dc[b2+2], dc[b2+3]]))
-                        })
-                        .collect();
-                    DeferEntry { trigger_node, body_subgraph, captured_inputs, registered: false }
-                })
-                .collect();
+            let mut defer_table = Vec::with_capacity(df_len);
+            for _ in 0..df_len {
+                let base = df_cur * 10;
+                df_cur += 1;
+                let trigger_node = NodeId(u32::from_le_bytes([df[base], df[base+1], df[base+2], df[base+3]]));
+                let body_subgraph = SubGraphId(u32::from_le_bytes([df[base+4], df[base+5], df[base+6], df[base+7]]));
+                let ci_len = u16::from_le_bytes([df[base+8], df[base+9]]) as usize;
+                let captured_inputs: Vec<NodeId> = (0..ci_len)
+                    .map(|j| {
+                        let b2 = (dc_cur + j) * 4;
+                        NodeId(u32::from_le_bytes([dc[b2], dc[b2+1], dc[b2+2], dc[b2+3]]))
+                    })
+                    .collect();
+                dc_cur += ci_len;
+                defer_table.push(DeferEntry { trigger_node, body_subgraph, captured_inputs, registered: false });
+            }
 
-            let has_reset_plan = read_u8(&mut sr_r) != 0;
-            let reset_plan = if has_reset_plan {
-                let rp_off = read_u32(&mut sr_r) as usize;
-                let mut rp_r = &rp[rp_off..];
+            subgraphs.push(SubGraph {
+                id: SubGraphId(i as u32),
+                node_range, param_count, entry_node, return_node, has_suspend,
+                event_source_decls, defer_table, loop_kind, loop_parent_sg, cond_node,
+                function_id, iter_next_node, upvalue_count, upvalue_outer_nodes,
+                nested_ranges: Vec::new(), // derived post-assembly (v3)
+                reset_plan: None,
+            });
+
+            if has_rp {
+                subgraphs[i].reset_plan = Some(ResetPlan {
+                    reset_to_zero: Vec::new(), reset_to_one: Vec::new(),
+                    reset_condition_tree: Vec::new(), condition_tree_plan: Vec::new(),
+                });
+            }
+        }
+        rp_starts.push(rp.len() as u32);
+        for (i, sg) in subgraphs.iter_mut().enumerate() {
+            if sg.reset_plan.is_some() {
+                let s = rp_starts[i] as usize;
+                let e = rp_starts[i + 1] as usize;
+                let mut rp_r = &rp[s..e];
                 let rz_len = read_u32(&mut rp_r) as usize;
                 let reset_to_zero: Vec<NodeId> = (0..rz_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
                 let ro_len = read_u32(&mut rp_r) as usize;
                 let reset_to_one: Vec<NodeId> = (0..ro_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
                 let rc_len = read_u32(&mut rp_r) as usize;
                 let reset_condition_tree: Vec<NodeId> = (0..rc_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
-                Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree, condition_tree_plan: Vec::new() })
-            } else {
-                let _ = read_u32(&mut sr_r); // skip placeholder
-                None
-            };
-
-            subgraphs.push(SubGraph {
-                id, node_range, param_count, entry_node, return_node, has_suspend,
-                event_source_decls, defer_table, loop_kind, loop_parent_sg, cond_node,
-                function_id, iter_next_node, upvalue_count, upvalue_outer_nodes,
-                nested_ranges, reset_plan,
-            });
+                sg.reset_plan = Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree, condition_tree_plan: Vec::new() });
+            }
         }
-        (subgraphs, sg_uv_offsets, sg_nr_offsets)
+        (subgraphs, sg_uv_offsets)
     };
 
     // v2: node inputs offsets — when elided (contiguous pool), materialize the
@@ -1524,10 +1539,10 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         memo_infos,
         memo_tables,
         vtable_fallback_dispatch: rustc_hash::FxHashMap::default(),
+        sg_debug_names: Vec::new(),
         string_pool,
         mem: Some(mem),
         sg_uv_offsets,
-        sg_nr_offsets,
         gate_branch_offsets,
         record_lit_info_offsets,
         select_info_offsets,
@@ -1540,6 +1555,9 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
     // W5: rebuild the flattened condition-tree reset plans (kept out of the
     // .kzo format; recomputed at load). Works through the mem-agnostic
     // accessors on the zerocopy backing.
+    // v3: nested_ranges are derived (no longer serialized) — must run BEFORE
+    // precompute_reset_plans, whose condition-tree walk reads them.
+    graph.compute_nested_ranges();
     graph.precompute_reset_plans();
     // E0 perf: materialize GateBranches once (borrowed access on every Gate execution).
     graph.materialize_gate_branches();
@@ -1859,6 +1877,8 @@ mod tests {
                 sa.reset_plan.as_ref().map(|p| &p.reset_to_zero),
                 sb.reset_plan.as_ref().map(|p| &p.reset_to_zero),
             );
+            assert_eq!(sa.nested_ranges, sb.nested_ranges, "sg {} nested_ranges", sa.id.0);
+            assert_eq!(sa.reset_plan.as_ref().map(|p| &p.reset_condition_tree), sb.reset_plan.as_ref().map(|p| &p.reset_condition_tree));
         }
         assert_eq!(a.entry_subgraph, b.entry_subgraph);
     }

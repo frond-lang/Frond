@@ -37,8 +37,20 @@ pub fn cmd_build(output: Option<String>, opt_level_cli: Option<u8>) {
         }
     };
 
-    // Serialize to .kzo
-    let kzo_data = crate::solidify::Format::serialize_solidify(&graph);
+    // Serialize to .kzo (stability net: an internal serialization panic
+    // becomes a clean internal-error exit, not a process crash).
+    let kzo_data = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::solidify::Format::serialize_solidify(&graph)
+    })) {
+        Ok(data) => data,
+        Err(payload) => {
+            eprintln!(
+                "error: internal compiler error during serialization: {}",
+                crate::pass::Optimizer::panic_payload_message(&payload)
+            );
+            process::exit(1);
+        }
+    };
     if let Err(e) = fs::write(&out_path, &kzo_data) {
         eprintln!("error: could not write '{}': {}", out_path, e);
         process::exit(1);

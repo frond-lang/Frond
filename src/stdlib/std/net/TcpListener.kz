@@ -16,6 +16,7 @@
 // ─── Kuzo wrapper: @extern("C") raw return value → Throw ──────────────
 
 // __net_tcp_listen(ip: IpAddr, port: u16, reuse_addr: bool): Throw<i64, IOError>
+@internal
 fun __net_tcp_listen(ip: IpAddr, port: u16, reuse_addr: bool): Throw<i64, IOError> {
     match ip {
         V4(v4_addr) => {

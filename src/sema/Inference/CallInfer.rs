@@ -13,6 +13,32 @@ impl<'a> InferContext<'a> {
     ) -> TypeHandle {
         match &ast.expr(expr).node {
             Expr::Call { callee, args, .. } => {
+                // Scalar type name used as a constructor call (e.g. `u64(x)`): scalar types
+                // have no constructors — the correct spelling is a cast. This must run
+                // FIRST: a scalar type name otherwise infers as a builtin conversion
+                // function type (Fn(scalar) -> scalar), which silently compiles to a
+                // target-less Call node evaluating to void (the `__read_u64_le` bug class).
+                if let Expr::Ident(name) = &ast.expr(*callee).node {
+                    if let Some(tag) = crate::value::ValueTag::from_name(name) {
+                        if tag.is_int() || tag.is_float()
+                            || matches!(tag, crate::value::ValueTag::Bool | crate::value::ValueTag::Char)
+                        {
+                            let span = ast.expr(expr).span;
+                            self.add_error_at(
+                                &format!(
+                                    "'{}' is a scalar type and has no constructor; use 'x as {}' for conversion",
+                                    name, name
+                                ),
+                                span.line,
+                                span.column,
+                            );
+                            for &a in args.iter() {
+                                let _ = self.infer_expr(a, ast, env, None);
+                            }
+                            return self.arena.make(Type::Unknown);
+                        }
+                    }
+                }
                 // ── Constructor multi-mapping disambiguation ──
                 // When callee is an Ident that maps to multiple same-named constructors, disambiguate by priority:
                 //   1. Type-oriented: when expected_ty is an Adt, select by type_name
@@ -224,6 +250,7 @@ impl<'a> InferContext<'a> {
                     return return_type;
                 }
                 // Fallback: infer all arguments and unify the callee with (args -> ret).
+                // (Scalar-name constructors are rejected at the top of this arm.)
                 let ret_ty = self.arena.fresh_type_var();
                 let arg_types: Vec<TypeHandle> = args
                     .iter()

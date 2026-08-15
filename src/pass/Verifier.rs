@@ -57,8 +57,33 @@ pub fn verify_with_stage(graph: &DataFlowGraph, stage: &str) -> Vec<Violation> {
     verify_subgraphs(graph, &regions, &mut v);
     verify_downstreams(graph, &mut v);
     verify_loop_versioning(graph, &mut v);
+    verify_node_ref_bounds(graph, &mut v);
     verify_sg_refs(graph, stage != "build", &mut v);
     v
+}
+
+/// V8: every out-of-band NodeId reference (NodeRef door) must be in bounds.
+/// A violation here means a pass or `rebuild` left a metadata reference to a
+/// node that no longer exists — the "ref node not live" / dangling-anchor
+/// class, caught at the stage where it happened instead of panicking three
+/// passes later. Load-path graphs are checked through the same door (the
+/// complex tables are materialized at load; upvalues via CSR accessor).
+fn verify_node_ref_bounds(graph: &DataFlowGraph, out: &mut Vec<Violation>) {
+    let total = graph.node_count();
+    let mut count = 0usize;
+    graph.for_each_node_ref(|site, owner, id| {
+        if id.0 as usize >= total {
+            out.push(Violation {
+                check: "V8-node-refs",
+                message: format!(
+                    "{:?} (owner {}) references node {} out of bounds (total={})",
+                    site, owner, id.0, total
+                ),
+            });
+        }
+        count += 1;
+    });
+    let _ = count;
 }
 
 /// Verify, report to stderr, and (under `KUZO_VERIFY_STRICT=1`) panic.

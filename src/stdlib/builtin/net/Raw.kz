@@ -22,6 +22,7 @@
 @c_include("winsock2.h")
 @c_include("ws2tcpip.h")
 @c_include("string.h")
+@internal
 @extern("C")
 fun __net_tcp_connect_v4(ip_bits: u32, port: u16, timeout_ns: i64): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -57,6 +58,7 @@ fun __net_tcp_connect_v4(ip_bits: u32, port: u16, timeout_ns: i64): i64 #{
 @c_include("winsock2.h")
 @c_include("ws2tcpip.h")
 @c_include("string.h")
+@internal
 @extern("C")
 fun __net_tcp_listen_v4(ip_bits: u32, port: u16, reuse_addr: bool): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -107,6 +109,7 @@ fun __net_tcp_listen_v4(ip_bits: u32, port: u16, reuse_addr: bool): i64 #{
 
 @c_include("winsock2.h")
 @c_include("ws2tcpip.h")
+@internal
 @extern("C")
 fun __net_tcp_accept(fd: i64): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -124,6 +127,7 @@ fun __net_tcp_accept(fd: i64): i64 #{
 }#
 
 @c_include("winsock2.h")
+@internal
 @extern("C")
 fun __net_tcp_read(fd: i64, buf: u8[], len: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -137,6 +141,7 @@ fun __net_tcp_read(fd: i64, buf: u8[], len: usize): i64 #{
 }#
 
 @c_include("winsock2.h")
+@internal
 @extern("C")
 fun __net_tcp_write(fd: i64, buf: u8[], len: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -151,6 +156,7 @@ fun __net_tcp_write(fd: i64, buf: u8[], len: usize): i64 #{
 
 @c_include("winsock2.h")
 @c_include("unistd.h")
+@internal
 @extern("C")
 fun __net_tcp_close_raw(fd: i64): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -165,6 +171,7 @@ fun __net_tcp_close_raw(fd: i64): i32 #{
 @c_include("winsock2.h")
 @c_include("ws2tcpip.h")
 @c_include("string.h")
+@internal
 @extern("C")
 fun __net_udp_bind_v4(ip_bits: u32, port: u16, reuse_addr: bool): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -208,6 +215,7 @@ fun __net_udp_bind_v4(ip_bits: u32, port: u16, reuse_addr: bool): i64 #{
 @c_include("winsock2.h")
 @c_include("ws2tcpip.h")
 @c_include("string.h")
+@internal
 @extern("C")
 fun __net_udp_send_to_v4(fd: i64, ip_bits: u32, port: u16, buf: u8[], len: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -232,6 +240,7 @@ fun __net_udp_send_to_v4(fd: i64, ip_bits: u32, port: u16, buf: u8[], len: usize
 
 @c_include("winsock2.h")
 @c_include("ws2tcpip.h")
+@internal
 @extern("C")
 fun __net_udp_recv_from_v4(fd: i64, buf: u8[], len: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -264,6 +273,7 @@ fun __net_udp_recv_from_v4(fd: i64, buf: u8[], len: usize): i64 #{
 @c_include("winsock2.h")
 @c_include("ws2tcpip.h")
 @c_include("string.h")
+@internal
 @extern("C")
 fun __net_resolve_into(host: str, out_buf: u8[], max_count: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -307,6 +317,7 @@ fun __net_resolve_into(host: str, out_buf: u8[], max_count: usize): i64 #{
 @c_include("winsock2.h")
 @c_include("ws2tcpip.h")
 @c_include("string.h")
+@internal
 @extern("C")
 fun __net_tcp_connect_v6(ip_hi: u64, ip_lo: u64, port: u16, timeout_ns: i64): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -372,6 +383,7 @@ fun __net_tcp_connect_v6(ip_hi: u64, ip_lo: u64, port: u16, timeout_ns: i64): i6
 @c_include("winsock2.h")
 @c_include("ws2tcpip.h")
 @c_include("string.h")
+@internal
 @extern("C")
 fun __net_tcp_listen_v6(ip_hi: u64, ip_lo: u64, port: u16, reuse_addr: bool): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -455,6 +467,7 @@ fun __net_tcp_listen_v6(ip_hi: u64, ip_lo: u64, port: u16, reuse_addr: bool): i6
 @c_include("winsock2.h")
 @c_include("ws2tcpip.h")
 @c_include("string.h")
+@internal
 @extern("C")
 fun __net_udp_bind_v6(ip_hi: u64, ip_lo: u64, port: u16, reuse_addr: bool): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -528,6 +541,7 @@ fun __net_udp_bind_v6(ip_hi: u64, ip_lo: u64, port: u16, reuse_addr: bool): i64 
 @c_include("winsock2.h")
 @c_include("ws2tcpip.h")
 @c_include("string.h")
+@internal
 @extern("C")
 fun __net_udp_send_to_v6(fd: i64, ip_hi: u64, ip_lo: u64, port: u16, buf: u8[], len: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
@@ -582,6 +596,7 @@ fun __net_udp_send_to_v6(fd: i64, ip_hi: u64, ip_lo: u64, port: u16, buf: u8[], 
 
 @c_include("winsock2.h")
 @c_include("ws2tcpip.h")
+@internal
 @extern("C")
 fun __net_udp_recv_from_v6(fd: i64, buf: u8[], len: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)

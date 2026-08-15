@@ -19,18 +19,21 @@ use crate::ir::Ir::*;
 pub const SOLIDIFY_MAGIC: [u8; 4] = *b"KZO\x00";
 /// Format schema version.
 ///
-/// v2 (2026-08-15): binary structural slimming —
-/// - Nodes packed to 4B/node (kind u8 + input_count u8 + compute_fn u16),
-///   with per-node `inputs_offset` elided when the pool layout is contiguous
-///   (guaranteed post-`rebuild`; header flag bit0), else 8B with offset;
-/// - all per-node `Option` metadata tables (categories A/C/D/E) switched from
-///   dense rows (mostly None/sentinel, ~195B/node total) to sparse
-///   `[count][idx u32, blob_off u32]...[blob]` encoding;
-/// - `HoistedOwners` / `HoistedNode` / `Downstreams` sections dropped: no
-///   runtime consumers (the first two) or purely derivable from inputs (the
-///   last, recomputed at load).
-/// v1 files are rejected (rebuild from source to regenerate).
-pub const SOLIDIFY_SCHEMA_VERSION: u16 = 2;
+/// v3 (2026-08-15): field-level density pass on top of v2 —
+/// - `SgNestedRanges` section dropped: nested_ranges are derived data
+///   (containment of node_ranges) and are recomputed at load with an
+///   O(SG·log SG) sort+stack pass;
+/// - SubGraphs records packed 77B → ~45B: `id` elided (== vector index),
+///   the five variable-length regions switch from explicit (offset,len)
+///   pairs to append-order implicit offsets (per-sg lengths only), boolean
+///   fields merged into one flags byte, defer entries 16B → 10B;
+/// - ConstValues payloads variable-length by tag (bool 1B, i32 4B … i128
+///   16B instead of a fixed 16B) — lookup cost unchanged (the sparse index
+///   already carries per-entry byte offsets).
+/// v2: Nodes packed 4B, sparse per-node tables, dropped HoistedOwners/
+/// HoistedNode/Downstreams, DynFfiInfos serialized.
+/// Older files are rejected (rebuild from source to regenerate).
+pub const SOLIDIFY_SCHEMA_VERSION: u16 = 3;
 /// Header flag bit0: node inputs_offset omitted from packed Nodes records
 /// (inputs pool contiguous in node-id order; offsets derived at load).
 pub const FLAG_NODE_INPUT_OFFSETS_ELIDED: u16 = 0b0000_0001;
@@ -242,6 +245,9 @@ pub fn write_bytes(w: &mut Vec<u8>, v: &[u8]) { w.extend_from_slice(v); }
 
 pub fn read_u8(r: &mut &[u8]) -> u8 {
     let v = r[0]; *r = &r[1..]; v
+}
+pub fn read_u16(r: &mut &[u8]) -> u16 {
+    let v = u16::from_le_bytes([r[0], r[1]]); *r = &r[2..]; v
 }
 pub fn read_u32(r: &mut &[u8]) -> u32 {
     let v = u32::from_le_bytes([r[0], r[1], r[2], r[3]]); *r = &r[4..]; v
@@ -550,6 +556,23 @@ pub fn bytes_to_trait_method_entry(buf: &[u8; 8]) -> TraitMethodEntry {
     let arity = buf[4];
     let upvalue_count = buf[5];
     TraitMethodEntry { subgraph_id, arity, upvalue_count }
+}
+
+// ==================== ConstValue payload width (v3) ====================
+
+/// Variable payload width per ConstValue tag (v3 sparse ConstValues blob).
+/// Lookup stays a binary search on the (idx, byte_off) index — entry stride
+/// is irrelevant, so shrinking payloads is free.
+pub fn const_payload_len(tag: u8) -> usize {
+    match tag {
+        20 | 21 => 0,                                  // Null / Void
+        1 | 6 | 17 => 1,                               // I8 / U8 / Bool
+        2 | 7 | 15 => 2,                               // I16 / U16 / F16
+        3 | 8 | 13 | 18 => 4,                          // I32 / U32 / F32 / Char
+        4 | 9 | 11 | 12 | 14 | 19 => 8,                // I64 / U64 / Isize / Usize / F64 / Str
+        5 | 10 | 16 => 16,                             // I128 / U128 / F128
+        other => panic!("invalid ConstTag: {}", other),
+    }
 }
 
 // ==================== AbiType / AbiSig serialization ====================

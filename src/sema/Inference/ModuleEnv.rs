@@ -199,8 +199,55 @@ impl<'a> InferContext<'a> {
                         // Look up the symbol by bare name in the module env (does not traverse
                         // the parent env, to avoid importing global symbols).
                         if let Some(sym_ty) = self.env.lookup_local(module_env, item.name) {
-                            let local_name = item.alias.unwrap_or(item.name);
-                            self.env.define(env, local_name, sym_ty);
+                            self.env.define(env, item.alias.unwrap_or(item.name), sym_ty);
+                            // Register the alias for the IR binding layer
+                            // (sema.import_aliases → IrBuilder's func_subgraphs /
+                            // global_var_slots alias keys). Without this the
+                            // symbol type-checks but the IR call cannot bind
+                            // (the "selective imports never worked at the IR
+                            // level" gap — previously masked by the bare-key
+                            // last-writer-wins slot). A duplicate alias bound
+                            // to a DIFFERENT target is a hard error: writer-wins
+                            // here would silently rebind every bare call.
+                            let local = item.alias.unwrap_or(item.name);
+                            let target_mangled = format!("{}.{}", full_path, item.name);
+                            let existing = self.sema_result.get_import_alias(local).cloned();
+                            match existing {
+                                Some(prev) => {
+                                    let prev_desc = match &prev {
+                                        crate::sema::Sema::AliasTarget::Symbol(m) => {
+                                            if m.as_ref() == target_mangled {
+                                                continue; // same target re-imported: idempotent
+                                            }
+                                            format!("'{}'", m)
+                                        }
+                                        crate::sema::Sema::AliasTarget::Module(m) => {
+                                            format!("module '{}'", m)
+                                        }
+                                    };
+                                    self.sema_result.add_error(
+                                        crate::sema::Sema::SemaError::new(
+                                            &format!(
+                                                "import alias '{}' is already bound to {} — \
+                                                 aliasing two different symbols under one name \
+                                                 is ambiguous; import one and qualify the other",
+                                                local, prev_desc
+                                            ),
+                                            0,
+                                            0,
+                                        ),
+                                    );
+                                }
+                                None => {
+                                    self.sema_result.put_import_alias(
+                                        local,
+                                        crate::sema::Sema::AliasTarget::Symbol(
+                                            target_mangled.into_boxed_str(),
+                                        ),
+                                        module.name,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -571,16 +618,19 @@ impl<'a> InferContext<'a> {
             Decl::FunDecl { name, type_params, params, return_type, body, extern_c_body, is_async, attributes, .. } => {
                 // ── FFI permission check ──
                 // `@extern` / `@c_include` / `#{ }#` are only allowed in builtin (stdlib) modules;
-                // `@internal` is a reserved attribute and may not appear in any user code.
+                // `@internal` marks stdlib implementation primitives (callable only from
+                // `builtin/**` / `std/**` — enforced at call binding in the IR builder) and may
+                // be declared anywhere inside the stdlib, but never in user code.
                 // The builtin check is based on the module-name path prefix
                 // (`current_module_name` is set from `module.name` in `check_module_with_env`;
                 // builtin module names look like "builtin/io/Raw.kz").
                 let is_builtin = self.current_module_name.starts_with("builtin/");
+                let is_stdlib = is_builtin || self.current_module_name.starts_with("std/");
                 if !is_builtin {
                     for attr in attributes {
                         match attr.name {
-                            crate::ffi::ATTR_INTERNAL => self.add_error_at(
-                                "attribute '@internal' is reserved for the language implementation",
+                            crate::ffi::ATTR_INTERNAL if !is_stdlib => self.add_error_at(
+                                "attribute '@internal' is reserved for the standard library implementation",
                                 decl_span.line,
                                 decl_span.column,
                             ),

@@ -55,3 +55,42 @@ pub async fun write_file_bytes(path: str, content: u8[]): Async<Throw<void, IOEr
     f.write(content, content.len()).await()?
     Ok(void)
 }
+
+// ─── File-system management ───────────────────────────────────────
+
+// Whether the path exists (false for a missing path is NOT an error;
+// a Throw Err is reserved for host-level failures).
+pub async fun exists(path: str): Async<Throw<bool, IOError>> {
+    Ok(__file_exists_raw(path) != 0)
+}
+
+// Exists overload (Path)
+pub async fun exists_path(path: Path): Async<Throw<bool, IOError>> {
+    exists(path.to_str()).await()
+}
+
+// Copy a file, overwriting dst if it exists. Metadata is not preserved
+// (a fresh destination file is created), matching a plain byte copy.
+pub async fun copy_file(src: str, dst: str): Async<Throw<void, IOError>> {
+    val rc = __file_copy_raw(src, dst)
+    if rc < 0 {
+        throw IOError(Other, "copy failed: " + src + " -> " + dst, 0, dst)
+    }
+    Ok(void)
+}
+
+// Copy overload (Path)
+pub async fun copy_file_path(src: Path, dst: Path): Async<Throw<void, IOError>> {
+    copy_file(src.to_str(), dst.to_str()).await()
+}
+
+// Change file permission bits.
+// NOTE Windows semantics downgrade: only the read-only bit is honored
+// (setting any write bit clears read-only, clearing all write bits sets it).
+pub async fun chmod(path: str, mode: i32): Async<Throw<void, IOError>> {
+    val rc = __file_chmod_raw(path, mode)
+    if rc < 0 {
+        throw IOError(Other, "chmod failed", 0, path)
+    }
+    Ok(void)
+}

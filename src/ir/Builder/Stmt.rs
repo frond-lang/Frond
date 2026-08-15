@@ -484,6 +484,11 @@ impl<'a> IrBuilder<'a> {
                 Some(n)
             }
             crate::ast::Ast::Stmt::While { condition, body } => {
+                // Sync pre-loop assignments of loop-modified vars into their home slots
+                // BEFORE registration (the home slot is what the rebind'd condition and
+                // post-loop reads see; without this sync a pre-loop `i = i - 1` was
+                // invisible to the loop).
+                self.sync_modified_vars_to_home(*body);
                 let while_sg = self.register_while_subgraph(*condition, *body);
                 let call_node = self.compile_recursive_call(while_sg);
                 // Bug #100 (residual): statements AFTER the loop must read loop-assigned
@@ -494,6 +499,7 @@ impl<'a> IrBuilder<'a> {
                 Some(call_node)
             }
             crate::ast::Ast::Stmt::Loop { body } => {
+                self.sync_modified_vars_to_home(*body);
                 let loop_sg = self.register_loop_subgraph(*body);
                 let call_node = self.compile_recursive_call(loop_sg);
                 self.rebind_modified_vars_to_home(*body);

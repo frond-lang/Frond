@@ -341,7 +341,28 @@ impl<S: LockStrategy> Engine<S> {
                 NodeResult::Call(pending) => {
                     // Tail-call graph jump.
                     let graph_call_id = NodeId(pending.call_node_local.0 + frame.node_offset);
-                    if graph.tail_call_flag(graph_call_id.0 as usize) {
+                    // Same-function branch-frame guard: when this frame IS an if/match branch
+                    // (its value table lives in the parent function's layout — node_offset ≠ its
+                    // own subgraph range — and its caller launch node is a Gate in that shared
+                    // layout), a tail jump would swap the branch frame in place with the callee:
+                    // the callee's completion then writes the Gate node directly as data and the
+                    // branch's own CF_RETURN never runs — the branch's Return signal is lost and
+                    // the function falls through to its tail expression (wrong result). Route
+                    // such calls through the normal call path so the branch frame executes its
+                    // Return node and propagates the signal properly.
+                    let frame_is_branch = frame.node_offset
+                        != graph.subgraphs[frame.subgraph_id.0 as usize].node_range.0 .0;
+                    // Only same-function branch frames share the caller's node_offset layout,
+                    // so the caller launch node is only resolvable (and only relevant) there.
+                    let branch_frame_tail = frame_is_branch
+                        && frame
+                            .caller
+                            .map(|(_, cn)| {
+                                graph.node((cn.0 + frame.node_offset) as usize).kind
+                                    == NodeKind::Gate
+                            })
+                            .unwrap_or(false);
+                    if graph.tail_call_flag(graph_call_id.0 as usize) && !branch_frame_tail {
                         let caller = frame.caller;
                         let propagate_to_parent =
                             if let Some((caller_fid, call_node)) = caller {
@@ -914,6 +935,9 @@ impl<S: LockStrategy> Engine<S> {
                     }
                 }
                 NodeResult::Return(v) => {
+                    if super::env_flag("KUZO_DEBUG_SIGNAL") {
+                        eprintln!("[SIG-SET] node_local={} sg={} v={:?}", local_id.0, frame.subgraph_id.0, v);
+                    }
                     frame.control_signal = ControlSignal::Return(v);
                     break;
                 }
@@ -1263,7 +1287,30 @@ impl<S: LockStrategy> Engine<S> {
                             }
                             if let Some(pf) = parent_box {
                                 let parent_has_caller = pf.caller.is_some();
-                                if parent_has_caller {
+                                // The parent may itself have been spawned as an ASYNC call:
+                                // its await-er waits on AsyncJoin(parent_async_id), which
+                                // complete_and_wake_caller never fires (it only completes
+                                // SubgraphComplete waiters). Route through the async_join
+                                // completion exactly like the normal Completed branch, or
+                                // the await after the call is lost forever (silent drop).
+                                let async_id =
+                                    self.async_join_runtime.lock().find_by_child(parent_fid);
+                                if let Some(async_id) = async_id {
+                                    let return_value =
+                                        extract_child_return(&pf, &self.graph);
+                                    self.async_join_runtime
+                                        .lock()
+                                        .set_result(async_id, return_value.clone());
+                                    let woken = self.on_event_arrived(
+                                        RuntimeEvent::AsyncJoin(async_id),
+                                        return_value,
+                                        queue,
+                                    );
+                                    if woken > 0 {
+                                        self.async_join_runtime.lock().remove_entry(async_id);
+                                    }
+                                    self.release_frame(pf);
+                                } else if parent_has_caller {
                                     self.complete_and_wake_caller(*pf, queue);
                                 } else {
                                     // Top-level frame (e.g. main): set the result.
@@ -1347,7 +1394,25 @@ impl<S: LockStrategy> Engine<S> {
                             }
                             if let Some(pf) = parent_box {
                                 let parent_has_caller = pf.caller.is_some();
-                                if parent_has_caller {
+                                // Same async-parent routing as the Completed branch:
+                                // an await-er waits on AsyncJoin, not SubgraphComplete.
+                                let async_id =
+                                    self.async_join_runtime.lock().find_by_child(parent_fid);
+                                if let Some(async_id) = async_id {
+                                    let return_value = Value::NULL;
+                                    self.async_join_runtime
+                                        .lock()
+                                        .set_result(async_id, return_value.clone());
+                                    let woken = self.on_event_arrived(
+                                        RuntimeEvent::AsyncJoin(async_id),
+                                        return_value,
+                                        queue,
+                                    );
+                                    if woken > 0 {
+                                        self.async_join_runtime.lock().remove_entry(async_id);
+                                    }
+                                    self.release_frame(pf);
+                                } else if parent_has_caller {
                                     self.complete_and_wake_caller(*pf, queue);
                                 } else {
                                     *self.result.lock() = Some(Value::NULL);

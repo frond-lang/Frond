@@ -6,22 +6,24 @@
 
 // ─── buffer read helpers (local, to avoid cross-package dependency on std.io.File) ──────────
 
+@internal
 fun __dns_read_u32_le(buf: u8[], offset: usize): u32 {
-    u32(buf[offset])
-        | (u32(buf[offset + 1]) << 8u32)
-        | (u32(buf[offset + 2]) << 16u32)
-        | (u32(buf[offset + 3]) << 24u32)
+    ((buf[u32]) as offset)
+        | (((buf[u32]) as offset + 1) << 8u32)
+        | (((buf[u32]) as offset + 2) << 16u32)
+        | (((buf[u32]) as offset + 3) << 24u32)
 }
 
+@internal
 fun __dns_read_u64_le(buf: u8[], offset: usize): u64 {
-    u64(buf[offset])
-        | (u64(buf[offset + 1]) << 8u64)
-        | (u64(buf[offset + 2]) << 16u64)
-        | (u64(buf[offset + 3]) << 24u64)
-        | (u64(buf[offset + 4]) << 32u64)
-        | (u64(buf[offset + 5]) << 40u64)
-        | (u64(buf[offset + 6]) << 48u64)
-        | (u64(buf[offset + 7]) << 56u64)
+    ((buf[u64]) as offset)
+        | (((buf[u64]) as offset + 1) << 8u64)
+        | (((buf[u64]) as offset + 2) << 16u64)
+        | (((buf[u64]) as offset + 3) << 24u64)
+        | (((buf[u64]) as offset + 4) << 32u64)
+        | (((buf[u64]) as offset + 5) << 40u64)
+        | (((buf[u64]) as offset + 6) << 48u64)
+        | (((buf[u64]) as offset + 7) << 56u64)
 }
 
 // ─── Kuzo wrapper: __net_resolve_into → Throw<IpAddr[], IOError> ──
@@ -29,6 +31,7 @@ fun __dns_read_u64_le(buf: u8[], offset: usize): u64 {
 // __net_resolve(host: str): Throw<IpAddr[], IOError>
 // Fills the out-buffer via __net_resolve_into (17 bytes per entry), then assembles IpAddr[]
 // Buffer size: 16 entries max, 16 * 17 = 272 bytes
+@internal
 fun __net_resolve(host: str): Throw<IpAddr[], IOError> {
     val max_count: usize = 16
     var buf: u8[] = []

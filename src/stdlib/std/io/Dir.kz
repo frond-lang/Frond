@@ -12,6 +12,7 @@ pub type DirEntry = DirEntry(name: str, kind: FileKind)
 // ─── Kuzo wrapper: @extern("C") raw return value → Throw ──────────
 
 // __dir_create(path: str, recursive: bool): Throw<void, IOError>
+@internal
 fun __dir_create(path: str, recursive: bool): Throw<void, IOError> {
     val rc = __dir_create_raw(path, recursive)
     if rc < 0 {
@@ -21,6 +22,7 @@ fun __dir_create(path: str, recursive: bool): Throw<void, IOError> {
 }
 
 // __dir_remove(path: str, recursive: bool): Throw<void, IOError>
+@internal
 fun __dir_remove(path: str, recursive: bool): Throw<void, IOError> {
     val rc = __dir_remove_raw(path, recursive)
     if rc < 0 {
@@ -32,6 +34,7 @@ fun __dir_remove(path: str, recursive: bool): Throw<void, IOError> {
 // __dir_list(path: str): Throw<DirEntry[], IOError>
 // Fill three out-buffers via __dir_list_into, then assemble DirEntry[]
 // Buffer sizes: 256 entries max, 8KB name space, 1KB offset space
+@internal
 fun __dir_list(path: str): Throw<DirEntry[], IOError> {
     val max_count: usize = 256
     var names_buf: u8[] = []
@@ -78,7 +81,7 @@ fun __dir_list(path: str): Throw<DirEntry[], IOError> {
             end_pos
         }
         val name = if name_end > name_start {
-            names_buf[name_start..name_end]
+            (names_buf[name_start..name_end]) as str
         } else {
             ""
         }
