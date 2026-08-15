@@ -42,6 +42,7 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     ("builtin/error/TimeError.kz", include_str!("../stdlib/builtin/error/TimeError.kz")),
     ("builtin/error/TerminalError.kz", include_str!("../stdlib/builtin/error/TerminalError.kz")),
     ("builtin/error/OsError.kz", include_str!("../stdlib/builtin/error/OsError.kz")),
+    ("builtin/error/FfiError.kz", include_str!("../stdlib/builtin/error/FfiError.kz")),
     // reflect module (runtime reflection, Raw.kz primitives + Reflect.kz wrapper)
     ("builtin/reflect/pack.kz", include_str!("../stdlib/builtin/reflect/pack.kz")),
     ("builtin/reflect/Raw.kz", include_str!("../stdlib/builtin/reflect/Raw.kz")),

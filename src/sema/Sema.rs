@@ -1460,8 +1460,12 @@ define_builtin_types! {
             sig("close", vec![TypeRepr::ThisType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
         ],
         "Lazy" : ["T"] = [],
+        // Lib/ForeignFn methods dispatch structurally (name-based, like reflect):
+        // `InferContext::lib_method_return_type` + `Builder::lib_method_intrinsic`.
+        "ForeignFn" : ["R"] = [],
     }
     nongeneric {
+        "Lib" : [] = [],
         "array" : ["T"] = [
             sig("len", vec![TypeRepr::ThisType], Some(TypeRepr::Named("usize".into())), Some(IntrinsicKind::UnOp(35))),
             sig("is_empty", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), None),
@@ -2285,6 +2289,7 @@ pub(crate) fn concretize_type<'a>(
                 ("Atomic", [t]) => arena.make_atomic(*t),
                 ("Sender", [t]) => arena.make_sender(*t),
                 ("Receiver", [t]) => arena.make_receiver(*t),
+                ("ForeignFn", [t]) => arena.make_foreign_fn(*t),
                 _ => {
                     if let Some(ty) = Type::from_type_name(name) {
                         // Bare builtin generic name written without args.

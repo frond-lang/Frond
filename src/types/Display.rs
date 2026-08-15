@@ -29,7 +29,7 @@ impl fmt::Display for TypeDisplay<'_> {
             | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
             | Type::Isize | Type::Usize
             | Type::F16 | Type::F32 | Type::F64 | Type::F128
-            | Type::Str | Type::Null => f.write_str(t.name()),
+            | Type::Str | Type::Null | Type::Lib => f.write_str(t.name()),
             Type::Fn(_) => {
                 let (params, return_type) = self.arena.fn_parts(resolved);
                 f.write_str("(")?;
@@ -110,14 +110,15 @@ impl fmt::Display for TypeDisplay<'_> {
                 }
                 f.write_str(" }")
             }
-            // Builtin generic names: Channel/Async/Lazy/Atomic/Sender/Receiver.
+            // Builtin generic names: Channel/Async/Lazy/Atomic/Sender/Receiver/ForeignFn.
             Type::Channel(_)
             | Type::Async(_)
             | Type::Lazy(_)
             | Type::Atomic(_)
             | Type::Sender(_)
             | Type::Receiver(_)
-            | Type::Timer(_) => f.write_str(t.name()),
+            | Type::Timer(_)
+            | Type::ForeignFn(_) => f.write_str(t.name()),
             Type::ModuleRef(_) => {
                 let (path, _) = self.arena.module_ref_parts(resolved);
                 write!(f, "module::{}", path)

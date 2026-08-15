@@ -9,4 +9,5 @@
 //! the verifiable criterion that platform dispatch is centralized here.
 
 pub mod AbiTable;
+pub mod Dylib;
 pub mod ResolveSelfSymbol;

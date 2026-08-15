@@ -19,6 +19,10 @@ use crate::ir::Ir::*;
 pub const SOLIDIFY_MAGIC: [u8; 4] = *b"KZO\x00";
 /// Format schema version.
 ///
+/// v4 (2026-08-16): Lib interop — new sections `LibRetKinds` (62, sparse u8:
+/// ForeignFn[R] return ABI tag for Lib.lookup nodes), `EmbedInfos` (63, sparse
+/// u32: resource index for Lib.embed nodes), `Resources` (64, self-contained
+/// `[count]{name_len,name,data_len,data}` blob for build-time embedded files).
 /// v3 (2026-08-15): field-level density pass on top of v2 —
 /// - `SgNestedRanges` section dropped: nested_ranges are derived data
 ///   (containment of node_ranges) and are recomputed at load with an
@@ -33,7 +37,7 @@ pub const SOLIDIFY_MAGIC: [u8; 4] = *b"KZO\x00";
 /// v2: Nodes packed 4B, sparse per-node tables, dropped HoistedOwners/
 /// HoistedNode/Downstreams, DynFfiInfos serialized.
 /// Older files are rejected (rebuild from source to regenerate).
-pub const SOLIDIFY_SCHEMA_VERSION: u16 = 3;
+pub const SOLIDIFY_SCHEMA_VERSION: u16 = 4;
 /// Header flag bit0: node inputs_offset omitted from packed Nodes records
 /// (inputs pool contiguous in node-id order; offsets derived at load).
 pub const FLAG_NODE_INPUT_OFFSETS_ELIDED: u16 = 0b0000_0001;
@@ -211,6 +215,14 @@ pub enum SectionKind {
     // Shared region
     StringPool = 60,
     Downstreams = 61,
+    /// Lib interop per-Node metadata (v4): static ForeignFn[R] return ABI tag
+    /// for Lib.lookup nodes.
+    LibRetKinds = 62,
+    /// Lib interop per-Node metadata (v4): resource index for Lib.embed nodes.
+    EmbedInfos = 63,
+    /// Lib interop (v4): Lib.embed build-time resources, self-contained layout
+    /// `[count u32]{ name_len u32, name bytes, data_len u32, data bytes }`.
+    Resources = 64,
     // Inline C FFI (compiled by kuzo build → cc → object extraction)
     CMachineCode = 70,
     CSymbols = 71,

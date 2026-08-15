@@ -115,6 +115,9 @@ pub fn types_equal(arena: &TypeArena, a: TypeHandle, b: TypeHandle) -> bool {
         (Type::Receiver(_), Type::Receiver(_)) => {
             types_equal(arena, arena.receiver_elem(ra), arena.receiver_elem(rb))
         }
+        (Type::ForeignFn(_), Type::ForeignFn(_)) => {
+            types_equal(arena, arena.foreign_fn_ret(ra), arena.foreign_fn_ret(rb))
+        }
         (Type::Trait(_), Type::Trait(_)) => {
             let (na, ta) = arena.trait_parts(ra);
             let (nb, tb) = arena.trait_parts(rb);

@@ -36,6 +36,75 @@ impl AbiSig {
     }
 }
 
+/// Map a Kuzo type name to an `AbiType` (single source of truth, shared by the
+/// compile-time `@extern("C")` path and the runtime `Lib.lookup` sig parser).
+/// `str` is handled separately by `push_abi_types_for_name` (two slots).
+pub fn abi_type_from_name(ty_name: &str) -> AbiType {
+    match ty_name {
+        "void" => AbiType::Void,
+        "i8" => AbiType::Int { bits: 8, signed: true },
+        "i16" => AbiType::Int { bits: 16, signed: true },
+        "i32" => AbiType::Int { bits: 32, signed: true },
+        "i64" | "isize" => AbiType::Int { bits: 64, signed: true },
+        "u8" | "bool" => AbiType::Int { bits: 8, signed: false },
+        "char" => AbiType::Int { bits: 32, signed: false },
+        "u16" => AbiType::Int { bits: 16, signed: false },
+        "u32" => AbiType::Int { bits: 32, signed: false },
+        "u64" | "usize" => AbiType::Int { bits: 64, signed: false },
+        "f32" => AbiType::Float32,
+        "f64" => AbiType::Float64,
+        _ if ty_name.starts_with('*') => AbiType::Ptr,
+        _ => AbiType::Int { bits: 64, signed: true }, // fallback
+    }
+}
+
+/// Push `AbiType`(s) for a Kuzo type name. `str` and `u8[]` expand to the
+/// `(Ptr, Int)` two slots, mirroring the DataLen C-side expansion in ffi/Gen.rs.
+pub fn push_abi_types_for_name(ty_name: &str, out: &mut Vec<AbiType>) {
+    if ty_name == "str" || ty_name == "u8[]" {
+        out.push(AbiType::Ptr);
+        out.push(AbiType::Int { bits: 64, signed: false });
+    } else {
+        out.push(abi_type_from_name(ty_name));
+    }
+}
+
+/// Parse a `Lib.lookup` argument-signature string (comma-separated Kuzo type
+/// names, e.g. `"u64, u8[]"`; empty string = no arguments) into the parameter
+/// list of an `AbiSig`. Unknown atoms are errors (unlike the compile-time path,
+/// which falls back to i64 — a typo in a lookup sig should fail loudly).
+/// `ret` is supplied by the caller (the static `ForeignFn[R]` type annotation).
+pub fn parse_arg_sig(args_csv: &str, ret: AbiType) -> Result<AbiSig, String> {
+    let mut params = Vec::new();
+    let trimmed = args_csv.trim();
+    if !trimmed.is_empty() {
+        for atom in trimmed.split(',') {
+            let atom = atom.trim();
+            if atom.is_empty() {
+                return Err(format!("empty type atom in signature '{}'", args_csv));
+            }
+            if !is_known_atom(atom) {
+                return Err(format!(
+                    "unknown type '{}' in signature '{}' (allowed: i8..i64/isize, u8..u64/usize, f32, f64, bool, char, str, u8[])",
+                    atom, args_csv
+                ));
+            }
+            push_abi_types_for_name(atom, &mut params);
+        }
+    }
+    Ok(AbiSig::new(params, ret))
+}
+
+/// Whether `atom` is a type name the sig parser accepts (no silent i64 fallback).
+fn is_known_atom(atom: &str) -> bool {
+    matches!(
+        atom,
+        "i8" | "i16" | "i32" | "i64" | "isize"
+            | "u8" | "u16" | "u32" | "u64" | "usize"
+            | "f32" | "f64" | "bool" | "char" | "str" | "u8[]"
+    ) || atom.starts_with('*')
+}
+
 /// Runtime argument value (type-erased carrier), one-to-one with `AbiSig.params`.
 ///
 /// The invoker dispatches each `AbiSlot` to an integer slot or a floating-point

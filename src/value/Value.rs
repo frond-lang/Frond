@@ -2270,6 +2270,53 @@ impl Drop for OpaquePointer {
 unsafe impl Send for OpaquePointer {}
 unsafe impl Sync for OpaquePointer {}
 
+/// Shared state of a loaded native library (dlopen / LoadLibrary handle).
+/// A `Lib` value and every `ForeignFn` resolved from it hold the same `Arc`,
+/// so `close()` flips `closed` once and all derived ForeignFns observe it, and
+/// Drop releases the OS handle exactly once.
+pub struct LibShared {
+    pub handle: *mut core::ffi::c_void,
+    pub path: String,
+    pub closed: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for LibShared {
+    fn drop(&mut self) {
+        if !self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::platform::Dylib::close(self.handle);
+        }
+    }
+}
+
+// SAFETY: same single-threaded-FFE argument as OpaquePointer above.
+unsafe impl Send for LibShared {}
+unsafe impl Sync for LibShared {}
+
+impl std::fmt::Debug for LibShared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LibShared")
+            .field("path", &self.path)
+            .field("closed", &self.closed.load(std::sync::atomic::Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Heap value of a `Lib`: opaque handle over a dynamically loaded native library.
+#[derive(Debug, Clone)]
+pub struct LibValue {
+    pub shared: Arc<LibShared>,
+}
+
+/// Heap value of a `ForeignFn[R]`: resolved symbol address + runtime-built AbiSig.
+/// Lifetime is tied to the owning library through `shared` (closed libs reject calls).
+#[derive(Debug, Clone)]
+pub struct ForeignFnValue {
+    pub shared: Arc<LibShared>,
+    pub addr: *mut core::ffi::c_void,
+    pub sig: crate::ffi::Abi::AbiSig,
+    pub name: String,
+}
+
 /// Heap object: unified representation of all heap-allocated value types (24 kinds)
 #[derive(Debug, Clone)]
 pub enum HeapObj {
@@ -2295,6 +2342,10 @@ pub enum HeapObj {
     CoroutineFrame,
     /// FFI opaque pointer (@extern("C") #{ }# calls). Wraps a raw `*mut c_void`.
     OpaquePtr(OpaquePointer),
+    /// `Lib` value: handle over a dlopen/LoadLibrary-loaded native library.
+    LibVal(LibValue),
+    /// `ForeignFn[R]` value: resolved symbol + runtime AbiSig (from `Lib.lookup`).
+    ForeignFnVal(ForeignFnValue),
 }
 
 /// Heap reference: a reference-counted heap object
@@ -2306,7 +2357,7 @@ pub enum RefKind {
     Str, Array, Record, Adt, Newtype, Cell, Range, Closure, Partial, Builtin,
     TraitVal, LazyVal, ErrorVal, ThrowVal,
     AtomicVal, AsyncVal, ChannelVal, SenderVal, ReceiverVal, CoroutineFrame,
-    OpaquePtr,
+    OpaquePtr, LibVal, ForeignFnVal,
 }
 
 impl HeapObj {
@@ -2360,6 +2411,8 @@ impl HeapObj {
             HeapObj::ReceiverVal(_) => RefKind::ReceiverVal,
             HeapObj::CoroutineFrame => RefKind::CoroutineFrame,
             HeapObj::OpaquePtr(_) => RefKind::OpaquePtr,
+            HeapObj::LibVal(_) => RefKind::LibVal,
+            HeapObj::ForeignFnVal(_) => RefKind::ForeignFnVal,
         }
     }
 
@@ -2386,6 +2439,8 @@ impl HeapObj {
             HeapObj::ReceiverVal(_) => "receiver",
             HeapObj::CoroutineFrame => "coroutine",
             HeapObj::OpaquePtr(op) => op.type_name,
+            HeapObj::LibVal(_) => "Lib",
+            HeapObj::ForeignFnVal(_) => "ForeignFn",
         }
     }
 
@@ -2412,6 +2467,8 @@ impl HeapObj {
             HeapObj::ReceiverVal(_) => "<receiver>",
             HeapObj::CoroutineFrame => "<coroutine>",
             HeapObj::OpaquePtr(op) => op.type_name,
+            HeapObj::LibVal(_) => "<lib>",
+            HeapObj::ForeignFnVal(_) => "<foreignfn>",
         }
     }
 
@@ -2496,7 +2553,7 @@ impl Hash for HeapObj {
             HeapObj::Partial(_) | HeapObj::TraitVal(_) | HeapObj::LazyVal(_)
             | HeapObj::AtomicVal(_) | HeapObj::AsyncVal(_) | HeapObj::ChannelVal(_)
             | HeapObj::SenderVal(_) | HeapObj::ReceiverVal(_) | HeapObj::CoroutineFrame
-            | HeapObj::OpaquePtr(_) => {}
+            | HeapObj::OpaquePtr(_) | HeapObj::LibVal(_) | HeapObj::ForeignFnVal(_) => {}
         }
     }
 }

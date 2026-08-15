@@ -1905,7 +1905,9 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         Ok(Module {
             name: module_name,
-            source_path: None,
+            // The parse filename is the module's source path (used by e.g.
+            // Lib.embed to resolve resource paths relative to the module dir).
+            source_path: Some(module_name),
             arena: std::mem::take(&mut self.ast),
             declarations,
         })

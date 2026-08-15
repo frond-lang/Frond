@@ -127,6 +127,16 @@ impl DataFlowGraph {
     pub fn pattern_field_index(&self, idx: usize) -> Option<u16> { self.pattern_field_indices[idx] }
     #[inline]
     pub fn closure_call_arg_count(&self, idx: usize) -> Option<u8> { self.closure_call_arg_counts[idx] }
+    #[inline]
+    pub fn lib_ret_kind(&self, idx: usize) -> Option<u8> { self.lib_ret_kinds.get(idx).copied().flatten() }
+    #[inline]
+    pub fn embed_info(&self, idx: usize) -> Option<u32> { self.embed_infos.get(idx).copied().flatten() }
+
+    /// Lib.embed resource by index (original path, bytes). Both paths read the
+    /// owned Vec (load path materializes from the CResources section).
+    pub fn resource(&self, idx: usize) -> Option<(&str, &[u8])> {
+        self.resources.get(idx).map(|(n, b)| (n.as_ref(), b.as_ref()))
+    }
 
     // hoisted metadata: dropped from the v2 format — loaded graphs fill
     // sentinel values (no runtime consumer; post-rebuild hoisted nodes are

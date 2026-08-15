@@ -39,6 +39,10 @@ impl<'a> InferContext<'a> {
         if let Some(ct) = name_to_concrete(name) {
             return self.arena.make(ct);
         }
+        // 3.5 Opaque nongeneric builtins (Lib): dedicated Type variant, not an Adt.
+        if name == crate::types::NAME_LIB {
+            return self.arena.make(Type::Lib);
+        }
         // 4. trait definition → Trait type.
         if self.sema_result.get_trait_def(name).is_some() {
             return self.arena.make_trait(name.into(), Box::new([]));

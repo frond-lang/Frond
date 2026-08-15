@@ -8,3 +8,4 @@ pub pack IOError
 pub pack TimeError
 pub pack TerminalError
 pub pack OsError
+pub pack FfiError

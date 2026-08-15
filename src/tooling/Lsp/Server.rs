@@ -753,7 +753,7 @@ fn complete_type_name(doc: &DocState, _index: &Option<WorkspaceIndex>) -> Vec<se
     for t in &[
         "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "isize", "usize",
         "f16", "f32", "f64", "f128", "bool", "char", "str", "void", "null", "Throw", "Channel",
-        "Async", "Lazy", "Atomic", "Sender", "Receiver", "Timer", "This",
+        "Async", "Lazy", "Atomic", "Sender", "Receiver", "Timer", "This", "Lib", "ForeignFn",
     ] {
         items.push(serde_json::json!({ "label": t, "kind": 5 }));
     }

@@ -19,6 +19,7 @@ impl<'a> InferContext<'a> {
             "Atomic" if args.len() == 1 => self.arena.make_atomic(args[0]),
             "Sender" if args.len() == 1 => self.arena.make_sender(args[0]),
             "Receiver" if args.len() == 1 => self.arena.make_receiver(args[0]),
+            "ForeignFn" if args.len() == 1 => self.arena.make_foreign_fn(args[0]),
             _ => self.arena.make_generic(name, args),
         }
     }
@@ -185,6 +186,55 @@ impl<'a> InferContext<'a> {
             return (arg_count == 1).then_some(ty);
         }
         None
+    }
+
+    /// Return type for a `Lib` / `ForeignFn` builtin method, or `None` if
+    /// (recv_ty, method) is not a Lib-family method call. This pairs with
+    /// `ir/Builder` structural lowering and `ir/Compute.rs` compute_lib_* /
+    /// compute_ffn_call (the runtime).
+    ///
+    /// `lookup`'s `R` is a FRESH TYPE VAR: the method-call path does not
+    /// propagate expected types, so R is solved either by the caller unifying
+    /// `expected` (when present) or downstream — the `Ok(f)` pattern binding
+    /// plus a `val f: ForeignFn<u64>` annotation, or a use of `f.call`'s
+    /// result. The IR layer reads the solved R at build time
+    /// (lib_lookup_ret_tag).
+    pub(super) fn lib_method_return_type(
+        &mut self,
+        recv_ty: Type,
+        recv_handle: TypeHandle,
+        method: &str,
+        arg_count: usize,
+        expected: Option<TypeHandle>,
+    ) -> Option<TypeHandle> {
+        match (recv_ty, method) {
+            (Type::Lib, "lookup") if arg_count == 2 => {
+                let r = self.arena.fresh_type_var();
+                let ff = self.arena.make_foreign_fn(r);
+                let err = self.ffi_error_ty();
+                let ret = self.arena.make_throw(ff, err);
+                if let Some(exp) = expected {
+                    self.unify_or_constrain(ret, exp);
+                }
+                Some(ret)
+            }
+            (Type::Lib, "has_symbol") if arg_count == 1 => Some(self.make_builtin(Type::Bool)),
+            (Type::Lib, "close") if arg_count == 0 => Some(self.make_builtin(Type::Void)),
+            (Type::ForeignFn(_), "call") => {
+                // Any arity ≥ 0; the return type is the receiver's R.
+                let ret = self.arena.foreign_fn_ret(recv_handle);
+                let err = self.ffi_error_ty();
+                Some(self.arena.make_throw(ret, err))
+            }
+            _ => None,
+        }
+    }
+
+    /// The `FfiError` type as seen from the Lib builtin methods. Declared in
+    /// `builtin/error/FfiError.kz`; resolved by name here (Adt unify is
+    /// name-based, so this handle interops with the declared one).
+    pub(super) fn ffi_error_ty(&mut self) -> TypeHandle {
+        self.arena.make_adt("FfiError".into(), Box::new([]))
     }
 
     /// Integer suffix → corresponding integer TypeHandle (derived from `BUILTIN_TABLE`; returns `None` on miss).

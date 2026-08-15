@@ -285,6 +285,40 @@ impl<'a> InferContext<'a> {
                 if let Expr::Ident("super") = &ast.expr(*recv).node {
                     return self.infer_super_method_call(expr, ast, env, expected, method, args);
                 }
+                // Lib.open(path) / Lib.embed(path): builtin native-library constructors.
+                // The receiver `Lib` is a type name, not a value, so this must run
+                // BEFORE receiver inference. A local binding named `Lib` shadows it.
+                if let Expr::Ident("Lib") = &ast.expr(*recv).node {
+                    let shadowed = self
+                        .env
+                        .lookup_with_pred(env, "Lib", |_| true)
+                        .is_some();
+                    if !shadowed && (*method == "open" || *method == "embed") {
+                        let span = ast.expr(expr).span;
+                        if args.len() != 1 {
+                            self.add_error_at(
+                                &format!("Lib.{} takes exactly 1 argument (path: str), got {}", method, args.len()),
+                                span.line,
+                                span.column,
+                            );
+                            return self.arena.fresh_type_var();
+                        }
+                        let str_ty = self.make_builtin(Type::Str);
+                        let arg_ty = self.infer_expr(args[0], ast, env, Some(str_ty));
+                        self.unify_or_constrain(str_ty, arg_ty);
+                        let lib_ty = self.make_builtin(Type::Lib);
+                        let err_ty = self.ffi_error_ty();
+                        let ret = self.arena.make_throw(lib_ty, err_ty);
+                        // Mark recv as module-func-recv (IR compilation skips the recv node).
+                        let recv_key = crate::sema::Sema::module_expr_key(
+                            &self.current_module_name,
+                            recv.0 as u64,
+                        );
+                        self.sema_result.module_func_recv_exprs.insert(recv_key);
+                        return ret;
+                    }
+                }
+
                 // Qualified-name syntax: Type.Ctor(args) (qualified call of a constructor with arguments)
                 if let Expr::Ident(type_name) = &ast.expr(*recv).node {
                     if let Some((ctor_type_name, field_type_reprs)) =
@@ -502,6 +536,42 @@ impl<'a> InferContext<'a> {
                         let _ = self.infer_expr(a, ast, env, None);
                     }
                     return ret_ty;
+                }
+
+                // Lib / ForeignFn builtin methods (structural, reflect-style):
+                // lookup/has_symbol/close on `Lib`; call (any arity) on `ForeignFn[R]`.
+                // Pairs with Builder::lib_method_intrinsic — the call type-checks here
+                // and lowers to a CF_LIB_* / CF_FFN_CALL compute_fn at IR build time.
+                {
+                    let recv_resolved_l = self.arena.resolve(recv_ty);
+                    let recv_ct = self.arena.get(recv_resolved_l);
+                    let needs_lib_dispatch = matches!(recv_ct, Type::Lib)
+                        || (matches!(recv_ct, Type::ForeignFn(_)) && *method == "call");
+                    if needs_lib_dispatch {
+                        for &a in args.iter() {
+                            let _ = self.infer_expr(a, ast, env, None);
+                        }
+                        let ret_ty = self.lib_method_return_type(
+                            recv_ct,
+                            recv_resolved_l,
+                            method,
+                            args.len(),
+                            expected,
+                        );
+                        return match ret_ty {
+                            Some(t) => t,
+                            None => {
+                                // Wrong arity for the recognized Lib method.
+                                let span = ast.expr(expr).span;
+                                self.add_error_at(
+                                    &format!("bad Lib method call '{}': lookup takes (name: str, args: str); has_symbol takes (name: str); close takes no args", method),
+                                    span.line,
+                                    span.column,
+                                );
+                                self.arena.fresh_type_var()
+                            }
+                        };
+                    }
                 }
 
                 // Fallback: infer arguments and return a fresh var.

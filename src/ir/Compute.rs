@@ -134,6 +134,7 @@ fn reflect_kind(v: &Value) -> u8 {
             crate::value::HeapObj::ReceiverVal(_) => k::RECEIVER,
             crate::value::HeapObj::CoroutineFrame => k::COROUTINE,
             crate::value::HeapObj::OpaquePtr(_) => k::PTR,
+            crate::value::HeapObj::LibVal(_) | crate::value::HeapObj::ForeignFnVal(_) => k::BUILTIN,
         },
     }
 }
@@ -167,6 +168,8 @@ fn reflect_kind_str(v: &Value) -> &'static str {
             crate::value::HeapObj::ReceiverVal(_) => "Receiver",
             crate::value::HeapObj::CoroutineFrame => "Coroutine",
             crate::value::HeapObj::OpaquePtr(_) => "Ptr",
+            crate::value::HeapObj::LibVal(_) => "Lib",
+            crate::value::HeapObj::ForeignFnVal(_) => "ForeignFn",
         },
     }
 }
@@ -200,6 +203,8 @@ fn reflect_type_name(v: &Value) -> String {
             crate::value::HeapObj::Closure(_) => "Fn".to_string(),
             crate::value::HeapObj::TraitVal(_) => "Trait".to_string(),
             crate::value::HeapObj::OpaquePtr(op) => op.type_name.to_string(),
+            crate::value::HeapObj::LibVal(_) => "Lib".to_string(),
+            crate::value::HeapObj::ForeignFnVal(_) => "ForeignFn".to_string(),
         },
     }
 }
@@ -938,6 +943,270 @@ pub fn compute_dyn_ffi_call(frame: &mut Frame, node: NodeId, ctx: &EvalContext) 
         Err(e) => make_error_throw("FfiError", e),
     };
     // Explicitly hold marshaled until after the call completes.
+    drop(marshaled);
+    result
+}
+
+// =========================================================================
+// Lib / ForeignFn compute_fns (337-342)
+//
+// Builtin native-library interop: Lib.open / Lib.embed construct `Lib` handles
+// (dlopen / LoadLibraryW via platform::Dylib), lib.lookup resolves a symbol and
+// builds a runtime AbiSig (params from the signature string, ret from the
+// static ForeignFn[R] annotation carried as the lib_ret_kinds metadata tag),
+// and f.call marshals engine Values and invokes the address under the C ABI —
+// the same Marshal/Dispatch/decode_ret path as compute_dyn_ffi_call.
+// =========================================================================
+
+/// Wraps a value as `ThrowVal(Ok(val))` (mirror of make_error_throw).
+fn make_ok_throw(val: Value) -> Value {
+    use crate::value::{HeapObj, ThrowPayload, ThrowValue};
+    Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Ok(val) }))
+}
+
+/// lib_ret_kinds tag ↔ AbiType. The tag is the single-source encoding of the
+/// static `ForeignFn[R]` return annotation (see Builder::lib lowering).
+pub fn lib_ret_kind_to_abi(tag: u8) -> crate::ffi::Abi::AbiType {
+    use crate::ffi::Abi::AbiType;
+    match tag {
+        1 => AbiType::Int { bits: 8, signed: true },
+        2 => AbiType::Int { bits: 16, signed: true },
+        3 => AbiType::Int { bits: 32, signed: true },
+        4 => AbiType::Int { bits: 64, signed: true },
+        5 => AbiType::Int { bits: 8, signed: false },
+        6 => AbiType::Int { bits: 16, signed: false },
+        7 => AbiType::Int { bits: 32, signed: false },
+        8 => AbiType::Int { bits: 64, signed: false },
+        9 => AbiType::Float32,
+        10 => AbiType::Float64,
+        11 => AbiType::Int { bits: 8, signed: false },  // bool
+        12 => AbiType::Int { bits: 32, signed: false }, // char
+        13 => AbiType::Ptr,
+        _ => AbiType::Void,
+    }
+}
+
+/// Kuzo scalar type name → lib_ret_kinds tag (Builder side). Mirrors
+/// `lib_ret_kind_to_abi`; returns 0 (void) for anything else.
+pub fn abi_name_to_lib_ret_kind(name: &str) -> u8 {
+    match name {
+        "i8" => 1, "i16" => 2, "i32" => 3, "i64" => 4, "isize" => 4,
+        "u8" => 5, "u16" => 6, "u32" => 7, "u64" => 8, "usize" => 8,
+        "f32" => 9, "f64" => 10, "bool" => 11, "char" => 12,
+        _ if name.starts_with('*') => 13,
+        _ => 0,
+    }
+}
+
+/// Extracts a `&str` from a forced input value (None when not a str heap obj).
+fn input_str(v: &Value) -> Option<&str> {
+    match v.heap_obj() {
+        Some(crate::value::HeapObj::Str(s)) => Some(s.bytes()),
+        _ => None,
+    }
+}
+
+/// FNV-1a 64 over the resource bytes — collision-safe filename component for
+/// the embed extraction cache.
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Global extraction cache: content hash → extracted temp-file path. Ensures
+/// one write per distinct embedded blob per process (and, because the target
+/// file is hash-named, reuses files left by previous runs).
+static EMBED_CACHE: std::sync::OnceLock<std::sync::Mutex<rustc_hash::FxHashMap<u64, std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+
+/// Extract embedded resource bytes to the temp dir (hash-named, idempotent)
+/// and return the path.
+fn extract_embedded(name: &str, bytes: &[u8]) -> Result<std::path::PathBuf, String> {
+    let cache = EMBED_CACHE.get_or_init(|| std::sync::Mutex::new(rustc_hash::FxHashMap::default()));
+    let hash = fnv64(bytes);
+    if let Some(p) = cache.lock().unwrap().get(&hash) {
+        return Ok(p.clone());
+    }
+    // Preserve the original extension so Windows resolves SxS/dependent dlls by name.
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("blob");
+    let ext = std::path::Path::new(base)
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let file_name = format!("kuzo-embed-{:016x}{}", hash, ext);
+    let path = std::env::temp_dir().join(file_name);
+    if !path.exists() {
+        std::fs::write(&path, bytes)
+            .map_err(|e| format!("embed extract to '{}' failed: {}", path.display(), e))?;
+    }
+    cache.lock().unwrap().insert(hash, path.clone());
+    Ok(path)
+}
+
+/// Opens a native library by path and wraps it as a `Lib` value (Throw).
+fn open_lib_value(path: &str) -> Value {
+    match crate::platform::Dylib::open(path) {
+        Ok(handle) => {
+            let shared = std::sync::Arc::new(crate::value::LibShared {
+                handle,
+                path: path.to_string(),
+                closed: std::sync::atomic::AtomicBool::new(false),
+            });
+            make_ok_throw(Value::ref_val(crate::value::HeapObj::LibVal(
+                crate::value::LibValue { shared },
+            )))
+        }
+        Err(e) => make_error_throw("FfiError", &format!("Lib.open('{}'): {}", path, e)),
+    }
+}
+
+/// compute_fn (337): `Lib.open(path)` — dlopen/LoadLibraryW by path.
+/// inputs[0] = path str (+ trailing effect dep).
+pub fn compute_lib_open(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
+    let path_val = force_input(frame, inputs[0]);
+    match input_str(&path_val) {
+        Some(path) => open_lib_value(path),
+        None => make_error_throw("FfiError", "Lib.open: path argument is not a str"),
+    }
+}
+
+/// compute_fn (338): `Lib.embed(path)` — extract the build-time resource
+/// recorded under `embed_infos[node]` to the temp cache and load it.
+/// Reads no runtime inputs (the path literal was captured at build time).
+pub fn compute_lib_embed(_frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    let graph = ctx.graph;
+    let res_idx = graph
+        .embed_info(node.0 as usize)
+        .expect("compute_lib_embed: no embed_info") as usize;
+    let (name, bytes) = match graph.resource(res_idx) {
+        Some(r) => r,
+        None => return make_error_throw("FfiError", "Lib.embed: resource missing from artifact"),
+    };
+    let bytes: &[u8] = bytes;
+    match extract_embedded(&name, bytes) {
+        Ok(path) => {
+            let p = path.to_string_lossy().into_owned();
+            open_lib_value(&p)
+        }
+        Err(e) => make_error_throw("FfiError", &format!("Lib.embed('{}'): {}", name, e)),
+    }
+}
+
+/// compute_fn (339): `lib.lookup(name, args_sig): Throw[ForeignFn[R], FfiError]`.
+/// The AbiSig return comes from the static R (lib_ret_kinds metadata);
+/// params come from the runtime signature string.
+pub fn compute_lib_lookup(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::{ForeignFnValue, HeapObj, LibValue};
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
+    let lib_val = force_input(frame, inputs[0]);
+    let name_val = force_input(frame, inputs[1]);
+    let sig_val = force_input(frame, inputs[2]);
+
+    let shared = match lib_val.heap_obj() {
+        Some(HeapObj::LibVal(LibValue { shared })) => shared.clone(),
+        _ => return make_error_throw("FfiError", "lib.lookup: receiver is not a Lib"),
+    };
+    if shared.closed.load(std::sync::atomic::Ordering::SeqCst) {
+        return make_error_throw("FfiError", &format!("lib.lookup: library '{}' is closed", shared.path));
+    }
+    let (name, sig_str) = match (input_str(&name_val), input_str(&sig_val)) {
+        (Some(n), Some(s)) => (n, s),
+        _ => return make_error_throw("FfiError", "lib.lookup: name and args signature must be str"),
+    };
+    let ret_tag = graph
+        .lib_ret_kind(node.0 as usize)
+        .unwrap_or(0);
+    let sig = match crate::ffi::Abi::parse_arg_sig(sig_str, lib_ret_kind_to_abi(ret_tag)) {
+        Ok(s) => s,
+        Err(e) => return make_error_throw("FfiError", &format!("lib.lookup('{}'): {}", name, e)),
+    };
+    match crate::platform::Dylib::symbol(shared.handle, name) {
+        Some(addr) => make_ok_throw(Value::ref_val(HeapObj::ForeignFnVal(ForeignFnValue {
+            shared,
+            addr,
+            sig,
+            name: name.to_string(),
+        }))),
+        None => make_error_throw(
+            "FfiError",
+            &format!("lib.lookup: symbol '{}' not found in '{}'", name, shared.path),
+        ),
+    }
+}
+
+/// compute_fn (340): `lib.has_symbol(name): bool`.
+pub fn compute_lib_has_symbol(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::{HeapObj, LibValue};
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
+    let lib_val = force_input(frame, inputs[0]);
+    let name_val = force_input(frame, inputs[1]);
+    let found = match lib_val.heap_obj() {
+        Some(HeapObj::LibVal(LibValue { shared })) => {
+            let name = input_str(&name_val).unwrap_or("");
+            !shared.closed.load(std::sync::atomic::Ordering::SeqCst)
+                && crate::platform::Dylib::symbol(shared.handle, name).is_some()
+        }
+        _ => false,
+    };
+    Value::bool_val(found)
+}
+
+/// compute_fn (341): `lib.close(): void` — idempotent; the shared handle makes
+/// all derived ForeignFns reject further calls.
+pub fn compute_lib_close(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::{HeapObj, LibValue};
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
+    let lib_val = force_input(frame, inputs[0]);
+    if let Some(HeapObj::LibVal(LibValue { shared })) = lib_val.heap_obj() {
+        if !shared.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            crate::platform::Dylib::close(shared.handle);
+        }
+    }
+    Value::VOID
+}
+
+/// compute_fn (342): `f.call(a1..an): Throw[R, FfiError]` — any arity.
+/// inputs[0] = ForeignFn; arg count from the shared closure_call_arg_count
+/// metadata slot; marshal → dispatch → writeback → decode, like
+/// compute_dyn_ffi_call but with the address+sig carried by the value.
+pub fn compute_ffn_call(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::HeapObj;
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
+    let ffn_val = force_input(frame, inputs[0]);
+    let ffn = match ffn_val.heap_obj() {
+        Some(HeapObj::ForeignFnVal(f)) => f.clone(),
+        _ => return make_error_throw("FfiError", "call: receiver is not a ForeignFn"),
+    };
+    if ffn.shared.closed.load(std::sync::atomic::Ordering::SeqCst) {
+        return make_error_throw(
+            "FfiError",
+            &format!("call '{}': library '{}' is closed", ffn.name, ffn.shared.path),
+        );
+    }
+    let arg_count = graph
+        .closure_call_arg_count(node.0 as usize)
+        .unwrap_or(0) as usize;
+    let mut args = Vec::with_capacity(arg_count);
+    for i in 0..arg_count.min(inputs.len().saturating_sub(1)) {
+        args.push(force_input(frame, inputs[i + 1]));
+    }
+    let mut marshaled = match crate::ffi::Marshal::encode_args(&ffn.sig, &args) {
+        Ok(m) => m,
+        Err(e) => return make_error_throw("FfiError", &format!("call '{}': {}", ffn.name, e)),
+    };
+    let result = match crate::ffi::Abi::CallDynamic::call_dynamic(&ffn.sig, ffn.addr, &marshaled.slots) {
+        Ok(ret) => {
+            crate::ffi::Marshal::apply_writebacks(&mut marshaled);
+            let v = crate::ffi::Marshal::decode_ret(&ffn.sig.ret, ret);
+            make_ok_throw(v)
+        }
+        Err(e) => make_error_throw("FfiError", &format!("call '{}': {}", ffn.name, e)),
+    };
     drop(marshaled);
     result
 }

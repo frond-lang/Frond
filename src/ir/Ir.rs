@@ -452,6 +452,16 @@ compute_fn_ids! {
     334 => CF_REFLECT_FIELD_VALUE,    // v.field_value(i)-> Value
     335 => CF_REFLECT_ARRAY_LEN,      // v.array_len()   -> usize
     336 => CF_REFLECT_ADT_CTOR,       // v.adt_constructor() -> str
+    // ── Lib / ForeignFn compute_fns (337-342): builtin native-library interop.
+    // open/embed: input[0] = path str (+ effect dep); lookup: [lib, name, args_sig];
+    // has_symbol: [lib, name]; close: [lib]; call: [ffn, args...] with the arg
+    // count in the shared closure_call_arg_count metadata slot.
+    337 => CF_LIB_OPEN,
+    338 => CF_LIB_EMBED,
+    339 => CF_LIB_LOOKUP,
+    340 => CF_LIB_HAS_SYMBOL,
+    341 => CF_LIB_CLOSE,
+    342 => CF_FFN_CALL,
 }
 
 /// Number of entries in `build_compute_fn_table()`.
@@ -461,7 +471,7 @@ compute_fn_ids! {
 /// by a binary with a different table length is rejected at load instead of
 /// silently mis-dispatching node compute fns. `build_compute_fn_table()`
 /// asserts equality so this constant cannot drift silently.
-pub const COMPUTE_FN_TABLE_LEN: u32 = 337;
+pub const COMPUTE_FN_TABLE_LEN: u32 = 343;
 
 // =========================================================================
 // NodeKind — node category (not an op; 9 variants for readiness checks)
@@ -2135,6 +2145,14 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         334 => super::Compute::compute_reflect_field_value,
         335 => super::Compute::compute_reflect_array_len,
         336 => super::Compute::compute_reflect_adt_ctor,
+        // Lib / ForeignFn (337-342): native-library interop (legacy Value
+        // signature; wrap_fn! handles safe_op short-circuit + batching)
+        337 => super::Compute::compute_lib_open,
+        338 => super::Compute::compute_lib_embed,
+        339 => super::Compute::compute_lib_lookup,
+        340 => super::Compute::compute_lib_has_symbol,
+        341 => super::Compute::compute_lib_close,
+        342 => super::Compute::compute_ffn_call,
     };
     // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
     // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values
@@ -2259,7 +2277,7 @@ pub fn effect_class(cf: ComputeFnId) -> EffectClass {
         // ── Launches ──
         36 | 41 => Call, // call_launch / closure_call
         // ── FFI ──
-        46 | 325 => Ffi,
+        46 | 325 | 337..=342 => Ffi,
         // ── Engine/frame effects ──
         322 | 323 | 324 => Runtime, // defer register/run/block-register
         // ── Allocation (distinct object per run) ──
@@ -2388,6 +2406,8 @@ macro_rules! node_metadata {
             opt(closure_infos, ClosureInfo, set_closure_info)
             opt(partial_infos, PartialInfo, set_partial_info)
             opt(closure_call_arg_counts, u8, set_closure_call_arg_count)
+            opt(lib_ret_kinds, u8, set_lib_ret_kind)
+            opt(embed_infos, u32, set_embed_info)
             opt(select_infos, SelectInfo, set_select_info)
             opt(writeback_targets, NodeId, set_writeback_target)
             opt(batch_infos, BatchInfo, set_batch_info)
@@ -2424,6 +2444,8 @@ macro_rules! node_metadata {
             opt(closure_infos, ClosureInfo, set_closure_info)
             opt(partial_infos, PartialInfo, set_partial_info)
             opt(closure_call_arg_counts, u8, set_closure_call_arg_count)
+            opt(lib_ret_kinds, u8, set_lib_ret_kind)
+            opt(embed_infos, u32, set_embed_info)
             opt(select_infos, SelectInfo, set_select_info)
             opt(writeback_targets, NodeId, set_writeback_target)
             opt(batch_infos, BatchInfo, set_batch_info)
@@ -2566,6 +2588,18 @@ pub struct DataFlowGraph {
     pub partial_infos: Vec<Option<PartialInfo>>,
     /// Argument count for closure call nodes (excluding closure value and effect; used for chained partial application detection).
     pub closure_call_arg_counts: Vec<Option<u8>>,
+    /// Static return-type ABI tag for Lib.lookup nodes (indexed by NodeId; see
+    /// lib_ret_kind_to_abi / abi_to_lib_ret_kind in Compute.rs). The annotation
+    /// `ForeignFn[R]` fixes the runtime AbiSig return at lookup time.
+    pub lib_ret_kinds: Vec<Option<u8>>,
+    /// Resource index for Lib.embed nodes (indexes `resources` on the build path
+    /// / the CResources solidify section on the load path).
+    pub embed_infos: Vec<Option<u32>>,
+    /// Lib.embed build-time resources (original path, file bytes). Build path:
+    /// filled by IrBuilder; load path: materialized from the CResources
+    /// section. Dual-source like `string_pool`, but always owned (resources
+    /// are small relative to the graph).
+    pub resources: Vec<(std::sync::Arc<str>, std::sync::Arc<[u8]>)>,
     /// select expression branch info (indexed by NodeId; None for non-select-gate nodes).
     pub select_infos: Vec<Option<SelectInfo>>,
     /// Target outer NodeId for WriteBack nodes (indexed by NodeId; None for non-WriteBack nodes).
@@ -2697,6 +2731,9 @@ impl Clone for DataFlowGraph {
             closure_infos: self.closure_infos.clone(),
             partial_infos: self.partial_infos.clone(),
             closure_call_arg_counts: self.closure_call_arg_counts.clone(),
+            lib_ret_kinds: self.lib_ret_kinds.clone(),
+            embed_infos: self.embed_infos.clone(),
+            resources: self.resources.clone(),
             select_infos: self.select_infos.clone(),
             writeback_targets: self.writeback_targets.clone(),
             tail_call_flags: self.tail_call_flags.clone(),
@@ -2770,6 +2807,9 @@ impl DataFlowGraph {
             closure_infos: Vec::new(),
             partial_infos: Vec::new(),
             closure_call_arg_counts: Vec::new(),
+            lib_ret_kinds: Vec::new(),
+            embed_infos: Vec::new(),
+            resources: Vec::new(),
             select_infos: Vec::new(),
             writeback_targets: Vec::new(),
             tail_call_flags: Vec::new(),
@@ -3016,6 +3056,8 @@ impl DataFlowGraph {
         hash_opt!(closure_infos);
         hash_opt!(partial_infos);
         hash_opt!(closure_call_arg_counts);
+        hash_opt!(lib_ret_kinds);
+        hash_opt!(embed_infos);
         hash_opt!(select_infos);
         hash_opt!(writeback_targets);
         hash_opt!(batch_infos);
@@ -3517,6 +3559,8 @@ impl DataFlowGraph {
         compress_opt!(closure_infos);
         compress_opt!(partial_infos);
         compress_opt!(closure_call_arg_counts);
+        compress_opt!(lib_ret_kinds);
+        compress_opt!(embed_infos);
         compress_opt!(batch_infos);
         compress_opt!(trait_construct_infos);
         compress_opt!(lazy_construct_infos);

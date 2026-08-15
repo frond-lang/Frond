@@ -233,6 +233,22 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
     ser_sparse_opt!(sections, graph, global_store_slots, GlobalStoreSlots, |b, v| write_u32(b, *v));
     ser_sparse_opt!(sections, graph, pattern_field_indices, PatternFieldIndices, |b, v| write_u16(b, *v));
     ser_sparse_opt!(sections, graph, closure_call_arg_counts, ClosureCallArgCounts, |b, v| write_u8(b, *v));
+    ser_sparse_opt!(sections, graph, lib_ret_kinds, LibRetKinds, |b, v| write_u8(b, *v));
+    ser_sparse_opt!(sections, graph, embed_infos, EmbedInfos, |b, v| write_u32(b, *v));
+
+    // Lib.embed resources (v4): self-contained section
+    // `[count u32]{ name_len u32, name bytes, data_len u32, data bytes }`.
+    {
+        let mut body: Vec<u8> = Vec::new();
+        write_u32(&mut body, graph.resources.len() as u32);
+        for (name, data) in &graph.resources {
+            write_u32(&mut body, name.len() as u32);
+            body.extend_from_slice(name.as_bytes());
+            write_u32(&mut body, data.len() as u32);
+            body.extend_from_slice(data);
+        }
+        sections.push((SectionKind::Resources, body));
+    }
 
     // ---- per-Node boolean tables (category B; dense bitmaps stay) ----
     ser_bool_table!(sections, n, graph, tail_call_flags, TailCallFlags);
@@ -680,6 +696,29 @@ pub fn load_solidify_from_file(path: &str) -> io::Result<DataFlowGraph> {
     load_zerocopy(mem)
 }
 
+/// Parses the v4 Resources section (self-contained
+/// `[count u32]{ name_len u32, name bytes, data_len u32, data bytes }`).
+/// Resources are small relative to the graph, so both load paths materialize
+/// them into the owned Vec (no mmap accessor indirection).
+fn parse_resources_section(mem: &GraphMemory) -> Vec<(Arc<str>, Arc<[u8]>)> {
+    let r = mem.section(SectionKind::Resources);
+    let count = u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut p = 4usize;
+    for _ in 0..count {
+        let nl = u32::from_le_bytes([r[p], r[p + 1], r[p + 2], r[p + 3]]) as usize;
+        p += 4;
+        let name = String::from_utf8_lossy(&r[p..p + nl]).into_owned();
+        p += nl;
+        let dl = u32::from_le_bytes([r[p], r[p + 1], r[p + 2], r[p + 3]]) as usize;
+        p += 4;
+        let data: Arc<[u8]> = Arc::from(r[p..p + dl].to_vec());
+        p += dl;
+        out.push((Arc::from(name), data));
+    }
+    out
+}
+
 /// Rebuilds an owned `DataFlowGraph` from a `GraphMemory` (shared parsing logic).
 fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     let n = mem.header().node_count as usize;
@@ -885,6 +924,22 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         for (idx, off) in pairs { v[idx as usize] = Some(blob[off as usize]); }
         v
     };
+    let lib_ret_kinds: Vec<Option<u8>> = {
+        let (pairs, blob) = split_sparse(SectionKind::LibRetKinds);
+        let mut v: Vec<Option<u8>> = vec![None; n];
+        for (idx, off) in pairs { v[idx as usize] = Some(blob[off as usize]); }
+        v
+    };
+    let embed_infos: Vec<Option<u32>> = {
+        let (pairs, blob) = split_sparse(SectionKind::EmbedInfos);
+        let mut v: Vec<Option<u32>> = vec![None; n];
+        for (idx, off) in pairs {
+            let b = off as usize;
+            v[idx as usize] = Some(u32::from_le_bytes([blob[b], blob[b+1], blob[b+2], blob[b+3]]));
+        }
+        v
+    };
+    let resources = parse_resources_section(mem);
 
     // ---- category B (dense bitmaps, unchanged) ----
     let read_bool_vec = |kind: SectionKind| -> Vec<bool> {
@@ -1142,6 +1197,9 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         closure_infos,
         partial_infos,
         closure_call_arg_counts,
+        lib_ret_kinds,
+        embed_infos,
+        resources,
         select_infos,
         writeback_targets,
         tail_call_flags,
@@ -1384,6 +1442,22 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         for (idx, off) in pairs { v[idx as usize] = Some(blob[off as usize]); }
         v
     };
+    let lib_ret_kinds: Vec<Option<u8>> = {
+        let (pairs, _, blob) = split_sparse(SectionKind::LibRetKinds);
+        let mut v: Vec<Option<u8>> = vec![None; n];
+        for (idx, off) in pairs { v[idx as usize] = Some(blob[off as usize]); }
+        v
+    };
+    let embed_infos: Vec<Option<u32>> = {
+        let (pairs, _, blob) = split_sparse(SectionKind::EmbedInfos);
+        let mut v: Vec<Option<u32>> = vec![None; n];
+        for (idx, off) in pairs {
+            let b = off as usize;
+            v[idx as usize] = Some(u32::from_le_bytes([blob[b], blob[b+1], blob[b+2], blob[b+3]]));
+        }
+        v
+    };
+    let resources = parse_resources_section(&mem);
     let scatter_str = |kind: SectionKind| -> Vec<Option<String>> {
         let (pairs, _, blob) = split_sparse(kind);
         let mut v: Vec<Option<String>> = vec![None; n];
@@ -1517,6 +1591,9 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         closure_infos,
         partial_infos,
         closure_call_arg_counts,
+        lib_ret_kinds,
+        embed_infos,
+        resources,
         select_infos: Vec::new(),
         writeback_targets,
         tail_call_flags: Vec::new(),

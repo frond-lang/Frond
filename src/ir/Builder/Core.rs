@@ -1075,6 +1075,23 @@ impl<'a> IrBuilder<'a> {
         None
     }
 
+    /// Look up an expression's inferred TypeHandle (from Sema).
+    ///
+    /// Companion of `expr_type_name` with the same instance-local → global
+    /// fallback order; used where the concrete type structure matters (e.g.
+    /// extracting `ForeignFn[R]`'s `R` for Lib.lookup lowering).
+    pub(super) fn expr_type_handle(&self, expr_id: crate::ast::Ast::ExprId) -> Option<crate::types::TypeHandle> {
+        let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr_id.0 as u64);
+        if let Some(inst_id) = self.current_instance_id {
+            if let Some(inst) = self.sema.monomorph_instances.get(inst_id as usize) {
+                if let Some(info) = inst.expr_types.get(&key) {
+                    return Some(info.ty);
+                }
+            }
+        }
+        self.sema.expr_types.get(&key).map(|info| info.ty)
+    }
+
     /// Look up the implicit-this access kind for an expression (set by sema).
     ///
     /// Sema records on `ExprInfo.implicit_this` whether a bare identifier/call inside a method

@@ -210,6 +210,16 @@ impl<'a> InferContext<'a> {
             Expr::Propagate(operand) => {
                 let inner_ty = self.infer_expr(*operand, ast, env, None);
                 let resolved = self.arena.resolve(inner_ty);
+                // Expected-type solve-through: `val f: T = expr?` where expr:
+                // Throw<V, E> — unify V with T here so type vars inside V
+                // (e.g. ForeignFn[R] from lib.lookup) are solved at inference
+                // time instead of leaking unresolved into the IR layer.
+                if let Some(exp) = expected {
+                    if let Type::Throw(_) = self.arena.get(resolved) {
+                        let (v, _) = self.arena.throw_parts(resolved);
+                        let _ = self.unify_or_constrain(v, exp);
+                    }
+                }
                 let span = ast.expr(expr).span;
                 self.check_propagate(resolved, inner_ty, self.expected_return, span.line, span.column)
             }

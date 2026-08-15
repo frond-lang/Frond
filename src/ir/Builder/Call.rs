@@ -821,35 +821,85 @@ impl<'a> IrBuilder<'a> {
 
     /// Map a Kuzo type name to AbiType. str is handled separately by push_abi_types (two slots).
     pub(super) fn abi_type_of(&self, ty_name: &str) -> crate::ffi::Abi::AbiType {
-        use crate::ffi::Abi::AbiType;
-        match ty_name {
-            "void" => AbiType::Void,
-            "i8" => AbiType::Int { bits: 8, signed: true },
-            "i16" => AbiType::Int { bits: 16, signed: true },
-            "i32" => AbiType::Int { bits: 32, signed: true },
-            "i64" | "isize" => AbiType::Int { bits: 64, signed: true },
-            "u8" | "bool" => AbiType::Int { bits: 8, signed: false },
-            "char" => AbiType::Int { bits: 32, signed: false },
-            "u16" => AbiType::Int { bits: 16, signed: false },
-            "u32" => AbiType::Int { bits: 32, signed: false },
-            "u64" | "usize" => AbiType::Int { bits: 64, signed: false },
-            "f32" => AbiType::Float32,
-            "f64" => AbiType::Float64,
-            _ if ty_name.starts_with('*') => AbiType::Ptr,
-            _ => AbiType::Int { bits: 64, signed: true }, // fallback
+        crate::ffi::Abi::abi_type_from_name(ty_name)
+    }
+
+    /// Reads a `Lib.embed` resource file, resolving `rel` against the entry
+    /// module's directory (falling back to the process CWD when the entry has
+    /// no source path, e.g. stdin).
+    pub(super) fn read_embed_resource(&self, rel: &str) -> Result<Vec<u8>, String> {
+        let base = self
+            .module
+            .source_path
+            .and_then(|p| std::path::Path::new(p).parent())
+            .map(|d| d.to_path_buf())
+            .unwrap_or_default();
+        let path = base.join(rel);
+        std::fs::read(&path).map_err(|e| format!("cannot read '{}': {}", path.display(), e))
+    }
+
+    /// Registers an embedded resource (deduplicated by path name), returning
+    /// its index into `graph.resources`.
+    pub(super) fn add_embed_resource(&mut self, name: &str, bytes: Vec<u8>) -> u32 {
+        if let Some(i) = self.graph.resources.iter().position(|(n, _)| &**n == name) {
+            return i as u32;
         }
+        self.graph.resources.push((
+            std::sync::Arc::from(name),
+            std::sync::Arc::from(bytes.into_boxed_slice()),
+        ));
+        (self.graph.resources.len() - 1) as u32
+    }
+
+    /// Extracts the `ForeignFn[R]` return ABI tag from a `lib.lookup(...)`
+    /// call's static type (`Throw<ForeignFn<R>, FfiError>`). 0 (void) on any
+    /// shape mismatch — Sema guarantees the annotation path, so this is a
+    /// defensive fallback.
+    fn lib_lookup_ret_tag(&self, call_expr_id: crate::ast::Ast::ExprId) -> u8 {
+        if std::env::var("KUZO_DEBUG_LIB").is_ok() {
+            let dbg = self.expr_type_handle(call_expr_id).map(|h| {
+                let r = self.type_arena.resolve(h);
+                let inner = match self.type_arena.get(r) {
+                    crate::types::Type::Throw(_) => {
+                        let (v, e) = self.type_arena.throw_parts(r);
+                        let vr = self.type_arena.resolve(v);
+                        let ff_inner = match self.type_arena.get(vr) {
+                            crate::types::Type::ForeignFn(_) => {
+                                let ret = self.type_arena.foreign_fn_ret(vr);
+                                let rr = self.type_arena.resolve(ret);
+                                format!(" ForeignFn ret={:?} err={:?}", self.type_arena.get(rr), self.type_arena.get(self.type_arena.resolve(e)))
+                            }
+                            other => format!(" value={:?} err={:?}", other, self.type_arena.get(self.type_arena.resolve(e))),
+                        };
+                        format!("Throw{{{:?}{}}}", self.type_arena.get(vr), ff_inner)
+                    }
+                    other => format!("{:?}", other),
+                };
+                format!("{:?} -> {}", self.type_arena.get(r), inner)
+            });
+            eprintln!("[LIB-RET-TAG] expr {:?} ty = {:?}", call_expr_id, dbg);
+        }
+        self.expr_type_handle(call_expr_id)
+            .map(|h| {
+                let resolved = self.type_arena.resolve(h);
+                if let crate::types::Type::Throw(_) = self.type_arena.get(resolved) {
+                    let (v, _) = self.type_arena.throw_parts(resolved);
+                    let fv = self.type_arena.resolve(v);
+                    if let crate::types::Type::ForeignFn(_) = self.type_arena.get(fv) {
+                        let r = self.type_arena.foreign_fn_ret(fv);
+                        let rt = self.type_arena.get(self.type_arena.resolve(r));
+                        return crate::ir::Compute::abi_name_to_lib_ret_kind(rt.name());
+                    }
+                }
+                0
+            })
+            .unwrap_or(0)
     }
 
     /// Push AbiType(s) for a Kuzo type name. str and u8[] expand to (Ptr, Int) two
     /// slots, mirroring the DataLen C-side expansion in ffi/Gen.rs (`{p}_data`/`{p}_len`).
     pub(super) fn push_abi_types(&self, ty_name: &str, out: &mut Vec<crate::ffi::Abi::AbiType>) {
-        if ty_name == "str" || ty_name == "u8[]" {
-            // str/u8[] → (data ptr, byte length)
-            out.push(crate::ffi::Abi::AbiType::Ptr);
-            out.push(crate::ffi::Abi::AbiType::Int { bits: 64, signed: false });
-        } else {
-            out.push(self.abi_type_of(ty_name));
-        }
+        crate::ffi::Abi::push_abi_types_for_name(ty_name, out)
     }
 
     /// Compile a method call.
@@ -866,6 +916,88 @@ impl<'a> IrBuilder<'a> {
         args: &[crate::ast::Ast::ExprId],
         recv_node_override: Option<NodeId>,
     ) -> NodeId {
+        // Lib.open(path) / Lib.embed(path): builtin native-library constructors.
+        // The receiver `Lib` is a type name (flagged module_func_recv by sema),
+        // never compiled as a value node. embed requires a string literal so
+        // the file can be captured into the artifact's resources at build time.
+        if let crate::ast::Ast::Expr::Ident("Lib") = &self.current_module().arena.expr(recv).node {
+            let recv_key = crate::sema::Sema::module_expr_key(
+                self.expr_key_module(),
+                recv.0 as u64,
+            );
+            if self.sema.module_func_recv_exprs.contains(&recv_key)
+                && (method == "open" || method == "embed")
+            {
+                let span = self.current_module().arena.expr(call_expr_id).span;
+                if args.len() != 1 {
+                    self.errors.push(format!(
+                        "Lib.{} takes exactly 1 argument (path: str) at line {}",
+                        method, span.line
+                    ));
+                    return self.compile_placeholder();
+                }
+                match method {
+                    "open" => {
+                        let mut inputs = Vec::with_capacity(2);
+                        inputs.push(self.compile_subexpr(args[0]));
+                        if let Some(eff) = self.current_effect {
+                            inputs.push(eff);
+                        }
+                        let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                        return self.graph.add_node(Node {
+                            kind: NodeKind::Call,
+                            input_count: inputs.len() as u8,
+                            inputs_offset,
+                            compute_fn: CF_LIB_OPEN,
+                        });
+                    }
+                    "embed" => {
+                        // Compile-time capture: the path must be a string literal.
+                        let lit = match &self.current_module().arena.expr(args[0]).node {
+                            crate::ast::Ast::Expr::StrLit(s) => Some(*s),
+                            _ => None,
+                        };
+                        let rel_path = match lit {
+                            Some(p) => p,
+                            None => {
+                                self.errors.push(format!(
+                                    "Lib.embed requires a string-literal path at line {} (the file is captured into the artifact at build time)",
+                                    span.line
+                                ));
+                                return self.compile_placeholder();
+                            }
+                        };
+                        let bytes = match self.read_embed_resource(rel_path) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                self.errors.push(format!(
+                                    "Lib.embed('{}') at line {}: {}",
+                                    rel_path, span.line, e
+                                ));
+                                return self.compile_placeholder();
+                            }
+                        };
+                        let res_idx = self.add_embed_resource(rel_path, bytes);
+                        let mut inputs = Vec::with_capacity(2);
+                        inputs.push(self.compile_subexpr(args[0]));
+                        if let Some(eff) = self.current_effect {
+                            inputs.push(eff);
+                        }
+                        let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                        let node = self.graph.add_node(Node {
+                            kind: NodeKind::Call,
+                            input_count: inputs.len() as u8,
+                            inputs_offset,
+                            compute_fn: CF_LIB_EMBED,
+                        });
+                        self.graph.set_embed_info(node, res_idx);
+                        return node;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+
         // Qualified-name constructor: Type.Ctor(args) (constructor with parameters)
         if let crate::ast::Ast::Expr::Ident(type_name) = &self.current_module().arena.expr(recv).node {
             if let Some((ctor_type_name, ctor_name, field_names, kind, is_nullary)) =
@@ -924,6 +1056,86 @@ impl<'a> IrBuilder<'a> {
         let intrinsic = dispatch_intrinsic.or_else(|| self.lookup_intrinsic(recv, method));
         if let Some(intrinsic) = intrinsic {
             if let Some(node) = self.try_lower_intrinsic(recv, recv_node, args, intrinsic) {
+                return node;
+            }
+        }
+
+        // ── Lib / ForeignFn builtin methods (structural, reflect-style dispatch) ──
+        // lookup/has_symbol/close on `Lib`; call (any arity) on `ForeignFn[R]`.
+        // Pairs with the Sema-side lib_method_return_type recognition.
+        {
+            let recv_ty = self.expr_type_name(recv).unwrap_or("");
+            if recv_ty == "Lib" {
+                match method {
+                    "lookup" if args.len() == 2 => {
+                        let ret_tag = self.lib_lookup_ret_tag(call_expr_id);
+                        let mut inputs = vec![recv_node];
+                        for &arg in args {
+                            inputs.push(self.compile_subexpr(arg));
+                        }
+                        if let Some(eff) = self.current_effect {
+                            inputs.push(eff);
+                        }
+                        let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                        let node = self.graph.add_node(Node {
+                            kind: NodeKind::Call,
+                            input_count: inputs.len() as u8,
+                            inputs_offset,
+                            compute_fn: CF_LIB_LOOKUP,
+                        });
+                        self.graph.set_lib_ret_kind(node, ret_tag);
+                        return node;
+                    }
+                    "has_symbol" if args.len() == 1 => {
+                        let mut inputs = vec![recv_node];
+                        for &arg in args {
+                            inputs.push(self.compile_subexpr(arg));
+                        }
+                        if let Some(eff) = self.current_effect {
+                            inputs.push(eff);
+                        }
+                        let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                        return self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: inputs.len() as u8,
+                            inputs_offset,
+                            compute_fn: CF_LIB_HAS_SYMBOL,
+                        });
+                    }
+                    "close" if args.is_empty() => {
+                        let mut inputs = vec![recv_node];
+                        if let Some(eff) = self.current_effect {
+                            inputs.push(eff);
+                        }
+                        let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                        return self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: inputs.len() as u8,
+                            inputs_offset,
+                            compute_fn: CF_LIB_CLOSE,
+                        });
+                    }
+                    _ => {}
+                }
+            } else if recv_ty == "ForeignFn" && method == "call" {
+                // Any arity: [ffn, args...] + effect; arg count via the shared
+                // closure_call_arg_count metadata slot.
+                let mut inputs = Vec::with_capacity(1 + args.len() + 1);
+                inputs.push(recv_node);
+                for &arg in args {
+                    inputs.push(self.compile_subexpr(arg));
+                }
+                if let Some(eff) = self.current_effect {
+                    inputs.push(eff);
+                }
+                let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                let node = self.graph.add_node(Node {
+                    kind: NodeKind::Call,
+                    input_count: inputs.len() as u8,
+                    inputs_offset,
+                    compute_fn: CF_FFN_CALL,
+                });
+                self.graph.set_closure_call_arg_count(node, args.len() as u8);
                 return node;
             }
         }

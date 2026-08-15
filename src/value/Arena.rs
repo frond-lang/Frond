@@ -1718,6 +1718,11 @@ pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
         (HeapObj::CoroutineFrame, HeapObj::CoroutineFrame) => false,
         // FFI opaque pointers: equal iff raw pointer value matches
         (HeapObj::OpaquePtr(x), HeapObj::OpaquePtr(y)) => x.ptr == y.ptr,
+        // Lib/ForeignFn: identity via the shared handle (Arc ptr_eq), like ChannelVal
+        (HeapObj::LibVal(x), HeapObj::LibVal(y)) => std::sync::Arc::ptr_eq(&x.shared, &y.shared),
+        (HeapObj::ForeignFnVal(x), HeapObj::ForeignFnVal(y)) => {
+            std::sync::Arc::ptr_eq(&x.shared, &y.shared) && x.addr == y.addr
+        }
         // Different HeapObj variants are never equal
         _ => false,
     }
@@ -1967,6 +1972,8 @@ fn deep_clone_heap(
         HeapObj::ReceiverVal(r) => HeapObj::ReceiverVal(r.clone()),
         HeapObj::CoroutineFrame => HeapObj::CoroutineFrame,
         HeapObj::OpaquePtr(op) => HeapObj::OpaquePtr(op.clone()),
+        HeapObj::LibVal(l) => HeapObj::LibVal(l.clone()),
+        HeapObj::ForeignFnVal(f) => HeapObj::ForeignFnVal(f.clone()),
     }
 }
 

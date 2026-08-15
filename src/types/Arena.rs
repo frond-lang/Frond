@@ -116,6 +116,10 @@ impl TypeArena {
         let id = self.make_detail(TypeDetail::Receiver { elem });
         self.make(Type::Receiver(id))
     }
+    pub fn make_foreign_fn(&mut self, ret: TypeHandle) -> TypeHandle {
+        let id = self.make_detail(TypeDetail::ForeignFn { ret });
+        self.make(Type::ForeignFn(id))
+    }
     pub fn make_array(&mut self, elem: TypeHandle, size: Option<u64>) -> TypeHandle {
         let id = self.make_detail(TypeDetail::Array { elem, size });
         self.make(Type::Array(id))
@@ -204,6 +208,7 @@ impl TypeArena {
             | Type::Atomic(id)
             | Type::Sender(id)
             | Type::Receiver(id)
+            | Type::ForeignFn(id)
             | Type::Array(id)
             | Type::Ref(id)
             | Type::Fn(id)
@@ -274,6 +279,14 @@ impl TypeArena {
     pub fn receiver_elem(&self, h: TypeHandle) -> TypeHandle {
         match self.detail(self.detail_id_of(self.get(h))) {
             TypeDetail::Receiver { elem } => *elem,
+            _ => unreachable!(),
+        }
+    }
+    /// The return type of a `ForeignFn`.
+    #[inline]
+    pub fn foreign_fn_ret(&self, h: TypeHandle) -> TypeHandle {
+        match self.detail(self.detail_id_of(self.get(h))) {
+            TypeDetail::ForeignFn { ret } => *ret,
             _ => unreachable!(),
         }
     }
@@ -426,6 +439,7 @@ impl TypeArena {
             Type::Atomic(_) => f(self.atomic_elem(resolved)),
             Type::Sender(_) => f(self.sender_elem(resolved)),
             Type::Receiver(_) => f(self.receiver_elem(resolved)),
+            Type::ForeignFn(_) => f(self.foreign_fn_ret(resolved)),
             // TypeVar, scalars, Str/Null/Void/Never/Unknown, TraitObject, ModuleRef, Timer: no children.
             _ => {}
         }
@@ -652,6 +666,7 @@ impl TypeArena {
             Type::Atomic(_) => self.occurs(var_idx, self.atomic_elem(ty)),
             Type::Sender(_) => self.occurs(var_idx, self.sender_elem(ty)),
             Type::Receiver(_) => self.occurs(var_idx, self.receiver_elem(ty)),
+            Type::ForeignFn(_) => self.occurs(var_idx, self.foreign_fn_ret(ty)),
             Type::Generic(_) => {
                 let (_, args) = self.generic_parts(ty);
                 args.iter().any(|&a| self.occurs(var_idx, a))
@@ -868,6 +883,9 @@ impl TypeArena {
             }
             (Type::Receiver(_), Type::Receiver(_)) => {
                 self.unify(self.receiver_elem(a), self.receiver_elem(b))
+            }
+            (Type::ForeignFn(_), Type::ForeignFn(_)) => {
+                self.unify(self.foreign_fn_ret(a), self.foreign_fn_ret(b))
             }
 
             _ => Err(UnifyError::TypeMismatch),
