@@ -6,7 +6,7 @@
 // Cross-platform logic is implemented in the C body via #if conditional compilation.
 // Called by wrappers in std/os/*.
 //
-// Out-buffer convention (shared with io/terminal Raw):
+// Out-buffer convention (shared with the io Raw primitives):
 //   __*_into functions fill `buf` and return the byte length written;
 //   -1 = not found / failure, -2 = buffer too small.
 

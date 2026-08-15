@@ -50,7 +50,6 @@ const EXTERN_FROND_FILES: &[&str] = &[
     "src/stdlib/builtin/time/Raw.kz",
     "src/stdlib/builtin/cast/Raw.kz",
     "src/stdlib/builtin/str/Raw.kz",
-    "src/stdlib/builtin/terminal/Raw.kz",
     "src/stdlib/builtin/os/Raw.kz",
 ];
 
