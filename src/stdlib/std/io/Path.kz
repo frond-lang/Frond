@@ -1,4 +1,4 @@
-// Path.kz — Cross-platform path abstraction (pure Kuzo implementation, no syscall dependency)
+// Path.kz — Cross-platform path abstraction (pure Frond implementation, no syscall dependency)
 //
 // Design doc §4.4: Path newtype + path operations
 // Path internally stores segments (normalized non-empty segment list) + is_absolute flag

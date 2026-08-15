@@ -1,5 +1,5 @@
 // builtin reflect pack declaration
 //
-// Exposes the Reflect submodule to all Kuzo user code as visible by default (builtin is fully visible by default).
+// Exposes the Reflect submodule to all Frond user code as visible by default (builtin is fully visible by default).
 // Reflect.format is the generic formatting entry, called by println etc. in builtin/io/Console.kz.
 pub pack Reflect

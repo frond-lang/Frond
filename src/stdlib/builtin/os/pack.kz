@@ -1,5 +1,5 @@
 // builtin os pack declaration
 //
-// Exposes the OS process-environment primitives module to all Kuzo user code
+// Exposes the OS process-environment primitives module to all Frond user code
 // as visible by default (builtin is fully visible by default).
 pub pack Raw

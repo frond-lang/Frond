@@ -1,6 +1,6 @@
 // Math standard library — Power/exponential/logarithm + number theory
 //
-// Pure Kuzo implementation, algorithm: Newton-Raphson (sqrt/cbrt), Taylor + argument reduction (exp/log).
+// Pure Frond implementation, algorithm: Newton-Raphson (sqrt/cbrt), Taylor + argument reduction (exp/log).
 // Depends on Round.kz floor/trunc/fmod/ldexp implementation.
 // Generic functions use match x.type_name() to dispatch to corresponding precision implementations by type.
 

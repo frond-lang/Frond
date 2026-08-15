@@ -1,6 +1,6 @@
 // Math standard library — General functions + constants + NaN/Inf
 //
-// Pure Kuzo implementation, zero FFI dependency.
+// Pure Frond implementation, zero FFI dependency.
 // NaN/Inf constructed using IEEE 754 floating point division by zero semantics.
 // Generic functions use match x.type_name() to dispatch to corresponding precision implementations by type.
 
@@ -27,7 +27,7 @@ pub val LN2_F128: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1f128
 pub val PI_F16: f16    = 0x1.92p+1f16
 pub val E_F16: f16     = 0x1.5cp+1f16
 
-// ─── NaN/Inf construction (pure Kuzo semantics, using IEEE 754 floating point division by zero) ───
+// ─── NaN/Inf construction (pure Frond semantics, using IEEE 754 floating point division by zero) ───
 // 0.0/0.0 = NaN, 1.0/0.0 = +Inf, -1.0/0.0 = -Inf
 
 pub fun nan_f64(): f64       { 0.0 / 0.0 }
@@ -275,7 +275,7 @@ pub fun isnormal<T>(x: T): bool {
     }
 }
 
-// ─── wrapping arithmetic (Kuzo integer operations already use wrapping semantics, here providing explicit API) ───
+// ─── wrapping arithmetic (Frond integer operations already use wrapping semantics, here providing explicit API) ───
 
 pub fun wrapping_add<T>(a: T, b: T): T { a + b }
 pub fun wrapping_sub<T>(a: T, b: T): T { a - b }

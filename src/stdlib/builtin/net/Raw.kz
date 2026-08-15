@@ -4,7 +4,7 @@
 // Cross-platform: every function has both a POSIX (sys/socket.h) and a Windows (winsock2.h) branch.
 //
 // Design notes:
-// - IpAddr/Ipv6Addr and other record types are decomposed into scalars by the Kuzo-side wrapper before calling this layer.
+// - IpAddr/Ipv6Addr and other record types are decomposed into scalars by the Frond-side wrapper before calling this layer.
 // - For example, __net_tcp_connect_v4 receives u32 ip_bits; the connect wrapper in std/net/TcpStream.kz
 //   extracts bits from IpAddr.V4(Ipv4Addr(bits)) and passes it in.
 // - Timeout parameter timeout_ns: i64, <0 means infinite wait.
@@ -17,7 +17,7 @@
 // Winsock requires WSAStartup before any socket call. Each socket-creating
 // entry point lazily initializes it via an inlined refcount guard (a separate
 // @extern("C") helper cannot be used because Gen.rs prefixes every exported
-// symbol with `kuzo_extern_`, which would break the cross-function call name).
+// symbol with `frond_extern_`, which would break the cross-function call name).
 
 @c_include("winsock2.h")
 @c_include("ws2tcpip.h")
@@ -309,7 +309,7 @@ fun __net_resolve_into(host: str, out_buf: u8[], max_count: usize): i64 #{
 
 // ─── IPv6 TCP/UDP primitives ───────────────────────────────────────────
 //
-// Ipv6Addr is stored big-endian as (hi: u64, lo: u64) on the Kuzo side.
+// Ipv6Addr is stored big-endian as (hi: u64, lo: u64) on the Frond side.
 // The C-side struct in6_addr is a 16-byte array; this layer assembles hi/lo → in6_addr:
 //   bytes[0..8)  = hi big-endian
 //   bytes[8..16) = lo big-endian

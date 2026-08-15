@@ -1,6 +1,6 @@
 // Proc.kz — current-process information and termination
 //
-// Sync API. Command-line arguments are intentionally NOT here: Kuzo passes
+// Sync API. Command-line arguments are intentionally NOT here: Frond passes
 // them to `main(args)` directly, which is the single source of truth.
 
 // Process id of the current process.

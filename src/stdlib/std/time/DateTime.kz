@@ -1,8 +1,8 @@
-// DateTime.kz — calendar representation + formatting (pure Kuzo)
+// DateTime.kz — calendar representation + formatting (pure Frond)
 //
 // Design doc §5.7: DateTime newtype + arithmetic + strftime-like formatting
 // All calendar operations (add_days etc.) are delegated to pure functions of the Calendar module
-// Formatting helpers like pad_int / digit_char are all implemented in Kuzo — decision S11 (no __format_int primitive introduced)
+// Formatting helpers like pad_int / digit_char are all implemented in Frond — decision S11 (no __format_int primitive introduced)
 
 pub type DateTime = DateTime(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8, nanos: u32, weekday: u8, day_of_year: u16) {
     // ─── Conversion to/from TimeComponents ────────────────────────────────────────
@@ -19,8 +19,8 @@ pub type DateTime = DateTime(year: i32, month: u8, day: u8, hour: u8, minute: u8
         DateTime(new_ymd.year, new_ymd.month, new_ymd.day, hour, minute, second, nanos, Calendar.weekday_of(new_ymd.year, new_ymd.month, new_ymd.day), Calendar.day_of_year(new_ymd.year, new_ymd.month, new_ymd.day))
     }
 
-    // Adds a Duration (round-trip conversion via UTC components, pure Kuzo algorithm)
-    // Calls pure Kuzo conversion functions of SystemTime (replacing the original __components_to_ns_utc / __systemtime_to_utc_components syscalls)
+    // Adds a Duration (round-trip conversion via UTC components, pure Frond algorithm)
+    // Calls pure Frond conversion functions of SystemTime (replacing the original __components_to_ns_utc / __systemtime_to_utc_components syscalls)
     pub fun add_duration(d: Duration): Throw<DateTime, TimeError> {
         val comp = to_components()
         val ns = std.time.SystemTime.components_to_ns_utc(comp)?
@@ -95,7 +95,7 @@ pub fun from_components(comp: TimeComponents): DateTime {
 
 // ─── Formatting helpers ───────────────────────────────────────────────────
 
-// Integer to string + zero padding (pure Kuzo implementation, decision S11)
+// Integer to string + zero padding (pure Frond implementation, decision S11)
 pub fun pad_int(value: i64, width: usize): str {
     val sign: str = if value < 0 { "-" } else { "" }
     var abs_val = if value < 0 { -value } else { value }
@@ -160,7 +160,7 @@ pub fun weekday_abbr(w: u8): str {
 }
 
 // parse implementation: parse an ISO 8601 string into a DateTime
-// Known blocker: the Kuzo engine has a bug where variable bindings are misaligned after
+// Known blocker: the Frond engine has a bug where variable bindings are misaligned after
 // calling other functions within a function
 // (parse_digits_at returns the correct value when called directly outside parse, but when
 //   called inside parse, the year/month field values are misaligned when constructing the

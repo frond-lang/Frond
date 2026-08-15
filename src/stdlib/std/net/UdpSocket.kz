@@ -4,7 +4,7 @@
 // All IO operations are async, return Async<Throw<T, IOError>>.
 //
 // Underlying @extern("C") primitives (__net_udp_bind_v4 / __net_udp_send_to_v4 etc.)
-// are declared in builtin/net/Raw.kz. __net_udp_bind / __net_udp_send_to are Kuzo wrappers.
+// are declared in builtin/net/Raw.kz. __net_udp_bind / __net_udp_send_to are Frond wrappers.
 // __net_tcp_close is defined in TcpStream.kz (shared by TCP/UDP).
 // async function bodies currently call synchronous primitives directly; spawn semantics
 // will be added once the IR/Engine async model is ready.
@@ -12,7 +12,7 @@
 // RecvFromResult layout (aligned with syscall/net.zig makeRecordWithNames):
 //   fields = [__tag=0, data=u8[], src_addr=SocketAddr]
 
-// ─── Kuzo wrapper: @extern("C") raw return value → Throw ──────────────
+// ─── Frond wrapper: @extern("C") raw return value → Throw ──────────────
 
 // __net_udp_bind(ip: IpAddr, port: u16, reuse_addr: bool): Throw<i64, IOError>
 @internal

@@ -4,10 +4,10 @@
 // All IO operations are async, returning Async<Throw<T, IOError>> (except Instant/SystemTime which are synchronous)
 //
 // Types use newtype form (type Name = Name(...)), so that values constructed by the syscall layer via
-// Value.makeRecordWithNames(type_name="Name", ...) can be recognized on the Kuzo side.
+// Value.makeRecordWithNames(type_name="Name", ...) can be recognized on the Frond side.
 //
 // The underlying @extern("C") primitives (__file_open_raw / __file_close / __file_read_into etc.)
-// are declared in builtin/io/Raw.kz. This file defines Kuzo wrappers that convert C raw return values to Throw.
+// are declared in builtin/io/Raw.kz. This file defines Frond wrappers that convert C raw return values to Throw.
 // async function bodies currently call synchronous primitives directly; spawn semantics will be added once the IR/Engine async model is ready.
 
 // ─── Top-level constants (POSIX flags) ─────────────────────────────
@@ -122,7 +122,7 @@ pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
         __file_fstat(fd)?
     }
 
-    // ─── Composite semantic methods (based on read/write primitive composition, pure Kuzo implementation) ──
+    // ─── Composite semantic methods (based on read/write primitive composition, pure Frond implementation) ──
 
     // Read exactly len bytes, return u8[]; throw UnexpectedEof when EOF is insufficient
     // Accumulate slices with str (amortized O(n)), avoid O(n²) of u8[] ++
@@ -215,7 +215,7 @@ pub fun __compute_flags(mode: OpenMode): i32 {
     flags
 }
 
-// ─── Kuzo wrapper: @extern("C") raw return value → Throw ──────────
+// ─── Frond wrapper: @extern("C") raw return value → Throw ──────────
 
 // __file_open_raw(path: str, flags: i32, mode: i32): i64 → Throw<i64, IOError>
 // fd < 0 = open failed

@@ -4,7 +4,7 @@
 // Scalar bit storage (zero waste): Ipv4Addr=u32, Ipv6Addr=hi/lo u64.
 // Types use newtype/ADT form so that values constructed by the syscall layer via
 // Value.makeRecordWithNames(type_name="Ipv4Addr"/"Ipv6Addr"/"IpAddr", ...)
-// can be recognized on the Kuzo side.
+// can be recognized on the Frond side.
 //
 // Method dispatch is not yet supported; use module function call syntax (see std_instant/Main.kz):
 //   std.net.Addr.v4_loopback()

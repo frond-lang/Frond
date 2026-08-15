@@ -26,7 +26,7 @@ fun __dns_read_u64_le(buf: u8[], offset: usize): u64 {
         | (((buf[u64]) as offset + 7) << 56u64)
 }
 
-// ─── Kuzo wrapper: __net_resolve_into → Throw<IpAddr[], IOError> ──
+// ─── Frond wrapper: __net_resolve_into → Throw<IpAddr[], IOError> ──
 
 // __net_resolve(host: str): Throw<IpAddr[], IOError>
 // Fills the out-buffer via __net_resolve_into (17 bytes per entry), then assembles IpAddr[]

@@ -4,7 +4,7 @@
 // All IO operations are async, return Async<Throw<T, IOError>>.
 //
 // Underlying @extern("C") primitives (__net_tcp_listen_v4 / __net_tcp_close_raw)
-// are declared in builtin/net/Raw.kz. __net_tcp_listen is a Kuzo wrapper.
+// are declared in builtin/net/Raw.kz. __net_tcp_listen is a Frond wrapper.
 // __net_tcp_close is defined in TcpStream.kz (shared by TCP/UDP).
 // async function bodies currently call synchronous primitives directly; spawn semantics
 // will be added once the IR/Engine async model is ready.
@@ -13,7 +13,7 @@
 //   fields = [__tag=0, stream_fd=i64, peer_addr=SocketAddr]
 // After accept succeeds, stream_fd can be used to construct a TcpStream (see TcpStream.from_accept_fd).
 
-// ─── Kuzo wrapper: @extern("C") raw return value → Throw ──────────────
+// ─── Frond wrapper: @extern("C") raw return value → Throw ──────────────
 
 // __net_tcp_listen(ip: IpAddr, port: u16, reuse_addr: bool): Throw<i64, IOError>
 @internal

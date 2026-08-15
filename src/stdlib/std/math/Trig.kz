@@ -1,6 +1,6 @@
 // Math standard library — Trigonometric and hyperbolic functions
 //
-// Pure Kuzo implementation, algorithm: Taylor series + argument reduction.
+// Pure Frond implementation, algorithm: Taylor series + argument reduction.
 // Depends on Round.kz for fmod implementation, Power.kz for exp/log/sqrt implementation.
 // Generic functions use match x.type_name() to dispatch to the corresponding precision implementation.
 

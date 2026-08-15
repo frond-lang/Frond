@@ -1,6 +1,6 @@
 // builtin error package declaration (decision #20: subdirectories need a pack.kz)
 //
-// Exposes Err / Error / IOError / TimeError to all Kuzo user code as visible by default (decision #19: fully visible by default).
+// Exposes Err / Error / IOError / TimeError to all Frond user code as visible by default (decision #19: fully visible by default).
 // builtin packages are not loaded via the normal import mechanism, but are registered directly into the global environment by sema at startup.
 pub pack Err
 pub pack Error

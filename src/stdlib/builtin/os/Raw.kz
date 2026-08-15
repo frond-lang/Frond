@@ -85,7 +85,7 @@ fun __os_getpid(): i64 #{
     #endif
 }#
 
-// Hard termination of the current process. Note: Kuzo `defer` blocks do NOT
+// Hard termination of the current process. Note: Frond `defer` blocks do NOT
 // run and buffered output is NOT flushed on this path (same semantics as the
 // C exit()). For graceful shutdown, return from main instead.
 @c_include("stdlib.h")

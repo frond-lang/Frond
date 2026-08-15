@@ -1,7 +1,7 @@
 // Math standard library — Rounding and integer operations
 //
 // Contains: floor/ceil/round/trunc/fabs/copysign/fmod/ldexp
-// Pure Kuzo implementation, no FFI dependency.
+// Pure Frond implementation, no FFI dependency.
 // Generic functions use match x.type_name() to dispatch to corresponding precision implementations by type.
 
 // ─── trunc (truncation toward zero) ───
@@ -298,7 +298,7 @@ pub fun ldexp<T>(x: T, exp: i32): T {
 
 // ─── frexp (decompose into mantissa m∈[0.5,1) and exponent e, x = m * 2^e) ───
 // x==0 → m=0,e=0; NaN/Inf returned as-is with m=x,e=0
-// Kuzo has no tuples, split into frexp_mantissa and frexp_exponent two functions
+// Frond has no tuples, split into frexp_mantissa and frexp_exponent two functions
 
 @internal
 fun frexp_f64_mantissa_impl(x: f64): f64 {

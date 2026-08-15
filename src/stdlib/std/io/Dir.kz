@@ -9,7 +9,7 @@
 // Directory entry (name + kind), aligned with syscall/io.zig dir_list return structure
 pub type DirEntry = DirEntry(name: str, kind: FileKind)
 
-// ─── Kuzo wrapper: @extern("C") raw return value → Throw ──────────
+// ─── Frond wrapper: @extern("C") raw return value → Throw ──────────
 
 // __dir_create(path: str, recursive: bool): Throw<void, IOError>
 @internal
