@@ -25,7 +25,36 @@ pub struct IrBuilder<'a> {
     pub builtin_analyses: Vec<Option<&'a crate::pass::Analyzer::AnalysisReport>>,
     pub graph: DataFlowGraph,
     /// Function name -> subgraph id map (looked up when compiling `Call` to bind `call_target`).
+    /// Key kinds: bare (builtin + user/dep only — std never registers bare),
+    /// mangled (`std.io.File.remove`), short-qualified (`File.remove`),
+    /// package (`std.math::ldexp_impl`), generic instance (`name#id`).
+    /// ALL lookups go through `resolve_func` — the single resolution point.
     pub func_subgraphs: rustc_hash::FxHashMap<String, SubGraphId>,
+    /// Collision tripwire, all key families: key → qualified display names of
+    /// the DISTINCT functions that competed for one slot during registration
+    /// (bare, short-qualified, package, import alias). `resolve_func` turns
+    /// any call resolving through a conflicted key into a hard compile error
+    /// — never a silent first/last-writer-wins (the File.remove/Env.remove
+    /// incident: identical signatures, wrong function, perfect fake success).
+    pub name_conflicts: rustc_hash::FxHashMap<String, Vec<String>>,
+    /// Global unique-name index across ALL modules (std included): bare name
+    /// → sg. The sema layer predeclares every loaded module's functions into
+    /// the root env, so a bare call to a GLOBALLY UNIQUE name type-checks
+    /// from anywhere (e.g. `fg_bright_yellow()` after `import
+    /// std.terminal.Ansi`); the IR must honor the same contract. Names
+    /// contested by ≥2 distinct functions go to the tripwire instead —
+    /// first registrant stays indexed, and any bare call through the
+    /// contested name is a hard error.
+    pub global_bare_index: rustc_hash::FxHashMap<String, SubGraphId>,
+    /// Bare names of functions declared `@internal` (stdlib implementation
+    /// primitives). `internal_access_blocked` is the single predicate guarding
+    /// both resolution paths: `resolve_func` (subgraph targets) and the
+    /// extern-dispatch branch in `compile_call` (CF_DYN_FFI_CALL — extern
+    /// functions never enter `func_subgraphs`, so the resolve_func guard
+    /// alone would miss them).
+    pub internal_funcs: rustc_hash::FxHashSet<String>,
+    /// sg → qualified display name, for collision diagnostics.
+    pub sg_qualified_names: rustc_hash::FxHashMap<SubGraphId, String>,
     /// Type method subgraph table: (type_id, method_idx) -> SubGraphId.
     /// `type_id = FIRST_DYNAMIC_TYPE_ID + type_def_index`; `method_idx` is the position of the
     /// method within `TypeDefInfo.methods`. Replaces the `"TypeName.method"` string key
@@ -43,6 +72,13 @@ pub struct IrBuilder<'a> {
     pub current_trait_default_idx: Option<usize>,
     /// The subgraph id of the function currently being compiled (used for `defer` registration).
     pub current_function_sg: Option<SubGraphId>,
+    /// W3C region context: the INNERMOST branch/loop-body subgraph currently
+    /// being compiled (None at function level). `build_await_node` registers
+    /// EventSourceDecls here first — structurally correct scoping that made
+    /// the post-hoc "drain decls from the function sg into the branch sg"
+    /// migrations (Bug #24) unnecessary. Save/restore around nested bodies;
+    /// cleared on function/lambda entry (their bodies are new function scopes).
+    pub current_branch_sg: Option<SubGraphId>,
     /// Loop context stack: the top entry is the current loop's context
     /// (continue jump target + For iterator node).
     pub loop_stack: Vec<LoopContext>,
@@ -76,6 +112,18 @@ pub struct IrBuilder<'a> {
     /// inherited by `Block` trailing expressions and by `If`/`Match` branches;
     /// set to `false` for arguments, conditions, and assignment right-hand sides.
     pub in_tail_position: bool,
+    /// Bug #97: whether the current function's return type is Throw (one Async layer
+    /// unfolded). A tail-position `expr?` must produce the FUNCTION's return value:
+    /// the propagate node yields the UNWRAPPED value (statement/value use), so the
+    /// Propagate lowering re-wraps it with `compute_throw_ok` when this is set.
+    pub fn_returns_throw: bool,
+    /// Bug #100: canonical "home" slot per variable name (the first node the name was
+    /// bound to — the var-decl node, which is also every WriteBack's target). A loop
+    /// condition must read loop-modified variables through their HOME node (the slot
+    /// WriteBacks keep current across iterations), not through the mid-chain node of a
+    /// previous assignment — otherwise the condition re-evaluates against a stale
+    /// snapshot every iteration and the loop never terminates.
+    pub var_home: rustc_hash::FxHashMap<String, (NodeId, bool)>,
     /// Bug #66: Whether the current `compile_block` call is the function body's top-level block.
     /// Set to `true` at `compile_function_body` entry; reset to `false` by the first `compile_block`
     /// call (the function body itself). Nested blocks see `false`, so only they extract
@@ -209,7 +257,7 @@ pub(super) fn reflect_method_intrinsic(method: &str) -> Option<(crate::sema::Sem
         "constructor" => un(336),       // CF_REFLECT_ADT_CTOR
         "field_name" => bin(333),       // CF_REFLECT_FIELD_NAME
         // field_value removed: its return type cannot be expressed without an "any"
-        // type in Kuzo's type system. CF_REFLECT_FIELD_VALUE (334) remains implemented
+        // type in Frond's type system. CF_REFLECT_FIELD_VALUE (334) remains implemented
         // in Compute.rs for potential future use (e.g. a typed field_value<T>(i): T).
         _ => None,
     }
@@ -271,10 +319,15 @@ impl<'a> IrBuilder<'a> {
             builtin_analyses: Vec::new(),
             graph: DataFlowGraph::new(),
             func_subgraphs: rustc_hash::FxHashMap::default(),
+            name_conflicts: rustc_hash::FxHashMap::default(),
+            global_bare_index: rustc_hash::FxHashMap::default(),
+            internal_funcs: rustc_hash::FxHashSet::default(),
+            sg_qualified_names: rustc_hash::FxHashMap::default(),
             method_subgraphs: rustc_hash::FxHashMap::default(),
             trait_default_subgraphs: rustc_hash::FxHashMap::default(),
             current_trait_default_idx: None,
             current_function_sg: None,
+            current_branch_sg: None,
             loop_stack: Vec::new(),
             scope_stack: Vec::new(),
             captured_scopes: Vec::new(),
@@ -283,6 +336,8 @@ impl<'a> IrBuilder<'a> {
             current_sg_start: 0,
             current_effect: None,
             in_tail_position: false,
+            fn_returns_throw: false,
+            var_home: rustc_hash::FxHashMap::default(),
             in_function_top_block: false,
             param_scope_depth: 0,
             in_loop_body: false,
@@ -431,10 +486,89 @@ impl<'a> IrBuilder<'a> {
     }
 
     /// Bind a variable name to a NodeId (in the current scope).
+
+    /// Bug #100 residual: a (re)declaration creates a FRESH home slot. bind_var keeps
+    /// the first home per name (loop-body WriteBack rebinds must not move it), so a
+    /// sequential redeclaration of the same name in one function (`var si` in an early
+    /// section, then `var si` again later) must reset the home explicitly — otherwise
+    /// the second declaration's initial value never reaches the home slot and later
+    /// loops reading through home start from the first declaration's stale final value.
+    pub(super) fn declare_var(&mut self, name: &str, node_id: NodeId) {
+        self.bind_var(name, node_id);
+        let fn_level = self.loop_stack.is_empty();
+        self.var_home.insert(name.to_string(), (node_id, fn_level));
+    }
+
+    /// Bug #100: rebind every loop-body-modified variable to its canonical HOME node
+    /// before compiling a while-loop condition. The condition re-evaluates every
+    /// iteration; WriteBacks update the home slot in the loop frame (via the frame
+    /// chain), so reading the home gives the current value. Reading the mid-chain node
+    /// of a pre-loop assignment instead freezes the condition at loop entry.
+    pub(super) fn rebind_modified_vars_to_home(&mut self, body: crate::ast::Ast::ExprId) {
+        let mut names = rustc_hash::FxHashSet::default();
+        let m = self.current_module();
+        collect_assigned_names(&m.arena, body, &mut names);
+        for name in names {
+            if let Some(&(home, fn_level)) = self.var_home.get(name.as_str()) {
+                if fn_level {
+                    // Rebind in the scope WHERE the name is bound (not the innermost
+                    // scope): a rebind performed inside an if-branch scope would be
+                    // discarded when the branch scope pops, leaving post-branch code
+                    // reading the stale pre-loop chain binding.
+                    for scope in self.scope_stack.iter_mut().rev() {
+                        if scope.contains_key(name.as_str()) {
+                            scope.insert(name.clone(), home);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Companion to `rebind_modified_vars_to_home`: BEFORE a loop is registered, any
+    /// pre-loop assignment to a loop-modified variable lives on the scope's value
+    /// chain (a fresh def node), while the loop's condition/post-loop reads go through
+    /// the variable's HOME slot — which still holds the declaration-time value. That
+    /// made `i = i - 1; while i > 1 {...}` evaluate the condition against the stale
+    /// declaration value. Sync each such variable's current def into its home slot with
+    /// a WriteBack chained onto the current effect, so loop entry sees the up-to-date
+    /// value exactly like an in-body WriteBack would.
+    pub(super) fn sync_modified_vars_to_home(&mut self, body: crate::ast::Ast::ExprId) {
+        let mut names = rustc_hash::FxHashSet::default();
+        let m = self.current_module();
+        collect_assigned_names(&m.arena, body, &mut names);
+        for name in names {
+            if let Some(&(home, fn_level)) = self.var_home.get(name.as_str()) {
+                if !fn_level {
+                    continue;
+                }
+                let cur = match self.lookup_var(name.as_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if cur == home {
+                    continue; // no pre-loop assignment; home already current
+                }
+                let wb = self.compile_writeback_node(cur, home);
+                let eff = self.chain_effects(self.current_effect, wb);
+                self.current_effect = Some(eff);
+            }
+        }
+    }
+
     pub(super) fn bind_var(&mut self, name: &str, node_id: NodeId) {
         if let Some(scope) = self.scope_stack.last_mut() {
             scope.insert(name.to_string(), node_id);
         }
+        // Bug #100: record the canonical home slot (first binding). Later re-bindings
+        // (loop-body WriteBacks) update the current binding but keep the home stable.
+        // The bool marks function-level declarations (bound outside any loop body):
+        // only those get rebound in loop conditions — a variable declared INSIDE an
+        // enclosing loop body is fresh each iteration and its binding chain is already
+        // correct (rebinding it broke nested-loop shapes like bubble sort).
+        let fn_level = self.loop_stack.is_empty();
+        self.var_home.entry(name.to_string()).or_insert((node_id, fn_level));
     }
 
     /// Look up the NodeId bound to a variable (searching from inner to outer scope).
@@ -721,13 +855,26 @@ impl<'a> IrBuilder<'a> {
             crate::ast::Ast::Expr::Propagate(inner) => {
                 let inner_node = self.compile_subexpr(*inner);
                 let inputs_offset = self.graph.inputs_pool.push(&[inner_node]);
-                let n = self.graph.add_node(Node {
+                let mut n = self.graph.add_node(Node {
                     kind: NodeKind::UnOp,
                     input_count: 1,
                     inputs_offset,
                     compute_fn: CF_PROPAGATE, // compute_propagate
                 });
-                n
+                // Bug #97: at the tail of a function whose return type is Throw, the
+                // propagate node's UNWRAPPED value would leak out as the function's
+                // return value (callers matching Ok/Err then hit the fallback panic).
+                // Re-wrap with Ok: the Err path has already exited via the Return
+                // control signal, so only the Ok path flows through this node.
+                if self.in_tail_position && self.fn_returns_throw {
+                    let off = self.graph.inputs_pool.push(&[n]);
+                    n = self.graph.add_node(Node {
+                        kind: NodeKind::Call,
+                        input_count: 1,
+                        inputs_offset: off,
+                        compute_fn: CF_THROW_OK, // compute_throw_ok
+                    });
+                }                n
             }
 
             // Unary operations: `!` (logical not), `-` (arithmetic negation), `~` (bitwise not).
@@ -845,6 +992,35 @@ impl<'a> IrBuilder<'a> {
     /// of the callee function; the expr_types key must use the instance's module_name (not the call-site
     /// module name), otherwise cross-module generic calls fail type lookup (e.g. when Math.abs calls
     /// cast(x).to(i32), source_ty resolves to void).
+    /// Bug #97 helper: does this (possibly Async-wrapped) type denote a Throw return?
+    /// Guards against invalid/placeholder handles (u32::MAX) seen on some sig entries.
+    pub(super) fn handle_returns_throw(&self, t0: crate::sema::Sema::TypeHandle) -> bool {
+        let mut t = t0;
+        for _ in 0..3 {
+            if (t.0 as usize) >= self.type_arena.len() {
+                return false;
+            }
+            match self.type_arena.get(t) {
+                crate::sema::Sema::Type::Fn(id) | crate::sema::Sema::Type::Async(id) => {
+                    // Placeholder detail ids (see concretize_type's Generic branch
+                    // note) can no longer occur for checked signatures; the guard
+                    // stays as defense in depth for predeclared-but-never-checked
+                    // shapes.
+                    if (id.0 as usize) >= self.type_arena.details_len() {
+                        return false;
+                    }
+                    t = match self.type_arena.get(t) {
+                        crate::sema::Sema::Type::Fn(_) => self.type_arena.fn_parts(t).1,
+                        _ => self.type_arena.async_value(t),
+                    };
+                }
+                crate::sema::Sema::Type::Throw(_) => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     pub(super) fn expr_key_module(&self) -> &'a str {
         if let Some(inst_id) = self.current_instance_id {
             if let Some(inst) = self.sema.monomorph_instances.get(inst_id as usize) {
@@ -899,6 +1075,23 @@ impl<'a> IrBuilder<'a> {
         None
     }
 
+    /// Look up an expression's inferred TypeHandle (from Sema).
+    ///
+    /// Companion of `expr_type_name` with the same instance-local → global
+    /// fallback order; used where the concrete type structure matters (e.g.
+    /// extracting `ForeignFn[R]`'s `R` for Lib.lookup lowering).
+    pub(super) fn expr_type_handle(&self, expr_id: crate::ast::Ast::ExprId) -> Option<crate::types::TypeHandle> {
+        let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr_id.0 as u64);
+        if let Some(inst_id) = self.current_instance_id {
+            if let Some(inst) = self.sema.monomorph_instances.get(inst_id as usize) {
+                if let Some(info) = inst.expr_types.get(&key) {
+                    return Some(info.ty);
+                }
+            }
+        }
+        self.sema.expr_types.get(&key).map(|info| info.ty)
+    }
+
     /// Look up the implicit-this access kind for an expression (set by sema).
     ///
     /// Sema records on `ExprInfo.implicit_this` whether a bare identifier/call inside a method
@@ -950,6 +1143,192 @@ impl<'a> IrBuilder<'a> {
             .unwrap_or(false)
     }
 
+    /// Single-point function-name resolution: EVERY call-site binding goes
+    /// through here (compile_call, module-qualified Path 0, partial
+    /// application, make_call_by_name, free-function method fallback). One
+    /// authority, one precedence order — lexical scope first, global bare
+    /// last:
+    ///
+    ///   1. generic instance key `<name>#<inst_id>` when provided — Sema
+    ///      already chose this monomorphization for the call site; it must
+    ///      outrank the generic declaration's own keys (the unmonomorphized
+    ///      body has unresolved type parameters and evaluates to void);
+    ///   2. current-module mangled key `<cur_mod_path>.<name>` (std modules
+    ///      have no bare slot, so their intra-module calls resolve here);
+    ///   3. recv short-qualified key `<Recv>.<name>` — the `File.remove(...)`
+    ///      shape. An EXPLICIT qualifier outranks ambient package visibility:
+    ///      `Instant.now()` inside std.time must bind Instant.now, not the
+    ///      package key `std.time::now` (contested by SystemTime.now — the
+    ///      silent wrong-callee the tripwire exposed in Timer.kz);
+    ///   4. package-scoped key `<cur_pkg>::<name>` (stdlib sibling files
+    ///      calling each other bare within one package directory);
+    ///   5. bare name — builtin (globally visible by design) and user/dep
+    ///      modules only; std never registers bare.
+    ///
+    /// Orders 3–5 consult the collision tripwire: a key contested by two
+    /// distinct functions is a HARD error listing the candidates — never
+    /// first/last-writer-wins.
+    ///
+    /// Returns `Some(Ok(sg))` on success, `Some(Err(diagnostic))` on an
+    /// ambiguous key, `None` when nothing matched.
+    pub(super) fn resolve_func(
+        &self,
+        site: &str,
+        name: &str,
+        inst_mangled: Option<&str>,
+        recv: Option<&str>,
+    ) -> Option<Result<SubGraphId, String>> {
+        // @internal guard — runs BEFORE any key lookup so the deny is uniform
+        // across all five binding shapes (bare / mangled / recv-qualified /
+        // package / generic instance).
+        if self.internal_access_blocked(name) {
+            return Some(Err(self.internal_access_diag(name)));
+        }
+        let cur_path = crate::sema::Sema::module_logical_path(self.current_module().name);
+        // 1. generic instance (the sema-chosen monomorphization)
+        if let Some(m) = inst_mangled {
+            if let Some(&sg) = self.func_subgraphs.get(m) {
+                self.log_call_bind(site, name, recv, m, sg);
+                return Some(Ok(sg));
+            }
+        }
+        // 2. current-module mangled
+        if let Some(ref mp) = cur_path {
+            let key = format!("{}.{}", mp, name);
+            if let Some(&sg) = self.func_subgraphs.get(key.as_str()) {
+                self.log_call_bind(site, name, recv, &key, sg);
+                return Some(Ok(sg));
+            }
+        }
+        // 3. recv short-qualified (`File.remove`) — explicit qualifier beats
+        // ambient package visibility (see doc comment).
+        if let Some(rn) = recv {
+            let key = format!("{}.{}", rn, name);
+            if let Some(&sg) = self.func_subgraphs.get(key.as_str()) {
+                if let Some(diag) = self.conflict_diag(&key) {
+                    return Some(Err(diag));
+                }
+                self.log_call_bind(site, name, recv, &key, sg);
+                return Some(Ok(sg));
+            }
+        }
+        // 4. package-scoped key
+        if let Some(ref mp) = cur_path {
+            if let Some(pos) = mp.rfind('.') {
+                let key = format!("{}::{}", &mp[..pos], name);
+                if let Some(&sg) = self.func_subgraphs.get(key.as_str()) {
+                    if let Some(diag) = self.conflict_diag(&key) {
+                        return Some(Err(diag));
+                    }
+                    self.log_call_bind(site, name, recv, &key, sg);
+                    return Some(Ok(sg));
+                }
+            }
+        }
+        // 5. bare (builtin + user/dep), guarded by the collision tripwire
+        if let Some(&sg) = self.func_subgraphs.get(name) {
+            if let Some(diag) = self.conflict_diag(name) {
+                return Some(Err(diag));
+            }
+            self.log_call_bind(site, name, recv, name, sg);
+            return Some(Ok(sg));
+        }
+        // 5b. Global unique-name index (std included): the sema layer
+        // predeclares every loaded module's functions into the root env, so
+        // a bare call to a globally-UNIQUE name type-checks from anywhere —
+        // honor the same contract (`fg_bright_yellow()` after importing
+        // std.terminal.Ansi). Contested names were recorded by the tripwire
+        // and error here.
+        if let Some(&sg) = self.global_bare_index.get(name) {
+            if let Some(diag) = self.conflict_diag(name) {
+                return Some(Err(diag));
+            }
+            self.log_call_bind(site, name, recv, name, sg);
+            return Some(Ok(sg));
+        }
+        if std::env::var("FROND_DEBUG_BUILD").is_ok() {
+            eprintln!(
+                "[CALL-BIND] site={} callee={:?} recv={:?} key=<unresolved> cur_mod={:?}",
+                site, name, recv, self.current_module().name
+            );
+        }
+        None
+    }
+
+    /// Diagnostic for a call resolving through a tripwire-conflicted key:
+    /// `None` when the key is unambiguous. Covers every registration key
+    /// family (bare / short-qualified / package / import alias).
+    fn conflict_diag(&self, key: &str) -> Option<String> {
+        let cands = self.name_conflicts.get(key)?;
+        if cands.len() < 2 {
+            return None;
+        }
+        Some(format!(
+            "ambiguous call '{}': [{}] — qualify the call (e.g. {}.{}(...))",
+            key,
+            cands.join(", "),
+            cands.first()
+                .and_then(|c| c.rsplit_once('.').map(|(_, tail)| tail))
+                .unwrap_or(key),
+            key.rsplit('.').next().unwrap_or(key),
+        ))
+    }
+
+    /// Records a key-family collision into the tripwire registry: `key`'s
+    /// slot is contested by two DISTINCT functions (`sg_id` and `other`).
+    /// Any call that later RESOLVES through `key` becomes a hard error
+    /// listing both candidates — recording alone changes nothing for calls
+    /// that resolve through unambiguous keys.
+    fn record_key_conflict(&mut self, key: &str, sg_id: SubGraphId, other: SubGraphId) {
+        let entry = self.name_conflicts.entry(key.to_string()).or_default();
+        for cand in [sg_id, other] {
+            if let Some(q) = self.sg_qualified_names.get(&cand) {
+                if !entry.contains(q) {
+                    entry.push(q.clone());
+                }
+            }
+        }
+    }
+
+    /// Provenance for every resolution: which site asked, which key won, and
+    /// which sg it bound — "who did I actually call" in one glance
+    /// (FROND_DEBUG_BUILD=1).
+    fn log_call_bind(&self, site: &str, name: &str, recv: Option<&str>, key: &str, sg: SubGraphId) {
+        if std::env::var("FROND_DEBUG_BUILD").is_ok() {
+            eprintln!(
+                "[CALL-BIND] site={} callee={:?} recv={:?} key={:?} sg={} cur_mod={:?}",
+                site, name, recv, key, sg.0, self.current_module().name
+            );
+        }
+    }
+
+    /// @internal access enforcement. Functions marked `@internal` are stdlib
+    /// implementation primitives: only `builtin/**` and `std/**` modules may
+    /// bind them. Consulted from `resolve_func` (subgraph-target calls) and
+    /// the extern-dispatch branch of `compile_call` (CF_DYN_FFI_CALL). A
+    /// same-named declaration in the caller's own module shadows the internal
+    /// one — the name is theirs, not the stdlib's.
+    pub(super) fn internal_access_blocked(&self, name: &str) -> bool {
+        if !self.internal_funcs.contains(name) {
+            return false;
+        }
+        let caller = self.current_module().name;
+        if caller.starts_with("builtin/") || caller.starts_with("std/") {
+            return false;
+        }
+        !self.current_module().find_function(name).is_some()
+    }
+
+    /// Diagnostic for a blocked @internal reference (shared by both guard
+    /// sites so the wording stays identical).
+    pub(super) fn internal_access_diag(&self, name: &str) -> String {
+        format!(
+            "'{}' is @internal (a stdlib implementation primitive): call the public std wrapper instead — in module '{}'",
+            name,
+            self.current_module().name
+        )
+    }
+
     pub fn build(mut self) -> DataFlowGraph {
         // 0. Pre-register all functions (builtin + std + dep + user) into func_subgraphs to solve forward references:
         //    When function A calls function B, B may not yet be compiled (not registered in func_subgraphs),
@@ -965,19 +1344,114 @@ impl<'a> IrBuilder<'a> {
         for m in &all_modules {
             let module_path = crate::sema::Sema::module_logical_path(m.name);
             for d in &m.declarations {
-                if let crate::ast::Ast::Decl::FunDecl { name, params, is_async, .. } = &d.node {
+                if let crate::ast::Ast::Decl::FunDecl { name, params, is_async, attributes, .. } = &d.node {
+                    // @internal registry: bare names of stdlib implementation
+                    // primitives, consulted by `internal_access_blocked` in
+                    // BOTH resolution paths (externs are skipped as subgraph
+                    // targets below but still land here).
+                    if attributes.iter().any(|a| a.name == crate::ffi::ATTR_INTERNAL) {
+                        self.internal_funcs.insert(name.to_string());
+                    }
                     // Skip @extern("C") functions: they are only called via FFI and need no subgraph
                     if let crate::ast::Ast::Decl::FunDecl { extern_c_body, .. } = &d.node {
                         if extern_c_body.is_some() {
                             continue;
                         }
                     }
-                    let sg_id = self.register_subgraph_placeholder(name, params.len() as u8, *is_async);
-                    self.func_subgraphs.insert(name.to_string(), sg_id);
-                    // Also register the mangled name (module_path.function_name) for selective import alias resolution
+                    // One function = one placeholder. If the mangled key
+                    // already has a placeholder (the module was reached twice
+                    // — e.g. via the user's import AND the full-std preload),
+                    // REUSE it: minting a second sg would leave every
+                    // or_insert key (short-qualified / package) pointing at
+                    // the never-compiled first placeholder.
+                    let mangled_key = module_path
+                        .as_ref()
+                        .map(|mp| format!("{}.{}", mp, name));
+                    let sg_id = match mangled_key.as_deref().and_then(|k| self.func_subgraphs.get(k)) {
+                        Some(&existing) => existing,
+                        None => self.register_subgraph_placeholder(name, params.len() as u8, *is_async),
+                    };
+                    // Qualified display name for collision diagnostics.
+                    let qualified = mangled_key
+                        .clone()
+                        .unwrap_or_else(|| name.to_string());
+                    self.sg_qualified_names.insert(sg_id, qualified.clone());
+                    // Bare-name policy (user-approved): std modules
+                    // (stdlib/std/**, logical path "std.*") register NO bare
+                    // slot — their calls resolve through mangled / package /
+                    // recv-qualified keys (see `resolve_func`). builtin
+                    // (globally visible by design) and user/dep modules keep
+                    // the bare slot, guarded by the collision tripwire: two
+                    // distinct functions competing for one bare key are
+                    // recorded and any bare call through that key is a hard
+                    // error at the call site.
+                    let is_std = module_path
+                        .as_deref()
+                        .map(|mp| mp.starts_with("std."))
+                        .unwrap_or(false);
+                    if !is_std {
+                        if let Some(&prev_sg) = self.func_subgraphs.get(&**name) {
+                            if prev_sg != sg_id {
+                                self.record_key_conflict(name, sg_id, prev_sg);
+                            }
+                        }
+                        self.func_subgraphs.insert(name.to_string(), sg_id);
+                    }
+                    // Global unique-name index (ALL modules, std included):
+                    // mirrors sema's root-env predeclaration, so a bare call
+                    // to a globally-unique name binds even without a bare
+                    // slot. Contested names go to the tripwire; first
+                    // registrant stays indexed.
+                    match self.global_bare_index.get(&**name) {
+                        Some(&prev_sg) => {
+                            if prev_sg != sg_id {
+                                self.record_key_conflict(name, sg_id, prev_sg);
+                            }
+                        }
+                        None => {
+                            self.global_bare_index.insert(name.to_string(), sg_id);
+                        }
+                    }
                     if let Some(ref mp) = module_path {
+                        // Full mangled name (module_path.function_name)
                         let mangled = format!("{}.{}", mp, name);
                         self.func_subgraphs.insert(mangled, sg_id);
+                        // Short qualified name (module tail segment + fn name): the call-site
+                        // shape `File.remove(...)` resolves by the recv identifier.
+                        // or_insert (first-wins) keeps the slot stable, but a DIFFERENT
+                        // function competing for it is recorded — resolving a call through
+                        // a conflicted short key is a hard error at the call site.
+                        if let Some(tail) = mp.rsplit('.').next() {
+                            let short = format!("{}.{}", tail, name);
+                            match self.func_subgraphs.get(&short) {
+                                Some(&prev_sg) if prev_sg != sg_id => {
+                                    self.record_key_conflict(&short, sg_id, prev_sg);
+                                }
+                                None => {
+                                    self.func_subgraphs.insert(short, sg_id);
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Package-scoped key (`std.math::fn`): stdlib modules commonly call
+                        // siblings in the same package directory bare (`ldexp_f64_impl`
+                        // defined in Round.kz, called from Power.kz). This is package
+                        // visibility, not a global bare name — first registrant wins inside
+                        // the package; two same-named functions in ONE package are a real
+                        // ambiguity and get the same tripwire treatment.
+                        if let Some(pos) = mp.rfind('.') {
+                            let pkg = &mp[..pos];
+                            let pkg_key = format!("{}::{}", pkg, name);
+                            match self.func_subgraphs.get(&pkg_key) {
+                                Some(&prev_sg) if prev_sg != sg_id => {
+                                    self.record_key_conflict(&pkg_key, sg_id, prev_sg);
+                                }
+                                None => {
+                                    self.func_subgraphs.insert(pkg_key, sg_id);
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
@@ -1036,23 +1510,33 @@ impl<'a> IrBuilder<'a> {
         // 0a-trait. Pre-register trait default method monomorphization subgraphs:
         //   (type_id, trait_def_idx, method_idx) -> SubGraphId
         //   Consumes trait_default_instances collected in the Sema post-phase; registers a dedicated subgraph for each specialization instance.
-        //   Instance collection (including skipping explicit overrides) is already done by Monomorph::collect_trait_default_instances.
+        //   Instance collection (binding-driven: only the bound trait, plus overrides that
+        //   call super) is already done by Monomorph::collect_trait_default_instances.
         for inst in &self.sema.trait_default_instances {
-            // Look up the AST info for the trait default method (method_name, params_count, is_async)
-            let method_info = self.module.declarations.iter().find_map(|d| {
-                if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
-                    if *name == inst.trait_name.as_ref() {
-                        if let Some(method) = methods.get(inst.method_idx as usize) {
-                            return Some((
-                                method.name.to_string(),
-                                method.params.len() as u8,
-                                method.is_async,
-                            ));
+            // Look up the AST info for the trait default method (method_name, params_count,
+            // is_async). Search builtin modules AND the current module: a type may implement
+            // a trait declared in an embedded stdlib module.
+            let method_info = self
+                .builtin_modules
+                .iter()
+                .copied()
+                .chain(std::iter::once(self.module))
+                .find_map(|m| {
+                    m.declarations.iter().find_map(|d| {
+                        if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
+                            if *name == inst.trait_name.as_ref() {
+                                if let Some(method) = methods.get(inst.method_idx as usize) {
+                                    return Some((
+                                        method.name.to_string(),
+                                        method.params.len() as u8,
+                                        method.is_async,
+                                    ));
+                                }
+                            }
                         }
-                    }
-                }
-                None
-            });
+                        None
+                    })
+                });
             let (method_name, params_count, is_async) = match method_info {
                 Some(info) => info,
                 None => continue,
@@ -1075,6 +1559,14 @@ impl<'a> IrBuilder<'a> {
             .collect();
         for (alias, mangled) in &alias_entries {
             if let Some(&sg_id) = self.func_subgraphs.get(mangled.as_str()) {
+                // Alias collisions go through the same tripwire: two imports
+                // binding the same alias name to different functions make any
+                // bare call through that alias a hard error.
+                if let Some(&prev_sg) = self.func_subgraphs.get(alias.as_str()) {
+                    if prev_sg != sg_id {
+                        self.record_key_conflict(alias, sg_id, prev_sg);
+                    }
+                }
                 self.func_subgraphs.insert(alias.clone(), sg_id);
             }
         }
@@ -1225,8 +1717,13 @@ impl<'a> IrBuilder<'a> {
                 })
             })
             .collect();
-        for (name, _mod_idx) in &builtin_fun_names {
-            self.compile_function(name);
+        // Compile by (module, name): builtin_fun_names already carries the
+        // declaring module index — same-named functions in different modules
+        // (File.chmod / Fs.chmod) each get THEIR body compiled. A bare-name
+        // re-resolution here would compile the first match twice and leave
+        // the other's qualified keys pointing at an empty placeholder.
+        for (name, mod_idx) in &builtin_fun_names {
+            self.compile_function_in(Some(*mod_idx), name);
         }
 
         // 1b. Compile TypeDecl methods in builtin modules (indexed by method_idx)
@@ -1312,9 +1809,9 @@ impl<'a> IrBuilder<'a> {
             );
         }
 
-        // 3. Compile user module functions
+        // 3. Compile user module functions (declaring module = the entry module)
         for name in &fun_names {
-            self.compile_function(name);
+            self.compile_function_in(None, name);
         }
 
         // 3a. Compile monomorphization instances: consumes Sema's monomorph_instances,
@@ -1330,7 +1827,7 @@ impl<'a> IrBuilder<'a> {
         }
 
         // DEBUG: dump all func_subgraphs whose node_range is (0,0) — these are uncompiled placeholders
-        if std::env::var("KUZO_DEBUG_BUILD").is_ok() {
+        if std::env::var("FROND_DEBUG_BUILD").is_ok() {
             eprintln!("=== [BUILD] func_subgraphs with EMPTY node_range (uncompiled) ===");
             for (name, &sg_id) in &self.func_subgraphs {
                 let sg = &self.graph.subgraphs[sg_id.0 as usize];
@@ -1348,6 +1845,11 @@ impl<'a> IrBuilder<'a> {
                 }
             }
         }
+
+        // W2: storage versioning needs nested_ranges first; downstreams must
+        // reflect the version edges appended by the versioning pass.
+        self.graph.compute_nested_ranges();
+        self.apply_storage_versioning();
 
         // Compute fan-out
         self.graph.compute_downstreams();
@@ -1384,8 +1886,30 @@ impl<'a> IrBuilder<'a> {
         // Move IR compile-time errors (unimplemented features, etc.) in for the caller to inspect
         self.graph.ir_errors = std::mem::take(&mut self.errors);
 
+        // Debug name sidecar for the execution-coverage instrumentation
+        // (FROND_EXEC_COVERAGE=1): sg → qualified function name, parallel to
+        // subgraphs; remapped by rebuild's sg compaction, never serialized.
+        {
+            let total_sgs = self.graph.subgraphs.len();
+            let mut names: Vec<Option<Box<str>>> = vec![None; total_sgs];
+            for (sg, qualified) in &self.sg_qualified_names {
+                let idx = sg.0 as usize;
+                if idx < total_sgs {
+                    names[idx] = Some(qualified.as_str().into());
+                }
+            }
+            self.graph.sg_debug_names = names;
+        }
+
         // Pre-compute nested_ranges for all subgraphs; runtime O(len) lookup replaces full-graph scans
         self.graph.compute_nested_ranges();
+
+        // W5: flatten loop condition-tree reset plans once, so the engine's
+        // per-iteration reset is mechanical (no per-iteration DFS).
+        self.graph.precompute_reset_plans();
+
+        // W0: structural invariant verification (debug builds / FROND_VERIFY=1).
+        crate::pass::Verifier::verify_and_report(&self.graph, "build");
 
         // Move the build-time string_pool into graph.string_pool (ConstValue::Str references this pool)
         let pool = std::mem::take(&mut self.string_pool);
@@ -1394,4 +1918,72 @@ impl<'a> IrBuilder<'a> {
         self.graph
     }
 
+}
+
+/// Bug #100 helper: collects the names assigned inside a loop body (Assignment /
+/// CompoundAssignment with an Ident target). Over-approximation is safe (rebinding a
+/// non-modified variable to its home is a no-op when home == current binding).
+/// Recurses through Block/If/Match/While/Loop/For and expression blocks; skips lambda
+/// bodies (their assignments are scoped to the nested function).
+fn collect_assigned_names(
+    arena: &crate::ast::Ast::AstArena<'_>,
+    expr: crate::ast::Ast::ExprId,
+    out: &mut rustc_hash::FxHashSet<String>,
+) {
+    use crate::ast::Ast::Expr;
+    match &arena.expr(expr).node {
+        Expr::Block { stmts, trailing } => {
+            for &st in stmts {
+                collect_assigned_names_stmt(arena, st, out);
+            }
+            if let Some(t) = trailing {
+                collect_assigned_names(arena, *t, out);
+            }
+        }
+        Expr::If { cond, then_branch, else_branch } => {
+            collect_assigned_names(arena, *cond, out);
+            collect_assigned_names(arena, *then_branch, out);
+            if let Some(e) = else_branch {
+                collect_assigned_names(arena, *e, out);
+            }
+        }
+        Expr::Match { scrutinee, arms } => {
+            collect_assigned_names(arena, *scrutinee, out);
+            for arm in arms {
+                collect_assigned_names(arena, arm.body, out);
+            }
+        }
+        // Skip nested functions/lambdas: their assignments bind their own scopes.
+        Expr::Lambda { .. } => {}
+        _ => {}
+    }
+}
+
+fn collect_assigned_names_stmt(
+    arena: &crate::ast::Ast::AstArena<'_>,
+    stmt: crate::ast::Ast::StmtId,
+    out: &mut rustc_hash::FxHashSet<String>,
+) {
+    use crate::ast::Ast::Stmt;
+    match &arena.stmt(stmt).node {
+        Stmt::Assignment { target, .. } | Stmt::CompoundAssignment { target, .. } => {
+            if let crate::ast::Ast::Expr::Ident(name) = &arena.expr(*target).node {
+                out.insert(name.to_string());
+            }
+        }
+        Stmt::Expression { expr } => collect_assigned_names(arena, *expr, out),
+        // Nested loops' own conditions rebind at their own registration; recursing
+        // here would rebind OUTER loop variables in the INNER condition (e.g. `si`
+        // in bubble sort's inner loop), which breaks nested-loop shapes.
+        Stmt::While { condition, .. } => {
+            collect_assigned_names(arena, *condition, out);
+        }
+        Stmt::Loop { .. } => {}
+        Stmt::For { iterable, .. } => {
+            collect_assigned_names(arena, *iterable, out);
+        }
+        Stmt::Return { value: Some(v) } => collect_assigned_names(arena, *v, out),
+        Stmt::Throw { expr } => collect_assigned_names(arena, *expr, out),
+        _ => {}
+    }
 }

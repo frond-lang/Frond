@@ -5,7 +5,7 @@
 // Single-shot read/write semantics (no looping block, consistent with File.read).
 //
 // Underlying @extern("C") primitives (__net_tcp_connect_v4 / __net_tcp_close_raw etc.)
-// are declared in builtin/net/Raw.kz. This file defines Kuzo wrappers that convert C raw
+// are declared in builtin/net/Raw.kz. This file defines Frond wrappers that convert C raw
 // return values to Throw.
 // async function bodies currently call synchronous primitives directly; spawn semantics
 // will be added once the IR/Engine async model is ready.
@@ -15,11 +15,12 @@
 // The read primitive calls __net_tcp_read directly without touching the buffer; the two
 // buffers are isolated, mixing them requires attention to data ordering.
 
-// ─── Kuzo wrapper: @extern("C") raw return value → Throw ──────────────
+// ─── Frond wrapper: @extern("C") raw return value → Throw ──────────────
 
 // __net_tcp_connect(ip: IpAddr, port: u16, timeout_ns: i64): Throw<i64, IOError>
 // Extracts v4 bits from IpAddr, calls __net_tcp_connect_v4
 // IPv6 is not yet supported, throws NotSupported
+@internal
 fun __net_tcp_connect(ip: IpAddr, port: u16, timeout_ns: i64): Throw<i64, IOError> {
     match ip {
         V4(v4_addr) => {
@@ -41,6 +42,7 @@ fun __net_tcp_connect(ip: IpAddr, port: u16, timeout_ns: i64): Throw<i64, IOErro
 
 // __net_tcp_close(fd: i64): Throw<void, IOError>
 // Shared close for TCP/UDP (both are close(fd) underneath)
+@internal
 fun __net_tcp_close(fd: i64): Throw<void, IOError> {
     val rc = __net_tcp_close_raw(fd)
     if rc < 0 {
@@ -103,7 +105,7 @@ pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, 
         }
     }
 
-    // ─── Composite semantics methods (composed from read/write primitives, pure Kuzo) ──────
+    // ─── Composite semantics methods (composed from read/write primitives, pure Frond) ──────
 
     // Writes all bytes; throws BrokenPipe when write returns 0 (avoids infinite loop)
     pub async fun write_all(buf: u8[], len: usize): Async<Throw<void, IOError>> {

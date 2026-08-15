@@ -1,4 +1,4 @@
-//! Value.rs — Kuzo unified value system (merges 14 submodules)
+//! Value.rs — Frond unified value system (merges 14 submodules)
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
@@ -494,16 +494,16 @@ impl F128 {
         }
         let sign = x < 0;
         let abs = x.unsigned_abs();
-        // abs is u128; MSB is the position of the implicit 1. exp = msb, mant = abs.
-        // pack aligns the MSB to bit 112 and handles rounding (no rounding here, abs is fully preserved).
-        Self::pack(sign, 0, abs, false)
+        // pack's contract is value = mant × 2^(exp - 112), so exp must be 112
+        // for the integer value abs × 2^0 (passing 0 scales by 2^-112).
+        Self::pack(sign, 112, abs, false)
     }
     /// Constructs an F128 from a u128 exactly (no f64 intermediate).
     pub fn from_u128(x: u128) -> Self {
         if x == 0 {
             return Self::zero_val(false);
         }
-        Self::pack(false, 0, x, false)
+        Self::pack(false, 112, x, false)
     }
 
     /// Extracts the integer part of an F128 value as i128 (lossless for values within i128 range).
@@ -884,8 +884,12 @@ impl F128 {
         // pack semantics: value = mant * 2^(exp - 112)
         // true quotient = (ma/mb) * 2^result_exp = quot * 2^(result_exp - 114)
         // so exp = result_exp - 114 + 112 = result_exp - 2
+        // 256-bit split of ma * 2^114: hi = ma >> 14, lo = (low 14 bits of ma) << 114.
+        // (The previous `ma << 14` for lo put ma's middle bits in the wrong positions,
+        // leaving garbage in the quotient's low mantissa bits: 6.0/4.0 printed 1.5
+        // but differed from the 1.5f128 literal at bit level.)
         let numer_hi = ma >> 14;
-        let numer_lo = ma << 14;
+        let numer_lo = (ma & 0x3FFF) << 114;
         let (quot, stk) = Self::div_256_by_113(numer_hi, numer_lo, mb);
         Self::pack(result_sign, result_exp - 2, quot, stk)
     }
@@ -1084,9 +1088,9 @@ pub union ScalarValue {
     pub f128_val: [u64; 2],
 }
 
-// ---- Value — Kuzo runtime unified value representation (spec §3.3) ----
+// ---- Value — Frond runtime unified value representation (spec §3.3) ----
 
-/// Kuzo runtime unified value representation (spec §3.3).
+/// Frond runtime unified value representation (spec §3.3).
 /// `Value` is self-contained: scalars are inline; heap objects are shared across workers via `Arc`.
 #[derive(Clone)]
 pub enum Value {
@@ -1246,6 +1250,7 @@ impl Value {
                     ValueTag::Isize => F128::from_i128(v.isize_val as i128),
                     ValueTag::Usize => F128::from_u128(v.usize_val as u128),
                     ValueTag::Char => F128::from_u128(v.char_val as u128),
+                    ValueTag::Bool => F128::from_f64(if v.bool_val { 1.0 } else { 0.0 }),
                     _ => F128::from_f64(0.0),
                 }
             },
@@ -1355,7 +1360,7 @@ impl Hash for Value {
 
 // ---- ValueHandle — 4B index handle ----
 
-/// Unique handle for a Kuzo value: a 4B index encoding the type bucket + index within the bucket.
+/// Unique handle for a Frond value: a 4B index encoding the type bucket + index within the bucket.
 /// High 8 bits = ValueTag, low 24 bits = index within the bucket.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueHandle(u32);
@@ -1562,15 +1567,15 @@ impl From<char> for Char {
 // Part 2: heap object types (merges 6 files)
 // =========================================================================
 
-// ---- str.rs → KuzoStr ----
+// ---- str.rs → Str ----
 
-/// Kuzo string: a reference-counted immutable UTF-8 string
+/// Frond string: a reference-counted immutable UTF-8 string
 #[derive(Debug, Clone)]
-pub struct KuzoStr {
+pub struct Str {
     inner: Arc<str>,
 }
 
-impl KuzoStr {
+impl Str {
     pub fn new(s: impl Into<String>) -> Self {
         Self { inner: Arc::from(s.into().as_str()) }
     }
@@ -1610,20 +1615,20 @@ impl KuzoStr {
     }
 }
 
-impl PartialEq for KuzoStr {
+impl PartialEq for Str {
     fn eq(&self, other: &Self) -> bool {
         self.inner == other.inner
     }
 }
-impl Eq for KuzoStr {}
+impl Eq for Str {}
 
-impl Hash for KuzoStr {
+impl Hash for Str {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.inner.hash(state);
     }
 }
 
-impl fmt::Display for KuzoStr {
+impl fmt::Display for Str {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.inner)
     }
@@ -2008,8 +2013,8 @@ pub struct ThrowValue {
     pub payload: ThrowPayload,
 }
 
-// ---- iterator.rs → fully migrated to Kuzo builtin (Iterator.kz) ----
-// Note: ArrayIterator / StringIterator / RangeIterator have all been migrated to the Kuzo builtin.
+// ---- iterator.rs → fully migrated to Frond builtin (Iterator.kz) ----
+// Note: ArrayIterator / StringIterator / RangeIterator have all been migrated to the Frond builtin.
 
 // ---- concurrent.rs → AtomicValue, AsyncStatus, AsyncHandle, ChannelValue, SenderValue, ReceiverValue ----
 
@@ -2210,16 +2215,16 @@ pub struct ReceiverValue {
 /// Ownership kind of an FFI opaque pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PtrKind {
-    /// C-side owned; Kuzo does not free it (e.g. a `FILE*` returned by `fopen` that the user
+    /// C-side owned; Frond does not free it (e.g. a `FILE*` returned by `fopen` that the user
     /// must `fclose` manually). v1: all pointers returned from FFI are Borrowed.
     Borrowed,
-    /// C-allocated, Kuzo holds it; Drop invokes the destructor (e.g. a handle with a cleanup fn).
+    /// C-allocated, Frond holds it; Drop invokes the destructor (e.g. a handle with a cleanup fn).
     /// v1 unused — reserved for future RAII FFI support.
     Owned,
 }
 
 /// Wrapper for a raw C pointer returned from or passed to FFI (`@extern("C") #{ }#` calls).
-/// Stored as a `HeapObj::OpaquePtr` so it can flow through Kuzo's `Value::Ref(Arc<HeapObj>)`.
+/// Stored as a `HeapObj::OpaquePtr` so it can flow through Frond's `Value::Ref(Arc<HeapObj>)`.
 #[derive(Debug)]
 pub struct OpaquePointer {
     pub ptr: *mut core::ffi::c_void,
@@ -2265,10 +2270,57 @@ impl Drop for OpaquePointer {
 unsafe impl Send for OpaquePointer {}
 unsafe impl Sync for OpaquePointer {}
 
+/// Shared state of a loaded native library (dlopen / LoadLibrary handle).
+/// A `Lib` value and every `ForeignFn` resolved from it hold the same `Arc`,
+/// so `close()` flips `closed` once and all derived ForeignFns observe it, and
+/// Drop releases the OS handle exactly once.
+pub struct LibShared {
+    pub handle: *mut core::ffi::c_void,
+    pub path: String,
+    pub closed: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for LibShared {
+    fn drop(&mut self) {
+        if !self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::platform::Dylib::close(self.handle);
+        }
+    }
+}
+
+// SAFETY: same single-threaded-FFE argument as OpaquePointer above.
+unsafe impl Send for LibShared {}
+unsafe impl Sync for LibShared {}
+
+impl std::fmt::Debug for LibShared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LibShared")
+            .field("path", &self.path)
+            .field("closed", &self.closed.load(std::sync::atomic::Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Heap value of a `Lib`: opaque handle over a dynamically loaded native library.
+#[derive(Debug, Clone)]
+pub struct LibValue {
+    pub shared: Arc<LibShared>,
+}
+
+/// Heap value of a `ForeignFn[R]`: resolved symbol address + runtime-built AbiSig.
+/// Lifetime is tied to the owning library through `shared` (closed libs reject calls).
+#[derive(Debug, Clone)]
+pub struct ForeignFnValue {
+    pub shared: Arc<LibShared>,
+    pub addr: *mut core::ffi::c_void,
+    pub sig: crate::ffi::Abi::AbiSig,
+    pub name: String,
+}
+
 /// Heap object: unified representation of all heap-allocated value types (24 kinds)
 #[derive(Debug, Clone)]
 pub enum HeapObj {
-    Str(KuzoStr),
+    Str(Str),
     Array(ArrayValue),
     Record(RecordValue),
     Adt(AdtValue),
@@ -2290,6 +2342,10 @@ pub enum HeapObj {
     CoroutineFrame,
     /// FFI opaque pointer (@extern("C") #{ }# calls). Wraps a raw `*mut c_void`.
     OpaquePtr(OpaquePointer),
+    /// `Lib` value: handle over a dlopen/LoadLibrary-loaded native library.
+    LibVal(LibValue),
+    /// `ForeignFn[R]` value: resolved symbol + runtime AbiSig (from `Lib.lookup`).
+    ForeignFnVal(ForeignFnValue),
 }
 
 /// Heap reference: a reference-counted heap object
@@ -2301,7 +2357,7 @@ pub enum RefKind {
     Str, Array, Record, Adt, Newtype, Cell, Range, Closure, Partial, Builtin,
     TraitVal, LazyVal, ErrorVal, ThrowVal,
     AtomicVal, AsyncVal, ChannelVal, SenderVal, ReceiverVal, CoroutineFrame,
-    OpaquePtr,
+    OpaquePtr, LibVal, ForeignFnVal,
 }
 
 impl HeapObj {
@@ -2355,6 +2411,8 @@ impl HeapObj {
             HeapObj::ReceiverVal(_) => RefKind::ReceiverVal,
             HeapObj::CoroutineFrame => RefKind::CoroutineFrame,
             HeapObj::OpaquePtr(_) => RefKind::OpaquePtr,
+            HeapObj::LibVal(_) => RefKind::LibVal,
+            HeapObj::ForeignFnVal(_) => RefKind::ForeignFnVal,
         }
     }
 
@@ -2381,6 +2439,8 @@ impl HeapObj {
             HeapObj::ReceiverVal(_) => "receiver",
             HeapObj::CoroutineFrame => "coroutine",
             HeapObj::OpaquePtr(op) => op.type_name,
+            HeapObj::LibVal(_) => "Lib",
+            HeapObj::ForeignFnVal(_) => "ForeignFn",
         }
     }
 
@@ -2407,6 +2467,8 @@ impl HeapObj {
             HeapObj::ReceiverVal(_) => "<receiver>",
             HeapObj::CoroutineFrame => "<coroutine>",
             HeapObj::OpaquePtr(op) => op.type_name,
+            HeapObj::LibVal(_) => "<lib>",
+            HeapObj::ForeignFnVal(_) => "<foreignfn>",
         }
     }
 
@@ -2491,7 +2553,7 @@ impl Hash for HeapObj {
             HeapObj::Partial(_) | HeapObj::TraitVal(_) | HeapObj::LazyVal(_)
             | HeapObj::AtomicVal(_) | HeapObj::AsyncVal(_) | HeapObj::ChannelVal(_)
             | HeapObj::SenderVal(_) | HeapObj::ReceiverVal(_) | HeapObj::CoroutineFrame
-            | HeapObj::OpaquePtr(_) => {}
+            | HeapObj::OpaquePtr(_) | HeapObj::LibVal(_) | HeapObj::ForeignFnVal(_) => {}
         }
     }
 }

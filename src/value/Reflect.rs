@@ -108,7 +108,7 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                     out.push(']');
                     out
                 }
-                HeapObj::Str(kuzo_str) => kuzo_str.bytes().to_string(),
+                HeapObj::Str(frond_str) => frond_str.bytes().to_string(),
                 HeapObj::LazyVal(lazy) => {
                     // Forced LazyValue: format the cached value
                     // Unforced LazyValue: normally pre-processed by Engine's force_lazy_value_sync;

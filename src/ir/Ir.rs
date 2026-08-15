@@ -11,7 +11,7 @@
 //!
 //! Design principles (see docs/superpowers/specs/2026-07-31-dataflow-engine-design.md):
 //! - Nodes are fixed 16B and store only topological references; the output is implicitly the node's own id.
-//! - `kind` has only 6 variants, used solely for scheduler readiness checks, not for operation dispatch.
+//! - `kind` has 9 variants, used solely for scheduler readiness checks, not for operation dispatch.
 //! - `compute_fn` is a function index bound at build time via type specialization, looked up at runtime by array index.
 //! - Value table slots use the `Value` enum from Value.rs (scalars and `Arc<HeapObj>` references).
 //! - The standalone input pool stores all node inputs contiguously for cache friendliness.
@@ -433,7 +433,7 @@ compute_fn_ids! {
     323 => CF_DEFER_RUN,
     // Block-scoped defer registration (324): like CF_DEFER_REGISTER but input[0] is an effect dep.
     324 => CF_BLOCK_DEFER_REGISTER,
-    // stdlib @extern("C") #{ }# inline FFI call (325): resolves a self-symbol (kuzo_extern_<name>)
+    // stdlib @extern("C") #{ }# inline FFI call (325): resolves a self-symbol (frond_extern_<name>)
     // via dlsym/GetProcAddress + Abi::call_dynamic. Inputs are the call arguments + a trailing
     // effect dep; dyn_ffi_info metadata carries (symbol, sig, arg_count).
     325 => CF_DYN_FFI_CALL,
@@ -452,10 +452,29 @@ compute_fn_ids! {
     334 => CF_REFLECT_FIELD_VALUE,    // v.field_value(i)-> Value
     335 => CF_REFLECT_ARRAY_LEN,      // v.array_len()   -> usize
     336 => CF_REFLECT_ADT_CTOR,       // v.adt_constructor() -> str
+    // ── Lib / ForeignFn compute_fns (337-342): builtin native-library interop.
+    // open/embed: input[0] = path str (+ effect dep); lookup: [lib, name, args_sig];
+    // has_symbol: [lib, name]; close: [lib]; call: [ffn, args...] with the arg
+    // count in the shared closure_call_arg_count metadata slot.
+    337 => CF_LIB_OPEN,
+    338 => CF_LIB_EMBED,
+    339 => CF_LIB_LOOKUP,
+    340 => CF_LIB_HAS_SYMBOL,
+    341 => CF_LIB_CLOSE,
+    342 => CF_FFN_CALL,
 }
 
+/// Number of entries in `build_compute_fn_table()`.
+///
+/// Single source of truth for the solidify header's `compute_fn_count`
+/// compatibility check (`solidify::Spec::COMPUTE_FN_COUNT`): a `.kzo` written
+/// by a binary with a different table length is rejected at load instead of
+/// silently mis-dispatching node compute fns. `build_compute_fn_table()`
+/// asserts equality so this constant cannot drift silently.
+pub const COMPUTE_FN_TABLE_LEN: u32 = 343;
+
 // =========================================================================
-// NodeKind — node category (not an op; only 8 variants for readiness checks)
+// NodeKind — node category (not an op; 9 variants for readiness checks)
 // =========================================================================
 
 /// Node category: used solely by the scheduler to determine readiness, not for operation dispatch.
@@ -550,6 +569,7 @@ pub struct BatchInfo {
 ///
 /// Node N's inputs = `data[N.inputs_offset .. N.inputs_offset + N.input_count]`.
 /// Contiguous storage ensures cache friendliness and enables batch SIMD scanning of readiness.
+#[derive(Clone)]
 pub struct InputsPool {
     pub data: Vec<NodeId>,
 }
@@ -741,7 +761,7 @@ impl std::fmt::Debug for ValueTable {
 /// At frame initialization, Engine allocates a ValueHandle via ValueArena and pre-fills the value_table.
 ///
 /// The `Str` variant stores an (offset, len) reference into `DataFlowGraph.string_pool`.
-/// Access via `to_value(&pool)` passes the string pool slice to construct a KuzoStr on the fly.
+/// Access via `to_value(&pool)` passes the string pool slice to construct a Str on the fly.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConstValue {
     I8(i8),
@@ -798,7 +818,7 @@ impl ConstValue {
                 let end = off + *len as usize;
                 let s = std::str::from_utf8(&pool[off..end]).unwrap_or("");
                 crate::value::Value::ref_val(
-                    crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(s)),
+                    crate::value::HeapObj::Str(crate::value::Str::from_rust_str(s)),
                 )
             }
             ConstValue::Null => crate::value::Value::NULL,
@@ -868,6 +888,13 @@ pub struct GateBranches {
     pub condition_input: NodeId,
     /// Branch list: (condition value, subgraph id, parameter node list).
     pub branches: Vec<(bool, SubGraphId, Vec<NodeId>)>,
+    /// W4c capture gate: the selected branch's Return signal is CAPTURED as
+    /// the Gate's value instead of propagating to the caller frame. Used by
+    /// inline expansion of bodies with early `return`/`?` — the captured
+    /// value flows as data to the call site (exactly what a non-inlined call
+    /// does), and the caller keeps executing. Serialized in the section's
+    /// validity byte (2 = valid + capture).
+    pub capture: bool,
 }
 
 /// select expression branch info (indexed by Gate node NodeId into select_infos).
@@ -915,8 +942,45 @@ pub enum ControlSignal {
 /// Replaces the old control_signal_nodes table check: control-flow semantics are now
 /// expressed directly via compute_fn (CF_RETURN/CF_BREAK/CF_CONTINUE/CF_THROW_WRAP_ERR)
 /// returning NodeResult::Return/Break/Continue.
+///
+/// NOTE: this is the narrow "produces a non-local exit signal" predicate, kept
+/// exact for behavior preservation. The broader dispatch classification lives
+/// in `effect_class` (whose ControlFlow class additionally contains Gate launch
+/// and match fallback).
 pub fn is_control_flow_compute_fn(cf: ComputeFnId) -> bool {
     cf == CF_RETURN || cf == CF_BREAK || cf == CF_CONTINUE || cf == CF_THROW_WRAP_ERR
+}
+
+/// Control-signal propagation matrix (single source of truth).
+///
+/// Decides whether a completing child subgraph's control signal propagates to
+/// the caller frame on the normal (non-LoopBody) completion path. Shared by
+/// the async engine (`engine/Subgraph.rs` `complete_and_wake_caller`) and the
+/// sync interpreter (`ir/Compute.rs`); the `pending_completions` race path in
+/// `engine/Schedule.rs` intentionally propagates more broadly (see the
+/// comment there — a dropped signal cannot be recovered on that path).
+///
+/// - `Return`: propagates from Gate branches (if/match arm) and loop frames
+///   (while/loop/for/tailrec sg); NOT from cross-function or lambda calls —
+///   their return value has already been extracted as data (Bug #65/#97
+///   class: propagating would make the caller exit prematurely).
+/// - `Break`/`Continue`: propagate from Gate branches only — they must
+///   penetrate to the enclosing LoopBody frame; a loop frame's own
+///   Break/Continue has already been consumed by the loop.
+/// - `None`: never propagates.
+///
+/// Both engines additionally gate propagation on `child.function_id ==
+/// caller.function_id` (in-function only).
+pub fn should_propagate_control_signal(
+    child_signal: &ControlSignal,
+    call_node_is_gate: bool,
+    child_loop_kind: LoopKind,
+) -> bool {
+    match child_signal {
+        ControlSignal::Return(_) => call_node_is_gate || child_loop_kind != LoopKind::None,
+        ControlSignal::Break | ControlSignal::Continue => call_node_is_gate,
+        ControlSignal::None => false,
+    }
 }
 
 // =========================================================================
@@ -1066,12 +1130,18 @@ pub enum NodeResult {
 ///
 /// Does not borrow frame data (to avoid conflicts with &mut Frame borrows).
 /// collect_batch_candidates receives &Frame as a parameter to access ready_queue.
-pub struct EvalContext {
+///
+/// `graph` carries a shared borrow of the DataFlowGraph supplied by the driver (engine loop /
+/// sync interpreter), so compute_fns never need `frame.graph.clone()` (a per-node atomic RMW
+/// pair) to obtain graph access.
+pub struct EvalContext<'a> {
     /// Subgraph node start offset (used for local NodeId → global NodeId conversion).
     pub node_start: u32,
+    /// The executing graph (shared borrow, outlives the current node execution).
+    pub graph: &'a DataFlowGraph,
 }
 
-impl EvalContext {
+impl<'a> EvalContext<'a> {
     /// Scans ready_queue after the current node, collecting nodes of the same type as the current node.
     ///
     /// compute_fn uses this method to decide whether to do SIMD batching.
@@ -1151,6 +1221,21 @@ pub struct Frame {
     pub parent_frame_ptr: *mut Frame,
     /// Generic cached child frame ID (loop-body frame reuse: while_sg/loop_sg/for_sg/tailrec frames cache the body_sg child frame).
     pub cached_child_frame: Option<FrameId>,
+    /// E2 loop hot path: the loop-body frame carried in hand across iterations. While set, the
+    /// Gate drives the body directly on the current stack (no queue round-trip per iteration).
+    /// The stash is dropped on frame reuse (acquire_frame); a suspending body is handed back to
+    /// the frames map (fallback to the queue protocol) and the stash cleared.
+    pub hot_body: Option<(FrameId, Box<Frame>)>,
+    /// E3 perf: steady-state cache for same_function branch-frame preparation. Holds
+    /// (parent-ready bitmap snapshot at derivation time, derived pending_inputs, seed list).
+    /// When the copied-in ready bitmap matches the snapshot, the derivation is skipped and the
+    /// cached pending/seed reused (memcpy). Cleared on frame reuse / subgraph switch; length
+    /// mismatches (resize) also invalidate via the comparison.
+    pub same_fn_prep_cache: Option<Box<(Vec<u8>, Vec<u16>, Vec<NodeId>)>>,
+    /// E5: set by prepare paths when the frame starts fresh (all own slots unready except
+    /// injected params). One-shot: the dispatch wrapper consumes it to enter run_linear once;
+    /// a bail or resume falls back to the dataflow engine permanently for this frame.
+    pub linear_fresh: bool,
     /// Stores the Closure value for escaping closure calls, used to write back upvalues to the Closure after the child frame completes.
     /// None = ordinary function call or same_function closure call.
     pub closure_val: Option<Value>,
@@ -1177,6 +1262,9 @@ impl Frame {
             root_frame_ptr: std::ptr::null_mut(),
             parent_frame_ptr: std::ptr::null_mut(),
             cached_child_frame: None,
+            hot_body: None,
+            same_fn_prep_cache: None,
+            linear_fresh: false,
             closure_val: None,
         }
     }
@@ -1371,11 +1459,11 @@ pub struct ClosureInfo {
 /// `Abi::CallDynamic::call_dynamic`.
 #[derive(Debug, Clone, Hash)]
 pub struct DynFfiInfo {
-    /// C symbol name (e.g. "kuzo_extern___file_open_raw").
+    /// C symbol name (e.g. "frond_extern___file_open_raw").
     pub symbol: String,
     /// ABI signature (parameter types + return type); str params are pre-expanded to (Ptr, Int).
     pub sig: crate::ffi::Abi::AbiSig,
-    /// Number of Kuzo-level argument values (not counting the trailing effect dependency).
+    /// Number of Frond-level argument values (not counting the trailing effect dependency).
     /// Used by compute_dyn_ffi_call to separate args from the effect input.
     pub arg_count: u8,
 }
@@ -1546,6 +1634,24 @@ pub struct ResetPlan {
     pub reset_to_one: Vec<NodeId>,
     /// Condition tree root nodes requiring recursive reset (While/Loop's cond_node).
     pub reset_condition_tree: Vec<NodeId>,
+    /// W5: `reset_condition_tree` flattened ONCE at build/load time into
+    /// (node, pending) pairs (topological order), so the engine applies the
+    /// per-iteration reset mechanically instead of re-running the DFS (which
+    /// also rescanned every subgraph for nested ranges) each iteration.
+    /// Empty when there is nothing to precompute or before `precompute_reset_plans`.
+    pub condition_tree_plan: Vec<(NodeId, u16)>,
+}
+
+/// Which side of the NodeRef door a reference came from: per-node metadata
+/// (`owner` = node index) or a subgraph anchor (`owner` = subgraph index).
+/// Diagnostic label for the door's consumers (see `for_each_node_ref` /
+/// `map_node_refs` in the `rebuild` impl block).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRefSite {
+    /// await source / writeback target / gate cond+params / select sources.
+    NodeMeta,
+    /// sg anchors / defer registration / event decls / upvalues / reset plan.
+    SgAnchor,
 }
 
 /// Loop subgraph kind.
@@ -1591,11 +1697,11 @@ macro_rules! wrap_fn {
         fn wrapper(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
             // safe_op short-circuit: nodes marked with ?. return Null when the receiver (inputs[0]) is null,
             // without executing subsequent computation (field access/method call/intrinsic, etc.).
-            // This is a unified data-driven short-circuit logic, triggered by the compile-time set_safe_op flag.
+            // A unified data-driven short-circuit logic, triggered by the compile-time set_safe_op flag.
             if frame.graph.safe_op_flag(node.0 as usize) {
-                let n = frame.graph.node(node.0 as usize);
+                let n = ctx.graph.node(node.0 as usize);
                 if n.input_count > 0 {
-                    let inputs = frame.graph.inputs(n.inputs_offset, n.input_count);
+                    let inputs = ctx.graph.inputs(n.inputs_offset, n.input_count);
                     let recv = frame.get_value_by_global(inputs[0]);
                     if recv.is_null() {
                         return NodeResult::Value(Value::Null);
@@ -1603,8 +1709,8 @@ macro_rules! wrap_fn {
                 }
             }
             // SIMD batch decision: check batch_infos; if there are same-type ready nodes, compute in batch
-            if let Some(info) = frame.graph.batch_info(node.0 as usize) {
-                let graph = frame.graph.clone();
+            if let Some(info) = ctx.graph.batch_info(node.0 as usize) {
+                let graph = ctx.graph;
                 let candidates = ctx.collect_batch_candidates(frame, node, |gid| {
                     graph.batch_info(gid.0 as usize) == Some(info)
                 });
@@ -1621,7 +1727,7 @@ macro_rules! wrap_fn {
                     }
                 }
             }
-            NodeResult::Value($f(frame, node))
+            NodeResult::Value($f(frame, node, ctx))
         }
         wrapper as ComputeFn
     }};
@@ -2039,6 +2145,14 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         334 => super::Compute::compute_reflect_field_value,
         335 => super::Compute::compute_reflect_array_len,
         336 => super::Compute::compute_reflect_adt_ctor,
+        // Lib / ForeignFn (337-342): native-library interop (legacy Value
+        // signature; wrap_fn! handles safe_op short-circuit + batching)
+        337 => super::Compute::compute_lib_open,
+        338 => super::Compute::compute_lib_embed,
+        339 => super::Compute::compute_lib_lookup,
+        340 => super::Compute::compute_lib_has_symbol,
+        341 => super::Compute::compute_lib_close,
+        342 => super::Compute::compute_ffn_call,
     };
     // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
     // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values
@@ -2063,61 +2177,197 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
     table[322] = super::Compute::compute_defer_register;
     table[323] = super::Compute::compute_defer_run;
     table[324] = super::Compute::compute_block_defer_register;
+    assert_eq!(
+        table.len() as u32, COMPUTE_FN_TABLE_LEN,
+        "build_compute_fn_table(): table length drifted from COMPUTE_FN_TABLE_LEN; update the constant"
+    );
     table
 }
 
 /// Set of pure compute_fn (no side effects; eligible for CSE/DCE).
 ///
-/// Includes: all arithmetic and comparison (1-27, 50-91, 92-259), pure reads (30/32/34/35),
-/// pure semantic operations (260/261/265/274-276/278/279/287), stack-allocated construction (288-289).
-/// Excludes: call/gate/await (36-49), heap allocation (29/31), mutation (33/271/282),
-/// channel (283-285), global_store (271), throw (28/47), ffi (46).
+/// Derived from `effect_class` (W1); the derivation's equivalence with the
+/// pre-W1 hand-written set is asserted by the unit test at the bottom of this
+/// file. Aliasing heap reads are folded in by `aliasing_read_cfs`; their
+/// movement safety is guaranteed by W2 storage-version edges (see
+/// `graph_pure_set`), not by subtracting them from this set.
+///
+/// The four aliased heap reads (`is_versioned_read_cf` subset) folded into the
+/// CSE/LICM pure set by `pure_compute_fn_set`. Their movement safety no longer
+/// relies on purity subtraction (the pre-W2 Bug #99 stopgap, removed): the
+/// storage-versioning pass (`Builder::Versioning`) attaches version edges that
+/// make CSE/LICM see mutations through shared Arcs directly.
+pub fn aliasing_read_cfs() -> [ComputeFnId; 4] {
+    [CF_RECORD_FIELD_GET, CF_ARRAY_INDEX, CF_ARRAY_LEN, CF_PATTERN_ADT_FIELD_GET]
+}
+
+// =========================================================================
+// EffectClass — single source of truth for per-CF effect classification (W1)
+// =========================================================================
+
+/// Effect classification of a compute function: the ONE place every pass asks
+/// "what can be done with a node of this cf" (move / merge / duplicate /
+/// delete / reorder). Adding a new CF means adding one classification here —
+/// the pass layer must not keep its own lists.
+///
+/// `pure_compute_fn_set()` (CSE/LICM/DCE eligibility) is derived from this
+/// classification; the derivation is equivalence-tested against the previous
+/// hand-written set (see `effect_classification_tests`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EffectClass {
+    /// No side effects, deterministic per input: reorder/merge/duplicate/delete
+    /// freely.
+    Pure,
+    /// Pure value-metadata reads (reflect kind/type-name/size/...). Semantically
+    /// pure, but kept OUT of the CSE/LICM set to preserve pre-W1 behavior until
+    /// interning/metadata-hash stability is validated (W2).
+    PureMeta,
+    /// Allocates a distinct object per run (record/array/closure/range/slice/
+    /// string builds): not CSE/LICM-able — sharing one instance across loop
+    /// iterations would pollute state.
+    Alloc,
+    /// Reads mutable state that is NOT tracked as a dataflow input edge (heap
+    /// field/array/deref/global/atomic/memo-cache reads). Pure only in graphs
+    /// without writers to the same state (see `aliasing_read_cfs`).
+    ReadMutable,
+    /// In-place write to mutable state (field set / array store / deref write /
+    /// atomic RMW / memo store).
+    WriteMutable,
+    /// Writes a graph location: WriteBack / TailRec WriteBack / global store.
+    WriteLocal,
+    /// Produces a non-local control signal or dispatches control (return/break/
+    /// continue/throw/propagate/match-fallback, Gate launch).
+    ControlFlow,
+    /// Effect-chain ordering node (CF_SEQ): value-transparent sequencer.
+    Seq,
+    /// Interacts with the async runtime (await/async launch/select/channel
+    /// send/close/cancel).
+    Async,
+    /// Launches a subgraph/closure; effect depends on the callee.
+    Call,
+    /// Foreign function call: assume ANY effect.
+    Ffi,
+    /// Engine/frame-level effect (defer register/run).
+    Runtime,
+}
+
+/// Classify a compute function. Panics on unclassified ids so a newly added CF
+/// cannot silently default to a wrong class — extend this match (and, if the
+/// table grew, `COMPUTE_FN_TABLE_LEN`) in the same commit.
+pub fn effect_class(cf: ComputeFnId) -> EffectClass {
+    use EffectClass::*;
+    match cf.0 {
+        // ── Pure: legacy arithmetic/comparison ranges (equivalence-tested) ──
+        1..=27 | 50..=91 | 92..=259 => Pure,
+        34 | 260 | 261 | 265 | 274 | 276 | 278 | 279 | 287 => Pure, // reads/queries
+        292..=300 | 302..=307 => Pure, // string/obj/bool/f128 comparison
+        // ── Reads of mutable state (aliasing) ──
+        30 | 32 | 35 | 275 => ReadMutable,      // field/array/pattern-ADT reads (aliasing_read_cfs)
+        270 | 281 | 308 | 315 | 334 | 335 => ReadMutable, // global/deref/memo/atomic/reflect-value reads
+        // ── In-place writes ──
+        33 | 282 | 301 | 309 | 316 | 317 | 318 => WriteMutable,
+        // ── Graph-location writes ──
+        49 | 271 | 310 => WriteLocal, // writeback / global_store / tailrec writeback
+        // ── Control flow / dispatch ──
+        28 | 37 | 47 | 311 | 312 | 313 | 314 => ControlFlow,
+        // ── Ordering ──
+        48 => Seq, // CF_SEQ
+        // ── Async runtime ──
+        38 | 39 | 42 | 43 | 284 | 285 => Async,
+        // ── Launches ──
+        36 | 41 => Call, // call_launch / closure_call
+        // ── FFI ──
+        46 | 325 | 337..=342 => Ffi,
+        // ── Engine/frame effects ──
+        322 | 323 | 324 => Runtime, // defer register/run/block-register
+        // ── Allocation (distinct object per run) ──
+        29 | 31 | 40 | 44 | 45 | 262 | 263 | 264 | 266 | 267 | 268 | 269 | 272 | 273
+        | 277 | 280 | 283 | 286 | 288 | 289 | 290 | 291 | 319 | 320 | 321 => Alloc,
+        // ── Pure value metadata (kept out of CSE/LICM pending W2 validation) ──
+        326..=333 | 336 => PureMeta,
+        // CF_NOOP: parameter placeholder passthrough.
+        0 => Pure,
+        other => panic!(
+            "effect_class: unclassified compute fn {} — classify it in Ir::effect_class",
+            other
+        ),
+    }
+}
+
+/// Aliased heap reads that participate in storage versioning (W2): the read's
+/// storage root is always `inputs[0]`. Shared between the Builder versioning
+/// pass and the Verifier's V6 completeness check.
+pub fn is_versioned_read_cf(cf: ComputeFnId) -> bool {
+    matches!(
+        cf,
+        CF_RECORD_FIELD_GET
+            | CF_ARRAY_INDEX
+            | CF_ARRAY_LEN
+            | CF_PATTERN_ADT_FIELD_GET
+            | CF_DEREF_READ
+            | CF_ATOMIC_LOAD
+            | CF_REFLECT_FIELD_VALUE
+            | CF_REFLECT_ARRAY_LEN
+    )
+}
+
+/// In-place heap writes that participate in storage versioning (W2): the
+/// write's storage root is always `inputs[0]`; the write node becomes the
+/// root's new version.
+pub fn is_versioned_write_cf(cf: ComputeFnId) -> bool {
+    matches!(
+        cf,
+        CF_RECORD_FIELD_SET
+            | CF_ARRAY_STORE
+            | CF_DEREF_WRITE
+            | CF_ATOMIC_STORE
+            | CF_ATOMIC_SWAP
+            | CF_ATOMIC_COMPARE_EXCHANGE
+    )
+}
+
+/// The CSE/LICM/DCE-pure set for a specific graph.
+///
+/// W2: aliased heap reads stay eligible — their correctness when moved is
+/// guaranteed by storage-version edges attached at build time
+/// (`Builder::Versioning`): reads inside mutating loop bodies carry a
+/// loop-internal input (cond_node), so LICM cannot hoist them and CSE cannot
+/// merge reads across a write (their version inputs differ). The pre-W2
+/// blanket subtraction of aliasing reads (Bug #99 stopgap) is gone.
+pub fn graph_pure_set(_graph: &DataFlowGraph) -> rustc_hash::FxHashSet<ComputeFnId> {
+    pure_compute_fn_set()
+}
+
+/// Scheduler-visible node kinds that launch or gate runtime work. Passes must
+/// not freely move/delete/merge these regardless of purity. The complement
+/// (Const/BinOp/TriOp/UnOp/FieldAccess) is the "pure computation" kind set.
+pub fn is_launch_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Gate | NodeKind::Call | NodeKind::Await | NodeKind::EventSource
+    )
+}
+
 pub fn pure_compute_fn_set() -> rustc_hash::FxHashSet<ComputeFnId> {
+    // Derived from effect_class (W1). Equivalence with the pre-W1 hand-written
+    // set is asserted by the unit test at the bottom of this file.
+    // CF_NOOP is excluded: it is the parameter-placeholder passthrough, and
+    // CSE-merging two 0-input NOOP nodes would merge distinct parameters.
     let mut s = rustc_hash::FxHashSet::default();
-    // ── Legacy i32/f64/bool arithmetic and comparison (1-27) ──
-    for id in 1..=27u32 { s.insert(ComputeFnId(id)); }
-    // ── i64/i128 arithmetic comparison + bitwise operations (50-91) ──
-    for id in 50..=91u32 { s.insert(ComputeFnId(id)); }
-    // ── All primitive type arithmetic (92-259: 12 integer types × 12 ops + 4 float types × 6 ops) ──
-    for id in 92..=259u32 { s.insert(ComputeFnId(id)); }
-    // ── Pure reads and queries ──
-    s.insert(CF_RECORD_FIELD_GET); // record_field_get
-    s.insert(CF_ARRAY_INDEX); // array_index
-    s.insert(CF_IS_NULL); // is_null
-    s.insert(CF_ARRAY_LEN); // array_len
-    // ── Pure semantic operations ──
-    s.insert(CF_REF_EQ); // ref_eq
-    s.insert(CF_REF_NEQ); // ref_neq
-    s.insert(CF_ELVIS); // elvis
-    s.insert(CF_PATTERN_CTOR_MATCH); // pattern_ctor_match
-    s.insert(CF_PATTERN_ADT_FIELD_GET); // pattern_adt_field_get
-    s.insert(CF_PATTERN_STR_EQ); // pattern_str_eq
-    s.insert(CF_CAST_SCALAR); // cast_scalar
-    s.insert(CF_NON_NULL_ASSERT); // non_null_assert
-    s.insert(CF_STR_BYTES); // str_bytes
-    // ── String comparison (pure functions, eligible for CSE) ──
-    s.insert(CF_EQ_STR);
-    s.insert(CF_NE_STR);
-    s.insert(CF_LT_STR);
-    s.insert(CF_GT_STR);
-    s.insert(CF_LE_STR);
-    s.insert(CF_GE_STR);
-    // ── Semantic equality/inequality for composite types (pure functions, deep comparison, eligible for CSE) ──
-    s.insert(CF_EQ_OBJ);
-    s.insert(CF_NE_OBJ);
-    // ── Boolean inequality (pure comparison, symmetric with CF_EQ_BOOL) ──
-    s.insert(CF_NE_BOOL);
-    // ── f128 comparison (pure comparison, dedicated bit-pattern path) ──
-    s.insert(CF_EQ_F128);
-    s.insert(CF_NE_F128);
-    s.insert(CF_LT_F128);
-    s.insert(CF_GT_F128);
-    s.insert(CF_LE_F128);
-    s.insert(CF_GE_F128);
-    // Note: CF_RECORD_CONSTRUCT_STACK / CF_ARRAY_CONSTRUCT_STACK are not added to the pure set.
-    // Although they have no externally observable side effects, each execution produces a distinct
-    // object (different memory address). If hoisted by LICM or eliminated by CSE, loop iterations
-    // would share the same object, causing state pollution.
+    for id in 0..COMPUTE_FN_TABLE_LEN {
+        let cf = ComputeFnId(id);
+        if cf == CF_NOOP {
+            continue;
+        }
+        if effect_class(cf) == EffectClass::Pure {
+            s.insert(cf);
+        }
+    }
+    // Aliasing heap reads are pure ONLY in graphs without in-place mutators;
+    // the mutator-aware subtraction lives in graph_pure_set.
+    for cf in aliasing_read_cfs() {
+        s.insert(cf);
+    }
     s
 }
 
@@ -2156,6 +2406,8 @@ macro_rules! node_metadata {
             opt(closure_infos, ClosureInfo, set_closure_info)
             opt(partial_infos, PartialInfo, set_partial_info)
             opt(closure_call_arg_counts, u8, set_closure_call_arg_count)
+            opt(lib_ret_kinds, u8, set_lib_ret_kind)
+            opt(embed_infos, u32, set_embed_info)
             opt(select_infos, SelectInfo, set_select_info)
             opt(writeback_targets, NodeId, set_writeback_target)
             opt(batch_infos, BatchInfo, set_batch_info)
@@ -2192,6 +2444,8 @@ macro_rules! node_metadata {
             opt(closure_infos, ClosureInfo, set_closure_info)
             opt(partial_infos, PartialInfo, set_partial_info)
             opt(closure_call_arg_counts, u8, set_closure_call_arg_count)
+            opt(lib_ret_kinds, u8, set_lib_ret_kind)
+            opt(embed_infos, u32, set_embed_info)
             opt(select_infos, SelectInfo, set_select_info)
             opt(writeback_targets, NodeId, set_writeback_target)
             opt(batch_infos, BatchInfo, set_batch_info)
@@ -2292,6 +2546,23 @@ pub struct DataFlowGraph {
     pub downstreams: Vec<Vec<NodeId>>,
     /// Raw values for constant nodes (indexed by NodeId; None for non-Const nodes).
     pub const_values: Vec<Option<ConstValue>>,
+    /// E0 perf: one-time materialized Const values, parallel to `nodes` (empty until the engine
+    /// populates it at startup — see EngineRef::new). Non-const slots hold `Value::VOID`.
+    /// Derived data: never serialized; recomputed at engine start (after build/optimize/load),
+    /// so optimizer `rebuild` renumbering cannot invalidate it.
+    pub const_cache: Vec<crate::value::Value>,
+    /// E3 perf: per-subgraph initial pending_inputs templates for cross-function frames
+    /// (indexed by sg idx; includes PENDING_EXTERNAL sentinels for nested/EventSource nodes).
+    /// Derived data: populated at EngineRef::new (after build/optimize/load) — never serialized.
+    pub sg_initial_pending: Vec<Vec<u16>>,
+    /// E3 perf: per-subgraph ready-queue seed lists (local NodeIds of 0-input non-Param
+    /// non-nested nodes), parallel to sg_initial_pending.
+    pub sg_initial_seed: Vec<Vec<NodeId>>,
+    pub downstream_counts: Vec<u16>,
+    /// E5 perf: per-subgraph linearized execution plans (topological order of sg-own
+    /// nodes; None = not linearizable: EventSource present or cyclic). Populated once at
+    /// EngineRef::new — derived data, never serialized (F-7 safe by construction).
+    pub linear_plans: Vec<Option<Vec<NodeId>>>,
     /// Target subgraph for Call nodes (indexed by NodeId; None for non-Call nodes).
     pub call_targets: Vec<Option<SubGraphId>>,
     /// Branch info for Gate nodes (indexed by NodeId; None for non-Gate nodes).
@@ -2317,6 +2588,18 @@ pub struct DataFlowGraph {
     pub partial_infos: Vec<Option<PartialInfo>>,
     /// Argument count for closure call nodes (excluding closure value and effect; used for chained partial application detection).
     pub closure_call_arg_counts: Vec<Option<u8>>,
+    /// Static return-type ABI tag for Lib.lookup nodes (indexed by NodeId; see
+    /// lib_ret_kind_to_abi / abi_to_lib_ret_kind in Compute.rs). The annotation
+    /// `ForeignFn[R]` fixes the runtime AbiSig return at lookup time.
+    pub lib_ret_kinds: Vec<Option<u8>>,
+    /// Resource index for Lib.embed nodes (indexes `resources` on the build path
+    /// / the CResources solidify section on the load path).
+    pub embed_infos: Vec<Option<u32>>,
+    /// Lib.embed build-time resources (original path, file bytes). Build path:
+    /// filled by IrBuilder; load path: materialized from the CResources
+    /// section. Dual-source like `string_pool`, but always owned (resources
+    /// are small relative to the graph).
+    pub resources: Vec<(std::sync::Arc<str>, std::sync::Arc<[u8]>)>,
     /// select expression branch info (indexed by NodeId; None for non-select-gate nodes).
     pub select_infos: Vec<Option<SelectInfo>>,
     /// Target outer NodeId for WriteBack nodes (indexed by NodeId; None for non-WriteBack nodes).
@@ -2364,6 +2647,13 @@ pub struct DataFlowGraph {
     pub memo_infos: Vec<Option<MemoInfo>>,
     /// Memoization cache table runtime storage (one HashMap<u64, Value> per memoized function).
     pub memo_tables: Arc<Vec<std::sync::Mutex<rustc_hash::FxHashMap<u64, Value>>>>,
+    /// Debug-only sg → qualified function name (e.g. "std.io.File.remove"),
+    /// parallel to `subgraphs`. Filled by the builder from its registration
+    /// table, remapped by `rebuild`'s sg compaction, NEVER serialized (the
+    /// .kzo artifact carries no name table — loads leave this empty).
+    /// Consumed by the execution-coverage instrumentation
+    /// (`FROND_EXEC_COVERAGE=1`): the "never-executed std path" detector.
+    pub sg_debug_names: Vec<Option<Box<str>>>,
     /// Vtable fallback dispatch: (vtable_method_idx, type_name) → SubGraphId.
     /// When a vtable call receives a concrete record (not a TraitVal), the runtime looks up
     /// the method subgraph by the value's type_name here, enabling static dispatch on the
@@ -2381,11 +2671,6 @@ pub struct DataFlowGraph {
     /// Build path is empty (accessor falls back to SubGraph.upvalue_outer_nodes Vec).
     /// Load path (zerocopy) is filled; SubGraph.upvalue_outer_nodes Vec is set to empty.
     pub sg_uv_offsets: Vec<(u32, u32)>,
-    /// CSR offset table for SubGraph nested_ranges (load path).
-    /// Each element = (byte_offset_into_SgNestedRanges, count).
-    /// Build path is empty (accessor falls back to SubGraph.nested_ranges Vec).
-    /// Load path (zerocopy) is filled; SubGraph.nested_ranges Vec is set to empty.
-    pub sg_nr_offsets: Vec<(u32, u32)>,
     /// Per-Node byte offset tables for the 5 complex variable-length tables (load path).
     /// u32::MAX = None (no data for this node in that table); other values = byte offset within the section.
     /// Build path is empty (accessor falls back to owned Vec fields).
@@ -2395,12 +2680,113 @@ pub struct DataFlowGraph {
     pub select_info_offsets: Vec<u32>,
     pub trait_construct_info_offsets: Vec<u32>,
     pub record_extend_info_offsets: Vec<u32>,
+    /// Per-node inputs-pool offsets, materialized at load when the `.kzo` v2
+    /// Nodes section elides them (inputs pool contiguous in node-id order).
+    /// Build path / non-elided files: empty.
+    pub node_input_offsets: Vec<u32>,
+    /// Flat CSR downstream table, derived at load from inputs + gate condition
+    /// edges (the `.kzo` v2 format no longer serializes Downstreams).
+    /// `downstream_csr_offsets` has node_count+1 entries; slices of
+    /// `downstream_csr_flat` are returned by `downstream_slice` on loaded graphs.
+    /// Build path: empty (owned `downstreams` Vec is authoritative).
+    pub downstream_csr_offsets: Vec<u32>,
+    pub downstream_csr_flat: Vec<NodeId>,
+}
+
+impl Clone for DataFlowGraph {
+    /// Deep clone with runtime-shared storage (global vars / memo tables stay
+    /// shared via their Arcs). Used by the optimizer's per-round snapshot for
+    /// the never-corrupt fallback policy: any optimization-round failure
+    /// restores the snapshot instead of propagating a panic.
+    ///
+    /// Only build-path graphs (`mem = None`) are cloned; mmap-backed loaded
+    /// graphs are never snapshotted (optimization never runs on them).
+    fn clone(&self) -> Self {
+        debug_assert!(
+            self.mem.is_none(),
+            "cloning a mmap-backed (loaded) graph is not supported"
+        );
+        Self {
+            nodes: self.nodes.clone(),
+            inputs_pool: self.inputs_pool.clone(),
+            subgraphs: self.subgraphs.clone(),
+            entry_subgraph: self.entry_subgraph,
+            compute_fns: self.compute_fns.clone(),
+            downstreams: self.downstreams.clone(),
+            const_values: self.const_values.clone(),
+            const_cache: self.const_cache.clone(),
+            sg_initial_pending: self.sg_initial_pending.clone(),
+            sg_initial_seed: self.sg_initial_seed.clone(),
+            downstream_counts: self.downstream_counts.clone(),
+            linear_plans: self.linear_plans.clone(),
+            call_targets: self.call_targets.clone(),
+            gate_branches: self.gate_branches.clone(),
+            field_access_infos: self.field_access_infos.clone(),
+            record_lit_infos: self.record_lit_infos.clone(),
+            ffi_call_names: self.ffi_call_names.clone(),
+            dyn_ffi_infos: self.dyn_ffi_infos.clone(),
+            field_set_names: self.field_set_names.clone(),
+            vtable_call_methods: self.vtable_call_methods.clone(),
+            await_event_sources: self.await_event_sources.clone(),
+            closure_infos: self.closure_infos.clone(),
+            partial_infos: self.partial_infos.clone(),
+            closure_call_arg_counts: self.closure_call_arg_counts.clone(),
+            lib_ret_kinds: self.lib_ret_kinds.clone(),
+            embed_infos: self.embed_infos.clone(),
+            resources: self.resources.clone(),
+            select_infos: self.select_infos.clone(),
+            writeback_targets: self.writeback_targets.clone(),
+            tail_call_flags: self.tail_call_flags.clone(),
+            safe_op_flags: self.safe_op_flags.clone(),
+            hoisted_node: self.hoisted_node.clone(),
+            hoisted_owners: self.hoisted_owners.clone(),
+            batch_infos: self.batch_infos.clone(),
+            ir_errors: self.ir_errors.clone(),
+            trait_construct_infos: self.trait_construct_infos.clone(),
+            lazy_construct_infos: self.lazy_construct_infos.clone(),
+            record_extend_infos: self.record_extend_infos.clone(),
+            slice_inclusive: self.slice_inclusive.clone(),
+            global_var_storage: self.global_var_storage.clone(),
+            global_load_slots: self.global_load_slots.clone(),
+            global_store_slots: self.global_store_slots.clone(),
+            pattern_ctor_names: self.pattern_ctor_names.clone(),
+            pattern_type_names: self.pattern_type_names.clone(),
+            pattern_field_indices: self.pattern_field_indices.clone(),
+            cast_target_types: self.cast_target_types.clone(),
+            memo_infos: self.memo_infos.clone(),
+            memo_tables: self.memo_tables.clone(),
+            vtable_fallback_dispatch: self.vtable_fallback_dispatch.clone(),
+            sg_debug_names: self.sg_debug_names.clone(),
+            string_pool: self.string_pool.clone(),
+            mem: None,
+            sg_uv_offsets: self.sg_uv_offsets.clone(),
+            gate_branch_offsets: self.gate_branch_offsets.clone(),
+            record_lit_info_offsets: self.record_lit_info_offsets.clone(),
+            select_info_offsets: self.select_info_offsets.clone(),
+            trait_construct_info_offsets: self.trait_construct_info_offsets.clone(),
+            record_extend_info_offsets: self.record_extend_info_offsets.clone(),
+            node_input_offsets: self.node_input_offsets.clone(),
+            downstream_csr_offsets: self.downstream_csr_offsets.clone(),
+            downstream_csr_flat: self.downstream_csr_flat.clone(),
+        }
+    }
 }
 
 impl DataFlowGraph {
+    /// E5: linearized execution plan for subgraph `sg_idx` (None = not linearizable or the
+    /// engine has not materialized plans). Global NodeIds in topological order.
+    pub fn linear_plan(&self, sg_idx: usize) -> Option<&[NodeId]> {
+        self.linear_plans.get(sg_idx).and_then(|p| p.as_deref())
+    }
+
     /// Creates an empty graph.
     pub fn new() -> Self {
         Self {
+            const_cache: Vec::new(),
+            sg_initial_pending: Vec::new(),
+            sg_initial_seed: Vec::new(),
+            downstream_counts: Vec::new(),
+            linear_plans: Vec::new(),
             nodes: Vec::new(),
             inputs_pool: InputsPool::new(),
             subgraphs: Vec::new(),
@@ -2421,6 +2807,9 @@ impl DataFlowGraph {
             closure_infos: Vec::new(),
             partial_infos: Vec::new(),
             closure_call_arg_counts: Vec::new(),
+            lib_ret_kinds: Vec::new(),
+            embed_infos: Vec::new(),
+            resources: Vec::new(),
             select_infos: Vec::new(),
             writeback_targets: Vec::new(),
             tail_call_flags: Vec::new(),
@@ -2443,15 +2832,18 @@ impl DataFlowGraph {
             memo_infos: Vec::new(),
             memo_tables: Arc::new(Vec::new()),
             vtable_fallback_dispatch: rustc_hash::FxHashMap::default(),
+            sg_debug_names: Vec::new(),
             string_pool: Arc::from(Vec::new()),
             mem: None,
             sg_uv_offsets: Vec::new(),
-            sg_nr_offsets: Vec::new(),
             gate_branch_offsets: Vec::new(),
             record_lit_info_offsets: Vec::new(),
             select_info_offsets: Vec::new(),
             trait_construct_info_offsets: Vec::new(),
             record_extend_info_offsets: Vec::new(),
+            node_input_offsets: Vec::new(),
+            downstream_csr_offsets: Vec::new(),
+            downstream_csr_flat: Vec::new(),
         }
     }
 
@@ -2664,6 +3056,8 @@ impl DataFlowGraph {
         hash_opt!(closure_infos);
         hash_opt!(partial_infos);
         hash_opt!(closure_call_arg_counts);
+        hash_opt!(lib_ret_kinds);
+        hash_opt!(embed_infos);
         hash_opt!(select_infos);
         hash_opt!(writeback_targets);
         hash_opt!(batch_infos);
@@ -2690,9 +3084,14 @@ impl DataFlowGraph {
     /// `downstreams` list of each of its input nodes. Used for slot-level RC:
     /// on node produce, `refcount = downstreams[n].len()`.
     pub fn compute_downstreams(&mut self) {
-        // Clear first.
-        for ds in &mut self.downstreams {
-            ds.clear();
+        // (Re)allocate to match the node count, then clear (callers that run
+        // this on every iteration keep their buffers).
+        if self.downstreams.len() != self.nodes.len() {
+            self.downstreams = vec![Vec::new(); self.nodes.len()];
+        } else {
+            for ds in &mut self.downstreams {
+                ds.clear();
+            }
         }
         // Iterate over nodes and register downstream edges (input edges in inputs_pool).
         for nid in 0..self.nodes.len() {
@@ -2718,22 +3117,266 @@ impl DataFlowGraph {
         }
     }
 
-    /// Late compaction rebuild: rebuilds the graph from the `dead` set and
-    /// `redirect` map. Compacts `nodes`/`inputs_pool`, remaps all `NodeId`
-    /// references and per-NodeId metadata vectors. After rebuild, all `NodeId`
-    /// references are updated to the new contiguous numbering. Returns the
-    /// `old_to_new` map (so callers can sync `expr_node_map`, etc.).
+    /// Computes the flat CSR downstream table for LOADED graphs (`.kzo` v2 no
+    /// longer serializes Downstreams). Works through the mem-agnostic
+    /// accessors so both the mmap and owned backends derive identically.
+    /// Mirrors `compute_downstreams` + `rebuild` step 4: input edges plus the
+    /// Gate condition_input edge when it is not already a regular input.
+    /// Must run AFTER gate branches are materialized.
+    pub fn compute_downstream_csr(&mut self) {
+        let n = self.node_count();
+        // Pass 1: degree per producer.
+        let mut degrees = vec![0u32; n];
+        for nid in 0..n {
+            let node = self.node(nid);
+            let inputs = self.inputs(node.inputs_offset, node.input_count);
+            for &input in inputs {
+                degrees[input.0 as usize] += 1;
+            }
+            if let Some(gb) = self.gate_branches.get(nid).and_then(|g| g.as_ref()) {
+                if !inputs.contains(&gb.condition_input) {
+                    degrees[gb.condition_input.0 as usize] += 1;
+                }
+            }
+        }
+        // Prefix sums → offsets.
+        let mut offsets = Vec::with_capacity(n + 1);
+        let mut acc = 0u32;
+        offsets.push(0u32);
+        for &d in &degrees {
+            acc += d;
+            offsets.push(acc);
+        }
+        // Pass 2: scatter with a moving cursor per producer.
+        let mut flat: Vec<NodeId> = vec![NodeId(0); acc as usize];
+        let mut cursor = offsets.clone();
+        for nid in 0..n {
+            let node = self.node(nid);
+            let inputs = self.inputs(node.inputs_offset, node.input_count);
+            for &input in inputs {
+                let p = input.0 as usize;
+                flat[cursor[p] as usize] = NodeId(nid as u32);
+                cursor[p] += 1;
+            }
+            if let Some(gb) = self.gate_branches.get(nid).and_then(|g| g.as_ref()) {
+                if !inputs.contains(&gb.condition_input) {
+                    let p = gb.condition_input.0 as usize;
+                    flat[cursor[p] as usize] = NodeId(nid as u32);
+                    cursor[p] += 1;
+                }
+            }
+        }
+        self.downstream_csr_offsets = offsets;
+        self.downstream_csr_flat = flat;
+    }
+
+    // ------------------------------------------------------------------
+    // NodeRef door — the single enumeration of out-of-band NodeId refs
+    // ------------------------------------------------------------------
+    // Every NodeId the graph stores OUTSIDE `inputs_pool` is enumerated
+    // through this door ONLY. Three consumers must see the identical list:
+    // liveness seeding (Optimizer `compute_liveness`), preserve propagation
+    // (`collect_refs`) and remapping (`rebuild` via `map_node_refs`). Before
+    // the door existed each consumer hand-rolled its own list and they had
+    // already diverged (`upvalue_outer_nodes` / `reset_plan` were remapped by
+    // rebuild but never seeded as live → `remap_n` panics). Known non-door
+    // consumer: `pass_dse`'s read/write ref sets intentionally enumerate a
+    // subset (store analysis, not liveness).
+    //
+    // Adding a new metadata field that stores NodeIds: add it to
+    // `each_node_ref` + `each_sg_anchor_ref` below (and only there).
+
+    /// Per-node metadata NodeId refs of `idx`: await source, writeback target,
+    /// gate condition + branch params, select event sources. Inputs are NOT
+    /// included — they are structural edges every traversal already walks.
+    /// Load-path safe (the complex tables are materialized at load).
+    pub fn node_meta_refs(&self, idx: usize, out: &mut Vec<NodeId>) {
+        self.each_node_ref(idx, |id| out.push(id));
+    }
+
+    #[inline]
+    fn each_node_ref(&self, idx: usize, mut f: impl FnMut(NodeId)) {
+        if let Some(src) = self.await_event_sources.get(idx).and_then(|o| *o) {
+            f(src);
+        }
+        if let Some(t) = self.writeback_targets.get(idx).and_then(|o| *o) {
+            f(t);
+        }
+        if let Some(gb) = self.gate_branches.get(idx).and_then(|o| o.as_ref()) {
+            f(gb.condition_input);
+            for (_, _, params) in &gb.branches {
+                for &p in params {
+                    f(p);
+                }
+            }
+        }
+        if let Some(si) = self.select_infos.get(idx).and_then(|o| o.as_ref()) {
+            for sb in &si.branches {
+                f(sb.event_source_node);
+            }
+        }
+    }
+
+    /// Anchor NodeId refs of subgraph `si`: everything that must stay live for
+    /// the sg to remain structurally valid (anchors, defer registration,
+    /// event declarations, upvalues, loop reset plan). Load-path safe via
+    /// `sg_upvalue_outer_nodes`.
+    pub fn sg_anchor_refs(&self, si: usize, out: &mut Vec<NodeId>) {
+        self.each_sg_anchor_ref(si, |id| out.push(id));
+    }
+
+    #[inline]
+    fn each_sg_anchor_ref(&self, si: usize, mut f: impl FnMut(NodeId)) {
+        let sg = &self.subgraphs[si];
+        f(sg.entry_node);
+        f(sg.return_node);
+        if let Some(c) = sg.cond_node {
+            f(c);
+        }
+        if let Some(n) = sg.iter_next_node {
+            f(n);
+        }
+        for decl in &sg.event_source_decls {
+            f(decl.node);
+        }
+        for e in &sg.defer_table {
+            f(e.trigger_node);
+            for &c in &e.captured_inputs {
+                f(c);
+            }
+        }
+        for &u in self.sg_upvalue_outer_nodes(si) {
+            f(u);
+        }
+        if let Some(plan) = &sg.reset_plan {
+            for &n in &plan.reset_to_zero {
+                f(n);
+            }
+            for &n in &plan.reset_to_one {
+                f(n);
+            }
+            for &n in &plan.reset_condition_tree {
+                f(n);
+            }
+            // plan.condition_tree_plan is deliberately NOT enumerated: rebuild
+            // clears it (W5) and the pipeline recomputes it post-compaction.
+        }
+    }
+
+    /// Read door over EVERY metadata NodeId in the graph (per-node tables +
+    /// per-sg anchors). Used by liveness seeding and the Verifier.
+    pub fn for_each_node_ref(&self, mut f: impl FnMut(NodeRefSite, u32, NodeId)) {
+        for idx in 0..self.nodes.len() {
+            self.each_node_ref(idx, |id| f(NodeRefSite::NodeMeta, idx as u32, id));
+        }
+        for si in 0..self.subgraphs.len() {
+            self.each_sg_anchor_ref(si, |id| f(NodeRefSite::SgAnchor, si as u32, id));
+        }
+    }
+
+    /// Write door: remaps EVERY metadata NodeId in place. Build path only —
+    /// load-path graphs are never rebuilt (upvalues live in the CSR section).
+    /// Replaces rebuild's scattered per-field remap blocks so the write list
+    /// can never diverge from the read list above.
+    pub fn map_node_refs(&mut self, mut f: impl FnMut(NodeRefSite, u32, NodeId) -> NodeId) {
+        debug_assert!(self.mem.is_none() && self.sg_uv_offsets.is_empty());
+        for idx in 0..self.nodes.len() {
+            if let Some(src) = self.await_event_sources.get(idx).and_then(|o| *o) {
+                self.await_event_sources[idx] =
+                    Some(f(NodeRefSite::NodeMeta, idx as u32, src));
+            }
+            if let Some(t) = self.writeback_targets.get(idx).and_then(|o| *o) {
+                self.writeback_targets[idx] =
+                    Some(f(NodeRefSite::NodeMeta, idx as u32, t));
+            }
+            if let Some(gb) = self.gate_branches.get(idx).and_then(|o| o.as_ref()) {
+                let new_cond = f(NodeRefSite::NodeMeta, idx as u32, gb.condition_input);
+                let mut branches = gb.branches.clone();
+                for (_, _, params) in &mut branches {
+                    for p in params.iter_mut() {
+                        *p = f(NodeRefSite::NodeMeta, idx as u32, *p);
+                    }
+                }
+                let new_gb = GateBranches {
+                    condition_input: new_cond,
+                    branches,
+                    capture: gb.capture,
+                };
+                self.gate_branches[idx] = Some(new_gb);
+            }
+            if let Some(si) = self.select_infos.get(idx).and_then(|o| o.as_ref()) {
+                let mut branches = si.branches.clone();
+                for sb in &mut branches {
+                    sb.event_source_node =
+                        f(NodeRefSite::NodeMeta, idx as u32, sb.event_source_node);
+                }
+                self.select_infos[idx] = Some(SelectInfo { branches });
+            }
+        }
+        for si in 0..self.subgraphs.len() {
+            let sg = &mut self.subgraphs[si];
+            sg.entry_node = f(NodeRefSite::SgAnchor, si as u32, sg.entry_node);
+            sg.return_node = f(NodeRefSite::SgAnchor, si as u32, sg.return_node);
+            if let Some(c) = sg.cond_node {
+                sg.cond_node = Some(f(NodeRefSite::SgAnchor, si as u32, c));
+            }
+            if let Some(n) = sg.iter_next_node {
+                sg.iter_next_node = Some(f(NodeRefSite::SgAnchor, si as u32, n));
+            }
+            for decl in &mut sg.event_source_decls {
+                decl.node = f(NodeRefSite::SgAnchor, si as u32, decl.node);
+            }
+            for e in &mut sg.defer_table {
+                e.trigger_node = f(NodeRefSite::SgAnchor, si as u32, e.trigger_node);
+                for c in e.captured_inputs.iter_mut() {
+                    *c = f(NodeRefSite::SgAnchor, si as u32, *c);
+                }
+            }
+            for u in sg.upvalue_outer_nodes.iter_mut() {
+                *u = f(NodeRefSite::SgAnchor, si as u32, *u);
+            }
+            if let Some(plan) = &mut sg.reset_plan {
+                for n in plan.reset_to_zero.iter_mut() {
+                    *n = f(NodeRefSite::SgAnchor, si as u32, *n);
+                }
+                for n in plan.reset_to_one.iter_mut() {
+                    *n = f(NodeRefSite::SgAnchor, si as u32, *n);
+                }
+                for n in plan.reset_condition_tree.iter_mut() {
+                    *n = f(NodeRefSite::SgAnchor, si as u32, *n);
+                }
+                // condition_tree_plan: cleared by rebuild (W5), never remapped.
+            }
+        }
+    }
+
+    /// Late compaction rebuild: rebuilds the graph from the `dead` set,
+    /// `redirect` map and `dead_sgs` set. Compacts `nodes`/`inputs_pool`,
+    /// remaps all `NodeId` references and per-NodeId metadata vectors, removes
+    /// dead/placeholder subgraphs and remaps every `SubGraphId` reference, then
+    /// recomputes `nested_ranges` from the final ranges. After rebuild, all
+    /// `NodeId`/`SubGraphId` references are updated to the new contiguous
+    /// numbering. Returns the `old_to_new` map (so callers can sync
+    /// `expr_node_map`, etc.).
     pub fn rebuild(
         &mut self,
         dead: &rustc_hash::FxHashSet<NodeId>,
         redirect: &rustc_hash::FxHashMap<NodeId, NodeId>,
+        dead_sgs: &rustc_hash::FxHashSet<SubGraphId>,
     ) -> Vec<Option<NodeId>> {
+        // Test hook for the optimizer stability policy (run_guarded snapshot
+        // rollback): simulates an invariant violation inside rebuild.
+        if std::env::var("FROND_TEST_INJECT_REBUILD_FAIL").is_ok() {
+            panic!("rebuild: injected invariant failure (FROND_TEST_INJECT_REBUILD_FAIL)");
+        }
         // ── Recursively resolve redirects ──
         let resolve = |id: NodeId| -> NodeId {
             let mut cur = id;
             while let Some(&next) = redirect.get(&cur) { cur = next; }
             cur
         };
+
+
 
         // ── 1. Arrange live nodes grouped by function-level subgraph ──
         // Hoisted nodes appended by the pass layer (LICM/inline) live at the end
@@ -2891,10 +3534,9 @@ impl DataFlowGraph {
 
         // ── 3. Compact per-NodeId metadata vectors ──
         // Collect metadata in new-index order using the new_to_old map.
-        let remap_n = |id: NodeId| -> NodeId {
-            let r = resolve(id);
-            old_to_new[r.0 as usize].expect("rebuild: ref node not live")
-        };
+        // NodeId VALUES are not remapped here — every metadata NodeId remap
+        // happens in one place after step 6, through `map_node_refs` (the
+        // write door), so this list can never diverge from liveness seeding.
 
         // 3a. Compact Vec<Option<T: Clone>> (no interior NodeId).
         macro_rules! compress_opt {
@@ -2917,6 +3559,8 @@ impl DataFlowGraph {
         compress_opt!(closure_infos);
         compress_opt!(partial_infos);
         compress_opt!(closure_call_arg_counts);
+        compress_opt!(lib_ret_kinds);
+        compress_opt!(embed_infos);
         compress_opt!(batch_infos);
         compress_opt!(trait_construct_infos);
         compress_opt!(lazy_construct_infos);
@@ -2953,73 +3597,41 @@ impl DataFlowGraph {
             self.hoisted_owners = v;
         }
 
-        // 3c. Compact vectors containing NodeId.
-        // await_event_sources: Vec<Option<NodeId>>
+        // 3c. Compact vectors containing NodeId (plain clone — remap happens
+        // once, after step 6, via `map_node_refs`).
+        // await_event_sources / writeback_targets: Vec<Option<NodeId>>
         {
             let mut v: Vec<Option<NodeId>> = Vec::with_capacity(new_to_old.len());
             for &old_idx in &new_to_old {
-                v.push(self.await_event_sources[old_idx].map(&remap_n));
+                v.push(self.await_event_sources[old_idx]);
             }
             self.await_event_sources = v;
         }
-        // writeback_targets: Vec<Option<NodeId>>
         {
             let mut v: Vec<Option<NodeId>> = Vec::with_capacity(new_to_old.len());
             for &old_idx in &new_to_old {
-                v.push(self.writeback_targets[old_idx].map(&remap_n));
+                v.push(self.writeback_targets[old_idx]);
             }
             self.writeback_targets = v;
         }
-        // gate_branches: Vec<Option<GateBranches>> — interior NodeId needs remap.
+        // gate_branches / select_infos: interior NodeIds remapped by the door.
         {
             let mut v: Vec<Option<GateBranches>> = Vec::with_capacity(new_to_old.len());
             for &old_idx in &new_to_old {
-                let opt = &self.gate_branches[old_idx];
-                v.push(opt.as_ref().map(|gb| GateBranches {
-                    condition_input: remap_n(gb.condition_input),
-                    branches: gb.branches.iter().map(|(b, sg, params)| {
-                        (*b, *sg, params.iter().map(|&n| remap_n(n)).collect())
-                    }).collect(),
-                }));
+                v.push(self.gate_branches[old_idx].clone());
             }
             self.gate_branches = v;
         }
-        // select_infos: Vec<Option<SelectInfo>> — SelectBranch.event_source_node needs remap.
         {
             let mut v: Vec<Option<SelectInfo>> = Vec::with_capacity(new_to_old.len());
             for &old_idx in &new_to_old {
-                let opt = &self.select_infos[old_idx];
-                v.push(opt.as_ref().map(|si| SelectInfo {
-                    branches: si.branches.iter().map(|sb| SelectBranch {
-                        subgraph_id: sb.subgraph_id,
-                        event_kind: sb.event_kind,
-                        event_source_node: remap_n(sb.event_source_node),
-                    }).collect(),
-                }));
+                v.push(self.select_infos[old_idx].clone());
             }
             self.select_infos = v;
         }
 
-        // ── 4. Rebuild downstreams (including Gate condition_input edges) ──
-        let n = self.nodes.len();
-        self.downstreams = vec![Vec::new(); n];
-        for node_idx in 0..n {
-            let node = self.nodes[node_idx];
-            let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
-            for &input in inputs {
-                self.downstreams[input.0 as usize].push(NodeId(node_idx as u32));
-            }
-        }
-        // Gate condition_input → Gate edge (aligned with compute_downstreams).
-        for nid in 0..n {
-            if let Some(gb) = &self.gate_branches[nid] {
-                let node = self.nodes[nid];
-                let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
-                if !inputs.contains(&gb.condition_input) {
-                    self.downstreams[gb.condition_input.0 as usize].push(NodeId(nid as u32));
-                }
-            }
-        }
+        // ── 4. (moved) Rebuild downstreams AFTER the NodeId door remap below —
+        // gate condition_input must already be new-indexed when this runs.
 
         // ── 5. Remap NodeId references inside subgraphs ──
         // node_range is recomputed by scanning live nodes within the old range
@@ -3027,17 +3639,144 @@ impl DataFlowGraph {
         // nodes by function-level subgraph grouping, with hoisted nodes directly
         // following the native nodes, so the new node_range is naturally
         // contiguous (native live node new_id + hoisted live node new_id).
-        let dbg_rebuild = std::env::var("KUZO_DEBUG_REBUILD").is_ok();
+        //
+        // 5-pre. Subgraph removal candidates: (a) subgraphs explicitly killed
+        // by function-level DCE (pass_func_dce marks the function sg plus all
+        // nested branch/loop/defer-body subgraphs); (b) empty-range subgraphs —
+        // never-compiled placeholders (analyzer-dead branches), or subgraphs
+        // fully emptied by earlier rounds (e.g. LoopUnroll).
+        //
+        // A candidate still referenced by a live structure is vetoed BEFORE
+        // step 5, so vetoed subgraphs go through normal range-recalc/remap
+        // (their anchors stay consistent instead of going stale). The veto is
+        // iterative: keeping a subgraph keeps its function/loop-parent/defer
+        // bodies alive too (cascade), so a kept subgraph never references a
+        // removed one and step 6's renumbering is always total.
+        let mut remove_sg: Vec<bool> = self
+            .subgraphs
+            .iter()
+            .map(|sg| dead_sgs.contains(&sg.id) || sg.node_range.0 == sg.node_range.1)
+            .collect();
+        if remove_sg.iter().any(|&r| r) {
+            let mut referenced: rustc_hash::FxHashSet<SubGraphId> = rustc_hash::FxHashSet::default();
+            if let Some(e) = self.entry_subgraph {
+                referenced.insert(e);
+            }
+            for sg in self.vtable_fallback_dispatch.values() {
+                referenced.insert(*sg);
+            }
+            // Live nodes' cross-sg references. NOTE: this runs AFTER step 3's
+            // metadata compaction, so these tables are already new-indexed and
+            // contain ONLY live nodes' entries (dead/redirect-key nodes' rows
+            // were dropped) — no liveness filtering needed here.
+            for ct in self.call_targets.iter().flatten() {
+                referenced.insert(*ct);
+            }
+            for ci in self.closure_infos.iter().flatten() {
+                referenced.insert(ci.subgraph_id);
+            }
+            for pi in self.partial_infos.iter().flatten() {
+                referenced.insert(pi.subgraph_id);
+            }
+            for li in self.lazy_construct_infos.iter().flatten() {
+                referenced.insert(li.thunk_sg);
+            }
+            for ti in self.trait_construct_infos.iter().flatten() {
+                for m in &ti.methods {
+                    referenced.insert(m.subgraph_id);
+                }
+            }
+            for gb in self.gate_branches.iter().flatten() {
+                for (_, bsg, _) in &gb.branches {
+                    referenced.insert(*bsg);
+                }
+            }
+            for si in self.select_infos.iter().flatten() {
+                for sb in &si.branches {
+                    referenced.insert(sb.subgraph_id);
+                }
+            }
+            // Kept (non-candidate) subgraphs' sg-internal links.
+            for (i, sg) in self.subgraphs.iter().enumerate() {
+                if remove_sg[i] {
+                    continue;
+                }
+                referenced.insert(SubGraphId(sg.function_id));
+                if let Some(p) = sg.loop_parent_sg {
+                    referenced.insert(p);
+                }
+                for e in &sg.defer_table {
+                    referenced.insert(e.body_subgraph);
+                }
+            }
+            // Iterative veto with cascade.
+            loop {
+                let mut changed = false;
+                for i in 0..self.subgraphs.len() {
+                    if !remove_sg[i] {
+                        continue;
+                    }
+                    let sg = &self.subgraphs[i];
+                    if referenced.contains(&sg.id) {
+                        remove_sg[i] = false;
+                        changed = true;
+                        // Tripwire: a NON-EMPTY subgraph needing this veto
+                        // means the liveness closure (compute_liveness, which
+                        // seeds callee anchors from live call/closure edges)
+                        // missed a cross-sg edge kind — the function should
+                        // have stayed reachable in the first place. Empty
+                        // placeholders (analyzer-dead branches) are the only
+                        // legitimate veto saves.
+                        debug_assert!(
+                            sg.node_range.0 == sg.node_range.1,
+                            "rebuild: non-empty sg {} (fn={} range=[{},{}) survived only via \
+                             the removal veto — liveness closure missed an edge to it",
+                            sg.id.0, sg.function_id, sg.node_range.0.0, sg.node_range.1.0
+                        );
+                        referenced.insert(SubGraphId(sg.function_id));
+                        if let Some(p) = sg.loop_parent_sg {
+                            referenced.insert(p);
+                        }
+                        for e in &sg.defer_table {
+                            referenced.insert(e.body_subgraph);
+                        }
+                        if std::env::var("FROND_DEBUG_REBUILD").is_ok() {
+                            eprintln!(
+                                "[REBUILD] sg={} removal vetoed: still referenced (fn={} kind={:?} range=[{},{})",
+                                sg.id.0, sg.function_id, sg.loop_kind,
+                                sg.node_range.0.0, sg.node_range.1.0
+                            );
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        let dbg_rebuild = std::env::var("FROND_DEBUG_REBUILD").is_ok();
         // Save old node_ranges for debugging.
         let old_ranges: Vec<(u32, u32)> = if dbg_rebuild {
             self.subgraphs.iter().map(|sg| (sg.node_range.0.0, sg.node_range.1.0)).collect()
         } else {
             Vec::new()
         };
-        for sg in self.subgraphs.iter_mut() {
+        for (sg_idx, sg) in self.subgraphs.iter_mut().enumerate() {
             let old_start = sg.node_range.0.0 as usize;
             let old_end = (sg.node_range.1.0 as usize).min(total);
             let sg_id = sg.id;
+
+            // Removed subgraphs: dropped in step 6 — nothing to remap (their
+            // anchor nodes are dead; remap_n would panic on them).
+            if remove_sg[sg_idx] {
+                continue;
+            }
+            // NOTE: kept subgraphs — including still-referenced EMPTY
+            // placeholders (analyzer-dead branches that live gates select at
+            // runtime) — go through the same anchor remapping as before:
+            // their entry/return point at live nodes of sibling regions, and
+            // the engine resolves the branch result through them.
+
             let mut new_start: Option<u32> = None;
             let mut new_end: u32 = 0;
 
@@ -3133,35 +3872,181 @@ impl DataFlowGraph {
                 Some(ns) => (NodeId(ns), NodeId(new_end)),
                 None => (NodeId(0), NodeId(0)), // All dead; range collapses.
             };
-            sg.entry_node = remap_n(sg.entry_node);
-            sg.return_node = remap_n(sg.return_node);
-            if let Some(c) = sg.cond_node { sg.cond_node = Some(remap_n(c)); }
-            if let Some(n) = sg.iter_next_node { sg.iter_next_node = Some(remap_n(n)); }
-            // event_source_decls: EventSourceDecl.node
-            for decl in &mut sg.event_source_decls {
-                decl.node = remap_n(decl.node);
-            }
-            // defer_table: DeferEntry.trigger_node + captured_inputs
-            for entry in &mut sg.defer_table {
-                entry.trigger_node = remap_n(entry.trigger_node);
-                entry.captured_inputs = entry.captured_inputs.iter().map(|&n| remap_n(n)).collect();
-            }
-            // upvalue_outer_nodes: captured-variable outer nodes need remap.
-            sg.upvalue_outer_nodes = sg.upvalue_outer_nodes.iter().map(|&n| remap_n(n)).collect();
-            // nested_ranges: subgraph node_range needs remap.
-            sg.nested_ranges = sg.nested_ranges.iter().map(|&(s, e)| {
-                (remap_n(NodeId(s)).0, remap_n(NodeId(e)).0)
-            }).collect();
-            // reset_plan: NodeIds inside ResetPlan need remap (synced with cond_node/iter_next_node).
+            // Anchor/metadata NodeId remapping for kept subgraphs no longer
+            // happens here — it happens in ONE place after step 6, through
+            // `map_node_refs` (the write door), for per-node tables and
+            // per-sg anchors alike.
+            // nested_ranges: NOT remapped here — step 6 recomputes every kept
+            // subgraph's nested_ranges from the final ranges.
+            // W5: the flattened condition-tree plan is stale after compaction
+            // (node ids AND tree membership changed). Clear it; the engine
+            // falls back to the runtime DFS until the pipeline recomputes it
+            // post-optimization.
             if let Some(ref mut plan) = sg.reset_plan {
-                plan.reset_to_zero = plan.reset_to_zero.iter().map(|&n| remap_n(n)).collect();
-                plan.reset_to_one = plan.reset_to_one.iter().map(|&n| remap_n(n)).collect();
-                plan.reset_condition_tree = plan.reset_condition_tree.iter().map(|&n| remap_n(n)).collect();
+                plan.condition_tree_plan = Vec::new();
             }
         }
 
+        // ── 6. Compact subgraphs: remove empty/dead subgraphs, remap SubGraphIds ──
+        // Removals were finalized (with reference-veto cascade) in 5-pre, so
+        // every kept SubGraphId reference maps to a kept subgraph.
+        {
+            let removed_count = remove_sg.iter().filter(|&&r| r).count();
+
+            if removed_count > 0 {
+                let mut sg_old_to_new: Vec<u32> = vec![u32::MAX; self.subgraphs.len()];
+                let mut new_sgs: Vec<SubGraph> = Vec::with_capacity(self.subgraphs.len() - removed_count);
+                for (i, sg) in std::mem::take(&mut self.subgraphs).into_iter().enumerate() {
+                    if remove_sg[i] {
+                        continue;
+                    }
+                    sg_old_to_new[i] = new_sgs.len() as u32;
+                    new_sgs.push(sg);
+                }
+                // Vetoed references guarantee map_sg never sees a removed id.
+                let map_sg = |id: SubGraphId| -> SubGraphId {
+                    SubGraphId(sg_old_to_new[id.0 as usize])
+                };
+                for sg in &mut new_sgs {
+                    sg.id = map_sg(sg.id);
+                    sg.function_id = map_sg(SubGraphId(sg.function_id)).0;
+                    sg.loop_parent_sg = sg.loop_parent_sg.map(map_sg);
+                    for e in &mut sg.defer_table {
+                        e.body_subgraph = map_sg(e.body_subgraph);
+                    }
+                }
+                // Debug-only name sidecar follows the same renumbering
+                // (entries are parallel to `subgraphs`).
+                if !self.sg_debug_names.is_empty() {
+                    let mut new_names: Vec<Option<Box<str>>> =
+                        Vec::with_capacity(new_sgs.len());
+                    for (i, keep) in remove_sg.iter().enumerate() {
+                        if *keep {
+                            continue;
+                        }
+                        new_names.push(self.sg_debug_names.get(i).cloned().flatten());
+                    }
+                    self.sg_debug_names = new_names;
+                }
+                self.subgraphs = new_sgs;
+                if let Some(e) = self.entry_subgraph {
+                    self.entry_subgraph = Some(map_sg(e));
+                }
+                for ct in self.call_targets.iter_mut() {
+                    *ct = ct.map(map_sg);
+                }
+                for ci in self.closure_infos.iter_mut().flatten() {
+                    ci.subgraph_id = map_sg(ci.subgraph_id);
+                }
+                for pi in self.partial_infos.iter_mut().flatten() {
+                    pi.subgraph_id = map_sg(pi.subgraph_id);
+                }
+                for li in self.lazy_construct_infos.iter_mut().flatten() {
+                    li.thunk_sg = map_sg(li.thunk_sg);
+                }
+                for ti in self.trait_construct_infos.iter_mut().flatten() {
+                    for m in &mut ti.methods {
+                        m.subgraph_id = map_sg(m.subgraph_id);
+                    }
+                }
+                for gb in self.gate_branches.iter_mut().flatten() {
+                    for (_, bsg, _) in &mut gb.branches {
+                        let mapped = map_sg(*bsg);
+                        // The 5-pre reference-veto guarantees no live gate
+                        // branch points at a removed subgraph.
+                        debug_assert!(mapped.0 != u32::MAX, "gate branch mapped to removed sg");
+                        *bsg = mapped;
+                    }
+                }
+                for si in self.select_infos.iter_mut().flatten() {
+                    for sb in &mut si.branches {
+                        sb.subgraph_id = map_sg(sb.subgraph_id);
+                    }
+                }
+                for owner in self.hoisted_owners.iter_mut() {
+                    // u32::MAX sentinel for non-hoisted nodes is preserved.
+                    if owner.0 != u32::MAX {
+                        *owner = map_sg(*owner);
+                    }
+                }
+                let mut new_vtable: rustc_hash::FxHashMap<(u16, Box<str>), SubGraphId> =
+                    rustc_hash::FxHashMap::default();
+                for (k, v) in std::mem::take(&mut self.vtable_fallback_dispatch) {
+                    new_vtable.insert(k, map_sg(v));
+                }
+                self.vtable_fallback_dispatch = new_vtable;
+
+                // F-7: per-sg-index derived data is invalidated by renumbering.
+                // EngineRef::new recomputes it after build/optimize/load.
+                // (Load-path CSR offset tables only exist on loaded graphs,
+                // which are never rebuilt.)
+                debug_assert!(self.sg_uv_offsets.is_empty());
+                self.sg_initial_pending = Vec::new();
+                self.sg_initial_seed = Vec::new();
+                self.linear_plans = Vec::new();
+
+                if dbg_rebuild {
+                    eprintln!(
+                        "[REBUILD] compacted subgraphs: removed {} ({} remain)",
+                        removed_count,
+                        self.subgraphs.len()
+                    );
+                }
+            }
+        }
+
+        // ── 6b. Remap every metadata NodeId through the single write door ──
+        // Per-node tables were compacted in step 3 (new-indexed, values still
+        // old ids) and removed subgraphs are gone after step 6, so the door
+        // sees exactly the kept structures. Any metadata NodeId not in
+        // old_to_new here means the liveness seeding (Optimizer's
+        // compute_liveness, which seeds through the READ door) diverged from
+        // this enumeration — an invariant violation, not a salvage case.
+        {
+            let remap_ref = |site: NodeRefSite, owner: u32, id: NodeId| -> NodeId {
+                let r = resolve(id);
+                old_to_new[r.0 as usize].unwrap_or_else(|| panic!(
+                    "rebuild: node-ref door {:?} (owner {}) ref node {} not live — \
+                     liveness seeding diverged from the door enumeration",
+                    site, owner, r.0
+                ))
+            };
+            self.map_node_refs(remap_ref);
+        }
+
+        // ── 4. Rebuild downstreams (including Gate condition_input edges) ──
+        // Runs after the door remap so every NodeId (inputs pool since step 2,
+        // gate condition_input since 6b) is new-indexed.
+        {
+            let n = self.nodes.len();
+            self.downstreams = vec![Vec::new(); n];
+            for node_idx in 0..n {
+                let node = self.nodes[node_idx];
+                let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
+                for &input in inputs {
+                    self.downstreams[input.0 as usize].push(NodeId(node_idx as u32));
+                }
+            }
+            // Gate condition_input → Gate edge (aligned with compute_downstreams).
+            for nid in 0..n {
+                if let Some(gb) = &self.gate_branches[nid] {
+                    let node = self.nodes[nid];
+                    let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
+                    if !inputs.contains(&gb.condition_input) {
+                        self.downstreams[gb.condition_input.0 as usize].push(NodeId(nid as u32));
+                    }
+                }
+            }
+        }
+
+        // Recompute nested_ranges for every kept subgraph from the final
+        // ranges: the per-range remap above cannot express ranges that
+        // collapsed this round, and it accumulated zero-length residue across
+        // rounds (formerly tolerated by the Verifier).
+        self.compute_nested_ranges();
+
         // Verify: check for dangling references.
-        if std::env::var("KUZO_VERIFY_GRAPH").is_ok() {
+        if std::env::var("FROND_VERIFY_GRAPH").is_ok() {
             let total = self.nodes.len();
             for (idx, node) in self.nodes.iter().enumerate() {
                 let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
@@ -3187,7 +4072,7 @@ impl DataFlowGraph {
 
         // DEBUG: check if any Gate node is inside its branch subgraph's node_range.
         // This would cause infinite recursion (Gate launches a subgraph that contains itself).
-        if std::env::var("KUZO_DEBUG_REBUILD").is_ok() {
+        if std::env::var("FROND_DEBUG_REBUILD").is_ok() {
             for (idx, gb_opt) in self.gate_branches.iter().enumerate() {
                 if let Some(gb) = gb_opt {
                     let gate_node = NodeId(idx as u32);
@@ -3209,28 +4094,120 @@ impl DataFlowGraph {
         old_to_new
     }
 
-    /// Computes `nested_ranges` for all subgraphs: for each subgraph, collects
-    /// the ranges of subgraphs directly nested within its `node_range`. Called
-    /// once at build time so runtime can query in O(len) instead of scanning
-    /// the whole graph.
-    pub fn compute_nested_ranges(&mut self) {
-        let subgraph_count = self.subgraphs.len();
-        // Pre-collect all subgraph ranges to avoid repeatedly borrowing
-        // self.subgraphs inside the loop.
-        let ranges: Vec<(SubGraphId, u32, u32)> = self.subgraphs.iter()
-            .map(|sg| (sg.id, sg.node_range.0 .0, sg.node_range.1 .0))
-            .collect();
-        for sg in &mut self.subgraphs {
-            let (sg_id, branch_start, branch_end) = (sg.id, sg.node_range.0 .0, sg.node_range.1 .0);
-            sg.nested_ranges = ranges.iter()
-                .filter(|(id, s, e)| {
-                    *id != sg_id && *s >= branch_start && *e <= branch_end
-                })
-                .map(|(_, s, e)| (*s, *e))
-                .collect();
+/// Computes `nested_ranges` for all subgraphs: for each subgraph, the ranges
+/// of subgraphs DIRECTLY nested within its `node_range`. Called at build
+/// time, after every optimizer `rebuild`, and at `.kzo` load (v3: the section
+/// is no longer serialized — this is the derived source of truth). Empty
+/// ranges (collapsed or placeholder subgraphs) are never children.
+///
+/// O(SG.log SG): sort non-empty ranges by (start asc, end desc) and walk with
+/// a stack of open ancestors — each range's direct parent is the stack top
+/// after popping everything that has ended or does not contain it.
+pub fn compute_nested_ranges(&mut self) {
+    let mut ranges: Vec<(u32, u32, usize)> = self
+        .subgraphs
+        .iter()
+        .enumerate()
+        .filter(|(_, sg)| sg.node_range.0 .0 < sg.node_range.1 .0)
+        .map(|(i, sg)| (sg.node_range.0 .0, sg.node_range.1 .0, i))
+        .collect();
+    ranges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+
+    let mut children: Vec<Vec<(u32, u32)>> = vec![Vec::new(); self.subgraphs.len()];
+    // Stack of (end, idx) of currently open ancestors (outermost first).
+    let mut stack: Vec<(u32, usize)> = Vec::new();
+    for &(start, end, idx) in &ranges {
+        // Pop everything that cannot contain this range.
+        while let Some(&(top_end, _)) = stack.last() {
+            if top_end <= start || end > top_end {
+                stack.pop();
+            } else {
+                break;
+            }
         }
-        // Avoid unused warning.
-        let _ = subgraph_count;
+        if let Some(&(_, parent_idx)) = stack.last() {
+            children[parent_idx].push((start, end));
+        }
+        stack.push((end, idx));
+    }
+    for (i, sg) in self.subgraphs.iter_mut().enumerate() {
+        sg.nested_ranges = std::mem::take(&mut children[i]);
+    }
+}
+
+    /// W5: flatten every loop subgraph's `reset_condition_tree` roots into the
+    /// mechanical `condition_tree_plan` — the same DFS the engine's
+    /// `reset_condition_tree` performs, done ONCE at build/load time instead
+    /// of on every loop iteration. Uses the mem-agnostic accessors so both the
+    /// built and the loaded (zerocopy) graphs can run it.
+    pub fn precompute_reset_plans(&mut self) {
+        let plans: Vec<(usize, Vec<(NodeId, u16)>)> = self
+            .subgraphs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, sg)| {
+                let plan = sg.reset_plan.as_ref()?;
+                if plan.reset_condition_tree.is_empty() {
+                    return None;
+                }
+                Some((i, self.compute_condition_tree_plan(i, sg, &plan.reset_condition_tree)))
+            })
+            .collect();
+        for (i, computed) in plans {
+            if let Some(plan) = self.subgraphs[i].reset_plan.as_mut() {
+                plan.condition_tree_plan = computed;
+            }
+        }
+    }
+
+    /// The condition-tree flattening shared semantics with
+    /// `Engine::reset_condition_tree`: DFS over the cond roots' inputs, keeping
+    /// nodes inside the loop subgraph but outside every nested subgraph range
+    /// (Gate nodes included — Bug #38); each node's pending count is the number
+    /// of its inputs that are also inside the collected tree.
+    fn compute_condition_tree_plan(
+        &self,
+        loop_sg_idx: usize,
+        loop_sg: &SubGraph,
+        roots: &[NodeId],
+    ) -> Vec<(NodeId, u16)> {
+        let (sg_start, sg_end) = loop_sg.node_range;
+        // Mem-agnostic nested ranges (zerocopy graphs keep them in the mmap
+        // CSR section rather than the owned Vec).
+        let nested = self.sg_nested_ranges(loop_sg_idx);
+        let is_nested = |gid: u32| nested.iter().any(|&(s, e)| gid >= s && gid < e);
+        let is_in_sg = |gid: u32| gid >= sg_start.0 && gid < sg_end.0 && !is_nested(gid);
+
+        let mut visited: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+        let mut stack: Vec<NodeId> = roots.to_vec();
+        let mut cond_nodes: Vec<NodeId> = Vec::new();
+        while let Some(gid) = stack.pop() {
+            if !visited.insert(gid.0) {
+                continue;
+            }
+            if !is_in_sg(gid.0) {
+                continue;
+            }
+            cond_nodes.push(gid);
+            let node = self.node(gid.0 as usize);
+            let inputs = self.inputs(node.inputs_offset, node.input_count);
+            for &inp in inputs {
+                stack.push(inp);
+            }
+        }
+
+        cond_nodes
+            .into_iter()
+            .map(|gid| {
+                let node = self.node(gid.0 as usize);
+                let inputs = self.inputs(node.inputs_offset, node.input_count);
+                let pending = inputs
+                    .iter()
+                    .filter(|&&inp| visited.contains(&inp.0) && is_in_sg(inp.0))
+                    .count() as u16;
+                (gid, pending)
+            })
+            .collect()
     }
 }
 
@@ -3346,4 +4323,88 @@ pub const fn scalar_meta(tag: crate::value::ValueTag) -> Option<ScalarMeta> {
         // Non-scalar tag: no arithmetic metadata.
         _ => return None,
     })
+}
+
+// =========================================================================
+// Effect classification tests (W1)
+// =========================================================================
+
+#[cfg(test)]
+mod effect_classification_tests {
+    use super::*;
+
+    /// Verbatim copy of the PRE-W1 hand-written pure set (the behavior W1 must
+    /// preserve exactly). Keep frozen; if `pure_compute_fn_set()` drifts from
+    /// this, the equivalence guarantee is broken.
+    fn legacy_pure_set() -> rustc_hash::FxHashSet<ComputeFnId> {
+        let mut s = rustc_hash::FxHashSet::default();
+        for id in 1..=27u32 { s.insert(ComputeFnId(id)); }
+        for id in 50..=91u32 { s.insert(ComputeFnId(id)); }
+        for id in 92..=259u32 { s.insert(ComputeFnId(id)); }
+        s.insert(CF_RECORD_FIELD_GET);
+        s.insert(CF_ARRAY_INDEX);
+        s.insert(CF_IS_NULL);
+        s.insert(CF_ARRAY_LEN);
+        s.insert(CF_REF_EQ);
+        s.insert(CF_REF_NEQ);
+        s.insert(CF_ELVIS);
+        s.insert(CF_PATTERN_CTOR_MATCH);
+        s.insert(CF_PATTERN_ADT_FIELD_GET);
+        s.insert(CF_PATTERN_STR_EQ);
+        s.insert(CF_CAST_SCALAR);
+        s.insert(CF_NON_NULL_ASSERT);
+        s.insert(CF_STR_BYTES);
+        s.insert(CF_EQ_STR);
+        s.insert(CF_NE_STR);
+        s.insert(CF_LT_STR);
+        s.insert(CF_GT_STR);
+        s.insert(CF_LE_STR);
+        s.insert(CF_GE_STR);
+        s.insert(CF_EQ_OBJ);
+        s.insert(CF_NE_OBJ);
+        s.insert(CF_NE_BOOL);
+        s.insert(CF_EQ_F128);
+        s.insert(CF_NE_F128);
+        s.insert(CF_LT_F128);
+        s.insert(CF_GT_F128);
+        s.insert(CF_LE_F128);
+        s.insert(CF_GE_F128);
+        s
+    }
+
+    /// The derived set must equal the legacy set member-for-member.
+    #[test]
+    fn pure_set_equivalence_with_legacy() {
+        let new = pure_compute_fn_set();
+        let old = legacy_pure_set();
+        let missing: Vec<_> = old.difference(&new).collect();
+        let added: Vec<_> = new.difference(&old).collect();
+        assert!(
+            missing.is_empty() && added.is_empty(),
+            "pure set drift: lost {:?}, gained {:?}",
+            missing,
+            added
+        );
+    }
+
+    /// Every compute fn id in the table must be classified (effect_class
+    /// panics otherwise — this test turns that into a named failure).
+    #[test]
+    fn classification_covers_all_cfs() {
+        for id in 0..COMPUTE_FN_TABLE_LEN {
+            let _ = effect_class(ComputeFnId(id));
+        }
+    }
+
+    /// Aliasing reads are classified ReadMutable; in-place mutators are
+    /// WriteMutable (the graph_pure_set contract depends on this).
+    #[test]
+    fn aliasing_contract() {
+        for cf in aliasing_read_cfs() {
+            assert_eq!(effect_class(cf), EffectClass::ReadMutable, "cf {}", cf.0);
+        }
+        for cf in [CF_RECORD_FIELD_SET, CF_ARRAY_STORE, CF_DEREF_WRITE] {
+            assert_eq!(effect_class(cf), EffectClass::WriteMutable, "cf {}", cf.0);
+        }
+    }
 }

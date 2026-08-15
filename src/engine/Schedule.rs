@@ -38,11 +38,11 @@ pub fn alloc_const_value(cv: ConstValue, pool: &[u8]) -> Value {
         ConstValue::Null => Value::NULL,
         ConstValue::Void => Value::VOID,
         ConstValue::Str { offset, len } => {
-            use crate::value::{HeapObj, KuzoStr};
+            use crate::value::{HeapObj, Str};
             let off = offset as usize;
             let end = off + len as usize;
             let s = std::str::from_utf8(&pool[off..end]).unwrap_or("");
-            Value::ref_val(HeapObj::Str(KuzoStr::new(s)))
+            Value::ref_val(HeapObj::Str(Str::new(s)))
         }
     }
 }
@@ -53,30 +53,42 @@ pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
     let sg_id = frame.subgraph_id;
     let (node_start, node_end) = graph.subgraphs[sg_id.0 as usize].node_range;
     let node_count = (node_end.0 - node_start.0) as usize;
-    let offset = node_start.0 as usize;
-    let node_end_global = node_start.0 + node_count as u32;
+
+    // Set node_offset.
+    frame.node_offset = node_start.0;
+
+    // E3: engine-precomputed per-sg template (static for cross-function frames — no parent
+    // state participates). Falls back to the legacy derivation when the engine hasn't
+    // populated the templates (LSP / sync-interpreter contexts).
+    if !graph.sg_initial_pending.is_empty() {
+        let tpl = &graph.sg_initial_pending[sg_id.0 as usize];
+        frame.pending_inputs[..node_count].copy_from_slice(tpl);
+        for &local in &graph.sg_initial_seed[sg_id.0 as usize] {
+            if !frame.value_table.is_ready(local.0 as usize) {
+                frame.push_ready(local);
+            }
+        }
+        return;
+    }
 
     // Use the precomputed nested_ranges (filled at build time) to avoid a runtime full-graph scan.
     let nested_ranges: &[(u32, u32)] = graph.sg_nested_ranges(sg_id.0 as usize);
 
-    if super::env_flag("KUZO_DEBUG_STALL") {
+    if super::env_flag("FROND_DEBUG_STALL") {
         eprintln!("[PREPARE] sg={} node_range=[{},{}) nested={:?}",
-            sg_id.0, node_start.0, node_end_global, nested_ranges);
+            sg_id.0, node_start.0, node_start.0 + node_count as u32, nested_ranges);
     }
 
     let is_nested = |global_idx: u32| -> bool {
         nested_ranges.iter().any(|&(s, e)| global_idx >= s && global_idx < e)
     };
 
-    // Set node_offset.
-    frame.node_offset = node_start.0;
-
     // 1. Initialize pending_inputs (select Gate -> 0; other nodes count actual in-frame inputs).
     for i in 0..node_count {
-        if is_nested((offset + i) as u32) {
+        if is_nested((node_start.0 as usize + i) as u32) {
             frame.pending_inputs[i] = PENDING_EXTERNAL;
         } else {
-            let graph_node = graph.node(offset + i);
+            let graph_node = graph.node(node_start.0 as usize + i);
             if graph_node.kind == NodeKind::EventSource {
                 frame.pending_inputs[i] = PENDING_EXTERNAL;
             } else {
@@ -100,11 +112,63 @@ pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
         if i < param_count {
             continue;
         }
-        if is_nested((offset + i) as u32) {
+        if is_nested((node_start.0 as usize + i) as u32) {
             continue;
         }
         if frame.pending_inputs[i] == 0 && !frame.value_table.is_ready(i) {
             frame.push_ready(NodeId(i as u32));
+        }
+    }
+}
+
+/// E5 linear bail-out: rebuilds the dataflow readiness state (pending_inputs + ready-queue
+/// seeds) for the frame's in-range nodes from the current ready bitmap, so the engine can
+/// continue the remainder of the subgraph exactly as if it had been driven by the queue all
+/// along. Mirrors prepare_frame_nodes / prepare_same_function_frame_sync semantics:
+/// pending = count of in-sg-range inputs not ready; nested/EventSource nodes keep
+/// PENDING_EXTERNAL; non-branch slots of same_function frames stay untouched.
+pub fn rebuild_linear_bailout(frame: &mut Frame, graph: &DataFlowGraph) {
+    let sg_id = frame.subgraph_id;
+    let (start, end) = graph.subgraphs[sg_id.0 as usize].node_range;
+    let start = start.0 as usize;
+    let end = end.0 as usize;
+    let node_start = frame.node_offset as usize;
+    let table_len = frame.value_table.len();
+    if table_len == 0 {
+        return;
+    }
+    frame.ready_queue.clear();
+    let nested: &[(u32, u32)] = graph.sg_nested_ranges(sg_id.0 as usize);
+    let is_nested = |gid: u32| -> bool { nested.iter().any(|&(a, b)| gid >= a && gid < b) };
+
+    for gid in start..end {
+        let local = gid.wrapping_sub(node_start);
+        if local >= table_len {
+            break;
+        }
+        let node = graph.node(gid);
+        if node.kind == NodeKind::EventSource {
+            frame.pending_inputs[local] = PENDING_EXTERNAL;
+            continue;
+        }
+        if is_nested(gid as u32) {
+            frame.pending_inputs[local] = PENDING_EXTERNAL;
+            continue;
+        }
+        let inputs = graph.inputs(node.inputs_offset, node.input_count);
+        let mut pending: u16 = 0;
+        for &inp in inputs {
+            let il = inp.0 as usize;
+            if il >= start && il < end {
+                let l = il.wrapping_sub(node_start);
+                if l < table_len && !frame.value_table.is_ready(l) {
+                    pending += 1;
+                }
+            }
+        }
+        frame.pending_inputs[local] = pending;
+        if pending == 0 && !frame.value_table.is_ready(local) {
+            frame.push_ready(NodeId(local as u32));
         }
     }
 }
@@ -183,8 +247,18 @@ pub(super) fn extract_child_return(child: &Frame, graph: &DataFlowGraph) -> Valu
 // =========================================================================
 
 impl<S: LockStrategy> Engine<S> {
+    /// Native stack depth cap for E1 inline synchronous execution. Beyond it, calls fall back to
+    /// the queue protocol (which has no native recursion), matching the legacy engine's ability
+    /// to run arbitrarily deep recursion. Debug builds use unoptimized multi-KB stack frames, so
+    /// the cap is lowered to stay well inside the 1MB Windows main-thread stack (measured: 256
+    /// levels overflow in debug, pass in release).
+    pub(super) const INLINE_MAX_DEPTH: u32 = if cfg!(debug_assertions) { 48 } else { 256 };
+
     /// Executes all ready nodes in the frame until the ready queue is empty or the frame suspends.
-    pub(super) fn run_frame_nodes(&self, frame: &mut Frame, fid: FrameId, queue: &QueueHandle<'_>) {
+    ///
+    /// `depth` = current inline-call nesting (E1). process_frame enters at 0; each inline
+    /// synchronous child runs at depth+1.
+    pub(super) fn run_frame_nodes(&self, frame: &mut Frame, fid: FrameId, queue: &QueueHandle<'_>, depth: u32) {
         let graph = frame.graph.clone();
 
         let mut iter_guard: u64 = 0;
@@ -213,7 +287,7 @@ impl<S: LockStrategy> Engine<S> {
             let local_id = match frame.pop_ready() {
                 Some(n) => n,
                 None => {
-                    if super::env_flag("KUZO_DEBUG_STALL") {
+                    if super::env_flag("FROND_DEBUG_STALL") {
                         let sg_id = frame.subgraph_id;
                         let (ns, ne) = graph.subgraphs[sg_id.0 as usize].node_range;
                         let ncnt = (ne.0 - ns.0) as usize;
@@ -238,7 +312,7 @@ impl<S: LockStrategy> Engine<S> {
             let node_start = frame.node_offset;
             let graph_node_id = NodeId(local_id.0 + node_start);
             let node = graph.node(graph_node_id.0 as usize);
-            let ctx = EvalContext { node_start };
+            let ctx = EvalContext { node_start, graph: &graph };
 
             // COMPUTE: uniformly invoke compute_fn, with no specialization checks.
             let result = (graph.compute_fns[node.compute_fn.0 as usize])(frame, graph_node_id, &ctx);
@@ -246,14 +320,14 @@ impl<S: LockStrategy> Engine<S> {
             // MATCH NodeResult: unified side-effect handling.
             match result {
                 NodeResult::Value(v) => {
-                    let cc = graph.downstream_slice(graph_node_id.0 as usize).len() as u16;
+                    let cc = graph.downstream_count(graph_node_id.0 as usize);
                     frame.set_value(local_id, v, cc);
                     notify_downstream(frame, &graph, local_id, graph_node_id, NodeId(node_start));
                 }
                 NodeResult::Batch(results) => {
                     for &(lid, ref v) in &results {
                         let gid = NodeId(lid.0 + node_start);
-                        let cc = graph.downstream_slice(gid.0 as usize).len() as u16;
+                        let cc = graph.downstream_count(gid.0 as usize);
                         frame.set_value(lid, v.clone(), cc);
                     }
                     for &(lid, _) in &results {
@@ -267,7 +341,28 @@ impl<S: LockStrategy> Engine<S> {
                 NodeResult::Call(pending) => {
                     // Tail-call graph jump.
                     let graph_call_id = NodeId(pending.call_node_local.0 + frame.node_offset);
-                    if graph.tail_call_flag(graph_call_id.0 as usize) {
+                    // Same-function branch-frame guard: when this frame IS an if/match branch
+                    // (its value table lives in the parent function's layout — node_offset ≠ its
+                    // own subgraph range — and its caller launch node is a Gate in that shared
+                    // layout), a tail jump would swap the branch frame in place with the callee:
+                    // the callee's completion then writes the Gate node directly as data and the
+                    // branch's own CF_RETURN never runs — the branch's Return signal is lost and
+                    // the function falls through to its tail expression (wrong result). Route
+                    // such calls through the normal call path so the branch frame executes its
+                    // Return node and propagates the signal properly.
+                    let frame_is_branch = frame.node_offset
+                        != graph.subgraphs[frame.subgraph_id.0 as usize].node_range.0 .0;
+                    // Only same-function branch frames share the caller's node_offset layout,
+                    // so the caller launch node is only resolvable (and only relevant) there.
+                    let branch_frame_tail = frame_is_branch
+                        && frame
+                            .caller
+                            .map(|(_, cn)| {
+                                graph.node((cn.0 + frame.node_offset) as usize).kind
+                                    == NodeKind::Gate
+                            })
+                            .unwrap_or(false);
+                    if graph.tail_call_flag(graph_call_id.0 as usize) && !branch_frame_tail {
                         let caller = frame.caller;
                         let propagate_to_parent =
                             if let Some((caller_fid, call_node)) = caller {
@@ -321,12 +416,176 @@ impl<S: LockStrategy> Engine<S> {
                         continue;
                     }
 
-                    // LoopBody frame reuse.
+                    // LoopBody invocation.
                     let target_loop_kind =
                         graph.subgraphs[pending.target_sg.0 as usize].loop_kind;
-                    let child_fid = if target_loop_kind
-                        == crate::ir::Ir::LoopKind::LoopBody
+                    let is_loop_body = target_loop_kind
+                        == crate::ir::Ir::LoopKind::LoopBody;
+                    // E1: non-LoopBody synchronous calls run inline (frame built by
+                    // start_subgraph_frame below, never registered in the frames map unless it
+                    // suspends). Async spawns and depth-exceeded calls keep the queue protocol.
+                    let inline_sync = !is_loop_body
+                        && !pending.is_async
+                        && depth < Self::INLINE_MAX_DEPTH;
+                    if is_loop_body
+                        && !graph.subgraphs[pending.target_sg.0 as usize].has_suspend
+                        && depth < Self::INLINE_MAX_DEPTH
                     {
+                        // E2 loop hot path: drive the body on the current stack, iteration after
+                        // iteration, without queue round-trips. Eligibility: body sg has no
+                        // suspension point (a suspending body falls back to the queue protocol —
+                        // the cached_child_frame mechanism then owns it) and inline depth headroom.
+                        // Semantics mirror complete_and_wake_caller's LoopBody arms exactly:
+                        // Break/Return exit (+ Bug G defer drain), TailRec base case on None,
+                        // Continue/None reset via reset_loop_iteration.
+                        let (body_fid, mut body) =
+                            if let Some((bfid, b)) = frame.hot_body.take() {
+                                (bfid, b)
+                            } else if let Some(bfid) = frame.cached_child_frame {
+                                match self.frames.lock().remove(&bfid) {
+                                    Some(b) => (bfid, b),
+                                    None => self.start_subgraph_frame(
+                                        fid,
+                                        pending.call_node_local,
+                                        pending.target_sg,
+                                        &pending.args,
+                                        frame,
+                                        pending.closure_val.clone(),
+                                    ),
+                                }
+                            } else {
+                                self.start_subgraph_frame(
+                                    fid,
+                                    pending.call_node_local,
+                                    pending.target_sg,
+                                    &pending.args,
+                                    frame,
+                                    pending.closure_val.clone(),
+                                )
+                            };
+
+                        // Per-iteration argument injection + chain wiring (same as the map-reuse
+                        // path: values set, notify_downstream, Bug #100 in-hand parent pointers).
+                        {
+                            let target_sg =
+                                &graph.subgraphs[pending.target_sg.0 as usize];
+                            let param_count = target_sg.param_count as usize;
+                            let parent_start = body.node_offset;
+                            let branch_start = target_sg.node_range.0 .0;
+                            let param_local_offset =
+                                (branch_start.wrapping_sub(parent_start)) as usize;
+                            for (i, arg) in
+                                pending.args.iter().enumerate().take(param_count)
+                            {
+                                let local_id =
+                                    NodeId((param_local_offset + i) as u32);
+                                let gid = (branch_start as usize) + i;
+                                let global_id = NodeId(gid as u32);
+                                let consumer_count =
+                                    graph.downstream_count(gid);
+                                body.set_value(local_id, arg.clone(), consumer_count);
+                                notify_downstream(
+                                    &mut body,
+                                    &graph,
+                                    local_id,
+                                    global_id,
+                                    NodeId(parent_start),
+                                );
+                            }
+                            body.caller = Some((fid, pending.call_node_local));
+                            if !super::env_flag("FROND_NO_REUSECHAIN") {
+                                let parent_ptr =
+                                    frame as *const Frame as *mut Frame;
+                                body.parent_frame_ptr = parent_ptr;
+                                body.root_frame_ptr = if !frame.root_frame_ptr.is_null() {
+                                    frame.root_frame_ptr
+                                } else {
+                                    parent_ptr
+                                };
+                            } else {
+                                body.parent_frame_ptr = std::ptr::null_mut();
+                            }
+                            body.state = FrameState::Ready;
+                        }
+
+                        self.run_frame_dispatch(&mut body, body_fid, queue, depth + 1);
+
+                        if body.state == FrameState::Suspended {
+                            // Body awaits/selects: hand it to the queue protocol (legacy
+                            // suspend), where its completion re-enters
+                            // complete_and_wake_caller's LoopBody handling.
+                            self.frames.lock().insert(body_fid, body);
+                            frame.cached_child_frame = Some(body_fid);
+                            queue.push(body_fid);
+                            self.event_waiters.lock().push((
+                                RuntimeEvent::SubgraphComplete(body_fid),
+                                fid,
+                            ));
+                            frame.state = FrameState::Suspended;
+                            frame.suspend_state =
+                                SuspendState::WaitingSubgraph(body_fid);
+                            frame.suspend_event =
+                                Some(RuntimeEvent::SubgraphComplete(body_fid));
+                            return;
+                        }
+
+                        match body.control_signal.clone() {
+                            ControlSignal::Break
+                            | ControlSignal::Return(_) => {
+                                let signal = body.control_signal.clone();
+                                frame.cached_child_frame = None;
+                                frame.control_signal = signal.clone();
+                                // Bug G: break/return exits the loop without entering the
+                                // void_sg, so CF_DEFER_RUN never drains the loop frame's
+                                // defer_stack — drain here (LIFO), as complete_and_wake_caller
+                                // does.
+                                if !frame.defer_stack.is_empty() {
+                                    let defers: Vec<crate::ir::Ir::RuntimeDefer> =
+                                        frame.defer_stack.drain(..).collect();
+                                    crate::ir::Compute::run_defer_entries_sync(
+                                        frame,
+                                        &defers,
+                                        &graph,
+                                    );
+                                }
+                                self.release_frame(body);
+                                // control_signal set: the outer loop breaks and the defer tail
+                                // runs; upstream propagation happens through the frame's own
+                                // completion path.
+                                continue;
+                            }
+                            ControlSignal::Continue => {
+                                self.reset_loop_iteration(frame, fid, &mut body);
+                                frame.hot_body = Some((body_fid, body));
+                                // A finished body iteration is provable progress, not a
+                                // livelock: reset the node-pop guard (long loops legitimately
+                                // exceed 500k pops inside one run_frame_nodes invocation).
+                                iter_guard = 0;
+                                continue;
+                            }
+                            ControlSignal::None => {
+                                let loop_kind = graph.subgraphs
+                                    [frame.subgraph_id.0 as usize]
+                                    .loop_kind;
+                                if loop_kind == crate::ir::Ir::LoopKind::TailRec {
+                                    // TailRec base case: the body's return value is the
+                                    // loop's result.
+                                    let return_value = extract_child_return(&body, &graph);
+                                    frame.cached_child_frame = None;
+                                    frame.control_signal =
+                                        ControlSignal::Return(return_value);
+                                    self.release_frame(body);
+                                    continue;
+                                }
+                                self.reset_loop_iteration(frame, fid, &mut body);
+                                frame.hot_body = Some((body_fid, body));
+                                iter_guard = 0;
+                                continue;
+                            }
+                        }
+                    }
+
+                    let child_fid = if is_loop_body {
                         if let Some(bfid) = frame.cached_child_frame {
                             let target_sg =
                                 &graph.subgraphs[pending.target_sg.0 as usize];
@@ -345,14 +604,32 @@ impl<S: LockStrategy> Engine<S> {
                                     let gid = (branch_start as usize) + i;
                                     let global_id = NodeId(gid as u32);
                                     let consumer_count =
-                                        graph.downstream_slice(gid).len() as u16;
+                                        graph.downstream_count(gid);
                                     bf.set_value(local_id, arg.clone(), consumer_count);
                                     // Do not push_ready: the parameter value is already set;
                                     // notify_downstream propagates it downstream.
                                     notify_downstream(bf, &graph, local_id, global_id, NodeId(parent_start));
                                 }
                                 bf.caller = Some((fid, pending.call_node_local));
-                                bf.parent_frame_ptr = std::ptr::null_mut();
+                                // Bug #100: keep the frame chain connected on reuse.
+                                // Nulling parent_frame_ptr here orphaned the body's
+                                // WriteBacks (setup_frame_chain cannot restore them:
+                                // the caller is mid-processing, absent from the map),
+                                // so loop-variable updates never reached the loop frame
+                                // and the condition re-read a stale snapshot forever.
+                                // Box addresses are stable across remove/insert (see
+                                // process_frame), so the in-hand frame pointer is safe.
+                                if super::env_flag("FROND_NO_REUSECHAIN") {
+                                    bf.parent_frame_ptr = std::ptr::null_mut();
+                                } else {
+                                    let parent_ptr = frame as *const Frame as *mut Frame;
+                                    bf.parent_frame_ptr = parent_ptr;
+                                    bf.root_frame_ptr = if !frame.root_frame_ptr.is_null() {
+                                        frame.root_frame_ptr
+                                    } else {
+                                        parent_ptr
+                                    };
+                                }
                                 bf.state = FrameState::Ready;
                             }
                             if let Some(bf) = body_frame {
@@ -368,7 +645,7 @@ impl<S: LockStrategy> Engine<S> {
                                 frame,
                                 pending.closure_val.clone(),
                             );
-                            if std::env::var("KUZO_DEBUG_FORIN").is_ok() {
+                            if super::env_flag("FROND_DEBUG_FORIN") {
                                 let bsg = &graph.subgraphs[pending.target_sg.0 as usize];
                                 eprintln!("[FORIN-CREATE] body_sg={} bfid={:?} args={:?} body_range=[{},{})",
                                     pending.target_sg.0, bfid, pending.args,
@@ -377,6 +654,10 @@ impl<S: LockStrategy> Engine<S> {
                             frame.cached_child_frame = Some(bfid);
                             bfid
                         }
+                    } else if inline_sync {
+                        // Placeholder: the inline path below builds the frame itself (without a
+                        // frames-map insert). This arm must not be reachable for is_async.
+                        FrameId(u32::MAX)
                     } else {
                         self.start_subgraph(
                             fid,
@@ -389,6 +670,7 @@ impl<S: LockStrategy> Engine<S> {
                     };
 
                     if pending.is_async {
+                        debug_assert!(!inline_sync);
                         let async_id = self
                             .async_join_runtime
                             .lock()
@@ -399,7 +681,7 @@ impl<S: LockStrategy> Engine<S> {
                         let graph_node_id =
                             NodeId(pending.call_node_local.0 + node_start);
                         let consumer_count =
-                            graph.downstream_slice(graph_node_id.0 as usize).len() as u16;
+                            graph.downstream_count(graph_node_id.0 as usize);
                         frame.set_value(
                             pending.call_node_local,
                             async_handle,
@@ -412,6 +694,47 @@ impl<S: LockStrategy> Engine<S> {
                             graph_node_id,
                             NodeId(node_start),
                         );
+                        continue;
+                    } else if inline_sync {
+                        // E1: inline synchronous execution. The child frame runs to completion on
+                        // the current stack — no frames-map insert, no queue round-trip, the caller
+                        // never suspends. On any suspend (await/select/defer-waiter) the exact
+                        // legacy queue protocol is re-established below (child registered + caller
+                        // suspended on SubgraphComplete), so every wakeup path keeps working.
+                        let (child_fid, mut child) = self.start_subgraph_frame(
+                            fid,
+                            pending.call_node_local,
+                            pending.target_sg,
+                            &pending.args,
+                            frame,
+                            pending.closure_val.clone(),
+                        );
+                        self.run_frame_dispatch(&mut child, child_fid, queue, depth + 1);
+                        if child.state == FrameState::Suspended {
+                            // Suspend fallback: hand the child to the queue exactly like the
+                            // legacy suspend path (Bug #78's pending_completions race resolution
+                            // in process_frame then applies verbatim).
+                            self.frames.lock().insert(child_fid, child);
+                            queue.push(child_fid);
+                            self.event_waiters.lock().push((
+                                RuntimeEvent::SubgraphComplete(child_fid),
+                                fid,
+                            ));
+                            frame.state = FrameState::Suspended;
+                            frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
+                            frame.suspend_event =
+                                Some(RuntimeEvent::SubgraphComplete(child_fid));
+                            return;
+                        }
+                        // Completed or Failed: write the result back into the caller (return
+                        // value, signal propagation, downstream notify) and keep executing it.
+                        super::Subgraph::finish_call_in_caller(
+                            frame,
+                            pending.call_node_local,
+                            &child,
+                            &graph,
+                        );
+                        self.release_frame(child);
                         continue;
                     } else {
                         queue.push(child_fid);
@@ -435,7 +758,7 @@ impl<S: LockStrategy> Engine<S> {
                         let graph_node_id =
                             NodeId(await_node_local.0 + node_start);
                         let consumer_count =
-                            graph.downstream_slice(graph_node_id.0 as usize).len() as u16;
+                            graph.downstream_count(graph_node_id.0 as usize);
                         frame.set_value(await_node_local, value, consumer_count);
                         notify_downstream(
                             frame,
@@ -462,7 +785,7 @@ impl<S: LockStrategy> Engine<S> {
                     // After a successful send we still must set the node value + notify downstream,
                     // otherwise subsequent statements will never become ready.
                     let consumer_count =
-                        graph.downstream_slice(graph_node_id.0 as usize).len() as u16;
+                        graph.downstream_count(graph_node_id.0 as usize);
                     frame.set_value(local_id, Value::VOID, consumer_count);
                     notify_downstream(
                         frame,
@@ -481,7 +804,7 @@ impl<S: LockStrategy> Engine<S> {
                         self.cancel_frame(child_fid, queue);
                     }
                     let consumer_count =
-                        graph.downstream_slice(graph_node_id.0 as usize).len() as u16;
+                        graph.downstream_count(graph_node_id.0 as usize);
                     frame.set_value(local_id, Value::VOID, consumer_count);
                     notify_downstream(
                         frame,
@@ -612,6 +935,9 @@ impl<S: LockStrategy> Engine<S> {
                     }
                 }
                 NodeResult::Return(v) => {
+                    if super::env_flag("FROND_DEBUG_SIGNAL") {
+                        eprintln!("[SIG-SET] node_local={} sg={} v={:?}", local_id.0, frame.subgraph_id.0, v);
+                    }
                     frame.control_signal = ControlSignal::Return(v);
                     break;
                 }
@@ -626,6 +952,20 @@ impl<S: LockStrategy> Engine<S> {
             }
         }
 
+        self.finish_frame(frame, fid, queue, depth, &graph);
+    }
+
+    /// Frame termination handling shared by the dataflow runner and the E5 linear runner:
+    /// suspend passthrough, Cancelling cleanup (defer + Failed), LIFO defer execution
+    /// (Bug #77 defer-waiter accounting), and the final Completed transition.
+    fn finish_frame(
+        &self,
+        frame: &mut Frame,
+        fid: FrameId,
+        queue: &QueueHandle<'_>,
+        depth: u32,
+        graph: &DataFlowGraph,
+    ) {
         // Frame suspended: do not execute defer, do not mark Completed.
         if frame.state == FrameState::Suspended {
             return;
@@ -633,15 +973,13 @@ impl<S: LockStrategy> Engine<S> {
 
         // Frame cancelled: execute defer cleanup + mark Failed (spec 5.3).
         if frame.state == FrameState::Cancelling {
-            let defer_entries: Vec<DeferEntry> = {
-                let sg_id = frame.subgraph_id;
-                graph.subgraphs[sg_id.0 as usize].defer_table.clone()
-            };
+            let defer_entries: &[DeferEntry] =
+                &graph.subgraphs[frame.subgraph_id.0 as usize].defer_table;
             for entry in defer_entries.iter().rev() {
                 let defer_fid = self.init_defer_frame(entry.body_subgraph, frame);
                 let mut defer_frame = self.frames.lock().remove(&defer_fid);
                 if let Some(df) = defer_frame.as_deref_mut() {
-                    self.run_frame_nodes(df, defer_fid, queue);
+                    self.run_frame_nodes(df, defer_fid, queue, depth);
                 }
                 if let Some(df) = defer_frame {
                     if df.state != FrameState::Completed {
@@ -654,16 +992,14 @@ impl<S: LockStrategy> Engine<S> {
         }
 
         // Execute defer (LIFO): any termination path runs defer.
-        let defer_entries: Vec<DeferEntry> = {
-            let sg_id = frame.subgraph_id;
-            graph.subgraphs[sg_id.0 as usize].defer_table.clone()
-        };
+        let defer_entries: &[DeferEntry] =
+            &graph.subgraphs[frame.subgraph_id.0 as usize].defer_table;
         let mut pending_defer_count: u32 = 0;
         for entry in defer_entries.iter().rev() {
             let defer_fid = self.init_defer_frame(entry.body_subgraph, frame);
             let mut defer_frame = self.frames.lock().remove(&defer_fid);
             if let Some(df) = defer_frame.as_deref_mut() {
-                self.run_frame_nodes(df, defer_fid, queue);
+                self.run_frame_nodes(df, defer_fid, queue, depth);
             }
             if let Some(df) = defer_frame {
                 if df.state != FrameState::Completed {
@@ -694,6 +1030,108 @@ impl<S: LockStrategy> Engine<S> {
         frame.state = FrameState::Completed;
     }
 
+    /// E5 dispatch: fresh frames with a linearized plan run linearly (no readiness machinery);
+    /// everything else runs through the dataflow engine. `linear_fresh` is one-shot.
+    pub(super) fn run_frame_dispatch(&self, frame: &mut Frame, fid: FrameId, queue: &QueueHandle<'_>, depth: u32) {
+        if frame.linear_fresh {
+            frame.linear_fresh = false;
+            if let Some(plan) = self.graph.linear_plan(frame.subgraph_id.0 as usize) {
+                if !plan.is_empty() {
+                    self.run_linear(frame, fid, plan, queue, depth);
+                    return;
+                }
+            }
+        }
+        self.run_frame_nodes(frame, fid, queue, depth);
+    }
+
+    /// E5 linear runner: executes the sg's own nodes in precomputed topological order —
+    /// no pending_inputs countdown, no ready queue, no notify_downstream (values live until
+    /// frame end, the documented frame-level fallback semantics). Launch nodes (Gate/Call/
+    /// Await/EventSource — is_launch_kind) bail to the dataflow engine, which rebuilds the
+    /// readiness state for the remaining nodes and continues seamlessly.
+    fn run_linear(
+        &self,
+        frame: &mut Frame,
+        fid: FrameId,
+        plan: &[NodeId],
+        queue: &QueueHandle<'_>,
+        depth: u32,
+    ) {
+        let graph = frame.graph.clone();
+        let node_start = frame.node_offset;
+        let mut bailed = false;
+
+        'plan: for &gid in plan {
+            if !matches!(frame.control_signal, ControlSignal::None) {
+                break;
+            }
+            if frame.state == FrameState::Cancelling
+                || frame.state == FrameState::Suspended
+            {
+                break;
+            }
+            let local = NodeId(gid.0.wrapping_sub(node_start));
+            if frame.value_table.is_ready(local.0 as usize) {
+                // Params / injected slots: already hold their values; executing their
+                // compute_fn would return VOID and clobber them.
+                continue;
+            }
+            let node = graph.node(gid.0 as usize);
+            if is_launch_kind(node.kind) {
+                // Control node at its topological position: the remainder (including this
+                // node) belongs to the dataflow engine.
+                bailed = true;
+                break 'plan;
+            }
+            let ctx = EvalContext { node_start, graph: &graph };
+            let result = (graph.compute_fns[node.compute_fn.0 as usize])(frame, gid, &ctx);
+            match result {
+                NodeResult::Value(v) => {
+                    let cc = graph.downstream_count(gid.0 as usize);
+                    frame.set_value(local, v, cc);
+                }
+                NodeResult::Batch(results) => {
+                    for &(lid, ref v) in &results {
+                        let g2 = lid.0 + node_start;
+                        let cc = graph.downstream_count(g2 as usize);
+                        frame.set_value(lid, v.clone(), cc);
+                    }
+                }
+                NodeResult::Return(v) => {
+                    frame.control_signal = ControlSignal::Return(v);
+                    break 'plan;
+                }
+                NodeResult::Break => {
+                    frame.control_signal = ControlSignal::Break;
+                    break 'plan;
+                }
+                NodeResult::Continue => {
+                    frame.control_signal = ControlSignal::Continue;
+                    break 'plan;
+                }
+                _ => {
+                    // Engine-needing result (Call/Await/ChannelNotify/Cancel/SelectWait) from
+                    // a non-launch kind: defensive bail — the dataflow engine re-drives it.
+                    debug_assert!(
+                        false,
+                        "linear plan hit engine node {:?} (kind={:?})",
+                        gid, node.kind
+                    );
+                    bailed = true;
+                    break 'plan;
+                }
+            }
+        }
+
+        if bailed {
+            rebuild_linear_bailout(frame, &graph);
+            self.run_frame_nodes(frame, fid, queue, depth);
+            return;
+        }
+        self.finish_frame(frame, fid, queue, depth, &graph);
+    }
+
     /// Processes one frame: timer check + run_frame_nodes + state transition.
     /// Returns (); the result is communicated via `self.result.lock()`.
     pub(super) fn process_frame(&self, fid: FrameId, queue: &QueueHandle<'_>) {
@@ -715,7 +1153,7 @@ impl<S: LockStrategy> Engine<S> {
         self.setup_frame_chain(frame);
 
         // Execute the frame's ready nodes (lock-free).
-        self.run_frame_nodes(frame, fid, queue);
+        self.run_frame_dispatch(frame, fid, queue, 0);
 
         // Handle the frame state.
         let state = frame.state;
@@ -757,14 +1195,26 @@ impl<S: LockStrategy> Engine<S> {
                     for (call_node, return_value, child_signal) in completions {
                         let call_graph_id = NodeId(call_node.0 + caller_offset.0);
                         let consumer_count =
-                            self.graph.downstream_slice(call_graph_id.0 as usize).len() as u16;
+                            self.graph.downstream_count(call_graph_id.0 as usize);
                         frame.set_value(call_node, return_value, consumer_count);
                         // Gate branch subgraph control-signal propagation (consistent with the
                         // normal path in complete_and_wake_caller).
                         // Bug #78: propagate control_signal for all call nodes (not just Gate),
                         // because LoopBody completion may also arrive via pending_completions when
-                        // the loop_frame is being processed by another worker.
-                        if !matches!(child_signal, ControlSignal::None) {
+                        // the loop_frame is being processed by another worker. This is deliberately
+                        // BROADER than Ir::should_propagate_control_signal: on this race path a
+                        // dropped signal cannot be recovered later, so any non-None signal is
+                        // forwarded and the receiver's loop/Gate protocol sorts it out.
+                        // W4c exception: capture gates must never propagate — the Return is the
+                        // inlined value (already written above), not a signal.
+                        let capture_gate = self.graph.node(call_graph_id.0 as usize).kind
+                            == crate::ir::Ir::NodeKind::Gate
+                            && self
+                                .graph
+                                .gate_branches_at(call_graph_id.0 as usize)
+                                .map(|gb| gb.capture)
+                                .unwrap_or(false);
+                        if !capture_gate && !matches!(child_signal, ControlSignal::None) {
                             frame.control_signal = child_signal;
                         }
                         notify_downstream(
@@ -837,7 +1287,30 @@ impl<S: LockStrategy> Engine<S> {
                             }
                             if let Some(pf) = parent_box {
                                 let parent_has_caller = pf.caller.is_some();
-                                if parent_has_caller {
+                                // The parent may itself have been spawned as an ASYNC call:
+                                // its await-er waits on AsyncJoin(parent_async_id), which
+                                // complete_and_wake_caller never fires (it only completes
+                                // SubgraphComplete waiters). Route through the async_join
+                                // completion exactly like the normal Completed branch, or
+                                // the await after the call is lost forever (silent drop).
+                                let async_id =
+                                    self.async_join_runtime.lock().find_by_child(parent_fid);
+                                if let Some(async_id) = async_id {
+                                    let return_value =
+                                        extract_child_return(&pf, &self.graph);
+                                    self.async_join_runtime
+                                        .lock()
+                                        .set_result(async_id, return_value.clone());
+                                    let woken = self.on_event_arrived(
+                                        RuntimeEvent::AsyncJoin(async_id),
+                                        return_value,
+                                        queue,
+                                    );
+                                    if woken > 0 {
+                                        self.async_join_runtime.lock().remove_entry(async_id);
+                                    }
+                                    self.release_frame(pf);
+                                } else if parent_has_caller {
                                     self.complete_and_wake_caller(*pf, queue);
                                 } else {
                                     // Top-level frame (e.g. main): set the result.
@@ -921,7 +1394,25 @@ impl<S: LockStrategy> Engine<S> {
                             }
                             if let Some(pf) = parent_box {
                                 let parent_has_caller = pf.caller.is_some();
-                                if parent_has_caller {
+                                // Same async-parent routing as the Completed branch:
+                                // an await-er waits on AsyncJoin, not SubgraphComplete.
+                                let async_id =
+                                    self.async_join_runtime.lock().find_by_child(parent_fid);
+                                if let Some(async_id) = async_id {
+                                    let return_value = Value::NULL;
+                                    self.async_join_runtime
+                                        .lock()
+                                        .set_result(async_id, return_value.clone());
+                                    let woken = self.on_event_arrived(
+                                        RuntimeEvent::AsyncJoin(async_id),
+                                        return_value,
+                                        queue,
+                                    );
+                                    if woken > 0 {
+                                        self.async_join_runtime.lock().remove_entry(async_id);
+                                    }
+                                    self.release_frame(pf);
+                                } else if parent_has_caller {
                                     self.complete_and_wake_caller(*pf, queue);
                                 } else {
                                     *self.result.lock() = Some(Value::NULL);

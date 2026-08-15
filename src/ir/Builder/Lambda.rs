@@ -307,7 +307,16 @@ impl<'a> IrBuilder<'a> {
         // (the lambda is not in the call_graph, so `lookup_memo_strategy` returns None -> the
         // default `compile_expr` path is taken).
         let lambda_name = fn_name.unwrap_or("");
-        let return_node = self.compile_function_body(lambda_name, None, body_expr, params, false, is_async);
+        // Bug #97: tail `expr?` must re-wrap into Ok when the lambda returns Throw.
+        // The lambda's declared `: T` lives in its ExprInfo (a Fn type handle).
+        let fn_returns_throw = lambda_expr_id
+            .and_then(|lid| {
+                let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), lid.0 as u64);
+                self.sema.expr_types.get(&key).map(|info| info.ty)
+            })
+            .map(|t| self.handle_returns_throw(t))
+            .unwrap_or(false);
+        let return_node = self.compile_function_body(lambda_name, None, body_expr, params, false, is_async, fn_returns_throw);
 
         self.current_sg_start = prev_sg_start;
         self.current_effect = prev_effect;

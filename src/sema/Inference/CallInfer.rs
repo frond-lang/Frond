@@ -13,6 +13,32 @@ impl<'a> InferContext<'a> {
     ) -> TypeHandle {
         match &ast.expr(expr).node {
             Expr::Call { callee, args, .. } => {
+                // Scalar type name used as a constructor call (e.g. `u64(x)`): scalar types
+                // have no constructors — the correct spelling is a cast. This must run
+                // FIRST: a scalar type name otherwise infers as a builtin conversion
+                // function type (Fn(scalar) -> scalar), which silently compiles to a
+                // target-less Call node evaluating to void (the `__read_u64_le` bug class).
+                if let Expr::Ident(name) = &ast.expr(*callee).node {
+                    if let Some(tag) = crate::value::ValueTag::from_name(name) {
+                        if tag.is_int() || tag.is_float()
+                            || matches!(tag, crate::value::ValueTag::Bool | crate::value::ValueTag::Char)
+                        {
+                            let span = ast.expr(expr).span;
+                            self.add_error_at(
+                                &format!(
+                                    "'{}' is a scalar type and has no constructor; use 'x as {}' for conversion",
+                                    name, name
+                                ),
+                                span.line,
+                                span.column,
+                            );
+                            for &a in args.iter() {
+                                let _ = self.infer_expr(a, ast, env, None);
+                            }
+                            return self.arena.make(Type::Unknown);
+                        }
+                    }
+                }
                 // ── Constructor multi-mapping disambiguation ──
                 // When callee is an Ident that maps to multiple same-named constructors, disambiguate by priority:
                 //   1. Type-oriented: when expected_ty is an Adt, select by type_name
@@ -224,6 +250,7 @@ impl<'a> InferContext<'a> {
                     return return_type;
                 }
                 // Fallback: infer all arguments and unify the callee with (args -> ret).
+                // (Scalar-name constructors are rejected at the top of this arm.)
                 let ret_ty = self.arena.fresh_type_var();
                 let arg_types: Vec<TypeHandle> = args
                     .iter()
@@ -251,6 +278,47 @@ impl<'a> InferContext<'a> {
         match &ast.expr(expr).node {
             Expr::MethodCall { recv, method, args, .. }
             | Expr::SafeMethodCall { recv, method, args, .. } => {
+                // super.method(args): static dispatch to the bound trait-default
+                // layer of the enclosing type. Must be handled before anything
+                // that infers the receiver (`super` is not a value and resolves
+                // in no environment).
+                if let Expr::Ident("super") = &ast.expr(*recv).node {
+                    return self.infer_super_method_call(expr, ast, env, expected, method, args);
+                }
+                // Lib.open(path) / Lib.embed(path): builtin native-library constructors.
+                // The receiver `Lib` is a type name, not a value, so this must run
+                // BEFORE receiver inference. A local binding named `Lib` shadows it.
+                if let Expr::Ident("Lib") = &ast.expr(*recv).node {
+                    let shadowed = self
+                        .env
+                        .lookup_with_pred(env, "Lib", |_| true)
+                        .is_some();
+                    if !shadowed && (*method == "open" || *method == "embed") {
+                        let span = ast.expr(expr).span;
+                        if args.len() != 1 {
+                            self.add_error_at(
+                                &format!("Lib.{} takes exactly 1 argument (path: str), got {}", method, args.len()),
+                                span.line,
+                                span.column,
+                            );
+                            return self.arena.fresh_type_var();
+                        }
+                        let str_ty = self.make_builtin(Type::Str);
+                        let arg_ty = self.infer_expr(args[0], ast, env, Some(str_ty));
+                        self.unify_or_constrain(str_ty, arg_ty);
+                        let lib_ty = self.make_builtin(Type::Lib);
+                        let err_ty = self.ffi_error_ty();
+                        let ret = self.arena.make_throw(lib_ty, err_ty);
+                        // Mark recv as module-func-recv (IR compilation skips the recv node).
+                        let recv_key = crate::sema::Sema::module_expr_key(
+                            &self.current_module_name,
+                            recv.0 as u64,
+                        );
+                        self.sema_result.module_func_recv_exprs.insert(recv_key);
+                        return ret;
+                    }
+                }
+
                 // Qualified-name syntax: Type.Ctor(args) (qualified call of a constructor with arguments)
                 if let Expr::Ident(type_name) = &ast.expr(*recv).node {
                     if let Some((ctor_type_name, field_type_reprs)) =
@@ -426,7 +494,7 @@ impl<'a> InferContext<'a> {
 
                 // Path 0 (fallback): look up a binding named after the method as an Fn type in env (free function with a self parameter).
                 // Use lookup_with_pred to skip same-named non-function bindings (e.g. a local variable shadowing a free function).
-                // In Kuzo `recv.method(args)` is sugar for `method(recv, args)`.
+                // In Frond `recv.method(args)` is sugar for `method(recv, args)`.
                 if let Some(fn_ty) = self.env.lookup_with_pred(env, method, |ty| {
                     let r = self.arena.resolve(ty);
                     matches!(self.arena.get(r), Type::Fn(_))
@@ -468,6 +536,42 @@ impl<'a> InferContext<'a> {
                         let _ = self.infer_expr(a, ast, env, None);
                     }
                     return ret_ty;
+                }
+
+                // Lib / ForeignFn builtin methods (structural, reflect-style):
+                // lookup/has_symbol/close on `Lib`; call (any arity) on `ForeignFn[R]`.
+                // Pairs with Builder::lib_method_intrinsic — the call type-checks here
+                // and lowers to a CF_LIB_* / CF_FFN_CALL compute_fn at IR build time.
+                {
+                    let recv_resolved_l = self.arena.resolve(recv_ty);
+                    let recv_ct = self.arena.get(recv_resolved_l);
+                    let needs_lib_dispatch = matches!(recv_ct, Type::Lib)
+                        || (matches!(recv_ct, Type::ForeignFn(_)) && *method == "call");
+                    if needs_lib_dispatch {
+                        for &a in args.iter() {
+                            let _ = self.infer_expr(a, ast, env, None);
+                        }
+                        let ret_ty = self.lib_method_return_type(
+                            recv_ct,
+                            recv_resolved_l,
+                            method,
+                            args.len(),
+                            expected,
+                        );
+                        return match ret_ty {
+                            Some(t) => t,
+                            None => {
+                                // Wrong arity for the recognized Lib method.
+                                let span = ast.expr(expr).span;
+                                self.add_error_at(
+                                    &format!("bad Lib method call '{}': lookup takes (name: str, args: str); has_symbol takes (name: str); close takes no args", method),
+                                    span.line,
+                                    span.column,
+                                );
+                                self.arena.fresh_type_var()
+                            }
+                        };
+                    }
                 }
 
                 // Fallback: infer arguments and return a fresh var.
@@ -591,6 +695,173 @@ impl<'a> InferContext<'a> {
     }
 
     /// Looks up the method signature for an object type (returns a function type whose first parameter is self).
+    /// Infer `super.method(args)` — static dispatch to the bound trait-default
+    /// implementation of the enclosing type.
+    ///
+    /// `super` is a layer view of `this`, not a value: the call resolves to the
+    /// trait default that `method` is bound to on the enclosing type (explicit
+    /// delegate `= A.m` or unique provider), bypassing the type's own override.
+    /// The resolved `(trait_idx, method_idx)` is recorded into
+    /// `sema_result.super_dispatches` for the IR builder, and the
+    /// (type, trait, method) triple into `super_targets` so the monomorph phase
+    /// generates the specialized default subgraph even for overriding types.
+    fn infer_super_method_call(
+        &mut self,
+        expr: ExprId,
+        ast: &AstArena<'_>,
+        env: EnvId,
+        expected: Option<TypeHandle>,
+        method: &str,
+        args: &[ExprId],
+    ) -> TypeHandle {
+        use crate::sema::Sema::MethodBinding;
+        let span = ast.expr(expr).span;
+
+        // Inside a trait default method, `super` would mean the parent trait's
+        // default — trait parents are not implemented yet.
+        if self.current_trait_name.is_some() {
+            self.add_error_at(
+                "super is not allowed inside a trait default method (trait parents are not implemented yet)",
+                span.line,
+                span.column,
+            );
+            return self.arena.fresh_type_var();
+        }
+        let traits: Vec<Box<str>> = match self.current_type_decl_traits.clone() {
+            Some(t) => t,
+            None => {
+                self.add_error_at(
+                    "super is only valid inside a type method",
+                    span.line,
+                    span.column,
+                );
+                return self.arena.fresh_type_var();
+            }
+        };
+        // The enclosing type's name (from the pushed `this` type) — needed to
+        // consult the declared methods' delegate annotations.
+        let type_name: Box<str> = self
+            .current_this_type()
+            .and_then(|t| {
+                let r = self.arena.resolve(t);
+                match self.arena.get(r) {
+                    Type::Adt(_) => {
+                        let (n, _) = self.arena.adt_parts(r);
+                        Some(n.into())
+                    }
+                    _ => None,
+                }
+            })
+            .unwrap_or_default();
+        if type_name.is_empty() {
+            self.add_error_at(
+                "super: the enclosing type could not be determined",
+                span.line,
+                span.column,
+            );
+            return self.arena.fresh_type_var();
+        }
+
+        let binding = self
+            .sema_result
+            .resolve_method_binding(&traits, &type_name, method);
+        let trait_name: Box<str> = match binding {
+            MethodBinding::Bound { trait_name, .. } => trait_name,
+            MethodBinding::Ambiguous(list) => {
+                self.add_error_at(
+                    &format!(
+                        "ambiguous super: '{}' has default implementations from [{}]; bind it explicitly on the method ('... = Trait.{}')",
+                        method,
+                        list.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(", "),
+                        method,
+                    ),
+                    span.line,
+                    span.column,
+                );
+                return self.arena.fresh_type_var();
+            }
+            MethodBinding::Unbound => {
+                self.add_error_at(
+                    &format!(
+                        "no trait default '{}' is available via super on type '{}'",
+                        method, type_name
+                    ),
+                    span.line,
+                    span.column,
+                );
+                return self.arena.fresh_type_var();
+            }
+        };
+
+        // Trait method signature (position + shape) for type-checking the call.
+        let trait_idx = self.sema_result.trait_def_index.get(trait_name.as_ref()).copied();
+        let sig = self.sema_result.get_trait_def(trait_name.as_ref()).and_then(|td| {
+            td.methods
+                .iter()
+                .enumerate()
+                .find(|(_, m)| m.name.as_ref() == method)
+                .map(|(i, m)| (i as u16, m.param_count, m.return_type, m.has_body))
+        });
+        let (trait_idx, method_idx, param_count, return_type, has_body) =
+            match (trait_idx, sig) {
+                (Some(t), Some((mi, pc, rt, hb))) => (t, mi, pc, rt, hb),
+                _ => {
+                    self.add_error_at(
+                        &format!(
+                            "super: trait '{}' or its method '{}' could not be resolved",
+                            trait_name, method
+                        ),
+                        span.line,
+                        span.column,
+                    );
+                    return self.arena.fresh_type_var();
+                }
+            };
+        if !has_body {
+            self.add_error_at(
+                &format!(
+                    "super: trait '{}' method '{}' has no default body to call",
+                    trait_name, method
+                ),
+                span.line,
+                span.column,
+            );
+            return self.arena.fresh_type_var();
+        }
+
+        // Build the callable type (mirror of the trait-typed receiver path):
+        // params[0] is `this`; the remaining parameters are inferred from args.
+        let this_ty = self.current_this_type().unwrap_or_else(|| self.arena.fresh_type_var());
+        let params: Vec<TypeHandle> = (0..param_count)
+            .map(|i| if i == 0 { this_ty } else { self.arena.fresh_type_var() })
+            .collect();
+        let fn_ty = self.arena.make_fn(params.into_boxed_slice(), return_type);
+        let inst_fn = self.instantiate_fn_type(fn_ty);
+        if let Type::Fn(_) = self.arena.get(inst_fn) {
+            let (param_types, ret_ty) = self.arena.fn_parts(inst_fn);
+            let param_types: Vec<TypeHandle> = param_types.to_vec();
+            let n = param_types.len().min(args.len() + 1);
+            for i in 1..n {
+                let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(param_types[i]));
+                self.unify_or_constrain(param_types[i], arg_ty);
+            }
+            if let Some(exp) = expected {
+                self.unify_or_constrain(ret_ty, exp);
+            }
+            // Record the static dispatch target for the IR builder and mark the
+            // (type, trait, method) triple as needing a default subgraph.
+            let key = module_expr_key(&self.current_module_name, expr.0 as u64);
+            self.sema_result.super_dispatches.insert(key, (trait_idx, method_idx));
+            self.sema_result.super_targets.insert((
+                type_name.clone(),
+                trait_name.clone(),
+                method.into(),
+            ));
+            return ret_ty;
+        }
+        self.arena.fresh_type_var()
+    }
+
     pub(super) fn lookup_method_type(
         &mut self,
         recv_ty: TypeHandle,

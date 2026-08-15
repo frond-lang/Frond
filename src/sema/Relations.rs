@@ -11,7 +11,7 @@ use crate::ast::Ast::{AstArena, MethodDecl, TypeNode, TypeRef as AstTypeRef};
 // phase5: subtype_check — subtype relation judgment
 //
 // Rust port of `src/sema/subtype_check.zig`.
-// Determines subtype relations between the various types in the Kuzo
+// Determines subtype relations between the various types in the Frond
 // language: null/nullable, record structural subtyping, ADT error subtyping,
 // Throw subtyping, trait structural subtyping.
 // =========================================================================
@@ -114,6 +114,9 @@ pub fn types_equal(arena: &TypeArena, a: TypeHandle, b: TypeHandle) -> bool {
         }
         (Type::Receiver(_), Type::Receiver(_)) => {
             types_equal(arena, arena.receiver_elem(ra), arena.receiver_elem(rb))
+        }
+        (Type::ForeignFn(_), Type::ForeignFn(_)) => {
+            types_equal(arena, arena.foreign_fn_ret(ra), arena.foreign_fn_ret(rb))
         }
         (Type::Trait(_), Type::Trait(_)) => {
             let (na, ta) = arena.trait_parts(ra);

@@ -256,7 +256,7 @@ impl<'a> InferContext<'a> {
             Type::Throw(_) => {
                 let (value_type, error_type) = self.arena.throw_parts(resolved_inner);
                 // Unify error_type with the enclosing function's error_type (when the outer function is a throwing one).
-                // Kuzo allows `?` in non-throwing functions (panics/exits on failure); in that case error_type is not propagated.
+                // Frond allows `?` in non-throwing functions (panics/exits on failure); in that case error_type is not propagated.
                 if let Some(er) = expected_return {
                     let er_resolved = self.arena.resolve(er);
                     let er_ty = self.arena.get(er_resolved);
@@ -292,7 +292,7 @@ impl<'a> InferContext<'a> {
     }
 
     /// Checks the expression type of a throw statement.
-    /// Kuzo has no try-catch; throw is a general-purpose raising mechanism that accepts any ADT/Record/Throw/TypeVar.
+    /// Frond has no try-catch; throw is a general-purpose raising mechanism that accepts any ADT/Record/Throw/TypeVar.
     pub fn check_throw_stmt(&mut self, thrown_ty: TypeHandle, _line: u32, _column: u32) {
         let resolved = self.arena.resolve(thrown_ty);
         let ct = self.arena.get(resolved);

@@ -171,6 +171,11 @@ impl<'a> InferContext<'a> {
                 let new_elem = self.substitute_type(elem, subst);
                 self.arena.make_receiver(new_elem)
             }
+            Type::ForeignFn(_) => {
+                let ret = self.arena.foreign_fn_ret(resolved);
+                let new_ret = self.substitute_type(ret, subst);
+                self.arena.make_foreign_fn(new_ret)
+            }
             // Scalars, Never, Unknown, Void, Null, TraitObject, ModuleRef, Timer have no sub-nodes → return as-is.
             _ => resolved,
         }

@@ -7,7 +7,7 @@ use crate::engine::EngineRef;
 use super::Manifest::{load_manifest, opt_level_from};
 use super::Pipeline::run_from_project;
 
-/// `kuzo run` overloaded entry:
+/// `frond run` overloaded entry:
 /// - No args: compile + execute immediately within a project (like cargo run).
 /// - With args <file.kzo>: execute the specified artifact (.kzo load).
 pub fn cmd_run(file: Option<String>, opt_level_cli: Option<u8>) {
@@ -27,7 +27,7 @@ fn run_from_kzo(path: &str) {
     // Validate file extension
     if !path.ends_with(".kzo") {
         eprintln!("error: expected .kzo file, got: {}", path);
-        eprintln!("  hint: run `kuzo build` first to compile, then `kuzo run out/<name>.kzo`");
+        eprintln!("  hint: run `frond build` first to compile, then `frond run out/<name>.kzo`");
         process::exit(1);
     }
     if !std::path::Path::new(path).exists() {

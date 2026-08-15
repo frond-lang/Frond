@@ -1,17 +1,17 @@
-// Kuzo basic type ↔ C type mapping table (single source of truth).
+// Frond basic type ↔ C type mapping table (single source of truth).
 //
 // This file is pure data + lookup functions, with **no `crate::` dependency**, so it
 // can be reused from two places:
 //  - lib crate: `crate::types::Ctype` (via `pub mod Ctype`)
 //  - build.rs: `include!` inline (build-time text extraction path)
 //
-// Gen.rs's `KUZO_TYPE_MAP` / `c_type_to_rust` and other FFI mappings derive from
-// this table, avoiding the Kuzo→C type correspondence being scattered across
+// Gen.rs's `FROND_TYPE_MAP` / `c_type_to_rust` and other FFI mappings derive from
+// this table, avoiding the Frond→C type correspondence being scattered across
 // multiple places.
 
-// ============ Kuzo type → C type ============
+// ============ Frond type → C type ============
 
-/// Kuzo basic type → C type mapping table.
+/// Frond basic type → C type mapping table.
 ///
 /// Covers:
 ///  - scalar integers: i8..i128, u8..u128, isize, usize
@@ -27,7 +27,7 @@
 /// argument position; this table gives "the corresponding C type name for that type",
 /// and the concrete passing strategy at the FFI layer is decided by Gen.rs's
 /// `CParamKind`.
-pub const KUZO_TO_C_TYPE: &[(&str, &str)] = &[
+pub const TO_C_TYPE: &[(&str, &str)] = &[
     // ── scalar integers ──
     ("i8",    "int8_t"),
     ("i16",   "int16_t"),
@@ -65,14 +65,14 @@ pub const KUZO_TO_C_TYPE: &[(&str, &str)] = &[
     ("*void", "void*"),
 ];
 
-/// Kuzo type name → C type name lookup.
+/// Frond type name → C type name lookup.
 ///
 /// Returns `None` to indicate that the type has no direct C counterpart (e.g. a
 /// user-defined type).
 #[inline]
-pub fn kuzo_to_c_type(kuzo_name: &str) -> Option<&'static str> {
-    KUZO_TO_C_TYPE
+pub fn to_c_type(name: &str) -> Option<&'static str> {
+    TO_C_TYPE
         .iter()
-        .find(|(n, _)| *n == kuzo_name)
+        .find(|(n, _)| *n == name)
         .map(|(_, c)| *c)
 }

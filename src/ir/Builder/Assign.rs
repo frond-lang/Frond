@@ -104,6 +104,10 @@ impl<'a> IrBuilder<'a> {
                         compute_fn: CF_RECORD_FIELD_SET,
                     });
                     self.graph.set_field_set_name(set_node, field.to_string());
+                    // Bug #99: chain the field set into the effect order so later reads
+                    // of the field in the same method execute after the write (e.g. the
+                    // exponent `if` reading `pos` after the fraction loop advanced it).
+                    self.current_effect = Some(self.chain_effects(self.current_effect, set_node));
                     return self.compile_void_const();
                 }
                 let captured_source = self.captured_scopes.iter().rev()

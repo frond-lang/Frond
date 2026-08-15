@@ -234,6 +234,23 @@ impl<S: LockStrategy> EventSource<S> for AsyncJoinSource {
         engine: &Engine<S>,
         pending: &crate::ir::Ir::PendingAwait,
     ) -> (RuntimeEvent, Option<Value>) {
+        // Inline-sync completion fast path: when the awaited callee has no
+        // suspension point, it runs to completion inline and the call node's
+        // value is already the RESULT (e.g. a ThrowVal), not an AsyncHandle.
+        // Awaiting it must resolve immediately — reading it as a handle id
+        // would wait forever on an id that was never registered (the
+        // sync-fn-with-async-defer hang). Sema guarantees `await` only applies
+        // to Async<T> values, whose runtime representation is an i32 handle,
+        // so "not an i32 scalar" reliably means "already the result".
+        if !matches!(
+            pending.event_obj,
+            crate::value::Value::Scalar(_, crate::value::ValueTag::I32)
+        ) {
+            return (
+                RuntimeEvent::AsyncJoin(crate::ir::Ir::AsyncHandleId(u32::MAX)),
+                Some(pending.event_obj.clone()),
+            );
+        }
         let async_id = crate::ir::Ir::AsyncHandleId(pending.event_obj.as_i32() as u32);
         let event = RuntimeEvent::AsyncJoin(async_id);
         // try_get_result is a consuming read: if the result is ready it removes the entry and
@@ -365,7 +382,7 @@ impl<S: LockStrategy> Engine<S> {
         } else {
             // Ordinary await frame: inject the event value into the await node.
             let consumer_count =
-                self.graph.downstream_slice(await_graph_id.0 as usize).len() as u16;
+                self.graph.downstream_count(await_graph_id.0 as usize);
             frame.set_value(await_node, value, consumer_count);
             frame.state = FrameState::Ready;
             frame.suspend_state = SuspendState::NotSuspended;

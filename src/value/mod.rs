@@ -1,5 +1,5 @@
 #![allow(non_snake_case)]
-//! value — Kuzo unified value system
+//! value — Frond unified value system
 //!
 //! Split into five submodules:
 //! - `Value`: value representation layer (scalar primitive types + heap object types)

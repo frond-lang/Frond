@@ -16,6 +16,8 @@ pub const NAME_ATOMIC: &str = "Atomic";
 pub const NAME_SENDER: &str = "Sender";
 pub const NAME_RECEIVER: &str = "Receiver";
 pub const NAME_TIMER: &str = "Timer";
+pub const NAME_LIB: &str = "Lib";
+pub const NAME_FOREIGN_FN: &str = "ForeignFn";
 
 /// Mapping from builtin generic type name → Type variant.
 /// All string-based type resolution for generics should go through this table.
@@ -28,12 +30,13 @@ pub const BUILTIN_GENERIC_TABLE: &[(&str, TypeKind)] = &[
     (NAME_SENDER, TypeKind::Sender),
     (NAME_RECEIVER, TypeKind::Receiver),
     (NAME_TIMER, TypeKind::Timer),
+    (NAME_FOREIGN_FN, TypeKind::ForeignFn),
 ];
 
 /// The kind of a builtin generic type (used for name→variant mapping).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeKind {
-    Throw, Channel, Async, Lazy, Atomic, Sender, Receiver, Timer,
+    Throw, Channel, Async, Lazy, Atomic, Sender, Receiver, Timer, ForeignFn,
 }
 
 impl TypeKind {
@@ -47,11 +50,12 @@ impl TypeKind {
             TypeKind::Sender => Type::Sender(detail),
             TypeKind::Receiver => Type::Receiver(detail),
             TypeKind::Timer => Type::Timer(detail),
+            TypeKind::ForeignFn => Type::ForeignFn(detail),
         }
     }
 }
 
-/// The unified type representation for Kuzo.
+/// The unified type representation for Frond.
 ///
 /// **Single source of types**: both the sema and IR layers use `Type`; there is no longer
 /// a `ConcreteType`.
@@ -77,12 +81,15 @@ pub enum Type {
     Isize, Usize,
     F16, F32, F64, F128,
 
-    // -- Basic: 3 non-scalar builtins (no payload) --
+    // -- Basic: 4 non-scalar builtins (no payload) --
     Str,    // fat pointer
     Null,   // no value
     Void,   // no type
+    /// `Lib` — opaque builtin handle over a dynamically loaded native library.
+    /// Unit variant: all identity lives in the runtime HeapObj; `==` suffices.
+    Lib,
 
-    // -- Basic: 7 builtin generics (DetailId indexes subtype structure in the arena) --
+    // -- Basic: 8 builtin generics (DetailId indexes subtype structure in the arena) --
     /// `Throw<V, E>` (arena stores `{ value: TypeHandle, error: TypeHandle }`).
     Throw(DetailId),
     /// `Channel<T>` (arena stores `{ elem: TypeHandle }`).
@@ -97,6 +104,9 @@ pub enum Type {
     Sender(DetailId),
     /// `Receiver<T>` (arena stores `{ elem: TypeHandle }`).
     Receiver(DetailId),
+    /// `ForeignFn<R>` (arena stores `{ ret: TypeHandle }`) — resolved native symbol;
+    /// `call` returns `R`. Constructor: `Lib.lookup` only.
+    ForeignFn(DetailId),
     /// Timer (used for event-source dispatch; a user-defined type with builtin event-source semantics).
     Timer(DetailId),
 
@@ -159,6 +169,7 @@ impl Type {
             Type::Str => TypeFamily::Str,
             Type::Null => TypeFamily::Null,
             Type::Void => TypeFamily::Void,
+            Type::Lib => TypeFamily::Lib,
             Type::Throw(_) => TypeFamily::Throw,
             Type::Channel(_) => TypeFamily::Channel,
             Type::Async(_) => TypeFamily::Async,
@@ -166,6 +177,7 @@ impl Type {
             Type::Atomic(_) => TypeFamily::Atomic,
             Type::Sender(_) => TypeFamily::Sender,
             Type::Receiver(_) => TypeFamily::Receiver,
+            Type::ForeignFn(_) => TypeFamily::ForeignFn,
             Type::Timer(_) => TypeFamily::Timer,
             Type::Array(_) => TypeFamily::Array,
             Type::Ref(_) => TypeFamily::Ref,
@@ -211,12 +223,14 @@ impl Type {
     pub fn is_builtin_generic(&self) -> bool {
         matches!(self.family(),
             TypeFamily::Throw | TypeFamily::Channel | TypeFamily::Async
-            | TypeFamily::Lazy | TypeFamily::Atomic | TypeFamily::Sender | TypeFamily::Receiver)
+            | TypeFamily::Lazy | TypeFamily::Atomic | TypeFamily::Sender | TypeFamily::Receiver
+            | TypeFamily::ForeignFn)
     }
     #[inline]
     pub fn is_builtin(&self) -> bool {
         self.is_scalar() || matches!(self.family(),
-            TypeFamily::Str | TypeFamily::Null | TypeFamily::Void) || self.is_builtin_generic()
+            TypeFamily::Str | TypeFamily::Null | TypeFamily::Void | TypeFamily::Lib)
+            || self.is_builtin_generic()
     }
 
     /// Whether this variant is a payload-less unit for which `==` equality is
@@ -232,7 +246,7 @@ impl Type {
             | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
             | Type::Isize | Type::Usize
             | Type::F16 | Type::F32 | Type::F64 | Type::F128
-            | Type::Str | Type::Null | Type::Void
+            | Type::Str | Type::Null | Type::Void | Type::Lib
             | Type::Never | Type::Unknown
         )
     }
@@ -305,6 +319,7 @@ impl Type {
             Type::F16 => "f16", Type::F32 => "f32", Type::F64 => "f64", Type::F128 => "f128",
             Type::Bool => "bool", Type::Char => "char",
             Type::Str => "str", Type::Null => "null", Type::Void => "void",
+            Type::Lib => "Lib",
             Type::Throw(_) => "Throw",
             Type::Channel(_) => "Channel",
             Type::Async(_) => "Async",
@@ -312,6 +327,7 @@ impl Type {
             Type::Atomic(_) => "Atomic",
             Type::Sender(_) => "Sender",
             Type::Receiver(_) => "Receiver",
+            Type::ForeignFn(_) => "ForeignFn",
             Type::Timer(_) => "Timer",
             Type::Array(_) => "array",
             Type::Ref(_) => "ref",
@@ -355,6 +371,7 @@ impl Type {
         matches!(self,
             Type::Throw(_) | Type::Channel(_) | Type::Async(_) | Type::Lazy(_)
             | Type::Atomic(_) | Type::Sender(_) | Type::Receiver(_) | Type::Timer(_)
+            | Type::ForeignFn(_)
             | Type::Array(_) | Type::Ref(_) | Type::Fn(_) | Type::Nullable(_)
             | Type::Adt(_) | Type::Record(_) | Type::Trait(_)
             | Type::TraitObject(_) | Type::ModuleRef(_) | Type::Generic(_))
@@ -368,6 +385,10 @@ impl Type {
         // Builtin scalars + str + null + void.
         if let Some(info) = builtin_info_by_name(name) {
             return Some(info.value_tag.into());
+        }
+        // Opaque nongeneric builtins.
+        if name == NAME_LIB {
+            return Some(Type::Lib);
         }
         // Bare builtin generic names (both "Async" and "Async<i32>" are recognized as Type::Async).
         // DetailId uses DetailId(u32::MAX) as a placeholder (family() does not read the payload,
@@ -459,6 +480,8 @@ pub enum TypeDetail {
     Sender { elem: TypeHandle },
     /// `Type::Receiver`: `Receiver<T>`.
     Receiver { elem: TypeHandle },
+    /// `Type::ForeignFn`: `ForeignFn<R>` — the return type of `call`.
+    ForeignFn { ret: TypeHandle },
     /// `Type::Array`: `[T; N]`; `size == None` denotes a slice.
     Array { elem: TypeHandle, size: Option<u64> },
     /// `Type::Ref`: `&T` / `*T`.

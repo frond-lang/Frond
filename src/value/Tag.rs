@@ -138,7 +138,7 @@ impl ValueTag {
 // TypeFamily — family classification for all types (replaces string-based family).
 // =========================================================================
 
-/// Family classification for all Kuzo types.
+/// Family classification for all Frond types.
 ///
 /// Replaces the previous fragmented checks:
 /// - `Ir.rs`'s `family: &'static str` (scalars only: "i32"/"i64"/"i128"/"float"/"bool")
@@ -174,6 +174,8 @@ pub enum TypeFamily {
 
     // -- Non-scalar builtins --
     Str, Null, Void,
+    /// `Lib` — opaque builtin handle over a dynamically loaded native library.
+    Lib,
 
     // -- Builtin generics (replace starts_with / name-based special cases) --
     /// `Throw<V, E>` (dispatched via is_ok).
@@ -190,6 +192,8 @@ pub enum TypeFamily {
     Sender,
     /// `Receiver<T>`.
     Receiver,
+    /// `ForeignFn<R>` — resolved native symbol whose `call` returns `R`.
+    ForeignFn,
     /// Timer (used for event-source dispatch; a user-defined type with builtin event-source semantics).
     Timer,
 

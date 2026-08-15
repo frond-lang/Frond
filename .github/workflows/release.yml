@@ -20,31 +20,31 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: kuzo
+            artifact: frond
             archive: tar.gz
             cc: clang
             cxx: clang++
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            artifact: kuzo
+            artifact: frond
             archive: tar.gz
             cc: clang
             cxx: clang++
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: kuzo
+            artifact: frond
             archive: tar.gz
             cc: clang
             cxx: clang++
           - os: macos-13
             target: x86_64-apple-darwin
-            artifact: kuzo
+            artifact: frond
             archive: tar.gz
             cc: clang
             cxx: clang++
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: kuzo.exe
+            artifact: frond.exe
             archive: zip
             cc: cl
             cxx: cl
@@ -100,20 +100,20 @@ jobs:
         if: matrix.archive == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../kuzo-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          tar czf ../../../frond-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
 
       - name: Package (windows)
         if: matrix.archive == 'zip'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../kuzo-${{ matrix.target }}.zip ${{ matrix.artifact }}
+          7z a ../../../frond-${{ matrix.target }}.zip ${{ matrix.artifact }}
 
       - name: Generate checksum
         run: |
           if [ "${{ matrix.archive }}" = "tar.gz" ]; then
-            shasum -a 256 kuzo-${{ matrix.target }}.tar.gz > kuzo-${{ matrix.target }}.tar.gz.sha256
+            shasum -a 256 frond-${{ matrix.target }}.tar.gz > frond-${{ matrix.target }}.tar.gz.sha256
           else
-            sha256sum kuzo-${{ matrix.target }}.zip > kuzo-${{ matrix.target }}.zip.sha256
+            sha256sum frond-${{ matrix.target }}.zip > frond-${{ matrix.target }}.zip.sha256
           fi
         shell: bash
 
@@ -138,4 +138,4 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
           files: |
-            kuzo-${{ matrix.target }}.*
+            frond-${{ matrix.target }}.*

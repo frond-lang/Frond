@@ -19,6 +19,7 @@ impl<'a> InferContext<'a> {
             "Atomic" if args.len() == 1 => self.arena.make_atomic(args[0]),
             "Sender" if args.len() == 1 => self.arena.make_sender(args[0]),
             "Receiver" if args.len() == 1 => self.arena.make_receiver(args[0]),
+            "ForeignFn" if args.len() == 1 => self.arena.make_foreign_fn(args[0]),
             _ => self.arena.make_generic(name, args),
         }
     }
@@ -187,6 +188,55 @@ impl<'a> InferContext<'a> {
         None
     }
 
+    /// Return type for a `Lib` / `ForeignFn` builtin method, or `None` if
+    /// (recv_ty, method) is not a Lib-family method call. This pairs with
+    /// `ir/Builder` structural lowering and `ir/Compute.rs` compute_lib_* /
+    /// compute_ffn_call (the runtime).
+    ///
+    /// `lookup`'s `R` is a FRESH TYPE VAR: the method-call path does not
+    /// propagate expected types, so R is solved either by the caller unifying
+    /// `expected` (when present) or downstream — the `Ok(f)` pattern binding
+    /// plus a `val f: ForeignFn<u64>` annotation, or a use of `f.call`'s
+    /// result. The IR layer reads the solved R at build time
+    /// (lib_lookup_ret_tag).
+    pub(super) fn lib_method_return_type(
+        &mut self,
+        recv_ty: Type,
+        recv_handle: TypeHandle,
+        method: &str,
+        arg_count: usize,
+        expected: Option<TypeHandle>,
+    ) -> Option<TypeHandle> {
+        match (recv_ty, method) {
+            (Type::Lib, "lookup") if arg_count == 2 => {
+                let r = self.arena.fresh_type_var();
+                let ff = self.arena.make_foreign_fn(r);
+                let err = self.ffi_error_ty();
+                let ret = self.arena.make_throw(ff, err);
+                if let Some(exp) = expected {
+                    self.unify_or_constrain(ret, exp);
+                }
+                Some(ret)
+            }
+            (Type::Lib, "has_symbol") if arg_count == 1 => Some(self.make_builtin(Type::Bool)),
+            (Type::Lib, "close") if arg_count == 0 => Some(self.make_builtin(Type::Void)),
+            (Type::ForeignFn(_), "call") => {
+                // Any arity ≥ 0; the return type is the receiver's R.
+                let ret = self.arena.foreign_fn_ret(recv_handle);
+                let err = self.ffi_error_ty();
+                Some(self.arena.make_throw(ret, err))
+            }
+            _ => None,
+        }
+    }
+
+    /// The `FfiError` type as seen from the Lib builtin methods. Declared in
+    /// `builtin/error/FfiError.kz`; resolved by name here (Adt unify is
+    /// name-based, so this handle interops with the declared one).
+    pub(super) fn ffi_error_ty(&mut self) -> TypeHandle {
+        self.arena.make_adt("FfiError".into(), Box::new([]))
+    }
+
     /// Integer suffix → corresponding integer TypeHandle (derived from `BUILTIN_TABLE`; returns `None` on miss).
     pub(super) fn int_suffix_to_type(&mut self, suffix: &str) -> Option<TypeHandle> {
         let tag = crate::types::ValueTag::from_name(suffix)?;
@@ -341,3 +391,112 @@ pub(super) fn numeric_builtin_names() -> Vec<(&'static str, Type)> {
         .collect()
 }
 
+
+// ── Missing return value check (Bug: non-void function with no tail expression) ──
+
+/// A `return value` or `throw` anywhere in the function body (outside nested
+/// lambdas/defer bodies) means the body may exit with a value. An unconditional
+/// `loop { ... }` that contains no `break` never exits normally (diverging),
+/// which also satisfies "the function cannot fall off the end".
+fn body_stmt_has_exit(ast: &AstArena<'_>, stmt: StmtId) -> bool {
+    match &ast.stmt(stmt).node {
+        Stmt::Return { value } => value.is_some(),
+        Stmt::Throw { .. } => true,
+        // A nested function's returns belong to it, not the enclosing function.
+        Stmt::LocalDecl { .. } => false,
+        Stmt::Defer { .. } => false,
+        Stmt::Loop { body } => {
+            body_expr_has_exit(ast, *body) || !stmt_tree_has_break(ast, *body)
+        }
+        Stmt::For { body, .. } | Stmt::While { body, .. } => body_expr_has_exit(ast, *body),
+        Stmt::Expression { expr } => body_expr_has_exit(ast, *expr),
+        _ => false,
+    }
+}
+
+fn body_expr_has_exit(ast: &AstArena<'_>, expr: ExprId) -> bool {
+    match &ast.expr(expr).node {
+        // Stop at lambda boundaries: their returns/throws are their own.
+        Expr::Lambda { .. } => false,
+        Expr::Block { stmts, trailing } => {
+            stmts.iter().any(|s| body_stmt_has_exit(ast, *s))
+                || trailing.map(|t| body_expr_has_exit(ast, t)).unwrap_or(false)
+        }
+        Expr::If { then_branch, else_branch, .. } => {
+            body_expr_has_exit(ast, *then_branch)
+                || else_branch.map(|e| body_expr_has_exit(ast, e)).unwrap_or(false)
+        }
+        Expr::Match { arms, .. } => arms.iter()
+            .any(|arm| body_expr_has_exit(ast, arm.body)),
+        _ => false,
+    }
+}
+
+fn stmt_tree_has_break(ast: &AstArena<'_>, expr: ExprId) -> bool {
+    match &ast.expr(expr).node {
+        Expr::Lambda { .. } => false,
+        Expr::Block { stmts, trailing } => {
+            stmts.iter().any(|s| match &ast.stmt(*s).node {
+                Stmt::Break => true,
+                Stmt::Expression { expr } => stmt_tree_has_break(ast, *expr),
+                Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::Loop { body } =>
+                    stmt_tree_has_break(ast, *body),
+                _ => false,
+            }) || trailing.map(|t| stmt_tree_has_break(ast, t)).unwrap_or(false)
+        }
+        Expr::If { then_branch, else_branch, .. } => {
+            stmt_tree_has_break(ast, *then_branch)
+                || else_branch.map(|e| stmt_tree_has_break(ast, e)).unwrap_or(false)
+        }
+        Expr::Match { arms, .. } => arms.iter()
+            .any(|arm| stmt_tree_has_break(ast, arm.body)),
+        _ => false,
+    }
+}
+
+impl<'a> InferContext<'a> {
+    /// Rejects a function/lambda whose declared return type is non-void but whose
+    /// body is a block with no trailing expression and no `return value`/`throw`
+    /// statement. Such a body previously compiled silently and returned garbage
+    /// at runtime (e.g. an i32 function returning `2.71875f16`, or a str function
+    /// leaking `Ok(void)`).
+    pub(super) fn check_missing_return_value(
+        &mut self,
+        what: &str,
+        ret_ty: TypeHandle,
+        body: ExprId,
+        ast: &AstArena<'_>,
+        line: u32,
+        column: u32,
+    ) {
+        // Async<X> carries X as its produced value: Async<void> needs no value.
+        let mut ret_ty = ret_ty;
+        loop {
+            let resolved = self.arena.resolve(ret_ty);
+            match self.arena.get(resolved) {
+                Type::Void => return,
+                Type::Async(_) => ret_ty = self.arena.async_value(resolved),
+                _ => break,
+            }
+        }
+        let (stmts, trailing) = match &ast.expr(body).node {
+            Expr::Block { stmts, trailing } => (stmts, trailing),
+            // A non-block body expression is itself the return value.
+            _ => return,
+        };
+        if trailing.is_some() {
+            return;
+        }
+        if stmts.iter().any(|s| body_stmt_has_exit(ast, *s)) {
+            return;
+        }
+        let ret_str = format!("{}", self.arena.display(ret_ty));
+        self.add_error_at(
+            &format!(
+                "missing return value: {what} declares return type '{ret_str}' but its body has no trailing expression and no 'return'/'throw' statement"
+            ),
+            line,
+            column,
+        );
+    }
+}

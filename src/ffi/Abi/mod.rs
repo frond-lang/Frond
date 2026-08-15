@@ -24,4 +24,4 @@ pub mod CallDynamic;
 pub mod Dispatch;
 pub mod Sig;
 
-pub use Sig::{AbiSlot, AbiSig, AbiType, RetSlot};
+pub use Sig::{abi_type_from_name, parse_arg_sig, push_abi_types_for_name, AbiSlot, AbiSig, AbiType, RetSlot};

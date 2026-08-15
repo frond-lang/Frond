@@ -1,0 +1,11 @@
+// Tty.kz — terminal detection
+//
+// Sync API. Works on any file descriptor: 0=stdin, 1=stdout, 2=stderr,
+// or a descriptor opened from a file (always false).
+
+// Whether the given file descriptor refers to a terminal (tty/console).
+// Typical use: a CLI tool checks `is_tty(0)` before entering raw mode,
+// and prints a human-readable hint instead of failing cryptically.
+pub fun is_tty(fd: i32): bool {
+    __os_is_tty(fd) != 0
+}

@@ -1,5 +1,5 @@
 // builtin str pack declaration
 //
-// Exposes the string UTF-8 decoding primitives to all Kuzo user code as visible by default (builtin is fully visible by default).
+// Exposes the string UTF-8 decoding primitives to all Frond user code as visible by default (builtin is fully visible by default).
 // Raw: @extern("C") UTF-8 decoding primitives (decode_at / char_len_at)
 pub pack Raw

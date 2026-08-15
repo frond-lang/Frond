@@ -1,4 +1,4 @@
 // builtin net pack declaration
 //
-// Exposes the Net primitives module to all Kuzo user code as visible by default (builtin is fully visible by default).
+// Exposes the Net primitives module to all Frond user code as visible by default (builtin is fully visible by default).
 pub pack Raw

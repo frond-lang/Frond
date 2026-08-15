@@ -5,13 +5,13 @@
 //
 // Formatting is delegated to builtin/reflect/Reflect.format (builtin default visible, no import needed).
 // The underlying @extern("C") primitives (__stdout_write_raw / __stderr_write_raw / __stdin_readln_into)
-// are declared in builtin/io/Raw.kz, compiled by the cc crate into the kuzo_extern static library.
+// are declared in builtin/io/Raw.kz, compiled by the cc crate into the frond_extern static library.
 //
 // Usage (builtin default visible, no import needed):
 //   println("hello")           // hello
 //   println(Point(3, 4))       // Point(x: 3, y: 4)
 
-// ─── Kuzo wrapper: C raw return value → Throw ──────────────────────────
+// ─── Frond wrapper: C raw return value → Throw ──────────────────────────
 
 // __stdout_write_raw(s: str): i32 → Throw<void, IOError>
 // rc < 0 = write failed

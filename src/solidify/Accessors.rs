@@ -1,16 +1,23 @@
 //! DataFlowGraph zerocopy accessor layer.
 //!
-//! When `DataFlowGraph.mem = Some(GraphMemory)` (the `.kzo` loading path), the
-//! 24 per-Node scalar tables plus `nodes` and `inputs` are read directly from the
-//! mmap'd byte slices via accessor methods, with no copy into owned `Vec`s.
+//! When `DataFlowGraph.mem = Some(GraphMemory)` (the `.kzo` loading path):
+//! - `nodes` and `inputs` are read directly from the mmap'd byte slices via
+//!   accessor methods (v2 packed 4B/8B node records; the inputs-offset column
+//!   is either in-record or a load-time prefix table), with no copy into
+//!   owned `Vec`s;
+//! - the sparse per-Node scalar/composite/string tables (categories A/C/D)
+//!   are scatter-materialized at load into owned `Vec<Option<T>>`s (v2 sparse
+//!   sections hold only present entries — tiny), so their accessors read
+//!   owned fields with no `mem` branching;
+//! - the five variable-length complex tables (`gate_branches` /
+//!   `record_lit_infos` / `select_infos` / `trait_construct_infos` /
+//!   `record_extend_infos`) and `const_values` keep per-node byte-offset
+//!   tables and parse single entries on demand from the mmap blob;
+//! - `downstreams` were dropped from the v2 format and are re-derived at load
+//!   into a flat CSR (`downstream_csr_offsets` / `downstream_csr_flat`).
 //!
-//! When `mem = None` (the build path), accessor methods fall back to owned `Vec`
-//! field access.
-//!
-//! The five variable-length complex tables (`gate_branches` / `record_lit_infos` /
-//! `select_infos` / `trait_construct_infos` / `record_extend_infos`) plus
-//! `subgraphs` and `downstreams` stay owned on both paths (eager-loaded at load
-//! time) and need no `mem` branching.
+//! When `mem = None` (the build path), accessor methods read the owned `Vec`
+//! fields.
 
 #![allow(non_snake_case)]
 
@@ -29,87 +36,6 @@ fn rd_u16(r: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([r[off], r[off + 1]])
 }
 
-#[inline]
-fn rd_i32(r: &[u8], off: usize) -> i32 {
-    i32::from_le_bytes([r[off], r[off + 1], r[off + 2], r[off + 3]])
-}
-
-#[inline]
-fn rd_u8(r: &[u8], off: usize) -> u8 {
-    r[off]
-}
-
-// ==================== Accessor generation macros ====================
-//
-// Category A (fixed-width scalar Option), B (boolean bitmap), and C (with strings)
-// accessors are highly repetitive; the three macros below generate the method bodies.
-// Category D (fixed-width composite) and the five on-demand variable-length tables are
-// structurally heterogeneous and are not macro-generated.
-
-/// Category A accessor: zerocopy reads a fixed-width scalar; the sentinel value means `None`.
-///
-/// `$read` is `rd_u8`/`rd_u16`/`rd_u32` (a type-annotated helper to work around closure
-/// parameter inference issues). `$wrap` wraps the decoded integer into the target type
-/// (`|v| v` means the value is already the integer).
-macro_rules! accessor_opt {
-    ($method:ident, $field:ident, $kind:ident, $read:ident, $width:expr, $sentinel:expr, $ret:ty, $wrap:expr) => {
-        #[inline]
-        pub fn $method(&self, idx: usize) -> Option<$ret> {
-            if let Some(ref mem) = self.mem {
-                let r = mem.section(SectionKind::$kind);
-                let v = $read(r, idx * $width);
-                if v == $sentinel {
-                    None
-                } else {
-                    Some($wrap(v))
-                }
-            } else {
-                self.$field[idx]
-            }
-        }
-    };
-}
-
-/// Category B accessor: zerocopy reads a boolean bitmap bit.
-macro_rules! accessor_bool {
-    ($method:ident, $field:ident, $kind:ident) => {
-        #[inline]
-        pub fn $method(&self, idx: usize) -> bool {
-            if let Some(ref mem) = self.mem {
-                let r = mem.section(SectionKind::$kind);
-                r[idx / 8] & (1 << (idx % 8)) != 0
-            } else {
-                self.$field[idx]
-            }
-        }
-    };
-}
-
-/// Category C accessor: zerocopy reads a `StrRef` -> `&str` (from the StringPool section).
-macro_rules! accessor_str {
-    ($method:ident, $field:ident, $kind:ident) => {
-        #[inline]
-        pub fn $method(&self, idx: usize) -> Option<&str> {
-            if let Some(ref mem) = self.mem {
-                let r = mem.section(SectionKind::$kind);
-                let off = idx * 8;
-                let str_off = rd_u32(r, off);
-                if str_off == u32::MAX {
-                    None
-                } else {
-                    let str_len = rd_u32(r, off + 4);
-                    let pool = mem.string_pool();
-                    Some(std::str::from_utf8(
-                        &pool[str_off as usize..(str_off + str_len) as usize],
-                    ).unwrap())
-                }
-            } else {
-                self.$field[idx].as_deref()
-            }
-        }
-    };
-}
-
 // ==================== Accessor methods ====================
 
 impl DataFlowGraph {
@@ -125,19 +51,33 @@ impl DataFlowGraph {
         }
     }
 
+    /// Whether the v2 Nodes section elides the per-node inputs_offset column
+    /// (contiguous inputs pool; offsets come from the load-time prefix table).
+    #[inline]
+    fn node_inputs_elided(&self) -> bool {
+        debug_assert!(self.mem.is_some() || self.node_input_offsets.is_empty());
+        !self.node_input_offsets.is_empty()
+    }
+
     // ---- Node ----
 
-    /// Reads a node by index (Copy; 14 bytes read from the mmap slice).
+    /// Reads a node by index (load path: v2 packed record — 4B when offsets
+    /// are elided, 8B otherwise — read from the mmap slice).
     #[inline]
     pub fn node(&self, idx: usize) -> Node {
         if let Some(ref mem) = self.mem {
             let r = mem.section(SectionKind::Nodes);
-            let off = idx * 14;
+            let elided = self.node_inputs_elided();
+            let off = if elided { idx * 4 } else { idx * 8 };
             Node {
                 kind: u8_to_node_kind(r[off]),
                 input_count: r[off + 1],
-                inputs_offset: rd_u32(r, off + 2),
-                compute_fn: ComputeFnId(rd_u32(r, off + 6)),
+                inputs_offset: if elided {
+                    self.node_input_offsets[idx]
+                } else {
+                    rd_u32(r, off + 4)
+                },
+                compute_fn: ComputeFnId(rd_u16(r, off + 2) as u32),
             }
         } else {
             self.nodes[idx]
@@ -164,215 +104,195 @@ impl DataFlowGraph {
         }
     }
 
-    // ---- Category A: fixed-width scalar tables (zerocopy, sentinel means None) ----
+    // ---- Category A / C / D tables ----
+    // v2: scatter-materialized into owned fields on BOTH the eager and
+    // zerocopy load paths (sparse sections only carry present entries), so
+    // these accessors need no `mem` branching.
 
-    accessor_opt!(call_target, call_targets, CallTargets, rd_u32, 4, u32::MAX, SubGraphId, |v| SubGraphId(v));
-    accessor_opt!(field_access_info, field_access_infos, FieldAccessInfos, rd_u16, 2, u16::MAX, u16, |v| v);
-    accessor_opt!(vtable_call_method, vtable_call_methods, VtableCallMethods, rd_u16, 2, u16::MAX, u16, |v| v);
-    accessor_opt!(await_event_source, await_event_sources, AwaitEventSources, rd_u32, 4, u32::MAX, NodeId, |v| NodeId(v));
-    accessor_opt!(writeback_target, writeback_targets, WritebackTargets, rd_u32, 4, u32::MAX, NodeId, |v| NodeId(v));
-
-    // hoisted_owner: SubGraphId (no None, read directly)
     #[inline]
-    pub fn hoisted_owner(&self, idx: usize) -> SubGraphId {
-        if let Some(ref mem) = self.mem {
-            let r = mem.section(SectionKind::HoistedOwners);
-            SubGraphId(rd_u32(r, idx * 4))
-        } else {
-            self.hoisted_owners[idx]
-        }
+    pub fn call_target(&self, idx: usize) -> Option<SubGraphId> { self.call_targets[idx] }
+    #[inline]
+    pub fn field_access_info(&self, idx: usize) -> Option<u16> { self.field_access_infos[idx] }
+    #[inline]
+    pub fn vtable_call_method(&self, idx: usize) -> Option<u16> { self.vtable_call_methods[idx] }
+    #[inline]
+    pub fn await_event_source(&self, idx: usize) -> Option<NodeId> { self.await_event_sources[idx] }
+    #[inline]
+    pub fn writeback_target(&self, idx: usize) -> Option<NodeId> { self.writeback_targets[idx] }
+    #[inline]
+    pub fn global_load_slot(&self, idx: usize) -> Option<u32> { self.global_load_slots[idx] }
+    #[inline]
+    pub fn global_store_slot(&self, idx: usize) -> Option<u32> { self.global_store_slots[idx] }
+    #[inline]
+    pub fn pattern_field_index(&self, idx: usize) -> Option<u16> { self.pattern_field_indices[idx] }
+    #[inline]
+    pub fn closure_call_arg_count(&self, idx: usize) -> Option<u8> { self.closure_call_arg_counts[idx] }
+    #[inline]
+    pub fn lib_ret_kind(&self, idx: usize) -> Option<u8> { self.lib_ret_kinds.get(idx).copied().flatten() }
+    #[inline]
+    pub fn embed_info(&self, idx: usize) -> Option<u32> { self.embed_infos.get(idx).copied().flatten() }
+
+    /// Lib.embed resource by index (original path, bytes). Both paths read the
+    /// owned Vec (load path materializes from the CResources section).
+    pub fn resource(&self, idx: usize) -> Option<(&str, &[u8])> {
+        self.resources.get(idx).map(|(n, b)| (n.as_ref(), b.as_ref()))
     }
 
-    accessor_opt!(global_load_slot, global_load_slots, GlobalLoadSlots, rd_u32, 4, u32::MAX, u32, |v| v);
-    accessor_opt!(global_store_slot, global_store_slots, GlobalStoreSlots, rd_u32, 4, u32::MAX, u32, |v| v);
-    accessor_opt!(pattern_field_index, pattern_field_indices, PatternFieldIndices, rd_u16, 2, u16::MAX, u16, |v| v);
-    accessor_opt!(closure_call_arg_count, closure_call_arg_counts, ClosureCallArgCounts, rd_u8, 1, u8::MAX, u8, |v| v);
+    // hoisted metadata: dropped from the v2 format — loaded graphs fill
+    // sentinel values (no runtime consumer; post-rebuild hoisted nodes are
+    // covered by their owning ranges).
+    #[inline]
+    pub fn hoisted_owner(&self, idx: usize) -> SubGraphId { self.hoisted_owners[idx] }
+    #[inline]
+    pub fn is_hoisted_node(&self, idx: usize) -> bool { self.hoisted_node[idx] }
 
     // ---- Category B: boolean tables (zerocopy, bitmap read) ----
 
-    accessor_bool!(tail_call_flag, tail_call_flags, TailCallFlags);
-    accessor_bool!(safe_op_flag, safe_op_flags, SafeOpFlags);
-    accessor_bool!(is_hoisted_node, hoisted_node, HoistedNode);
-    accessor_bool!(slice_inclusive, slice_inclusive, SliceInclusive);
-
-    // ---- Category C: tables with strings (zerocopy, StrRef -> &str from StringPool) ----
-
-    accessor_str!(ffi_call_name, ffi_call_names, FfiCallNames);
-    accessor_str!(field_set_name, field_set_names, FieldSetNames);
-    accessor_str!(pattern_ctor_name, pattern_ctor_names, PatternCtorNames);
-    accessor_str!(pattern_type_name, pattern_type_names, PatternTypeNames);
-    accessor_str!(cast_target_type, cast_target_types, CastTargetTypes);
-
-    // ---- Category D: fixed-width composite tables (zerocopy, validity byte + fields) ----
-
     #[inline]
-    pub fn closure_info(&self, idx: usize) -> Option<ClosureInfo> {
+    pub fn tail_call_flag(&self, idx: usize) -> bool {
         if let Some(ref mem) = self.mem {
-            let r = mem.section(SectionKind::ClosureInfos);
-            let off = idx * 10; // valid(1) + subgraph_id(4) + arity(1) + self_upvalue_idx(4)
-            if r[off] == 0 { None } else {
-                Some(ClosureInfo {
-                    subgraph_id: SubGraphId(rd_u32(r, off + 1)),
-                    arity: r[off + 5],
-                    self_upvalue_idx: rd_i32(r, off + 6),
-                })
-            }
+            let r = mem.section(SectionKind::TailCallFlags);
+            r[idx / 8] & (1 << (idx % 8)) != 0
         } else {
-            self.closure_infos[idx].clone()
+            self.tail_call_flags[idx]
         }
     }
 
-    /// stdlib @extern("C") #{ }# inline FFI call info.
-    /// Build path: clone from Vec. Load path: v1 unsupported (returns None) — .kzo serialization
-    /// of DynFfiInfo (containing String + Vec) is deferred to a later phase.
+    #[inline]
+    pub fn safe_op_flag(&self, idx: usize) -> bool {
+        if let Some(ref mem) = self.mem {
+            let r = mem.section(SectionKind::SafeOpFlags);
+            r[idx / 8] & (1 << (idx % 8)) != 0
+        } else {
+            self.safe_op_flags[idx]
+        }
+    }
+
+    #[inline]
+    pub fn slice_inclusive(&self, idx: usize) -> bool {
+        if let Some(ref mem) = self.mem {
+            let r = mem.section(SectionKind::SliceInclusive);
+            r[idx / 8] & (1 << (idx % 8)) != 0
+        } else {
+            self.slice_inclusive[idx]
+        }
+    }
+
+    // ---- Category C: tables with strings (materialized at load; owned read) ----
+
+    #[inline]
+    pub fn ffi_call_name(&self, idx: usize) -> Option<&str> { self.ffi_call_names[idx].as_deref() }
+    #[inline]
+    pub fn field_set_name(&self, idx: usize) -> Option<&str> { self.field_set_names[idx].as_deref() }
+    #[inline]
+    pub fn pattern_ctor_name(&self, idx: usize) -> Option<&str> { self.pattern_ctor_names[idx].as_deref() }
+    #[inline]
+    pub fn pattern_type_name(&self, idx: usize) -> Option<&str> { self.pattern_type_names[idx].as_deref() }
+    #[inline]
+    pub fn cast_target_type(&self, idx: usize) -> Option<&str> { self.cast_target_types[idx].as_deref() }
+
+    // ---- Category D: fixed-width composite tables (materialized at load) ----
+
+    #[inline]
+    pub fn closure_info(&self, idx: usize) -> Option<ClosureInfo> {
+        self.closure_infos[idx].clone()
+    }
+
+    /// stdlib @extern("C") #{ }# inline FFI call info (materialized at load;
+    /// v2 serializes it — the v1 gap that panicked `frond run <file>.kzo` is
+    /// closed).
     #[inline]
     pub fn dyn_ffi_info(&self, idx: usize) -> Option<DynFfiInfo> {
-        if self.mem.is_some() {
-            // TODO: implement zerocopy load path for DynFfiInfo (symbol/sig/arg_count).
-            None
-        } else {
-            self.dyn_ffi_infos[idx].clone()
-        }
+        self.dyn_ffi_infos[idx].clone()
     }
 
     #[inline]
     pub fn partial_info(&self, idx: usize) -> Option<PartialInfo> {
-        if let Some(ref mem) = self.mem {
-            let r = mem.section(SectionKind::PartialInfos);
-            let off = idx * 6; // valid(1) + subgraph_id(4) + bound_count(1)
-            if r[off] == 0 { None } else {
-                Some(PartialInfo {
-                    subgraph_id: SubGraphId(rd_u32(r, off + 1)),
-                    bound_count: r[off + 5],
-                })
-            }
-        } else {
-            self.partial_infos[idx].clone()
-        }
+        self.partial_infos[idx].clone()
     }
 
     #[inline]
     pub fn lazy_construct_info(&self, idx: usize) -> Option<LazyConstructInfo> {
-        if let Some(ref mem) = self.mem {
-            let r = mem.section(SectionKind::LazyConstructInfos);
-            let off = idx * 5; // valid(1) + thunk_sg(4)
-            if r[off] == 0 { None } else {
-                Some(LazyConstructInfo {
-                    thunk_sg: SubGraphId(rd_u32(r, off + 1)),
-                })
-            }
-        } else {
-            self.lazy_construct_infos[idx].clone()
-        }
+        self.lazy_construct_infos[idx].clone()
     }
 
     #[inline]
     pub fn memo_info(&self, idx: usize) -> Option<MemoInfo> {
-        if let Some(ref mem) = self.mem {
-            let r = mem.section(SectionKind::MemoInfos);
-            let off = idx * 6; // valid(1) + table_index(4) + param_count(1)
-            if r[off] == 0 { None } else {
-                Some(MemoInfo {
-                    table_index: rd_u32(r, off + 1),
-                    param_count: r[off + 5],
-                })
-            }
-        } else {
-            self.memo_infos[idx].clone()
-        }
+        self.memo_infos[idx].clone()
     }
 
-    // ---- Fixed-width variable-length tables (zerocopy, tag + payload) ----
+    #[inline]
+    pub fn batch_info(&self, idx: usize) -> Option<BatchInfo> {
+        self.batch_infos[idx].clone()
+    }
 
+    // ---- const_values (sparse fixed-stride blob; on-demand binary search) ----
+
+    /// Parses a ConstValue on demand. Load path: the v2 section is
+    /// `[count][ (idx u32, off u32) *count ][blob]` with a fixed 17B blob
+    /// stride (tag + 16B payload), binary-searchable by node idx. Hot reads
+    /// are covered by the engine's `const_cache` (populated once at start).
     #[inline]
     pub fn const_value(&self, idx: usize) -> Option<ConstValue> {
         if let Some(ref mem) = self.mem {
             let r = mem.section(SectionKind::ConstValues);
-            let off = idx * 17; // tag(1) + payload(16)
-            let tag = r[off];
-            if tag == 0 { return None; }
-            let p = &r[off + 1..off + 17];
-            Some(match tag {
-                1 => ConstValue::I8(p[0] as i8),
-                2 => ConstValue::I16(i16::from_le_bytes([p[0], p[1]])),
-                3 => ConstValue::I32(i32::from_le_bytes([p[0], p[1], p[2], p[3]])),
-                4 => ConstValue::I64(i64::from_le_bytes({ let mut b = [0u8; 8]; b.copy_from_slice(&p[0..8]); b })),
-                5 => ConstValue::I128(i128::from_le_bytes({ let mut b = [0u8; 16]; b.copy_from_slice(p); b })),
-                6 => ConstValue::U8(p[0]),
-                7 => ConstValue::U16(u16::from_le_bytes([p[0], p[1]])),
-                8 => ConstValue::U32(u32::from_le_bytes([p[0], p[1], p[2], p[3]])),
-                9 => ConstValue::U64(u64::from_le_bytes({ let mut b = [0u8; 8]; b.copy_from_slice(&p[0..8]); b })),
-                10 => ConstValue::U128(u128::from_le_bytes({ let mut b = [0u8; 16]; b.copy_from_slice(p); b })),
-                11 => ConstValue::Isize(i64::from_le_bytes({ let mut b = [0u8; 8]; b.copy_from_slice(&p[0..8]); b }) as isize),
-                12 => ConstValue::Usize(u64::from_le_bytes({ let mut b = [0u8; 8]; b.copy_from_slice(&p[0..8]); b }) as usize),
-                13 => ConstValue::F32(f32::from_le_bytes([p[0], p[1], p[2], p[3]])),
-                14 => ConstValue::F64(f64::from_le_bytes({ let mut b = [0u8; 8]; b.copy_from_slice(&p[0..8]); b })),
-                15 => ConstValue::F16(u16::from_le_bytes([p[0], p[1]])),
-                16 => ConstValue::F128({ let mut b = [0u8; 16]; b.copy_from_slice(p); b }),
-                17 => ConstValue::Bool(p[0] != 0),
-                18 => ConstValue::Char(u32::from_le_bytes([p[0], p[1], p[2], p[3]])),
-                19 => {
-                    let off = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-                    let len = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
-                    ConstValue::Str { offset: off, len }
+            let count = rd_u32(r, 0) as usize;
+            // Binary search the index region (entries sorted by idx).
+            let (mut lo, mut hi) = (0usize, count);
+            let mut found: Option<u32> = None;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let key = rd_u32(r, 4 + mid * 8);
+                if key == idx as u32 {
+                    found = Some(rd_u32(r, 4 + mid * 8 + 4));
+                    break;
+                } else if key < idx as u32 {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
                 }
-                20 => ConstValue::Null,
-                21 => ConstValue::Void,
-                _ => panic!("invalid ConstTag: {}", tag),
-            })
+            }
+            let off = found? as usize;
+            let blob_start = 4 + count * 8;
+            let b = blob_start + off;
+            let tag = r[b];
+            if tag == 0 { return None; }
+            // v3: variable-width payload.
+            let w = super::Spec::const_payload_len(tag);
+            Some(super::Format::parse_const_value(tag, &r[b + 1..b + 1 + w]))
         } else {
             self.const_values[idx].clone()
         }
     }
 
-    #[inline]
-    pub fn batch_info(&self, idx: usize) -> Option<BatchInfo> {
-        if let Some(ref mem) = self.mem {
-            let r = mem.section(SectionKind::BatchInfos);
-            let off = idx * 5; // valid(1) + payload(4)
-            let valid = r[off];
-            let mut buf = [0u8; 4];
-            buf.copy_from_slice(&r[off + 1..off + 5]);
-            if valid == 0 { None } else { Some(bytes_to_batch_info(&buf)) }
-        } else {
-            self.batch_infos[idx].clone()
-        }
-    }
-
-    // ---- Downstreams (zerocopy CSR access) ----
+    // ---- Downstreams (load path: flat CSR derived at load) ----
 
     /// Returns the downstream-node slice for node `idx`.
     ///
-    /// Load path: returns a `&[NodeId]` slice directly from the mmap Downstreams
-    /// section with no heap allocation (eliminates the ~700KB memory blowup of
-    /// `Vec<Vec<NodeId>>` and hot-path clones).
+    /// Load path: the v2 format no longer serializes Downstreams; the flat
+    /// CSR table (`downstream_csr_offsets` / `downstream_csr_flat`) is derived
+    /// once at load from inputs + gate condition edges.
     ///
     /// Build path: returns a reference to `self.downstreams[idx]`.
-    ///
-    /// CSR layout: `[u32; N+1]` offsets (element-count index) followed by
-    /// `[u32; M]` flat. `offsets[i]..offsets[i+1]` is the element range of node i's
-    /// downstreams within the flat region.
     #[inline]
     pub fn downstream_slice(&self, idx: usize) -> &[NodeId] {
-        if let Some(ref mem) = self.mem {
-            let r = mem.section(SectionKind::Downstreams);
-            let n = mem.header().node_count as usize;
-            // Offsets region: [u32; N+1], followed by the flat region.
-            let offsets_start = 0;
-            let flat_start = (n + 1) * 4;
-            let start_elem = rd_u32(r, offsets_start + idx * 4) as usize;
-            let end_elem = rd_u32(r, offsets_start + (idx + 1) * 4) as usize;
-            let byte_start = flat_start + start_elem * 4;
-            let count = end_elem - start_elem;
-            // SAFETY: NodeId is #[repr(transparent)] over u32 (4 bytes, 4-byte aligned).
-            // The Downstreams section is 4-byte aligned, flat_start = (N+1)*4 is a multiple of 4,
-            // and byte_start = flat_start + start_elem*4 is also a multiple of 4.
-            // The slice range is within the section bounds (serialization guarantees offsets[N] = M = flat length).
-            unsafe {
-                std::slice::from_raw_parts(r.as_ptr().add(byte_start) as *const NodeId, count)
-            }
+        if self.mem.is_some() {
+            let start = self.downstream_csr_offsets[idx] as usize;
+            let end = self.downstream_csr_offsets[idx + 1] as usize;
+            &self.downstream_csr_flat[start..end]
         } else {
             &self.downstreams[idx]
+        }
+    }
+
+    /// E4 perf: flat per-node downstream consumer count (materialized once at engine start).
+    /// Replaces the `downstream_slice(idx).len()` CSR arithmetic on every set_value.
+    #[inline]
+    pub fn downstream_count(&self, idx: usize) -> u16 {
+        if !self.downstream_counts.is_empty() {
+            self.downstream_counts[idx]
+        } else {
+            self.downstream_slice(idx).len() as u16
         }
     }
 
@@ -399,8 +319,7 @@ impl DataFlowGraph {
     /// Returns the `upvalue_outer_nodes` slice for subgraph `sg_idx`.
     ///
     /// Load path: returns a `&[NodeId]` slice directly from the mmap
-    /// SgUpvalueNodes section with no heap allocation (eliminates the per-subgraph
-    /// `Vec<NodeId>` allocation, typically saving ~56B/subgraph).
+    /// SgUpvalueNodes section with no heap allocation.
     ///
     /// Build path: returns a reference to `self.subgraphs[sg_idx].upvalue_outer_nodes`.
     #[inline]
@@ -423,33 +342,13 @@ impl DataFlowGraph {
 
     /// Returns the `nested_ranges` slice for subgraph `sg_idx`.
     ///
-    /// Load path: returns a `&[(u32, u32)]` slice directly from the mmap
-    /// SgNestedRanges section with no heap allocation (eliminates the per-subgraph
-    /// `Vec<(u32, u32)>` allocation).
-    ///
-    /// Build path: returns a reference to `self.subgraphs[sg_idx].nested_ranges`.
+    /// v3: nested_ranges are derived data (recomputed by
+    /// `compute_nested_ranges` at build, after every optimizer rebuild, and
+    /// at load) — both paths read the owned Vec.
     #[inline]
     pub fn sg_nested_ranges(&self, sg_idx: usize) -> &[(u32, u32)] {
-        if let Some(ref mem) = self.mem {
-            let (off, len) = self.sg_nr_offsets[sg_idx];
-            let r = mem.section(SectionKind::SgNestedRanges);
-            let byte_start = off as usize;
-            let count = len as usize;
-            // SAFETY: (u32, u32) is 8 bytes under repr(Rust) (two consecutive u32s), 4-byte aligned.
-            // The SgNestedRanges section is 4-byte aligned, and offset is a multiple of 4.
-            // During serialization each element is written as two u32s (8 bytes), matching the (u32, u32) layout.
-            unsafe {
-                std::slice::from_raw_parts(r.as_ptr().add(byte_start) as *const (u32, u32), count)
-            }
-        } else {
-            &self.subgraphs[sg_idx].nested_ranges
-        }
+        &self.subgraphs[sg_idx].nested_ranges
     }
-
-    // ---- The tables below stay owned on both paths; accessors index directly. ----
-    //(gate_branches / record_lit_infos / select_infos /
-    //  trait_construct_infos / record_extend_infos / subgraphs)
-    // These tables need no mem branch; the execution path keeps using graph.field[idx] directly.
 
     // ---- Five complex variable-length table on-demand accessors (zerocopy: eliminates Vec<Option<T>> arrays) ----
 
@@ -464,31 +363,63 @@ impl DataFlowGraph {
     }
 
     /// Parses GateBranches on demand (load path parses a single entry from the mmap section).
-    pub fn gate_branches_at(&self, idx: usize) -> Option<GateBranches> {
-        if let Some(ref mem) = self.mem {
-            let off = self.gate_branch_offsets.get(idx).copied()?;
-            if off == u32::MAX { return None; }
-            let section = mem.section(SectionKind::GateBranches);
-            let mut r = &section[off as usize..];
-            let valid = super::Spec::read_u8(&mut r);
-            if valid == 0 { return None; }
-            let condition_input = NodeId(super::Spec::read_u32(&mut r));
-            let branch_count = super::Spec::read_u32(&mut r) as usize;
-            let mut branches = Vec::with_capacity(branch_count);
-            for _ in 0..branch_count {
-                let cond = super::Spec::read_u8(&mut r) != 0;
-                let sg = SubGraphId(super::Spec::read_u32(&mut r));
-                let input_count = super::Spec::read_u32(&mut r) as usize;
-                let mut inputs = Vec::with_capacity(input_count);
-                for _ in 0..input_count {
-                    inputs.push(NodeId(super::Spec::read_u32(&mut r)));
-                }
-                branches.push((cond, sg, inputs));
-            }
-            Some(GateBranches { condition_input, branches })
-        } else {
-            self.gate_branches[idx].clone()
+    ///
+    /// E0 perf note: returns a borrowed entry. The mmap (zerocopy) path relies on the one-time
+    /// `materialize_gate_branches()` pass at load (see Format.rs) — every Gate execution and every
+    /// call-completion capture check read the materialized entry without deep-cloning branch Vecs.
+    pub fn gate_branches_at(&self, idx: usize) -> Option<&GateBranches> {
+        self.gate_branches.get(idx).and_then(|g| g.as_ref())
+    }
+
+    /// One-time eager materialization of all GateBranches entries for zerocopy (mmap) graphs.
+    /// Build-path graphs already own `gate_branches` (no-op when already populated).
+    /// Must run while the graph is still owned (before Arc wrap), i.e. at the end of both loaders.
+    pub fn materialize_gate_branches(&mut self) {
+        if self.mem.is_none() || !self.gate_branches.is_empty() {
+            return;
         }
+        let offsets = std::mem::take(&mut self.gate_branch_offsets);
+        let mut table: Vec<Option<GateBranches>> = Vec::with_capacity(offsets.len());
+        for i in 0..offsets.len() {
+            table.push(self.parse_gate_branches_entry(i, &offsets));
+        }
+        self.gate_branch_offsets = offsets;
+        self.gate_branches = table;
+    }
+
+    /// Parses a single GateBranches entry from the mmap GateBranches section (by offsets table).
+    fn parse_gate_branches_entry(
+        &self,
+        idx: usize,
+        offsets: &[u32],
+    ) -> Option<GateBranches> {
+        let mem = self.mem.as_ref()?;
+        let off = offsets.get(idx).copied()?;
+        if off == u32::MAX {
+            return None;
+        }
+        let section = mem.section(SectionKind::GateBranches);
+        let mut r = &section[off as usize..];
+        let valid = super::Spec::read_u8(&mut r);
+        if valid == 0 {
+            return None;
+        }
+        // Validity byte encodes the W4c capture flag: 2 = valid + capture.
+        let capture = valid == 2;
+        let condition_input = NodeId(super::Spec::read_u32(&mut r));
+        let branch_count = super::Spec::read_u32(&mut r) as usize;
+        let mut branches = Vec::with_capacity(branch_count);
+        for _ in 0..branch_count {
+            let cond = super::Spec::read_u8(&mut r) != 0;
+            let sg = SubGraphId(super::Spec::read_u32(&mut r));
+            let input_count = super::Spec::read_u32(&mut r) as usize;
+            let mut inputs = Vec::with_capacity(input_count);
+            for _ in 0..input_count {
+                inputs.push(NodeId(super::Spec::read_u32(&mut r)));
+            }
+            branches.push((cond, sg, inputs));
+        }
+        Some(GateBranches { condition_input, branches, capture })
     }
 
     /// Parses RecordLitInfo on demand (load path parses from the mmap section + string_pool).

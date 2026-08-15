@@ -169,11 +169,30 @@ impl ConstraintSolver {
     ///   when both sides are concrete types, record into errors.
     /// - TraitBound: when ty is still a TypeVar, re-enqueue; otherwise query the witness table.
     /// - Subtype/Narrow: single-pass handling (does not propagate TypeVar bindings).
+    /// Termination does not need an iteration cap — it follows from the consumption
+    /// invariant below. Every processed constraint occurrence ends in exactly one of:
+    /// 1. consumed with success (Equality unify Ok / Narrow bind) — the only paths that
+    ///    set `changed`;
+    /// 2. consumed with error (concrete mismatch, Subtype/TraitBound failure);
+    /// 3. re-enqueued (Equality/TraitBound failure with the TypeVar still unresolved).
+    /// A success never re-enqueues, so total occurrences = N0 + R and consumed = N0.
+    /// Each round that sets `changed` consumes at least one occurrence, hence at most
+    /// N0 rounds can set `changed`; the first `changed == false` round ends the loop.
+    /// The debug_assert trips if a future edit ever breaks this (e.g. re-enqueueing on
+    /// a success path), which is the only way the loop could fail to terminate.
     pub fn solve_with_witness(&mut self, arena: &mut TypeArena, witness: Option<&WitnessTable>) {
-        const MAX_ITERATIONS: usize = 1000;
+        let total_bound = self.pending.len();
         let mut pending = std::mem::take(&mut self.pending);
+        let mut rounds: usize = 0;
 
-        for _iteration in 0..MAX_ITERATIONS {
+        loop {
+            debug_assert!(
+                rounds <= total_bound,
+                "solver fixpoint exceeded consumption bound (rounds={rounds}, constraints={total_bound}): \
+                 a success path must consume its constraint, not re-enqueue it"
+            );
+            rounds += 1;
+
             if pending.is_empty() {
                 break;
             }
@@ -321,10 +340,9 @@ impl ConstraintSolver {
             }
         }
 
-        // Constraints that did not converge after MAX_ITERATIONS: recorded but not reported
-        // (defensive).
-        // These are usually TypeVar ↔ TypeVar circular dependencies and do not affect
-        // correctness.
+        // Constraints still pending at exit: their TypeVars never got bound (typically
+        // TypeVar ↔ TypeVar constraints with no anchor). Recorded but not reported
+        // (defensive); these do not affect correctness.
 
         // After fixpoint convergence: build subst from candidates and detect ambiguity.
         self.finalize_solution(arena);
@@ -413,6 +431,42 @@ impl ConstraintSolver {
                     arena.type_vars[idx as usize].bound = Some(resolved);
                 }
                 _ => {
+                    // null-join rule: a null LITERAL's inferred type is either Null or
+                    // Nullable<fresh-var> (unconstrained inner). A candidate set of
+                    // {nullish, X} resolves to X? — a null literal is compatible with
+                    // any nullable, so it must not make inference ambiguous
+                    // (`pick(null, 5)` infers T = i32?). A Nullable with a CONCRETE
+                    // inner (a nullable variable) does NOT join — variables never
+                    // implicitly lift (#60 strictness).
+                    if unique.len() == 2 {
+                        let is_nullish = |arena: &TypeArena, h: TypeHandle| {
+                            let r = arena.resolve(h);
+                            match arena.get(r) {
+                                Type::Null => true,
+                                Type::Nullable(_) => {
+                                    let inner = arena.nullable_inner(r);
+                                    matches!(arena.get(inner), Type::TypeVar(_))
+                                }
+                                _ => false,
+                            }
+                        };
+                        let a = unique[0];
+                        let b = unique[1];
+                        let base = if is_nullish(arena, a) && !is_nullish(arena, b) {
+                            Some(b)
+                        } else if is_nullish(arena, b) && !is_nullish(arena, a) {
+                            Some(a)
+                        } else {
+                            None
+                        };
+                        if let Some(base) = base {
+                            let base_r = arena.resolve(base);
+                            let nullable = arena.make_nullable(base_r);
+                            self.subst.insert(idx, nullable);
+                            arena.type_vars[idx as usize].bound = Some(nullable);
+                            continue;
+                        }
+                    }
                     // Multiple distinct candidates: ambiguity.
                     // Pick the arena's actual solution (unify picked the first successful one)
                     // and write it into subst to avoid cascading false positives.
@@ -469,3 +523,83 @@ impl ConstraintSolver {
     }
 }
 
+
+// =========================================================================
+// Termination tests — the fixpoint loop no longer has an iteration cap; these
+// pin the consumption invariant it now relies on.
+// =========================================================================
+#[cfg(test)]
+mod solver_termination_tests {
+    use super::*;
+    use crate::types::Arena::TypeArena;
+    use crate::types::Ty::Type;
+
+    /// A long var chain added in the worst order (anchor first, links reversed)
+    /// forces repeated re-enqueues; it must still terminate and bind everything.
+    #[test]
+    fn reversed_chain_terminates_and_binds_all() {
+        let mut arena = TypeArena::new();
+        const N: usize = 200;
+        let vars: Vec<_> = (0..N).map(|_| arena.fresh_type_var()).collect();
+        let i32_ = arena.make(Type::I32);
+        let mut s = ConstraintSolver::new();
+        // Anchor first, then links from the far end: every early link fails and
+        // re-enqueues at least once before its neighbor gets bound.
+        s.add_equality(vars[N - 1], i32_);
+        for k in (0..N - 1).rev() {
+            s.add_equality(vars[k], vars[k + 1]);
+        }
+        s.solve(&mut arena);
+        assert!(s.errors.is_empty(), "errors: {:?}", s.errors.iter().map(|e| e.reason.to_string()).collect::<Vec<_>>());
+        for (k, v) in vars.iter().enumerate() {
+            assert_eq!(arena.resolve(*v), i32_, "var {k} not bound");
+        }
+    }
+
+    /// An unresolvable var-var cycle plus conflicting anchors terminates with errors
+    /// recorded (not an infinite loop).
+    #[test]
+    fn conflicting_cycle_terminates_with_errors() {
+        let mut arena = TypeArena::new();
+        let v0 = arena.fresh_type_var();
+        let v1 = arena.fresh_type_var();
+        let i32_ = arena.make(Type::I32);
+        let str_ = arena.make(Type::Str);
+        let mut s = ConstraintSolver::new();
+        s.add_equality(v0, v1);
+        s.add_equality(v0, i32_);
+        s.add_equality(v1, str_);
+        s.solve(&mut arena);
+        assert!(!s.errors.is_empty(), "conflicting anchors must produce errors");
+    }
+
+    /// A pending-only cycle (no anchor at all) terminates with the vars unbound.
+    #[test]
+    fn anchorless_cycle_terminates_unbound() {
+        let mut arena = TypeArena::new();
+        let v0 = arena.fresh_type_var();
+        let v1 = arena.fresh_type_var();
+        let mut s = ConstraintSolver::new();
+        s.add_equality(v0, v1);
+        s.add_equality(v1, v0);
+        s.solve(&mut arena);
+        let unbound = arena.type_vars.iter().filter(|v| v.bound.is_none()).count();
+        assert!(unbound >= 1, "var-var unify binds one side at most");
+        // The loop must have exited via !changed with no errors: nothing is provably wrong.
+        assert!(s.errors.is_empty());
+    }
+
+    /// Unify success against a TypeVar must leave it bound (binding monotonicity —
+    /// the "success binds" half of the solver's termination argument).
+    #[test]
+    fn equality_success_always_binds() {
+        let mut arena = TypeArena::new();
+        let v = arena.fresh_type_var();
+        let bool_ = arena.make(Type::Bool);
+        let mut s = ConstraintSolver::new();
+        s.add_equality(v, bool_);
+        s.solve(&mut arena);
+        assert!(matches!(arena.get(arena.resolve(v)), Type::Bool | Type::TypeVar(_)));
+        assert_eq!(arena.resolve(v), bool_);
+    }
+}

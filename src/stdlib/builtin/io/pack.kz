@@ -1,6 +1,6 @@
 // builtin io pack declaration
 //
-// Exposes the IO module to all Kuzo user code as visible by default (builtin is fully visible by default).
+// Exposes the IO module to all Frond user code as visible by default (builtin is fully visible by default).
 // Raw: @extern("C") IO primitives
 // Reader/Writer: IO trait
 // Console: print/println/eprint/eprintln/scan/scanln

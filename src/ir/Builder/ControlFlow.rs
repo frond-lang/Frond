@@ -51,6 +51,7 @@ impl<'a> IrBuilder<'a> {
         self.graph.set_gate_branches(
             gate_node,
             GateBranches {
+                capture: false,
                 condition_input: cond_node,
                 branches: vec![
                     (true, then_sg, then_inputs),
@@ -58,7 +59,7 @@ impl<'a> IrBuilder<'a> {
                 ],
             },
         );
-        if std::env::var("KUZO_DEBUG_COMPILE").is_ok() {
+        if std::env::var("FROND_DEBUG_COMPILE").is_ok() {
             let then_r = self.graph.subgraphs[then_sg.0 as usize].node_range;
             let else_r = self.graph.subgraphs[else_sg.0 as usize].node_range;
             eprintln!("[COMPILE_IF] cond_node={} then_sg={} then_range=[{},{}) else_sg={} else_range=[{},{}) gate_node={} cur_mod={:?}",
@@ -98,55 +99,20 @@ impl<'a> IrBuilder<'a> {
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
 
-        // Record the length of the function subgraph's `event_source_decls` before compilation.
-        // While compiling the branch body, `build_await_node` registers EventSourceDecls into
-        // `current_function_sg` (the function subgraph), but at runtime `compute_await` looks
-        // them up using `frame.subgraph_id` (the branch subgraph) -- the branch subgraph's empty
-        // `event_source_decls` causes a fallback to AsyncJoin, misclassifying `channel.recv` /
-        // `timer.await` as async join (Bug #24). After compilation, the newly added decls are
-        // migrated into the branch subgraph.
-        // Nested branches are handled correctly: an inner branch drains its own decls first, so
-        // by the time an outer branch drains, only its own remain.
-        let prev_decl_count = self.current_function_sg
-            .and_then(|sg_id| self.graph.subgraphs.get(sg_id.0 as usize))
-            .map(|sg| sg.event_source_decls.len())
-            .unwrap_or(0);
-
-        let raw_return = self.compile_expr(expr);
-        // Link any pending effect into the return node so side-effecting expressions
-        // (e.g. `defer b.v = 77` compiles to an Assign with a field_set in current_effect)
-        // are not orphaned. Without this, the set_node has no consumer and is dropped by DCE.
-        // Only chain when there IS a pending effect (avoids spurious seq nodes for pure branches).
-        let return_node = match self.current_effect {
-            Some(eff) if eff != raw_return => self.chain_effects(Some(eff), raw_return),
-            _ => raw_return,
-        };
-        self.current_sg_start = prev_sg_start;
-        self.exit_scope();
-
-        let node_end = self.graph.nodes.len() as u32;
+        // W3C: pre-register the branch subgraph so its id is stable across the
+        // body compile (nested lambdas also add subgraphs). build_await_node
+        // registers EventSourceDecls directly into it — structurally correct
+        // scoping replacing the old post-hoc migration from the function sg
+        // (Bug #24).
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
-
-        // Migrate the event_source_decls newly added while compiling the branch body from the
-        // function subgraph into the branch subgraph.
-        let branch_decls: Vec<_> = if let Some(func_sg_id) = self.current_function_sg {
-            if let Some(func_sg) = self.graph.subgraphs.get_mut(func_sg_id.0 as usize) {
-                func_sg.event_source_decls.drain(prev_decl_count..).collect()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
         self.graph.add_subgraph(SubGraph {
             id: sg_id,
-            node_range: (NodeId(node_start), NodeId(node_end)),
+            node_range: (NodeId(node_start), NodeId(node_start)),
             param_count: 0,
             entry_node: NodeId(node_start),
-            return_node,
+            return_node: NodeId(node_start),
             has_suspend: false,
-            event_source_decls: branch_decls,
+            event_source_decls: Vec::new(),
             defer_table: Vec::new(),
             loop_kind: LoopKind::None,
             loop_parent_sg: None,
@@ -158,6 +124,30 @@ impl<'a> IrBuilder<'a> {
             nested_ranges: Vec::new(),
             reset_plan: None,
         });
+        let prev_branch_sg = self.current_branch_sg;
+        self.current_branch_sg = Some(sg_id);
+
+        let raw_return = self.compile_expr(expr);
+        // Link any pending effect into the return node so side-effecting expressions
+        // (e.g. `defer b.v = 77` compiles to an Assign with a field_set in current_effect)
+        // are not orphaned. Without this, the set_node has no consumer and is dropped by DCE.
+        // Only chain when there IS a pending effect (avoids spurious seq nodes for pure branches).
+        let return_node = match self.current_effect {
+            Some(eff) if eff != raw_return => self.chain_effects(Some(eff), raw_return),
+            _ => raw_return,
+        };
+        self.current_sg_start = prev_sg_start;
+        self.current_branch_sg = prev_branch_sg;
+        self.exit_scope();
+
+        let node_end = self.graph.nodes.len() as u32;
+        {
+            let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
+            sg.node_range = (NodeId(node_start), NodeId(node_end));
+            sg.return_node = return_node;
+            // has_suspend stays false (historical behavior for branch sgs;
+            // their frames are same_function branch frames).
+        }
         (sg_id, Vec::new())
     }
 
@@ -397,6 +387,7 @@ impl<'a> IrBuilder<'a> {
             self.graph.set_gate_branches(
                 gate_node,
                 GateBranches {
+                capture: false,
                     condition_input: pattern_node,
                     branches: vec![
                         (true, ad.body_sg, ad.body_inputs.clone()),

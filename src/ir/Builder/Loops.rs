@@ -121,6 +121,7 @@ impl<'a> IrBuilder<'a> {
         self.graph.set_gate_branches(
             gate_node,
             GateBranches {
+                capture: false,
                 condition_input: is_null_node,
                 branches: vec![
                     (true, void_sg, vec![]),
@@ -141,6 +142,7 @@ impl<'a> IrBuilder<'a> {
             reset_to_zero: vec![next_call],
             reset_to_one: vec![is_null_node],
             reset_condition_tree: vec![],
+            condition_tree_plan: Vec::new(),
         });
         sg_id
     }
@@ -266,6 +268,10 @@ impl<'a> IrBuilder<'a> {
             reset_plan: None,
         });
 
+        // Bug #100: loop-modified variables must be read through their canonical home
+        // slot in the condition, so each re-evaluation sees the WriteBack-updated value
+        // instead of a stale pre-loop snapshot.
+        if !std::env::var("FROND_NO_REBIND").is_ok() { self.rebind_modified_vars_to_home(body); }
         // Compile the condition.
         // Reset `current_effect = None` to avoid creating CF_SEQ nodes inside the loop subgraph
         // that depend on the external effect chain.
@@ -292,6 +298,7 @@ impl<'a> IrBuilder<'a> {
         self.graph.set_gate_branches(
             gate_node,
             GateBranches {
+                capture: false,
                 condition_input: cond_node,
                 branches: vec![
                     (true, body_sg, vec![]),
@@ -311,6 +318,7 @@ impl<'a> IrBuilder<'a> {
             reset_to_zero: vec![],
             reset_to_one: vec![],
             reset_condition_tree: vec![cond_node],
+            condition_tree_plan: Vec::new(),
         });
         sg_id
     }

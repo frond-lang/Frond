@@ -27,7 +27,7 @@ pub fn cmd_init(name: Option<String>) {
             Ok(_) => {
                 let manifest_path = format!("{}/{}", target_dir, MANIFEST_NAME);
                 if fs::metadata(&manifest_path).is_ok() {
-                    eprintln!("error: already a Kuzo project ({} contains {})", target_dir, MANIFEST_NAME);
+                    eprintln!("error: already a Frond project ({} contains {})", target_dir, MANIFEST_NAME);
                     process::exit(1);
                 }
                 if let Ok(entries) = fs::read_dir(target_dir) {
@@ -77,13 +77,13 @@ pub fn cmd_init(name: Option<String>) {
         format!("{}/{}", target_dir, DEFAULT_ENTRY)
     };
     // Console is under builtin/io and visible by default, so no import is needed.
-    let main_content = "fun main(): void {\n    println(\"Hello, Kuzo!\")\n}\n";
+    let main_content = "fun main(): void {\n    println(\"Hello, Frond!\")\n}\n";
     if let Err(e) = fs::write(&main_path, main_content) {
         eprintln!("error: could not write '{}': {}", main_path, e);
         process::exit(1);
     }
 
-    println!("Created Kuzo project '{}'", proj_name);
+    println!("Created Frond project '{}'", proj_name);
     println!("  {}", manifest_path);
     println!("  {}", main_path);
 }

@@ -5,7 +5,7 @@
 // Synchronous implementation — decision S04.
 // TimeComponents is a 9-field record, constructed by the syscall layer via makeRecordWithNames.
 
-// ─── TimeComponents (record type shared between syscall layer and Kuzo layer) ──────
+// ─── TimeComponents (record type shared between syscall layer and Frond layer) ──────
 // Field order corresponds one-to-one with syscall/time.zig makeTimeComponents:
 //   year, month, day, hour, minute, second, nanos, weekday, day_of_year
 
@@ -62,10 +62,10 @@ pub fun now(): SystemTime {
     SystemTime(__systemtime_now_ns())
 }
 
-// ─── Pure Kuzo time component conversion (replacing the original syscall implementation) ─────────────────
+// ─── Pure Frond time component conversion (replacing the original syscall implementation) ─────────────────
 //
 // The original three syscalls __systemtime_to_utc_components / __systemtime_to_local_components /
-// __components_to_ns_utc have been lowered to pure Kuzo algorithms (calling Calendar's
+// __components_to_ns_utc have been lowered to pure Frond algorithms (calling Calendar's
 // days_from_civil / civil_from_days / weekday_from_days), following the syscall minimization
 // principle — pure algorithms do not depend on host capabilities and should not occupy syscall slots.
 //
@@ -73,7 +73,7 @@ pub fun now(): SystemTime {
 // original Zig implementation.
 // Supports negative ns (before 1970), uses floor division to ensure correct semantics.
 
-// i128 nanoseconds → UTC TimeComponents (pure Kuzo algorithm)
+// i128 nanoseconds → UTC TimeComponents (pure Frond algorithm)
 pub fun to_utc_components(ns: i128): TimeComponents {
     val ns_per_sec: i128 = (1_000_000_000) as i128
     val secs_per_day: i128 = 86400 as i128
@@ -114,7 +114,7 @@ pub fun to_local_components(ns: i128): TimeComponents {
 }
 
 // TimeComponents → i128 nanoseconds (UTC), validates field legality
-// Pure Kuzo algorithm + field validation, consistent with the original syscall components_to_ns_utc behavior
+// Pure Frond algorithm + field validation, consistent with the original syscall components_to_ns_utc behavior
 pub fun components_to_ns_utc(comp: TimeComponents): Throw<i128, TimeError> {
     if comp.month < 1 || comp.month > 12 {
         throw TimeError(InvalidDateTime, "month out of range", "")

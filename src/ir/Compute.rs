@@ -28,12 +28,12 @@ fn env_flag(name: &str) -> bool {
     static FLAG_SYNC: OnceLock<bool> = OnceLock::new();
     static FLAG_MEMO: OnceLock<bool> = OnceLock::new();
     match name {
-        "KUZO_DEBUG_CALL" => *FLAG_CALL.get_or_init(|| std::env::var("KUZO_DEBUG_CALL").is_ok()),
-        "KUZO_DEBUG_GATE" => *FLAG_GATE.get_or_init(|| std::env::var("KUZO_DEBUG_GATE").is_ok()),
-        "KUZO_DEBUG_STALL" => *FLAG_STALL.get_or_init(|| std::env::var("KUZO_DEBUG_STALL").is_ok()),
-        "KUZO_DEBUG_WB" => *FLAG_WB.get_or_init(|| std::env::var("KUZO_DEBUG_WB").is_ok()),
-        "KUZO_DEBUG_SYNC" => *FLAG_SYNC.get_or_init(|| std::env::var("KUZO_DEBUG_SYNC").is_ok()),
-        "KUZO_DEBUG_MEMO" => *FLAG_MEMO.get_or_init(|| std::env::var("KUZO_DEBUG_MEMO").is_ok()),
+        "FROND_DEBUG_CALL" => *FLAG_CALL.get_or_init(|| std::env::var("FROND_DEBUG_CALL").is_ok()),
+        "FROND_DEBUG_GATE" => *FLAG_GATE.get_or_init(|| std::env::var("FROND_DEBUG_GATE").is_ok()),
+        "FROND_DEBUG_STALL" => *FLAG_STALL.get_or_init(|| std::env::var("FROND_DEBUG_STALL").is_ok()),
+        "FROND_DEBUG_WB" => *FLAG_WB.get_or_init(|| std::env::var("FROND_DEBUG_WB").is_ok()),
+        "FROND_DEBUG_SYNC" => *FLAG_SYNC.get_or_init(|| std::env::var("FROND_DEBUG_SYNC").is_ok()),
+        "FROND_DEBUG_MEMO" => *FLAG_MEMO.get_or_init(|| std::env::var("FROND_DEBUG_MEMO").is_ok()),
         _ => std::env::var(name).is_ok(),
     }
 }
@@ -134,6 +134,7 @@ fn reflect_kind(v: &Value) -> u8 {
             crate::value::HeapObj::ReceiverVal(_) => k::RECEIVER,
             crate::value::HeapObj::CoroutineFrame => k::COROUTINE,
             crate::value::HeapObj::OpaquePtr(_) => k::PTR,
+            crate::value::HeapObj::LibVal(_) | crate::value::HeapObj::ForeignFnVal(_) => k::BUILTIN,
         },
     }
 }
@@ -167,6 +168,8 @@ fn reflect_kind_str(v: &Value) -> &'static str {
             crate::value::HeapObj::ReceiverVal(_) => "Receiver",
             crate::value::HeapObj::CoroutineFrame => "Coroutine",
             crate::value::HeapObj::OpaquePtr(_) => "Ptr",
+            crate::value::HeapObj::LibVal(_) => "Lib",
+            crate::value::HeapObj::ForeignFnVal(_) => "ForeignFn",
         },
     }
 }
@@ -200,6 +203,8 @@ fn reflect_type_name(v: &Value) -> String {
             crate::value::HeapObj::Closure(_) => "Fn".to_string(),
             crate::value::HeapObj::TraitVal(_) => "Trait".to_string(),
             crate::value::HeapObj::OpaquePtr(op) => op.type_name.to_string(),
+            crate::value::HeapObj::LibVal(_) => "Lib".to_string(),
+            crate::value::HeapObj::ForeignFnVal(_) => "ForeignFn".to_string(),
         },
     }
 }
@@ -217,17 +222,17 @@ fn reflect_type_name(v: &Value) -> String {
 ///
 /// Usage (inside a compute_fn body):
 /// ```ignore
-/// pub fn compute_foo(frame: &mut Frame, node: NodeId) -> Value {
-///     read_node_inputs!(frame, node, graph, n, inputs);
+/// pub fn compute_foo(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+///     read_node_inputs!(frame, node, ctx, graph, n, inputs);
 ///     let a = force_input(frame, inputs[0]).as_i32();
 ///     ...
 /// }
 /// ```
 /// After expansion, the three bindings `graph`, `n`, and `inputs` are in scope.
-/// `inputs` is tied to the lifetime of `graph` (an `Arc` clone of `frame.graph`).
+/// `inputs` is tied to the lifetime of `graph` (a shared borrow of `ctx.graph`).
 macro_rules! read_node_inputs {
-    ($frame:ident, $node:ident, $graph:ident, $n:ident, $inputs:ident) => {
-        let $graph = $frame.graph.clone();
+    ($frame:ident, $node:ident, $ctx:ident, $graph:ident, $n:ident, $inputs:ident) => {
+        let $graph = $ctx.graph;
         let $n = $graph.node($node.0 as usize);
         let $inputs = $graph.inputs($n.inputs_offset, $n.input_count);
     };
@@ -260,8 +265,8 @@ pub fn force_input(frame: &mut Frame, global_node: NodeId) -> Value {
 macro_rules! impl_cmp_compute {
     ($($name:ident: $op:tt for $acc:ident);* $(;)?) => {
         $(
-            pub fn $name(frame: &mut Frame, node: NodeId) -> Value {
-                read_node_inputs!(frame, node, graph, n, inputs);
+            pub fn $name(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                read_node_inputs!(frame, node, ctx, graph, n, inputs);
                 let a = force_input(frame, inputs[0]).$acc();
                 let b = force_input(frame, inputs[1]).$acc();
                 Value::bool_val(a $op b)
@@ -425,8 +430,8 @@ pub fn do_simd_batch(
 // =========================================================================
 
 /// compute_fn: i32 less-than-or-equal comparison (`<=`).
-pub fn compute_le_i32(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_le_i32(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let a = force_input(frame, inputs[0]).as_i32();
     let b = force_input(frame, inputs[1]).as_i32();
     Value::bool_val(a <= b)
@@ -492,32 +497,32 @@ impl_cmp_compute! {
 macro_rules! impl_int_ops {
     ($ty:ident, $rust:ty, $ctor:ident, $acc:ident) => {
         pastey::paste! {
-            pub fn [<compute_add_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_add_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
                 let b = force_input(frame, inputs[1]).$acc();
                 Value::$ctor(crate::value::[<arith_add_$ty>](a, b))
             }
-            pub fn [<compute_sub_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_sub_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
                 let b = force_input(frame, inputs[1]).$acc();
                 Value::$ctor(crate::value::[<arith_sub_$ty>](a, b))
             }
-            pub fn [<compute_mul_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_mul_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
                 let b = force_input(frame, inputs[1]).$acc();
                 Value::$ctor(crate::value::[<arith_mul_$ty>](a, b))
             }
-            pub fn [<compute_div_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_div_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
@@ -527,8 +532,8 @@ macro_rules! impl_int_ops {
                     None => make_arith_throw("DivideByZero", "integer divide by zero"),
                 }
             }
-            pub fn [<compute_mod_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_mod_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
@@ -538,32 +543,32 @@ macro_rules! impl_int_ops {
                     None => make_arith_throw("DivideByZero", "integer modulo by zero"),
                 }
             }
-            pub fn [<compute_bitand_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_bitand_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
                 let b = force_input(frame, inputs[1]).$acc();
                 Value::$ctor(crate::value::[<arith_bitand_$ty>](a, b))
             }
-            pub fn [<compute_bitor_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_bitor_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
                 let b = force_input(frame, inputs[1]).$acc();
                 Value::$ctor(crate::value::[<arith_bitor_$ty>](a, b))
             }
-            pub fn [<compute_bitxor_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_bitxor_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
                 let b = force_input(frame, inputs[1]).$acc();
                 Value::$ctor(crate::value::[<arith_bitxor_$ty>](a, b))
             }
-            pub fn [<compute_shl_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_shl_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
@@ -573,8 +578,8 @@ macro_rules! impl_int_ops {
                     None => make_arith_throw("ShiftOutOfRange", "shift amount out of range"),
                 }
             }
-            pub fn [<compute_shr_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_shr_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
@@ -584,15 +589,15 @@ macro_rules! impl_int_ops {
                     None => make_arith_throw("ShiftOutOfRange", "shift amount out of range"),
                 }
             }
-            pub fn [<compute_neg_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_neg_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
                 Value::$ctor(crate::value::[<arith_neg_$ty>](a))
             }
-            pub fn [<compute_bitnot_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_bitnot_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
@@ -608,48 +613,48 @@ macro_rules! impl_int_ops {
 macro_rules! impl_float_ops {
     ($ty:ident, $rust:ty, $ctor:ident, $acc:ident) => {
         pastey::paste! {
-            pub fn [<compute_add_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_add_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
                 let b = force_input(frame, inputs[1]).$acc();
                 Value::$ctor(crate::value::[<arith_add_$ty>](a, b))
             }
-            pub fn [<compute_sub_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_sub_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
                 let b = force_input(frame, inputs[1]).$acc();
                 Value::$ctor(crate::value::[<arith_sub_$ty>](a, b))
             }
-            pub fn [<compute_mul_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_mul_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
                 let b = force_input(frame, inputs[1]).$acc();
                 Value::$ctor(crate::value::[<arith_mul_$ty>](a, b))
             }
-            pub fn [<compute_div_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_div_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
                 let b = force_input(frame, inputs[1]).$acc();
                 Value::$ctor(crate::value::[<arith_div_$ty>](a, b))
             }
-            pub fn [<compute_mod_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_mod_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
                 let b = force_input(frame, inputs[1]).$acc();
                 Value::$ctor(crate::value::[<arith_mod_$ty>](a, b))
             }
-            pub fn [<compute_neg_$ty>](frame: &mut Frame, node: NodeId) -> Value {
-                let graph = frame.graph.clone();
+            pub fn [<compute_neg_$ty>](frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+                let graph = ctx.graph;
                 let n = graph.node(node.0 as usize);
                 let inputs = graph.inputs(n.inputs_offset, n.input_count);
                 let a = force_input(frame, inputs[0]).$acc();
@@ -718,10 +723,10 @@ const F128_NONZERO_MASK: u128 = 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
 /// Common F128 comparison dispatch: extracts bytes, checks NaN, delegates to `logic`.
 /// `nan_result` is the value returned when either operand is NaN (true for ne, false for all others).
 #[inline]
-fn f128_cmp_with<F>(frame: &mut Frame, node: NodeId, nan_result: bool, logic: F) -> Value
+fn f128_cmp_with<F>(frame: &mut Frame, node: NodeId, ctx: &EvalContext, nan_result: bool, logic: F) -> Value
 where F: FnOnce(u128, u128) -> bool
 {
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let a = force_input(frame, inputs[0]).as_f128();
     let b = force_input(frame, inputs[1]).as_f128();
     let ab = u128::from_le_bytes(a.0);
@@ -734,29 +739,29 @@ where F: FnOnce(u128, u128) -> bool
     Value::bool_val(result)
 }
 
-pub fn compute_eq_f128(frame: &mut Frame, node: NodeId) -> Value {
-    f128_cmp_with(frame, node, false, |ab, bb| ab == bb || (ab | bb) & F128_NONZERO_MASK == 0)
+pub fn compute_eq_f128(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    f128_cmp_with(frame, node, ctx, false, |ab, bb| ab == bb || (ab | bb) & F128_NONZERO_MASK == 0)
 }
-pub fn compute_ne_f128(frame: &mut Frame, node: NodeId) -> Value {
-    f128_cmp_with(frame, node, true, |ab, bb| ab != bb && (ab | bb) & F128_NONZERO_MASK != 0)
+pub fn compute_ne_f128(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    f128_cmp_with(frame, node, ctx, true, |ab, bb| ab != bb && (ab | bb) & F128_NONZERO_MASK != 0)
 }
-pub fn compute_lt_f128(frame: &mut Frame, node: NodeId) -> Value {
-    f128_cmp_with(frame, node, false, |ab, bb| {
+pub fn compute_lt_f128(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    f128_cmp_with(frame, node, ctx, false, |ab, bb| {
         if (ab | bb) & F128_NONZERO_MASK == 0 { false } else { f128_sort_key(ab) < f128_sort_key(bb) }
     })
 }
-pub fn compute_gt_f128(frame: &mut Frame, node: NodeId) -> Value {
-    f128_cmp_with(frame, node, false, |ab, bb| {
+pub fn compute_gt_f128(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    f128_cmp_with(frame, node, ctx, false, |ab, bb| {
         if (ab | bb) & F128_NONZERO_MASK == 0 { false } else { f128_sort_key(ab) > f128_sort_key(bb) }
     })
 }
-pub fn compute_le_f128(frame: &mut Frame, node: NodeId) -> Value {
-    f128_cmp_with(frame, node, false, |ab, bb| {
+pub fn compute_le_f128(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    f128_cmp_with(frame, node, ctx, false, |ab, bb| {
         (ab | bb) & F128_NONZERO_MASK == 0 || f128_sort_key(ab) < f128_sort_key(bb)
     })
 }
-pub fn compute_ge_f128(frame: &mut Frame, node: NodeId) -> Value {
-    f128_cmp_with(frame, node, false, |ab, bb| {
+pub fn compute_ge_f128(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    f128_cmp_with(frame, node, ctx, false, |ab, bb| {
         (ab | bb) & F128_NONZERO_MASK == 0 || f128_sort_key(ab) > f128_sort_key(bb)
     })
 }
@@ -764,39 +769,39 @@ pub fn compute_ge_f128(frame: &mut Frame, node: NodeId) -> Value {
 // ---- bool logic (indices 22–24, 27) ----
 
 /// compute_fn: bool AND (reuses the pure arithmetic core).
-pub fn compute_and_bool(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_and_bool(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let a = force_input(frame, inputs[0]).as_bool();
     let b = force_input(frame, inputs[1]).as_bool();
     Value::bool_val(crate::value::arith_and_bool(a, b))
 }
 
 /// compute_fn: bool OR (reuses the pure arithmetic core).
-pub fn compute_or_bool(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_or_bool(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let a = force_input(frame, inputs[0]).as_bool();
     let b = force_input(frame, inputs[1]).as_bool();
     Value::bool_val(crate::value::arith_or_bool(a, b))
 }
 
 /// compute_fn: bool NOT (unary, reuses the pure arithmetic core).
-pub fn compute_not_bool(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_not_bool(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let a = force_input(frame, inputs[0]).as_bool();
     Value::bool_val(crate::value::arith_not_bool(a))
 }
 
 /// compute_fn: bool equality.
-pub fn compute_eq_bool(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_eq_bool(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let a = force_input(frame, inputs[0]).as_bool();
     let b = force_input(frame, inputs[1]).as_bool();
     Value::bool_val(a == b)
 }
 
 /// compute_fn: bool inequality (symmetric with `eq_bool`).
-pub fn compute_ne_bool(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_ne_bool(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let a = force_input(frame, inputs[0]).as_bool();
     let b = force_input(frame, inputs[1]).as_bool();
     Value::bool_val(a != b)
@@ -806,15 +811,15 @@ pub fn compute_ne_bool(frame: &mut Frame, node: NodeId) -> Value {
 
 /// compute_fn: wraps a value as `ThrowVal(Err)` (used by `throw` statements).
 ///
-/// Kuzo has no try-catch; `throw` produces a `ThrowVal(Err)` plus a `Return`
+/// Frond has no try-catch; `throw` produces a `ThrowVal(Err)` plus a `Return`
 /// signal that propagates up to the top level. The Err payload holds the thrown
 /// value itself (before Bug #27 was fixed, the original type was wrapped as an
 /// `Error(value:v)` record, requiring `Error(Error(v))` nested destructuring).
 /// - Input is a `ThrowVal` (already a thrown value) → returned directly (idempotent).
 /// - Any other value (scalar/Str/Record/Adt/Array) → wrapped directly as `ThrowVal(Err(v))`.
-pub fn compute_throw_wrap_err(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
+pub fn compute_throw_wrap_err(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
     use crate::value::{HeapObj, ThrowPayload, ThrowValue};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let v = force_input(frame, inputs[0]);
     // Already a ThrowVal → re-throw directly (idempotent, supports re-throw).
     if let Some(HeapObj::ThrowVal(_)) = v.heap_obj() {
@@ -826,9 +831,9 @@ pub fn compute_throw_wrap_err(frame: &mut Frame, node: NodeId, _ctx: &EvalContex
 }
 
 /// compute_fn: wraps a value as `ThrowVal(Ok(val))` (used by the `Ok` constructor).
-pub fn compute_throw_ok(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_throw_ok(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{HeapObj, ThrowPayload, ThrowValue};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let val = force_input(frame, inputs[0]);
     Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Ok(val) }))
 }
@@ -839,9 +844,9 @@ pub fn compute_throw_ok(frame: &mut Frame, node: NodeId) -> Value {
 /// but the `Err` constructor treats any value type uniformly: it wraps it
 /// directly as `ThrowVal(Err(v))`. Consistent with `compute_throw_wrap_err`, it
 /// no longer wraps the original type as `Error(value:v)` (Bug #27).
-pub fn compute_throw_err(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_throw_err(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{HeapObj, ThrowPayload, ThrowValue};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let v = force_input(frame, inputs[0]);
     Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(v) }))
 }
@@ -858,8 +863,8 @@ pub fn compute_throw_err(frame: &mut Frame, node: NodeId) -> Value {
 ///   return early with null.
 /// - non-null → returns `NodeResult::Value(v)` (nullable and non-null values
 ///   share the same representation, so the value is passed through directly).
-pub fn compute_propagate(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_propagate(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let v = force_input(frame, inputs[0]);
 
     if let Some(crate::value::HeapObj::ThrowVal(tv)) = v.heap_obj() {
@@ -887,11 +892,11 @@ pub fn compute_propagate(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) ->
 /// [`crate::ffi::Abi::CallDynamic::call_dynamic`]. Errors (missing symbol, ABI dispatch
 /// failure) become `FfiError` throw values.
 ///
-/// The symbols are compiled and linked into the kuzo binary by build.rs and resolved at
+/// The symbols are compiled and linked into the frond binary by build.rs and resolved at
 /// runtime by the system dynamic loader (dlsym / GetProcAddress) — no compile-time binding
 /// table is needed.
-pub fn compute_dyn_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_dyn_ffi_call(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let info = graph.dyn_ffi_info(node.0 as usize)
         .expect("compute_dyn_ffi_call: no dyn_ffi_info");
 
@@ -903,9 +908,15 @@ pub fn compute_dyn_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
     }
 
     // Marshal Value → AbiSlot
-    let marshaled = match crate::ffi::Marshal::encode_args(&info.sig, &args) {
+    let mut marshaled = match crate::ffi::Marshal::encode_args(&info.sig, &args) {
         Ok(m) => m,
-        Err(e) => return make_error_throw("FfiError", &e),
+        Err(e) => {
+            if env_flag("FROND_DEBUG_FFI") {
+                eprintln!("[FFI-ENCODE-ERR] symbol={} frame.sg={} err={} args={:?}",
+                    info.symbol, frame.subgraph_id.0, e, args);
+            }
+            return make_error_throw("FfiError", &e);
+        }
     };
 
     // Resolve the symbol address by name (dlsym self-lookup + cache).
@@ -917,12 +928,285 @@ pub fn compute_dyn_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
         ),
     };
 
+    if env_flag("FROND_DEBUG_FFI") {
+        eprintln!("[FFI] symbol={} frame.sg={} frame.offset={} arg_count={} slots={}",
+            info.symbol, frame.subgraph_id.0, frame.node_offset, info.arg_count,
+            marshaled.slots.len());
+    }
     // ABI dynamic call (marshaled must outlive this call for str NULL buffers)
     let result = match crate::ffi::Abi::CallDynamic::call_dynamic(&info.sig, fn_ptr, &marshaled.slots) {
-        Ok(ret) => crate::ffi::Marshal::decode_ret(&info.sig.ret, ret),
+        Ok(ret) => {
+            // u8[] out-params: copy C-side mutations back into the array heap objects.
+            crate::ffi::Marshal::apply_writebacks(&mut marshaled);
+            crate::ffi::Marshal::decode_ret(&info.sig.ret, ret)
+        }
         Err(e) => make_error_throw("FfiError", e),
     };
     // Explicitly hold marshaled until after the call completes.
+    drop(marshaled);
+    result
+}
+
+// =========================================================================
+// Lib / ForeignFn compute_fns (337-342)
+//
+// Builtin native-library interop: Lib.open / Lib.embed construct `Lib` handles
+// (dlopen / LoadLibraryW via platform::Dylib), lib.lookup resolves a symbol and
+// builds a runtime AbiSig (params from the signature string, ret from the
+// static ForeignFn[R] annotation carried as the lib_ret_kinds metadata tag),
+// and f.call marshals engine Values and invokes the address under the C ABI —
+// the same Marshal/Dispatch/decode_ret path as compute_dyn_ffi_call.
+// =========================================================================
+
+/// Wraps a value as `ThrowVal(Ok(val))` (mirror of make_error_throw).
+fn make_ok_throw(val: Value) -> Value {
+    use crate::value::{HeapObj, ThrowPayload, ThrowValue};
+    Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Ok(val) }))
+}
+
+/// lib_ret_kinds tag ↔ AbiType. The tag is the single-source encoding of the
+/// static `ForeignFn[R]` return annotation (see Builder::lib lowering).
+pub fn lib_ret_kind_to_abi(tag: u8) -> crate::ffi::Abi::AbiType {
+    use crate::ffi::Abi::AbiType;
+    match tag {
+        1 => AbiType::Int { bits: 8, signed: true },
+        2 => AbiType::Int { bits: 16, signed: true },
+        3 => AbiType::Int { bits: 32, signed: true },
+        4 => AbiType::Int { bits: 64, signed: true },
+        5 => AbiType::Int { bits: 8, signed: false },
+        6 => AbiType::Int { bits: 16, signed: false },
+        7 => AbiType::Int { bits: 32, signed: false },
+        8 => AbiType::Int { bits: 64, signed: false },
+        9 => AbiType::Float32,
+        10 => AbiType::Float64,
+        11 => AbiType::Int { bits: 8, signed: false },  // bool
+        12 => AbiType::Int { bits: 32, signed: false }, // char
+        13 => AbiType::Ptr,
+        _ => AbiType::Void,
+    }
+}
+
+/// Frond scalar type name → lib_ret_kinds tag (Builder side). Mirrors
+/// `lib_ret_kind_to_abi`; returns 0 (void) for anything else.
+pub fn abi_name_to_lib_ret_kind(name: &str) -> u8 {
+    match name {
+        "i8" => 1, "i16" => 2, "i32" => 3, "i64" => 4, "isize" => 4,
+        "u8" => 5, "u16" => 6, "u32" => 7, "u64" => 8, "usize" => 8,
+        "f32" => 9, "f64" => 10, "bool" => 11, "char" => 12,
+        _ if name.starts_with('*') => 13,
+        _ => 0,
+    }
+}
+
+/// Extracts a `&str` from a forced input value (None when not a str heap obj).
+fn input_str(v: &Value) -> Option<&str> {
+    match v.heap_obj() {
+        Some(crate::value::HeapObj::Str(s)) => Some(s.bytes()),
+        _ => None,
+    }
+}
+
+/// FNV-1a 64 over the resource bytes — collision-safe filename component for
+/// the embed extraction cache.
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Global extraction cache: content hash → extracted temp-file path. Ensures
+/// one write per distinct embedded blob per process (and, because the target
+/// file is hash-named, reuses files left by previous runs).
+static EMBED_CACHE: std::sync::OnceLock<std::sync::Mutex<rustc_hash::FxHashMap<u64, std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+
+/// Extract embedded resource bytes to the temp dir (hash-named, idempotent)
+/// and return the path.
+fn extract_embedded(name: &str, bytes: &[u8]) -> Result<std::path::PathBuf, String> {
+    let cache = EMBED_CACHE.get_or_init(|| std::sync::Mutex::new(rustc_hash::FxHashMap::default()));
+    let hash = fnv64(bytes);
+    if let Some(p) = cache.lock().unwrap().get(&hash) {
+        return Ok(p.clone());
+    }
+    // Preserve the original extension so Windows resolves SxS/dependent dlls by name.
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("blob");
+    let ext = std::path::Path::new(base)
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let file_name = format!("frond-embed-{:016x}{}", hash, ext);
+    let path = std::env::temp_dir().join(file_name);
+    if !path.exists() {
+        std::fs::write(&path, bytes)
+            .map_err(|e| format!("embed extract to '{}' failed: {}", path.display(), e))?;
+    }
+    cache.lock().unwrap().insert(hash, path.clone());
+    Ok(path)
+}
+
+/// Opens a native library by path and wraps it as a `Lib` value (Throw).
+fn open_lib_value(path: &str) -> Value {
+    match crate::platform::Dylib::open(path) {
+        Ok(handle) => {
+            let shared = std::sync::Arc::new(crate::value::LibShared {
+                handle,
+                path: path.to_string(),
+                closed: std::sync::atomic::AtomicBool::new(false),
+            });
+            make_ok_throw(Value::ref_val(crate::value::HeapObj::LibVal(
+                crate::value::LibValue { shared },
+            )))
+        }
+        Err(e) => make_error_throw("FfiError", &format!("Lib.open('{}'): {}", path, e)),
+    }
+}
+
+/// compute_fn (337): `Lib.open(path)` — dlopen/LoadLibraryW by path.
+/// inputs[0] = path str (+ trailing effect dep).
+pub fn compute_lib_open(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
+    let path_val = force_input(frame, inputs[0]);
+    match input_str(&path_val) {
+        Some(path) => open_lib_value(path),
+        None => make_error_throw("FfiError", "Lib.open: path argument is not a str"),
+    }
+}
+
+/// compute_fn (338): `Lib.embed(path)` — extract the build-time resource
+/// recorded under `embed_infos[node]` to the temp cache and load it.
+/// Reads no runtime inputs (the path literal was captured at build time).
+pub fn compute_lib_embed(_frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    let graph = ctx.graph;
+    let res_idx = graph
+        .embed_info(node.0 as usize)
+        .expect("compute_lib_embed: no embed_info") as usize;
+    let (name, bytes) = match graph.resource(res_idx) {
+        Some(r) => r,
+        None => return make_error_throw("FfiError", "Lib.embed: resource missing from artifact"),
+    };
+    let bytes: &[u8] = bytes;
+    match extract_embedded(&name, bytes) {
+        Ok(path) => {
+            let p = path.to_string_lossy().into_owned();
+            open_lib_value(&p)
+        }
+        Err(e) => make_error_throw("FfiError", &format!("Lib.embed('{}'): {}", name, e)),
+    }
+}
+
+/// compute_fn (339): `lib.lookup(name, args_sig): Throw[ForeignFn[R], FfiError]`.
+/// The AbiSig return comes from the static R (lib_ret_kinds metadata);
+/// params come from the runtime signature string.
+pub fn compute_lib_lookup(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::{ForeignFnValue, HeapObj, LibValue};
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
+    let lib_val = force_input(frame, inputs[0]);
+    let name_val = force_input(frame, inputs[1]);
+    let sig_val = force_input(frame, inputs[2]);
+
+    let shared = match lib_val.heap_obj() {
+        Some(HeapObj::LibVal(LibValue { shared })) => shared.clone(),
+        _ => return make_error_throw("FfiError", "lib.lookup: receiver is not a Lib"),
+    };
+    if shared.closed.load(std::sync::atomic::Ordering::SeqCst) {
+        return make_error_throw("FfiError", &format!("lib.lookup: library '{}' is closed", shared.path));
+    }
+    let (name, sig_str) = match (input_str(&name_val), input_str(&sig_val)) {
+        (Some(n), Some(s)) => (n, s),
+        _ => return make_error_throw("FfiError", "lib.lookup: name and args signature must be str"),
+    };
+    let ret_tag = graph
+        .lib_ret_kind(node.0 as usize)
+        .unwrap_or(0);
+    let sig = match crate::ffi::Abi::parse_arg_sig(sig_str, lib_ret_kind_to_abi(ret_tag)) {
+        Ok(s) => s,
+        Err(e) => return make_error_throw("FfiError", &format!("lib.lookup('{}'): {}", name, e)),
+    };
+    match crate::platform::Dylib::symbol(shared.handle, name) {
+        Some(addr) => make_ok_throw(Value::ref_val(HeapObj::ForeignFnVal(ForeignFnValue {
+            shared,
+            addr,
+            sig,
+            name: name.to_string(),
+        }))),
+        None => make_error_throw(
+            "FfiError",
+            &format!("lib.lookup: symbol '{}' not found in '{}'", name, shared.path),
+        ),
+    }
+}
+
+/// compute_fn (340): `lib.has_symbol(name): bool`.
+pub fn compute_lib_has_symbol(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::{HeapObj, LibValue};
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
+    let lib_val = force_input(frame, inputs[0]);
+    let name_val = force_input(frame, inputs[1]);
+    let found = match lib_val.heap_obj() {
+        Some(HeapObj::LibVal(LibValue { shared })) => {
+            let name = input_str(&name_val).unwrap_or("");
+            !shared.closed.load(std::sync::atomic::Ordering::SeqCst)
+                && crate::platform::Dylib::symbol(shared.handle, name).is_some()
+        }
+        _ => false,
+    };
+    Value::bool_val(found)
+}
+
+/// compute_fn (341): `lib.close(): void` — idempotent; the shared handle makes
+/// all derived ForeignFns reject further calls.
+pub fn compute_lib_close(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::{HeapObj, LibValue};
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
+    let lib_val = force_input(frame, inputs[0]);
+    if let Some(HeapObj::LibVal(LibValue { shared })) = lib_val.heap_obj() {
+        if !shared.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            crate::platform::Dylib::close(shared.handle);
+        }
+    }
+    Value::VOID
+}
+
+/// compute_fn (342): `f.call(a1..an): Throw[R, FfiError]` — any arity.
+/// inputs[0] = ForeignFn; arg count from the shared closure_call_arg_count
+/// metadata slot; marshal → dispatch → writeback → decode, like
+/// compute_dyn_ffi_call but with the address+sig carried by the value.
+pub fn compute_ffn_call(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::HeapObj;
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
+    let ffn_val = force_input(frame, inputs[0]);
+    let ffn = match ffn_val.heap_obj() {
+        Some(HeapObj::ForeignFnVal(f)) => f.clone(),
+        _ => return make_error_throw("FfiError", "call: receiver is not a ForeignFn"),
+    };
+    if ffn.shared.closed.load(std::sync::atomic::Ordering::SeqCst) {
+        return make_error_throw(
+            "FfiError",
+            &format!("call '{}': library '{}' is closed", ffn.name, ffn.shared.path),
+        );
+    }
+    let arg_count = graph
+        .closure_call_arg_count(node.0 as usize)
+        .unwrap_or(0) as usize;
+    let mut args = Vec::with_capacity(arg_count);
+    for i in 0..arg_count.min(inputs.len().saturating_sub(1)) {
+        args.push(force_input(frame, inputs[i + 1]));
+    }
+    let mut marshaled = match crate::ffi::Marshal::encode_args(&ffn.sig, &args) {
+        Ok(m) => m,
+        Err(e) => return make_error_throw("FfiError", &format!("call '{}': {}", ffn.name, e)),
+    };
+    let result = match crate::ffi::Abi::CallDynamic::call_dynamic(&ffn.sig, ffn.addr, &marshaled.slots) {
+        Ok(ret) => {
+            crate::ffi::Marshal::apply_writebacks(&mut marshaled);
+            let v = crate::ffi::Marshal::decode_ret(&ffn.sig.ret, ret);
+            make_ok_throw(v)
+        }
+        Err(e) => make_error_throw("FfiError", &format!("call '{}': {}", ffn.name, e)),
+    };
     drop(marshaled);
     result
 }
@@ -944,12 +1228,12 @@ pub fn compute_dyn_ffi_call(frame: &mut Frame, node: NodeId) -> Value {
 /// Before formatting, forces evaluation of the LazyValue (if the input is
 /// lazy), then calls `value::format_value`. Does not depend on
 /// `ffi_call_name`; reads `inputs[0]` directly.
-pub fn compute_reflect_format(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, _n, inputs);
+pub fn compute_reflect_format(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let s = crate::value::format_value(&v, 0);
-    Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&s)))
+    Value::ref_val(crate::value::HeapObj::Str(crate::value::Str::from_rust_str(&s)))
 }
 
 /// compute_fn (idx 291): scalar value → str.
@@ -957,12 +1241,12 @@ pub fn compute_reflect_format(frame: &mut Frame, node: NodeId) -> Value {
 /// Semantically identical to `compute_reflect_format` (both go through
 /// `format_value`); kept as a distinct id for historical compatibility
 /// (the two were once separate `@extern("C")` primitives).
-pub fn compute_reflect_scalar_to_str(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, _n, inputs);
+pub fn compute_reflect_scalar_to_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let s = crate::value::format_value(&v, 0);
-    Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&s)))
+    Value::ref_val(crate::value::HeapObj::Str(crate::value::Str::from_rust_str(&s)))
 }
 
 // =========================================================================
@@ -974,34 +1258,34 @@ pub fn compute_reflect_scalar_to_str(frame: &mut Frame, node: NodeId) -> Value {
 // =========================================================================
 
 /// compute_fn (326): `v.kind()` → u8 (TypeKind, see types/kind).
-pub fn compute_reflect_kind(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, _n, inputs);
+pub fn compute_reflect_kind(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     Value::u8(reflect_kind(&v))
 }
 
 /// compute_fn (327): `v.type_name()` → str.
-pub fn compute_reflect_type_name(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, _n, inputs);
+pub fn compute_reflect_type_name(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let name = reflect_type_name(&v);
-    Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&name)))
+    Value::ref_val(crate::value::HeapObj::Str(crate::value::Str::from_rust_str(&name)))
 }
 
 /// compute_fn (328): `v.kind()` → str ("Record"/"Adt"/"Primitive"/...).
-pub fn compute_reflect_kind_str(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, _n, inputs);
+pub fn compute_reflect_kind_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let s = reflect_kind_str(&v);
-    Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(s)))
+    Value::ref_val(crate::value::HeapObj::Str(crate::value::Str::from_rust_str(s)))
 }
 
 /// compute_fn (329): `v.size()` → u8 (scalar byte width; 0 for heap objects).
-pub fn compute_reflect_size(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, _n, inputs);
+pub fn compute_reflect_size(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let size: u8 = match &v {
@@ -1012,24 +1296,24 @@ pub fn compute_reflect_size(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 /// compute_fn (330): `v.size()` → u32 (aggregate layout size estimate).
-pub fn compute_reflect_layout_size(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, _n, inputs);
+pub fn compute_reflect_layout_size(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     Value::u32(crate::value::reflect_layout_size(&v))
 }
 
 /// compute_fn (331): `v.alignment()` → u32.
-pub fn compute_reflect_layout_align(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, _n, inputs);
+pub fn compute_reflect_layout_align(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     Value::u32(crate::value::reflect_layout_alignment(&v))
 }
 
 /// compute_fn (332): `v.field_count()` → u16 (Record/Adt/Newtype/Array).
-pub fn compute_reflect_field_count(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, _n, inputs);
+pub fn compute_reflect_field_count(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let count: u16 = match v.heap_obj() {
@@ -1043,8 +1327,8 @@ pub fn compute_reflect_field_count(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 /// compute_fn (333): `v.field_name(i)` → str.
-pub fn compute_reflect_field_name(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, _n, inputs);
+pub fn compute_reflect_field_name(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let i = force_input(frame, inputs[1]).as_u16();
@@ -1062,12 +1346,12 @@ pub fn compute_reflect_field_name(frame: &mut Frame, node: NodeId) -> Value {
         }
         _ => String::new(),
     };
-    Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&name)))
+    Value::ref_val(crate::value::HeapObj::Str(crate::value::Str::from_rust_str(&name)))
 }
 
 /// compute_fn (334): `v.field_value(i)` → Value (child value for recursive reflection).
-pub fn compute_reflect_field_value(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, _n, inputs);
+pub fn compute_reflect_field_value(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let i = force_input(frame, inputs[1]).as_u16();
@@ -1086,8 +1370,8 @@ pub fn compute_reflect_field_value(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 /// compute_fn (335): `v.array_len()` → usize.
-pub fn compute_reflect_array_len(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, _n, inputs);
+pub fn compute_reflect_array_len(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let len = match v.heap_obj() {
@@ -1098,23 +1382,23 @@ pub fn compute_reflect_array_len(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 /// compute_fn (336): `v.adt_constructor()` → str.
-pub fn compute_reflect_adt_ctor(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, _n, inputs);
+pub fn compute_reflect_adt_ctor(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let ctor = match v.heap_obj() {
         Some(crate::value::HeapObj::Adt(a)) => a.constructor.clone(),
         _ => String::new(),
     };
-    Value::ref_val(crate::value::HeapObj::Str(crate::value::KuzoStr::from_rust_str(&ctor)))
+    Value::ref_val(crate::value::HeapObj::Str(crate::value::Str::from_rust_str(&ctor)))
 }
 
 /// compute_fn: type construction (collects field values from inputs and builds
 /// a Record/Adt/Newtype HeapObj based on `kind`).
-pub fn compute_record_construct(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_record_construct(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::ir::Ir::{RecordLitInfo, RecordLitKind};
     use crate::value::{AdtField, AdtValue, HeapObj, NewtypeValue, RecordValue, ValueArena};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let fields: Vec<Value> = inputs
         .iter()
         .map(|&input_node| frame.get_value_by_global(input_node))
@@ -1165,8 +1449,8 @@ pub fn compute_record_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// Unified mechanism: both Record and Adt use `find_field(name)` for name-based
 /// lookup, independent of the compile-time `field_idx`. This eliminates the idx
 /// fallback and any Record/Adt path divergence.
-pub fn compute_record_field_get(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_record_field_get(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let record_val = force_input(frame, inputs[0]);
     let name = graph.field_set_name(node.0 as usize);
     let make_err = |msg: &str| make_error_throw("FieldError", msg);
@@ -1182,9 +1466,9 @@ pub fn compute_record_field_get(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 /// compute_fn: array construction (collects elements from inputs and builds an ArrayValue).
-pub fn compute_array_construct(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_array_construct(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{ArrayValue, HeapObj};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let elements: Vec<Value> = inputs
         .iter()
         .map(|&input_node| frame.get_value_by_global(input_node))
@@ -1195,9 +1479,9 @@ pub fn compute_array_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// compute_fn: array fill `[value, ..count]` (321).
 /// inputs[0] = value to repeat, inputs[1] = count (integer).
 /// Returns an array of `count` copies of `value`. Negative or zero count yields empty array.
-pub fn compute_array_fill(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_array_fill(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{ArrayValue, HeapObj};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let value = frame.get_value_by_global(inputs[0]);
     let count_raw = frame.get_value_by_global(inputs[1]).as_i64();
     if count_raw <= 0 {
@@ -1215,8 +1499,8 @@ pub fn compute_array_fill(frame: &mut Frame, node: NodeId) -> Value {
 /// (under the Value model, `Arc` is the only reference mechanism), and is kept
 /// as a separation point: once the Value model supports frame-local
 /// allocation, this function can switch to genuine stack allocation.
-pub fn compute_record_construct_stack(frame: &mut Frame, node: NodeId) -> Value {
-    compute_record_construct(frame, node)
+pub fn compute_record_construct_stack(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    compute_record_construct(frame, node, ctx)
 }
 
 /// compute_fn: stack-allocated array construction (289).
@@ -1224,14 +1508,14 @@ pub fn compute_record_construct_stack(frame: &mut Frame, node: NodeId) -> Value 
 /// Used at allocation sites the analyzer marks as non-escaping.
 /// The current implementation is identical to `compute_array_construct`, kept
 /// as a separation point.
-pub fn compute_array_construct_stack(frame: &mut Frame, node: NodeId) -> Value {
-    compute_array_construct(frame, node)
+pub fn compute_array_construct_stack(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    compute_array_construct(frame, node, ctx)
 }
 
 /// compute_fn: array indexing (fetches an element from an ArrayValue by i32 index).
 /// Panics on out-of-bounds or negative index (Rust-style bounds checking).
-pub fn compute_array_index(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_array_index(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let recv_val = force_input(frame, inputs[0]);
     let idx_raw = force_input(frame, inputs[1]).as_i32();
     if idx_raw < 0 {
@@ -1261,9 +1545,9 @@ pub fn compute_array_index(frame: &mut Frame, node: NodeId) -> Value {
 /// - array: sliced by element index, returns a new array.
 /// Out-of-bounds indices are clamped to `[0, len]`, matching Rust slice
 /// semantics (no panic).
-pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::value::{ArrayValue, HeapObj, KuzoStr};
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_slice(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::{ArrayValue, HeapObj, Str};
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let recv_val = force_input(frame, inputs[0]);
     let start = force_input(frame, inputs[1]).as_usize();
     let mut end = force_input(frame, inputs[2]).as_usize();
@@ -1301,7 +1585,7 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
             for c in &chars[st..en] {
                 buf.push(*c);
             }
-            Value::ref_val(HeapObj::Str(KuzoStr::new(buf)))
+            Value::ref_val(HeapObj::Str(Str::new(buf)))
         }
         _ => make_err("slice on non-sliceable type"),
     }
@@ -1310,9 +1594,9 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId) -> Value {
 /// compute_fn: string concatenation `lhs + rhs` (both sides must be str).
 ///
 /// Two inputs: lhs, rhs. Returns an error value if either side is not a str.
-pub fn compute_str_concat(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_str_concat(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::HeapObj;
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let lhs = force_input(frame, inputs[0]);
     let rhs = force_input(frame, inputs[1]);
     let make_err = |msg: &str| make_error_throw("TypeError", msg);
@@ -1329,13 +1613,13 @@ pub fn compute_str_concat(frame: &mut Frame, node: NodeId) -> Value {
 /// All inputs (>=2) are concatenated into a single str in one pass, O(n) time complexity.
 /// Used for the compile-time lowering of string interpolation `"a{b}c{d}e"`, replacing the chained `compute_str_concat` which is O(n^2).
 /// Inputs have already been converted to str via `compute_reflect_format` in the Builder; here they are concatenated directly.
-pub fn compute_str_multi_concat(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::value::{HeapObj, KuzoStr};
-    let graph = frame.graph.clone();
+pub fn compute_str_multi_concat(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::{HeapObj, Str};
+    let graph = ctx.graph;
     let n = graph.node(node.0 as usize);
     let inputs = graph.inputs(n.inputs_offset, n.input_count);
     if inputs.is_empty() {
-        return Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str("")));
+        return Value::ref_val(HeapObj::Str(Str::from_rust_str("")));
     }
     // First force-evaluate all inputs and collect Values (to avoid temporary Values being dropped during the loop, which would invalidate references)
     let mut vals: Vec<Value> = Vec::with_capacity(inputs.len());
@@ -1357,16 +1641,16 @@ pub fn compute_str_multi_concat(frame: &mut Frame, node: NodeId) -> Value {
             buf.push_str(s.bytes());
         }
     }
-    Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str(&buf)))
+    Value::ref_val(HeapObj::Str(Str::from_rust_str(&buf)))
 }
 
 /// compute_fn (idx 320): string array join — `str[] + sep → str`.
 ///
 /// One-shot O(n) concat, replacing the stdlib loop `result = result + seg` (O(n^2)).
 /// inputs[0] = str[] array, inputs[1] = sep separator.
-pub fn compute_str_array_join(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::value::{HeapObj, KuzoStr};
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_str_array_join(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::{HeapObj, Str};
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let arr_val = force_input(frame, inputs[0]);
     let sep_val = force_input(frame, inputs[1]);
     let sep = match sep_val.heap_obj() {
@@ -1378,7 +1662,7 @@ pub fn compute_str_array_join(frame: &mut Frame, node: NodeId) -> Value {
         _ => return make_error_throw("TypeError", "str_array_join: first operand is not array"),
     };
     if elements.is_empty() {
-        return Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str("")));
+        return Value::ref_val(HeapObj::Str(Str::from_rust_str("")));
     }
     // First pass: compute total length
     let sep_bytes = sep.byte_len();
@@ -1404,7 +1688,7 @@ pub fn compute_str_array_join(frame: &mut Frame, node: NodeId) -> Value {
         }
         buf.push_str(s);
     }
-    Value::ref_val(HeapObj::Str(KuzoStr::from_rust_str(&buf)))
+    Value::ref_val(HeapObj::Str(Str::from_rust_str(&buf)))
 }
 
 /// compute_fn (idx 270): global variable read.
@@ -1412,7 +1696,7 @@ pub fn compute_str_array_join(frame: &mut Frame, node: NodeId) -> Value {
 /// No inputs; reads the value from `graph.global_var_storage[slot]`.
 /// The slot index is obtained from `graph.global_load_slots[node]`.
 /// Global variables do not depend on the frame chain, so any function can read them correctly.
-pub fn compute_global_load(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_global_load(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> Value {
     let slot = frame.graph.global_load_slot(node.0 as usize)
         .expect("global_load node has no slot");
     let storage = &frame.graph.global_var_storage;
@@ -1427,8 +1711,8 @@ pub fn compute_global_load(frame: &mut Frame, node: NodeId) -> Value {
 /// `graph.global_var_storage[slot]`. The slot index is obtained from
 /// `graph.global_store_slots[node]`. Returns the written value (for downstream
 /// chained use).
-pub fn compute_global_store(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_global_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let val = force_input(frame, inputs[0]);
     let slot = graph.global_store_slot(node.0 as usize)
         .expect("global_store node has no slot");
@@ -1444,10 +1728,10 @@ pub fn compute_global_store(frame: &mut Frame, node: NodeId) -> Value {
 /// Returns a Record `{hit: bool, value: Value}`:
 /// - hit: `hit=true`, `value=cached value`
 /// - miss: `hit=false`, `value=Void`
-pub fn compute_memo_check(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_memo_check(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{HeapObj, RecordValue};
     use std::hash::{Hash, Hasher};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let info = graph.memo_info(node.0 as usize)
         .expect("memo_check node has no MemoInfo");
     let param_count = info.param_count as usize;
@@ -1456,7 +1740,7 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId) -> Value {
     let param_vals: Vec<Value> = inputs[..param_count].iter()
         .map(|&inp| frame.get_value_by_global(inp))
         .collect();
-    if env_flag("KUZO_DEBUG_MEMO") {
+    if env_flag("FROND_DEBUG_MEMO") {
         eprintln!("[MEMO_CHECK] table={} params={:?}", info.table_index, param_vals);
     }
     for val in &param_vals {
@@ -1469,7 +1753,7 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId) -> Value {
         let guard = table[info.table_index as usize].lock().unwrap();
         guard.get(&key).cloned()
     };
-    if env_flag("KUZO_DEBUG_MEMO") {
+    if env_flag("FROND_DEBUG_MEMO") {
         eprintln!("[MEMO_CHECK] key={} hit={}", key, hit_val.is_some());
     }
     match hit_val {
@@ -1499,9 +1783,9 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId) -> Value {
 /// `inputs[0..param_count]` are the parameter values (used as the cache key),
 /// and `inputs[param_count]` is the result value. Writes the result into the
 /// cache table and then forwards it (for downstream use).
-pub fn compute_memo_store(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_memo_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use std::hash::{Hash, Hasher};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let info = graph.memo_info(node.0 as usize)
         .expect("memo_store node has no MemoInfo");
     let param_count = info.param_count as usize;
@@ -1515,7 +1799,7 @@ pub fn compute_memo_store(frame: &mut Frame, node: NodeId) -> Value {
         val.hash(&mut hasher);
     }
     let key = hasher.finish();
-    if env_flag("KUZO_DEBUG_MEMO") {
+    if env_flag("FROND_DEBUG_MEMO") {
         eprintln!("[MEMO_STORE] table={} key={} params={:?} result={:?}",
             info.table_index, key, param_vals, result_val);
     }
@@ -1535,9 +1819,9 @@ pub fn compute_memo_store(frame: &mut Frame, node: NodeId) -> Value {
 /// to `inputs[1..]`. Clones the base's fields and field names, then either
 /// replaces same-named fields or appends new ones per `update_names`, building a
 /// new RecordValue (preserving the base's `type_name`).
-pub fn compute_record_extend(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_record_extend(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{HeapObj, RecordValue};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let info = graph.record_extend_info_at(node.0 as usize);
     let info = info
         .as_ref()
@@ -1592,9 +1876,9 @@ pub fn compute_record_extend(frame: &mut Frame, node: NodeId) -> Value {
 /// `inputs[0]` is the initial-value node; it is wrapped in an `AtomicValue`
 /// (an atomic container sharing the underlying memory). `AtomicValue.data` is a
 /// Value, so this compute_fn can construct it without an arena.
-pub fn compute_atomic_construct(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_atomic_construct(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{AtomicValue, HeapObj};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let val = force_input(frame, inputs[0]);
     Value::ref_val(HeapObj::AtomicVal(AtomicValue::new(val)))
 }
@@ -1602,8 +1886,8 @@ pub fn compute_atomic_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// compute_fn (idx 315): atomic load.
 ///
 /// Input: the Atomic<T> reference. Returns a clone of the inner value.
-pub fn compute_atomic_load(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_atomic_load(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let recv = force_input(frame, inputs[0]);
     match recv.heap_obj() {
         Some(crate::value::HeapObj::AtomicVal(a)) => a.load(),
@@ -1614,8 +1898,8 @@ pub fn compute_atomic_load(frame: &mut Frame, node: NodeId) -> Value {
 /// compute_fn (idx 316): atomic store.
 ///
 /// Inputs: [Atomic<T>, new_value]. Stores `new_value` into the atomic and returns void.
-pub fn compute_atomic_store(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_atomic_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let recv = force_input(frame, inputs[0]);
     let new_val = force_input(frame, inputs[1]);
     if let Some(crate::value::HeapObj::AtomicVal(a)) = recv.heap_obj() {
@@ -1628,8 +1912,8 @@ pub fn compute_atomic_store(frame: &mut Frame, node: NodeId) -> Value {
 ///
 /// Inputs: [Atomic<T>, new_value]. Replaces the inner value with `new_value` and
 /// returns the previous value.
-pub fn compute_atomic_swap(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_atomic_swap(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let recv = force_input(frame, inputs[0]);
     let new_val = force_input(frame, inputs[1]);
     match recv.heap_obj() {
@@ -1642,8 +1926,8 @@ pub fn compute_atomic_swap(frame: &mut Frame, node: NodeId) -> Value {
 ///
 /// Inputs: [Atomic<T>, expected, new]. If the current value equals `expected`,
 /// replaces it with `new` and returns true; otherwise returns false.
-pub fn compute_atomic_compare_exchange(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_atomic_compare_exchange(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let recv = force_input(frame, inputs[0]);
     let expected = force_input(frame, inputs[1]);
     let new_val = force_input(frame, inputs[2]);
@@ -1661,8 +1945,8 @@ pub fn compute_atomic_compare_exchange(frame: &mut Frame, node: NodeId) -> Value
 /// Record whose `type_name` matches, or a ThrowVal whose constructor name is
 /// "Ok"/"Error" matching the corresponding payload variant.
 /// Returns `bool`.
-pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let val = force_input(frame, inputs[0]);
     let ctor_name = graph.pattern_ctor_name(node.0 as usize)
         .expect("pattern ctor match node has no ctor name");
@@ -1679,7 +1963,26 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId) -> Value {
         Some(crate::value::HeapObj::Newtype(n)) => n.type_name == ctor_name,
         Some(crate::value::HeapObj::ThrowVal(tv)) => match &tv.payload {
             crate::value::ThrowPayload::Ok(_) => ctor_name == CTOR_OK,
-            crate::value::ThrowPayload::Err(_) => ctor_name == CTOR_ERR || ctor_name == CTOR_ERR_ALT,
+            crate::value::ThrowPayload::Err(payload) => {
+                if ctor_name == CTOR_ERR || ctor_name == CTOR_ERR_ALT {
+                    true
+                } else {
+                    // User error-type constructor pattern (e.g. a `MyErr(e)` arm on
+                    // Throw<T, MyErr>): match against the THROWN PAYLOAD's constructor
+                    // (consistent with `Error(v)` arms, whose sub-patterns bind the
+                    // payload). Without this, any error arm not spelled Error/Err
+                    // could never match at runtime and fell into the fallback panic.
+                    match payload.heap_obj() {
+                        Some(crate::value::HeapObj::Adt(a)) => {
+                            a.constructor == ctor_name
+                                && type_name.map_or(true, |tn| a.type_name == tn)
+                        }
+                        Some(crate::value::HeapObj::Newtype(n)) => n.type_name == ctor_name,
+                        Some(crate::value::HeapObj::Record(r)) => r.type_name == ctor_name,
+                        _ => false,
+                    }
+                }
+            }
         },
         _ => false,
     };
@@ -1692,8 +1995,8 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId) -> Value {
 /// Fetches a field value from an ADT by position, or from a Record by position,
 /// or extracts the inner value from a ThrowVal (index 0: Ok's `val` or Err's
 /// `record`). Returns the field value (out-of-bounds returns Void).
-pub fn compute_pattern_adt_field_get(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_pattern_adt_field_get(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let val = force_input(frame, inputs[0]);
     let idx = graph.pattern_field_index(node.0 as usize)
         .expect("pattern adt field get node has no field index")
@@ -1734,8 +2037,8 @@ pub fn compute_pattern_adt_field_get(frame: &mut Frame, node: NodeId) -> Value {
 ///
 /// Inputs: scrutinee, str_const. Compares whether the two values are equal strings.
 /// Returns `bool`.
-pub fn compute_pattern_str_eq(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_pattern_str_eq(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let lhs = force_input(frame, inputs[0]);
     let rhs = force_input(frame, inputs[1]);
     let lhs_str = match lhs.heap_obj() {
@@ -1755,9 +2058,9 @@ pub fn compute_pattern_str_eq(frame: &mut Frame, node: NodeId) -> Value {
 /// semantics; UTF-8 byte order matches codepoint order).
 /// Returns `false` when an operand is not a str (for Eq/Le/Ge), or returns
 /// `false` without panicking under `Ord` semantics.
-/// Uses `KuzoStr.compare` (`Ordering`) to avoid redundant allocations.
-fn str_compare_operands(frame: &mut Frame, node: NodeId) -> Option<std::cmp::Ordering> {
-    read_node_inputs!(frame, node, graph, n, inputs);
+/// Uses `Str.compare` (`Ordering`) to avoid redundant allocations.
+fn str_compare_operands(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Option<std::cmp::Ordering> {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let lhs = force_input(frame, inputs[0]);
     let rhs = force_input(frame, inputs[1]);
     match (lhs.heap_obj(), rhs.heap_obj()) {
@@ -1768,34 +2071,34 @@ fn str_compare_operands(frame: &mut Frame, node: NodeId) -> Option<std::cmp::Ord
     }
 }
 
-pub fn compute_eq_str(frame: &mut Frame, node: NodeId) -> Value {
-    Value::bool_val(str_compare_operands(frame, node) == Some(std::cmp::Ordering::Equal))
+pub fn compute_eq_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    Value::bool_val(str_compare_operands(frame, node, ctx) == Some(std::cmp::Ordering::Equal))
 }
 
-pub fn compute_ne_str(frame: &mut Frame, node: NodeId) -> Value {
-    Value::bool_val(str_compare_operands(frame, node) != Some(std::cmp::Ordering::Equal))
+pub fn compute_ne_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    Value::bool_val(str_compare_operands(frame, node, ctx) != Some(std::cmp::Ordering::Equal))
 }
 
-pub fn compute_lt_str(frame: &mut Frame, node: NodeId) -> Value {
-    Value::bool_val(str_compare_operands(frame, node) == Some(std::cmp::Ordering::Less))
+pub fn compute_lt_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    Value::bool_val(str_compare_operands(frame, node, ctx) == Some(std::cmp::Ordering::Less))
 }
 
-pub fn compute_gt_str(frame: &mut Frame, node: NodeId) -> Value {
-    Value::bool_val(str_compare_operands(frame, node) == Some(std::cmp::Ordering::Greater))
+pub fn compute_gt_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    Value::bool_val(str_compare_operands(frame, node, ctx) == Some(std::cmp::Ordering::Greater))
 }
 
-pub fn compute_le_str(frame: &mut Frame, node: NodeId) -> Value {
-    Value::bool_val(matches!(str_compare_operands(frame, node), Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)))
+pub fn compute_le_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    Value::bool_val(matches!(str_compare_operands(frame, node, ctx), Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)))
 }
 
-pub fn compute_ge_str(frame: &mut Frame, node: NodeId) -> Value {
-    Value::bool_val(matches!(str_compare_operands(frame, node), Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)))
+pub fn compute_ge_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    Value::bool_val(matches!(str_compare_operands(frame, node, ctx), Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)))
 }
 
 /// compute_fn: generic type conversion — any value → str (idx 277).
 ///
 /// Input: source-value node. Dispatches formatting per `Value` variant to
-/// produce a KuzoStr:
+/// produce a Str:
 ///   - scalar integer → `as_int_i128().to_string()`
 ///   - scalar float → `as_float_f64().to_string()`
 ///   - bool → "true"/"false"
@@ -1804,9 +2107,9 @@ pub fn compute_ge_str(frame: &mut Frame, node: NodeId) -> Value {
 ///   - Null → "null"
 ///   - Void → "void"
 ///   - other Ref → "<non-scalar>"
-pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId) -> Value {
-    use crate::value::{HeapObj, KuzoStr, ValueTag};
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::{HeapObj, Str, ValueTag};
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let val = force_input(frame, inputs[0]);
 
     let s: String = match &val {
@@ -1828,7 +2131,7 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId) -> Value {
             }
         }
         Value::Ref(r) => match r.as_ref() {
-            HeapObj::Str(kuzo_str) => kuzo_str.bytes().to_string(),
+            HeapObj::Str(frond_str) => frond_str.bytes().to_string(),
             HeapObj::Array(arr) => {
                 // u8[] → str: extract bytes from SoA or elements
                 use crate::value::ScalarSoA;
@@ -1844,7 +2147,7 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId) -> Value {
             _ => "<non-scalar>".to_string(),
         },
     };
-    Value::ref_val(HeapObj::Str(KuzoStr::new(s)))
+    Value::ref_val(HeapObj::Str(Str::new(s)))
 }
 
 /// compute_fn: generic type conversion — scalar → scalar (idx 278).
@@ -1854,9 +2157,9 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId) -> Value {
 /// int↔int (truncate/extend), int↔float, float↔float, bool→int, char→int.
 /// The target type is read from the `cast_target_types` metadata and the
 /// corresponding Value is constructed by dispatching on `ValueTag`.
-pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::ValueTag;
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let val = force_input(frame, inputs[0]);
     let target_ty = graph.cast_target_type(node.0 as usize)
         .expect("cast_scalar node has no target type");
@@ -1910,8 +2213,8 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId) -> Value {
 /// Input is a nullable value: `Null` → panic (a programming error, not a
 /// recoverable flow); non-Null → returned as-is (Scalar/Ref pass-through, i.e.
 /// unwrapping the nullable).
-pub fn compute_non_null_assert(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_non_null_assert(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let v = force_input(frame, inputs[0]);
     if v.is_null() {
         panic!("non-null assertion failed: value is null");
@@ -1925,8 +2228,8 @@ pub fn compute_non_null_assert(frame: &mut Frame, node: NodeId) -> Value {
 /// `Value::Ref(arc)`. Multiple references share the same Cell (via Arc clone),
 /// so writes are visible to all of them. For values that are already a Ref
 /// (records, etc.), the same Arc is shared directly (no second wrapping needed).
-pub fn compute_ref_of(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_ref_of(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let v = force_input(frame, inputs[0]);
     match &v {
         // Scalar/Null/Void → wrap in a Cell.
@@ -1944,8 +2247,8 @@ pub fn compute_ref_of(frame: &mut Frame, node: NodeId) -> Value {
 /// Input is an `Arc<HeapObj::Cell>`: returns the value inside the Cell.
 /// Input is any other Ref (record/array, etc.): returned as-is (`&rec` shares
 /// the Arc, so `*r` is just `rec` itself).
-pub fn compute_deref_read(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_deref_read(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let v = force_input(frame, inputs[0]);
     match v.heap_obj() {
         Some(crate::value::HeapObj::Cell(c)) => c.get(),
@@ -1959,8 +2262,8 @@ pub fn compute_deref_read(frame: &mut Frame, node: NodeId) -> Value {
 /// the new value into the Cell and returns the written value (for chained use).
 /// Non-Cell references (a record's shared Arc) are left untouched (record field
 /// writes go through `record_field_set`).
-pub fn compute_deref_write(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_deref_write(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let ref_val = force_input(frame, inputs[0]);
     let new_val = force_input(frame, inputs[1]);
     if let Some(crate::value::HeapObj::Cell(c)) = ref_val.heap_obj() {
@@ -1977,8 +2280,8 @@ pub fn compute_deref_write(frame: &mut Frame, node: NodeId) -> Value {
 /// field name is obtained from `graph.field_set_names[node]` and mutated in
 /// place via `Arc::make_mut`. After mutation the value is written back to the
 /// value-table slot so the change is visible to other nodes.
-pub fn compute_record_field_set(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_record_field_set(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let new_value = force_input(frame, inputs[1]);
     graph.field_set_name(node.0 as usize)
         .expect("field set node has no field name");
@@ -2008,7 +2311,7 @@ pub fn compute_record_field_set(frame: &mut Frame, node: NodeId) -> Value {
                     crate::value::HeapObj::Record(r) => {
                         if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(field_name)) {
                             if idx < r.fields.len() {
-                                r.fields[idx] = new_value.clone();
+                                    r.fields[idx] = new_value.clone();
                             }
                         }
                     }
@@ -2035,8 +2338,8 @@ pub fn compute_record_field_set(frame: &mut Frame, node: NodeId) -> Value {
 /// Safety: the engine executes single-threaded; the caller frame is Suspended
 /// while the callee runs, so there is no concurrent access. Out-of-bounds
 /// indices grow the array to `idx + 1` (padding with Void), matching dynamic-array semantics.
-pub fn compute_array_store(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_array_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let idx = force_input(frame, inputs[1]).as_usize();
     let new_value = force_input(frame, inputs[2]);
 
@@ -2066,8 +2369,8 @@ pub fn compute_array_store(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 /// compute_fn: null check (checks whether a value is null; returns `bool`).
-pub fn compute_is_null(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_is_null(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let val = force_input(frame, inputs[0]);
     let is_null = val.is_null();
     Value::bool_val(is_null)
@@ -2077,8 +2380,8 @@ pub fn compute_is_null(frame: &mut Frame, node: NodeId) -> Value {
 /// - Array: element count.
 /// - Str: Unicode codepoint count (consistent with `str[i]` indexing, both
 ///   counted by codepoint).
-pub fn compute_array_len(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_array_len(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let val = force_input(frame, inputs[0]);
     let len = match val.heap_obj() {
         Some(crate::value::HeapObj::Array(arr)) => arr.len() as i32,
@@ -2091,8 +2394,8 @@ pub fn compute_array_len(frame: &mut Frame, node: NodeId) -> Value {
 /// compute_fn: reference equality comparison (`===`), checks whether two Refs'
 /// Arc pointers refer to the same object. Returns `bool`. Uses `Arc::ptr_eq`
 /// when both sides are Refs; otherwise returns `false`.
-pub fn compute_ref_eq(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_ref_eq(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let lhs = force_input(frame, inputs[0]);
     let rhs = force_input(frame, inputs[1]);
     let eq = match (&lhs, &rhs) {
@@ -2103,8 +2406,8 @@ pub fn compute_ref_eq(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 /// compute_fn: reference inequality comparison (`!==`), the negation of RefEq.
-pub fn compute_ref_neq(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_ref_neq(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let lhs = force_input(frame, inputs[0]);
     let rhs = force_input(frame, inputs[1]);
     let neq = match (&lhs, &rhs) {
@@ -2117,8 +2420,8 @@ pub fn compute_ref_neq(frame: &mut Frame, node: NodeId) -> Value {
 /// compute_fn: semantic equality for composite types (record/adt/newtype/array/closure/throw, etc.).
 /// Refs go through `heap_equals` for deep comparison; scalars/Null/Void fall
 /// back to `value_equals`.
-pub fn compute_eq_obj(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_eq_obj(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let lhs = force_input(frame, inputs[0]);
     let rhs = force_input(frame, inputs[1]);
     let eq = crate::value::ValueArena::with_global(|arena| {
@@ -2128,8 +2431,8 @@ pub fn compute_eq_obj(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 /// compute_fn: semantic inequality for composite types; the negation of `compute_eq_obj`.
-pub fn compute_ne_obj(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_ne_obj(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let lhs = force_input(frame, inputs[0]);
     let rhs = force_input(frame, inputs[1]);
     let neq = crate::value::ValueArena::with_global(|arena| {
@@ -2139,9 +2442,9 @@ pub fn compute_ne_obj(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 /// compute_fn: list concatenation (ConcatList) — concatenates two Arrays into a new Array.
-pub fn compute_concat_list(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_concat_list(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{ArrayValue, HeapObj};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let lhs = force_input(frame, inputs[0]);
     let rhs = force_input(frame, inputs[1]);
     match (lhs.heap_obj(), rhs.heap_obj()) {
@@ -2156,18 +2459,18 @@ pub fn compute_concat_list(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 /// compute_fn: range generation (Range, `a..b`, half-open).
-pub fn compute_range(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_range(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{HeapObj, Range};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let start = force_input(frame, inputs[0]).as_i64();
     let end = force_input(frame, inputs[1]).as_i64();
     Value::ref_val(HeapObj::Range(Range::new(start, end, false)))
 }
 
 /// compute_fn: range generation (RangeInclusive, `a..=b`, closed).
-pub fn compute_range_inclusive(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_range_inclusive(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{HeapObj, Range};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let start = force_input(frame, inputs[0]).as_i64();
     let end = force_input(frame, inputs[1]).as_i64();
     Value::ref_val(HeapObj::Range(Range::new(start, end, true)))
@@ -2181,8 +2484,8 @@ pub fn compute_range_inclusive(frame: &mut Frame, node: NodeId) -> Value {
 /// - `ThrowVal(Err(_))` → returns `rhs` (default value on error).
 /// - `null` (Nullable) → returns `rhs`.
 /// - any other non-null value → returns `lhs`.
-pub fn compute_elvis(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_elvis(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let lhs = force_input(frame, inputs[0]);
     // Throw type: Ok unwraps, Err uses the default value.
     if let Some(crate::value::HeapObj::ThrowVal(tv)) = lhs.heap_obj() {
@@ -2206,8 +2509,8 @@ pub fn compute_elvis(frame: &mut Frame, node: NodeId) -> Value {
 /// `target_sg.has_suspend`, and the core loop decides whether to spawn a
 /// subframe + suspend the current frame after observing `pending_call`.
 /// Does not call `start_subgraph` directly (compute_fns have no Engine reference).
-pub fn compute_call_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
-    let graph = frame.graph.clone();
+pub fn compute_call_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
+    let graph = ctx.graph;
     let call_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
 
     // safe_op short-circuit: `?.method(args)` returns Null when the receiver is null, without invoking the call.
@@ -2224,7 +2527,7 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
 
     // Static binding: has call_target → collect args + return NodeResult::Call.
     if let Some(target_sg) = graph.call_target(node.0 as usize) {
-        if env_flag("KUZO_DEBUG_CALL") {
+        if env_flag("FROND_DEBUG_CALL") {
             eprintln!("[CALL] node={:?} target_sg={} frame.sg={} frame.offset={}",
                 node, target_sg.0, frame.subgraph_id.0, frame.node_offset);
         }
@@ -2327,27 +2630,29 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
         });
     }
 
-    // Neither present: the compiler guarantees a Call node has at least one; no panic here, kept fault-tolerant.
-    if env_flag("KUZO_DEBUG_CALL") {
-        eprintln!("[CALL-FALLTHROUGH] node={:?} frame.sg={} frame.offset={} — NO call_target and NO vtable_method! Returning VOID.",
-            node, frame.subgraph_id.0, frame.node_offset);
-    }
-    NodeResult::Value(Value::VOID)
+    // Neither present: the compiler guarantees a Call node has a binding (static
+    // target or vtable dispatch). A missing binding is a broken invariant — fail
+    // loudly instead of silently producing VOID (which masked target-less Call
+    // nodes compiled from unknown callees, e.g. scalar-constructor typos like
+    // `u64(x)`, for months).
+    panic!(
+        "call node {:?} (sg {}) has no call_target and no vtable dispatch — broken compiler invariant",
+        node, frame.subgraph_id.0
+    );
 }
 
 /// compute_fn: Gate node selects a branch + returns `NodeResult::Call`.
-pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
-    let graph = frame.graph.clone();
-    let branches = graph.gate_branches_at(node.0 as usize);
-    let branches = branches
-        .as_ref()
+pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
+    let graph = ctx.graph;
+    let branches = graph
+        .gate_branches_at(node.0 as usize)
         .expect("Gate node has no branches");
 
     // Read the condition value.
     let cond_raw = frame.get_value_by_global(branches.condition_input);
     let cond = cond_raw.as_bool();
 
-    if env_flag("KUZO_DEBUG_GATE") {
+    if env_flag("FROND_DEBUG_GATE") {
         let sg = &graph.subgraphs[frame.subgraph_id.0 as usize];
         eprintln!("[GATE] node={:?} cond_raw={:?} cond={} frame.sg={} frame.offset={} sg.range=[{},{}) branches={:?}",
             node, cond_raw, cond, frame.subgraph_id.0, frame.node_offset,
@@ -2355,12 +2660,12 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
             branches.branches.iter().map(|(c, sg, _)| (*c, sg.0)).collect::<Vec<_>>());
     }
 
-    // Select a branch.
+    // Select a branch (borrowed — no branch-inputs clone per Gate execution).
     let (target_sg, branch_inputs) = branches
         .branches
         .iter()
         .find(|(c, _, _)| *c == cond)
-        .map(|(_, sg, inputs)| (*sg, inputs.clone()))
+        .map(|(_, sg, inputs)| (*sg, inputs.as_slice()))
         .expect("no matching gate branch");
 
     // Collect arguments.
@@ -2371,7 +2676,7 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
         .map(|&n| frame.get_value_by_global(n))
         .collect();
 
-    if env_flag("KUZO_DEBUG_STALL") {
+    if env_flag("FROND_DEBUG_STALL") {
         let (ns, ne) = graph.subgraphs[target_sg.0 as usize].node_range;
         eprintln!("[GATE] node={} cond={} target_sg={} sg_range=[{},{}) params={} branch_inputs={:?} args={}",
             node.0, cond, target_sg.0, ns.0, ne.0, param_count, branch_inputs, args.len());
@@ -2400,10 +2705,10 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
 /// nodes → suspend. When the core loop receives `NodeResult::Await`, it resolves
 /// the event source → checks readiness → if ready, injects the value and
 /// continues; if not ready, suspends.
-pub fn compute_await(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
+pub fn compute_await(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
     use crate::ir::Ir::PendingAwait;
 
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     // inputs[0] = event-object node (AsyncHandle/Channel/Timer).
     let event_obj = force_input(frame, inputs[0]);
     let await_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
@@ -2435,8 +2740,8 @@ pub fn compute_await(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> Nod
 ///
 /// Input: `inputs[0] = capacity` (usize).
 /// Output: `Value::ref_val(HeapObj::ChannelVal(Arc<ChannelValue>))`.
-pub fn compute_channel_create(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_channel_create(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let capacity = force_input(frame, inputs[0]).as_usize();
     Value::ref_val(crate::value::HeapObj::ChannelVal(
         std::sync::Arc::new(crate::value::ChannelValue::new(capacity)),
@@ -2450,8 +2755,8 @@ pub fn compute_channel_create(frame: &mut Frame, node: NodeId) -> Value {
 /// After sending, returns `NodeResult::ChannelNotify`; when the core loop
 /// consumes it, it triggers a `ChannelReady` event that wakes the suspended
 /// frames waiting on that channel (inline trigger, zero latency).
-pub fn compute_channel_send(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_channel_send(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     // safe_op short-circuit: `?.send(v)` returns Null when the receiver is null.
     if graph.safe_op_flag(node.0 as usize) {
         let ch_val = force_input(frame, inputs[0]);
@@ -2478,8 +2783,8 @@ pub fn compute_channel_send(frame: &mut Frame, node: NodeId, _ctx: &EvalContext)
 /// compute_channel_close (idx 285): closes the channel.
 ///
 /// Input: `inputs[0] = channel ref`.
-pub fn compute_channel_close(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_channel_close(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let ch_val = force_input(frame, inputs[0]);
     let ch = ch_val.heap_obj().and_then(|h| h.channel())
         .expect("close on non-channel value");
@@ -2492,9 +2797,9 @@ pub fn compute_channel_close(frame: &mut Frame, node: NodeId) -> Value {
 /// Reads the subgraph id + arity from `graph.closure_infos`, merges the inputs
 /// (captured values) to construct a Closure heap object. The node's inputs are
 /// the captured upvalues (in the order of `captured` in `compile_lambda`).
-pub fn compute_closure_construct(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_closure_construct(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{Cell, Closure, HeapObj};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let info = graph.closure_info(node.0 as usize)
         .expect("closure construct node has no ClosureInfo");
     // Wrap each upvalue in a Cell so that escaping closures (cross-function
@@ -2521,9 +2826,9 @@ pub fn compute_closure_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// Reads the trait name + method list from `graph.trait_construct_infos`,
 /// merges the node's inputs (each method's upvalues concatenated in order) to
 /// build multiple Closures, and packs them into a TraitValue heap object.
-pub fn compute_trait_construct(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_trait_construct(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{Closure, HeapObj, TraitValue};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let info = graph.trait_construct_info_at(node.0 as usize);
     let info = info
         .as_ref()
@@ -2565,9 +2870,9 @@ pub fn compute_trait_construct(frame: &mut Frame, node: NodeId) -> Value {
 /// node's inputs (upvalues) to construct a LazyValue heap object. The thunk is
 /// unevaluated; on the first force it starts subgraph computation and caches
 /// the result.
-pub fn compute_lazy_construct(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_lazy_construct(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{Closure, HeapObj, LazyValue};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let info = graph.lazy_construct_info(node.0 as usize)
         .expect("lazy construct node has no LazyConstructInfo");
 
@@ -2656,7 +2961,7 @@ pub fn force_lazy_value_sync(caller_frame: &mut Frame, lazy_val: &Value) -> Valu
     let param_count = graph.subgraphs[thunk_sg.0 as usize].param_count as usize;
     for (i, arg) in closure.upvalues.iter().enumerate().take(param_count) {
         let local_id = NodeId(i as u32);
-        let consumer_count = graph.downstream_slice(offset + i).len() as u16;
+        let consumer_count = graph.downstream_count(offset + i);
         thunk_frame.set_value(local_id, arg.clone(), consumer_count);
         thunk_frame.push_ready(local_id);
     }
@@ -2741,7 +3046,7 @@ fn reset_loop_frame_for_next_iteration(frame: &mut Frame, graph: &DataFlowGraph)
                 if let Some(cv) = graph.const_value(cond_node.0 as usize) {
                     let handle = cv.to_value(graph.string_pool_slice());
                     let consumer_count =
-                        graph.downstream_slice(cond_node.0 as usize).len() as u16;
+                        graph.downstream_count(cond_node.0 as usize);
                     frame.set_value(cond_local, handle, consumer_count);
                 }
             }
@@ -2834,7 +3139,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 if (return_local as usize) < frame.value_table.len()
                     && !frame.value_table.is_ready(return_local as usize)
                 {
-                    if env_flag("KUZO_DEBUG_SYNC") {
+                    if env_flag("FROND_DEBUG_SYNC") {
                         let ns = sg.node_range.0.0;
                         let ne = sg.node_range.1.0;
                         let nc = (ne - ns) as usize;
@@ -2852,7 +3157,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                     }
                     return Value::NULL;
                 }
-                if env_flag("KUZO_DEBUG_SYNC") {
+                if env_flag("FROND_DEBUG_SYNC") {
                     let rv = frame.get_value_by_global(sg.return_node);
                     eprintln!("[SYNC-RET] sg={} return_node={} (local={}) offset={} val={:?}",
                         sg.id.0, sg.return_node.0, return_local, frame.node_offset, rv);
@@ -2864,7 +3169,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
         let node_start = frame.node_offset;
         let graph_node_id = NodeId(local_id.0 + node_start);
         let node = graph.node(graph_node_id.0 as usize);
-        let ctx = EvalContext { node_start };
+        let ctx = EvalContext { node_start, graph };
 
         // 3. COMPUTE.
         let result = (graph.compute_fns[node.compute_fn.0 as usize])(frame, graph_node_id, &ctx);
@@ -2872,14 +3177,14 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
         // 4. MATCH NodeResult
         match result {
             NodeResult::Value(v) => {
-                let cc = graph.downstream_slice(graph_node_id.0 as usize).len() as u16;
+                let cc = graph.downstream_count(graph_node_id.0 as usize);
                 frame.set_value(local_id, v, cc);
                 notify_downstream(frame, graph, local_id, graph_node_id, NodeId(node_start));
             }
             NodeResult::Batch(results) => {
                 for &(lid, ref v) in &results {
                     let gid = NodeId(lid.0 + node_start);
-                    let cc = graph.downstream_slice(gid.0 as usize).len() as u16;
+                    let cc = graph.downstream_count(gid.0 as usize);
                     frame.set_value(lid, v.clone(), cc);
                 }
                 for &(lid, _) in &results {
@@ -2893,7 +3198,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
             NodeResult::Call(pending) => {
                 // Tail call: reuse the current frame.
                 if graph.tail_call_flag(graph_node_id.0 as usize) {
-                    if env_flag("KUZO_DEBUG_CALL") {
+                    if env_flag("FROND_DEBUG_CALL") {
                         eprintln!("[CALL-TAIL] node={} target_sg={} (TAIL CALL)",
                             graph_node_id.0, pending.target_sg.0);
                     }
@@ -2919,7 +3224,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 let child_param_count = graph.subgraphs[pending.target_sg.0 as usize].param_count as usize;
                 for (i, arg) in pending.args.iter().enumerate().take(child_param_count) {
                     let lid = NodeId(i as u32);
-                    let cc = graph.downstream_slice(child_offset + i).len() as u16;
+                    let cc = graph.downstream_count(child_offset + i);
                     child_frame.set_value(lid, arg.clone(), cc);
                     child_frame.push_ready(lid);
                 }
@@ -2948,8 +3253,8 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 let child_signal = child_frame.control_signal.clone();
 
                 // Inject the return value into the current frame.
-                let consumer_count = graph.downstream_slice(graph_node_id.0 as usize).len() as u16;
-                if env_flag("KUZO_DEBUG_CALL") {
+                let consumer_count = graph.downstream_count(graph_node_id.0 as usize);
+                if env_flag("FROND_DEBUG_CALL") {
                     let csg = &graph.subgraphs[pending.target_sg.0 as usize];
                     eprintln!("[CALL] node={} target_sg={} range=[{},{}) child_result={:?} signal={:?} consumer_count={}",
                         graph_node_id.0, pending.target_sg.0, csg.node_range.0.0, csg.node_range.1.0,
@@ -2968,16 +3273,32 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 // Control-flow propagation for Gate branches / loop frames is handled
                 // below (consistent with the async path in Subgraph.rs).
 
-                // Propagate the Gate branch control signal.
+                // Shared propagation matrix (Ir::should_propagate_control_signal).
+                // child_loop_kind = None here: on the sync path, Gate branches are
+                // ordinary branch subgraphs, and loop-frame completions are handled
+                // by the LoopBody protocol below — so only the Gate column applies.
+                // W4c capture gates: the Return is the inlined value (data), never
+                // a signal.
                 let is_gate = graph.node(graph_node_id.0 as usize).kind == NodeKind::Gate;
-                if is_gate && !matches!(child_signal, ControlSignal::None) {
+                let capture_gate = is_gate
+                    && graph
+                        .gate_branches_at(graph_node_id.0 as usize)
+                        .map(|gb| gb.capture)
+                        .unwrap_or(false);
+                if !capture_gate
+                    && crate::ir::Ir::should_propagate_control_signal(
+                        &child_signal,
+                        is_gate,
+                        LoopKind::None,
+                    )
+                {
                     frame.control_signal = child_signal;
                     continue;
                 }
 
                 // LoopBody completion handling.
                 if target_loop_kind == LoopKind::LoopBody {
-                    if env_flag("KUZO_DEBUG_CALL") {
+                    if env_flag("FROND_DEBUG_CALL") {
                         eprintln!("[CALL-LB] node={} target_sg={} child_signal={:?} frame.sg={} frame.loop_kind={:?}",
                             graph_node_id.0, pending.target_sg.0, child_signal,
                             frame.subgraph_id.0,
@@ -3036,9 +3357,9 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
 /// (already-bound argument values) to construct `HeapObj::Partial`.
 /// `remaining_arity = subgraph.param_count - bound_count`.
 /// For top-level function partial application, upvalues are empty and `self_upvalue_idx = -1`.
-pub fn compute_partial_construct(frame: &mut Frame, node: NodeId) -> Value {
+pub fn compute_partial_construct(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{HeapObj, PartialApplication};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let info = graph.partial_info(node.0 as usize)
         .expect("partial construct node has no PartialInfo");
     let bound_args: Vec<Value> = inputs
@@ -3057,10 +3378,10 @@ pub fn compute_partial_construct(frame: &mut Frame, node: NodeId) -> Value {
 }
 
 /// compute_str_bytes (idx 287): `str.bytes()` -> `u8[]`.
-/// Constructs a `u8` array from the UTF-8 byte sequence of a `KuzoStr`.
-pub fn compute_str_bytes(frame: &mut Frame, node: NodeId) -> Value {
+/// Constructs a `u8` array from the UTF-8 byte sequence of a `Str`.
+pub fn compute_str_bytes(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     use crate::value::{ArrayValue, HeapObj};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let val = force_input(frame, inputs[0]);
     let bytes: Vec<Value> = match val.heap_obj() {
         Some(HeapObj::Str(s)) => s.bytes().as_bytes()
@@ -3094,9 +3415,9 @@ fn unwrap_cell(v: &Value) -> Value {
     }
 }
 
-pub fn compute_closure_call(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
+pub fn compute_closure_call(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
     use crate::value::{HeapObj, PartialApplication};
-    read_node_inputs!(frame, node, graph, n, inputs);
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let callable_val = force_input(frame, inputs[0]);
     // safe_op short-circuit: `?.method(args)` returns Null when the receiver is null.
     if graph.safe_op_flag(node.0 as usize) && callable_val.is_null() {
@@ -3178,8 +3499,8 @@ pub fn compute_closure_call(frame: &mut Frame, node: NodeId, _ctx: &EvalContext)
 /// `inputs[0]` = async handle value (an `i32` scalar whose value is `async_id`).
 /// Returns `NodeResult::Cancel`; the core loop looks up `async_id` -> `child_fid` in
 /// `AsyncJoinRuntime` to perform the cancellation.
-pub fn compute_cancel_async_handle(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_cancel_async_handle(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let handle_val = force_input(frame, inputs[0]);
     // safe_op short-circuit: `?.cancel()` returns Null when the receiver is null.
     if graph.safe_op_flag(node.0 as usize) && handle_val.is_null() {
@@ -3194,8 +3515,8 @@ pub fn compute_cancel_async_handle(frame: &mut Frame, node: NodeId, _ctx: &EvalC
 ///
 /// Upon receiving this, the core loop checks the ready state of all branch event
 /// sources (it has access to the full Engine state).
-pub fn compute_select_gate(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
-    let graph = frame.graph.clone();
+pub fn compute_select_gate(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
+    let graph = ctx.graph;
     // Verify that the gate node actually has a bound SelectInfo.
     let info = graph.select_info_at(node.0 as usize);
     let _ = info
@@ -3207,16 +3528,24 @@ pub fn compute_select_gate(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
 
 
 /// noop compute_fn (matches the real signature).
-pub fn noop_compute_real(_frame: &mut Frame, _node: NodeId) -> Value {
+pub fn noop_compute_real(_frame: &mut Frame, _node: NodeId, _ctx: &EvalContext) -> Value {
     Value::VOID
 }
 
 /// compute_fn for Const nodes (new signature, not wrapped via `wrap_fn!`).
 /// Materializes a value from the `const_values` table and returns it.
 /// Non-Const nodes (which also use `CF_NOOP`) return `Value::VOID` (compatible with `noop_compute_real`).
-pub fn compute_const(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
-    if let Some(cv) = frame.graph.const_value(node.0 as usize) {
-        NodeResult::Value(crate::engine::alloc_const_value(cv, frame.graph.string_pool_slice()))
+///
+/// E0 perf: when the engine populated `const_cache` (EngineRef::new), serve the materialized
+/// Value directly (a 24-byte clone / Arc bump) instead of re-materializing per execution —
+/// string consts used to cost 2 heap allocations every time they executed.
+pub fn compute_const(_frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
+    let graph = ctx.graph;
+    if !graph.const_cache.is_empty() {
+        return NodeResult::Value(graph.const_cache[node.0 as usize].clone());
+    }
+    if let Some(cv) = graph.const_value(node.0 as usize) {
+        NodeResult::Value(crate::engine::alloc_const_value(cv, graph.string_pool_slice()))
     } else {
         NodeResult::Value(Value::VOID)
     }
@@ -3227,8 +3556,8 @@ pub fn compute_const(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> Nod
 /// `inputs[0]` = return value. Optional `inputs[1]` = prior side-effect dependency
 /// (used only for readiness checks; its value is ignored).
 /// Replaces the old `control_signal_nodes[SignalKind::Return]` table lookup.
-pub fn compute_return(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_return(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let v = force_input(frame, inputs[0]);
     NodeResult::Return(v)
 }
@@ -3265,8 +3594,8 @@ pub fn compute_match_fallback(_frame: &mut Frame, _node: NodeId, _ctx: &EvalCont
 /// Used for statement sequencing: `inputs = [prev_effect, current_value]`, returns `current_value`.
 /// `prev_effect` acts only as a data-dependency edge (ordering constraint) to ensure the previous
 /// statement completes before the current one executes.
-pub fn compute_seq(frame: &mut Frame, node: NodeId) -> Value {
-    read_node_inputs!(frame, node, graph, n, inputs);
+pub fn compute_seq(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
     if n.input_count == 0 {
         return Value::VOID;
     }
@@ -3290,8 +3619,8 @@ pub fn compute_seq(frame: &mut Frame, node: NodeId) -> Value {
 /// 3. `closure_val` Cell: escaped closure (cross-function call, frame chain is null),
 ///    updates the closure upvalues via the `Cell`'s interior mutability so the next call
 ///    reads the latest value.
-pub fn compute_writeback(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
-    let graph = frame.graph.clone();
+pub fn compute_writeback(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
+    let graph = ctx.graph;
     let n = graph.node(node.0 as usize);
     if n.input_count == 0 {
         return NodeResult::Value(Value::VOID);
@@ -3300,9 +3629,9 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) ->
     let val = frame.get_value_by_global(val_node);
     let target = graph.writeback_target(node.0 as usize)
         .expect("WriteBack node missing target");
-    let consumer_count = graph.downstream_slice(target.0 as usize).len() as u16;
+    let consumer_count = graph.downstream_count(target.0 as usize);
 
-    if env_flag("KUZO_DEBUG_WB") {
+    if env_flag("FROND_DEBUG_WB") {
         let sg = &graph.subgraphs[frame.subgraph_id.0 as usize];
         eprintln!("[WB] node={:?} target={:?} val={:?} val_node={:?} frame.sg={} frame.offset={} sg.range=[{},{}) sg.func_id={} vt_len={}",
             node, target, val, val_node, frame.subgraph_id.0, frame.node_offset,
@@ -3405,10 +3734,10 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) ->
 /// In a TailRec loop, when `body_sg` completes:
 /// - `Continue` (returned by the rec arm's WriteBack) -> `reset_loop_iteration` (loop continues)
 /// - `None` (base arm has no WriteBack) -> loop exits, returning `body_sg`'s return value
-pub fn compute_tailrec_writeback(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
+pub fn compute_tailrec_writeback(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
     // Normal writeback -> Continue (loop continues); out-of-bounds and other errors
     // (NodeResult::Return) -> propagate upward (not silent).
-    match compute_writeback(frame, node, _ctx) {
+    match compute_writeback(frame, node, ctx) {
         NodeResult::Value(_) => NodeResult::Continue,
         other => other,
     }
@@ -3423,8 +3752,8 @@ pub fn compute_tailrec_writeback(frame: &mut Frame, node: NodeId, _ctx: &EvalCon
 /// `parent_frame_ptr`), which persists across iterations (reset_loop_iteration does not
 /// clear it). The loop-exit `CF_DEFER_RUN` node (in void_sg) drains the stack in LIFO
 /// order and executes each defer body with its captured values.
-pub fn compute_defer_register(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
-    let graph = frame.graph.clone();
+pub fn compute_defer_register(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
+    let graph = ctx.graph;
     let n = graph.node(node.0 as usize);
     let body_sg = match graph.call_target(node.0 as usize) {
         Some(sg) => sg,
@@ -3460,8 +3789,8 @@ pub fn compute_defer_register(frame: &mut Frame, node: NodeId, _ctx: &EvalContex
 /// captured loop-variable inputs), a block-scoped defer may have zero captures (e.g. a defer
 /// that only touches globals), which would leave the node with zero inputs and let the
 /// scheduler fire it prematurely at frame start. The leading effect input prevents that.
-pub fn compute_block_defer_register(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
-    let graph = frame.graph.clone();
+pub fn compute_block_defer_register(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
+    let graph = ctx.graph;
     let n = graph.node(node.0 as usize);
     let body_sg = match graph.call_target(node.0 as usize) {
         Some(sg) => sg,
@@ -3506,7 +3835,7 @@ pub fn run_defer_entries_sync(parent_frame: &Frame, defers: &[RuntimeDefer], gra
             let captured_gid = entry.captured_nodes[i];
             let local = captured_gid.0.wrapping_sub(parent_offset);
             if (local as usize) < defer_frame.value_table.len() {
-                let cc = graph.downstream_slice(captured_gid.0 as usize).len() as u16;
+                let cc = graph.downstream_count(captured_gid.0 as usize);
                 defer_frame.set_value(NodeId(local), val.clone(), cc);
                 defer_frame.ready_queue.retain(|n| n.0 != local);
             }
@@ -3523,8 +3852,8 @@ pub fn run_defer_entries_sync(parent_frame: &Frame, defers: &[RuntimeDefer], gra
 /// (accessed via `root_frame_ptr`) so they read the latest outer-variable values (e.g. `log`
 /// updated by previous defers in LIFO order). Captured loop-variable values are injected
 /// into the defer frame so the defer body reads per-iteration values.
-pub fn compute_defer_run(frame: &mut Frame, _node: NodeId, _ctx: &EvalContext) -> NodeResult {
-    let graph = frame.graph.clone();
+pub fn compute_defer_run(frame: &mut Frame, _node: NodeId, ctx: &EvalContext) -> NodeResult {
+    let graph = ctx.graph;
     // Drain the loop frame's defer_stack (via parent_frame_ptr).
     let defers: Vec<RuntimeDefer> = if !frame.parent_frame_ptr.is_null() {
         unsafe { &mut *frame.parent_frame_ptr }.defer_stack.drain(..).collect()

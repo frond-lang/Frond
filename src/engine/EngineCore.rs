@@ -18,14 +18,92 @@ use std::sync::OnceLock;
 use crossbeam_deque::Injector;
 use std::sync::Arc;
 
-/// Caches a boolean environment-variable flag to avoid calling `std::env::var` on every hot-path invocation.
-#[inline]
+/// Caches boolean environment-variable flags to avoid calling `std::env::var` on every hot-path
+/// invocation. All known engine-side flag names are probed once (first call) and served from the
+/// map afterwards; unknown names fall back to an uncached probe (and are not memoized).
 pub(super) fn env_flag(name: &str) -> bool {
-    static FLAG_STALL: OnceLock<bool> = OnceLock::new();
-    match name {
-        "KUZO_DEBUG_STALL" => *FLAG_STALL.get_or_init(|| std::env::var("KUZO_DEBUG_STALL").is_ok()),
-        _ => std::env::var(name).is_ok(),
+    static FLAGS: OnceLock<hashbrown::HashMap<&'static str, bool>> = OnceLock::new();
+    const KNOWN_FLAGS: &[&str] = &[
+        "FROND_DEBUG_STALL",
+        "FROND_NO_REUSECHAIN",
+        "FROND_DEBUG_FORIN",
+        "FROND_DEBUG_CALL",
+        "FROND_DEBUG_IFELSE",
+        "FROND_DEBUG_GATE",
+        "FROND_DEBUG_WB",
+        "FROND_DEBUG_SYNC",
+        "FROND_DEBUG_MEMO",
+        "FROND_VERIFY",
+        "FROND_VERIFY_STRICT",
+        "FROND_EXEC_COVERAGE",
+    ];
+    let flags = FLAGS.get_or_init(|| {
+        let mut m = hashbrown::HashMap::with_capacity(KNOWN_FLAGS.len());
+        for flag in KNOWN_FLAGS {
+            m.insert(*flag, std::env::var(flag).is_ok());
+        }
+        m
+    });
+    match flags.get(name) {
+        Some(&v) => v,
+        None => std::env::var(name).is_ok(),
     }
+}
+
+// =========================================================================
+// Execution coverage (FROND_EXEC_COVERAGE=1)
+// =========================================================================
+
+/// Process-global per-sg frame-start counters — the class-level detector for
+/// "std paths that exist in the final graph but are NEVER executed by any
+/// test". Every incident in this family (u64(x) silent void, `[0u8]*len` empty
+/// array, open-flags abort, File.remove deleting nothing) lived for months in
+/// exactly such paths. Instrumented at `start_subgraph_frame` (both the queue
+/// and the inline sync path) and at `switch_subgraph` (tail-call frame reuse);
+/// reported by `exec_cov_dump` keyed by the graph's debug name sidecar.
+static EXEC_COV: OnceLock<Vec<std::sync::atomic::AtomicU32>> = OnceLock::new();
+
+/// Bumps the execution counter for `sg`; initializes the counter table on
+/// first use (sized to the graph). No-op unless FROND_EXEC_COVERAGE is set.
+pub(super) fn exec_cov_bump(sg: crate::ir::Ir::SubGraphId, total_sgs: usize) {
+    if !env_flag("FROND_EXEC_COVERAGE") {
+        return;
+    }
+    let cov = EXEC_COV.get_or_init(|| {
+        (0..total_sgs).map(|_| std::sync::atomic::AtomicU32::new(0)).collect()
+    });
+    if let Some(slot) = cov.get(sg.0 as usize) {
+        slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// End-of-run report, keyed by the qualified debug names (`sg_debug_names`):
+///   EXECCOV-INV <name>  — std.* function present in the final graph
+///   EXECCOV-RUN <name>  — …and actually frame-started at least once
+/// Aggregated across the whole test suite by tests/scripts/run_execcov.sh
+/// (names are stable across processes; sg ids are not).
+pub fn exec_cov_dump(graph: &crate::ir::Ir::DataFlowGraph) {
+    if !env_flag("FROND_EXEC_COVERAGE") {
+        return;
+    }
+    let Some(cov) = EXEC_COV.get() else { return };
+    let mut inv = 0usize;
+    let mut ran = 0usize;
+    for (idx, name) in graph.sg_debug_names.iter().enumerate() {
+        let Some(name) = name else { continue };
+        if !name.starts_with("std.") {
+            continue;
+        }
+        inv += 1;
+        eprintln!("EXECCOV-INV {name}");
+        if graph.subgraphs.get(idx).is_some()
+            && cov.get(idx).map_or(false, |c| c.load(std::sync::atomic::Ordering::Relaxed) > 0)
+        {
+            ran += 1;
+            eprintln!("EXECCOV-RUN {name}");
+        }
+    }
+    eprintln!("EXECCOV-SUMMARY std_inv={inv} std_ran={ran}");
 }
 
 // =========================================================================
@@ -83,6 +161,181 @@ pub struct Engine<S: LockStrategy> {
 unsafe impl Send for Engine<Multi> {}
 unsafe impl Sync for Engine<Multi> {}
 
+/// E0 perf: one-time materialization of every node's Const value (scalars inline; strings
+/// shared as one Arc for the whole run — previously every execution of a string const cost
+/// two heap allocations). Runs at EngineRef::new, the single choke point after
+/// build/optimize/load, so renumbering passes can never invalidate a populated cache.
+fn materialize_const_cache(graph: &mut DataFlowGraph) {
+    if !graph.const_cache.is_empty() {
+        return;
+    }
+    let n = graph.node_count();
+    let mut cache = Vec::with_capacity(n);
+    let pool = graph.string_pool_slice();
+    for idx in 0..n {
+        let v = match graph.const_value(idx) {
+            Some(cv) => alloc_const_value(cv, pool),
+            None => Value::VOID,
+        };
+        cache.push(v);
+    }
+    graph.const_cache = cache;
+}
+
+/// E3 perf: precompute per-subgraph initial pending_inputs + ready-queue seeds for
+/// cross-function frames. The derivation depends only on graph structure (nested ranges,
+/// EventSource kinds, input counts, param positions) — never on runtime state — so a single
+/// pass at engine start covers every later frame instantiation with a memcpy.
+fn precompute_sg_templates(graph: &mut DataFlowGraph) {
+    if !graph.sg_initial_pending.is_empty() {
+        return;
+    }
+    const PENDING_EXTERNAL: u16 = u16::MAX;
+    let sg_count = graph.subgraphs.len();
+    let mut templates: Vec<Vec<u16>> = Vec::with_capacity(sg_count);
+    let mut seeds: Vec<Vec<NodeId>> = Vec::with_capacity(sg_count);
+    for s in 0..sg_count {
+        let (node_start, node_end) = graph.subgraphs[s].node_range;
+        let node_count = (node_end.0 - node_start.0) as usize;
+        let offset = node_start.0 as usize;
+        let nested_ranges: &[(u32, u32)] = graph.sg_nested_ranges(s);
+        let is_nested =
+            |gid: u32| -> bool { nested_ranges.iter().any(|&(a, b)| gid >= a && gid < b) };
+        let param_count = graph.subgraphs[s].param_count as usize;
+
+        let mut pending = vec![0u16; node_count];
+        let mut seed = Vec::new();
+        for i in 0..node_count {
+            let gid = (offset + i) as u32;
+            if is_nested(gid) {
+                pending[i] = PENDING_EXTERNAL;
+                continue;
+            }
+            let node = graph.node(offset + i);
+            if node.kind == NodeKind::EventSource {
+                pending[i] = PENDING_EXTERNAL;
+                continue;
+            }
+            let inputs = graph.inputs(node.inputs_offset, node.input_count);
+            let in_frame = inputs
+                .iter()
+                .filter(|&&n| (n.0.wrapping_sub(node_start.0) as usize) < node_count)
+                .count() as u16;
+            pending[i] = in_frame;
+            if in_frame == 0 && i >= param_count {
+                seed.push(NodeId(i as u32));
+            }
+        }
+        templates.push(pending);
+        seeds.push(seed);
+    }
+    graph.sg_initial_pending = templates;
+    graph.sg_initial_seed = seeds;
+}
+
+/// E4 perf: flat per-node downstream consumer count, replacing CSR offset arithmetic on every
+/// set_value / argument injection.
+fn materialize_downstream_counts(graph: &mut DataFlowGraph) {
+    if !graph.downstream_counts.is_empty() {
+        return;
+    }
+    let n = graph.node_count();
+    let mut counts = Vec::with_capacity(n);
+    for idx in 0..n {
+        counts.push(graph.downstream_slice(idx).len() as u16);
+    }
+    graph.downstream_counts = counts;
+}
+
+/// E5 perf: per-subgraph linearized execution plans. A plan is the topological order of the
+/// sg's own nodes (node_range minus nested-subgraph ranges); run_linear executes it without the
+/// readiness machinery (pending countdown / ready queue / notify). Launch nodes (Gate/Call/
+/// Await/EventSource) stay IN the plan at their topological position — the linear runner bails
+/// to the dataflow engine at them (control flow breaks linearity). Non-linearizable: any
+/// EventSource in range, or a cyclic own-node subgraph (defensive — dataflow sgs are DAGs).
+fn materialize_linear_plans(graph: &mut DataFlowGraph) {
+    if !graph.linear_plans.is_empty() {
+        return;
+    }
+    let sg_count = graph.subgraphs.len();
+    let mut plans: Vec<Option<Vec<NodeId>>> = Vec::with_capacity(sg_count);
+    for s in 0..sg_count {
+        plans.push(compute_linear_plan(graph, s));
+    }
+    graph.linear_plans = plans;
+}
+
+fn compute_linear_plan(graph: &DataFlowGraph, s: usize) -> Option<Vec<NodeId>> {
+    let (node_start, node_end) = graph.subgraphs[s].node_range;
+    let start = node_start.0 as usize;
+    let end = node_end.0 as usize;
+    let n = end - start;
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    let nested: &[(u32, u32)] = graph.sg_nested_ranges(s);
+    let is_nested = |gid: u32| -> bool { nested.iter().any(|&(a, b)| gid >= a && gid < b) };
+
+    let mut own = vec![false; n];
+    for i in 0..n {
+        let node = graph.node(start + i);
+        if node.kind == NodeKind::EventSource {
+            return None;
+        }
+        // Only fully-linear subgraphs get a plan: a launch node mid-sg would force a
+        // bail + readiness rebuild every run, which costs more than pure dataflow
+        // driving (measured: match_dispatch regressed ~13% with prefix-linear plans).
+        // The bail machinery in run_linear remains as a safety net.
+        if is_launch_kind(node.kind) {
+            return None;
+        }
+        if is_nested((start + i) as u32) {
+            continue;
+        }
+        own[i] = true;
+    }
+
+    // Own-node edges (producer → consumer) for Kahn's algorithm.
+    let mut indeg = vec![0u32; n];
+    let mut consumers: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for i in 0..n {
+        if !own[i] {
+            continue;
+        }
+        let node = graph.node(start + i);
+        let inputs = graph.inputs(node.inputs_offset, node.input_count);
+        for &inp in inputs {
+            let il = inp.0.wrapping_sub(node_start.0) as usize;
+            if il < n && own[il] {
+                indeg[i] += 1;
+                consumers[il].push(i as u32);
+            }
+        }
+    }
+
+    let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+    for i in 0..n {
+        if own[i] && indeg[i] == 0 {
+            queue.push_back(i as u32);
+        }
+    }
+    let own_count = own.iter().filter(|&&o| o).count();
+    let mut plan: Vec<NodeId> = Vec::with_capacity(own_count);
+    while let Some(i) = queue.pop_front() {
+        plan.push(NodeId((start + i as usize) as u32));
+        for &c in &consumers[i as usize] {
+            indeg[c as usize] -= 1;
+            if indeg[c as usize] == 0 {
+                queue.push_back(c);
+            }
+        }
+    }
+    if plan.len() != own_count {
+        return None; // cycle among own nodes — defensive
+    }
+    Some(plan)
+}
+
 // =========================================================================
 // EngineRef — unified factory (picks a compile-time strategy based on the worker count)
 // =========================================================================
@@ -106,6 +359,11 @@ impl EngineRef {
     /// scheduling is most efficient (no work-stealing overhead); a program containing async has
     /// suspend/wake behavior, so multiple workers advancing frames concurrently is more efficient.
     pub fn new(graph: DataFlowGraph) -> Self {
+        let mut graph = graph;
+        materialize_const_cache(&mut graph);
+        precompute_sg_templates(&mut graph);
+        materialize_downstream_counts(&mut graph);
+        materialize_linear_plans(&mut graph);
         let has_async = Self::entry_reaches_suspend(&graph);
         if has_async {
             let workers = std::thread::available_parallelism()
@@ -159,9 +417,15 @@ impl EngineRef {
 
     /// Runs the engine and returns the result value.
     pub fn run(self) -> Value {
-        match self {
+        let graph = match &self {
+            Self::Single(e) => e.graph.clone(),
+            Self::Multi(e) => e.graph.clone(),
+        };
+        let result = match self {
             Self::Single(e) => e.run_single(),
             Self::Multi(e) => Engine::<Multi>::run_multi(e),
-        }
+        };
+        exec_cov_dump(&graph);
+        result
     }
 }

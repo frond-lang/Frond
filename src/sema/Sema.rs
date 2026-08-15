@@ -339,6 +339,15 @@ pub struct MethodSigInfo {
     /// trait methods); `Some` for built-in intrinsic methods (no body, lowered
     /// directly to a `compute_fn` node by the IR layer).
     pub intrinsic: Option<IntrinsicKind>,
+    /// Whether the method declares its own body. Pure delegations
+    /// (`fun m(): R = A.m`) have `has_body == false` — their method slot is an
+    /// alias for the bound trait default (dispatch falls through to Path 3).
+    pub has_body: bool,
+    /// Explicit trait binding from a delegate annotation (`= A.m`): the trait
+    /// whose default implementation this method is bound to. Also present when
+    /// the annotation coexists with a body (`override fun m(): R = A.m { ... }`),
+    /// where it fixes the target of `super.m()` under multi-trait conflicts.
+    pub delegate_trait: Option<Box<str>>,
 }
 
 /// Type definition info (replaces IRBuilder's type_table + ctor_table).
@@ -448,6 +457,22 @@ pub struct DispatchInfo {
     /// etc.) do not register `MethodSigInfo.intrinsic`, but await/recv are
     /// universal semantics tagged here by sema during `MethodCall` inference.
     pub intrinsic: Option<IntrinsicKind>,
+}
+
+/// The trait-default binding of a method on an implementing type — the single
+/// source of truth shared by override/delegate validation, `super` resolution,
+/// and trait-default instance collection.
+#[derive(Debug, Clone)]
+pub enum MethodBinding {
+    /// The method's default layer is bound to `trait_name` (explicitly via a
+    /// delegate `= A.m`, or implicitly because it is the unique provider).
+    /// `overridden`: the type declares its own method (with a body) on top of
+    /// the default.
+    Bound { trait_name: Box<str>, overridden: bool },
+    /// No implemented trait provides a default for this method.
+    Unbound,
+    /// Multiple traits provide a default and no delegate disambiguates.
+    Ambiguous(Vec<Box<str>>),
 }
 
 /// Resolved reflect metadata.
@@ -726,6 +751,17 @@ pub struct SemaResult {
     /// consumed by the IR builder (replaces its `collect_free_idents_expr` scan
     /// and the 7-branch assignment decision tree).
     pub captures: FxHashMap<u64, Vec<CaptureInfo>>,
+    /// `super.method(...)` static-dispatch results: call-expr key
+    /// (`module_expr_key`) → (trait_def_idx, method_idx within the trait).
+    /// Produced by sema when inferring a method call whose receiver is `super`;
+    /// consumed by the IR builder to bypass the type's own override (Path 2)
+    /// and the vtable (Path 1), targeting the trait-default subgraph directly.
+    pub super_dispatches: FxHashMap<u64, (u16, u16)>,
+    /// `(type_name, trait_name, method_name)` triples for which a `super` call
+    /// was resolved. Drives trait-default instance generation: an overriding
+    /// type normally gets no specialized default subgraph, but one must exist
+    /// when its override calls `super` into the default layer.
+    pub super_targets: FxHashSet<(Box<str>, Box<str>, Box<str>)>,
     /// Phase 2: module-origin index for incremental purge
     pub module_ownership: ModuleOwnership,
 }
@@ -802,6 +838,8 @@ impl SemaResult {
             module_const_recv_exprs: FxHashMap::default(),
             pattern_ctor_types: FxHashMap::default(),
             captures: FxHashMap::default(),
+            super_dispatches: FxHashMap::default(),
+            super_targets: FxHashSet::default(),
             module_ownership: ModuleOwnership::default(),
         }
     }
@@ -1094,6 +1132,57 @@ impl SemaResult {
         type_def.methods.get(method_idx as usize)
     }
 
+    /// Resolve the trait-default binding of `method_name` on an implementing
+    /// type (see `MethodBinding`).
+    ///
+    /// `implemented_traits` are the trait names bound by the type declaration
+    /// (`type T: (A, B)`); pass the witness-table entries' trait names when the
+    /// declaration AST is not at hand.
+    ///
+    /// Resolution order:
+    /// 1. An explicit delegate annotation on the declared method
+    ///    (`fun m(): R = A.m`, with or without a body) wins outright.
+    /// 2. Otherwise, among implemented traits that provide a default (a method
+    ///    with a body) named `method_name`: a unique provider binds implicitly;
+    ///    multiple providers make the binding ambiguous.
+    pub fn resolve_method_binding(
+        &self,
+        implemented_traits: &[Box<str>],
+        type_name: &str,
+        method_name: &str,
+    ) -> MethodBinding {
+        let declared = self
+            .type_def_index
+            .get(type_name)
+            .and_then(|&idx| self.type_defs.get(&idx))
+            .and_then(|td| td.methods.iter().find(|m| m.name.as_ref() == method_name));
+        let mut providers: Vec<Box<str>> = Vec::new();
+        for t in implemented_traits {
+            let has_default = self
+                .get_trait_def(t)
+                .map(|td| {
+                    td.methods
+                        .iter()
+                        .any(|m| m.name.as_ref() == method_name && m.has_body)
+                })
+                .unwrap_or(false);
+            if has_default {
+                providers.push(t.clone());
+            }
+        }
+        if let Some(m) = declared {
+            if let Some(ref t) = m.delegate_trait {
+                return MethodBinding::Bound { trait_name: t.clone(), overridden: m.has_body };
+            }
+        }
+        let overridden = declared.map(|m| m.has_body).unwrap_or(false);
+        match providers.len() {
+            0 => MethodBinding::Unbound,
+            1 => MethodBinding::Bound { trait_name: providers.remove(0), overridden },
+            _ => MethodBinding::Ambiguous(providers),
+        }
+    }
+
     // ── Coroutine metadata ──
 
     /// Add coroutine metadata.
@@ -1126,6 +1215,7 @@ impl SemaResult {
                 self.call_instantiations.remove(k);
                 self.module_func_recv_exprs.remove(k);
                 self.module_const_recv_exprs.remove(k);
+                self.super_dispatches.remove(k);
             }
         }
         // pattern_ctor_types: key is (String, u32), filter by module name
@@ -1301,6 +1391,8 @@ macro_rules! define_builtin_types {
                     param_type_reprs: param_reprs.into_boxed_slice(),
                     return_type_repr: return_repr,
                     intrinsic,
+                    has_body: true,
+                    delegate_trait: None,
                 }
             }
 
@@ -1368,8 +1460,12 @@ define_builtin_types! {
             sig("close", vec![TypeRepr::ThisType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
         ],
         "Lazy" : ["T"] = [],
+        // Lib/ForeignFn methods dispatch structurally (name-based, like reflect):
+        // `InferContext::lib_method_return_type` + `Builder::lib_method_intrinsic`.
+        "ForeignFn" : ["R"] = [],
     }
     nongeneric {
+        "Lib" : [] = [],
         "array" : ["T"] = [
             sig("len", vec![TypeRepr::ThisType], Some(TypeRepr::Named("usize".into())), Some(IntrinsicKind::UnOp(35))),
             sig("is_empty", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), None),
@@ -1909,6 +2005,8 @@ fn build_method_sig_info<'a>(
         param_type_reprs: param_type_reprs.into_boxed_slice(),
         return_type_repr,
         intrinsic: None,
+        has_body: method.body.is_some(),
+        delegate_trait: method.delegate.as_ref().map(|d| d.trait_name.into()),
     }
 }
 
@@ -2168,11 +2266,38 @@ pub(crate) fn concretize_type<'a>(
             let mut visiting = FxHashSet::default();
             resolve_named_type_resolved(arena, name, type_args, sema_result, &mut visiting)
         }
-        TypeNode::Generic { name, .. } => {
-            if let Some(ty) = Type::from_type_name(name) {
-                arena.make(ty)
-            } else {
-                arena.make_generic((*name).into(), Box::new([]))
+        TypeNode::Generic { name, args } => {
+            // Builtin generics must carry their REAL type arguments. The old
+            // code called `Type::from_type_name(name)`, which returns a
+            // placeholder (`DetailId(u32::MAX)`) that DISCARDS the args — so
+            // every signature declaring `Async<X>` / `Throw<X, E>` /
+            // `Channel<T>`… was registered with an opaque placeholder type.
+            // Downstream consumers of `func_sigs` then silently
+            // mis-handled them (the await value-propagation bug family:
+            // #97's tail-`?` Ok re-wrap sees Async<placeholder> instead of
+            // Async<Throw<…>> and skips the re-wrap; the raw payload leaks
+            // out and `match f().await() { Ok/Err }` hits the fallback
+            // panic). Construction mirrors InferContext::make_builtin_generic.
+            let resolved: Vec<TypeHandle> = args.iter()
+                .map(|&a| concretize_type(arena, a, type_args, ast, sema_result))
+                .collect();
+            match (*name, resolved.as_slice()) {
+                ("Throw", [v, e]) => arena.make_throw(*v, *e),
+                ("Channel", [t]) => arena.make_channel(*t),
+                ("Async", [t]) => arena.make_async(*t),
+                ("Lazy", [t]) => arena.make_lazy(*t),
+                ("Atomic", [t]) => arena.make_atomic(*t),
+                ("Sender", [t]) => arena.make_sender(*t),
+                ("Receiver", [t]) => arena.make_receiver(*t),
+                ("ForeignFn", [t]) => arena.make_foreign_fn(*t),
+                _ => {
+                    if let Some(ty) = Type::from_type_name(name) {
+                        // Bare builtin generic name written without args.
+                        arena.make(ty)
+                    } else {
+                        arena.make_generic((*name).into(), Box::new([]))
+                    }
+                }
             }
         }
         TypeNode::Nullable { inner } => {
@@ -2356,7 +2481,7 @@ fn record_fields_to_ctor_info<'a>(
 //   (a function-pointer table).
 // - Dispatch is indexed by the type_id on `Type`, in O(1).
 // - Replaces the current mangled-name ("TypeName.method") lookup.
-// - Naturally fits Kuzo's type_id / reflection mechanism.
+// - Naturally fits Frond's type_id / reflection mechanism.
 //
 // Data structures:
 // - WitnessEntry { trait_name, type_id, method_slots }

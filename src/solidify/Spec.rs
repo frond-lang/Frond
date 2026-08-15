@@ -15,14 +15,42 @@ use crate::ir::Ir::*;
 
 // ==================== Format constants ====================
 
-/// Magic number: `b"KZO\x00"` (Kuzo abbreviation).
+/// Magic number: `b"KZO\x00"` (Frond abbreviation).
 pub const SOLIDIFY_MAGIC: [u8; 4] = *b"KZO\x00";
 /// Format schema version.
-pub const SOLIDIFY_SCHEMA_VERSION: u16 = 1;
+///
+/// v4 (2026-08-16): Lib interop — new sections `LibRetKinds` (62, sparse u8:
+/// ForeignFn[R] return ABI tag for Lib.lookup nodes), `EmbedInfos` (63, sparse
+/// u32: resource index for Lib.embed nodes), `Resources` (64, self-contained
+/// `[count]{name_len,name,data_len,data}` blob for build-time embedded files).
+/// v3 (2026-08-15): field-level density pass on top of v2 —
+/// - `SgNestedRanges` section dropped: nested_ranges are derived data
+///   (containment of node_ranges) and are recomputed at load with an
+///   O(SG·log SG) sort+stack pass;
+/// - SubGraphs records packed 77B → ~45B: `id` elided (== vector index),
+///   the five variable-length regions switch from explicit (offset,len)
+///   pairs to append-order implicit offsets (per-sg lengths only), boolean
+///   fields merged into one flags byte, defer entries 16B → 10B;
+/// - ConstValues payloads variable-length by tag (bool 1B, i32 4B … i128
+///   16B instead of a fixed 16B) — lookup cost unchanged (the sparse index
+///   already carries per-entry byte offsets).
+/// v2: Nodes packed 4B, sparse per-node tables, dropped HoistedOwners/
+/// HoistedNode/Downstreams, DynFfiInfos serialized.
+/// Older files are rejected (rebuild from source to regenerate).
+pub const SOLIDIFY_SCHEMA_VERSION: u16 = 4;
+/// Header flag bit0: node inputs_offset omitted from packed Nodes records
+/// (inputs pool contiguous in node-id order; offsets derived at load).
+pub const FLAG_NODE_INPUT_OFFSETS_ELIDED: u16 = 0b0000_0001;
 /// Runtime ABI version (compute_fn table version).
 pub const SOLIDIFY_ABI_VERSION: u16 = 1;
 /// Number of compute_fn entries (used for ABI validation).
-pub const COMPUTE_FN_COUNT: u32 = 314;
+///
+/// Derived from the actual table length (`ir::Ir::COMPUTE_FN_TABLE_LEN`,
+/// asserted at table build) — was previously a hand-maintained `314` that had
+/// drifted 23 entries behind the real table, defeating the load-time check.
+/// `.kzo` files written by binaries with a different count are rejected;
+/// rebuilding the source regenerates them.
+pub const COMPUTE_FN_COUNT: u32 = crate::ir::Ir::COMPUTE_FN_TABLE_LEN;
 
 // ==================== Header (64B) ====================
 
@@ -181,10 +209,21 @@ pub enum SectionKind {
     TraitConstructInfos = 54,
     RecordExtendInfos = 55,
     BatchInfos = 56,
+    /// stdlib `#{ }#` inline-FFI call info (v2: serialized — closes the v1 gap
+    /// where `frond run <file>.kzo` panicked with "no dyn_ffi_info").
+    DynFfiInfos = 57,
     // Shared region
     StringPool = 60,
     Downstreams = 61,
-    // Inline C FFI (compiled by kuzo build → cc → object extraction)
+    /// Lib interop per-Node metadata (v4): static ForeignFn[R] return ABI tag
+    /// for Lib.lookup nodes.
+    LibRetKinds = 62,
+    /// Lib interop per-Node metadata (v4): resource index for Lib.embed nodes.
+    EmbedInfos = 63,
+    /// Lib interop (v4): Lib.embed build-time resources, self-contained layout
+    /// `[count u32]{ name_len u32, name bytes, data_len u32, data bytes }`.
+    Resources = 64,
+    // Inline C FFI (compiled by frond build → cc → object extraction)
     CMachineCode = 70,
     CSymbols = 71,
 }
@@ -218,6 +257,9 @@ pub fn write_bytes(w: &mut Vec<u8>, v: &[u8]) { w.extend_from_slice(v); }
 
 pub fn read_u8(r: &mut &[u8]) -> u8 {
     let v = r[0]; *r = &r[1..]; v
+}
+pub fn read_u16(r: &mut &[u8]) -> u16 {
+    let v = u16::from_le_bytes([r[0], r[1]]); *r = &r[2..]; v
 }
 pub fn read_u32(r: &mut &[u8]) -> u32 {
     let v = u32::from_le_bytes([r[0], r[1], r[2], r[3]]); *r = &r[4..]; v
@@ -526,6 +568,53 @@ pub fn bytes_to_trait_method_entry(buf: &[u8; 8]) -> TraitMethodEntry {
     let arity = buf[4];
     let upvalue_count = buf[5];
     TraitMethodEntry { subgraph_id, arity, upvalue_count }
+}
+
+// ==================== ConstValue payload width (v3) ====================
+
+/// Variable payload width per ConstValue tag (v3 sparse ConstValues blob).
+/// Lookup stays a binary search on the (idx, byte_off) index — entry stride
+/// is irrelevant, so shrinking payloads is free.
+pub fn const_payload_len(tag: u8) -> usize {
+    match tag {
+        20 | 21 => 0,                                  // Null / Void
+        1 | 6 | 17 => 1,                               // I8 / U8 / Bool
+        2 | 7 | 15 => 2,                               // I16 / U16 / F16
+        3 | 8 | 13 | 18 => 4,                          // I32 / U32 / F32 / Char
+        4 | 9 | 11 | 12 | 14 | 19 => 8,                // I64 / U64 / Isize / Usize / F64 / Str
+        5 | 10 | 16 => 16,                             // I128 / U128 / F128
+        other => panic!("invalid ConstTag: {}", other),
+    }
+}
+
+// ==================== AbiType / AbiSig serialization ====================
+
+/// Variable-length `AbiType` encoding: tag u8 (+2B payload for Int).
+pub fn write_abi_type(buf: &mut Vec<u8>, t: &crate::ffi::Abi::AbiType) {
+    use crate::ffi::Abi::AbiType::*;
+    match t {
+        Void => buf.push(0),
+        Int { bits, signed } => {
+            buf.push(1);
+            buf.push(*bits);
+            buf.push(*signed as u8);
+        }
+        Float32 => buf.push(2),
+        Float64 => buf.push(3),
+        Ptr => buf.push(4),
+    }
+}
+
+pub fn read_abi_type(r: &mut &[u8]) -> crate::ffi::Abi::AbiType {
+    use crate::ffi::Abi::AbiType::*;
+    match read_u8(r) {
+        0 => Void,
+        1 => Int { bits: read_u8(r), signed: read_u8(r) != 0 },
+        2 => Float32,
+        3 => Float64,
+        4 => Ptr,
+        other => panic!("invalid AbiType tag: {}", other),
+    }
 }
 
 // ==================== CRC32 ====================

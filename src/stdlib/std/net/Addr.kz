@@ -4,7 +4,7 @@
 // Scalar bit storage (zero waste): Ipv4Addr=u32, Ipv6Addr=hi/lo u64.
 // Types use newtype/ADT form so that values constructed by the syscall layer via
 // Value.makeRecordWithNames(type_name="Ipv4Addr"/"Ipv6Addr"/"IpAddr", ...)
-// can be recognized on the Kuzo side.
+// can be recognized on the Frond side.
 //
 // Method dispatch is not yet supported; use module function call syntax (see std_instant/Main.kz):
 //   std.net.Addr.v4_loopback()
@@ -17,9 +17,9 @@ pub type Ipv4Addr = Ipv4Addr(bits: u32) {
     // ─── Ipv4Addr accessors ──────────────────────────────────────────────
 
     pub fun v4_octet(i: u8): u8 {
-        val idx = u32(i)
+        val idx = (i as u32)
         val shift = (3u32 - idx) * 8u32
-        u8((bits >> shift) & 0xFFu32)
+        ((bits >> shift) & 0xFFu32) as u8
     }
 
     pub fun v4_bits(): u32 {
@@ -40,10 +40,10 @@ pub type Ipv6Addr = Ipv6Addr(hi: u64, lo: u64) {
     // ─── Ipv6Addr accessors ──────────────────────────────────────────────
 
     pub fun v6_segment(i: u8): u16 {
-        val idx = u64(i)
+        val idx = (i as u64)
         val word = if idx < 4u64 { hi } else { lo }
         val shift = (3u64 - (idx % 4u64)) * 16u64
-        u16((word >> shift) & 0xFFFFu64)
+        ((word >> shift) & 0xFFFFu64) as u16
     }
 
     pub fun v6_hi(): u64 {
@@ -94,7 +94,7 @@ pub type SocketAddr = SocketAddr(ip: IpAddr, port: u16) {
 // ─── Ipv4Addr constructors ──────────────────────────────────────────────
 
 pub fun v4_from_octets(a: u8, b: u8, c: u8, d: u8): Ipv4Addr {
-    Ipv4Addr((u32(a) << 24u32) | (u32(b) << 16u32) | (u32(c) << 8u32) | u32(d))
+    Ipv4Addr(((a as u32) << 24u32) | ((b as u32) << 16u32) | ((c as u32) << 8u32) | (d as u32))
 }
 
 pub fun v4_from_bits(bits: u32): Ipv4Addr {
@@ -112,8 +112,8 @@ pub fun v4_unspecified(): Ipv4Addr {
 // ─── Ipv6Addr constructors ──────────────────────────────────────────────
 
 pub fun v6_from_segments(w0: u16, w1: u16, w2: u16, w3: u16, w4: u16, w5: u16, w6: u16, w7: u16): Ipv6Addr {
-    val hi = (u64(w0) << 48u64) | (u64(w1) << 32u64) | (u64(w2) << 16u64) | u64(w3)
-    val lo = (u64(w4) << 48u64) | (u64(w5) << 32u64) | (u64(w6) << 16u64) | u64(w7)
+    val hi = ((w0 as u64) << 48u64) | ((w1 as u64) << 32u64) | ((w2 as u64) << 16u64) | (w3 as u64)
+    val lo = ((w4 as u64) << 48u64) | ((w5 as u64) << 32u64) | ((w6 as u64) << 16u64) | (w7 as u64)
     Ipv6Addr(hi, lo)
 }
 

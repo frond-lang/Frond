@@ -1,6 +1,7 @@
 //! Subgraph invocation and return: switch_subgraph + start_subgraph + complete_and_wake_caller.
 
 use super::*;
+use super::EngineCore::exec_cov_bump;
 use crate::ir::Ir::*;
 use crate::ir::Ir::Frame;
 use crate::value::Value;
@@ -8,6 +9,7 @@ use crate::value::Value;
 /// Tail-call graph jump: reuses the current frame to execute the target subgraph (zero pool
 /// allocation).
 pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubGraphId, args: &[Value]) {
+    exec_cov_bump(target_sg, graph.subgraphs.len());
     let (node_start, node_end) = graph.subgraphs[target_sg.0 as usize].node_range;
     let node_count = (node_end.0 - node_start.0) as usize;
 
@@ -25,6 +27,8 @@ pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubG
     frame.ready_queue.clear();
     frame.control_signal = ControlSignal::None;
     frame.cached_child_frame = None;
+    frame.hot_body = None;
+    frame.same_fn_prep_cache = None;
     frame.defer_stack.clear();
     frame.select_timers.clear();
     frame.root_frame_ptr = std::ptr::null_mut();
@@ -35,6 +39,8 @@ pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubG
     // caller is unchanged: the return value goes straight to the original caller's call node.
 
     // prepare_frame_nodes: set node_offset + pending_inputs + Const prefill.
+    // E5: tail-call jump re-prepares the frame — fresh for one linear run.
+    frame.linear_fresh = true;
     prepare_frame_nodes(frame, graph);
 
     // Argument injection.
@@ -43,7 +49,7 @@ pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubG
     for (i, arg) in args.iter().enumerate().take(param_count) {
         let local_id = NodeId(i as u32);
         let global_id = NodeId((offset + i) as u32);
-        let consumer_count = graph.downstream_slice(offset + i).len() as u16;
+        let consumer_count = graph.downstream_count(offset + i);
         frame.set_value(local_id, arg.clone(), consumer_count);
         // Do not push_ready: the parameter value is already set by set_value; notify_downstream
         // propagates it to downstream. If we did push_ready, compute_const would be invoked and
@@ -52,12 +58,78 @@ pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubG
     }
 }
 
+/// E1 inline-completion helper: writes a finished child frame's return value back into the
+/// in-hand caller frame — the exact semantics of `complete_and_wake_caller`'s tail (return-value
+/// extraction, capture-gate suppression, shared propagation matrix, downstream notify) minus the
+/// frames-map / queue dance (the caller keeps executing on the current stack).
+pub(super) fn finish_call_in_caller(
+    caller_frame: &mut Frame,
+    call_node: NodeId,
+    child: &Frame,
+    graph: &DataFlowGraph,
+) {
+    let child_sg_id = child.subgraph_id;
+    let return_value = super::Schedule::extract_child_return(child, graph);
+    let child_signal = child.control_signal.clone();
+    let caller_offset = NodeId(caller_frame.node_offset);
+    let call_graph_id = NodeId(call_node.0 + caller_offset.0);
+    let consumer_count = graph.downstream_count(call_graph_id.0 as usize);
+
+    if super::env_flag("FROND_DEBUG_IFELSE") {
+        let child_sg = &graph.subgraphs[child_sg_id.0 as usize];
+        eprintln!("[COMPLETE-INLINE] child_sg={} call_node_local={} call_graph_id={} caller_offset={} return_value={:?} child_loop_kind={:?} caller_sg={}",
+            child_sg_id.0, call_node.0, call_graph_id.0, caller_offset.0,
+            return_value, child_sg.loop_kind, caller_frame.subgraph_id.0);
+        if super::env_flag("FROND_DEBUG_STALL") {
+            let (bs, be) = child_sg.node_range;
+            let mut unready: Vec<u32> = Vec::new();
+            for i in 0..child.value_table.len() {
+                let gid = (child.node_offset as usize + i) as u32;
+                if gid >= bs.0 && gid < be.0 && !child.value_table.is_ready(i) {
+                    unready.push(gid);
+                }
+            }
+            eprintln!("[COMPLETE-INLINE-UNREADY] child_sg={} unready={:?}",
+                child_sg_id.0, &unready[..unready.len().min(12)]);
+        }
+    }
+
+    caller_frame.set_value(call_node, return_value, consumer_count);
+
+    // Control-signal propagation — same matrix as complete_and_wake_caller (see the full
+    // rationale there): capture gates never propagate; cross-function and lambda returns are
+    // data, not signals; same-function gate/loop signals penetrate.
+    let is_gate = graph.node(call_graph_id.0 as usize).kind == crate::ir::Ir::NodeKind::Gate;
+    let capture_gate = is_gate
+        && graph
+            .gate_branches_at(call_graph_id.0 as usize)
+            .map(|gb| gb.capture)
+            .unwrap_or(false);
+    let child_loop_kind = graph.subgraphs[child_sg_id.0 as usize].loop_kind;
+    let should_propagate = !capture_gate
+        && crate::ir::Ir::should_propagate_control_signal(&child_signal, is_gate, child_loop_kind);
+    if super::env_flag("FROND_DEBUG_SIGNAL") {
+        eprintln!("[SIG-PROP-I] child_sg={} caller_sg={} signal={:?} propagate={} capture={}",
+            child_sg_id.0, caller_frame.subgraph_id.0, child_signal, should_propagate, capture_gate);
+    }
+    if should_propagate {
+        let child_fn_id = graph.subgraphs[child_sg_id.0 as usize].function_id;
+        let caller_fn_id = graph.subgraphs[caller_frame.subgraph_id.0 as usize].function_id;
+        if child_fn_id == caller_fn_id {
+            caller_frame.control_signal = child_signal;
+        }
+    }
+
+    notify_downstream(caller_frame, graph, call_node, call_graph_id, caller_offset);
+}
+
 // =========================================================================
 // impl<S: LockStrategy> Engine<S> — subgraph methods
 // =========================================================================
 
 impl<S: LockStrategy> Engine<S> {
-    /// Starts a subgraph: creates a child frame + injects arguments + binds the caller.
+    /// Starts a subgraph: creates a child frame + injects arguments + binds the caller, then
+    /// registers it in the frames map and returns its id (queue-driven execution path).
     /// For same-function branch subgraphs (if-else/match arm): the value table is sized to the
     /// parent function and parent-frame values are copied, so branch nodes can directly access
     /// outer variables via get_value_by_global (no frame-chain pointers needed).
@@ -70,6 +142,37 @@ impl<S: LockStrategy> Engine<S> {
         parent_frame: &Frame,
         closure_val: Option<Value>,
     ) -> FrameId {
+        let (fid, mut child) = self.start_subgraph_frame(
+            caller_fid,
+            call_node,
+            subgraph_id,
+            args,
+            parent_frame,
+            closure_val,
+        );
+        // Queue path: same_function chain pointers are re-established by setup_frame_chain
+        // in process_frame (legacy contract).
+        child.root_frame_ptr = std::ptr::null_mut();
+        child.parent_frame_ptr = std::ptr::null_mut();
+        self.frames.lock().insert(fid, child);
+        fid
+    }
+
+    /// Core frame construction shared by the queue path (`start_subgraph`) and the E1 inline
+    /// synchronous-execution path. Returns the frame WITHOUT registering it in the frames map —
+    /// the caller decides how to drive it. For same_function frames the chain pointers stay
+    /// connected to the in-hand parent (Bug #100: immediate connection is the correct wiring;
+    /// the queue path nulls them afterwards to preserve the setup_frame_chain contract).
+    pub(super) fn start_subgraph_frame(
+        &self,
+        caller_fid: FrameId,
+        call_node: NodeId,
+        subgraph_id: SubGraphId,
+        args: &[Value],
+        parent_frame: &Frame,
+        closure_val: Option<Value>,
+    ) -> (FrameId, Box<Frame>) {
+        exec_cov_bump(subgraph_id, self.graph.subgraphs.len());
         let child_fid = self.alloc_frame_id();
         let parent_sg = &self.graph.subgraphs[parent_frame.subgraph_id.0 as usize];
         let child_sg = &self.graph.subgraphs[subgraph_id.0 as usize];
@@ -81,7 +184,7 @@ impl<S: LockStrategy> Engine<S> {
         let same_function = parent_sg.function_id == child_sg.function_id
             && subgraph_id != parent_frame.subgraph_id;
 
-        if super::env_flag("KUZO_DEBUG_STALL") {
+        if super::env_flag("FROND_DEBUG_STALL") {
             let (cs, ce) = child_sg.node_range;
             let child_sz = ce.0 - cs.0;
             if child_sz <= 3 {
@@ -114,6 +217,18 @@ impl<S: LockStrategy> Engine<S> {
 
             let mut child = self.acquire_frame(child_fid, subgraph_id, parent_node_count);
             child.node_offset = parent_start;
+            // Bug #100 (residual): connect the frame chain IMMEDIATELY from the in-hand
+            // parent frame. The old "set later by setup_frame_chain in process_frame"
+            // never fires when the caller is mid-processing (absent from the map), so a
+            // while-frame created inside a branch/loop had a null chain — its body's
+            // WriteBacks stopped at the while frame and the enclosing frames kept stale
+            // values (negative-exponent residual). Box addresses are stable.
+            child.parent_frame_ptr = parent_frame as *const Frame as *mut Frame;
+            child.root_frame_ptr = if !parent_frame.root_frame_ptr.is_null() {
+                parent_frame.root_frame_ptr
+            } else {
+                child.parent_frame_ptr
+            };
 
             // Copy the parent frame's ready values (refcount set to 0 = never reclaimed; released
             // all at once when the frame ends).
@@ -212,7 +327,7 @@ impl<S: LockStrategy> Engine<S> {
                 let lid = NodeId((param_local_offset + i) as u32);
                 let gid = branch_start.0 as usize + i;
                 let global_id = NodeId(gid as u32);
-                let cc = self.graph.downstream_slice(gid).len() as u16;
+                let cc = self.graph.downstream_count(gid);
                 child.set_value(lid, arg.clone(), cc);
                 // Do not push_ready: the parameter value is already set; notify_downstream
                 // propagates it downstream.
@@ -238,7 +353,7 @@ impl<S: LockStrategy> Engine<S> {
                 let lid = NodeId((param_local_offset + arg_idx) as u32);
                 let gid = branch_start.0 as usize + arg_idx;
                 let global_id = NodeId(gid as u32);
-                let cc = self.graph.downstream_slice(gid).len() as u16;
+                let cc = self.graph.downstream_count(gid);
                 let val = if self_upvalue_idx >= 0 && i == self_upvalue_idx as usize {
                     closure_val.clone().unwrap_or_else(|| parent_frame.get_value_by_global(outer_node))
                 } else {
@@ -252,12 +367,11 @@ impl<S: LockStrategy> Engine<S> {
 
             child.caller = Some((caller_fid, call_node));
 
-            // Frame-chain pointers are set later by setup_frame_chain in process_frame.
-            child.root_frame_ptr = std::ptr::null_mut();
-            child.parent_frame_ptr = std::ptr::null_mut();
             child.closure_val = closure_val;
+            // E5: fresh same_function branch frame — eligible for one linear run.
+            child.linear_fresh = true;
 
-            if std::env::var("KUZO_DEBUG_FORIN").is_ok() {
+            if super::env_flag("FROND_DEBUG_FORIN") {
                 let rq_len = child.ready_queue.len();
                 let mut pending_info: Vec<(u32, u16, bool)> = Vec::new();
                 for i in 0..parent_node_count {
@@ -274,15 +388,14 @@ impl<S: LockStrategy> Engine<S> {
                     subgraph_id.0, rq_len, &pending_info[..pending_info.len().min(15)]);
             }
 
-            self.frames.lock().insert(child_fid, child);
-            child_fid
+            (child_fid, child)
         } else {
             // Cross-function call: original logic.
             let (node_start, node_end) = child_sg.node_range;
             let node_count = (node_end.0 - node_start.0) as usize;
             let offset = node_start.0 as usize;
 
-            if std::env::var("KUZO_DEBUG_CALL").is_ok() && node_count == 0 {
+            if super::env_flag("FROND_DEBUG_CALL") && node_count == 0 {
                 eprintln!("[SUBGRAPH-ZERO] sg={} has 0 nodes! node_range=[{:?},{:?}) param_count={} — function body was NOT compiled (placeholder)",
                     subgraph_id.0, node_start, node_end, child_sg.param_count);
             }
@@ -294,7 +407,7 @@ impl<S: LockStrategy> Engine<S> {
             for (i, arg) in args.iter().enumerate().take(param_count) {
                 let local_id = NodeId(i as u32);
                 let global_id = NodeId((offset + i) as u32);
-                let consumer_count = self.graph.downstream_slice(offset + i).len() as u16;
+                let consumer_count = self.graph.downstream_count(offset + i);
                 child.set_value(local_id, arg.clone(), consumer_count);
                 // Do not push_ready: the parameter value is already set; notify_downstream
                 // propagates it downstream.
@@ -306,8 +419,7 @@ impl<S: LockStrategy> Engine<S> {
             child.parent_frame_ptr = std::ptr::null_mut();
             child.closure_val = closure_val;
 
-            self.frames.lock().insert(child_fid, child);
-            child_fid
+            (child_fid, child)
         }
     }
 
@@ -408,7 +520,7 @@ impl<S: LockStrategy> Engine<S> {
                 }
                 ControlSignal::None => {
                     // Normal completion: check the caller's loop kind.
-                    if std::env::var("KUZO_DEBUG_FORIN").is_ok() {
+                    if super::env_flag("FROND_DEBUG_FORIN") {
                         let bsg = &self.graph.subgraphs[child_frame.subgraph_id.0 as usize];
                         let rq_len = child_frame.ready_queue.len();
                         let (bs, be) = bsg.node_range;
@@ -505,9 +617,9 @@ impl<S: LockStrategy> Engine<S> {
                 let caller_offset = NodeId(caller_frame.node_offset);
                 let call_graph_id = NodeId(call_node.0 + caller_offset.0);
                 let consumer_count =
-                    self.graph.downstream_slice(call_graph_id.0 as usize).len() as u16;
+                    self.graph.downstream_count(call_graph_id.0 as usize);
 
-                if std::env::var("KUZO_DEBUG_IFELSE").is_ok() {
+                if super::env_flag("FROND_DEBUG_IFELSE") {
                     let child_sg = &self.graph.subgraphs[child_sg_id.0 as usize];
                     eprintln!("[COMPLETE] child_sg={} caller_fid={:?} call_node_local={} call_graph_id={} caller_offset={} return_value={:?} child_loop_kind={:?} caller_sg={}",
                         child_sg_id.0, caller_fid, call_node.0, call_graph_id.0, caller_offset.0,
@@ -540,20 +652,27 @@ impl<S: LockStrategy> Engine<S> {
                 let child_loop_kind = self.graph.subgraphs[child_sg_id.0 as usize].loop_kind;
                 let is_gate = self.graph.node(call_graph_id.0 as usize).kind
                     == crate::ir::Ir::NodeKind::Gate;
-                let should_propagate = match child_signal {
-                    ControlSignal::Return(_) => {
-                        // Return: propagate from Gate branches + loop frames; not from
-                        // Lambda/function calls.
-                        is_gate || child_loop_kind != crate::ir::Ir::LoopKind::None
-                    }
-                    ControlSignal::Break | ControlSignal::Continue => {
-                        // Break/Continue: propagate from Gate branches only (penetrate to
-                        // LoopBody). A loop frame's Break/Continue has already been consumed by the
-                        // loop.
-                        is_gate
-                    }
-                    ControlSignal::None => false,
-                };
+                // W4c capture gate: the branch's Return is the inlined
+                // function's value — extract as data (already done via
+                // extract_child_return) and never propagate the signal.
+                let capture_gate = is_gate
+                    && self
+                        .graph
+                        .gate_branches_at(call_graph_id.0 as usize)
+                        .map(|gb| gb.capture)
+                        .unwrap_or(false);
+                // Single shared propagation matrix (see Ir::should_propagate_control_signal
+                // for the full rationale, including the cases that must NOT propagate).
+                let should_propagate = !capture_gate
+                    && crate::ir::Ir::should_propagate_control_signal(
+                        &child_signal,
+                        is_gate,
+                        child_loop_kind,
+                    );
+                if super::env_flag("FROND_DEBUG_SIGNAL") {
+                    eprintln!("[SIG-PROP-Q] child_sg={} caller_sg={} signal_ok={} capture={} is_gate={}",
+                        child_sg_id.0, caller_frame.subgraph_id.0, should_propagate, capture_gate, is_gate);
+                }
                 if should_propagate {
                     let child_fn_id = self.graph.subgraphs[child_sg_id.0 as usize].function_id;
                     let caller_fn_id =

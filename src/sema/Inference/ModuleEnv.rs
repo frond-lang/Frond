@@ -14,7 +14,7 @@ impl<'a> InferContext<'a> {
         );
         self.env.define(env, "Panic", panic_fn);
 
-        // type/type_name has been converted to a kuzo wrapper (see Reflect.kz::type_name).
+        // type/type_name has been converted to a frond wrapper (see Reflect.kz::type_name).
         // Sema no longer registers the `type` builtin.
 
         // Ok: ∀T,E. (T) -> Throw<T, E>
@@ -199,8 +199,55 @@ impl<'a> InferContext<'a> {
                         // Look up the symbol by bare name in the module env (does not traverse
                         // the parent env, to avoid importing global symbols).
                         if let Some(sym_ty) = self.env.lookup_local(module_env, item.name) {
-                            let local_name = item.alias.unwrap_or(item.name);
-                            self.env.define(env, local_name, sym_ty);
+                            self.env.define(env, item.alias.unwrap_or(item.name), sym_ty);
+                            // Register the alias for the IR binding layer
+                            // (sema.import_aliases → IrBuilder's func_subgraphs /
+                            // global_var_slots alias keys). Without this the
+                            // symbol type-checks but the IR call cannot bind
+                            // (the "selective imports never worked at the IR
+                            // level" gap — previously masked by the bare-key
+                            // last-writer-wins slot). A duplicate alias bound
+                            // to a DIFFERENT target is a hard error: writer-wins
+                            // here would silently rebind every bare call.
+                            let local = item.alias.unwrap_or(item.name);
+                            let target_mangled = format!("{}.{}", full_path, item.name);
+                            let existing = self.sema_result.get_import_alias(local).cloned();
+                            match existing {
+                                Some(prev) => {
+                                    let prev_desc = match &prev {
+                                        crate::sema::Sema::AliasTarget::Symbol(m) => {
+                                            if m.as_ref() == target_mangled {
+                                                continue; // same target re-imported: idempotent
+                                            }
+                                            format!("'{}'", m)
+                                        }
+                                        crate::sema::Sema::AliasTarget::Module(m) => {
+                                            format!("module '{}'", m)
+                                        }
+                                    };
+                                    self.sema_result.add_error(
+                                        crate::sema::Sema::SemaError::new(
+                                            &format!(
+                                                "import alias '{}' is already bound to {} — \
+                                                 aliasing two different symbols under one name \
+                                                 is ambiguous; import one and qualify the other",
+                                                local, prev_desc
+                                            ),
+                                            0,
+                                            0,
+                                        ),
+                                    );
+                                }
+                                None => {
+                                    self.sema_result.put_import_alias(
+                                        local,
+                                        crate::sema::Sema::AliasTarget::Symbol(
+                                            target_mangled.into_boxed_str(),
+                                        ),
+                                        module.name,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -308,9 +355,21 @@ impl<'a> InferContext<'a> {
         };
         // Record the current module env for use by check_decl (e.g. let-bindings).
         self.current_module_env = Some(module_env);
+        // Same-module duplicate function definitions: `define` is first-wins and
+        // silently ignores the second registration, so a redefinition used to
+        // compile quietly with confusing resolution (Bug #94). Track names within
+        // this predeclare pass (immune to any module being processed twice).
+        let mut seen_fns: FxHashSet<&str> = FxHashSet::default();
         for decl in module.declarations.iter() {
             match &decl.node {
                 Decl::FunDecl { name, type_params, params, return_type, is_async, .. } => {
+                    if !seen_fns.insert(name) {
+                        self.add_error_at(
+                            &format!("duplicate definition of function '{}' in this module", name),
+                            decl.span.line,
+                            decl.span.column,
+                        );
+                    }
                     // Top-level functions disallow a self parameter (detected via the ThisType
                     // type node, not by parameter name).
                     if !params.is_empty() && self.is_this_param(params[0].type_annotation, &module.arena) {
@@ -559,16 +618,19 @@ impl<'a> InferContext<'a> {
             Decl::FunDecl { name, type_params, params, return_type, body, extern_c_body, is_async, attributes, .. } => {
                 // ── FFI permission check ──
                 // `@extern` / `@c_include` / `#{ }#` are only allowed in builtin (stdlib) modules;
-                // `@internal` is a reserved attribute and may not appear in any user code.
+                // `@internal` marks stdlib implementation primitives (callable only from
+                // `builtin/**` / `std/**` — enforced at call binding in the IR builder) and may
+                // be declared anywhere inside the stdlib, but never in user code.
                 // The builtin check is based on the module-name path prefix
                 // (`current_module_name` is set from `module.name` in `check_module_with_env`;
                 // builtin module names look like "builtin/io/Raw.kz").
                 let is_builtin = self.current_module_name.starts_with("builtin/");
+                let is_stdlib = is_builtin || self.current_module_name.starts_with("std/");
                 if !is_builtin {
                     for attr in attributes {
                         match attr.name {
-                            crate::ffi::ATTR_INTERNAL => self.add_error_at(
-                                "attribute '@internal' is reserved for the language implementation",
+                            crate::ffi::ATTR_INTERNAL if !is_stdlib => self.add_error_at(
+                                "attribute '@internal' is reserved for the standard library implementation",
                                 decl_span.line,
                                 decl_span.column,
                             ),
@@ -608,7 +670,7 @@ impl<'a> InferContext<'a> {
                     );
                 }
                 // @extern("C") function: register the signature but skip body type checking
-                // (the body is C code, not a Kuzo expression).
+                // (the body is C code, not a Frond expression).
                 if extern_c_body.is_some() {
                     if !type_params.is_empty() {
                         self.pop_type_bindings();
@@ -663,6 +725,18 @@ impl<'a> InferContext<'a> {
                 } else if self.unify_return_type(ret_ty, body_ty).is_err() {
                     self.solver.add_equality(ret_ty, body_ty);
                 }
+                // Non-void declared return type with no trailing expression and no
+                // return/throw would silently return garbage at runtime — reject it.
+                if return_type.is_some() {
+                    self.check_missing_return_value(
+                        &format!("function '{}'", name),
+                        ret_ty,
+                        *body,
+                        ast,
+                        decl_span.line,
+                        decl_span.column,
+                    );
+                }
                 if !type_params.is_empty() {
                     self.pop_type_bindings();
                 }
@@ -675,7 +749,7 @@ impl<'a> InferContext<'a> {
                     let _ = self.infer_expr(*expr, ast, env, None);
                 }
             }
-            Decl::TypeDecl { name, type_params, def, methods, .. } => {
+            Decl::TypeDecl { name, type_params, def, implemented_traits, methods, .. } => {
                 // Register the nested type definition into sema_result (so constructor calls are
                 // recognized during type checking).
                 ast_type_decl_to_type_def(self.arena, self.sema_result, *name, type_params, def, ast, decl_span, &self.current_module_name);
@@ -742,6 +816,12 @@ impl<'a> InferContext<'a> {
                 }
                 // Type method checking.
                 self.push_this_type(self_ty);
+                // Expose the implemented trait names to method-body inference:
+                // `super.method(...)` resolves against the trait-default layer of
+                // these traits (see infer_super_method_call).
+                self.current_type_decl_traits = Some(
+                    implemented_traits.iter().map(|t| t.trait_name.into()).collect(),
+                );
                 // First register all methods as functions into env (supports bare-name method
                 // call syntax `method(recv, args)`), then check method bodies (avoids
                 // forward-reference issues).
@@ -792,6 +872,18 @@ impl<'a> InferContext<'a> {
                         self.expected_return = ret_ty;
                         let body_ty = self.infer_expr(body, ast, method_env, ret_ty);
                         self.expected_return = prev_return;
+                        // Non-void declared return type with no trailing expression and no
+                        // return/throw would silently return garbage at runtime — reject it.
+                        if let Some(r) = ret_ty {
+                            self.check_missing_return_value(
+                                &format!("method '{}'", method.name),
+                                r,
+                                body,
+                                ast,
+                                decl_span.line,
+                                decl_span.column,
+                            );
+                        }
                         // Unify the method body type with the declared return type (aligned with
                         // FunDecl):
                         // - Unannotated return type: ret_ty is None → fresh_type_var; bind via
@@ -810,6 +902,7 @@ impl<'a> InferContext<'a> {
                         }
                     }
                 }
+                self.current_type_decl_traits = None;
                 self.pop_this_type();
                 if !type_params.is_empty() {
                     self.pop_type_bindings();
@@ -854,6 +947,18 @@ impl<'a> InferContext<'a> {
                         self.expected_return = ret_ty;
                         let body_ty = self.infer_expr(body, ast, method_env, ret_ty);
                         self.expected_return = prev_return;
+                        // Non-void declared return type with no trailing expression and no
+                        // return/throw would silently return garbage at runtime — reject it.
+                        if let Some(r) = ret_ty {
+                            self.check_missing_return_value(
+                                &format!("method '{}'", method.name),
+                                r,
+                                body,
+                                ast,
+                                decl_span.line,
+                                decl_span.column,
+                            );
+                        }
                         // Unify the method body type with the declared return type (aligned with
                         // FunDecl):
                         // - Unannotated return type: ret_ty is None → fresh_type_var; bind via

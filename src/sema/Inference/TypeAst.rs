@@ -39,6 +39,10 @@ impl<'a> InferContext<'a> {
         if let Some(ct) = name_to_concrete(name) {
             return self.arena.make(ct);
         }
+        // 3.5 Opaque nongeneric builtins (Lib): dedicated Type variant, not an Adt.
+        if name == crate::types::NAME_LIB {
+            return self.arena.make(Type::Lib);
+        }
         // 4. trait definition → Trait type.
         if self.sema_result.get_trait_def(name).is_some() {
             return self.arena.make_trait(name.into(), Box::new([]));
@@ -147,6 +151,24 @@ impl<'a> InferContext<'a> {
                 self.arena.make_generic((*name).into(), args_box)
             }
             TypeNode::Nullable { inner } => {
+                // Surface syntax `T??` is rejected (AST shape: a Nullable node whose
+                // inner node is also Nullable): nullable has no Some-constructor, so a
+                // nested nullable carries no meaning and silently collapsing it would
+                // let Kotlin/TS users keep wrong expectations (Some(null) semantics).
+                // The type machinery still collapses nested nullables produced by
+                // generic instantiation (`T?` with T := X?) inside make_nullable —
+                // only literally written double-`?` is an error. `Alias?` where Alias
+                // resolves to a nullable stays legal (named inner node, not Nullable).
+                if self.instantiation_ctx.is_none()
+                    && matches!(&ast.ty(*inner).node, TypeNode::Nullable { .. })
+                {
+                    let span = ast.ty(type_ref).span;
+                    self.add_error_at(
+                        "double nullable 'T??' is not allowed: nullable has no Some-constructor, so nesting adds no meaning. Use a single '?', or an ADT for two-level absence (e.g. `type Hit<T> = | Missing | Found(T?)`)",
+                        span.line,
+                        span.column,
+                    );
+                }
                 let inner_ty = self.type_from_ast_with_params(*inner, ast, type_param_map);
                 self.arena.make_nullable(inner_ty)
             }

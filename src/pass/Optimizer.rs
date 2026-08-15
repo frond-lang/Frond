@@ -240,6 +240,10 @@ pub struct OptimizerContext {
     pub dead: FxHashSet<NodeId>,
     /// Redirect map: old_node_id → new_node_id (produced by CSE/CopyProp)
     pub redirect: FxHashMap<NodeId, NodeId>,
+    /// Dead subgraph set (FuncDCE-marked): a function subgraph plus every nested
+    /// branch/loop/defer-body subgraph of an unreachable function. Consumed by
+    /// `rebuild` for subgraph compaction (SubGraphId renumbering).
+    pub dead_sgs: FxHashSet<SubGraphId>,
     /// Whether ConstFold modified any node (modifies in place, produces no redirect)
     pub mutated: bool,
     /// Number of nodes folded by ConstFold this round (for debugging)
@@ -266,7 +270,7 @@ impl OptimizerContext {
     /// Whether any transformation occurred this round.
     #[inline]
     pub fn has_changes(&self) -> bool {
-        self.mutated || !self.dead.is_empty() || !self.redirect.is_empty()
+        self.mutated || !self.dead.is_empty() || !self.redirect.is_empty() || !self.dead_sgs.is_empty()
     }
 }
 
@@ -294,80 +298,177 @@ fn collect_writeback_targets(graph: &DataFlowGraph) -> FxHashSet<NodeId> {
 }
 
 // =========================================================================
-// compute_live_set — reverse reachability analysis
+// Liveness — the single liveness authority
 // =========================================================================
 
-/// Computes the live node set: traverses inputs backwards from all sub-graphs' return_node/cond_node/iter_next_node.
-/// Uses ctx.resolve to resolve redirects, ensuring redirected nodes' inputs are not traversed.
-/// Also traverses NodeId references in per-node metadata (gate_branches/select_infos/writeback_targets).
-pub fn compute_live_set(graph: &DataFlowGraph, ctx: &OptimizerContext) -> FxHashSet<NodeId> {
+/// Node- and function-level liveness, computed from ONE enumeration of
+/// out-of-band NodeId references (the NodeRef door: `for_each_node_ref` /
+/// `node_meta_refs`). Consumers:
+/// - `pass_dce` / `pass_dse` → node set (`compute_live_nodes`);
+/// - `pass_func_dce` → function set + node→function attribution
+///   (`compute_liveness`).
+/// Before this struct existed, each pass hand-rolled its own reference list
+/// and they had already diverged from rebuild's remap list
+/// (`upvalue_outer_nodes` / `reset_plan` were remapped but never seeded →
+/// `remap_n` panics), and node- vs function-level liveness were two separate
+/// BFS runs that could disagree about a call site and its callee body.
+pub struct Liveness {
+    /// Live node ids (redirect-resolved).
+    pub nodes: FxHashSet<NodeId>,
+    /// Reachable function ids (owning-function attribution).
+    pub funcs: FxHashSet<u32>,
+    /// Node idx → owning function id (u32::MAX = unattributed).
+    pub node_owner: Vec<u32>,
+}
+
+/// Phase 1 only: the node liveness closure. Seeds = every metadata NodeId
+/// (via the door — subgraph anchors, defer registration, event declarations,
+/// upvalues, loop reset plans, await sources, writeback targets, gate/select
+/// refs) + all side-effecting nodes; closure over inputs and per-node
+/// metadata refs (same door). Effect edges are inputs, so they are traversed
+/// like any other edge.
+pub fn compute_live_nodes(graph: &DataFlowGraph, ctx: &OptimizerContext) -> FxHashSet<NodeId> {
     let mut live: FxHashSet<NodeId> = FxHashSet::default();
     let mut stack: Vec<NodeId> = Vec::new();
-
-    // Helper: resolve + insert + push
     let add = |id: NodeId, live: &mut FxHashSet<NodeId>, stack: &mut Vec<NodeId>| {
         let r = ctx.resolve(id);
         if live.insert(r) { stack.push(r); }
     };
 
-    // Seeds: all sub-graphs' return_node + entry_node + cond_node + iter_next_node
-    for sg in &graph.subgraphs {
-        for &raw in &[sg.return_node, sg.entry_node] {
-            add(raw, &mut live, &mut stack);
-        }
-        if let Some(c) = sg.cond_node { add(c, &mut live, &mut stack); }
-        if let Some(n) = sg.iter_next_node { add(n, &mut live, &mut stack); }
-        // defer_table: trigger_node + captured_inputs
-        for entry in &sg.defer_table {
-            add(entry.trigger_node, &mut live, &mut stack);
-            for &cap in &entry.captured_inputs { add(cap, &mut live, &mut stack); }
-        }
-        // event_source_decls: node
-        for decl in &sg.event_source_decls {
-            add(decl.node, &mut live, &mut stack);
-        }
-    }
-    // Retain event source declaration nodes
-    for opt_n in &graph.await_event_sources {
-        if let Some(n) = opt_n { add(*n, &mut live, &mut stack); }
-    }
-    // Retain side-effecting nodes (cannot be removed by DCE)
+    // Seeds 1: every metadata NodeId through the door.
+    let mut refs: Vec<NodeId> = Vec::new();
+    graph.for_each_node_ref(|_site, _owner, id| refs.push(id));
+    for id in refs { add(id, &mut live, &mut stack); }
+
+    // Seeds 2: side-effecting nodes (never removable by node DCE).
     for idx in 0..graph.nodes.len() {
         if has_side_effect(graph, idx) {
             add(NodeId(idx as u32), &mut live, &mut stack);
         }
     }
 
+    // Closure: inputs + per-node metadata refs (the same door).
+    let mut meta: Vec<NodeId> = Vec::new();
     while let Some(n) = stack.pop() {
         let idx = n.0 as usize;
         let node = graph.nodes[idx];
-
-        // 1. Traverse node.inputs
         let inputs = graph.inputs_pool.get(node.inputs_offset, node.input_count);
         for &input in inputs {
             add(input, &mut live, &mut stack);
         }
-
-        // 2. Traverse NodeId references in per-node metadata
-        // gate_branches: condition_input + branches params
-        if let Some(gb) = graph.gate_branches.get(idx).and_then(|o| o.as_ref()) {
-            add(gb.condition_input, &mut live, &mut stack);
-            for (_, _, params) in &gb.branches {
-                for &p in params { add(p, &mut live, &mut stack); }
-            }
-        }
-        // select_infos: event_source_node
-        if let Some(si) = graph.select_infos.get(idx).and_then(|o| o.as_ref()) {
-            for sb in &si.branches {
-                add(sb.event_source_node, &mut live, &mut stack);
-            }
-        }
-        // writeback_targets
-        if let Some(Some(wt)) = graph.writeback_targets.get(idx).map(|o| o.as_ref()) {
-            add(*wt, &mut live, &mut stack);
-        }
+        meta.clear();
+        graph.node_meta_refs(idx, &mut meta);
+        for &id in &meta { add(id, &mut live, &mut stack); }
     }
     live
+}
+
+/// Phase 1 + phase 2: adds the function-level reachability closure consumed
+/// by `pass_func_dce`. Phase 2 roots: entry function + vtable fallback
+/// targets; edges: cross-sg references of RETAINED nodes (`ctx.is_live` —
+/// rebuild retains exactly those, and a Call node that is neither
+/// closure-live nor dead yet still binds its callee, so retention — not the
+/// phase-1 closure — is the criterion the kill set must agree with).
+pub fn compute_liveness(graph: &DataFlowGraph, ctx: &OptimizerContext) -> Liveness {
+    let nodes = compute_live_nodes(graph, ctx);
+
+    // Node → owning function subgraph (same attribution rebuild step 1a uses:
+    // function-level ranges cover nested branch/loop ranges; hoisted nodes
+    // resolve through hoisted_owners, upcasting a branch-sg owner to its
+    // function).
+    let total = graph.nodes.len();
+    let mut node_owner: Vec<u32> = vec![u32::MAX; total];
+    for sg in &graph.subgraphs {
+        if sg.loop_kind != crate::ir::Ir::LoopKind::None || sg.loop_parent_sg.is_some() {
+            continue;
+        }
+        if sg.id.0 != sg.function_id {
+            continue;
+        }
+        let start = sg.node_range.0.0 as usize;
+        let end = (sg.node_range.1.0 as usize).min(total);
+        for idx in start..end {
+            node_owner[idx] = sg.function_id;
+        }
+    }
+    for idx in 0..total {
+        if graph.hoisted_node[idx] && node_owner[idx] == u32::MAX {
+            let raw_owner = graph.hoisted_owners[idx].0 as usize;
+            node_owner[idx] = if raw_owner < graph.subgraphs.len() {
+                graph.subgraphs[raw_owner].function_id
+            } else {
+                graph.hoisted_owners[idx].0
+            };
+        }
+    }
+
+    let mut funcs: FxHashSet<u32> = FxHashSet::default();
+    if let Some(entry_sg) = graph.entry_subgraph {
+        let entry_func = graph.subgraphs[entry_sg.0 as usize].function_id;
+        let mut func_stack: Vec<u32> = Vec::new();
+        let push_func = |f: u32, funcs: &mut FxHashSet<u32>, stack: &mut Vec<u32>| {
+            if funcs.insert(f) { stack.push(f); }
+        };
+        push_func(entry_func, &mut funcs, &mut func_stack);
+        // Concrete-type virtual dispatch may reach these impls without any
+        // static Call edge.
+        for sg in graph.vtable_fallback_dispatch.values() {
+            push_func(graph.subgraphs[sg.0 as usize].function_id, &mut funcs, &mut func_stack);
+        }
+        // Retained nodes grouped by owning function. Unattributed retained
+        // nodes are attributed to the entry function — the conservative
+        // direction that keeps callees alive.
+        let mut funcs_of: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+        for (idx, &owner) in node_owner.iter().enumerate() {
+            let id = NodeId(idx as u32);
+            if !ctx.is_live(id) {
+                continue;
+            }
+            let owner = if owner == u32::MAX { entry_func } else { owner };
+            funcs_of.entry(owner).or_default().push(idx);
+        }
+        while let Some(f) = func_stack.pop() {
+            let Some(nodes_of_f) = funcs_of.get(&f) else { continue };
+            for &idx in nodes_of_f {
+                if let Some(t) = graph.call_targets.get(idx).and_then(|o| *o) {
+                    push_func(graph.subgraphs[t.0 as usize].function_id, &mut funcs, &mut func_stack);
+                }
+                if let Some(ci) = graph.closure_infos.get(idx).and_then(|o| o.as_ref()) {
+                    push_func(graph.subgraphs[ci.subgraph_id.0 as usize].function_id, &mut funcs, &mut func_stack);
+                }
+                if let Some(pi) = graph.partial_infos.get(idx).and_then(|o| o.as_ref()) {
+                    push_func(graph.subgraphs[pi.subgraph_id.0 as usize].function_id, &mut funcs, &mut func_stack);
+                }
+                if let Some(li) = graph.lazy_construct_infos.get(idx).and_then(|o| o.as_ref()) {
+                    push_func(graph.subgraphs[li.thunk_sg.0 as usize].function_id, &mut funcs, &mut func_stack);
+                }
+                if let Some(ti) = graph.trait_construct_infos.get(idx).and_then(|o| o.as_ref()) {
+                    for m in &ti.methods {
+                        push_func(graph.subgraphs[m.subgraph_id.0 as usize].function_id, &mut funcs, &mut func_stack);
+                    }
+                }
+                // Gate/select branch targets: normally same-function, but
+                // build-time inlining (compile_inline_expansion) can leave a
+                // live gate in one function pointing at a branch sg
+                // REGISTERED under another — including analyzer-dead branches
+                // whose placeholders were never compiled. The runtime really
+                // dispatches into those sgs, so their owning functions (and
+                // the anchor nodes those sgs resolve values through) must
+                // stay alive.
+                if let Some(gb) = graph.gate_branches.get(idx).and_then(|o| o.as_ref()) {
+                    for (_, bsg, _) in &gb.branches {
+                        push_func(graph.subgraphs[bsg.0 as usize].function_id, &mut funcs, &mut func_stack);
+                    }
+                }
+                if let Some(si) = graph.select_infos.get(idx).and_then(|o| o.as_ref()) {
+                    for sb in &si.branches {
+                        push_func(graph.subgraphs[sb.subgraph_id.0 as usize].function_id, &mut funcs, &mut func_stack);
+                    }
+                }
+            }
+        }
+    }
+    Liveness { nodes, funcs, node_owner }
 }
 
 // =========================================================================
@@ -446,44 +547,21 @@ pub fn pass_const_fold(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext) {
 // Pass: CSE — common subexpression elimination
 // =========================================================================
 
-/// Pre-computes the starting NodeId of the innermost sub-graph for each node.
-/// CSE only merges nodes within the same innermost sub-graph, preventing cross if-else/match
-/// branch sub-graph merges that would cause branch frames to incorrectly compute merged nodes
-/// (Bug #45).
-fn compute_innermost_sg_starts(graph: &DataFlowGraph) -> Vec<u32> {
-    let n = graph.nodes.len();
-    // Default 0 = function body sub-graph start (or no sub-graph)
-    let mut starts: Vec<u32> = vec![0; n];
-    // Sort by sub-graph range size descending: large ranges filled first, small ranges overwrite later
-    let mut sgs: Vec<(u32, u32)> = graph
-        .subgraphs
-        .iter()
-        .map(|sg| (sg.node_range.0 .0, sg.node_range.1 .0))
-        .collect();
-    sgs.sort_by_key(|&(_, end)| std::cmp::Reverse(end));
-    // Descending by end is not enough: need descending by range size to ensure small ranges overwrite large ones
-    sgs.sort_by_key(|&(start, end)| std::cmp::Reverse(end - start));
-    for (start, end) in &sgs {
-        for i in *start..*end {
-            if (i as usize) < n {
-                starts[i as usize] = *start;
-            }
-        }
-    }
-    starts
-}
-
-/// CSE pass: pure nodes with the same (compute_fn, resolved_inputs, metadata_hash, innermost_sg) → merge.
-/// The first occurrence is kept; subsequent ones are redirected to it.
-/// The key includes the innermost sub-graph start ID, ensuring identical computations across
-/// if-else/match branches are not merged (branch sub-graphs are mutually exclusive; merging would
-/// lose node references in non-executed branches, Bug #45).
-/// The metadata hash ensures nodes with different per-node metadata
-/// (pattern_field_indices/pattern_ctor_names/field_access_infos, etc.) are not incorrectly merged.
+/// CSE pass: pure nodes with the same (compute_fn, resolved_inputs, metadata_hash) → merge.
+/// The first occurrence is kept; subsequent ones are redirected to it — but ONLY
+/// when the kept node's region structurally dominates the duplicate's (W3:
+/// region-dominance legality replacing the innermost_sg_start key from Bug #45).
+/// Sibling branch sub-graphs (if-else/match arms) never dominate each other, so
+/// mutually-exclusive computations are still never merged; a function-level
+/// computation dominating an identical one inside a branch/loop body IS now
+/// merged (previously blocked). The metadata hash ensures nodes with different
+/// per-node metadata (pattern_field_indices/pattern_ctor_names/field_access_infos,
+/// etc.) are not incorrectly merged.
 pub fn pass_cse(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &FxHashSet<ComputeFnId>) {
-    let mut seen: FxHashMap<(ComputeFnId, Vec<NodeId>, u64, u32), NodeId> = FxHashMap::default();
+    let mut seen: FxHashMap<(ComputeFnId, Vec<NodeId>, u64), NodeId> = FxHashMap::default();
     let wb_targets = collect_writeback_targets(graph);
-    let sg_starts = compute_innermost_sg_starts(graph);
+    let regions = crate::ir::Region::RegionTree::build(graph);
+    let innermost = regions.innermost_all(graph.nodes.len());
 
     for (idx, node) in graph.nodes.iter().enumerate() {
         let id = NodeId(idx as u32);
@@ -500,10 +578,39 @@ pub fn pass_cse(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &Fx
         let inputs = graph.inputs_pool.get(node.inputs_offset, node.input_count);
         let resolved: Vec<NodeId> = inputs.iter().map(|&i| ctx.resolve(i)).collect();
         let meta_hash = graph.cse_metadata_hash(idx);
-        let sg_start = sg_starts[idx];
-        let key = (node.compute_fn, resolved, meta_hash, sg_start);
+        let key = (node.compute_fn, resolved, meta_hash);
         if let Some(&existing) = seen.get(&key) {
-            ctx.redirect.insert(id, existing);
+            // W3 dominance check. Same-subgraph merges keep the historical
+            // (innermost-key) behavior. Cross-subgraph merges are NEW and must
+            // respect two runtime invariants the old key implicitly preserved:
+            // - the loop reset machinery re-evaluates every cond-tree node each
+            //   iteration, so a node inside ANY loop subgraph (While/Loop/For/
+            //   TailRec/LoopBody) must never be redirected away (a redirected
+            //   cond-tree node left ResetPlan pointing at dead nodes → hang);
+            // - a branch subgraph's entry/return nodes are anchor points; a
+            //   cross-sg redirect would move them outside the sg range.
+            let ex_sg = innermost[existing.0 as usize];
+            let du_sg = innermost[idx];
+            let legal = match (ex_sg, du_sg) {
+                (None, None) => true,
+                (Some(e), Some(d)) => {
+                    if e == d {
+                        true // same subgraph — historical behavior
+                    } else {
+                        let dup_in_loop =
+                            graph.subgraphs[d.0 as usize].loop_kind != crate::ir::Ir::LoopKind::None;
+                        let dup_is_anchor = {
+                            let sg = &graph.subgraphs[d.0 as usize];
+                            sg.entry_node == id || sg.return_node == id
+                        };
+                        !dup_in_loop && !dup_is_anchor && regions.dominates(e, d)
+                    }
+                }
+                _ => false,
+            };
+            if legal {
+                ctx.redirect.insert(id, existing);
+            }
         } else {
             seen.insert(key, id);
         }
@@ -554,19 +661,13 @@ fn collect_refs(graph: &DataFlowGraph, ctx: &OptimizerContext, idx: usize, out: 
     for &input in inputs {
         out.push(ctx.resolve(input));
     }
-    if let Some(gb) = graph.gate_branches.get(idx).and_then(|o| o.as_ref()) {
-        out.push(ctx.resolve(gb.condition_input));
-        for (_, _, params) in &gb.branches {
-            for &p in params { out.push(ctx.resolve(p)); }
-        }
-    }
-    if let Some(si) = graph.select_infos.get(idx).and_then(|o| o.as_ref()) {
-        for sb in &si.branches {
-            out.push(ctx.resolve(sb.event_source_node));
-        }
-    }
-    if let Some(Some(wt)) = graph.writeback_targets.get(idx).map(|o| o.as_ref()) {
-        out.push(ctx.resolve(*wt));
+    // Per-node metadata refs through the door (single enumeration shared
+    // with liveness seeding and rebuild remapping). The tail pushed raw here
+    // is resolved in place to match the input handling above.
+    let base = out.len();
+    graph.node_meta_refs(idx, out);
+    for id in out[base..].iter_mut() {
+        *id = ctx.resolve(*id);
     }
 }
 
@@ -578,19 +679,21 @@ fn collect_refs(graph: &DataFlowGraph, ctx: &OptimizerContext, idx: usize, out: 
 /// 3. Handle the case where a redirect target is dead: if the redirect target is dead, the redirect key
 ///    is also dead
 pub fn pass_dce(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &FxHashSet<ComputeFnId>) {
-    let live = compute_live_set(graph, ctx);
+    let live = compute_live_nodes(graph, ctx);
 
     // Step 1: Mark pure computation nodes not in the live set as dead candidates
     for (idx, node) in graph.nodes.iter().enumerate() {
         let id = NodeId(idx as u32);
         if live.contains(&id) { continue; }
         if !ctx.is_live(id) { continue; }
-        let is_pure_calc = match node.kind {
-            NodeKind::BinOp | NodeKind::TriOp | NodeKind::UnOp | NodeKind::FieldAccess => {
-                pure_set.contains(&node.compute_fn)
-            }
-            NodeKind::Const | NodeKind::Call | NodeKind::Gate
-            | NodeKind::Await | NodeKind::EventSource => false,
+        // W1: kind gate via is_launch_kind — launch kinds and Const are never
+        // deletable; the pure-computation kinds go through the pure set.
+        let is_pure_calc = if crate::ir::Ir::is_launch_kind(node.kind)
+            || node.kind == NodeKind::Const
+        {
+            false
+        } else {
+            pure_set.contains(&node.compute_fn)
         };
         if is_pure_calc {
             ctx.dead.insert(id);
@@ -634,6 +737,60 @@ pub fn pass_dce(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &Fx
             }
         }
         if !changed { break; }
+    }
+}
+
+// =========================================================================
+// Pass: FuncDCE — function-level dead code elimination
+// =========================================================================
+
+/// Function-level DCE: kills entire functions unreachable from the entry
+/// function, wholesale (all their nodes + the function subgraph and every
+/// nested branch/loop/defer-body subgraph). This is what removes the uncalled
+/// builtin/library bulk from the final artifact: node-level DCE cannot touch
+/// it because every subgraph's entry/return anchors are DCE roots.
+///
+/// Soundness rests on the cross-function reference surface being enumerable
+/// (no runtime name resolution exists — `.kzo` carries no function-name table):
+/// - `call_targets` (static Call nodes)
+/// - `closure_infos` / `partial_infos` (function values & partial application)
+/// - `lazy_construct_infos` (lazy thunk bodies)
+/// - `trait_construct_infos` (inline-trait method tables)
+/// - `vtable_fallback_dispatch` (concrete-type virtual dispatch)
+/// Global initializers are compiled INTO the entry function body, so entry
+/// reachability covers them. Non-escaping lambdas share the enclosing
+/// function's `function_id` and die together with it. `rebuild`'s removal
+/// veto (reference scan) is the final safety net for anything missed here.
+pub fn pass_func_dce(graph: &DataFlowGraph, ctx: &mut OptimizerContext) {
+    if graph.entry_subgraph.is_none() {
+        return;
+    }
+    // Single liveness authority: phase 2 of `compute_liveness` derives the
+    // reachable-function set from the same door-seeded node closure and the
+    // same retention criterion (`ctx.is_live`) that rebuild uses, so a live
+    // call site and its callee body can never disagree about who survives.
+    let liv = compute_liveness(graph, ctx);
+
+    // Kill unreachable functions wholesale: every owned node + the function
+    // subgraph and all nested subgraphs (any sg whose function_id is dead).
+    let mut killed = false;
+    for (idx, &owner) in liv.node_owner.iter().enumerate() {
+        if owner == u32::MAX || liv.funcs.contains(&owner) {
+            continue;
+        }
+        let id = NodeId(idx as u32);
+        if ctx.is_live(id) {
+            ctx.dead.insert(id);
+            killed = true;
+        }
+    }
+    if killed {
+        for sg in &graph.subgraphs {
+            if !liv.funcs.contains(&sg.function_id) {
+                ctx.dead_sgs.insert(sg.id);
+            }
+        }
+        ctx.mutated = true;
     }
 }
 
@@ -816,7 +973,7 @@ pub fn pass_strength_reduction(graph: &mut DataFlowGraph, ctx: &mut OptimizerCon
                 graph.nodes[idx].inputs_offset = new_offset;
                 graph.nodes[idx].input_count = 2;
 
-                if std::env::var("KUZO_STRENGTH_DBG").is_ok() {
+                if std::env::var("FROND_STRENGTH_DBG").is_ok() {
                     eprintln!("[STRENGTH] mul→shl node={} var={} const_node={} const_val={}→{} cf={} downstreams={} const_kind={:?} const_cf={}",
                         idx, var_input.0, resolved.0, val, n, shl_cf.0, graph.downstreams[ridx].len(),
                         graph.nodes[ridx].kind, graph.nodes[ridx].compute_fn.0);
@@ -862,7 +1019,7 @@ pub fn pass_strength_reduction(graph: &mut DataFlowGraph, ctx: &mut OptimizerCon
             graph.nodes[idx].inputs_offset = new_offset;
             graph.nodes[idx].input_count = 2;
 
-            if std::env::var("KUZO_STRENGTH_DBG").is_ok() {
+            if std::env::var("FROND_STRENGTH_DBG").is_ok() {
                 eprintln!("[STRENGTH] udiv→shr node={} dividend={} divisor={}→{} cf={}",
                     idx, dividend_input.0, dval, n, shr_cf.0);
             }
@@ -902,7 +1059,7 @@ pub fn pass_strength_reduction(graph: &mut DataFlowGraph, ctx: &mut OptimizerCon
             // Input order unchanged: [dividend, mask constant]
             // No need to reorder inputs; both mod and bitand are [x, const]
 
-            if std::env::var("KUZO_STRENGTH_DBG").is_ok() {
+            if std::env::var("FROND_STRENGTH_DBG").is_ok() {
                 eprintln!("[STRENGTH] umod→bitand node={} dividend={} divisor={}→mask={} cf={}",
                     idx, inputs[0].0, dval, mask, bitand_cf.0);
             }
@@ -919,12 +1076,18 @@ pub fn pass_strength_reduction(graph: &mut DataFlowGraph, ctx: &mut OptimizerCon
 
 /// Determines whether a node is a store-class side-effecting node (WriteBack/FieldSet/ArrayStore/GlobalStore).
 /// Uses compute_fn for unified determination, consistent with the node's actual computation semantics.
+///
+/// W1 note: deliberately NOT derived from `Ir::effect_class` (WriteLocal|WriteMutable
+/// would additionally admit TailRec writeback, deref write, atomic RMW and memo
+/// stores). Eliminating those is not yet validated — TailRec writeback drives the
+/// loop-continue signal and atomic stores are synchronization effects. Revisit
+/// under W2 together with storage versioning.
 fn is_store_node(graph: &DataFlowGraph, idx: usize) -> bool {
     let cf = graph.nodes[idx].compute_fn;
     cf == CF_WRITEBACK
-    || cf == CF_RECORD_FIELD_SET
-    || cf == CF_ARRAY_STORE
-    || cf == CF_GLOBAL_STORE
+        || cf == CF_RECORD_FIELD_SET
+        || cf == CF_ARRAY_STORE
+        || cf == CF_GLOBAL_STORE
 }
 
 /// DSE pass: eliminates store nodes whose results are not consumed.
@@ -942,7 +1105,7 @@ fn is_store_node(graph: &DataFlowGraph, idx: usize) -> bool {
 ///
 /// Elimination method: added to the ctx.dead set, cleaned up by rebuild.
 pub fn pass_dse(graph: &DataFlowGraph, ctx: &mut OptimizerContext) {
-    let live = compute_live_set(graph, ctx);
+    let live = compute_live_nodes(graph, ctx);
 
     // Build two reference sets:
     // - all_refs: inputs references of all non-dead nodes (including store-class nodes).
@@ -1084,7 +1247,7 @@ pub fn pass_dse(graph: &DataFlowGraph, ctx: &mut OptimizerContext) {
         }
 
         // Dead store: add to the dead set
-        if std::env::var("KUZO_DSE_DBG").is_ok() {
+        if std::env::var("FROND_DSE_DBG").is_ok() {
             eprintln!("[DSE] eliminate dead store node={} cf={} kind={:?}",
                 idx, node.compute_fn.0, node.kind);
         }
@@ -1098,13 +1261,13 @@ pub fn pass_dse(graph: &DataFlowGraph, ctx: &mut OptimizerContext) {
 
 /// Optimization level.
 ///
-/// Drives pass selection and iteration limits for `optimize_with_analysis`:
+/// Drives pass selection and the fixpoint stall window for `optimize_with_analysis`:
 /// - `O0`: no optimization, only Build output
 /// - `O1`: skip structural transforms, only fixpoint iteration (Inline + traditional optimization)
 /// - `O2`: full (structural transforms + fixpoint iteration), standard level
-/// - `O3`: full + increased iteration limit (200), aggressive optimization
+/// - `O3`: full + wider fixpoint stall window (30 vs 10), aggressive optimization
 ///
-/// The `KUZO_NO_*` environment variables can still disable individual passes (for debugging),
+/// The `FROND_NO_*` environment variables can still disable individual passes (for debugging),
 /// taking priority over the level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -1126,6 +1289,46 @@ pub fn optimize(graph: &mut DataFlowGraph) {
     optimize_with_analysis(graph, None, OptLevel::default());
 }
 
+/// Best-effort human-readable message from a panic payload.
+pub(crate) fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Never-corrupt execution of one optimization unit (see the stability policy
+/// on `optimize_with_analysis`): snapshot → run → on panic restore the
+/// snapshot, report, and return `None`. `FROND_OPT_STRICT_PANIC=1` (or the CI
+/// gate `FROND_VERIFY_STRICT=1`) re-raises the panic unchanged so invariant
+/// violations stay loud in development.
+fn run_guarded<F, R>(graph: &mut DataFlowGraph, label: &str, f: F) -> Option<R>
+where
+    F: FnOnce(&mut DataFlowGraph) -> R,
+{
+    let strict = std::env::var("FROND_OPT_STRICT_PANIC").is_ok()
+        || std::env::var("FROND_VERIFY_STRICT").is_ok();
+    if strict {
+        return Some(f(graph));
+    }
+    let snapshot = graph.clone();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(graph))) {
+        Ok(result) => Some(result),
+        Err(payload) => {
+            eprintln!(
+                "[OPT] internal error in {}: {}\n[OPT] optimization stopped; graph restored to its last consistent state — the compile continues with a less-optimized (still correct) result. Set FROND_OPT_STRICT_PANIC=1 to re-raise this.",
+                label,
+                panic_payload_message(&payload)
+            );
+            *graph = snapshot;
+            None
+        }
+    }
+}
+
 /// Optimization entry point (with analysis report): performs fixpoint-iterated optimization on the graph.
 ///
 /// Two-phase pipeline (enabled by `level`):
@@ -1135,6 +1338,15 @@ pub fn optimize(graph: &mut DataFlowGraph) {
 ///    — Inline self-collects candidates (does not depend on analysis), so it can safely run every round.
 /// Without an analysis report, Phase 1 is skipped, degrading to a pure traditional optimization pipeline.
 /// When `level == O0`, the entire optimizer is skipped.
+///
+/// Stability policy (never-corrupt): every optimization unit (phase / fixpoint
+/// round, including its `rebuild`) runs against a snapshot of the last
+/// consistent graph. Any panic inside the unit — an invariant tripwire such as
+/// `rebuild: ref node not live`, an unexpected index, anything — restores the
+/// snapshot and stops optimizing; the compile then continues with the
+/// unoptimized-but-correct graph instead of crashing the process. Set
+/// `FROND_OPT_STRICT_PANIC=1` (or the CI gate `FROND_VERIFY_STRICT=1`) to
+/// re-raise the original panic for debugging.
 pub fn optimize_with_analysis(
     graph: &mut DataFlowGraph,
     analysis: Option<&AnalysisReport>,
@@ -1145,73 +1357,144 @@ pub fn optimize_with_analysis(
         return;
     }
 
-    let pure_set = crate::ir::Ir::pure_compute_fn_set();
-    let no_fold = std::env::var("KUZO_NO_FOLD").is_ok();
-    let no_cse = std::env::var("KUZO_NO_CSE").is_ok();
-    let no_copy = std::env::var("KUZO_NO_COPY").is_ok();
-    let no_dce = std::env::var("KUZO_NO_DCE").is_ok();
-    let no_licm = std::env::var("KUZO_NO_LICM").is_ok();
-    let no_unroll = std::env::var("KUZO_NO_UNROLL").is_ok();
-    let no_strength = std::env::var("KUZO_NO_STRENGTH").is_ok();
-    let no_dse = std::env::var("KUZO_NO_DSE").is_ok();
-    // Inline pass is enabled by default. KUZO_NO_INLINE=1 can explicitly disable it.
+    // W1: single derivation point (pure CFs minus aliasing reads when the
+    // graph contains in-place mutators — Bug #99).
+    let pure_set = crate::ir::Ir::graph_pure_set(graph);
+    let no_fold = std::env::var("FROND_NO_FOLD").is_ok();
+    let no_cse = std::env::var("FROND_NO_CSE").is_ok();
+    let no_copy = std::env::var("FROND_NO_COPY").is_ok();
+    let no_dce = std::env::var("FROND_NO_DCE").is_ok();
+    let no_licm = std::env::var("FROND_NO_LICM").is_ok();
+    let no_unroll = std::env::var("FROND_NO_UNROLL").is_ok();
+    let no_strength = std::env::var("FROND_NO_STRENGTH").is_ok();
+    let no_dse = std::env::var("FROND_NO_DSE").is_ok();
+    // Function-level DCE (uncalled-function elimination) runs inside the
+    // phase-2 fixpoint so functions freed by inlining die the same round and
+    // the entry-level constants they kept alive are collected by the next
+    // round's node-level DCE.
+    let no_funcdce = std::env::var("FROND_NO_FUNCDCE").is_ok();
+    // Inline pass is enabled by default. FROND_NO_INLINE=1 can explicitly disable it.
     // hoisted_owners tracking + rebuild grouped reordering ensures body nodes are correctly
     // included in the caller's range.
-    let no_inline = std::env::var("KUZO_NO_INLINE").is_ok();
+    let no_inline = std::env::var("FROND_NO_INLINE").is_ok();
 
     // ── Phase 1: structural transforms (one-time, depend on analysis NodeIds, level >= 2) ──
     if level >= OptLevel::O2 && analysis.is_some() {
         let mut ctx = OptimizerContext::default();
-        if !no_licm   { pass_licm(graph, &mut ctx, analysis); }
-        if !no_unroll { pass_loop_unroll(graph, &mut ctx, analysis); }
-        if ctx.has_changes() {
-            check_gate_in_branch(graph, "BEFORE phase1 rebuild");
-            graph.rebuild(&ctx.dead, &ctx.redirect);
-            check_gate_in_branch(graph, "AFTER phase1 rebuild");
-        }
+        run_guarded(graph, "phase1 (LICM/Unroll)", |graph| {
+            if !no_licm   { pass_licm(graph, &mut ctx, analysis); }
+            if !no_unroll { pass_loop_unroll(graph, &mut ctx, analysis); }
+            if ctx.has_changes() {
+                check_gate_in_branch(graph, "BEFORE phase1 rebuild");
+                graph.rebuild(&ctx.dead, &ctx.redirect, &ctx.dead_sgs);
+                check_gate_in_branch(graph, "AFTER phase1 rebuild");
+                crate::pass::Verifier::verify_and_report(graph, "opt-phase1");
+            }
+        });
+        // On failure `run_guarded` already restored the pre-phase1 graph;
+        // phase 2 still runs on the (unoptimized) consistent graph.
     }
 
     // ── Phase 2: fixpoint iteration (Inline + traditional optimization, level >= 1) ──
-    let dbg_iter = std::env::var("KUZO_INLINE_DBG").is_ok();
-    // O3 increases the iteration limit; the KUZO_OPT_MAX_ITER environment variable takes priority (for debugging)
-    let default_max_iter = if level >= OptLevel::O3 { 200 } else { 50 };
-    let mut max_iter = std::env::var("KUZO_OPT_MAX_ITER")
+    let dbg_iter = std::env::var("FROND_INLINE_DBG").is_ok();
+    // Termination guard (replaces the former fixed 50/200-round cap): the loop stops
+    // after `stall_window` consecutive rounds without a strict decrease of the
+    // progress measure `(call sites, nodes)`, lexicographic. Every productive round
+    // strictly decreases it — Inline removes a call site (even when it grows the node
+    // count), CF/CSE/CopyProp/DCE/DSE only remove or simplify nodes. Redirect-only
+    // churn (CopyProp rewiring with nothing dead yet) can hold the measure flat for a
+    // few rounds, hence a window rather than a per-round requirement. Because the
+    // measure is well-ordered and starts finite, improvements can only happen finitely
+    // often, so the loop always terminates — no round cap is needed.
+    // Legitimately long optimization chains keep improving and are never cut short;
+    // only pass oscillations (flat/increasing forever) hit the window.
+    // O3 gets a wider window (aggressive settings stretch flat stretches).
+    // FROND_OPT_STALL_WINDOW overrides; FROND_OPT_MAX_ITER still imposes a hard round
+    // cap when set (debugging aid, off by default).
+    let default_window: u32 = if level >= OptLevel::O3 { 30 } else { 10 };
+    let stall_window = std::env::var("FROND_OPT_STALL_WINDOW")
         .ok().and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(default_max_iter);
+        .unwrap_or(default_window);
+    let hard_cap: Option<u32> = std::env::var("FROND_OPT_MAX_ITER")
+        .ok().and_then(|s| s.parse::<u32>().ok());
+    let mut best = fixpoint_measure(graph);
+    let mut stalled: u32 = 0;
+    let mut round: u32 = 0;
     loop {
+        round += 1;
         let mut ctx = OptimizerContext::default();
 
-        if !no_inline { pass_inline(graph, &mut ctx, None); }
-        if !no_fold   { pass_const_fold(graph, &mut ctx); }
-        if !no_strength { pass_strength_reduction(graph, &mut ctx); }
-        if !no_cse    { pass_cse(graph, &mut ctx, &pure_set); }
-        if !no_copy   { pass_copy_prop(graph, &mut ctx); }
-        if !no_dce    { pass_dce(graph, &mut ctx, &pure_set); }
-        if !no_dse    { pass_dse(graph, &mut ctx); }
+        // Never-corrupt policy: the round (passes + rebuild + verify) runs
+        // against a snapshot of the last consistent state; a panic restores it
+        // and ends optimization instead of killing the compile.
+        let progressed = run_guarded(graph, &format!("phase2 round {round}"), |graph| {
+            if !no_inline { pass_inline(graph, &mut ctx, None); }
+            if !no_fold   { pass_const_fold(graph, &mut ctx); }
+            if !no_strength { pass_strength_reduction(graph, &mut ctx); }
+            if !no_cse    { pass_cse(graph, &mut ctx, &pure_set); }
+            if !no_copy   { pass_copy_prop(graph, &mut ctx); }
+            if !no_dce    { pass_dce(graph, &mut ctx, &pure_set); }
+            if !no_dse    { pass_dse(graph, &mut ctx); }
+            if !no_funcdce { pass_func_dce(graph, &mut ctx); }
 
-        if !ctx.has_changes() { break; }
+            if !ctx.has_changes() {
+                return false; // converged
+            }
 
-        if dbg_iter {
-            eprintln!("[OPT-ITER] iter={} nodes={} before rebuild", 51 - max_iter, graph.nodes.len());
-        }
-        check_gate_in_branch(graph, "BEFORE phase2 rebuild");
-        let _old_to_new = graph.rebuild(&ctx.dead, &ctx.redirect);
-        check_gate_in_branch(graph, "AFTER phase2 rebuild");
-        if dbg_iter {
-            eprintln!("[OPT-ITER] iter={} nodes={} after rebuild", 51 - max_iter, graph.nodes.len());
-        }
-
-        max_iter -= 1;
-        if max_iter == 0 {
+            if dbg_iter {
+                eprintln!("[OPT-ITER] round={} nodes={} before rebuild", round, graph.nodes.len());
+            }
+            check_gate_in_branch(graph, "BEFORE phase2 rebuild");
+            let _old_to_new = graph.rebuild(&ctx.dead, &ctx.redirect, &ctx.dead_sgs);
+            check_gate_in_branch(graph, "AFTER phase2 rebuild");
+            crate::pass::Verifier::verify_and_report(graph, "opt-phase2");
+            true
+        });
+        if progressed != Some(true) {
+            // Either converged, or the round failed and the graph was restored
+            // (run_guarded already reported) — stop in both cases. On failure
+            // this leaves the last consistent (possibly unoptimized) graph.
             break;
         }
+
+        let m = fixpoint_measure(graph);
+        if m < best {
+            best = m;
+            stalled = 0;
+        } else {
+            stalled += 1;
+        }
+        if dbg_iter {
+            eprintln!("[OPT-ITER] round={} calls={} nodes={} stalled={}/{}", round, m.0, m.1, stalled, stall_window);
+        }
+        if stalled >= stall_window {
+            eprintln!(
+                "[OPT] fixpoint stalled: no measure improvement in {stalled} rounds (calls={}, nodes={}) — stopping; pass oscillation suspected",
+                m.0, m.1
+            );
+            break;
+        }
+        if let Some(cap) = hard_cap {
+            if round >= cap { break; }
+        }
     }
+}
+
+/// Progress measure for the phase-2 fixpoint loop (see `optimize_with_analysis`):
+/// `(call-site count, total node count)`, compared lexicographically.
+fn fixpoint_measure(graph: &DataFlowGraph) -> (usize, usize) {
+    let calls = graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == crate::ir::Ir::NodeKind::Call)
+        .count();
+    (calls, graph.nodes.len())
 }
 
 /// Debug helper: check if any Gate node is inside its branch subgraph's node_range.
 /// This would cause infinite recursion at runtime (Gate launches a subgraph that contains itself).
 fn check_gate_in_branch(graph: &DataFlowGraph, label: &str) {
-    if std::env::var("KUZO_DEBUG_REBUILD").is_err() {
+    if std::env::var("FROND_DEBUG_REBUILD").is_err() {
         return;
     }
     for (idx, gb_opt) in graph.gate_branches.iter().enumerate() {
@@ -1532,14 +1815,14 @@ pub fn pass_inline(
         return;
     }
 
-    let inline_limit = std::env::var("KUZO_INLINE_LIMIT")
+    let inline_limit = std::env::var("FROND_INLINE_LIMIT")
         .ok().and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(usize::MAX);
-    if std::env::var("KUZO_INLINE_DBG").is_ok() {
+    if std::env::var("FROND_INLINE_DBG").is_ok() {
         eprintln!("[INLINE] {} candidates", candidates.len());
     }
     for (i, candidate) in candidates.iter().enumerate().take(inline_limit) {
-        if std::env::var("KUZO_INLINE_DBG").is_ok() {
+        if std::env::var("FROND_INLINE_DBG").is_ok() {
             let callee_sg = &graph.subgraphs[candidate.callee_sg.0 as usize];
             let callee_size = (callee_sg.node_range.1.0 - callee_sg.node_range.0.0) as usize;
             eprintln!("[INLINE] #{} call_node={} callee_sg={} caller_sg={} (size={}, params={}, return={})",
@@ -1604,7 +1887,7 @@ fn collect_inline_candidates(graph: &DataFlowGraph) -> Vec<InlineCandidate> {
         // → caller logic corruption.
         let ret = callee_sg.return_node;
         if ret.0 < callee_sg.node_range.0.0 || ret.0 >= callee_sg.node_range.1.0 {
-            if std::env::var("KUZO_INLINE_DBG").is_ok() {
+            if std::env::var("FROND_INLINE_DBG").is_ok() {
                 eprintln!("[INLINE-SKIP] call_node={} callee_sg={} return={} not in range [{},{})",
                     nid.0, callee_sg_id.0, ret.0,
                     callee_sg.node_range.0.0, callee_sg.node_range.1.0);
@@ -1612,16 +1895,14 @@ fn collect_inline_candidates(graph: &DataFlowGraph) -> Vec<InlineCandidate> {
             continue;
         }
 
-        // The body must contain only Const/BinOp/UnOp/FieldAccess nodes whose compute_fn is in pure_set
+        // The body must contain only pure-computation kinds (W1: !is_launch_kind,
+        // i.e. Const/BinOp/TriOp/UnOp/FieldAccess) whose compute_fn is in pure_set
         // (this condition simultaneously guarantees: pure function + no recursion + no control flow + no construction side effects)
         let (cs, ce) = callee_sg.node_range;
         let mut safe_body = true;
         for cidx in (cs.0 as usize)..(ce.0 as usize) {
             let cn = &graph.nodes[cidx];
-            if !matches!(
-                cn.kind,
-                NodeKind::Const | NodeKind::BinOp | NodeKind::TriOp | NodeKind::UnOp | NodeKind::FieldAccess
-            ) {
+            if crate::ir::Ir::is_launch_kind(cn.kind) {
                 safe_body = false;
                 break;
             }
@@ -1681,7 +1962,7 @@ fn collect_inline_candidates(graph: &DataFlowGraph) -> Vec<InlineCandidate> {
             }
         }
         if !inputs_in_range {
-            if std::env::var("KUZO_INLINE_DBG").is_ok() {
+            if std::env::var("FROND_INLINE_DBG").is_ok() {
                 eprintln!("[INLINE-SKIP] call_node={} has inputs outside caller_func_sg={} range=[{},{})",
                     nid.0, caller_func_sg.0, caller_range.0 .0, caller_range.1 .0);
             }
@@ -1710,7 +1991,7 @@ fn inline_call(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext, candidate:
     let call_inputs =
         graph.inputs_pool.get(call_node_struct.inputs_offset, call_node_struct.input_count);
 
-    if std::env::var("KUZO_INLINE_DBG").is_ok() {
+    if std::env::var("FROND_INLINE_DBG").is_ok() {
         let ret_node = &graph.nodes[return_node.0 as usize];
         let ret_inputs = graph.inputs_pool.get(ret_node.inputs_offset, ret_node.input_count);
         eprintln!("[INLINE-DBG] call_node={} inputs={:?} callee=[{},{}) params={} return={} ret_kind={:?} ret_cf={} ret_inputs={:?}",
@@ -1811,7 +2092,7 @@ fn inline_call(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext, candidate:
     if let Some(eff) = effect_input {
         if eff.0 >= caller_range.0 .0 && eff.0 < caller_range.1 .0 {
             new_inputs.push(eff);
-        } else if std::env::var("KUZO_INLINE_DBG").is_ok() {
+        } else if std::env::var("FROND_INLINE_DBG").is_ok() {
             let eff_sg = graph.find_innermost_sg_for_node(eff);
             eprintln!("[INLINE-WARN] call_node={} effect_input={} outside caller_func_sg={} range=[{},{}) — dropped | caller_sg function_id={} loop_kind={:?} loop_parent={:?} param_count={} upvalue_count={} | eff_sg={:?} eff_kind={:?} eff_cf={}",
                 call_node.0, eff.0, candidate.caller_func_sg.0, caller_range.0 .0, caller_range.1 .0,
@@ -1838,4 +2119,64 @@ fn inline_call(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext, candidate:
     // groups nodes by function-level sub-graph, placing body nodes within the caller_func_sg range.
 
     ctx.mutated = true;
+}
+
+// ==================== Stability-policy tests ====================
+
+#[cfg(test)]
+mod stability_tests {
+    use super::*;
+    use crate::ir::Ir::*;
+
+    fn tiny_graph() -> DataFlowGraph {
+        let mut g = DataFlowGraph::new();
+        // entry function sg: [const 1, const 2, unused pure add] — the unused
+        // add gives the first fixpoint round something to change so rebuild
+        // (and thus the injected failure) is actually reached.
+        let off = g.inputs_pool.push(&[]);
+        g.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: off, compute_fn: CF_NOOP });
+        g.const_values[0] = Some(ConstValue::I32(1));
+        let off = g.inputs_pool.push(&[]);
+        g.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: off, compute_fn: CF_NOOP });
+        g.const_values[1] = Some(ConstValue::I32(2));
+        let off = g.inputs_pool.push(&[NodeId(0), NodeId(1)]);
+        g.add_node(Node { kind: NodeKind::BinOp, input_count: 2, inputs_offset: off, compute_fn: ComputeFnId(1) });
+        g.add_subgraph(SubGraph {
+            id: SubGraphId(0),
+            node_range: (NodeId(0), NodeId(3)),
+            param_count: 0,
+            entry_node: NodeId(0),
+            return_node: NodeId(0),
+            has_suspend: false,
+            event_source_decls: Vec::new(),
+            defer_table: Vec::new(),
+            loop_kind: LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: 0,
+            iter_next_node: None,
+            upvalue_count: 0,
+            upvalue_outer_nodes: Vec::new(),
+            nested_ranges: Vec::new(),
+            reset_plan: None,
+        });
+        g.set_entry_subgraph(SubGraphId(0));
+        g.compute_downstreams();
+        g
+    }
+
+    /// The never-corrupt policy: an invariant violation inside an optimization
+    /// round must roll the graph back to the last consistent state instead of
+    /// panicking out of the optimizer.
+    #[test]
+    fn optimizer_rollback_on_rebuild_failure() {
+        std::env::set_var("FROND_TEST_INJECT_REBUILD_FAIL", "1");
+        let mut g = tiny_graph();
+        let nodes_before = g.nodes.len();
+        optimize_with_analysis(&mut g, None, OptLevel::O1); // must not panic
+        std::env::remove_var("FROND_TEST_INJECT_REBUILD_FAIL");
+        assert_eq!(g.nodes.len(), nodes_before, "graph must be restored to the pre-round state");
+        assert_eq!(g.entry_subgraph, Some(SubGraphId(0)));
+        assert_eq!(g.node_count(), 3);
+    }
 }

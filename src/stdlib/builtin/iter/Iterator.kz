@@ -1,4 +1,4 @@
-// Iterator<T>: iterator trait (builtin Kuzo implementation)
+// Iterator<T>: iterator trait (builtin Frond implementation)
 //
 // Three built-in implementations:
 //   ArrayIter<T>     — array iterator, next() returns T?

@@ -235,7 +235,7 @@ impl_scalar_bucket_methods! {
 
 impl ValueArena {
     // ─── Global arena access (for extern "C" reflection primitives) ──────────────
-    // Kuzo is a single-threaded compiler; thread_local is sufficient.
+    // Frond is a single-threaded compiler; thread_local is sufficient.
     thread_local! {
         static GLOBAL_ARENA: RefCell<ValueArena> = RefCell::new(ValueArena::new());
     }
@@ -437,10 +437,10 @@ impl ValueArena {
 
     // ---- Heap object convenience constructors ----
     pub fn alloc_str(&mut self, s: impl Into<String>) -> ValueHandle {
-        self.alloc_ref(HeapObj::Str(KuzoStr::new(s)))
+        self.alloc_ref(HeapObj::Str(Str::new(s)))
     }
     pub fn alloc_str_from(&mut self, s: &str) -> ValueHandle {
-        self.alloc_ref(HeapObj::Str(KuzoStr::from_rust_str(s)))
+        self.alloc_ref(HeapObj::Str(Str::from_rust_str(s)))
     }
     pub fn alloc_array(&mut self, arr: ArrayValue) -> ValueHandle {
         self.alloc_ref(HeapObj::Array(arr))
@@ -699,7 +699,7 @@ fn arena_debug(arena: &ValueArena, h: ValueHandle, f: &mut fmt::Formatter) -> fm
 // ValueTrait — unified external interface (methods carry &ValueArena)
 // =========================================================================
 
-/// Kuzo unified value trait: the external interface for all value types.
+/// Frond unified value trait: the external interface for all value types.
 pub trait ValueTrait: Sized + Clone + Copy + PartialEq + Eq + Hash {
     // ---- Predicates (tag only, no arena needed) ----
     fn is_null(&self) -> bool;
@@ -746,7 +746,7 @@ pub trait ValueTrait: Sized + Clone + Copy + PartialEq + Eq + Hash {
     fn as_f128(&self, arena: &ValueArena) -> Option<F128>;
 
     // ---- Heap accessors ----
-    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a KuzoStr>;
+    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a Str>;
     fn as_array<'a>(&self, arena: &'a ValueArena) -> Option<&'a ArrayValue>;
     fn as_record<'a>(&self, arena: &'a ValueArena) -> Option<&'a RecordValue>;
     fn as_adt<'a>(&self, arena: &'a ValueArena) -> Option<&'a AdtValue>;
@@ -1022,7 +1022,7 @@ impl ValueTrait for ValueHandle {
 
     // ---- Heap accessors ----
     #[inline]
-    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a KuzoStr> {
+    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a Str> {
         match arena.heap_obj_opt(*self)? {
             HeapObj::Str(s) => Some(s),
             _ => None,
@@ -1718,6 +1718,11 @@ pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
         (HeapObj::CoroutineFrame, HeapObj::CoroutineFrame) => false,
         // FFI opaque pointers: equal iff raw pointer value matches
         (HeapObj::OpaquePtr(x), HeapObj::OpaquePtr(y)) => x.ptr == y.ptr,
+        // Lib/ForeignFn: identity via the shared handle (Arc ptr_eq), like ChannelVal
+        (HeapObj::LibVal(x), HeapObj::LibVal(y)) => std::sync::Arc::ptr_eq(&x.shared, &y.shared),
+        (HeapObj::ForeignFnVal(x), HeapObj::ForeignFnVal(y)) => {
+            std::sync::Arc::ptr_eq(&x.shared, &y.shared) && x.addr == y.addr
+        }
         // Different HeapObj variants are never equal
         _ => false,
     }
@@ -1967,6 +1972,8 @@ fn deep_clone_heap(
         HeapObj::ReceiverVal(r) => HeapObj::ReceiverVal(r.clone()),
         HeapObj::CoroutineFrame => HeapObj::CoroutineFrame,
         HeapObj::OpaquePtr(op) => HeapObj::OpaquePtr(op.clone()),
+        HeapObj::LibVal(l) => HeapObj::LibVal(l.clone()),
+        HeapObj::ForeignFnVal(f) => HeapObj::ForeignFnVal(f.clone()),
     }
 }
 
@@ -2068,12 +2075,12 @@ impl ValueArena {
 
     // ---- Heap object convenience constructors ----
     pub fn str(&mut self, s: impl Into<String>) -> ValueHandle {
-        self.alloc_ref(HeapObj::Str(KuzoStr::new(s)))
+        self.alloc_ref(HeapObj::Str(Str::new(s)))
     }
     pub fn str_from(&mut self, s: &str) -> ValueHandle {
-        self.alloc_ref(HeapObj::Str(KuzoStr::from_rust_str(s)))
+        self.alloc_ref(HeapObj::Str(Str::from_rust_str(s)))
     }
-    pub fn from_kuzo_str(&mut self, s: KuzoStr) -> ValueHandle {
+    pub fn from_str(&mut self, s: Str) -> ValueHandle {
         self.alloc_ref(HeapObj::Str(s))
     }
     pub fn heap(&mut self, obj: HeapObj) -> ValueHandle {

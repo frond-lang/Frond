@@ -1,4 +1,4 @@
-//! Ast.rs — Kuzo syntax tree (merging 8 submodules)
+//! Ast.rs — Frond syntax tree (merging 8 submodules)
 
 // AST source spans and node wrappers
 

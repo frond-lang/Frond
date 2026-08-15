@@ -1,53 +1,53 @@
 <p align="center">
-  <img src="https://github.com/kuzo-lang/assets/blob/main/logo.png?raw=true" alt="Kuzo" width="200">
+  <img src="https://github.com/frond-lang/assets/blob/main/logo.png?raw=true" alt="Frond" width="200">
 </p>
 
-# Kuzo
+# Frond
 
-Kuzo is a statically typed programming language implemented in Rust, featuring a dataflow-ready scheduling execution model. Source files use the `.kz` extension; compiled artifacts are cross-platform `.kzo` binaries.
+Frond is a statically typed programming language implemented in Rust, featuring a dataflow-ready scheduling execution model. Source files use the `.kz` extension; compiled artifacts are cross-platform `.kzo` binaries.
 
 ## Build
 
 ```bash
 cargo build --release
-# Binary: target/release/kuzo
+# Binary: target/release/frond
 ```
 
 ## Quick Start
 
 ```bash
 # Create a new project
-kuzo init myapp
+frond init myapp
 cd myapp
 
 # Compile and run
-kuzo run
+frond run
 
 # Or compile only
-kuzo build
+frond build
 # Execute the artifact
-kuzo run out/myapp.kzo
+frond run out/myapp.kzo
 ```
 
 Generated project layout:
 
 ```
 myapp/
-├── kuzo.toml      # Project manifest
+├── frond.toml      # Project manifest
 └── src/Main.kz    # Entry point
 ```
 
 Default entry:
 
-```kuzo
+```frond
 fun main(): void {
-    println("Hello, Kuzo!")
+    println("Hello, Frond!")
 }
 ```
 
 ## Language Tour
 
-```kuzo
+```frond
 // Variables
 val x: i32 = 42
 var counter: i32 = 0
@@ -94,9 +94,9 @@ println("sum = {1 + 2}, point = {p}")
 
 | Command | Description |
 |---------|-------------|
-| `kuzo init [name]` | Scaffold a new project |
-| `kuzo build [-O N]` | Compile to `.kzo` (`-O 0..3`, default 2) |
-| `kuzo run [-O N]` | Compile and run |
-| `kuzo run <file.kzo>` | Execute a compiled artifact |
-| `kuzo debug --stage S` | Diagnostics (`tokens`/`ast`/`check`/`emit-c`/`emit-ffi`/`full`) |
-| `kuzo inspect <file.kzo>` | Inspect `.kzo` metadata |
+| `frond init [name]` | Scaffold a new project |
+| `frond build [-O N]` | Compile to `.kzo` (`-O 0..3`, default 2) |
+| `frond run [-O N]` | Compile and run |
+| `frond run <file.kzo>` | Execute a compiled artifact |
+| `frond debug --stage S` | Diagnostics (`tokens`/`ast`/`check`/`emit-c`/`emit-ffi`/`full`) |
+| `frond inspect <file.kzo>` | Inspect `.kzo` metadata |

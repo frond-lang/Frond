@@ -10,9 +10,11 @@
 //! - On load, if schema_version does not match, a migration chain from
 //!   file_version -> current_version is looked up.
 //!
-//! Current state: only schema v1 exists, there are no historical versions, and
-//! the registry is empty. When new versions are added in the future, register
-//! migration functions here.
+//! Current state: schema v2 is current (v1 artifacts from before the 2026-08
+//! structural slimming are rejected at load validation with a schema-mismatch
+//! error - rebuild from source to regenerate). The registry stays empty until
+//! an in-place byte migration is actually needed; adding v3 would register a
+//! `2 -> 3` entry here.
 
 use super::Spec::{SOLIDIFY_SCHEMA_VERSION, SOLIDIFY_ABI_VERSION};
 

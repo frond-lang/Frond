@@ -13,6 +13,32 @@ impl<'a> IrBuilder<'a> {
     /// The mangled-name format matches how methods are registered in `build_call_graph`
     /// (`"Type.method"`).
     /// `memo_pass` already makes the unique decision; a function has at most one strategy.
+
+/// AST-level check: does this return type node denote Throw (unfolding one Async layer)?
+/// Used for method/lambda bodies whose sema FuncSigInfo is not registered under a plain name.
+pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: Option<crate::ast::Ast::TypeRef>) -> bool {
+    let mut t = match rt {
+        Some(t) => t,
+        None => return false,
+    };
+    for _ in 0..2 {
+        match &arena.ty(t).node {
+            crate::ast::Ast::TypeNode::Generic { name, args }
+                if &**name == "Async" =>
+            {
+                match args.first() {
+                    Some(inner) => t = *inner,
+                    None => return false,
+                }
+            }
+            crate::ast::Ast::TypeNode::Generic { name, .. }
+                if &**name == "Throw" => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
     pub(super) fn lookup_memo_strategy(
         &self,
         name: &str,
@@ -55,9 +81,15 @@ impl<'a> IrBuilder<'a> {
         params: &[crate::ast::Ast::Param<'_>],
         is_void_fn: bool,
         is_async: bool,
+        fn_returns_throw: bool,
     ) -> NodeId {
         let prev_tail = self.in_tail_position;
         self.in_tail_position = !is_void_fn;
+        let prev_fn_throw = self.fn_returns_throw;
+        self.fn_returns_throw = fn_returns_throw;
+        // Bug #100: var homes are per-function (the same name in different functions
+        // maps to unrelated nodes); save/clear on entry, restore on exit.
+        let prev_var_home = std::mem::take(&mut self.var_home);
         // Bug #66: Mark that the next compile_block call is the function body's top-level block.
         // compile_block reads and resets this flag so that only nested blocks extract
         // block-scoped defers; function-level defers stay in defer_table for function-exit execution.
@@ -92,6 +124,8 @@ impl<'a> IrBuilder<'a> {
             }
         };
         self.in_tail_position = prev_tail;
+        self.fn_returns_throw = prev_fn_throw;
+        self.var_home = prev_var_home;
         self.in_function_top_block = prev_top_block;
         r
     }
@@ -277,6 +311,7 @@ impl<'a> IrBuilder<'a> {
         self.graph.set_gate_branches(
             gate_node,
             crate::ir::Ir::GateBranches {
+                capture: false,
                 condition_input: hit_node,
                 branches: vec![
                     (true, hit_sg, vec![]),
@@ -313,7 +348,19 @@ impl<'a> IrBuilder<'a> {
                 return self.register_subgraph_placeholder(name, 0, false);
             }
         };
+        self.compile_function_in(location, name)
+    }
 
+    /// Compiles the function `name` declared IN the given module
+    /// (`None` = the user entry module, `Some(i)` = builtin_modules[i]).
+    ///
+    /// The compile scheduler MUST go through here with the declaring module:
+    /// re-resolving a bare name across all modules (`find_function_location`)
+    /// picks the FIRST same-named function, so when two modules declare the
+    /// same name (File.chmod / Fs.chmod) one body gets compiled twice and the
+    /// other is NEVER compiled — every qualified key pointing at its
+    /// placeholder is then a call into an empty subgraph.
+    pub fn compile_function_in(&mut self, location: Option<usize>, name: &str) -> SubGraphId {
         let module = match location {
             None => self.module,
             Some(i) => self.builtin_modules[i],
@@ -350,12 +397,21 @@ impl<'a> IrBuilder<'a> {
         };
         let param_count = params.len();
 
-        // Reuse the pre-registered sg_id (created by the build() pre-registration pass) to avoid duplicate subgraphs
-        let sg_id = if let Some(&existing) = self.func_subgraphs.get(name) {
+        // Reuse the pre-registered sg_id (created by the build() pre-registration
+        // pass) to avoid duplicate subgraphs. The lookup key is the function's
+        // OWN module-mangled name — the same key family pre-registration
+        // created. A bare-name lookup would miss std functions (they have no
+        // bare slot) and mint a duplicate sg, leaving every qualified key
+        // pointing at the never-compiled placeholder: an empty-sg call target
+        // and, worse, a silently re-introduced bare key.
+        let own_mangled = crate::sema::Sema::module_logical_path(module.name)
+            .map(|mp| format!("{}.{}", mp, name));
+        let lookup_key = own_mangled.as_deref().unwrap_or(name);
+        let sg_id = if let Some(&existing) = self.func_subgraphs.get(lookup_key) {
             existing
         } else {
             let new_id = self.register_subgraph_placeholder(name, param_count as u8, is_async);
-            self.func_subgraphs.insert(name.to_string(), new_id);
+            self.func_subgraphs.insert(lookup_key.to_string(), new_id);
             new_id
         };
         let node_start = self.graph.nodes.len() as u32;
@@ -431,7 +487,11 @@ impl<'a> IrBuilder<'a> {
         let fn_is_async = self.sema.get_func_sig(name)
             .map(|sig| sig.is_async)
             .unwrap_or(is_async);
-        let return_node = self.compile_function_body(name, None, body_expr, &params, is_void_fn, fn_is_async);
+        // Bug #97: tail `expr?` must re-wrap into Ok when the function returns Throw.
+        let fn_returns_throw = self.sema.get_func_sig(name)
+            .map(|sig| self.handle_returns_throw(sig.return_type))
+            .unwrap_or_else(|| Self::type_ref_returns_throw(&module.arena, return_type));
+        let return_node = self.compile_function_body(name, None, body_expr, &params, is_void_fn, fn_is_async, fn_returns_throw);
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
@@ -440,7 +500,7 @@ impl<'a> IrBuilder<'a> {
         self.compiling_builtin = prev_builtin;
 
         let node_end = self.graph.nodes.len() as u32;
-        let debug_mod_name = if std::env::var("KUZO_DEBUG_BUILD").is_ok() {
+        let debug_mod_name = if std::env::var("FROND_DEBUG_BUILD").is_ok() {
             Some(self.current_module().name.to_string())
         } else {
             None
@@ -456,8 +516,13 @@ impl<'a> IrBuilder<'a> {
         // Consumes sema's FuncSigInfo.is_async (builtin modules fall back to AST is_async)
         sg.has_suspend = fn_is_async;
         sg.function_id = sg_id.0;
-
-        self.func_subgraphs.insert(name.to_string(), sg_id);
+        // NOTE: no bare-name registration here. Historically this line
+        // re-inserted `name` (bare) for EVERY compiled function — including
+        // std modules, whose bare slots the registration policy deliberately
+        // omits — with last-compiled-wins semantics. That silently reintroduced
+        // the exact wrong-callee class the resolver guards against. Every key
+        // this function needs was registered at placeholder creation
+        // (lookup_key above) or during pre-registration.
         sg_id
     }
 
@@ -573,7 +638,10 @@ impl<'a> IrBuilder<'a> {
         let fn_is_async = self.sema.get_func_sig(func_name)
             .map(|sig| sig.is_async)
             .unwrap_or(is_async);
-        let return_node = self.compile_function_body(func_name, None, body_expr, &params, is_void_fn, fn_is_async);
+        let fn_returns_throw = self.sema.get_func_sig(func_name)
+            .map(|sig| self.handle_returns_throw(sig.return_type))
+            .unwrap_or_else(|| Self::type_ref_returns_throw(&module.arena, return_type));
+        let return_node = self.compile_function_body(func_name, None, body_expr, &params, is_void_fn, fn_is_async, fn_returns_throw);
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
@@ -672,7 +740,8 @@ impl<'a> IrBuilder<'a> {
                 matches!(m.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
             }
         };
-        let return_node = self.compile_function_body(method_name, Some(type_name), body_expr, &params, is_void_fn, is_async);
+        let fn_returns_throw = Self::type_ref_returns_throw(&m.arena, return_type);
+        let return_node = self.compile_function_body(method_name, Some(type_name), body_expr, &params, is_void_fn, is_async, fn_returns_throw);
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
@@ -765,7 +834,8 @@ impl<'a> IrBuilder<'a> {
                 matches!(self.module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
             }
         };
-        let return_node = self.compile_function_body(method_name, Some(type_name), body_expr, &params, is_void_fn, is_async);
+        let fn_returns_throw = Self::type_ref_returns_throw(&self.module.arena, return_type);
+        let return_node = self.compile_function_body(method_name, Some(type_name), body_expr, &params, is_void_fn, is_async, fn_returns_throw);
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_sg_start = prev_sg_start;
@@ -788,25 +858,36 @@ impl<'a> IrBuilder<'a> {
     /// concrete type information, allowing self.method() calls to statically bind to the correct
     /// method subgraph via path 2 (the type's own methods).
     pub(super) fn compile_trait_default_method(&mut self, trait_name: &str, method_idx: usize, impl_type_name: &str, instance_idx: usize) {
-        // Look up the TraitDecl method with a body in the user module (indexed directly by method_idx)
-        let found = self.module.declarations.iter().find_map(|d| {
-            if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
-                if *name == trait_name {
-                    if let Some(method) = methods.get(method_idx) {
-                        if method.body.is_some() {
-                            return Some((
-                                method.body.unwrap(),
-                                method.is_async,
-                                method.params.clone(),
-                            ));
+        // Look up the TraitDecl method with a body, searching builtin modules AND
+        // the current module (the trait may live in an embedded stdlib module).
+        // Returns (body, is_async, params, module) — the module is needed to
+        // switch the AST arena context while compiling the body.
+        let found = self
+            .builtin_modules
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.module))
+            .find_map(|m| {
+                m.declarations.iter().find_map(|d| {
+                    if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
+                        if *name == trait_name {
+                            if let Some(method) = methods.get(method_idx) {
+                                if method.body.is_some() {
+                                    return Some((
+                                        method.body.unwrap(),
+                                        method.is_async,
+                                        method.params.clone(),
+                                        m,
+                                    ));
+                                }
+                            }
                         }
                     }
-                }
-            }
-            None
-        });
+                    None
+                })
+            });
 
-        let (body_expr, is_async, params) = match found {
+        let (body_expr, is_async, params, decl_module) = match found {
             Some(x) => x,
             None => return,
         };
@@ -826,6 +907,15 @@ impl<'a> IrBuilder<'a> {
         };
 
         let node_start = self.graph.nodes.len() as u32;
+
+        // Switch the AST arena context to the trait's declaring module while
+        // compiling the body (compile_expr reads the arena via current_module()).
+        let prev_builtin = self.compiling_builtin;
+        self.compiling_builtin = if std::ptr::eq(decl_module, self.module) {
+            None
+        } else {
+            Some(decl_module)
+        };
 
         self.current_function_sg = Some(sg_id);
         self.current_function_id = sg_id.0;
@@ -855,6 +945,7 @@ impl<'a> IrBuilder<'a> {
         self.current_function_sg = None;
         self.current_trait_default_idx = None;
         self.current_method_type = prev_method_type;
+        self.compiling_builtin = prev_builtin;
 
         let node_end = self.graph.nodes.len() as u32;
         let sg = &mut self.graph.subgraphs[sg_id.0 as usize];

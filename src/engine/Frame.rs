@@ -41,6 +41,29 @@ pub fn prepare_same_function_frame_sync(frame: &mut Frame, graph: &DataFlowGraph
     let branch_end = sg.node_range.1 .0;
     let branch_param_count = sg.param_count as usize;
 
+    // E3 steady-state cache: the derivation is a pure function of (parent-ready bitmap, graph,
+    // sg). If the copied-in ready bitmap matches the snapshot taken at derivation time, reuse
+    // the cached pending_inputs + seed list (memcpy instead of a per-node nested-range scan).
+    // Loop iterations with a stable outer-ready set hit this every round.
+    if let Some(cache) = frame.same_fn_prep_cache.take() {
+        let (snap_ready, snap_pending, snap_seed) = *cache;
+        let hit = snap_ready.len() == frame.value_table.ready.len()
+            && snap_pending.len() == parent_node_count
+            && frame.pending_inputs.len() >= parent_node_count
+            && snap_ready[..] == frame.value_table.ready[..];
+        if hit {
+            frame.pending_inputs[..parent_node_count].copy_from_slice(&snap_pending);
+            for &local in &snap_seed {
+                if !frame.value_table.is_ready(local.0 as usize) {
+                    frame.push_ready(local);
+                }
+            }
+            frame.same_fn_prep_cache = Some(Box::new((snap_ready, snap_pending, snap_seed)));
+            return;
+        }
+        // Miss: fall through to re-derive; the tail stores a fresh snapshot.
+    }
+
     let nested_ranges: &[(u32, u32)] = graph.sg_nested_ranges(sg_id.0 as usize);
     let is_nested = |gid: u32| nested_ranges.iter().any(|&(s, e)| gid >= s && gid < e);
 
@@ -72,7 +95,8 @@ pub fn prepare_same_function_frame_sync(frame: &mut Frame, graph: &DataFlowGraph
         }
     }
 
-    // 2. Enqueue in-branch 0-input non-Param nodes.
+    // 2. Enqueue in-branch 0-input non-Param nodes (collect for the cache snapshot).
+    let mut seed: Vec<NodeId> = Vec::new();
     for i in 0..parent_node_count {
         let gid = (parent_start as usize + i) as u32;
         let in_branch = gid >= branch_start && gid < branch_end;
@@ -85,8 +109,15 @@ pub fn prepare_same_function_frame_sync(frame: &mut Frame, graph: &DataFlowGraph
         }
         if frame.pending_inputs[i] == 0 && !frame.value_table.is_ready(i) {
             frame.push_ready(NodeId(i as u32));
+            seed.push(NodeId(i as u32));
         }
     }
+
+    frame.same_fn_prep_cache = Some(Box::new((
+        frame.value_table.ready.clone(),
+        frame.pending_inputs[..parent_node_count].to_vec(),
+        seed,
+    )));
 }
 
 /// Creates a defer body frame for synchronous execution.
@@ -177,6 +208,11 @@ impl<S: LockStrategy> Engine<S> {
             frame.root_frame_ptr = std::ptr::null_mut();
             frame.parent_frame_ptr = std::ptr::null_mut();
             frame.cached_child_frame = None;
+            // E2: drop any stashed loop-body frame (a completed frame must not carry one into
+            // the pool; plain drop — the pool mutex is held here, so no nested release_frame).
+            frame.hot_body = None;
+            // E3: per-subgraph derivation cache is invalid once the frame is re-targeted.
+            frame.same_fn_prep_cache = None;
             frame.closure_val = None;
             frame_box
         } else {
@@ -216,7 +252,7 @@ impl<S: LockStrategy> Engine<S> {
         for i in 0..param_count {
             let local_id = NodeId(i as u32);
             let global_id = NodeId((offset + i) as u32);
-            let consumer_count = self.graph.downstream_slice(offset + i).len() as u16;
+            let consumer_count = self.graph.downstream_count(offset + i);
             // Default: empty array (main's `args: str[]` receives an empty array).
             let default_arg = Value::ref_val(HeapObj::Array(ArrayValue::new(Vec::new())));
             frame.set_value(local_id, default_arg, consumer_count);
@@ -288,6 +324,8 @@ impl<S: LockStrategy> Engine<S> {
         frame.value_table.reset_all();
         frame.ready_queue.clear();
         frame.control_signal = ControlSignal::None;
+        // E5: fresh cross-function frame — eligible for one linear run.
+        frame.linear_fresh = true;
         // Below: use prepare_frame_nodes to set node_offset + pending_inputs + Const prefill.
         prepare_frame_nodes(frame, &self.graph);
     }
@@ -301,10 +339,12 @@ impl<S: LockStrategy> Engine<S> {
         body_frame: &mut Frame,
     ) {
         let loop_sg_id = loop_frame.subgraph_id;
-        let (loop_kind, cond_node, return_node, iter_next_node, reset_plan) = {
-            let sg = &self.graph.subgraphs[loop_sg_id.0 as usize];
-            (sg.loop_kind, sg.cond_node, sg.return_node, sg.iter_next_node, sg.reset_plan.clone())
-        };
+        // Borrow the plan from the graph instead of cloning: reset_plan stays immutable for the
+        // whole run, and both this borrow and reset_condition_tree(&self) are shared borrows.
+        let sg = &self.graph.subgraphs[loop_sg_id.0 as usize];
+        let (loop_kind, cond_node, return_node, iter_next_node) =
+            (sg.loop_kind, sg.cond_node, sg.return_node, sg.iter_next_node);
+        let reset_plan = sg.reset_plan.as_ref();
         // Use loop_frame.node_offset rather than subgraph.node_range.0 (same-function branch frame
         // correction).
         let loop_offset = loop_frame.node_offset;
@@ -314,7 +354,7 @@ impl<S: LockStrategy> Engine<S> {
 
         // 1-3. Data-driven reset via ResetPlan when present; otherwise fall back to the LoopKind
         // branch.
-        if let Some(plan) = &reset_plan {
+        if let Some(plan) = reset_plan {
             for &nid in &plan.reset_to_zero {
                 let local = NodeId(nid.0.wrapping_sub(loop_offset));
                 Self::reset_node_ready(loop_frame, local);
@@ -324,8 +364,24 @@ impl<S: LockStrategy> Engine<S> {
                 let local = NodeId(nid.0.wrapping_sub(loop_offset));
                 Self::reset_node_pending(loop_frame, local, 1);
             }
-            for &nid in &plan.reset_condition_tree {
-                self.reset_condition_tree(loop_frame, loop_sg_id, nid, loop_offset);
+            // W5: apply the precomputed condition-tree plan mechanically —
+            // same (node, pending) pairs the DFS below would produce, flattened
+            // once at build/load time. Falls back to the DFS when the plan was
+            // not precomputed.
+            if !plan.condition_tree_plan.is_empty() {
+                for &(gid, pending) in &plan.condition_tree_plan {
+                    let local = NodeId(gid.0.wrapping_sub(loop_offset));
+                    Self::reset_node_pending(loop_frame, local, pending);
+                }
+                for &(gid, pending) in &plan.condition_tree_plan {
+                    if pending == 0 {
+                        loop_frame.push_ready(NodeId(gid.0.wrapping_sub(loop_offset)));
+                    }
+                }
+            } else {
+                for &nid in &plan.reset_condition_tree {
+                    self.reset_condition_tree(loop_frame, loop_sg_id, nid, loop_offset);
+                }
             }
         } else {
             // Fallback: LoopKind branch (subgraphs without a ResetPlan, e.g. TailRec).
@@ -360,6 +416,7 @@ impl<S: LockStrategy> Engine<S> {
         body_frame.ready_queue.clear();
         body_frame.select_timers.clear();
         body_frame.cached_child_frame = None;
+        body_frame.hot_body = None;
         body_frame.control_signal = ControlSignal::None;
 
         // Re-copy outer-variable values from loop_frame first (consistent with start_subgraph).
@@ -374,14 +431,29 @@ impl<S: LockStrategy> Engine<S> {
         copy_outer_ready_values(body_frame, loop_frame, copy_count, body_branch_start.0, body_branch_end.0);
 
         // After copying outer variables, set pending_inputs + enqueue 0-input nodes.
-        self.prepare_same_function_frame(body_frame);
+        // E5: when the body has a linearized plan, skip the readiness derivation entirely —
+        // the linear runner needs neither pending_inputs nor seeds, and a mid-body launch node
+        // rebuilds them on demand (rebuild_linear_bailout).
+        if self.graph.linear_plan(body_frame.subgraph_id.0 as usize).is_some() {
+            body_frame.linear_fresh = true;
+        } else {
+            self.prepare_same_function_frame(body_frame);
+        }
 
         // Rebind the body_sg frame's caller.
         body_frame.caller =
             Some((loop_fid, NodeId(return_node.0.wrapping_sub(loop_offset))));
-        // Frame-chain pointers set to null (HashMap addresses are unstable).
-        body_frame.root_frame_ptr = std::ptr::null_mut();
-        body_frame.parent_frame_ptr = std::ptr::null_mut();
+        // Bug #100: keep the frame chain connected across iterations. The loop frame is
+        // in hand here and Box addresses are stable (process_frame reuses the Box), so
+        // pointing the body at it is safe; nulling the pointers orphaned the body's
+        // WriteBacks (loop-variable updates never reached the loop frame).
+        let loop_ptr = loop_frame as *const Frame as *mut Frame;
+        body_frame.parent_frame_ptr = loop_ptr;
+        body_frame.root_frame_ptr = if !loop_frame.root_frame_ptr.is_null() {
+            loop_frame.root_frame_ptr
+        } else {
+            loop_ptr
+        };
 
         // 5. Reset the loop frame state.
         loop_frame.control_signal = ControlSignal::None;

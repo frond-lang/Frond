@@ -1,6 +1,6 @@
 // std/terminal/Ansi.kz — ANSI escape sequence construction
 //
-// Pure Kuzo, no FFI. Constructs escape sequences as str using \x1b (ESC byte).
+// Pure Frond, no FFI. Constructs escape sequences as str using \x1b (ESC byte).
 // Provides a comprehensive set of ANSI/VT100 escape sequences for:
 //   - Cursor positioning and movement
 //   - Screen and line clearing

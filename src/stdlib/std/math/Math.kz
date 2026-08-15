@@ -1,6 +1,6 @@
 // Math standard library — General functions + constants + NaN/Inf
 //
-// Pure Kuzo implementation, zero FFI dependency.
+// Pure Frond implementation, zero FFI dependency.
 // NaN/Inf constructed using IEEE 754 floating point division by zero semantics.
 // Generic functions use match x.type_name() to dispatch to corresponding precision implementations by type.
 
@@ -27,7 +27,7 @@ pub val LN2_F128: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1f128
 pub val PI_F16: f16    = 0x1.92p+1f16
 pub val E_F16: f16     = 0x1.5cp+1f16
 
-// ─── NaN/Inf construction (pure Kuzo semantics, using IEEE 754 floating point division by zero) ───
+// ─── NaN/Inf construction (pure Frond semantics, using IEEE 754 floating point division by zero) ───
 // 0.0/0.0 = NaN, 1.0/0.0 = +Inf, -1.0/0.0 = -Inf
 
 pub fun nan_f64(): f64       { 0.0 / 0.0 }
@@ -62,15 +62,25 @@ pub fun is_inf_f128(x: f128): bool { x == 1.0 / 0.0 || x == -1.0 / 0.0 }
 
 // ─── abs (generic, dispatch by type; unsigned is no-op) ───
 
+@internal
 fun abs_i8_impl(x: i8): i8 { if x < 0 { 0 - x } else { x } }
+@internal
 fun abs_i16_impl(x: i16): i16 { if x < 0 { 0 - x } else { x } }
+@internal
 fun abs_i32_impl(x: i32): i32 { if x < 0 { 0 - x } else { x } }
+@internal
 fun abs_i64_impl(x: i64): i64 { if x < 0 { 0 - x } else { x } }
+@internal
 fun abs_i128_impl(x: i128): i128 { if x < 0 { 0 - x } else { x } }
+@internal
 fun abs_isize_impl(x: isize): isize { if x < 0 { 0 - x } else { x } }
+@internal
 fun abs_f16_impl(x: f16): f16 { if x < 0.0 { 0.0 - x } else { x } }
+@internal
 fun abs_f32_impl(x: f32): f32 { if x < 0.0 { 0.0 - x } else { x } }
+@internal
 fun abs_f64_impl(x: f64): f64 { if x < 0.0 { 0.0 - x } else { x } }
+@internal
 fun abs_f128_impl(x: f128): f128 { if x < 0.0 { 0.0 - x } else { x } }
 
 pub fun abs<T>(x: T): T {
@@ -155,15 +165,19 @@ pub fun isfinite<T>(x: T): bool {
 }
 
 // signbit: negative or -0.0 → true, others → false
+@internal
 fun signbit_f64_impl(x: f64): bool {
     x < 0.0 || (x == 0.0 && (1.0 / x) < 0.0)
 }
+@internal
 fun signbit_f32_impl(x: f32): bool {
     x < 0.0 || (x == 0.0 && (1.0 / x) < 0.0)
 }
+@internal
 fun signbit_f16_impl(x: f16): bool {
     x < 0.0 || (x == 0.0 && (1.0 / x) < 0.0)
 }
+@internal
 fun signbit_f128_impl(x: f128): bool {
     x < 0.0 || (x == 0.0 && (1.0 / x) < 0.0)
 }
@@ -186,6 +200,7 @@ pub fun signbit<T>(x: T): bool {
 
 // isnormal: non-zero, finite, and exponent in normal range (not subnormal)
 // Algorithm: extract exponent e so |x|/2^e ∈ [1,2), check whether e is in normal range
+@internal
 fun isnormal_f64_impl(x: f64): bool {
     if is_nan_f64(x) || is_inf_f64(x) { return false }
     if x == 0.0 { return false }
@@ -201,6 +216,7 @@ fun isnormal_f64_impl(x: f64): bool {
     }
     e >= -1022 && e <= 1023
 }
+@internal
 fun isnormal_f32_impl(x: f32): bool {
     if is_nan_f32(x) || is_inf_f32(x) { return false }
     if x == 0.0 { return false }
@@ -216,6 +232,7 @@ fun isnormal_f32_impl(x: f32): bool {
     }
     e >= -126 && e <= 127
 }
+@internal
 fun isnormal_f16_impl(x: f16): bool {
     if is_nan_f16(x) || is_inf_f16(x) { return false }
     if x == 0.0 { return false }
@@ -231,6 +248,7 @@ fun isnormal_f16_impl(x: f16): bool {
     }
     e >= -14 && e <= 15
 }
+@internal
 fun isnormal_f128_impl(x: f128): bool {
     if is_nan_f128(x) || is_inf_f128(x) { return false }
     if x == 0.0 { return false }
@@ -257,7 +275,7 @@ pub fun isnormal<T>(x: T): bool {
     }
 }
 
-// ─── wrapping arithmetic (Kuzo integer operations already use wrapping semantics, here providing explicit API) ───
+// ─── wrapping arithmetic (Frond integer operations already use wrapping semantics, here providing explicit API) ───
 
 pub fun wrapping_add<T>(a: T, b: T): T { a + b }
 pub fun wrapping_sub<T>(a: T, b: T): T { a - b }
@@ -267,10 +285,15 @@ pub fun wrapping_mul<T>(a: T, b: T): T { a * b }
 // Provide implementations by bit width (8/16/32/64/128), signed types reuse after cast to unsigned
 
 // is_power_of_two: x > 0 and only one bit is 1
+@internal
 fun is_pow2_8_impl(x: u8): bool { x != 0 && (x & (x - 1)) == 0 }
+@internal
 fun is_pow2_16_impl(x: u16): bool { x != 0 && (x & (x - 1)) == 0 }
+@internal
 fun is_pow2_32_impl(x: u32): bool { x != 0 && (x & (x - 1)) == 0 }
+@internal
 fun is_pow2_64_impl(x: u64): bool { x != 0 && (x & (x - 1)) == 0 }
+@internal
 fun is_pow2_128_impl(x: u128): bool { x != 0 && (x & (x - 1)) == 0 }
 
 pub fun is_power_of_two<T>(x: T): bool {
@@ -292,6 +315,7 @@ pub fun is_power_of_two<T>(x: T): bool {
 }
 
 // count_ones: Brian Kernighan algorithm, clear lowest bit until zero
+@internal
 fun count_ones_8_impl(x: u8): u8 {
     var c = 0
     var v = x
@@ -301,6 +325,7 @@ fun count_ones_8_impl(x: u8): u8 {
     }
     c
 }
+@internal
 fun count_ones_16_impl(x: u16): u16 {
     var c = 0
     var v = x
@@ -310,6 +335,7 @@ fun count_ones_16_impl(x: u16): u16 {
     }
     c
 }
+@internal
 fun count_ones_32_impl(x: u32): u32 {
     var c = 0
     var v = x
@@ -319,6 +345,7 @@ fun count_ones_32_impl(x: u32): u32 {
     }
     c
 }
+@internal
 fun count_ones_64_impl(x: u64): u64 {
     var c = 0
     var v = x
@@ -328,6 +355,7 @@ fun count_ones_64_impl(x: u64): u64 {
     }
     c
 }
+@internal
 fun count_ones_128_impl(x: u128): u128 {
     var c = 0
     var v = x
@@ -357,6 +385,7 @@ pub fun count_ones<T>(x: T): T {
 }
 
 // leading_zeros: scan consecutive 0 bits from MSB
+@internal
 fun leading_zeros_8_impl(x: u8): u8 {
     if x == 0 { return 8 }
     var c = 0
@@ -367,6 +396,7 @@ fun leading_zeros_8_impl(x: u8): u8 {
     }
     c
 }
+@internal
 fun leading_zeros_16_impl(x: u16): u16 {
     if x == 0 { return 16 }
     var c = 0
@@ -377,6 +407,7 @@ fun leading_zeros_16_impl(x: u16): u16 {
     }
     c
 }
+@internal
 fun leading_zeros_32_impl(x: u32): u32 {
     if x == 0 { return 32 }
     var c = 0
@@ -387,6 +418,7 @@ fun leading_zeros_32_impl(x: u32): u32 {
     }
     c
 }
+@internal
 fun leading_zeros_64_impl(x: u64): u64 {
     if x == 0 { return 64 }
     var c = 0
@@ -397,6 +429,7 @@ fun leading_zeros_64_impl(x: u64): u64 {
     }
     c
 }
+@internal
 fun leading_zeros_128_impl(x: u128): u128 {
     if x == 0 { return 128 }
     var c = 0
@@ -427,6 +460,7 @@ pub fun leading_zeros<T>(x: T): T {
 }
 
 // trailing_zeros: scan consecutive 0 bits from LSB
+@internal
 fun trailing_zeros_8_impl(x: u8): u8 {
     if x == 0 { return 8 }
     var c = 0
@@ -437,6 +471,7 @@ fun trailing_zeros_8_impl(x: u8): u8 {
     }
     c
 }
+@internal
 fun trailing_zeros_16_impl(x: u16): u16 {
     if x == 0 { return 16 }
     var c = 0
@@ -447,6 +482,7 @@ fun trailing_zeros_16_impl(x: u16): u16 {
     }
     c
 }
+@internal
 fun trailing_zeros_32_impl(x: u32): u32 {
     if x == 0 { return 32 }
     var c = 0
@@ -457,6 +493,7 @@ fun trailing_zeros_32_impl(x: u32): u32 {
     }
     c
 }
+@internal
 fun trailing_zeros_64_impl(x: u64): u64 {
     if x == 0 { return 64 }
     var c = 0
@@ -467,6 +504,7 @@ fun trailing_zeros_64_impl(x: u64): u64 {
     }
     c
 }
+@internal
 fun trailing_zeros_128_impl(x: u128): u128 {
     if x == 0 { return 128 }
     var c = 0
@@ -497,6 +535,7 @@ pub fun trailing_zeros<T>(x: T): T {
 }
 
 // next_power_of_two: bit filling method, v |= v>>1|2|4|... then +1
+@internal
 fun next_pow2_8_impl(x: u8): u8 {
     if x <= 1 { return 1 }
     var v = x - 1
@@ -505,6 +544,7 @@ fun next_pow2_8_impl(x: u8): u8 {
     v = v | (v >> 4)
     v + 1
 }
+@internal
 fun next_pow2_16_impl(x: u16): u16 {
     if x <= 1 { return 1 }
     var v = x - 1
@@ -514,6 +554,7 @@ fun next_pow2_16_impl(x: u16): u16 {
     v = v | (v >> 8)
     v + 1
 }
+@internal
 fun next_pow2_32_impl(x: u32): u32 {
     if x <= 1 { return 1 }
     var v = x - 1
@@ -524,6 +565,7 @@ fun next_pow2_32_impl(x: u32): u32 {
     v = v | (v >> 16)
     v + 1
 }
+@internal
 fun next_pow2_64_impl(x: u64): u64 {
     if x <= 1 { return 1 }
     var v = x - 1
@@ -535,6 +577,7 @@ fun next_pow2_64_impl(x: u64): u64 {
     v = v | (v >> 32)
     v + 1
 }
+@internal
 fun next_pow2_128_impl(x: u128): u128 {
     if x <= 1 { return 1 }
     var v = x - 1
@@ -567,10 +610,15 @@ pub fun next_power_of_two<T>(x: T): T {
 }
 
 // rotate_left: (x << n) | (x >> (bits - n)), wrapping shift automatically handles n >= bits
+@internal
 fun rotate_left_8_impl(x: u8, n: u8): u8 { (x << n) | (x >> (8 - n)) }
+@internal
 fun rotate_left_16_impl(x: u16, n: u16): u16 { (x << n) | (x >> (16 - n)) }
+@internal
 fun rotate_left_32_impl(x: u32, n: u32): u32 { (x << n) | (x >> (32 - n)) }
+@internal
 fun rotate_left_64_impl(x: u64, n: u64): u64 { (x << n) | (x >> (64 - n)) }
+@internal
 fun rotate_left_128_impl(x: u128, n: u128): u128 { (x << n) | (x >> (128 - n)) }
 
 pub fun rotate_left<T>(x: T, n: T): T {
@@ -592,10 +640,15 @@ pub fun rotate_left<T>(x: T, n: T): T {
 }
 
 // rotate_right: (x >> n) | (x << (bits - n))
+@internal
 fun rotate_right_8_impl(x: u8, n: u8): u8 { (x >> n) | (x << (8 - n)) }
+@internal
 fun rotate_right_16_impl(x: u16, n: u16): u16 { (x >> n) | (x << (16 - n)) }
+@internal
 fun rotate_right_32_impl(x: u32, n: u32): u32 { (x >> n) | (x << (32 - n)) }
+@internal
 fun rotate_right_64_impl(x: u64, n: u64): u64 { (x >> n) | (x << (64 - n)) }
+@internal
 fun rotate_right_128_impl(x: u128, n: u128): u128 { (x >> n) | (x << (128 - n)) }
 
 pub fun rotate_right<T>(x: T, n: T): T {

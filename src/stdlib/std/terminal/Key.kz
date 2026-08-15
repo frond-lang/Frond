@@ -202,6 +202,7 @@ pub fun key_read_blocking(): Key {
 // ─── Pure decode helpers ───
 
 // Decode a single non-ESC byte into a Key.
+@internal
 fun decode_single_byte(b: u8): Key {
     // Check for special keys first
     if b == 0x0Du8 || b == 0x0Au8 {
@@ -226,6 +227,7 @@ fun decode_single_byte(b: u8): Key {
 
 // Decode CSI sequence with '~' terminator (ESC[{param}~).
 // buf contains the parameter bytes collected so far.
+@internal
 fun decode_csi_with_tilde(buf: u8[], len: usize): Key {
     if len == 0 { return UnknownKey }
     val c = buf[0]
@@ -243,6 +245,7 @@ fun decode_csi_with_tilde(buf: u8[], len: usize): Key {
 
 // Decode CSI sequence without '~' terminator (ESC[{letter}).
 // buf contains all bytes including the letter terminator.
+@internal
 fun decode_csi_no_tilde(buf: u8[], len: usize): Key {
     if len == 0 { return UnknownKey }
     // Last byte is the terminator letter

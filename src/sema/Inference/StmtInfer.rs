@@ -132,8 +132,38 @@ impl<'a> InferContext<'a> {
                 None
             }
             Stmt::CompoundAssignment { target, value, .. } => {
-                let _ = self.infer_expr(*target, ast, env, None);
-                let _ = self.infer_expr(*value, ast, env, None);
+                let target_ty = self.infer_expr(*target, ast, env, None);
+                let value_ty = self.infer_expr(*value, ast, env, None);
+                // Bug #95: compound assignment must enforce the same strict numeric
+                // rules as the equivalent binary expression — `x += 2.0` (i32 += f64)
+                // used to compile AND silently drop the store; `x += 2i64` silently
+                // cross-width converted. Literal values still adapt via
+                // peer_type_binary (so `u8_var += 2` keeps working).
+                let rt = self.arena.resolve(target_ty);
+                let rv = self.arena.resolve(value_ty);
+                if self.arena.get(rt).is_numeric() && self.arena.get(rv).is_numeric() {
+                    let span = ast.stmt(stmt).span;
+                    self.check_numeric_binop_compat(ast, *target, *value, rt, rv, span);
+                    let _ = peer_type_binary(
+                        self.arena,
+                        rt,
+                        rv,
+                        Self::expr_is_literal(ast, *target),
+                        Self::expr_is_literal(ast, *value),
+                    );
+                } else if self.arena.unify(rt, rv).is_err() {
+                    let span = ast.stmt(stmt).span;
+                    let t_str = format!("{}", self.arena.display(rt));
+                    let v_str = format!("{}", self.arena.display(rv));
+                    self.add_error_at(
+                        &format!(
+                            "compound assignment type mismatch: target '{}' is not compatible with value '{}'",
+                            t_str, v_str
+                        ),
+                        span.line,
+                        span.column,
+                    );
+                }
                 None
             }
             Stmt::Expression { expr } => {
@@ -203,6 +233,10 @@ impl<'a> InferContext<'a> {
                     // Check whether iterable is a non-iterator type (Array/Str/primitive)
                     let is_non_iterator = match ct {
                         Type::Array(_) => true,
+                        // for-in over a bare str must be rejected: the IR passes the
+                        // iterable to `.next` verbatim and `str.next` does not exist,
+                        // which hangs the engine (Bug #93). Use str_iter(s).
+                        Type::Str => true,
                         ct if ct.is_scalar() => true,
                         _ => false,
                     };
@@ -219,6 +253,20 @@ impl<'a> InferContext<'a> {
                             span.line,
                             span.column,
                         );
+                    }
+                    // Iterator protocol is null-terminated (`Iterator<T>.next() -> T?`):
+                    // when the ELEMENT type is itself nullable, a null element is
+                    // indistinguishable from end-of-iteration and the loop would stop
+                    // early. Reject with guidance to iterate by index instead.
+                    if let Some(elem) = self.extract_iterator_element(resolved) {
+                        let elem_r = self.arena.resolve(elem);
+                        if matches!(self.arena.get(elem_r), Type::Nullable(_)) {
+                            self.add_error_at(
+                                "cannot use for-in over an iterator whose element type is nullable: the null-terminated iterator protocol treats a null element as end-of-iteration. Iterate by index instead: `var i: usize = 0; while i < arr.len() { val e = arr[i] ... }`",
+                                span.line,
+                                span.column,
+                            );
+                        }
                     }
                     // Structured element type extraction.
                     self.extract_iterator_element(resolved).unwrap_or_else(|| {

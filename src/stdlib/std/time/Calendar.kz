@@ -1,14 +1,14 @@
-// Calendar.kz — calendar algorithms (pure Kuzo implementation)
+// Calendar.kz — calendar algorithms (pure Frond implementation)
 //
-// Design doc §5.6: leap year/month days/Julian day/weekday, all written in Kuzo
+// Design doc §5.6: leap year/month days/Julian day/weekday, all written in Frond
 // Uses Howard Hinnant's Julian day algorithm (refer to std::chrono::year_month_day implementation)
-// Because Kuzo's built-in `/` is truncating division (rounds toward 0), while the Julian day
+// Because Frond's built-in `/` is truncating division (rounds toward 0), while the Julian day
 // algorithm requires floor division (rounds toward -∞), floor_div / floor_mod helper functions
 // are provided
 
 // ─── Floor division (rounds toward negative infinity) ────────────────────────────────────
 
-// Kuzo's built-in `/` is truncating division (rounds toward 0); floor division needs to be
+// Frond's built-in `/` is truncating division (rounds toward 0); floor division needs to be
 // corrected based on the sign of the remainder
 pub fun floor_div(a: i64, b: i64): i64 {
     val q = a / b
@@ -108,7 +108,7 @@ pub fun from_julian_day(jd: i64): (year: i32, month: u8, day: u8) {
     return (year: final_year, month: m, day: d)
 }
 
-// ─── Epoch-related (days since 1970-01-01, pure Kuzo algorithm) ──────────────
+// ─── Epoch-related (days since 1970-01-01, pure Frond algorithm) ──────────────
 //
 // Replaces the original daysFromCivil + std.time.epoch implementation in syscall/time.zig.
 // days_from_civil is consistent with Howard Hinnant's algorithm; civil_from_days is its inverse.

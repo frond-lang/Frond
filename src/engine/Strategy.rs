@@ -120,12 +120,15 @@ impl Engine<Single> {
         let park_mutex = ParkingMutex::new(());
         let park_cv = Condvar::new();
 
-        let mut loop_guard: u64 = 0;
+        // Progress-based livelock watchdog: only iterations that find the queue empty
+        // (park / yield / timer waits) count toward the guard — every processed frame
+        // is real progress and resets it. Legitimately long computations (including
+        // user-level infinite loops that keep doing work) never trip it; a scheduler
+        // livelock (queue empty forever while waiters/timers exist but are never
+        // notified) still does. Hard deadlock (nothing pending at all) is caught
+        // separately below.
+        let mut idle_spins: u64 = 0;
         loop {
-            loop_guard += 1;
-            if loop_guard > 200000000 {
-                panic!("event loop stuck: guard={}", loop_guard);
-            }
             let queue = QueueHandle::Single(rq);
             // Pop first (the RefMut is released at the end of the statement), then handle the
             // empty-queue logic.
@@ -133,6 +136,13 @@ impl Engine<Single> {
             let fid = match fid {
                 Some(f) => f,
                 None => {
+                    idle_spins += 1;
+                    if idle_spins > 200_000_000 {
+                        panic!(
+                            "event loop stuck: {idle_spins} idle iterations without a ready \
+                             frame (livelock suspected: waiters/timers present but never notified)"
+                        );
+                    }
                     // Queue empty: check timers (check_timers -> on_event_arrived -> push needs borrow_mut).
                     self.check_timers(&queue);
                     if let Some(result) = self.result.lock().take() {
@@ -164,6 +174,7 @@ impl Engine<Single> {
                 }
             };
             self.process_frame(fid, &queue);
+            idle_spins = 0;
             if let Some(result) = self.result.lock().take() {
                 return result;
             }

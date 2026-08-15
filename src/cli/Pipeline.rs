@@ -36,10 +36,33 @@ pub fn read_source(path: &str) -> String {
 /// Returns the compiled `DataFlowGraph` (optimized). When `debug` is true, prints per-stage summaries.
 /// Any stage failure (type errors, IR errors, no entry point) is printed and exits with exit(1).
 pub fn compile_graph(entry_path: &str, opt_level: crate::pass::Optimizer::OptLevel, debug: bool) -> crate::ir::Ir::DataFlowGraph {
+    // Stability policy: the optimizer already contains its own per-round
+    // snapshot rollback (see Optimizer::optimize_with_analysis); this net
+    // catches panics from ANY other compile stage (parser/sema/analyzer/builder
+    // internals) and converts them into a clean internal-error exit instead of
+    // crashing the host process (CLI, LSP, embedded compiler).
+    let args = (entry_path, opt_level, debug);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let (entry_path, opt_level, debug) = args;
+        compile_graph_inner(entry_path, opt_level, debug)
+    })) {
+        Ok(graph) => graph,
+        Err(payload) => {
+            eprintln!(
+                "error: internal compiler error: {}
+(note: the optimizer degrades gracefully; this panic came from outside it — please report)",
+                crate::pass::Optimizer::panic_payload_message(&payload)
+            );
+            process::exit(1);
+        }
+    }
+}
+
+fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptLevel, debug: bool) -> crate::ir::Ir::DataFlowGraph {
     let source = read_source(entry_path);
 
     if debug {
-        eprintln!("=== Kuzo Debug Mode ===");
+        eprintln!("=== Frond Debug Mode ===");
         eprintln!("[1/5] Parsing {} ...", entry_path);
     }
 
@@ -89,15 +112,31 @@ pub fn compile_graph(entry_path: &str, opt_level: crate::pass::Optimizer::OptLev
 
     // 5. IR compilation
     // Collect all non-entry modules (builtin + std + dep) and pass them to the IR builder to compile as subgraphs.
-    let mut non_entry_modules: Vec<&_> = loader.builtin_modules().map(|(_, m)| m).collect();
+    // Dedup by module identity: a std module reached BOTH via the user's
+    // `import std.x.Y` (dep_keys) and the full-std preload (std_keys) is the
+    // SAME loaded module — pushing it twice made the IR pre-registration mint
+    // two placeholder subgraphs for one function, and the bare-key overwrite
+    // hid it while every or_insert key (short-qualified/package) kept pointing
+    // at the never-compiled first placeholder.
+    let mut seen_module_ptrs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut non_entry_modules: Vec<&_> = loader
+        .builtin_modules()
+        .filter_map(|(_, m)| {
+            (seen_module_ptrs.insert(m as *const _ as usize)).then_some(m)
+        })
+        .collect();
     for key in &std_keys {
         if let Some(m) = loader.get_module_by_key(key) {
-            non_entry_modules.push(m);
+            if seen_module_ptrs.insert(m as *const _ as usize) {
+                non_entry_modules.push(m);
+            }
         }
     }
     for k in &dep_keys {
         if let Some(m) = loader.get_module_by_key(k) {
-            non_entry_modules.push(m);
+            if seen_module_ptrs.insert(m as *const _ as usize) {
+                non_entry_modules.push(m);
+            }
         }
     }
     // Generate a static analysis report for each non-entry module (general coverage of memoize/dead_code/inline, etc.).
@@ -146,8 +185,17 @@ pub fn compile_graph(entry_path: &str, opt_level: crate::pass::Optimizer::OptLev
     }
 
     // Post-IR optimization: LICM/Unroll/Inline + ConstFold/CSE/CopyProp/DCE fixed-point iteration.
-    // Driven by opt_level: O0 skips, O1 fixed-point only, O2 full, O3 full + raised iteration limit.
+    // Driven by opt_level: O0 skips, O1 fixed-point only, O2 full, O3 full + wider stall window.
     crate::pass::Optimizer::optimize_with_analysis(&mut graph, Some(&analysis_report), opt_level);
+
+    // W5: optimization compaction (rebuild) invalidates the build-time
+    // condition-tree reset plans — recompute them on the final graph so the
+    // engine applies the mechanical fast path.
+    graph.precompute_reset_plans();
+
+    if std::env::var("FROND_DUMP_IR").is_ok() {
+        dump_ir(&graph);
+    }
 
     if debug {
         eprintln!("  IR (after opt):  {} nodes, {} subgraphs, {} compute_fns",
@@ -158,6 +206,51 @@ pub fn compile_graph(entry_path: &str, opt_level: crate::pass::Optimizer::OptLev
     }
 
     graph
+}
+
+/// FROND_DUMP_IR: human-readable graph dump (subgraphs + nodes + edges + metadata).
+fn dump_ir(graph: &crate::ir::Ir::DataFlowGraph) {
+    eprintln!("=== IR DUMP: {} nodes, {} subgraphs, entry={:?} ===",
+        graph.nodes.len(), graph.subgraphs.len(), graph.entry_subgraph);
+    for (si, sg) in graph.subgraphs.iter().enumerate() {
+        eprintln!("[sg {}] range={:?} params={} entry={:?} ret={:?} loop={:?} fn_id={} suspend={}",
+            si, (sg.node_range.0 .0, sg.node_range.1 .0), sg.param_count,
+            sg.entry_node.0, sg.return_node.0, format!("{:?}", sg.loop_kind), sg.function_id, sg.has_suspend);
+        for n in sg.node_range.0 .0..sg.node_range.1 .0 {
+            let node = &graph.nodes[n as usize];
+            let inputs: Vec<u32> = graph.inputs_pool
+                .get(node.inputs_offset, node.input_count)
+                .iter().map(|i| i.0).collect();
+            let mut extra = String::new();
+            if let Some(t) = graph.call_targets.get(n as usize).and_then(|t| *t) {
+                extra += &format!(" call_sg={}", t.0);
+            }
+            if let Some(info) = graph.dyn_ffi_infos.get(n as usize).and_then(|i| i.as_ref()) {
+                extra += &format!(" ffi={}", info.symbol);
+            }
+            if let Some(gb) = graph.gate_branches.get(n as usize) {
+                if let Some(gb) = gb {
+                    extra += &format!(" gate[cond={:?} capture={}", gb.condition_input.0, gb.capture);
+                    for (val, bsg, params) in &gb.branches {
+                        extra += &format!(" {}=>sg{}({:?})", val, bsg.0, params.iter().map(|p| p.0).collect::<Vec<_>>());
+                    }
+                    extra += "]";
+                }
+            }
+            if let Some(cv) = graph.const_values.get(n as usize) {
+                if let Some(cv) = cv {
+                    extra += &format!(" const={:?}", cv);
+                }
+            }
+            if std::env::var("FROND_DUMP_DOWNSTREAM").is_ok() {
+                let ds: Vec<u32> = graph.downstreams.get(n as usize)
+                    .map(|d| d.iter().map(|x| x.0).collect()).unwrap_or_default();
+                let cnt = graph.downstream_counts.get(n as usize).copied().unwrap_or(0);
+                extra += &format!(" ds={:?} cnt={}", ds, cnt);
+            }
+            eprintln!("  n{} {:?} cf{} in={:?}{}", n, node.kind, node.compute_fn.0, inputs, extra);
+        }
+    }
 }
 
 /// Compile + execute within a project (also reused by debug full).
@@ -177,8 +270,29 @@ pub fn run_from_project(opt_level: crate::pass::Optimizer::OptLevel, debug: bool
     //         process::exit(1);
     //     }
     // };
-    // Engine execution (worker count determined automatically)
-    let result = EngineRef::new(graph).run();
+    // Engine execution (worker count determined automatically).
+    // Stability net: a runtime engine panic becomes a clean error exit
+    // instead of crashing the process (the compile itself already succeeded).
+    // The graph Arc is kept for the panic path so execution-coverage
+    // instrumentation still reports what ran before the crash.
+    let engine = EngineRef::new(graph);
+    let cov_graph = match &engine {
+        EngineRef::Single(e) => e.graph.clone(),
+        EngineRef::Multi(e) => e.graph.clone(),
+    };
+    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine.run()
+    })) {
+        Ok(result) => result,
+        Err(payload) => {
+            crate::engine::EngineCore::exec_cov_dump(&cov_graph);
+            eprintln!(
+                "error: internal runtime error: {}",
+                crate::pass::Optimizer::panic_payload_message(&payload)
+            );
+            process::exit(1);
+        }
+    };
     if debug {
         eprintln!("  Result: {:?}", result);
         eprintln!("=== Done ===");

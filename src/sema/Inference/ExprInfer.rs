@@ -210,6 +210,16 @@ impl<'a> InferContext<'a> {
             Expr::Propagate(operand) => {
                 let inner_ty = self.infer_expr(*operand, ast, env, None);
                 let resolved = self.arena.resolve(inner_ty);
+                // Expected-type solve-through: `val f: T = expr?` where expr:
+                // Throw<V, E> — unify V with T here so type vars inside V
+                // (e.g. ForeignFn[R] from lib.lookup) are solved at inference
+                // time instead of leaking unresolved into the IR layer.
+                if let Some(exp) = expected {
+                    if let Type::Throw(_) = self.arena.get(resolved) {
+                        let (v, _) = self.arena.throw_parts(resolved);
+                        let _ = self.unify_or_constrain(v, exp);
+                    }
+                }
                 let span = ast.expr(expr).span;
                 self.check_propagate(resolved, inner_ty, self.expected_return, span.line, span.column)
             }
@@ -266,13 +276,68 @@ impl<'a> InferContext<'a> {
                     return self.arena.make_array(elem_ty, None);
                 }
                 let first_ty = self.infer_expr(elements[0], ast, env, expected_elem);
+                let mut elem_tys = vec![first_ty];
                 for &e in elements.iter().skip(1) {
                     let elem_ty = self.infer_expr(e, ast, env, expected_elem);
                     if let Err(e_err) = self.try_widen_unify(first_ty, elem_ty) {
                         self.add_error(&format!("array element type mismatch: {}", e_err));
                     }
+                    elem_tys.push(elem_ty);
                 }
-                self.arena.make_array(first_ty, Some(elements.len() as u64))
+                // Element-level nullable (T?[]) literal promotion: a null element
+                // (or a nullable-typed element) promotes the element type to
+                // nullable; the base is the first non-null element's type.
+                let mut has_null_elem = false;
+                let mut base_ty: Option<TypeHandle> = None;
+                for &et in elem_tys.iter() {
+                    let r = self.arena.resolve(et);
+                    match self.arena.get(r) {
+                        Type::Null => has_null_elem = true,
+                        Type::Nullable(_) => {
+                            has_null_elem = true;
+                            if base_ty.is_none() {
+                                base_ty = Some(self.arena.nullable_inner(r));
+                            }
+                        }
+                        _ => {
+                            if base_ty.is_none() {
+                                base_ty = Some(et);
+                            }
+                        }
+                    }
+                }
+                let final_elem = if has_null_elem {
+                    match base_ty {
+                        Some(b) => self.arena.make_nullable(b),
+                        None => match expected_elem {
+                            Some(exp) => {
+                                let r = self.arena.resolve(exp);
+                                if matches!(self.arena.get(r), Type::Nullable(_)) {
+                                    exp
+                                } else {
+                                    let fv = self.arena.fresh_type_var();
+                                    self.arena.make_nullable(fv)
+                                }
+                            }
+                            None => {
+                                let fv = self.arena.fresh_type_var();
+                                self.arena.make_nullable(fv)
+                            }
+                        },
+                    }
+                } else if let Some(exp) = expected_elem {
+                    // `[1, 2]` bound to a `i32?[]` annotation: adopt the nullable
+                    // element type from the annotation.
+                    let r = self.arena.resolve(exp);
+                    if matches!(self.arena.get(r), Type::Nullable(_)) {
+                        self.arena.make_nullable(first_ty)
+                    } else {
+                        first_ty
+                    }
+                } else {
+                    first_ty
+                };
+                self.arena.make_array(final_elem, Some(elements.len() as u64))
             }
 
             // ── Record literals ──
@@ -339,10 +404,18 @@ impl<'a> InferContext<'a> {
                         param_ty
                     })
                     .collect();
+                // A `return` inside a lambda exits the LAMBDA (not the enclosing
+                // function), so its value must be checked against the lambda's own
+                // declared return type.
+                let saved_expected_return = self.expected_return;
+                if let Some(rt) = return_type {
+                    self.expected_return = Some(self.type_from_ast(*rt, ast));
+                }
                 let body_ty = match body {
                     LambdaBody::Block(b) => self.infer_expr(*b, ast, child_env, None),
                     LambdaBody::Expression(e) => self.infer_expr(*e, ast, child_env, None),
                 };
+                self.expected_return = saved_expected_return;
                 // ── Unified capture analysis ──
                 // Record the capture list for this lambda scope. The IR builder
                 // consumes this (replacing its own `collect_free_idents_expr`
@@ -372,7 +445,18 @@ impl<'a> InferContext<'a> {
                 let effective_body_ty = if let Some(rt) = return_type {
                     let annot_ty = self.type_from_ast(*rt, ast);
                     if let Err(e) = self.try_widen_unify(annot_ty, body_ty) {
-                        self.add_error(&format!("lambda body type incompatible with declared return type: {}", e));
+                        let span = ast.expr(expr).span;
+                        self.add_error_at(
+                            &format!("lambda body type incompatible with declared return type: {}", e),
+                            span.line,
+                            span.column,
+                        );
+                    }
+                    // Non-void declared return type with no trailing expression and no
+                    // return/throw would silently return garbage at runtime — reject it.
+                    if let LambdaBody::Block(b) = body {
+                        let span = ast.expr(expr).span;
+                        self.check_missing_return_value("lambda", annot_ty, *b, ast, span.line, span.column);
                     }
                     annot_ty
                 } else {
@@ -617,6 +701,17 @@ impl<'a> InferContext<'a> {
     ) -> TypeHandle {
         match &ast.expr(expr).node {
             Expr::Ident(name) => {
+                // `super` is a dispatch qualifier, not a value: only legal as the
+                // receiver of a method call (handled in infer_method_call_expr).
+                if *name == "super" {
+                    let span = ast.expr(expr).span;
+                    self.add_error_at(
+                        "super is not a value; use it as a method-call receiver (super.method(...))",
+                        span.line,
+                        span.column,
+                    );
+                    return self.arena.fresh_type_var();
+                }
                 // sema v2: prefer the flow-narrowing result (path-sensitive type refinement).
                 if let Some(narrowed_ty) = self.flow_ctx.lookup_narrowed(name) {
                     return narrowed_ty;
@@ -748,13 +843,25 @@ impl<'a> InferContext<'a> {
                             self.check_numeric_binop_compat(ast, *lhs, *rhs, rl, rr, bin_span);
                             // v2 convergence: peer_type_binary replaces literal_promotion;
                             // literal promotion rules are inlined into peer_type_binary.
-                            return peer_type_binary(
+                            let peer_ty = peer_type_binary(
                                 self.arena,
                                 left_unwrapped,
                                 right_unwrapped,
                                 left_is_lit,
                                 right_is_lit,
                             );
+                            // Bug #96: the adaptation must also re-type the literal side's
+                            // ExprInfo — IR constant parsing reads ExprInfo (an unsuffixed
+                            // int literal defaults to i32), so a large literal adapted only
+                            // at the constraint level overflows at IR time
+                            // (`i64_var + 500000500000`).
+                            if right_is_lit {
+                                self.store_expr_info(*rhs, peer_ty);
+                            }
+                            if left_is_lit {
+                                self.store_expr_info(*lhs, peer_ty);
+                            }
+                            return peer_ty;
                         }
                         self.unify_or_constrain(left_unwrapped, right_unwrapped);
                         left_unwrapped
@@ -767,13 +874,21 @@ impl<'a> InferContext<'a> {
                             // Bug #73/#74: same strict checking for comparison ops.
                             self.check_numeric_binop_compat(ast, *lhs, *rhs, rl, rr, bin_span);
                             // v2 convergence: comparison ops use peer_type_binary to unify operand types.
-                            let _ = peer_type_binary(
+                            let peer_ty = peer_type_binary(
                                 self.arena,
                                 left_unwrapped,
                                 right_unwrapped,
                                 left_is_lit,
                                 right_is_lit,
                             );
+                            // Bug #96: same as the arithmetic branch — re-type the literal
+                            // side's ExprInfo to the adapted type (see above).
+                            if right_is_lit {
+                                self.store_expr_info(*rhs, peer_ty);
+                            }
+                            if left_is_lit {
+                                self.store_expr_info(*lhs, peer_ty);
+                            }
                         } else {
                             self.unify_or_constrain(left_unwrapped, right_unwrapped);
                         }
@@ -803,13 +918,25 @@ impl<'a> InferContext<'a> {
                     BinaryOp::Range | BinaryOp::RangeInclusive => {
                         // Range expressions a..b / a..=b return a RangeIterator type
                         // (Range is itself an iterator; For loops statically dispatch through RangeIterator.next).
-                        let i64_ty = self.make_builtin(Type::I64);
-                        if let Err(e) = self.try_widen_unify(i64_ty, left_unwrapped) {
-                            self.add_error(&format!("range operand must be integer: {}", e));
-                        }
-                        let i64_ty = self.make_builtin(Type::I64);
-                        if let Err(e) = self.try_widen_unify(i64_ty, right_unwrapped) {
-                            self.add_error(&format!("range operand must be integer: {}", e));
+                        // Operands may be ANY integer type: the IR lowering wraps each operand in an
+                        // explicit i64 cast node (implicit numeric promotion was removed language-wide,
+                        // Bug #60; requiring i64 here made every `0..n` fail — Bug #92).
+                        for (side_name, side_ty) in [("start", left_unwrapped), ("end", right_unwrapped)] {
+                            let rs = self.arena.resolve(side_ty);
+                            let is_int = matches!(
+                                self.arena.get(rs),
+                                Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128
+                                    | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
+                                    | Type::Isize | Type::Usize
+                            );
+                            if !is_int {
+                                let ty_str = format!("{}", self.arena.display(rs));
+                                self.add_error_at(
+                                    &format!("range {side_name} operand must be an integer type, found '{}'", ty_str),
+                                    bin_span.line,
+                                    bin_span.column,
+                                );
+                            }
                         }
                         self.arena.make_generic(
                             "RangeIterator".into(),

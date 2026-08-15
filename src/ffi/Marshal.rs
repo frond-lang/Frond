@@ -1,7 +1,7 @@
 //! Marshal — Value ↔ C ABI bidirectional conversion (only serves stdlib
 //! `@extern("C") #{ }#` dynamic FFI).
 //!
-//! Encodes a Kuzo `Value` into a list of `AbiSlot`s according to an `AbiSig` for
+//! Encodes a Frond `Value` into a list of `AbiSlot`s according to an `AbiSig` for
 //! use by the [`crate::ffi::Abi`] invoker; after the call returns, decodes the
 //! `RetSlot` back into a `Value`.
 //!
@@ -12,10 +12,12 @@
 //! - str (`HeapObj::Str`) → split into two slots `(Ptr, Int)` (already expanded
 //!   at sig construction time)
 //!
-//! Not supported (later stages): `u8[]` writeback, str out-param returns.
+//! Supported since the u8[] expansion fix: `u8[]` → `(Ptr, Int)` (data + length),
+//! with post-call writeback of C-side mutations (`apply_writebacks`).
+//! Not supported (later stages): str out-param returns.
 
 use crate::ffi::Abi::{AbiSig, AbiSlot, AbiType, RetSlot};
-use crate::value::{HeapObj, OpaquePointer, PtrKind, Value};
+use crate::value::{HeapObj, OpaquePointer, PtrKind, ScalarSoA, Value};
 
 /// Encode `args` into a list of `AbiSlot`s according to `sig.params`.
 ///
@@ -29,9 +31,12 @@ use crate::value::{HeapObj, OpaquePointer, PtrKind, Value};
 ///
 /// Returns `Err(msg)` on a type mismatch.
 pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> {
-    // NULL-ended buffers for str args; must outlive the call (C functions like strlen/printf
-    // require NULL-terminated strings, but KuzoStr's Arc<str> has no trailing NULL).
+    // NULL-ended buffers for str args (and plain byte buffers for u8[] args); must
+    // outlive the call (str: C functions like strlen/printf require NULL-terminated
+    // strings, but Str's Arc<str> has no trailing NULL; u8[]: the buffer doubles as
+    // the writeback target for C-side mutations).
     let mut str_buffers: Vec<Vec<u8>> = Vec::new();
+    let mut writebacks: Vec<(Value, usize)> = Vec::new();
     let mut slots = Vec::with_capacity(sig.params.len());
     let mut arg_idx = 0usize;
     let mut param_idx = 0usize;
@@ -44,6 +49,29 @@ pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> 
         }
         let param = &sig.params[param_idx];
         let arg = &args[arg_idx];
+
+        // Detect u8[] expansion: the current param is Ptr, the next is Int, and the
+        // arg is HeapObj::Array. Bytes are copied into a keepalive buffer whose
+        // pointer is handed to C; `apply_writebacks` copies C-side mutations back
+        // into the array after the call (out-parameter pattern, e.g. read_into).
+        if matches!(param, AbiType::Ptr)
+            && param_idx + 1 < sig.params.len()
+            && matches!(sig.params[param_idx + 1], AbiType::Int { .. })
+        {
+            if let Some(HeapObj::Array(arr)) = arg.heap_obj() {
+                let bytes = arr.collect_u8_bytes();
+                let len = bytes.len();
+                let ptr = bytes.as_ptr();
+                str_buffers.push(bytes);
+                let buf_idx = str_buffers.len() - 1;
+                slots.push(AbiSlot::Ptr(ptr as *mut core::ffi::c_void));
+                slots.push(AbiSlot::Int(len as u64));
+                writebacks.push((arg.clone(), buf_idx));
+                param_idx += 2;
+                arg_idx += 1;
+                continue;
+            }
+        }
 
         // Detect str expansion: the current param is Ptr, the next is Int, and the arg is
         // HeapObj::Str.
@@ -93,17 +121,62 @@ pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> 
         arg_idx += 1;
     }
 
-    Ok(MarshalArgs { slots, _keepalive: str_buffers })
+    Ok(MarshalArgs { slots, _keepalive: str_buffers, writebacks })
 }
 
 /// Return value of `encode_args`: the slots plus the NULL-buffer keepalive.
 /// The caller must keep this value alive until `Abi::call_dynamic` returns.
 pub struct MarshalArgs {
     pub slots: Vec<AbiSlot>,
-    /// NULL-ended str buffers, preventing C functions from reading out of bounds.
-    /// The underscore prefix indicates the field is never read directly; it is
-    /// kept alive solely by its lifetime.
+    /// NULL-ended str buffers / u8[] byte buffers. Prevents C functions from
+    /// reading out of bounds and keeps u8[] writeback targets alive for the
+    /// duration of the call.
     pub _keepalive: Vec<Vec<u8>>,
+    /// (array Value, keepalive buffer index) pairs for u8[] out-parameter
+    /// writeback; consumed by `apply_writebacks` after the call returns.
+    pub writebacks: Vec<(Value, usize)>,
+}
+
+/// Copy C-side mutations from the keepalive buffers back into the u8[] heap
+/// objects recorded during `encode_args`. Must run after `Abi::call_dynamic`
+/// returns (and only if the call actually happened — on dispatch error the C
+/// function never ran, so there is nothing to write back).
+pub fn apply_writebacks(m: &mut MarshalArgs) {
+    if m.writebacks.is_empty() {
+        return;
+    }
+    let buffers = std::mem::take(&mut m._keepalive);
+    let wbs = std::mem::take(&mut m.writebacks);
+    for (val, idx) in wbs {
+        if let Some(bytes) = buffers.get(idx) {
+            write_bytes_back(&val, bytes);
+        }
+    }
+}
+
+/// Write bytes into a `u8[]` heap object in place via `Arc::as_ptr` (the same
+/// shared-mutation pattern as `compute_array_store`: the engine is
+/// single-threaded, and the change is visible to every owner of the Arc).
+/// SOA U8 storage is the source of truth when present (mirrors
+/// `ArrayValue::collect_u8_bytes`' read preference); otherwise the per-element
+/// `elements` vector is updated.
+fn write_bytes_back(val: &Value, bytes: &[u8]) {
+    if let Value::Ref(arc) = val {
+        let ptr = std::sync::Arc::as_ptr(arc) as *mut HeapObj;
+        unsafe {
+            if let HeapObj::Array(arr) = &mut *ptr {
+                if let Some(ScalarSoA::U8(ref mut data)) = arr.scalar_soa {
+                    let n = bytes.len().min(data.len());
+                    data[..n].copy_from_slice(&bytes[..n]);
+                    return;
+                }
+                let n = bytes.len().min(arr.elements.len());
+                for i in 0..n {
+                    arr.elements[i] = Value::u8(bytes[i]);
+                }
+            }
+        }
+    }
 }
 
 /// Decode `RetSlot` back into a `Value` according to `ret_type`.

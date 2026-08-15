@@ -43,6 +43,10 @@ impl TypeArena {
     // -- Basic access --
 
     #[inline]
+    pub fn details_len(&self) -> usize {
+        self.details.len()
+    }
+
     pub fn len(&self) -> usize {
         self.types.len()
     }
@@ -112,6 +116,10 @@ impl TypeArena {
         let id = self.make_detail(TypeDetail::Receiver { elem });
         self.make(Type::Receiver(id))
     }
+    pub fn make_foreign_fn(&mut self, ret: TypeHandle) -> TypeHandle {
+        let id = self.make_detail(TypeDetail::ForeignFn { ret });
+        self.make(Type::ForeignFn(id))
+    }
     pub fn make_array(&mut self, elem: TypeHandle, size: Option<u64>) -> TypeHandle {
         let id = self.make_detail(TypeDetail::Array { elem, size });
         self.make(Type::Array(id))
@@ -129,6 +137,13 @@ impl TypeArena {
         self.make(Type::Fn(id))
     }
     pub fn make_nullable(&mut self, inner: TypeHandle) -> TypeHandle {
+        // `T??` collapses to `T?`: Frond nullable has no Some-constructor, so a
+        // "wrapped null" value is unrepresentable — Nullable<Nullable<T>> carries
+        // no additional information over Nullable<T> (Kotlin/TypeScript-style).
+        let inner = self.resolve(inner);
+        if matches!(self.get(inner), Type::Nullable(_)) {
+            return inner;
+        }
         let id = self.make_detail(TypeDetail::Nullable { inner });
         self.make(Type::Nullable(id))
     }
@@ -193,6 +208,7 @@ impl TypeArena {
             | Type::Atomic(id)
             | Type::Sender(id)
             | Type::Receiver(id)
+            | Type::ForeignFn(id)
             | Type::Array(id)
             | Type::Ref(id)
             | Type::Fn(id)
@@ -263,6 +279,14 @@ impl TypeArena {
     pub fn receiver_elem(&self, h: TypeHandle) -> TypeHandle {
         match self.detail(self.detail_id_of(self.get(h))) {
             TypeDetail::Receiver { elem } => *elem,
+            _ => unreachable!(),
+        }
+    }
+    /// The return type of a `ForeignFn`.
+    #[inline]
+    pub fn foreign_fn_ret(&self, h: TypeHandle) -> TypeHandle {
+        match self.detail(self.detail_id_of(self.get(h))) {
+            TypeDetail::ForeignFn { ret } => *ret,
             _ => unreachable!(),
         }
     }
@@ -415,6 +439,7 @@ impl TypeArena {
             Type::Atomic(_) => f(self.atomic_elem(resolved)),
             Type::Sender(_) => f(self.sender_elem(resolved)),
             Type::Receiver(_) => f(self.receiver_elem(resolved)),
+            Type::ForeignFn(_) => f(self.foreign_fn_ret(resolved)),
             // TypeVar, scalars, Str/Null/Void/Never/Unknown, TraitObject, ModuleRef, Timer: no children.
             _ => {}
         }
@@ -641,6 +666,7 @@ impl TypeArena {
             Type::Atomic(_) => self.occurs(var_idx, self.atomic_elem(ty)),
             Type::Sender(_) => self.occurs(var_idx, self.sender_elem(ty)),
             Type::Receiver(_) => self.occurs(var_idx, self.receiver_elem(ty)),
+            Type::ForeignFn(_) => self.occurs(var_idx, self.foreign_fn_ret(ty)),
             Type::Generic(_) => {
                 let (_, args) = self.generic_parts(ty);
                 args.iter().any(|&a| self.occurs(var_idx, a))
@@ -858,6 +884,9 @@ impl TypeArena {
             (Type::Receiver(_), Type::Receiver(_)) => {
                 self.unify(self.receiver_elem(a), self.receiver_elem(b))
             }
+            (Type::ForeignFn(_), Type::ForeignFn(_)) => {
+                self.unify(self.foreign_fn_ret(a), self.foreign_fn_ret(b))
+            }
 
             _ => Err(UnifyError::TypeMismatch),
         }
@@ -930,5 +959,127 @@ impl TypeArena {
             Some(ty) => self.make(ty),
             None => self.make(Type::Unknown),
         }
+    }
+}
+
+// =========================================================================
+// Property tests for unify — the termination contract of the constraint
+// solver depends on them (see Solver::solve_with_witness).
+// =========================================================================
+#[cfg(test)]
+mod unify_tests {
+    use super::*;
+
+    fn unbound_count(arena: &TypeArena) -> usize {
+        arena.type_vars.iter().filter(|v| v.bound.is_none()).count()
+    }
+
+    /// A successful unify against an unbound var strictly decreases the unbound-var
+    /// count (the binding monotonicity the solver's fixpoint relies on).
+    #[test]
+    fn ok_var_vs_concrete_binds_exactly_that_var() {
+        let mut a = TypeArena::new();
+        let v = a.fresh_type_var();
+        let i32_ = a.make(Type::I32);
+        assert_eq!(a.unify(v, i32_), Ok(()));
+        assert_eq!(a.type_var(0).bound, Some(i32_));
+        assert_eq!(a.resolve(v), i32_);
+        assert_eq!(unbound_count(&a), 0);
+    }
+
+    /// var-var unify binds exactly one side; the other resolves through it.
+    #[test]
+    fn ok_var_vs_var_binds_exactly_one_side() {
+        let mut a = TypeArena::new();
+        let v1 = a.fresh_type_var();
+        let v2 = a.fresh_type_var();
+        assert_eq!(a.unify(v1, v2), Ok(()));
+        let bound1 = a.type_var(0).bound.is_some();
+        let bound2 = a.type_var(1).bound.is_some();
+        assert!(bound1 ^ bound2, "exactly one side gets bound");
+        assert_eq!(unbound_count(&a), 1);
+        // Both resolve to the same root.
+        assert_eq!(a.resolve(v1), a.resolve(v2));
+    }
+
+    /// The Ok-without-binding path: structurally equal types with distinct handles
+    /// unify Ok and must not touch any binding. The solver tolerates this because an
+    /// Ok consumes the constraint (see consumption invariant); it must never
+    /// re-enqueue on it.
+    #[test]
+    fn ok_structural_equal_distinct_handles_binds_nothing() {
+        let mut a = TypeArena::new();
+        let i32_ = a.make(Type::I32);
+        let ret = a.make(Type::Bool);
+        let f1 = a.make_fn(Box::from([i32_]), ret);
+        let ret2 = a.make(Type::Bool);
+        let f2 = a.make_fn(Box::from([i32_]), ret2);
+        assert_ne!(f1, f2);
+        assert_eq!(a.unify(f1, f2), Ok(()));
+        assert_eq!(unbound_count(&a), a.type_vars.len());
+    }
+
+    /// Identical handles are a no-op Ok.
+    #[test]
+    fn ok_identical_handle_is_noop() {
+        let mut a = TypeArena::new();
+        let v = a.fresh_type_var();
+        assert_eq!(a.unify(v, v), Ok(()));
+        assert_eq!(a.type_var(0).bound, None);
+    }
+
+    /// Occurs check rejects infinite types and leaves the var unbound.
+    #[test]
+    fn occurs_check_rejects_infinite_type() {
+        let mut a = TypeArena::new();
+        let v = a.fresh_type_var();
+        let arr = a.make_array(v, None);
+        assert_eq!(a.unify(v, arr), Err(UnifyError::OccursCheckFailed));
+        assert_eq!(a.type_var(0).bound, None);
+    }
+
+    /// Never/Unknown overwrite is idempotent: the slot converges and stays stable.
+    #[test]
+    fn never_unknown_overwrite_is_stable() {
+        let mut a = TypeArena::new();
+        let unk = a.make(Type::Unknown);
+        let i32_ = a.make(Type::I32);
+        assert_eq!(a.unify(unk, i32_), Ok(()));
+        assert_eq!(a.get(unk), Type::I32);
+        // Second unify with the same target is still Ok and does not regress.
+        assert_eq!(a.unify(unk, i32_), Ok(()));
+        assert_eq!(a.get(unk), Type::I32);
+    }
+
+    /// Rigid vars refuse concrete bindings.
+    #[test]
+    fn rigid_var_rejects_concrete() {
+        let mut a = TypeArena::new();
+        let r = a.fresh_rigid_var();
+        let i32_ = a.make(Type::I32);
+        assert_eq!(a.unify(r, i32_), Err(UnifyError::TypeMismatch));
+        assert_eq!(a.type_var(0).bound, None);
+    }
+
+    /// Concrete mismatch errors without side effects.
+    #[test]
+    fn concrete_mismatch_errors() {
+        let mut a = TypeArena::new();
+        let i32_ = a.make(Type::I32);
+        let str_ = a.make(Type::Str);
+        assert_eq!(a.unify(i32_, str_), Err(UnifyError::TypeMismatch));
+    }
+
+    /// Structural recursion propagates bindings through nested composites.
+    #[test]
+    fn structural_recursion_binds_nested_vars() {
+        let mut a = TypeArena::new();
+        let v = a.fresh_type_var();
+        let i32_ = a.make(Type::I32);
+        // [v; None] vs [i32; None]
+        let arr_v = a.make_array(v, None);
+        let arr_i = a.make_array(i32_, None);
+        assert_eq!(a.unify(arr_v, arr_i), Ok(()));
+        assert_eq!(a.resolve(v), i32_);
     }
 }
