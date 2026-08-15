@@ -59,7 +59,7 @@ impl<'a> IrBuilder<'a> {
                 ],
             },
         );
-        if std::env::var("KUZO_DEBUG_COMPILE").is_ok() {
+        if std::env::var("FROND_DEBUG_COMPILE").is_ok() {
             let then_r = self.graph.subgraphs[then_sg.0 as usize].node_range;
             let else_r = self.graph.subgraphs[else_sg.0 as usize].node_range;
             eprintln!("[COMPILE_IF] cond_node={} then_sg={} then_range=[{},{}) else_sg={} else_range=[{},{}) gate_node={} cur_mod={:?}",

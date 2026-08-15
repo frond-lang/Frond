@@ -2,7 +2,7 @@
 //! ffi — Foreign Function Interface modules.
 //!
 //! FFI form: **only** stdlib `@extern("C") #{ }#` (compiled and linked into the
-//! kuzo binary by build.rs). Runtime symbol resolution goes through [`Symbols`]
+//! frond binary by build.rs). Runtime symbol resolution goes through [`Symbols`]
 //! (dlsym self-lookup + cache); there is no longer a compile-time binding table.
 //!
 //! User code is not allowed to use FFI directly (`@extern`/`#{ }#` are only

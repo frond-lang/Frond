@@ -1,7 +1,7 @@
 //! Symbols — stdlib C symbol address cache (replaces the deleted `bindings_addr`
 //! hardcoded table).
 //!
-//! stdlib `@extern("C") #{ }#` functions are compiled and linked into the kuzo
+//! stdlib `@extern("C") #{ }#` functions are compiled and linked into the frond
 //! binary by build.rs. At runtime, [`platform::ResolveSelfSymbol`] resolves their
 //! addresses by name via dlsym/GetProcAddress. This module layers a lazy cache on
 //! top to avoid hitting the system API on every FFI call.

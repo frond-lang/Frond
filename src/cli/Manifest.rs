@@ -1,10 +1,10 @@
-//! Project manifest (kuzo.toml) loading + path resolution.
+//! Project manifest (frond.toml) loading + path resolution.
 
 use std::fs;
 use std::process;
 
 /// Project manifest file name.
-pub const MANIFEST_NAME: &str = "kuzo.toml";
+pub const MANIFEST_NAME: &str = "frond.toml";
 /// Default entry file.
 pub const DEFAULT_ENTRY: &str = "src/Main.kz";
 /// Default output directory.
@@ -80,12 +80,12 @@ pub fn find_project_root() -> Option<String> {
     None
 }
 
-/// Loads the project manifest: searches upward for the project root, then reads and parses kuzo.toml.
+/// Loads the project manifest: searches upward for the project root, then reads and parses frond.toml.
 /// Exits with an error if no manifest is found (project-based).
 pub fn load_manifest() -> (String, Manifest) {
     let root = find_project_root().unwrap_or_else(|| {
-        eprintln!("error: not a Kuzo project (no {} found in current or parent directories)", MANIFEST_NAME);
-        eprintln!("  hint: run `kuzo init` to scaffold a new project");
+        eprintln!("error: not a Frond project (no {} found in current or parent directories)", MANIFEST_NAME);
+        eprintln!("  hint: run `frond init` to scaffold a new project");
         process::exit(1);
     });
     let manifest_path = std::path::Path::new(&root).join(MANIFEST_NAME);

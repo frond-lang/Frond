@@ -75,12 +75,12 @@ pub(super) fn finish_call_in_caller(
     let call_graph_id = NodeId(call_node.0 + caller_offset.0);
     let consumer_count = graph.downstream_count(call_graph_id.0 as usize);
 
-    if super::env_flag("KUZO_DEBUG_IFELSE") {
+    if super::env_flag("FROND_DEBUG_IFELSE") {
         let child_sg = &graph.subgraphs[child_sg_id.0 as usize];
         eprintln!("[COMPLETE-INLINE] child_sg={} call_node_local={} call_graph_id={} caller_offset={} return_value={:?} child_loop_kind={:?} caller_sg={}",
             child_sg_id.0, call_node.0, call_graph_id.0, caller_offset.0,
             return_value, child_sg.loop_kind, caller_frame.subgraph_id.0);
-        if super::env_flag("KUZO_DEBUG_STALL") {
+        if super::env_flag("FROND_DEBUG_STALL") {
             let (bs, be) = child_sg.node_range;
             let mut unready: Vec<u32> = Vec::new();
             for i in 0..child.value_table.len() {
@@ -108,7 +108,7 @@ pub(super) fn finish_call_in_caller(
     let child_loop_kind = graph.subgraphs[child_sg_id.0 as usize].loop_kind;
     let should_propagate = !capture_gate
         && crate::ir::Ir::should_propagate_control_signal(&child_signal, is_gate, child_loop_kind);
-    if super::env_flag("KUZO_DEBUG_SIGNAL") {
+    if super::env_flag("FROND_DEBUG_SIGNAL") {
         eprintln!("[SIG-PROP-I] child_sg={} caller_sg={} signal={:?} propagate={} capture={}",
             child_sg_id.0, caller_frame.subgraph_id.0, child_signal, should_propagate, capture_gate);
     }
@@ -184,7 +184,7 @@ impl<S: LockStrategy> Engine<S> {
         let same_function = parent_sg.function_id == child_sg.function_id
             && subgraph_id != parent_frame.subgraph_id;
 
-        if super::env_flag("KUZO_DEBUG_STALL") {
+        if super::env_flag("FROND_DEBUG_STALL") {
             let (cs, ce) = child_sg.node_range;
             let child_sz = ce.0 - cs.0;
             if child_sz <= 3 {
@@ -371,7 +371,7 @@ impl<S: LockStrategy> Engine<S> {
             // E5: fresh same_function branch frame — eligible for one linear run.
             child.linear_fresh = true;
 
-            if super::env_flag("KUZO_DEBUG_FORIN") {
+            if super::env_flag("FROND_DEBUG_FORIN") {
                 let rq_len = child.ready_queue.len();
                 let mut pending_info: Vec<(u32, u16, bool)> = Vec::new();
                 for i in 0..parent_node_count {
@@ -395,7 +395,7 @@ impl<S: LockStrategy> Engine<S> {
             let node_count = (node_end.0 - node_start.0) as usize;
             let offset = node_start.0 as usize;
 
-            if super::env_flag("KUZO_DEBUG_CALL") && node_count == 0 {
+            if super::env_flag("FROND_DEBUG_CALL") && node_count == 0 {
                 eprintln!("[SUBGRAPH-ZERO] sg={} has 0 nodes! node_range=[{:?},{:?}) param_count={} — function body was NOT compiled (placeholder)",
                     subgraph_id.0, node_start, node_end, child_sg.param_count);
             }
@@ -520,7 +520,7 @@ impl<S: LockStrategy> Engine<S> {
                 }
                 ControlSignal::None => {
                     // Normal completion: check the caller's loop kind.
-                    if super::env_flag("KUZO_DEBUG_FORIN") {
+                    if super::env_flag("FROND_DEBUG_FORIN") {
                         let bsg = &self.graph.subgraphs[child_frame.subgraph_id.0 as usize];
                         let rq_len = child_frame.ready_queue.len();
                         let (bs, be) = bsg.node_range;
@@ -619,7 +619,7 @@ impl<S: LockStrategy> Engine<S> {
                 let consumer_count =
                     self.graph.downstream_count(call_graph_id.0 as usize);
 
-                if super::env_flag("KUZO_DEBUG_IFELSE") {
+                if super::env_flag("FROND_DEBUG_IFELSE") {
                     let child_sg = &self.graph.subgraphs[child_sg_id.0 as usize];
                     eprintln!("[COMPLETE] child_sg={} caller_fid={:?} call_node_local={} call_graph_id={} caller_offset={} return_value={:?} child_loop_kind={:?} caller_sg={}",
                         child_sg_id.0, caller_fid, call_node.0, call_graph_id.0, caller_offset.0,
@@ -669,7 +669,7 @@ impl<S: LockStrategy> Engine<S> {
                         is_gate,
                         child_loop_kind,
                     );
-                if super::env_flag("KUZO_DEBUG_SIGNAL") {
+                if super::env_flag("FROND_DEBUG_SIGNAL") {
                     eprintln!("[SIG-PROP-Q] child_sg={} caller_sg={} signal_ok={} capture={} is_gate={}",
                         child_sg_id.0, caller_frame.subgraph_id.0, should_propagate, capture_gate, is_gate);
                 }

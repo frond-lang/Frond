@@ -433,7 +433,7 @@ compute_fn_ids! {
     323 => CF_DEFER_RUN,
     // Block-scoped defer registration (324): like CF_DEFER_REGISTER but input[0] is an effect dep.
     324 => CF_BLOCK_DEFER_REGISTER,
-    // stdlib @extern("C") #{ }# inline FFI call (325): resolves a self-symbol (kuzo_extern_<name>)
+    // stdlib @extern("C") #{ }# inline FFI call (325): resolves a self-symbol (frond_extern_<name>)
     // via dlsym/GetProcAddress + Abi::call_dynamic. Inputs are the call arguments + a trailing
     // effect dep; dyn_ffi_info metadata carries (symbol, sig, arg_count).
     325 => CF_DYN_FFI_CALL,
@@ -1459,11 +1459,11 @@ pub struct ClosureInfo {
 /// `Abi::CallDynamic::call_dynamic`.
 #[derive(Debug, Clone, Hash)]
 pub struct DynFfiInfo {
-    /// C symbol name (e.g. "kuzo_extern___file_open_raw").
+    /// C symbol name (e.g. "frond_extern___file_open_raw").
     pub symbol: String,
     /// ABI signature (parameter types + return type); str params are pre-expanded to (Ptr, Int).
     pub sig: crate::ffi::Abi::AbiSig,
-    /// Number of Kuzo-level argument values (not counting the trailing effect dependency).
+    /// Number of Frond-level argument values (not counting the trailing effect dependency).
     /// Used by compute_dyn_ffi_call to separate args from the effect input.
     pub arg_count: u8,
 }
@@ -2652,7 +2652,7 @@ pub struct DataFlowGraph {
     /// table, remapped by `rebuild`'s sg compaction, NEVER serialized (the
     /// .kzo artifact carries no name table — loads leave this empty).
     /// Consumed by the execution-coverage instrumentation
-    /// (`KUZO_EXEC_COVERAGE=1`): the "never-executed std path" detector.
+    /// (`FROND_EXEC_COVERAGE=1`): the "never-executed std path" detector.
     pub sg_debug_names: Vec<Option<Box<str>>>,
     /// Vtable fallback dispatch: (vtable_method_idx, type_name) → SubGraphId.
     /// When a vtable call receives a concrete record (not a TraitVal), the runtime looks up
@@ -3366,8 +3366,8 @@ impl DataFlowGraph {
     ) -> Vec<Option<NodeId>> {
         // Test hook for the optimizer stability policy (run_guarded snapshot
         // rollback): simulates an invariant violation inside rebuild.
-        if std::env::var("KUZO_TEST_INJECT_REBUILD_FAIL").is_ok() {
-            panic!("rebuild: injected invariant failure (KUZO_TEST_INJECT_REBUILD_FAIL)");
+        if std::env::var("FROND_TEST_INJECT_REBUILD_FAIL").is_ok() {
+            panic!("rebuild: injected invariant failure (FROND_TEST_INJECT_REBUILD_FAIL)");
         }
         // ── Recursively resolve redirects ──
         let resolve = |id: NodeId| -> NodeId {
@@ -3740,7 +3740,7 @@ impl DataFlowGraph {
                         for e in &sg.defer_table {
                             referenced.insert(e.body_subgraph);
                         }
-                        if std::env::var("KUZO_DEBUG_REBUILD").is_ok() {
+                        if std::env::var("FROND_DEBUG_REBUILD").is_ok() {
                             eprintln!(
                                 "[REBUILD] sg={} removal vetoed: still referenced (fn={} kind={:?} range=[{},{})",
                                 sg.id.0, sg.function_id, sg.loop_kind,
@@ -3754,7 +3754,7 @@ impl DataFlowGraph {
                 }
             }
         }
-        let dbg_rebuild = std::env::var("KUZO_DEBUG_REBUILD").is_ok();
+        let dbg_rebuild = std::env::var("FROND_DEBUG_REBUILD").is_ok();
         // Save old node_ranges for debugging.
         let old_ranges: Vec<(u32, u32)> = if dbg_rebuild {
             self.subgraphs.iter().map(|sg| (sg.node_range.0.0, sg.node_range.1.0)).collect()
@@ -4046,7 +4046,7 @@ impl DataFlowGraph {
         self.compute_nested_ranges();
 
         // Verify: check for dangling references.
-        if std::env::var("KUZO_VERIFY_GRAPH").is_ok() {
+        if std::env::var("FROND_VERIFY_GRAPH").is_ok() {
             let total = self.nodes.len();
             for (idx, node) in self.nodes.iter().enumerate() {
                 let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
@@ -4072,7 +4072,7 @@ impl DataFlowGraph {
 
         // DEBUG: check if any Gate node is inside its branch subgraph's node_range.
         // This would cause infinite recursion (Gate launches a subgraph that contains itself).
-        if std::env::var("KUZO_DEBUG_REBUILD").is_ok() {
+        if std::env::var("FROND_DEBUG_REBUILD").is_ok() {
             for (idx, gb_opt) in self.gate_branches.iter().enumerate() {
                 if let Some(gb) = gb_opt {
                     let gate_node = NodeId(idx as u32);

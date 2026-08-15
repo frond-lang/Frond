@@ -24,18 +24,18 @@ use std::sync::Arc;
 pub(super) fn env_flag(name: &str) -> bool {
     static FLAGS: OnceLock<hashbrown::HashMap<&'static str, bool>> = OnceLock::new();
     const KNOWN_FLAGS: &[&str] = &[
-        "KUZO_DEBUG_STALL",
-        "KUZO_NO_REUSECHAIN",
-        "KUZO_DEBUG_FORIN",
-        "KUZO_DEBUG_CALL",
-        "KUZO_DEBUG_IFELSE",
-        "KUZO_DEBUG_GATE",
-        "KUZO_DEBUG_WB",
-        "KUZO_DEBUG_SYNC",
-        "KUZO_DEBUG_MEMO",
-        "KUZO_VERIFY",
-        "KUZO_VERIFY_STRICT",
-        "KUZO_EXEC_COVERAGE",
+        "FROND_DEBUG_STALL",
+        "FROND_NO_REUSECHAIN",
+        "FROND_DEBUG_FORIN",
+        "FROND_DEBUG_CALL",
+        "FROND_DEBUG_IFELSE",
+        "FROND_DEBUG_GATE",
+        "FROND_DEBUG_WB",
+        "FROND_DEBUG_SYNC",
+        "FROND_DEBUG_MEMO",
+        "FROND_VERIFY",
+        "FROND_VERIFY_STRICT",
+        "FROND_EXEC_COVERAGE",
     ];
     let flags = FLAGS.get_or_init(|| {
         let mut m = hashbrown::HashMap::with_capacity(KNOWN_FLAGS.len());
@@ -51,7 +51,7 @@ pub(super) fn env_flag(name: &str) -> bool {
 }
 
 // =========================================================================
-// Execution coverage (KUZO_EXEC_COVERAGE=1)
+// Execution coverage (FROND_EXEC_COVERAGE=1)
 // =========================================================================
 
 /// Process-global per-sg frame-start counters — the class-level detector for
@@ -64,9 +64,9 @@ pub(super) fn env_flag(name: &str) -> bool {
 static EXEC_COV: OnceLock<Vec<std::sync::atomic::AtomicU32>> = OnceLock::new();
 
 /// Bumps the execution counter for `sg`; initializes the counter table on
-/// first use (sized to the graph). No-op unless KUZO_EXEC_COVERAGE is set.
+/// first use (sized to the graph). No-op unless FROND_EXEC_COVERAGE is set.
 pub(super) fn exec_cov_bump(sg: crate::ir::Ir::SubGraphId, total_sgs: usize) {
-    if !env_flag("KUZO_EXEC_COVERAGE") {
+    if !env_flag("FROND_EXEC_COVERAGE") {
         return;
     }
     let cov = EXEC_COV.get_or_init(|| {
@@ -83,7 +83,7 @@ pub(super) fn exec_cov_bump(sg: crate::ir::Ir::SubGraphId, total_sgs: usize) {
 /// Aggregated across the whole test suite by tests/scripts/run_execcov.sh
 /// (names are stable across processes; sg ids are not).
 pub fn exec_cov_dump(graph: &crate::ir::Ir::DataFlowGraph) {
-    if !env_flag("KUZO_EXEC_COVERAGE") {
+    if !env_flag("FROND_EXEC_COVERAGE") {
         return;
     }
     let Some(cov) = EXEC_COV.get() else { return };

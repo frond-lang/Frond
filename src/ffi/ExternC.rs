@@ -11,14 +11,14 @@
 //! the AST path and the build-time text path produce identical output without
 //! duplicating logic.
 //!
-//! ## Kuzo → C type mapping
+//! ## Frond → C type mapping
 //!
 //! See `gen::TYPE_MAP` for the full mapping table.
 //!
 //! ## `str` return (out-parameter pattern)
 //!
-//! C cannot return a fat pointer directly, so Kuzo `fun foo(): str` → C
-//! `void kuzo_foo(..., const char** out_data, size_t* out_len)`. The C body sets
+//! C cannot return a fat pointer directly, so Frond `fun foo(): str` → C
+//! `void frond_foo(..., const char** out_data, size_t* out_len)`. The C body sets
 //! `*out_data` and `*out_len`; the Rust wrapper constructs a `&'static str`.
 
 #[allow(dead_code)]
@@ -227,7 +227,7 @@ fn extract_extern_c_funcs<'a>(module: &Module<'a>) -> Result<Vec<ExternCFunc>, S
             funcs.push(ExternCFunc {
                 name: name.to_string(),
                 c_return,
-                c_name: format!("kuzo_extern_{}", name),
+                c_name: format!("frond_extern_{}", name),
                 c_params,
                 c_body,
                 c_includes,

@@ -22,7 +22,7 @@ pub fn cmd_lint(path: Option<String>, format: Option<String>, deny: Option<Strin
         let diags = lint_file_string("<stdin>", &source, &config);
         (diags, "<stdin>".to_string())
     } else {
-        // find_project_root() returns the project root directory (containing kuzo.toml),
+        // find_project_root() returns the project root directory (containing frond.toml),
         // so join "src" directly to get the default lint target (same as fmt).
         let target = path.unwrap_or_else(|| {
             find_project_root()

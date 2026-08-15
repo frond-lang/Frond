@@ -2481,7 +2481,7 @@ fn record_fields_to_ctor_info<'a>(
 //   (a function-pointer table).
 // - Dispatch is indexed by the type_id on `Type`, in O(1).
 // - Replaces the current mangled-name ("TypeName.method") lookup.
-// - Naturally fits Kuzo's type_id / reflection mechanism.
+// - Naturally fits Frond's type_id / reflection mechanism.
 //
 // Data structures:
 // - WitnessEntry { trait_name, type_id, method_slots }

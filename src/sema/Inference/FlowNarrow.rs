@@ -17,13 +17,13 @@ use super::*;
 // FlowContext is path-sensitive; the solver is path-insensitive.
 // =========================================================================
 
-/// Narrowing kinds: covers all flow-sensitive type refinement scenarios in Kuzo.
+/// Narrowing kinds: covers all flow-sensitive type refinement scenarios in Frond.
 #[derive(Debug, Clone)]
 pub enum NarrowKind {
     /// Non-null narrowing: `if x != null` → x narrows from `Nullable<T>` to `T`.
     NonNull,
     /// Type-test narrowing: `if x is Type` → x narrows to Type.
-    /// (Kuzo's `is` expression, similar to Kotlin's smart cast.)
+    /// (Frond's `is` expression, similar to Kotlin's smart cast.)
     IsCheck(TypeHandle),
     /// ADT constructor-match narrowing: `match x { Some(v) => ... }` → x narrows to
     /// `Some<T>`.

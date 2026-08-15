@@ -36,7 +36,7 @@ impl AbiSig {
     }
 }
 
-/// Map a Kuzo type name to an `AbiType` (single source of truth, shared by the
+/// Map a Frond type name to an `AbiType` (single source of truth, shared by the
 /// compile-time `@extern("C")` path and the runtime `Lib.lookup` sig parser).
 /// `str` is handled separately by `push_abi_types_for_name` (two slots).
 pub fn abi_type_from_name(ty_name: &str) -> AbiType {
@@ -58,7 +58,7 @@ pub fn abi_type_from_name(ty_name: &str) -> AbiType {
     }
 }
 
-/// Push `AbiType`(s) for a Kuzo type name. `str` and `u8[]` expand to the
+/// Push `AbiType`(s) for a Frond type name. `str` and `u8[]` expand to the
 /// `(Ptr, Int)` two slots, mirroring the DataLen C-side expansion in ffi/Gen.rs.
 pub fn push_abi_types_for_name(ty_name: &str, out: &mut Vec<AbiType>) {
     if ty_name == "str" || ty_name == "u8[]" {
@@ -69,7 +69,7 @@ pub fn push_abi_types_for_name(ty_name: &str, out: &mut Vec<AbiType>) {
     }
 }
 
-/// Parse a `Lib.lookup` argument-signature string (comma-separated Kuzo type
+/// Parse a `Lib.lookup` argument-signature string (comma-separated Frond type
 /// names, e.g. `"u64, u8[]"`; empty string = no arguments) into the parameter
 /// list of an `AbiSig`. Unknown atoms are errors (unlike the compile-time path,
 /// which falls back to i64 — a typo in a lookup sig should fail loudly).

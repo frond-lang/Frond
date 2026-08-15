@@ -137,7 +137,7 @@ impl TypeArena {
         self.make(Type::Fn(id))
     }
     pub fn make_nullable(&mut self, inner: TypeHandle) -> TypeHandle {
-        // `T??` collapses to `T?`: Kuzo nullable has no Some-constructor, so a
+        // `T??` collapses to `T?`: Frond nullable has no Some-constructor, so a
         // "wrapped null" value is unrepresentable — Nullable<Nullable<T>> carries
         // no additional information over Nullable<T> (Kotlin/TypeScript-style).
         let inner = self.resolve(inner);

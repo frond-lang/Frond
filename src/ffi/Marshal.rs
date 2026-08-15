@@ -1,7 +1,7 @@
 //! Marshal — Value ↔ C ABI bidirectional conversion (only serves stdlib
 //! `@extern("C") #{ }#` dynamic FFI).
 //!
-//! Encodes a Kuzo `Value` into a list of `AbiSlot`s according to an `AbiSig` for
+//! Encodes a Frond `Value` into a list of `AbiSlot`s according to an `AbiSig` for
 //! use by the [`crate::ffi::Abi`] invoker; after the call returns, decodes the
 //! `RetSlot` back into a `Value`.
 //!

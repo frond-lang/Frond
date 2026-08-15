@@ -1,5 +1,5 @@
 #![allow(non_snake_case)]
-//! Type — Kuzo type system module.
+//! Type — Frond type system module.
 //!
 //! Hosts the static attributes of all builtin types, the unified semantic-layer enum
 //! `Type` (the single source of types, `Copy`), `TypeArena` (type allocator +
@@ -18,7 +18,7 @@
 //! - `Display`: type display formatting (`TypeDisplay`)
 //! - `Ops`: `TypeOps` trait + scalar/reference ops implementations + ops lookup table +
 //!   `DynamicOpsRegistry`
-//! - `Ctype` (file `Ctype.rs`): Kuzo basic type ↔ C type mapping table (pure data,
+//! - `Ctype` (file `Ctype.rs`): Frond basic type ↔ C type mapping table (pure data,
 //!   no `crate::` dependency, can be `include!`d by `build.rs`)
 
 pub mod Tag;
@@ -39,7 +39,7 @@ pub use crate::value::{ValueTag, TypeFamily, BuiltinInfo, BUILTIN_TABLE, builtin
 // resolves to the module.
 pub mod Ty;
 
-/// Kuzo basic type ↔ C type mapping (pure data, no `crate::` dependency, can be
+/// Frond basic type ↔ C type mapping (pure data, no `crate::` dependency, can be
 /// `include!`d by `build.rs`).
 pub mod Ctype;
 

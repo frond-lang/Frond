@@ -199,7 +199,7 @@ impl DataFlowGraph {
     }
 
     /// stdlib @extern("C") #{ }# inline FFI call info (materialized at load;
-    /// v2 serializes it — the v1 gap that panicked `kuzo run <file>.kzo` is
+    /// v2 serializes it — the v1 gap that panicked `frond run <file>.kzo` is
     /// closed).
     #[inline]
     pub fn dyn_ffi_info(&self, idx: usize) -> Option<DynFfiInfo> {

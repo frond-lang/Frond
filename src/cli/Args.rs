@@ -2,9 +2,9 @@
 
 use clap::{Parser, Subcommand};
 
-/// Kuzo language Rust implementation CLI.
+/// Frond language Rust implementation CLI.
 #[derive(Parser)]
-#[command(name = "kuzo", version, about = "")]
+#[command(name = "frond", version, about = "")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,

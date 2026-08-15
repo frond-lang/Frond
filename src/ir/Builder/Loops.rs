@@ -271,7 +271,7 @@ impl<'a> IrBuilder<'a> {
         // Bug #100: loop-modified variables must be read through their canonical home
         // slot in the condition, so each re-evaluation sees the WriteBack-updated value
         // instead of a stale pre-loop snapshot.
-        if !std::env::var("KUZO_NO_REBIND").is_ok() { self.rebind_modified_vars_to_home(body); }
+        if !std::env::var("FROND_NO_REBIND").is_ok() { self.rebind_modified_vars_to_home(body); }
         // Compile the condition.
         // Reset `current_effect = None` to avoid creating CF_SEQ nodes inside the loop subgraph
         // that depend on the external effect chain.

@@ -74,7 +74,7 @@ pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
     // Use the precomputed nested_ranges (filled at build time) to avoid a runtime full-graph scan.
     let nested_ranges: &[(u32, u32)] = graph.sg_nested_ranges(sg_id.0 as usize);
 
-    if super::env_flag("KUZO_DEBUG_STALL") {
+    if super::env_flag("FROND_DEBUG_STALL") {
         eprintln!("[PREPARE] sg={} node_range=[{},{}) nested={:?}",
             sg_id.0, node_start.0, node_start.0 + node_count as u32, nested_ranges);
     }
@@ -287,7 +287,7 @@ impl<S: LockStrategy> Engine<S> {
             let local_id = match frame.pop_ready() {
                 Some(n) => n,
                 None => {
-                    if super::env_flag("KUZO_DEBUG_STALL") {
+                    if super::env_flag("FROND_DEBUG_STALL") {
                         let sg_id = frame.subgraph_id;
                         let (ns, ne) = graph.subgraphs[sg_id.0 as usize].node_range;
                         let ncnt = (ne.0 - ns.0) as usize;
@@ -493,7 +493,7 @@ impl<S: LockStrategy> Engine<S> {
                                 );
                             }
                             body.caller = Some((fid, pending.call_node_local));
-                            if !super::env_flag("KUZO_NO_REUSECHAIN") {
+                            if !super::env_flag("FROND_NO_REUSECHAIN") {
                                 let parent_ptr =
                                     frame as *const Frame as *mut Frame;
                                 body.parent_frame_ptr = parent_ptr;
@@ -619,7 +619,7 @@ impl<S: LockStrategy> Engine<S> {
                                 // and the condition re-read a stale snapshot forever.
                                 // Box addresses are stable across remove/insert (see
                                 // process_frame), so the in-hand frame pointer is safe.
-                                if super::env_flag("KUZO_NO_REUSECHAIN") {
+                                if super::env_flag("FROND_NO_REUSECHAIN") {
                                     bf.parent_frame_ptr = std::ptr::null_mut();
                                 } else {
                                     let parent_ptr = frame as *const Frame as *mut Frame;
@@ -645,7 +645,7 @@ impl<S: LockStrategy> Engine<S> {
                                 frame,
                                 pending.closure_val.clone(),
                             );
-                            if super::env_flag("KUZO_DEBUG_FORIN") {
+                            if super::env_flag("FROND_DEBUG_FORIN") {
                                 let bsg = &graph.subgraphs[pending.target_sg.0 as usize];
                                 eprintln!("[FORIN-CREATE] body_sg={} bfid={:?} args={:?} body_range=[{},{})",
                                     pending.target_sg.0, bfid, pending.args,
@@ -935,7 +935,7 @@ impl<S: LockStrategy> Engine<S> {
                     }
                 }
                 NodeResult::Return(v) => {
-                    if super::env_flag("KUZO_DEBUG_SIGNAL") {
+                    if super::env_flag("FROND_DEBUG_SIGNAL") {
                         eprintln!("[SIG-SET] node_local={} sg={} v={:?}", local_id.0, frame.subgraph_id.0, v);
                     }
                     frame.control_signal = ControlSignal::Return(v);

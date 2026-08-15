@@ -55,7 +55,7 @@ impl TypeKind {
     }
 }
 
-/// The unified type representation for Kuzo.
+/// The unified type representation for Frond.
 ///
 /// **Single source of types**: both the sema and IR layers use `Type`; there is no longer
 /// a `ConcreteType`.

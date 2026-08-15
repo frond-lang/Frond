@@ -15,7 +15,7 @@ use crate::ir::Ir::*;
 
 // ==================== Format constants ====================
 
-/// Magic number: `b"KZO\x00"` (Kuzo abbreviation).
+/// Magic number: `b"KZO\x00"` (Frond abbreviation).
 pub const SOLIDIFY_MAGIC: [u8; 4] = *b"KZO\x00";
 /// Format schema version.
 ///
@@ -210,7 +210,7 @@ pub enum SectionKind {
     RecordExtendInfos = 55,
     BatchInfos = 56,
     /// stdlib `#{ }#` inline-FFI call info (v2: serialized — closes the v1 gap
-    /// where `kuzo run <file>.kzo` panicked with "no dyn_ffi_info").
+    /// where `frond run <file>.kzo` panicked with "no dyn_ffi_info").
     DynFfiInfos = 57,
     // Shared region
     StringPool = 60,
@@ -223,7 +223,7 @@ pub enum SectionKind {
     /// Lib interop (v4): Lib.embed build-time resources, self-contained layout
     /// `[count u32]{ name_len u32, name bytes, data_len u32, data bytes }`.
     Resources = 64,
-    // Inline C FFI (compiled by kuzo build → cc → object extraction)
+    // Inline C FFI (compiled by frond build → cc → object extraction)
     CMachineCode = 70,
     CSymbols = 71,
 }

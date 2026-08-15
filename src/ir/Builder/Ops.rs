@@ -423,7 +423,7 @@ impl<'a> IrBuilder<'a> {
         (sg_id, Vec::new())
     }
 
-    /// Map a Kuzo BinaryOp + type name to a BatchInfo (batchable op + scalar type combination).
+    /// Map a Frond BinaryOp + type name to a BatchInfo (batchable op + scalar type combination).
     ///
     /// Returns None when the op is not SIMD-batchable (e.g. And/Or/RefEq/ConcatList/Range
     /// and other non-scalar arithmetic ops, or non-scalar types).
@@ -462,7 +462,7 @@ impl<'a> IrBuilder<'a> {
         Some(BatchInfo { tag, op: batch_op })
     }
 
-    /// Map a Kuzo UnaryOp + type name to a BatchInfo.
+    /// Map a Frond UnaryOp + type name to a BatchInfo.
     ///
     /// Neg (integer/float negation) and BitNot (integer bitwise not) are batchable;
     /// Not (bool logical not) does not go through SIMD batching.

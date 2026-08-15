@@ -62,7 +62,7 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
     let source = read_source(entry_path);
 
     if debug {
-        eprintln!("=== Kuzo Debug Mode ===");
+        eprintln!("=== Frond Debug Mode ===");
         eprintln!("[1/5] Parsing {} ...", entry_path);
     }
 
@@ -193,7 +193,7 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
     // engine applies the mechanical fast path.
     graph.precompute_reset_plans();
 
-    if std::env::var("KUZO_DUMP_IR").is_ok() {
+    if std::env::var("FROND_DUMP_IR").is_ok() {
         dump_ir(&graph);
     }
 
@@ -208,7 +208,7 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
     graph
 }
 
-/// KUZO_DUMP_IR: human-readable graph dump (subgraphs + nodes + edges + metadata).
+/// FROND_DUMP_IR: human-readable graph dump (subgraphs + nodes + edges + metadata).
 fn dump_ir(graph: &crate::ir::Ir::DataFlowGraph) {
     eprintln!("=== IR DUMP: {} nodes, {} subgraphs, entry={:?} ===",
         graph.nodes.len(), graph.subgraphs.len(), graph.entry_subgraph);
@@ -242,7 +242,7 @@ fn dump_ir(graph: &crate::ir::Ir::DataFlowGraph) {
                     extra += &format!(" const={:?}", cv);
                 }
             }
-            if std::env::var("KUZO_DUMP_DOWNSTREAM").is_ok() {
+            if std::env::var("FROND_DUMP_DOWNSTREAM").is_ok() {
                 let ds: Vec<u32> = graph.downstreams.get(n as usize)
                     .map(|d| d.iter().map(|x| x.0).collect()).unwrap_or_default();
                 let cnt = graph.downstream_counts.get(n as usize).copied().unwrap_or(0);

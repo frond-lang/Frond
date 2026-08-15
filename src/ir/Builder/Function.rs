@@ -500,7 +500,7 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         self.compiling_builtin = prev_builtin;
 
         let node_end = self.graph.nodes.len() as u32;
-        let debug_mod_name = if std::env::var("KUZO_DEBUG_BUILD").is_ok() {
+        let debug_mod_name = if std::env::var("FROND_DEBUG_BUILD").is_ok() {
             Some(self.current_module().name.to_string())
         } else {
             None

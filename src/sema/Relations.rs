@@ -11,7 +11,7 @@ use crate::ast::Ast::{AstArena, MethodDecl, TypeNode, TypeRef as AstTypeRef};
 // phase5: subtype_check — subtype relation judgment
 //
 // Rust port of `src/sema/subtype_check.zig`.
-// Determines subtype relations between the various types in the Kuzo
+// Determines subtype relations between the various types in the Frond
 // language: null/nullable, record structural subtyping, ADT error subtyping,
 // Throw subtyping, trait structural subtyping.
 // =========================================================================

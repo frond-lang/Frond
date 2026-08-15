@@ -1,7 +1,7 @@
-//! solidify — Kuzo binary executable format (`.kzo`)
+//! solidify — Frond binary executable format (`.kzo`)
 //!
 //! Persists the `DataFlowGraph` produced by the IR stage into a cross-platform
-//! binary file (`.kzo`), supporting mmap zerocopy loading and giving Kuzo a
+//! binary file (`.kzo`), supporting mmap zerocopy loading and giving Frond a
 //! "source compilation -> artifact distribution -> runtime interpretation" workflow.
 //!
 //! Module composition:

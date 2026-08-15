@@ -66,7 +66,7 @@ pub struct InferContext<'a> {
     /// Prevents ExprIds from different modules from colliding in the global expr_types.
     pub current_module_name: String,
     /// Diagnostic trace table: records (TypeHandle, Span) for each expression's inference result, used to trace unresolved TypeVars back to their source locations.
-    /// Only populated when KUZO_SEMA_TRACE is enabled, to avoid memory overhead during normal compilation.
+    /// Only populated when FROND_SEMA_TRACE is enabled, to avoid memory overhead during normal compilation.
     pub type_trace: Vec<(TypeHandle, crate::ast::Ast::Span)>,
     /// Constructor short name → module EnvId where the type is defined (Zig-style @This semantics).
     ///
@@ -406,8 +406,8 @@ impl<'a> InferContext<'a> {
                 info.implicit_this = Some(access);
             }
         }
-        // Diagnostic trace: only record (TypeHandle, Span) when KUZO_SEMA_TRACE is enabled.
-        if std::env::var("KUZO_SEMA_TRACE").is_ok() {
+        // Diagnostic trace: only record (TypeHandle, Span) when FROND_SEMA_TRACE is enabled.
+        if std::env::var("FROND_SEMA_TRACE").is_ok() {
             let span = ast.expr(expr).span;
             self.type_trace.push((ty, span));
         }
@@ -561,9 +561,9 @@ impl<'a> InferContext<'a> {
             .map(|(i, _)| i as u32)
             .collect();
 
-        // Verbose logging (controlled by KUZO_SEMA_TRACE env var): print unresolved TypeVar details
+        // Verbose logging (controlled by FROND_SEMA_TRACE env var): print unresolved TypeVar details
         // for easier diagnosis.
-        if !unresolved.is_empty() && std::env::var("KUZO_SEMA_TRACE").is_ok() {
+        if !unresolved.is_empty() && std::env::var("FROND_SEMA_TRACE").is_ok() {
             let unresolved_set: FxHashSet<u32> = unresolved.iter().copied().collect();
             eprintln!(
                 "[sema] {} unresolved type variable(s) after constraint solving:",

@@ -494,7 +494,7 @@ impl<'a> InferContext<'a> {
 
                 // Path 0 (fallback): look up a binding named after the method as an Fn type in env (free function with a self parameter).
                 // Use lookup_with_pred to skip same-named non-function bindings (e.g. a local variable shadowing a free function).
-                // In Kuzo `recv.method(args)` is sugar for `method(recv, args)`.
+                // In Frond `recv.method(args)` is sugar for `method(recv, args)`.
                 if let Some(fn_ty) = self.env.lookup_with_pred(env, method, |ty| {
                     let r = self.arena.resolve(ty);
                     matches!(self.arena.get(r), Type::Fn(_))

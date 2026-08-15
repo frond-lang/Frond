@@ -257,7 +257,7 @@ pub(super) fn reflect_method_intrinsic(method: &str) -> Option<(crate::sema::Sem
         "constructor" => un(336),       // CF_REFLECT_ADT_CTOR
         "field_name" => bin(333),       // CF_REFLECT_FIELD_NAME
         // field_value removed: its return type cannot be expressed without an "any"
-        // type in Kuzo's type system. CF_REFLECT_FIELD_VALUE (334) remains implemented
+        // type in Frond's type system. CF_REFLECT_FIELD_VALUE (334) remains implemented
         // in Compute.rs for potential future use (e.g. a typed field_value<T>(i): T).
         _ => None,
     }
@@ -1246,7 +1246,7 @@ impl<'a> IrBuilder<'a> {
             self.log_call_bind(site, name, recv, name, sg);
             return Some(Ok(sg));
         }
-        if std::env::var("KUZO_DEBUG_BUILD").is_ok() {
+        if std::env::var("FROND_DEBUG_BUILD").is_ok() {
             eprintln!(
                 "[CALL-BIND] site={} callee={:?} recv={:?} key=<unresolved> cur_mod={:?}",
                 site, name, recv, self.current_module().name
@@ -1292,9 +1292,9 @@ impl<'a> IrBuilder<'a> {
 
     /// Provenance for every resolution: which site asked, which key won, and
     /// which sg it bound — "who did I actually call" in one glance
-    /// (KUZO_DEBUG_BUILD=1).
+    /// (FROND_DEBUG_BUILD=1).
     fn log_call_bind(&self, site: &str, name: &str, recv: Option<&str>, key: &str, sg: SubGraphId) {
-        if std::env::var("KUZO_DEBUG_BUILD").is_ok() {
+        if std::env::var("FROND_DEBUG_BUILD").is_ok() {
             eprintln!(
                 "[CALL-BIND] site={} callee={:?} recv={:?} key={:?} sg={} cur_mod={:?}",
                 site, name, recv, key, sg.0, self.current_module().name
@@ -1827,7 +1827,7 @@ impl<'a> IrBuilder<'a> {
         }
 
         // DEBUG: dump all func_subgraphs whose node_range is (0,0) — these are uncompiled placeholders
-        if std::env::var("KUZO_DEBUG_BUILD").is_ok() {
+        if std::env::var("FROND_DEBUG_BUILD").is_ok() {
             eprintln!("=== [BUILD] func_subgraphs with EMPTY node_range (uncompiled) ===");
             for (name, &sg_id) in &self.func_subgraphs {
                 let sg = &self.graph.subgraphs[sg_id.0 as usize];
@@ -1887,7 +1887,7 @@ impl<'a> IrBuilder<'a> {
         self.graph.ir_errors = std::mem::take(&mut self.errors);
 
         // Debug name sidecar for the execution-coverage instrumentation
-        // (KUZO_EXEC_COVERAGE=1): sg → qualified function name, parallel to
+        // (FROND_EXEC_COVERAGE=1): sg → qualified function name, parallel to
         // subgraphs; remapped by rebuild's sg compaction, never serialized.
         {
             let total_sgs = self.graph.subgraphs.len();
@@ -1908,7 +1908,7 @@ impl<'a> IrBuilder<'a> {
         // per-iteration reset is mechanical (no per-iteration DFS).
         self.graph.precompute_reset_plans();
 
-        // W0: structural invariant verification (debug builds / KUZO_VERIFY=1).
+        // W0: structural invariant verification (debug builds / FROND_VERIFY=1).
         crate::pass::Verifier::verify_and_report(&self.graph, "build");
 
         // Move the build-time string_pool into graph.string_pool (ConstValue::Str references this pool)

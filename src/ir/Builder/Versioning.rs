@@ -27,7 +27,7 @@
 //! to the next epoch node (the branch Gate / loop launch Call), which is the
 //! same-frame node that actually orders post-branch/post-loop reads.
 //!
-//! Kill switch: `KUZO_NO_VERSIONING=1`.
+//! Kill switch: `FROND_NO_VERSIONING=1`.
 
 use super::Core::IrBuilder;
 use crate::ir::Ir::*;
@@ -71,7 +71,7 @@ impl IrBuilder<'_> {
     /// Entry: run storage versioning over the whole graph. Call after
     /// `compute_nested_ranges()` and before `compute_downstreams()`.
     pub(super) fn apply_storage_versioning(&mut self) {
-        if std::env::var("KUZO_NO_VERSIONING").is_ok() {
+        if std::env::var("FROND_NO_VERSIONING").is_ok() {
             return;
         }
         // Child range -> child subgraph id lookup.
@@ -90,7 +90,7 @@ impl IrBuilder<'_> {
             let mut state = ScanState::default();
             let mut fixups: Vec<BodyFixup> = Vec::new();
             let in_loop: Option<((u32, u32), NodeId)> = None; // function level is never a LoopBody
-            if std::env::var("KUZO_VERSIONING_DBG").is_ok() {
+            if std::env::var("FROND_VERSIONING_DBG").is_ok() {
                 eprintln!("[VER] scan fn sg {}", sg_id.0);
             }
             self.scan_subgraph(sg_id, &range_to_sg, &mut state, &mut fixups, in_loop);
@@ -128,7 +128,7 @@ impl IrBuilder<'_> {
                 let (cs, ce) = children[ci];
                 ci += 1;
                 if let Some(&child_id) = range_to_sg.get(&(cs, ce)) {
-                    let dbg = std::env::var("KUZO_VERSIONING_DBG").is_ok();
+                    let dbg = std::env::var("FROND_VERSIONING_DBG").is_ok();
                     if dbg {
                         eprintln!(
                             "[VER] sg{} enter child sg{} range [{}..{}) kind={:?}",
@@ -221,7 +221,7 @@ impl IrBuilder<'_> {
                 // still makes it iteration-variant, and the fixup will ensure
                 // it carries a loop-internal input (cond_node) in that case.
                 if in_loop.is_some() {
-                    if std::env::var("KUZO_VERSIONING_DBG").is_ok() {
+                    if std::env::var("FROND_VERSIONING_DBG").is_ok() {
                         eprintln!("[VER] record read {} in body {:?}", pos, (start.0, end.0));
                     }
                     fixups.push(BodyFixup {

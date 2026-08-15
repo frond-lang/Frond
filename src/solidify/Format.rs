@@ -517,7 +517,7 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
         finish_sparse!(sections, SectionKind::BatchInfos, index, blob, count);
     }
 
-    // DynFfiInfos (v2: closes the v1 gap — `kuzo run <file>.kzo` previously
+    // DynFfiInfos (v2: closes the v1 gap — `frond run <file>.kzo` previously
     // panicked with "no dyn_ffi_info" since these were never serialized).
     {
         let mut index: Vec<u8> = Vec::new();
@@ -1828,7 +1828,7 @@ mod tests {
         g.set_writeback_target(gate, NodeId((e0 + 1) as u32));
         g.set_global_load_slot(gate, 3);
         g.set_global_store_slot(call, 4);
-        g.set_ffi_call_name(call, "kuzo_extern_test".to_string());
+        g.set_ffi_call_name(call, "frond_extern_test".to_string());
         g.set_cast_target_type(gate, "i32".to_string());
         g.set_closure_info(gate, ClosureInfo { subgraph_id: callee_sg, arity: 2, self_upvalue_idx: -1 });
         g.set_partial_info(gate, PartialInfo { subgraph_id: callee_sg, bound_count: 1 });
@@ -1844,7 +1844,7 @@ mod tests {
         g.set_safe_op(gate);
         g.set_slice_inclusive(call, true);
         g.set_dyn_ffi_info(call, DynFfiInfo {
-            symbol: "kuzo_extern_test".to_string(),
+            symbol: "frond_extern_test".to_string(),
             sig: crate::ffi::Abi::AbiSig::new(
                 vec![crate::ffi::Abi::AbiType::Int { bits: 64, signed: false }],
                 crate::ffi::Abi::AbiType::Void,

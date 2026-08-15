@@ -14,7 +14,7 @@ impl<'a> InferContext<'a> {
         );
         self.env.define(env, "Panic", panic_fn);
 
-        // type/type_name has been converted to a kuzo wrapper (see Reflect.kz::type_name).
+        // type/type_name has been converted to a frond wrapper (see Reflect.kz::type_name).
         // Sema no longer registers the `type` builtin.
 
         // Ok: ∀T,E. (T) -> Throw<T, E>
@@ -670,7 +670,7 @@ impl<'a> InferContext<'a> {
                     );
                 }
                 // @extern("C") function: register the signature but skip body type checking
-                // (the body is C code, not a Kuzo expression).
+                // (the body is C code, not a Frond expression).
                 if extern_c_body.is_some() {
                     if !type_params.is_empty() {
                         self.pop_type_bindings();

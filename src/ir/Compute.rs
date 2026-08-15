@@ -28,12 +28,12 @@ fn env_flag(name: &str) -> bool {
     static FLAG_SYNC: OnceLock<bool> = OnceLock::new();
     static FLAG_MEMO: OnceLock<bool> = OnceLock::new();
     match name {
-        "KUZO_DEBUG_CALL" => *FLAG_CALL.get_or_init(|| std::env::var("KUZO_DEBUG_CALL").is_ok()),
-        "KUZO_DEBUG_GATE" => *FLAG_GATE.get_or_init(|| std::env::var("KUZO_DEBUG_GATE").is_ok()),
-        "KUZO_DEBUG_STALL" => *FLAG_STALL.get_or_init(|| std::env::var("KUZO_DEBUG_STALL").is_ok()),
-        "KUZO_DEBUG_WB" => *FLAG_WB.get_or_init(|| std::env::var("KUZO_DEBUG_WB").is_ok()),
-        "KUZO_DEBUG_SYNC" => *FLAG_SYNC.get_or_init(|| std::env::var("KUZO_DEBUG_SYNC").is_ok()),
-        "KUZO_DEBUG_MEMO" => *FLAG_MEMO.get_or_init(|| std::env::var("KUZO_DEBUG_MEMO").is_ok()),
+        "FROND_DEBUG_CALL" => *FLAG_CALL.get_or_init(|| std::env::var("FROND_DEBUG_CALL").is_ok()),
+        "FROND_DEBUG_GATE" => *FLAG_GATE.get_or_init(|| std::env::var("FROND_DEBUG_GATE").is_ok()),
+        "FROND_DEBUG_STALL" => *FLAG_STALL.get_or_init(|| std::env::var("FROND_DEBUG_STALL").is_ok()),
+        "FROND_DEBUG_WB" => *FLAG_WB.get_or_init(|| std::env::var("FROND_DEBUG_WB").is_ok()),
+        "FROND_DEBUG_SYNC" => *FLAG_SYNC.get_or_init(|| std::env::var("FROND_DEBUG_SYNC").is_ok()),
+        "FROND_DEBUG_MEMO" => *FLAG_MEMO.get_or_init(|| std::env::var("FROND_DEBUG_MEMO").is_ok()),
         _ => std::env::var(name).is_ok(),
     }
 }
@@ -811,7 +811,7 @@ pub fn compute_ne_bool(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Va
 
 /// compute_fn: wraps a value as `ThrowVal(Err)` (used by `throw` statements).
 ///
-/// Kuzo has no try-catch; `throw` produces a `ThrowVal(Err)` plus a `Return`
+/// Frond has no try-catch; `throw` produces a `ThrowVal(Err)` plus a `Return`
 /// signal that propagates up to the top level. The Err payload holds the thrown
 /// value itself (before Bug #27 was fixed, the original type was wrapped as an
 /// `Error(value:v)` record, requiring `Error(Error(v))` nested destructuring).
@@ -892,7 +892,7 @@ pub fn compute_propagate(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> 
 /// [`crate::ffi::Abi::CallDynamic::call_dynamic`]. Errors (missing symbol, ABI dispatch
 /// failure) become `FfiError` throw values.
 ///
-/// The symbols are compiled and linked into the kuzo binary by build.rs and resolved at
+/// The symbols are compiled and linked into the frond binary by build.rs and resolved at
 /// runtime by the system dynamic loader (dlsym / GetProcAddress) — no compile-time binding
 /// table is needed.
 pub fn compute_dyn_ffi_call(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
@@ -911,7 +911,7 @@ pub fn compute_dyn_ffi_call(frame: &mut Frame, node: NodeId, ctx: &EvalContext) 
     let mut marshaled = match crate::ffi::Marshal::encode_args(&info.sig, &args) {
         Ok(m) => m,
         Err(e) => {
-            if env_flag("KUZO_DEBUG_FFI") {
+            if env_flag("FROND_DEBUG_FFI") {
                 eprintln!("[FFI-ENCODE-ERR] symbol={} frame.sg={} err={} args={:?}",
                     info.symbol, frame.subgraph_id.0, e, args);
             }
@@ -928,7 +928,7 @@ pub fn compute_dyn_ffi_call(frame: &mut Frame, node: NodeId, ctx: &EvalContext) 
         ),
     };
 
-    if env_flag("KUZO_DEBUG_FFI") {
+    if env_flag("FROND_DEBUG_FFI") {
         eprintln!("[FFI] symbol={} frame.sg={} frame.offset={} arg_count={} slots={}",
             info.symbol, frame.subgraph_id.0, frame.node_offset, info.arg_count,
             marshaled.slots.len());
@@ -986,7 +986,7 @@ pub fn lib_ret_kind_to_abi(tag: u8) -> crate::ffi::Abi::AbiType {
     }
 }
 
-/// Kuzo scalar type name → lib_ret_kinds tag (Builder side). Mirrors
+/// Frond scalar type name → lib_ret_kinds tag (Builder side). Mirrors
 /// `lib_ret_kind_to_abi`; returns 0 (void) for anything else.
 pub fn abi_name_to_lib_ret_kind(name: &str) -> u8 {
     match name {
@@ -1037,7 +1037,7 @@ fn extract_embedded(name: &str, bytes: &[u8]) -> Result<std::path::PathBuf, Stri
         .extension()
         .map(|e| format!(".{}", e.to_string_lossy()))
         .unwrap_or_default();
-    let file_name = format!("kuzo-embed-{:016x}{}", hash, ext);
+    let file_name = format!("frond-embed-{:016x}{}", hash, ext);
     let path = std::env::temp_dir().join(file_name);
     if !path.exists() {
         std::fs::write(&path, bytes)
@@ -1740,7 +1740,7 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
     let param_vals: Vec<Value> = inputs[..param_count].iter()
         .map(|&inp| frame.get_value_by_global(inp))
         .collect();
-    if env_flag("KUZO_DEBUG_MEMO") {
+    if env_flag("FROND_DEBUG_MEMO") {
         eprintln!("[MEMO_CHECK] table={} params={:?}", info.table_index, param_vals);
     }
     for val in &param_vals {
@@ -1753,7 +1753,7 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
         let guard = table[info.table_index as usize].lock().unwrap();
         guard.get(&key).cloned()
     };
-    if env_flag("KUZO_DEBUG_MEMO") {
+    if env_flag("FROND_DEBUG_MEMO") {
         eprintln!("[MEMO_CHECK] key={} hit={}", key, hit_val.is_some());
     }
     match hit_val {
@@ -1799,7 +1799,7 @@ pub fn compute_memo_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
         val.hash(&mut hasher);
     }
     let key = hasher.finish();
-    if env_flag("KUZO_DEBUG_MEMO") {
+    if env_flag("FROND_DEBUG_MEMO") {
         eprintln!("[MEMO_STORE] table={} key={} params={:?} result={:?}",
             info.table_index, key, param_vals, result_val);
     }
@@ -2131,7 +2131,7 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
             }
         }
         Value::Ref(r) => match r.as_ref() {
-            HeapObj::Str(kuzo_str) => kuzo_str.bytes().to_string(),
+            HeapObj::Str(frond_str) => frond_str.bytes().to_string(),
             HeapObj::Array(arr) => {
                 // u8[] → str: extract bytes from SoA or elements
                 use crate::value::ScalarSoA;
@@ -2527,7 +2527,7 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
 
     // Static binding: has call_target → collect args + return NodeResult::Call.
     if let Some(target_sg) = graph.call_target(node.0 as usize) {
-        if env_flag("KUZO_DEBUG_CALL") {
+        if env_flag("FROND_DEBUG_CALL") {
             eprintln!("[CALL] node={:?} target_sg={} frame.sg={} frame.offset={}",
                 node, target_sg.0, frame.subgraph_id.0, frame.node_offset);
         }
@@ -2652,7 +2652,7 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     let cond_raw = frame.get_value_by_global(branches.condition_input);
     let cond = cond_raw.as_bool();
 
-    if env_flag("KUZO_DEBUG_GATE") {
+    if env_flag("FROND_DEBUG_GATE") {
         let sg = &graph.subgraphs[frame.subgraph_id.0 as usize];
         eprintln!("[GATE] node={:?} cond_raw={:?} cond={} frame.sg={} frame.offset={} sg.range=[{},{}) branches={:?}",
             node, cond_raw, cond, frame.subgraph_id.0, frame.node_offset,
@@ -2676,7 +2676,7 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
         .map(|&n| frame.get_value_by_global(n))
         .collect();
 
-    if env_flag("KUZO_DEBUG_STALL") {
+    if env_flag("FROND_DEBUG_STALL") {
         let (ns, ne) = graph.subgraphs[target_sg.0 as usize].node_range;
         eprintln!("[GATE] node={} cond={} target_sg={} sg_range=[{},{}) params={} branch_inputs={:?} args={}",
             node.0, cond, target_sg.0, ns.0, ne.0, param_count, branch_inputs, args.len());
@@ -3139,7 +3139,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 if (return_local as usize) < frame.value_table.len()
                     && !frame.value_table.is_ready(return_local as usize)
                 {
-                    if env_flag("KUZO_DEBUG_SYNC") {
+                    if env_flag("FROND_DEBUG_SYNC") {
                         let ns = sg.node_range.0.0;
                         let ne = sg.node_range.1.0;
                         let nc = (ne - ns) as usize;
@@ -3157,7 +3157,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                     }
                     return Value::NULL;
                 }
-                if env_flag("KUZO_DEBUG_SYNC") {
+                if env_flag("FROND_DEBUG_SYNC") {
                     let rv = frame.get_value_by_global(sg.return_node);
                     eprintln!("[SYNC-RET] sg={} return_node={} (local={}) offset={} val={:?}",
                         sg.id.0, sg.return_node.0, return_local, frame.node_offset, rv);
@@ -3198,7 +3198,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
             NodeResult::Call(pending) => {
                 // Tail call: reuse the current frame.
                 if graph.tail_call_flag(graph_node_id.0 as usize) {
-                    if env_flag("KUZO_DEBUG_CALL") {
+                    if env_flag("FROND_DEBUG_CALL") {
                         eprintln!("[CALL-TAIL] node={} target_sg={} (TAIL CALL)",
                             graph_node_id.0, pending.target_sg.0);
                     }
@@ -3254,7 +3254,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
 
                 // Inject the return value into the current frame.
                 let consumer_count = graph.downstream_count(graph_node_id.0 as usize);
-                if env_flag("KUZO_DEBUG_CALL") {
+                if env_flag("FROND_DEBUG_CALL") {
                     let csg = &graph.subgraphs[pending.target_sg.0 as usize];
                     eprintln!("[CALL] node={} target_sg={} range=[{},{}) child_result={:?} signal={:?} consumer_count={}",
                         graph_node_id.0, pending.target_sg.0, csg.node_range.0.0, csg.node_range.1.0,
@@ -3298,7 +3298,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
 
                 // LoopBody completion handling.
                 if target_loop_kind == LoopKind::LoopBody {
-                    if env_flag("KUZO_DEBUG_CALL") {
+                    if env_flag("FROND_DEBUG_CALL") {
                         eprintln!("[CALL-LB] node={} target_sg={} child_signal={:?} frame.sg={} frame.loop_kind={:?}",
                             graph_node_id.0, pending.target_sg.0, child_signal,
                             frame.subgraph_id.0,
@@ -3631,7 +3631,7 @@ pub fn compute_writeback(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> 
         .expect("WriteBack node missing target");
     let consumer_count = graph.downstream_count(target.0 as usize);
 
-    if env_flag("KUZO_DEBUG_WB") {
+    if env_flag("FROND_DEBUG_WB") {
         let sg = &graph.subgraphs[frame.subgraph_id.0 as usize];
         eprintln!("[WB] node={:?} target={:?} val={:?} val_node={:?} frame.sg={} frame.offset={} sg.range=[{},{}) sg.func_id={} vt_len={}",
             node, target, val, val_node, frame.subgraph_id.0, frame.node_offset,
