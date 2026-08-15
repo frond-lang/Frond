@@ -1,10 +1,10 @@
-//! build.rs — Kuzo `@extern("C")` stdlib C compilation.
+//! build.rs — Frond `@extern("C")` stdlib C compilation.
 //!
 //! ## Design
 //!
 //! This script extracts `@extern("C")` functions from `builtin/*/Raw.kz` files
-//! via **direct text parsing** — no kuzo binary dependency. This solves the
-//! bootstrap problem ("chicken-and-egg"): previously build.rs needed the kuzo
+//! via **direct text parsing** — no frond binary dependency. This solves the
+//! bootstrap problem ("chicken-and-egg"): previously build.rs needed the frond
 //! binary to emit C code, but the binary didn't exist on first build.
 //!
 //! The text extraction logic parses the fixed `.kz` syntax (`@extern("C")` +
@@ -13,16 +13,16 @@
 //!
 //! ## Workflow
 //!
-//! 1. Scan `.kz` files listed in `EXTERN_KUZO_FILES` (containing `@extern("C")` declarations).
+//! 1. Scan `.kz` files listed in `EXTERN_FROND_FILES` (containing `@extern("C")` declarations).
 //! 2. Text-extract each into `ExternCFunc` records (shared struct from `Gen.rs`).
 //! 3. Generate `.c` source for each file via `gen::generate_c_source`.
-//! 4. Compile all `.c` files into the `kuzo_extern` static library using the `cc` crate.
+//! 4. Compile all `.c` files into the `frond_extern` static library using the `cc` crate.
 //! 5. Delete intermediate `.c` artifacts from `OUT_DIR`.
 //!
 //! Symbol resolution: no Rust FFI binding table (`bindings_addr`) is generated
-//! anymore. At runtime, kuzo resolves in-process symbols via dlsym (GetProcAddress)
+//! anymore. At runtime, frond resolves in-process symbols via dlsym (GetProcAddress)
 //! self-lookup (see `platform::ResolveSelfSymbol`). C functions are exported on Windows
-//! via the `KUZO_EXPORT` macro (`__declspec(dllexport)`); on Linux/macOS they are
+//! via the `FROND_EXPORT` macro (`__declspec(dllexport)`); on Linux/macOS they are
 //! exported by default and visible to dlsym.
 
 use std::env;
@@ -44,7 +44,7 @@ use gen::{is_i128_return, is_str_return, type_to_c_params, type_to_c_return, Ext
 /// `reflect/Raw.kz` is not in this list: its primitives are implemented on the Rust side as
 /// `#[no_mangle] extern "C" fn`, so emit-c is not needed. The Raw.kz file itself
 /// is loaded directly by Sema (builtin) for type checking.
-const EXTERN_KUZO_FILES: &[&str] = &[
+const EXTERN_FROND_FILES: &[&str] = &[
     "src/stdlib/builtin/io/Raw.kz",
     "src/stdlib/builtin/net/Raw.kz",
     "src/stdlib/builtin/time/Raw.kz",
@@ -60,24 +60,24 @@ fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
 
     // Collect existing .kz files
-    let kuzo_files: Vec<PathBuf> = EXTERN_KUZO_FILES
+    let frond_files: Vec<PathBuf> = EXTERN_FROND_FILES
         .iter()
         .map(PathBuf::from)
         .filter(|p| p.exists())
         .collect();
 
-    if kuzo_files.is_empty() {
+    if frond_files.is_empty() {
         return;
     }
 
     // 1. Text-extract each .kz → ExternCFunc list, then generate .c into OUT_DIR
     let mut c_files: Vec<PathBuf> = Vec::new();
 
-    for kuzo_file in &kuzo_files {
-        let content = match fs::read_to_string(kuzo_file) {
+    for frond_file in &frond_files {
+        let content = match fs::read_to_string(frond_file) {
             Ok(c) => c,
             Err(e) => {
-                println!("cargo:warning=Read failed {}: {}", kuzo_file.display(), e);
+                println!("cargo:warning=Read failed {}: {}", frond_file.display(), e);
                 continue;
             }
         };
@@ -85,7 +85,7 @@ fn main() {
         let funcs = match parse_kz_extern_c(&content) {
             Ok(f) => f,
             Err(e) => {
-                println!("cargo:warning=Parse failed {}: {}", kuzo_file.display(), e);
+                println!("cargo:warning=Parse failed {}: {}", frond_file.display(), e);
                 continue;
             }
         };
@@ -98,12 +98,12 @@ fn main() {
         let c_source = match gen::generate_c_source(&funcs) {
             Ok(s) => s,
             Err(e) => {
-                println!("cargo:warning=C gen failed {}: {}", kuzo_file.display(), e);
+                println!("cargo:warning=C gen failed {}: {}", frond_file.display(), e);
                 continue;
             }
         };
 
-        let c_name = kuzo_file_to_c_name(kuzo_file);
+        let c_name = frond_file_to_c_name(frond_file);
         let c_path = Path::new(&out_dir).join(&c_name);
         if fs::write(&c_path, &c_source).is_err() {
             println!("cargo:warning=Write .c failed: {}", c_path.display());
@@ -111,14 +111,14 @@ fn main() {
         }
         c_files.push(c_path);
 
-        println!("cargo::rerun-if-changed={}", kuzo_file.display());
+        println!("cargo::rerun-if-changed={}", frond_file.display());
     }
 
     if c_files.is_empty() {
         return;
     }
 
-    // 2. Compile all .c files with cc::Build into the kuzo_extern static library.
+    // 2. Compile all .c files with cc::Build into the frond_extern static library.
     //
     // Key point: use cargo_metadata(false) to suppress the rustc-link-lib that cc emits
     // automatically (a plain -l would drop unreferenced symbols). Instead we emit the
@@ -139,7 +139,7 @@ fn main() {
     for c_file in &c_files {
         build.file(c_file);
     }
-    match build.try_compile("kuzo_extern") {
+    match build.try_compile("frond_extern") {
         Ok(_) => {
             // Emit link directives manually: whole-archive forces full linkage.
             // Output the library search path (try_compile already placed the .lib in
@@ -149,17 +149,17 @@ fn main() {
             let target = env::var("TARGET").unwrap_or_default();
             if target.contains("msvc") {
                 // MSVC: /WHOLEARCHIVE:<libname>. libname has no `lib` prefix / `.lib` suffix.
-                println!("cargo::rustc-link-arg-bin=kuzo=/WHOLEARCHIVE:kuzo_extern.lib");
+                println!("cargo::rustc-link-arg-bin=frond=/WHOLEARCHIVE:frond_extern.lib");
             } else if target.contains("apple") || target.contains("darwin") {
                 // macOS: -force_load <path> (requires the full path; -force_load wraps a single .a).
-                let lib_path = Path::new(&out_dir).join("libkuzo_extern.a");
-                println!("cargo::rustc-link-arg-bin=kuzo=-force_load");
-                println!("cargo::rustc-link-arg-bin=kuzo={}", lib_path.display());
+                let lib_path = Path::new(&out_dir).join("libfrond_extern.a");
+                println!("cargo::rustc-link-arg-bin=frond=-force_load");
+                println!("cargo::rustc-link-arg-bin=frond={}", lib_path.display());
             } else {
-                // Linux / other ELF: -Wl,--whole-archive -lkuzo_extern -Wl,--no-whole-archive
-                println!("cargo::rustc-link-arg-bin=kuzo=-Wl,--whole-archive");
-                println!("cargo::rustc-link-arg-bin=kuzo=-lkuzo_extern");
-                println!("cargo::rustc-link-arg-bin=kuzo=-Wl,--no-whole-archive");
+                // Linux / other ELF: -Wl,--whole-archive -lfrond_extern -Wl,--no-whole-archive
+                println!("cargo::rustc-link-arg-bin=frond=-Wl,--whole-archive");
+                println!("cargo::rustc-link-arg-bin=frond=-lfrond_extern");
+                println!("cargo::rustc-link-arg-bin=frond=-Wl,--no-whole-archive");
             }
             println!("cargo::rustc-cfg=has_extern_c");
             // After successful compilation, delete the .c intermediate artifacts from OUT_DIR
@@ -173,9 +173,9 @@ fn main() {
     }
 }
 
-/// Maps a kuzo file path to a unique .c file name in OUT_DIR.
-fn kuzo_file_to_c_name(kuzo_file: &Path) -> String {
-    let stem = kuzo_file
+/// Maps a frond file path to a unique .c file name in OUT_DIR.
+fn frond_file_to_c_name(frond_file: &Path) -> String {
+    let stem = frond_file
         .with_extension("")
         .to_string_lossy()
         .replace('/', "_");
@@ -193,7 +193,7 @@ fn kuzo_file_to_c_name(kuzo_file: &Path) -> String {
 //       <C body>
 //   }#
 //
-// This parser is intentionally lightweight — it does not need the full Kuzo
+// This parser is intentionally lightweight — it does not need the full Frond
 // parser. It only recognizes the subset of syntax that @extern("C") functions
 // use. Unknown types produce a warning and the function is skipped (same
 // behavior as the AST path in ExternC.rs).
@@ -541,7 +541,7 @@ fn build_extern_c_func(
     Some(ExternCFunc {
         name: name.to_string(),
         c_return,
-        c_name: format!("kuzo_extern_{}", name),
+        c_name: format!("frond_extern_{}", name),
         c_params,
         c_body: body.to_string(),
         c_includes: c_includes.to_vec(),
