@@ -14,7 +14,7 @@
 //!   LoopOptimizer / InlineOptimizer modules) are now merged into Analyzer /
 //!   Optimizer respectively. Consumes and transforms [`DataFlowGraph`] in place.
 //! - [`Verifier`]: structural invariant checks over the compiled graph
-//!   (debug builds / `KUZO_VERIFY=1`). Runs after IR build and after every
+//!   (debug builds / `FROND_VERIFY=1`). Runs after IR build and after every
 //!   optimizer rebuild; see IR_OPTIMIZATION_PLAN.md (W0).
 //!
 //! Both are independent post-processing passes sitting between major pipeline

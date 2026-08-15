@@ -973,7 +973,7 @@ pub fn pass_strength_reduction(graph: &mut DataFlowGraph, ctx: &mut OptimizerCon
                 graph.nodes[idx].inputs_offset = new_offset;
                 graph.nodes[idx].input_count = 2;
 
-                if std::env::var("KUZO_STRENGTH_DBG").is_ok() {
+                if std::env::var("FROND_STRENGTH_DBG").is_ok() {
                     eprintln!("[STRENGTH] mul→shl node={} var={} const_node={} const_val={}→{} cf={} downstreams={} const_kind={:?} const_cf={}",
                         idx, var_input.0, resolved.0, val, n, shl_cf.0, graph.downstreams[ridx].len(),
                         graph.nodes[ridx].kind, graph.nodes[ridx].compute_fn.0);
@@ -1019,7 +1019,7 @@ pub fn pass_strength_reduction(graph: &mut DataFlowGraph, ctx: &mut OptimizerCon
             graph.nodes[idx].inputs_offset = new_offset;
             graph.nodes[idx].input_count = 2;
 
-            if std::env::var("KUZO_STRENGTH_DBG").is_ok() {
+            if std::env::var("FROND_STRENGTH_DBG").is_ok() {
                 eprintln!("[STRENGTH] udiv→shr node={} dividend={} divisor={}→{} cf={}",
                     idx, dividend_input.0, dval, n, shr_cf.0);
             }
@@ -1059,7 +1059,7 @@ pub fn pass_strength_reduction(graph: &mut DataFlowGraph, ctx: &mut OptimizerCon
             // Input order unchanged: [dividend, mask constant]
             // No need to reorder inputs; both mod and bitand are [x, const]
 
-            if std::env::var("KUZO_STRENGTH_DBG").is_ok() {
+            if std::env::var("FROND_STRENGTH_DBG").is_ok() {
                 eprintln!("[STRENGTH] umod→bitand node={} dividend={} divisor={}→mask={} cf={}",
                     idx, inputs[0].0, dval, mask, bitand_cf.0);
             }
@@ -1247,7 +1247,7 @@ pub fn pass_dse(graph: &DataFlowGraph, ctx: &mut OptimizerContext) {
         }
 
         // Dead store: add to the dead set
-        if std::env::var("KUZO_DSE_DBG").is_ok() {
+        if std::env::var("FROND_DSE_DBG").is_ok() {
             eprintln!("[DSE] eliminate dead store node={} cf={} kind={:?}",
                 idx, node.compute_fn.0, node.kind);
         }
@@ -1267,7 +1267,7 @@ pub fn pass_dse(graph: &DataFlowGraph, ctx: &mut OptimizerContext) {
 /// - `O2`: full (structural transforms + fixpoint iteration), standard level
 /// - `O3`: full + wider fixpoint stall window (30 vs 10), aggressive optimization
 ///
-/// The `KUZO_NO_*` environment variables can still disable individual passes (for debugging),
+/// The `FROND_NO_*` environment variables can still disable individual passes (for debugging),
 /// taking priority over the level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -1302,15 +1302,15 @@ pub(crate) fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> 
 
 /// Never-corrupt execution of one optimization unit (see the stability policy
 /// on `optimize_with_analysis`): snapshot → run → on panic restore the
-/// snapshot, report, and return `None`. `KUZO_OPT_STRICT_PANIC=1` (or the CI
-/// gate `KUZO_VERIFY_STRICT=1`) re-raises the panic unchanged so invariant
+/// snapshot, report, and return `None`. `FROND_OPT_STRICT_PANIC=1` (or the CI
+/// gate `FROND_VERIFY_STRICT=1`) re-raises the panic unchanged so invariant
 /// violations stay loud in development.
 fn run_guarded<F, R>(graph: &mut DataFlowGraph, label: &str, f: F) -> Option<R>
 where
     F: FnOnce(&mut DataFlowGraph) -> R,
 {
-    let strict = std::env::var("KUZO_OPT_STRICT_PANIC").is_ok()
-        || std::env::var("KUZO_VERIFY_STRICT").is_ok();
+    let strict = std::env::var("FROND_OPT_STRICT_PANIC").is_ok()
+        || std::env::var("FROND_VERIFY_STRICT").is_ok();
     if strict {
         return Some(f(graph));
     }
@@ -1319,7 +1319,7 @@ where
         Ok(result) => Some(result),
         Err(payload) => {
             eprintln!(
-                "[OPT] internal error in {}: {}\n[OPT] optimization stopped; graph restored to its last consistent state — the compile continues with a less-optimized (still correct) result. Set KUZO_OPT_STRICT_PANIC=1 to re-raise this.",
+                "[OPT] internal error in {}: {}\n[OPT] optimization stopped; graph restored to its last consistent state — the compile continues with a less-optimized (still correct) result. Set FROND_OPT_STRICT_PANIC=1 to re-raise this.",
                 label,
                 panic_payload_message(&payload)
             );
@@ -1345,7 +1345,7 @@ where
 /// `rebuild: ref node not live`, an unexpected index, anything — restores the
 /// snapshot and stops optimizing; the compile then continues with the
 /// unoptimized-but-correct graph instead of crashing the process. Set
-/// `KUZO_OPT_STRICT_PANIC=1` (or the CI gate `KUZO_VERIFY_STRICT=1`) to
+/// `FROND_OPT_STRICT_PANIC=1` (or the CI gate `FROND_VERIFY_STRICT=1`) to
 /// re-raise the original panic for debugging.
 pub fn optimize_with_analysis(
     graph: &mut DataFlowGraph,
@@ -1360,23 +1360,23 @@ pub fn optimize_with_analysis(
     // W1: single derivation point (pure CFs minus aliasing reads when the
     // graph contains in-place mutators — Bug #99).
     let pure_set = crate::ir::Ir::graph_pure_set(graph);
-    let no_fold = std::env::var("KUZO_NO_FOLD").is_ok();
-    let no_cse = std::env::var("KUZO_NO_CSE").is_ok();
-    let no_copy = std::env::var("KUZO_NO_COPY").is_ok();
-    let no_dce = std::env::var("KUZO_NO_DCE").is_ok();
-    let no_licm = std::env::var("KUZO_NO_LICM").is_ok();
-    let no_unroll = std::env::var("KUZO_NO_UNROLL").is_ok();
-    let no_strength = std::env::var("KUZO_NO_STRENGTH").is_ok();
-    let no_dse = std::env::var("KUZO_NO_DSE").is_ok();
+    let no_fold = std::env::var("FROND_NO_FOLD").is_ok();
+    let no_cse = std::env::var("FROND_NO_CSE").is_ok();
+    let no_copy = std::env::var("FROND_NO_COPY").is_ok();
+    let no_dce = std::env::var("FROND_NO_DCE").is_ok();
+    let no_licm = std::env::var("FROND_NO_LICM").is_ok();
+    let no_unroll = std::env::var("FROND_NO_UNROLL").is_ok();
+    let no_strength = std::env::var("FROND_NO_STRENGTH").is_ok();
+    let no_dse = std::env::var("FROND_NO_DSE").is_ok();
     // Function-level DCE (uncalled-function elimination) runs inside the
     // phase-2 fixpoint so functions freed by inlining die the same round and
     // the entry-level constants they kept alive are collected by the next
     // round's node-level DCE.
-    let no_funcdce = std::env::var("KUZO_NO_FUNCDCE").is_ok();
-    // Inline pass is enabled by default. KUZO_NO_INLINE=1 can explicitly disable it.
+    let no_funcdce = std::env::var("FROND_NO_FUNCDCE").is_ok();
+    // Inline pass is enabled by default. FROND_NO_INLINE=1 can explicitly disable it.
     // hoisted_owners tracking + rebuild grouped reordering ensures body nodes are correctly
     // included in the caller's range.
-    let no_inline = std::env::var("KUZO_NO_INLINE").is_ok();
+    let no_inline = std::env::var("FROND_NO_INLINE").is_ok();
 
     // ── Phase 1: structural transforms (one-time, depend on analysis NodeIds, level >= 2) ──
     if level >= OptLevel::O2 && analysis.is_some() {
@@ -1396,7 +1396,7 @@ pub fn optimize_with_analysis(
     }
 
     // ── Phase 2: fixpoint iteration (Inline + traditional optimization, level >= 1) ──
-    let dbg_iter = std::env::var("KUZO_INLINE_DBG").is_ok();
+    let dbg_iter = std::env::var("FROND_INLINE_DBG").is_ok();
     // Termination guard (replaces the former fixed 50/200-round cap): the loop stops
     // after `stall_window` consecutive rounds without a strict decrease of the
     // progress measure `(call sites, nodes)`, lexicographic. Every productive round
@@ -1409,13 +1409,13 @@ pub fn optimize_with_analysis(
     // Legitimately long optimization chains keep improving and are never cut short;
     // only pass oscillations (flat/increasing forever) hit the window.
     // O3 gets a wider window (aggressive settings stretch flat stretches).
-    // KUZO_OPT_STALL_WINDOW overrides; KUZO_OPT_MAX_ITER still imposes a hard round
+    // FROND_OPT_STALL_WINDOW overrides; FROND_OPT_MAX_ITER still imposes a hard round
     // cap when set (debugging aid, off by default).
     let default_window: u32 = if level >= OptLevel::O3 { 30 } else { 10 };
-    let stall_window = std::env::var("KUZO_OPT_STALL_WINDOW")
+    let stall_window = std::env::var("FROND_OPT_STALL_WINDOW")
         .ok().and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(default_window);
-    let hard_cap: Option<u32> = std::env::var("KUZO_OPT_MAX_ITER")
+    let hard_cap: Option<u32> = std::env::var("FROND_OPT_MAX_ITER")
         .ok().and_then(|s| s.parse::<u32>().ok());
     let mut best = fixpoint_measure(graph);
     let mut stalled: u32 = 0;
@@ -1494,7 +1494,7 @@ fn fixpoint_measure(graph: &DataFlowGraph) -> (usize, usize) {
 /// Debug helper: check if any Gate node is inside its branch subgraph's node_range.
 /// This would cause infinite recursion at runtime (Gate launches a subgraph that contains itself).
 fn check_gate_in_branch(graph: &DataFlowGraph, label: &str) {
-    if std::env::var("KUZO_DEBUG_REBUILD").is_err() {
+    if std::env::var("FROND_DEBUG_REBUILD").is_err() {
         return;
     }
     for (idx, gb_opt) in graph.gate_branches.iter().enumerate() {
@@ -1815,14 +1815,14 @@ pub fn pass_inline(
         return;
     }
 
-    let inline_limit = std::env::var("KUZO_INLINE_LIMIT")
+    let inline_limit = std::env::var("FROND_INLINE_LIMIT")
         .ok().and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(usize::MAX);
-    if std::env::var("KUZO_INLINE_DBG").is_ok() {
+    if std::env::var("FROND_INLINE_DBG").is_ok() {
         eprintln!("[INLINE] {} candidates", candidates.len());
     }
     for (i, candidate) in candidates.iter().enumerate().take(inline_limit) {
-        if std::env::var("KUZO_INLINE_DBG").is_ok() {
+        if std::env::var("FROND_INLINE_DBG").is_ok() {
             let callee_sg = &graph.subgraphs[candidate.callee_sg.0 as usize];
             let callee_size = (callee_sg.node_range.1.0 - callee_sg.node_range.0.0) as usize;
             eprintln!("[INLINE] #{} call_node={} callee_sg={} caller_sg={} (size={}, params={}, return={})",
@@ -1887,7 +1887,7 @@ fn collect_inline_candidates(graph: &DataFlowGraph) -> Vec<InlineCandidate> {
         // → caller logic corruption.
         let ret = callee_sg.return_node;
         if ret.0 < callee_sg.node_range.0.0 || ret.0 >= callee_sg.node_range.1.0 {
-            if std::env::var("KUZO_INLINE_DBG").is_ok() {
+            if std::env::var("FROND_INLINE_DBG").is_ok() {
                 eprintln!("[INLINE-SKIP] call_node={} callee_sg={} return={} not in range [{},{})",
                     nid.0, callee_sg_id.0, ret.0,
                     callee_sg.node_range.0.0, callee_sg.node_range.1.0);
@@ -1962,7 +1962,7 @@ fn collect_inline_candidates(graph: &DataFlowGraph) -> Vec<InlineCandidate> {
             }
         }
         if !inputs_in_range {
-            if std::env::var("KUZO_INLINE_DBG").is_ok() {
+            if std::env::var("FROND_INLINE_DBG").is_ok() {
                 eprintln!("[INLINE-SKIP] call_node={} has inputs outside caller_func_sg={} range=[{},{})",
                     nid.0, caller_func_sg.0, caller_range.0 .0, caller_range.1 .0);
             }
@@ -1991,7 +1991,7 @@ fn inline_call(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext, candidate:
     let call_inputs =
         graph.inputs_pool.get(call_node_struct.inputs_offset, call_node_struct.input_count);
 
-    if std::env::var("KUZO_INLINE_DBG").is_ok() {
+    if std::env::var("FROND_INLINE_DBG").is_ok() {
         let ret_node = &graph.nodes[return_node.0 as usize];
         let ret_inputs = graph.inputs_pool.get(ret_node.inputs_offset, ret_node.input_count);
         eprintln!("[INLINE-DBG] call_node={} inputs={:?} callee=[{},{}) params={} return={} ret_kind={:?} ret_cf={} ret_inputs={:?}",
@@ -2092,7 +2092,7 @@ fn inline_call(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext, candidate:
     if let Some(eff) = effect_input {
         if eff.0 >= caller_range.0 .0 && eff.0 < caller_range.1 .0 {
             new_inputs.push(eff);
-        } else if std::env::var("KUZO_INLINE_DBG").is_ok() {
+        } else if std::env::var("FROND_INLINE_DBG").is_ok() {
             let eff_sg = graph.find_innermost_sg_for_node(eff);
             eprintln!("[INLINE-WARN] call_node={} effect_input={} outside caller_func_sg={} range=[{},{}) — dropped | caller_sg function_id={} loop_kind={:?} loop_parent={:?} param_count={} upvalue_count={} | eff_sg={:?} eff_kind={:?} eff_cf={}",
                 call_node.0, eff.0, candidate.caller_func_sg.0, caller_range.0 .0, caller_range.1 .0,
@@ -2170,11 +2170,11 @@ mod stability_tests {
     /// panicking out of the optimizer.
     #[test]
     fn optimizer_rollback_on_rebuild_failure() {
-        std::env::set_var("KUZO_TEST_INJECT_REBUILD_FAIL", "1");
+        std::env::set_var("FROND_TEST_INJECT_REBUILD_FAIL", "1");
         let mut g = tiny_graph();
         let nodes_before = g.nodes.len();
         optimize_with_analysis(&mut g, None, OptLevel::O1); // must not panic
-        std::env::remove_var("KUZO_TEST_INJECT_REBUILD_FAIL");
+        std::env::remove_var("FROND_TEST_INJECT_REBUILD_FAIL");
         assert_eq!(g.nodes.len(), nodes_before, "graph must be restored to the pre-round state");
         assert_eq!(g.entry_subgraph, Some(SubGraphId(0)));
         assert_eq!(g.node_count(), 3);

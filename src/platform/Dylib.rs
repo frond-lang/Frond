@@ -10,7 +10,7 @@
 //! - **Linux/macOS**: `dlopen(path, RTLD_NOW)` + `dlsym` + `dlclose`.
 //!   RTLD_NOW resolves all symbols eagerly so that a missing dependency fails
 //!   at open time with a diagnosable error instead of at call time.
-//! - **Windows**: `LoadLibraryW` (UTF-16 path; Kuzo `str` is UTF-8) +
+//! - **Windows**: `LoadLibraryW` (UTF-16 path; Frond `str` is UTF-8) +
 //!   `GetProcAddress` + `FreeLibrary`.
 //!
 //! Handles are raw pointers owned by `value::LibShared` (Drop → `close`).

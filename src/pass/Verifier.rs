@@ -5,8 +5,8 @@
 //! only" is checked here explicitly. Runs after `IrBuilder::build()` and after
 //! every optimizer `rebuild`:
 //! - enabled automatically in debug builds;
-//! - enabled in release builds via `KUZO_VERIFY=1`;
-//! - `KUZO_VERIFY_STRICT=1` turns violations into a panic (CI gate).
+//! - enabled in release builds via `FROND_VERIFY=1`;
+//! - `FROND_VERIFY_STRICT=1` turns violations into a panic (CI gate).
 //!
 //! Checks:
 //! - V1 structure: input-pool bounds, NodeId bounds, metadata target bounds.
@@ -86,22 +86,22 @@ fn verify_node_ref_bounds(graph: &DataFlowGraph, out: &mut Vec<Violation>) {
     let _ = count;
 }
 
-/// Verify, report to stderr, and (under `KUZO_VERIFY_STRICT=1`) panic.
-/// Cheap no-op unless debug assertions are on or `KUZO_VERIFY` is set.
+/// Verify, report to stderr, and (under `FROND_VERIFY_STRICT=1`) panic.
+/// Cheap no-op unless debug assertions are on or `FROND_VERIFY` is set.
 pub fn verify_and_report(graph: &DataFlowGraph, stage: &str) {
-    if !cfg!(debug_assertions) && std::env::var("KUZO_VERIFY").is_err() {
+    if !cfg!(debug_assertions) && std::env::var("FROND_VERIFY").is_err() {
         return;
     }
-    // Debug aid: KUZO_VERIFY_DUMP=<node_id> prints every subgraph whose range
+    // Debug aid: FROND_VERIFY_DUMP=<node_id> prints every subgraph whose range
     // covers the node (or the closest ranges around it), then exits verification.
-    if let Ok(target) = std::env::var("KUZO_VERIFY_DUMP") {
+    if let Ok(target) = std::env::var("FROND_VERIFY_DUMP") {
         if let Ok(t) = target.parse::<u32>() {
             dump_node_scope(graph, t);
             return;
         }
     }
-    // Debug aid: KUZO_VERIFY_DUMP_SG=2131-2140 prints a subgraph id range.
-    if let Ok(range) = std::env::var("KUZO_VERIFY_DUMP_SG") {
+    // Debug aid: FROND_VERIFY_DUMP_SG=2131-2140 prints a subgraph id range.
+    if let Ok(range) = std::env::var("FROND_VERIFY_DUMP_SG") {
         if let Some((lo, hi)) = range.split_once('-') {
             if let (Ok(lo), Ok(hi)) = (lo.parse::<usize>(), hi.parse::<usize>()) {
                 for si in lo..=hi.min(graph.subgraphs.len().saturating_sub(1)) {
@@ -120,7 +120,7 @@ pub fn verify_and_report(graph: &DataFlowGraph, stage: &str) {
     if violations.is_empty() {
         return;
     }
-    let strict = std::env::var("KUZO_VERIFY_STRICT").is_ok();
+    let strict = std::env::var("FROND_VERIFY_STRICT").is_ok();
     // Aggregate per check: at most 3 examples each + a total, so debug runs
     // stay readable when one root cause fires many times.
     let mut order: Vec<&'static str> = Vec::new();
@@ -145,7 +145,7 @@ pub fn verify_and_report(graph: &DataFlowGraph, stage: &str) {
     }
     if strict {
         panic!(
-            "[VERIFY/{}] {} invariant violation(s) (KUZO_VERIFY_STRICT=1)",
+            "[VERIFY/{}] {} invariant violation(s) (FROND_VERIFY_STRICT=1)",
             stage,
             violations.len()
         );
