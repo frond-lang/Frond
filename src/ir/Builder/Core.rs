@@ -40,8 +40,8 @@ pub struct IrBuilder<'a> {
     /// Global unique-name index across ALL modules (std included): bare name
     /// → sg. The sema layer predeclares every loaded module's functions into
     /// the root env, so a bare call to a GLOBALLY UNIQUE name type-checks
-    /// from anywhere (e.g. `fg_bright_yellow()` after `import
-    /// std.terminal.Ansi`); the IR must honor the same contract. Names
+    /// from anywhere (e.g. `is_tty(0)` after `import
+    /// std.os.Tty`); the IR must honor the same contract. Names
     /// contested by ≥2 distinct functions go to the tripwire instead —
     /// first registrant stays indexed, and any bare call through the
     /// contested name is a hard error.
@@ -1236,8 +1236,8 @@ impl<'a> IrBuilder<'a> {
         // 5b. Global unique-name index (std included): the sema layer
         // predeclares every loaded module's functions into the root env, so
         // a bare call to a globally-UNIQUE name type-checks from anywhere —
-        // honor the same contract (`fg_bright_yellow()` after importing
-        // std.terminal.Ansi). Contested names were recorded by the tripwire
+        // honor the same contract (`is_tty(0)` after importing
+        // std.os.Tty). Contested names were recorded by the tripwire
         // and error here.
         if let Some(&sg) = self.global_bare_index.get(name) {
             if let Some(diag) = self.conflict_diag(name) {
