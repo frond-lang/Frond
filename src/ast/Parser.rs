@@ -1,4 +1,4 @@
-//! Parser.rs — Kuzo lexical and syntax analysis
+//! Parser.rs — Frond lexical and syntax analysis
 //!
 //! Split from Ast.rs. Contains: BinaryOp precedence table, Lexer (TokenKind/Token/TokenSink/Lexer),
 //! ParseError/ParseErrorHandler, recursive-descent + Pratt Parser, and related helper functions.
@@ -249,7 +249,7 @@ pub fn lookup_binary_op(tok: TokenKind) -> Option<&'static OpMapping> {
 
 // Lexer
 //
-// Scans a Kuzo source string character-by-character into a Token sequence. Supports keywords,
+// Scans a Frond source string character-by-character into a Token sequence. Supports keywords,
 // identifiers, integers (binary/octal/hexadecimal), floating-point numbers, character and string
 // literals (with interpolation), and various operators and delimiters. Tokens carry line/column
 // information for error reporting.
@@ -2074,7 +2074,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 "function declaration must explicitly annotate the return type (use ': void' for no return value)",
             ));
         };
-        // @extern("C") function: body is a #{ }# raw block rather than a Kuzo expression
+        // @extern("C") function: body is a #{ }# raw block rather than a Frond expression
         let extern_c_body = if self.check(TokenKind::RawBlock) {
             let tok = self.advance();
             Some(tok.lexeme)
