@@ -21,6 +21,11 @@
 //!   bodies same-function; upvalue outer nodes strictly outside; call targets
 //!   in bounds; LoopBody parent containment.
 //! - V5 downstreams: the downstream table must exactly mirror input edges.
+//! - V7 sg references: every SubGraphId reference (call targets, closure/
+//!   partial/lazy/trait-construct metadata, gate/select branch targets, defer
+//!   bodies, loop parents, entry) must be in bounds, and dispatch targets
+//!   must not point at empty-range subgraphs (function-level DCE / subgraph
+//!   compaction residue would dispatch into nothing).
 
 use crate::ir::Ir::{DataFlowGraph, NodeId, SubGraphId};
 
@@ -35,6 +40,14 @@ pub struct Violation {
 
 /// Run all checks and collect violations (pure; no I/O, no panic).
 pub fn verify(graph: &DataFlowGraph) -> Vec<Violation> {
+    verify_with_stage(graph, "")
+}
+
+/// `verify` with the pipeline stage label: at `build` time, gates may still
+/// reference empty placeholder branch subgraphs (analyzer-dead branches never
+/// compile); the empty-range dispatch check only applies once the optimizer's
+/// function-level DCE has run and such residue should be gone.
+pub fn verify_with_stage(graph: &DataFlowGraph, stage: &str) -> Vec<Violation> {
     let mut v = Vec::new();
     verify_structure(graph, &mut v);
     let regions = crate::ir::Region::RegionTree::build(graph);
@@ -44,6 +57,7 @@ pub fn verify(graph: &DataFlowGraph) -> Vec<Violation> {
     verify_subgraphs(graph, &regions, &mut v);
     verify_downstreams(graph, &mut v);
     verify_loop_versioning(graph, &mut v);
+    verify_sg_refs(graph, stage != "build", &mut v);
     v
 }
 
@@ -77,7 +91,7 @@ pub fn verify_and_report(graph: &DataFlowGraph, stage: &str) {
             }
         }
     }
-    let violations = verify(graph);
+    let violations = verify_with_stage(graph, stage);
     if violations.is_empty() {
         return;
     }
@@ -452,6 +466,96 @@ fn verify_subgraphs(graph: &DataFlowGraph, regions: &crate::ir::Region::RegionTr
                     message: format!("LoopBody sg {} missing loop_parent_sg", si),
                 });
             }
+        }
+    }
+}
+
+// =========================================================================
+// V7 — SubGraphId reference integrity
+// =========================================================================
+
+/// Every SubGraphId reference must be in bounds, and anything that dispatches
+/// (call targets, closure/partial/lazy/trait-construct metadata, gate/select
+/// branches, defer bodies) must not point at an empty-range subgraph — after
+/// function-level DCE + subgraph compaction such a reference would launch a
+/// subgraph with no executable nodes. `check_empty=false` (build stage)
+/// skips the empty-range half: analyzer-dead branches legitimately keep
+/// placeholder branch subgraphs there.
+fn verify_sg_refs(graph: &DataFlowGraph, check_empty: bool, out: &mut Vec<Violation>) {
+    let n = graph.node_count();
+    let sg_count = graph.subgraphs.len();
+    let check = |id: SubGraphId, what: &str, node: Option<usize>, out: &mut Vec<Violation>| {
+        let idx = id.0 as usize;
+        if idx >= sg_count {
+            out.push(Violation {
+                check: "V7-sg-refs",
+                message: format!(
+                    "{} -> sg {} out of bounds (sg_count={})",
+                    what,
+                    id.0,
+                    sg_count
+                ),
+            });
+            return;
+        }
+        if !check_empty {
+            return;
+        }
+        let (s, e) = graph.subgraphs[idx].node_range;
+        if s.0 >= e.0 && node.is_some() {
+            out.push(Violation {
+                check: "V7-sg-refs",
+                message: format!(
+                    "node {} {} -> sg {} has empty range [{},{}) — dispatch into nothing",
+                    node.unwrap(),
+                    what,
+                    id.0,
+                    s.0,
+                    e.0
+                ),
+            });
+        }
+    };
+
+    if let Some(entry) = graph.entry_subgraph {
+        check(entry, "entry_subgraph", None, out);
+    }
+    for idx in 0..n {
+        if let Some(t) = graph.call_target(idx) {
+            check(t, "call_target", Some(idx), out);
+        }
+        if let Some(ci) = graph.closure_info(idx) {
+            check(SubGraphId(ci.subgraph_id.0), "closure_info", Some(idx), out);
+        }
+        if let Some(pi) = graph.partial_info(idx) {
+            check(SubGraphId(pi.subgraph_id.0), "partial_info", Some(idx), out);
+        }
+        if let Some(li) = graph.lazy_construct_info(idx) {
+            check(SubGraphId(li.thunk_sg.0), "lazy_thunk", Some(idx), out);
+        }
+        if let Some(ti) = graph.trait_construct_info_at(idx) {
+            for (mi, m) in ti.methods.iter().enumerate() {
+                check(SubGraphId(m.subgraph_id.0), &format!("trait_method[{mi}]"), Some(idx), out);
+            }
+        }
+        if let Some(gb) = graph.gate_branches_at(idx) {
+            for (_, bsg, _) in &gb.branches {
+                check(*bsg, "gate_branch", Some(idx), out);
+            }
+        }
+        if let Some(si) = graph.select_info_at(idx) {
+            for sb in &si.branches {
+                check(sb.subgraph_id, "select_branch", Some(idx), out);
+            }
+        }
+    }
+    for (si, sg) in graph.subgraphs.iter().enumerate() {
+        check(SubGraphId(sg.function_id), "function_id", None, out);
+        if let Some(p) = sg.loop_parent_sg {
+            check(p, "loop_parent", None, out);
+        }
+        for e in &sg.defer_table {
+            check(e.body_subgraph, &format!("sg{si} defer body"), None, out);
         }
     }
 }

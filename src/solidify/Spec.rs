@@ -18,7 +18,22 @@ use crate::ir::Ir::*;
 /// Magic number: `b"KZO\x00"` (Kuzo abbreviation).
 pub const SOLIDIFY_MAGIC: [u8; 4] = *b"KZO\x00";
 /// Format schema version.
-pub const SOLIDIFY_SCHEMA_VERSION: u16 = 1;
+///
+/// v2 (2026-08-15): binary structural slimming —
+/// - Nodes packed to 4B/node (kind u8 + input_count u8 + compute_fn u16),
+///   with per-node `inputs_offset` elided when the pool layout is contiguous
+///   (guaranteed post-`rebuild`; header flag bit0), else 8B with offset;
+/// - all per-node `Option` metadata tables (categories A/C/D/E) switched from
+///   dense rows (mostly None/sentinel, ~195B/node total) to sparse
+///   `[count][idx u32, blob_off u32]...[blob]` encoding;
+/// - `HoistedOwners` / `HoistedNode` / `Downstreams` sections dropped: no
+///   runtime consumers (the first two) or purely derivable from inputs (the
+///   last, recomputed at load).
+/// v1 files are rejected (rebuild from source to regenerate).
+pub const SOLIDIFY_SCHEMA_VERSION: u16 = 2;
+/// Header flag bit0: node inputs_offset omitted from packed Nodes records
+/// (inputs pool contiguous in node-id order; offsets derived at load).
+pub const FLAG_NODE_INPUT_OFFSETS_ELIDED: u16 = 0b0000_0001;
 /// Runtime ABI version (compute_fn table version).
 pub const SOLIDIFY_ABI_VERSION: u16 = 1;
 /// Number of compute_fn entries (used for ABI validation).
@@ -187,6 +202,9 @@ pub enum SectionKind {
     TraitConstructInfos = 54,
     RecordExtendInfos = 55,
     BatchInfos = 56,
+    /// stdlib `#{ }#` inline-FFI call info (v2: serialized — closes the v1 gap
+    /// where `kuzo run <file>.kzo` panicked with "no dyn_ffi_info").
+    DynFfiInfos = 57,
     // Shared region
     StringPool = 60,
     Downstreams = 61,
@@ -532,6 +550,36 @@ pub fn bytes_to_trait_method_entry(buf: &[u8; 8]) -> TraitMethodEntry {
     let arity = buf[4];
     let upvalue_count = buf[5];
     TraitMethodEntry { subgraph_id, arity, upvalue_count }
+}
+
+// ==================== AbiType / AbiSig serialization ====================
+
+/// Variable-length `AbiType` encoding: tag u8 (+2B payload for Int).
+pub fn write_abi_type(buf: &mut Vec<u8>, t: &crate::ffi::Abi::AbiType) {
+    use crate::ffi::Abi::AbiType::*;
+    match t {
+        Void => buf.push(0),
+        Int { bits, signed } => {
+            buf.push(1);
+            buf.push(*bits);
+            buf.push(*signed as u8);
+        }
+        Float32 => buf.push(2),
+        Float64 => buf.push(3),
+        Ptr => buf.push(4),
+    }
+}
+
+pub fn read_abi_type(r: &mut &[u8]) -> crate::ffi::Abi::AbiType {
+    use crate::ffi::Abi::AbiType::*;
+    match read_u8(r) {
+        0 => Void,
+        1 => Int { bits: read_u8(r), signed: read_u8(r) != 0 },
+        2 => Float32,
+        3 => Float64,
+        4 => Ptr,
+        other => panic!("invalid AbiType tag: {}", other),
+    }
 }
 
 // ==================== CRC32 ====================

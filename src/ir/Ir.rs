@@ -2631,6 +2631,17 @@ pub struct DataFlowGraph {
     pub select_info_offsets: Vec<u32>,
     pub trait_construct_info_offsets: Vec<u32>,
     pub record_extend_info_offsets: Vec<u32>,
+    /// Per-node inputs-pool offsets, materialized at load when the `.kzo` v2
+    /// Nodes section elides them (inputs pool contiguous in node-id order).
+    /// Build path / non-elided files: empty.
+    pub node_input_offsets: Vec<u32>,
+    /// Flat CSR downstream table, derived at load from inputs + gate condition
+    /// edges (the `.kzo` v2 format no longer serializes Downstreams).
+    /// `downstream_csr_offsets` has node_count+1 entries; slices of
+    /// `downstream_csr_flat` are returned by `downstream_slice` on loaded graphs.
+    /// Build path: empty (owned `downstreams` Vec is authoritative).
+    pub downstream_csr_offsets: Vec<u32>,
+    pub downstream_csr_flat: Vec<NodeId>,
 }
 
 impl DataFlowGraph {
@@ -2699,6 +2710,9 @@ impl DataFlowGraph {
             select_info_offsets: Vec::new(),
             trait_construct_info_offsets: Vec::new(),
             record_extend_info_offsets: Vec::new(),
+            node_input_offsets: Vec::new(),
+            downstream_csr_offsets: Vec::new(),
+            downstream_csr_flat: Vec::new(),
         }
     }
 
@@ -2937,9 +2951,14 @@ impl DataFlowGraph {
     /// `downstreams` list of each of its input nodes. Used for slot-level RC:
     /// on node produce, `refcount = downstreams[n].len()`.
     pub fn compute_downstreams(&mut self) {
-        // Clear first.
-        for ds in &mut self.downstreams {
-            ds.clear();
+        // (Re)allocate to match the node count, then clear (callers that run
+        // this on every iteration keep their buffers).
+        if self.downstreams.len() != self.nodes.len() {
+            self.downstreams = vec![Vec::new(); self.nodes.len()];
+        } else {
+            for ds in &mut self.downstreams {
+                ds.clear();
+            }
         }
         // Iterate over nodes and register downstream edges (input edges in inputs_pool).
         for nid in 0..self.nodes.len() {
@@ -2965,15 +2984,72 @@ impl DataFlowGraph {
         }
     }
 
-    /// Late compaction rebuild: rebuilds the graph from the `dead` set and
-    /// `redirect` map. Compacts `nodes`/`inputs_pool`, remaps all `NodeId`
-    /// references and per-NodeId metadata vectors. After rebuild, all `NodeId`
-    /// references are updated to the new contiguous numbering. Returns the
-    /// `old_to_new` map (so callers can sync `expr_node_map`, etc.).
+    /// Computes the flat CSR downstream table for LOADED graphs (`.kzo` v2 no
+    /// longer serializes Downstreams). Works through the mem-agnostic
+    /// accessors so both the mmap and owned backends derive identically.
+    /// Mirrors `compute_downstreams` + `rebuild` step 4: input edges plus the
+    /// Gate condition_input edge when it is not already a regular input.
+    /// Must run AFTER gate branches are materialized.
+    pub fn compute_downstream_csr(&mut self) {
+        let n = self.node_count();
+        // Pass 1: degree per producer.
+        let mut degrees = vec![0u32; n];
+        for nid in 0..n {
+            let node = self.node(nid);
+            let inputs = self.inputs(node.inputs_offset, node.input_count);
+            for &input in inputs {
+                degrees[input.0 as usize] += 1;
+            }
+            if let Some(gb) = self.gate_branches.get(nid).and_then(|g| g.as_ref()) {
+                if !inputs.contains(&gb.condition_input) {
+                    degrees[gb.condition_input.0 as usize] += 1;
+                }
+            }
+        }
+        // Prefix sums → offsets.
+        let mut offsets = Vec::with_capacity(n + 1);
+        let mut acc = 0u32;
+        offsets.push(0u32);
+        for &d in &degrees {
+            acc += d;
+            offsets.push(acc);
+        }
+        // Pass 2: scatter with a moving cursor per producer.
+        let mut flat: Vec<NodeId> = vec![NodeId(0); acc as usize];
+        let mut cursor = offsets.clone();
+        for nid in 0..n {
+            let node = self.node(nid);
+            let inputs = self.inputs(node.inputs_offset, node.input_count);
+            for &input in inputs {
+                let p = input.0 as usize;
+                flat[cursor[p] as usize] = NodeId(nid as u32);
+                cursor[p] += 1;
+            }
+            if let Some(gb) = self.gate_branches.get(nid).and_then(|g| g.as_ref()) {
+                if !inputs.contains(&gb.condition_input) {
+                    let p = gb.condition_input.0 as usize;
+                    flat[cursor[p] as usize] = NodeId(nid as u32);
+                    cursor[p] += 1;
+                }
+            }
+        }
+        self.downstream_csr_offsets = offsets;
+        self.downstream_csr_flat = flat;
+    }
+
+    /// Late compaction rebuild: rebuilds the graph from the `dead` set,
+    /// `redirect` map and `dead_sgs` set. Compacts `nodes`/`inputs_pool`,
+    /// remaps all `NodeId` references and per-NodeId metadata vectors, removes
+    /// dead/placeholder subgraphs and remaps every `SubGraphId` reference, then
+    /// recomputes `nested_ranges` from the final ranges. After rebuild, all
+    /// `NodeId`/`SubGraphId` references are updated to the new contiguous
+    /// numbering. Returns the `old_to_new` map (so callers can sync
+    /// `expr_node_map`, etc.).
     pub fn rebuild(
         &mut self,
         dead: &rustc_hash::FxHashSet<NodeId>,
         redirect: &rustc_hash::FxHashMap<NodeId, NodeId>,
+        dead_sgs: &rustc_hash::FxHashSet<SubGraphId>,
     ) -> Vec<Option<NodeId>> {
         // ── Recursively resolve redirects ──
         let resolve = |id: NodeId| -> NodeId {
@@ -3275,6 +3351,108 @@ impl DataFlowGraph {
         // nodes by function-level subgraph grouping, with hoisted nodes directly
         // following the native nodes, so the new node_range is naturally
         // contiguous (native live node new_id + hoisted live node new_id).
+        //
+        // 5-pre. Subgraph removal candidates: (a) subgraphs explicitly killed
+        // by function-level DCE (pass_func_dce marks the function sg plus all
+        // nested branch/loop/defer-body subgraphs); (b) empty-range subgraphs —
+        // never-compiled placeholders (analyzer-dead branches), or subgraphs
+        // fully emptied by earlier rounds (e.g. LoopUnroll).
+        //
+        // A candidate still referenced by a live structure is vetoed BEFORE
+        // step 5, so vetoed subgraphs go through normal range-recalc/remap
+        // (their anchors stay consistent instead of going stale). The veto is
+        // iterative: keeping a subgraph keeps its function/loop-parent/defer
+        // bodies alive too (cascade), so a kept subgraph never references a
+        // removed one and step 6's renumbering is always total.
+        let mut remove_sg: Vec<bool> = self
+            .subgraphs
+            .iter()
+            .map(|sg| dead_sgs.contains(&sg.id) || sg.node_range.0 == sg.node_range.1)
+            .collect();
+        if remove_sg.iter().any(|&r| r) {
+            let mut referenced: rustc_hash::FxHashSet<SubGraphId> = rustc_hash::FxHashSet::default();
+            if let Some(e) = self.entry_subgraph {
+                referenced.insert(e);
+            }
+            for sg in self.vtable_fallback_dispatch.values() {
+                referenced.insert(*sg);
+            }
+            // Live nodes' cross-sg references. NOTE: this runs AFTER step 3's
+            // metadata compaction, so these tables are already new-indexed and
+            // contain ONLY live nodes' entries (dead/redirect-key nodes' rows
+            // were dropped) — no liveness filtering needed here.
+            for ct in self.call_targets.iter().flatten() {
+                referenced.insert(*ct);
+            }
+            for ci in self.closure_infos.iter().flatten() {
+                referenced.insert(ci.subgraph_id);
+            }
+            for pi in self.partial_infos.iter().flatten() {
+                referenced.insert(pi.subgraph_id);
+            }
+            for li in self.lazy_construct_infos.iter().flatten() {
+                referenced.insert(li.thunk_sg);
+            }
+            for ti in self.trait_construct_infos.iter().flatten() {
+                for m in &ti.methods {
+                    referenced.insert(m.subgraph_id);
+                }
+            }
+            for gb in self.gate_branches.iter().flatten() {
+                for (_, bsg, _) in &gb.branches {
+                    referenced.insert(*bsg);
+                }
+            }
+            for si in self.select_infos.iter().flatten() {
+                for sb in &si.branches {
+                    referenced.insert(sb.subgraph_id);
+                }
+            }
+            // Kept (non-candidate) subgraphs' sg-internal links.
+            for (i, sg) in self.subgraphs.iter().enumerate() {
+                if remove_sg[i] {
+                    continue;
+                }
+                referenced.insert(SubGraphId(sg.function_id));
+                if let Some(p) = sg.loop_parent_sg {
+                    referenced.insert(p);
+                }
+                for e in &sg.defer_table {
+                    referenced.insert(e.body_subgraph);
+                }
+            }
+            // Iterative veto with cascade.
+            loop {
+                let mut changed = false;
+                for i in 0..self.subgraphs.len() {
+                    if !remove_sg[i] {
+                        continue;
+                    }
+                    let sg = &self.subgraphs[i];
+                    if referenced.contains(&sg.id) {
+                        remove_sg[i] = false;
+                        changed = true;
+                        referenced.insert(SubGraphId(sg.function_id));
+                        if let Some(p) = sg.loop_parent_sg {
+                            referenced.insert(p);
+                        }
+                        for e in &sg.defer_table {
+                            referenced.insert(e.body_subgraph);
+                        }
+                        if std::env::var("KUZO_DEBUG_REBUILD").is_ok() {
+                            eprintln!(
+                                "[REBUILD] sg={} removal vetoed: still referenced (fn={} kind={:?} range=[{},{})",
+                                sg.id.0, sg.function_id, sg.loop_kind,
+                                sg.node_range.0.0, sg.node_range.1.0
+                            );
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
         let dbg_rebuild = std::env::var("KUZO_DEBUG_REBUILD").is_ok();
         // Save old node_ranges for debugging.
         let old_ranges: Vec<(u32, u32)> = if dbg_rebuild {
@@ -3282,10 +3460,22 @@ impl DataFlowGraph {
         } else {
             Vec::new()
         };
-        for sg in self.subgraphs.iter_mut() {
+        for (sg_idx, sg) in self.subgraphs.iter_mut().enumerate() {
             let old_start = sg.node_range.0.0 as usize;
             let old_end = (sg.node_range.1.0 as usize).min(total);
             let sg_id = sg.id;
+
+            // Removed subgraphs: dropped in step 6 — nothing to remap (their
+            // anchor nodes are dead; remap_n would panic on them).
+            if remove_sg[sg_idx] {
+                continue;
+            }
+            // NOTE: kept subgraphs — including still-referenced EMPTY
+            // placeholders (analyzer-dead branches that live gates select at
+            // runtime) — go through the same anchor remapping as before:
+            // their entry/return point at live nodes of sibling regions, and
+            // the engine resolves the branch result through them.
+
             let mut new_start: Option<u32> = None;
             let mut new_end: u32 = 0;
 
@@ -3396,10 +3586,9 @@ impl DataFlowGraph {
             }
             // upvalue_outer_nodes: captured-variable outer nodes need remap.
             sg.upvalue_outer_nodes = sg.upvalue_outer_nodes.iter().map(|&n| remap_n(n)).collect();
-            // nested_ranges: subgraph node_range needs remap.
-            sg.nested_ranges = sg.nested_ranges.iter().map(|&(s, e)| {
-                (remap_n(NodeId(s)).0, remap_n(NodeId(e)).0)
-            }).collect();
+            // nested_ranges: NOT remapped here — remapping a child range that
+            // collapsed this round would panic on dead ids. Step 6 recomputes
+            // every kept subgraph's nested_ranges from the final ranges.
             // reset_plan: NodeIds inside ResetPlan need remap (synced with cond_node/iter_next_node).
             if let Some(ref mut plan) = sg.reset_plan {
                 plan.reset_to_zero = plan.reset_to_zero.iter().map(|&n| remap_n(n)).collect();
@@ -3412,6 +3601,107 @@ impl DataFlowGraph {
                 plan.condition_tree_plan = Vec::new();
             }
         }
+
+        // ── 6. Compact subgraphs: remove empty/dead subgraphs, remap SubGraphIds ──
+        // Removals were finalized (with reference-veto cascade) in 5-pre, so
+        // every kept SubGraphId reference maps to a kept subgraph.
+        {
+            let removed_count = remove_sg.iter().filter(|&&r| r).count();
+
+            if removed_count > 0 {
+                let mut sg_old_to_new: Vec<u32> = vec![u32::MAX; self.subgraphs.len()];
+                let mut new_sgs: Vec<SubGraph> = Vec::with_capacity(self.subgraphs.len() - removed_count);
+                for (i, sg) in std::mem::take(&mut self.subgraphs).into_iter().enumerate() {
+                    if remove_sg[i] {
+                        continue;
+                    }
+                    sg_old_to_new[i] = new_sgs.len() as u32;
+                    new_sgs.push(sg);
+                }
+                // Vetoed references guarantee map_sg never sees a removed id.
+                let map_sg = |id: SubGraphId| -> SubGraphId {
+                    SubGraphId(sg_old_to_new[id.0 as usize])
+                };
+                for sg in &mut new_sgs {
+                    sg.id = map_sg(sg.id);
+                    sg.function_id = map_sg(SubGraphId(sg.function_id)).0;
+                    sg.loop_parent_sg = sg.loop_parent_sg.map(map_sg);
+                    for e in &mut sg.defer_table {
+                        e.body_subgraph = map_sg(e.body_subgraph);
+                    }
+                }
+                self.subgraphs = new_sgs;
+                if let Some(e) = self.entry_subgraph {
+                    self.entry_subgraph = Some(map_sg(e));
+                }
+                for ct in self.call_targets.iter_mut() {
+                    *ct = ct.map(map_sg);
+                }
+                for ci in self.closure_infos.iter_mut().flatten() {
+                    ci.subgraph_id = map_sg(ci.subgraph_id);
+                }
+                for pi in self.partial_infos.iter_mut().flatten() {
+                    pi.subgraph_id = map_sg(pi.subgraph_id);
+                }
+                for li in self.lazy_construct_infos.iter_mut().flatten() {
+                    li.thunk_sg = map_sg(li.thunk_sg);
+                }
+                for ti in self.trait_construct_infos.iter_mut().flatten() {
+                    for m in &mut ti.methods {
+                        m.subgraph_id = map_sg(m.subgraph_id);
+                    }
+                }
+                for gb in self.gate_branches.iter_mut().flatten() {
+                    for (_, bsg, _) in &mut gb.branches {
+                        let mapped = map_sg(*bsg);
+                        // The 5-pre reference-veto guarantees no live gate
+                        // branch points at a removed subgraph.
+                        debug_assert!(mapped.0 != u32::MAX, "gate branch mapped to removed sg");
+                        *bsg = mapped;
+                    }
+                }
+                for si in self.select_infos.iter_mut().flatten() {
+                    for sb in &mut si.branches {
+                        sb.subgraph_id = map_sg(sb.subgraph_id);
+                    }
+                }
+                for owner in self.hoisted_owners.iter_mut() {
+                    // u32::MAX sentinel for non-hoisted nodes is preserved.
+                    if owner.0 != u32::MAX {
+                        *owner = map_sg(*owner);
+                    }
+                }
+                let mut new_vtable: rustc_hash::FxHashMap<(u16, Box<str>), SubGraphId> =
+                    rustc_hash::FxHashMap::default();
+                for (k, v) in std::mem::take(&mut self.vtable_fallback_dispatch) {
+                    new_vtable.insert(k, map_sg(v));
+                }
+                self.vtable_fallback_dispatch = new_vtable;
+
+                // F-7: per-sg-index derived data is invalidated by renumbering.
+                // EngineRef::new recomputes it after build/optimize/load.
+                // (Load-path CSR offset tables only exist on loaded graphs,
+                // which are never rebuilt.)
+                debug_assert!(self.sg_uv_offsets.is_empty() && self.sg_nr_offsets.is_empty());
+                self.sg_initial_pending = Vec::new();
+                self.sg_initial_seed = Vec::new();
+                self.linear_plans = Vec::new();
+
+                if dbg_rebuild {
+                    eprintln!(
+                        "[REBUILD] compacted subgraphs: removed {} ({} remain)",
+                        removed_count,
+                        self.subgraphs.len()
+                    );
+                }
+            }
+        }
+
+        // Recompute nested_ranges for every kept subgraph from the final
+        // ranges: the per-range remap above cannot express ranges that
+        // collapsed this round, and it accumulated zero-length residue across
+        // rounds (formerly tolerated by the Verifier).
+        self.compute_nested_ranges();
 
         // Verify: check for dangling references.
         if std::env::var("KUZO_VERIFY_GRAPH").is_ok() {
@@ -3464,13 +3754,15 @@ impl DataFlowGraph {
 
     /// Computes `nested_ranges` for all subgraphs: for each subgraph, collects
     /// the ranges of subgraphs directly nested within its `node_range`. Called
-    /// once at build time so runtime can query in O(len) instead of scanning
-    /// the whole graph.
+    /// at build time and after every optimizer `rebuild` so runtime can query
+    /// in O(len) instead of scanning the whole graph. Empty ranges (collapsed
+    /// or placeholder subgraphs) are never nested children — filtering them
+    /// keeps the table free of zero-length residue.
     pub fn compute_nested_ranges(&mut self) {
-        let subgraph_count = self.subgraphs.len();
-        // Pre-collect all subgraph ranges to avoid repeatedly borrowing
-        // self.subgraphs inside the loop.
+        // Pre-collect all non-empty subgraph ranges to avoid repeatedly
+        // borrowing self.subgraphs inside the loop.
         let ranges: Vec<(SubGraphId, u32, u32)> = self.subgraphs.iter()
+            .filter(|sg| sg.node_range.0 .0 < sg.node_range.1 .0)
             .map(|sg| (sg.id, sg.node_range.0 .0, sg.node_range.1 .0))
             .collect();
         for sg in &mut self.subgraphs {
@@ -3482,8 +3774,6 @@ impl DataFlowGraph {
                 .map(|(_, s, e)| (*s, *e))
                 .collect();
         }
-        // Avoid unused warning.
-        let _ = subgraph_count;
     }
 
     /// W5: flatten every loop subgraph's `reset_condition_tree` roots into the
