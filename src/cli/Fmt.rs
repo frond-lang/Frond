@@ -22,7 +22,7 @@ pub fn cmd_fmt(path: Option<String>, check: bool, stdin: bool) {
         return;
     }
 
-    // find_project_root() returns the project root *directory* (containing frond.toml),
+    // find_project_root() returns the project root *directory* (containing Root.toml),
     // so join "src" directly to get the default format target.
     let target = path.unwrap_or_else(|| {
         find_project_root()

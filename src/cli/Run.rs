@@ -1,4 +1,4 @@
-//! run subcommand — compile + execute (project) or execute .kzo artifact.
+//! run subcommand — compile + execute (project) or execute .fndo artifact.
 
 use std::process;
 
@@ -9,7 +9,7 @@ use super::Pipeline::run_from_project;
 
 /// `frond run` overloaded entry:
 /// - No args: compile + execute immediately within a project (like cargo run).
-/// - With args <file.kzo>: execute the specified artifact (.kzo load).
+/// - With args <file.fndo>: execute the specified artifact (.fndo load).
 pub fn cmd_run(file: Option<String>, opt_level_cli: Option<u8>) {
     match file {
         None => {
@@ -18,16 +18,16 @@ pub fn cmd_run(file: Option<String>, opt_level_cli: Option<u8>) {
             let opt_level = opt_level_from(opt_level_cli.or(Some(manifest.build.opt_level)));
             run_from_project(opt_level, false)
         }
-        Some(f) => run_from_kzo(&f),
+        Some(f) => run_from_fndo(&f),
     }
 }
 
-/// Execute a specified .kzo artifact: mmap load → rebuild runtime fields → Engine execution.
-fn run_from_kzo(path: &str) {
+/// Execute a specified .fndo artifact: mmap load → rebuild runtime fields → Engine execution.
+fn run_from_fndo(path: &str) {
     // Validate file extension
-    if !path.ends_with(".kzo") {
-        eprintln!("error: expected .kzo file, got: {}", path);
-        eprintln!("  hint: run `frond build` first to compile, then `frond run out/<name>.kzo`");
+    if !path.ends_with(".fndo") {
+        eprintln!("error: expected .fndo file, got: {}", path);
+        eprintln!("  hint: run `frond build` first to compile, then `frond run out/<name>.fndo`");
         process::exit(1);
     }
     if !std::path::Path::new(path).exists() {
@@ -37,7 +37,7 @@ fn run_from_kzo(path: &str) {
     let graph = match crate::solidify::Format::load_solidify_from_file(path) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("error: invalid .kzo file {}: {}", path, e);
+            eprintln!("error: invalid .fndo file {}: {}", path, e);
             process::exit(1);
         }
     };

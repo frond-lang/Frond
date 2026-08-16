@@ -17,7 +17,7 @@ pub enum Commands {
         /// Project name (created in ./name directory; defaults to the current directory when omitted).
         name: Option<String>,
     },
-    /// Compile only (within a project) → out/<project_name>.kzo.
+    /// Compile only (within a project) → out/<project_name>.fndo.
     Build {
         /// Output path (overrides manifest [build] output_dir + project name).
         #[arg(short = 'o', long = "output", value_name = "PATH")]
@@ -28,7 +28,7 @@ pub enum Commands {
     },
     /// Compile + execute immediately (within a project, no args); or execute a specified artifact (with args).
     Run {
-        /// .kzo artifact path (with args = execute the specified artifact, no project needed; without args = compile + execute within a project).
+        /// .fndo artifact path (with args = execute the specified artifact, no project needed; without args = compile + execute within a project).
         file: Option<String>,
         /// Optimization level 0-3 (default 2, only effective in no-arg mode).
         #[arg(short = 'O', long = "opt-level", value_name = "LEVEL")]
@@ -44,9 +44,9 @@ pub enum Commands {
         #[arg(long)]
         stage: Option<DebugStage>,
     },
-    /// View .kzo metadata.
+    /// View .fndo metadata.
     Inspect {
-        /// .kzo file path.
+        /// .fndo file path.
         file: String,
         /// Show details for each section (kind/offset/len).
         #[arg(short = 'v', long = "verbose")]

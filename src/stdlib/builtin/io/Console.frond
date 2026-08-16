@@ -1,0 +1,112 @@
+// builtin/io/Console.frond — standard IO top-level entry (builtin, visible by default)
+//
+// println/print/eprintln/eprint are synchronous functions returning Throw<void, IOError>.
+// scan/scanln are synchronous functions returning Throw<str?, IOError> (null = EOF).
+//
+// Formatting is delegated to builtin/reflect/Reflect.format (builtin default visible, no import needed).
+// The underlying @extern("C") primitives (__stdout_write_raw / __stderr_write_raw / __stdin_readln_into)
+// are declared in builtin/io/Raw.frond, compiled by the cc crate into the frond_extern static library.
+//
+// Usage (builtin default visible, no import needed):
+//   println("hello")           // hello
+//   println(Point(3, 4))       // Point(x: 3, y: 4)
+
+// ─── Frond wrapper: C raw return value → Throw ──────────────────────────
+
+// __stdout_write_raw(s: str): i32 → Throw<void, IOError>
+// rc < 0 = write failed
+fun __stdout_write(s: str): Throw<void, IOError> {
+    val rc = __stdout_write_raw(s)
+    if rc < 0 {
+        throw IOError(Other, "stdout write failed", 0, null)
+    }
+    Ok(void)
+}
+
+// __stderr_write_raw(s: str): i32 → Throw<void, IOError>
+fun __stderr_write(s: str): Throw<void, IOError> {
+    val rc = __stderr_write_raw(s)
+    if rc < 0 {
+        throw IOError(Other, "stderr write failed", 0, null)
+    }
+    Ok(void)
+}
+
+// __stdin_readln(): Throw<str?, IOError>
+// Reads into u8[] buffer via @extern("C") __stdin_readln_into, then casts to str.
+// Returns None = EOF, Some(s) = line with newline removed.
+fun __stdin_readln(): Throw<str?, IOError> {
+    val buf: u8[] = [0u8] * 4096
+    val n = __stdin_readln_into(buf)
+    if n < 0 {
+        throw IOError(Other, "stdin read failed", 0, null)
+    }
+    if n == 1 {
+        Ok(null)
+    } else {
+        Ok((buf[0..n as usize]) as str)
+    }
+}
+
+// ─── Standard output ──────────────────────────────────────────────────────
+
+pub fun print<T>(x: T): Throw<void, IOError> {
+    val s = x.format()
+    __stdout_write(s)?
+    Ok(void)
+}
+
+pub fun println<T>(x: T): Throw<void, IOError> {
+    val s = x.format()
+    __stdout_write(s)?
+    __stdout_write("\n")?
+    Ok(void)
+}
+
+// ─── Standard error ──────────────────────────────────────────────────────
+
+pub fun eprint<T>(x: T): Throw<void, IOError> {
+    val s = x.format()
+    __stderr_write(s)?
+    Ok(void)
+}
+
+pub fun eprintln<T>(x: T): Throw<void, IOError> {
+    val s = x.format()
+    __stderr_write(s)?
+    __stderr_write("\n")?
+    Ok(void)
+}
+
+// ─── Standard input ─────────────────────────────────────────────────────
+
+// scanln: reads one line (without newline), returns null on EOF
+pub fun scanln(): Throw<str?, IOError> {
+    __stdin_readln()?
+}
+
+// scan: reads a whitespace-separated token, returns null if no token (EOF or blank line)
+// Implemented by composing existing str primitives (len/index/slice), no new built-in methods added.
+pub fun scan(): Throw<str?, IOError> {
+    val line = __stdin_readln()?
+    val token: str? = match line {
+        null => null,
+        s => {
+            val n = s.len()
+            var i: usize = 0
+            while i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+                i = i + 1
+            }
+            if i == n {
+                null
+            } else {
+                var j: usize = i
+                while j < n && !(s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r') {
+                    j = j + 1
+                }
+                s[i..j]
+            }
+        },
+    }
+    Ok(token)
+}

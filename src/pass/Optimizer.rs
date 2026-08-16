@@ -751,7 +751,7 @@ pub fn pass_dce(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &Fx
 /// it because every subgraph's entry/return anchors are DCE roots.
 ///
 /// Soundness rests on the cross-function reference surface being enumerable
-/// (no runtime name resolution exists — `.kzo` carries no function-name table):
+/// (no runtime name resolution exists — `.fndo` carries no function-name table):
 /// - `call_targets` (static Call nodes)
 /// - `closure_infos` / `partial_infos` (function values & partial application)
 /// - `lazy_construct_infos` (lazy thunk bodies)

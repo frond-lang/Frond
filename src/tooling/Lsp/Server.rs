@@ -235,7 +235,7 @@ impl LspServer {
             if let Some(module_key) = uri_to_module_key(&uri) {
                 let arena = Bump::new();
                 let parse_result =
-                    Pipeline::parse_entry_module_lsp(&arena, &doc.text, "lsp_buffer.kz");
+                    Pipeline::parse_entry_module_lsp(&arena, &doc.text, "lsp_buffer.frond");
                 idx.update_module(&module_key, &parse_result.module);
             }
         }
@@ -272,7 +272,7 @@ impl LspServer {
 
         // Parse (LSP-safe, never exits)
         let arena = Bump::new();
-        let parse_result = Pipeline::parse_entry_module_lsp(&arena, &doc.text, "lsp_buffer.kz");
+        let parse_result = Pipeline::parse_entry_module_lsp(&arena, &doc.text, "lsp_buffer.frond");
         let mut all_diags = parse_result.diagnostics;
 
         // Extract decl signatures for API change detection
@@ -350,7 +350,7 @@ impl LspServer {
                 // Load all std modules (mirrors load_all_modules_or_exit without the exit).
                 for (key, _) in crate::module::STD_FILES {
                     let parts: Vec<&str> =
-                        key.strip_suffix(".kz").unwrap().split('/').collect();
+                        key.strip_suffix(".frond").unwrap().split('/').collect();
                     let _ = loader.resolve_and_load(&parts);
                 }
                 let (ta, sr, d) =
@@ -669,7 +669,7 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     }
 }
 
-/// Derive a module key (e.g. "src/Foo.kz" or "stdlib/io/File.kz") from a file URI.
+/// Derive a module key (e.g. "src/Foo.frond" or "stdlib/io/File.frond") from a file URI.
 /// Falls back to the basename if no recognizable source root is found.
 fn uri_to_module_key(uri: &str) -> Option<String> {
     let path = uri.strip_prefix("file://").unwrap_or(uri);
@@ -817,7 +817,7 @@ fn full_sema(
         })
         .collect();
 
-    match Pipeline::run_sema_pipeline_lsp(loader, &std_keys, &dep_keys, module, "lsp_buffer.kz") {
+    match Pipeline::run_sema_pipeline_lsp(loader, &std_keys, &dep_keys, module, "lsp_buffer.frond") {
         Pipeline::SemaOutcome::Ok {
             type_arena,
             sema_result,

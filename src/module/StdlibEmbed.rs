@@ -1,6 +1,6 @@
 //! Stdlib source embed table and lookups.
 //!
-//! Uses `include_str!` to embed `.kz` source files into the binary at compile time,
+//! Uses `include_str!` to embed `.frond` source files into the binary at compile time,
 //! for `Loader` to parse.
 //!
 //! ## Directory layout
@@ -8,7 +8,7 @@
 //! ```text
 //! src/stdlib/
 //! ├── builtin/          # builtin modules (visible by default, no import needed)
-//! │   ├── {io,net,time}/Raw.kz  # @extern("C") primitives (split by domain)
+//! │   ├── {io,net,time}/Raw.frond  # @extern("C") primitives (split by domain)
 //! │   ├── error/        # Err/Error/IOError/TimeError
 //! │   ├── reflect/      # runtime reflection formatting (Reflect.format)
 //! │   ├── io/           # Reader/Writer trait + Console(print/println/scan...)
@@ -27,42 +27,42 @@ pub type StdlibFile = (&'static str, &'static str);
 /// Ordered by dependency:
 ///   Raw(@extern primitives) → error → reflect → io(Reader/Writer/Console) → net → time → iter
 /// @extern("C") primitives load first: globally visible, available to builtin/std wrappers
-/// {io,net,time}/Raw.kz are loaded together at the primitive layer
+/// {io,net,time}/Raw.frond are loaded together at the primitive layer
 pub const BUILTIN_FILES: &[StdlibFile] = &[
-    // @extern("C") primitive modules (globally visible, split by domain into Raw.kz)
-    ("builtin/io/Raw.kz", include_str!("../stdlib/builtin/io/Raw.kz")),
-    ("builtin/net/Raw.kz", include_str!("../stdlib/builtin/net/Raw.kz")),
-    ("builtin/time/Raw.kz", include_str!("../stdlib/builtin/time/Raw.kz")),
+    // @extern("C") primitive modules (globally visible, split by domain into Raw.frond)
+    ("builtin/io/Raw.frond", include_str!("../stdlib/builtin/io/Raw.frond")),
+    ("builtin/net/Raw.frond", include_str!("../stdlib/builtin/net/Raw.frond")),
+    ("builtin/time/Raw.frond", include_str!("../stdlib/builtin/time/Raw.frond")),
     // error module
-    ("builtin/error/pack.kz", include_str!("../stdlib/builtin/error/pack.kz")),
-    ("builtin/error/Err.kz", include_str!("../stdlib/builtin/error/Err.kz")),
-    ("builtin/error/Error.kz", include_str!("../stdlib/builtin/error/Error.kz")),
-    ("builtin/error/IOError.kz", include_str!("../stdlib/builtin/error/IOError.kz")),
-    ("builtin/error/TimeError.kz", include_str!("../stdlib/builtin/error/TimeError.kz")),
-    ("builtin/error/OsError.kz", include_str!("../stdlib/builtin/error/OsError.kz")),
-    ("builtin/error/FfiError.kz", include_str!("../stdlib/builtin/error/FfiError.kz")),
-    // reflect module (runtime reflection, Raw.kz primitives + Reflect.kz wrapper)
-    ("builtin/reflect/pack.kz", include_str!("../stdlib/builtin/reflect/pack.kz")),
-    ("builtin/reflect/Raw.kz", include_str!("../stdlib/builtin/reflect/Raw.kz")),
-    ("builtin/reflect/Reflect.kz", include_str!("../stdlib/builtin/reflect/Reflect.kz")),
+    ("builtin/error/pack.frond", include_str!("../stdlib/builtin/error/pack.frond")),
+    ("builtin/error/Err.frond", include_str!("../stdlib/builtin/error/Err.frond")),
+    ("builtin/error/Error.frond", include_str!("../stdlib/builtin/error/Error.frond")),
+    ("builtin/error/IOError.frond", include_str!("../stdlib/builtin/error/IOError.frond")),
+    ("builtin/error/TimeError.frond", include_str!("../stdlib/builtin/error/TimeError.frond")),
+    ("builtin/error/OsError.frond", include_str!("../stdlib/builtin/error/OsError.frond")),
+    ("builtin/error/FfiError.frond", include_str!("../stdlib/builtin/error/FfiError.frond")),
+    // reflect module (runtime reflection, Raw.frond primitives + Reflect.frond wrapper)
+    ("builtin/reflect/pack.frond", include_str!("../stdlib/builtin/reflect/pack.frond")),
+    ("builtin/reflect/Raw.frond", include_str!("../stdlib/builtin/reflect/Raw.frond")),
+    ("builtin/reflect/Reflect.frond", include_str!("../stdlib/builtin/reflect/Reflect.frond")),
     // io module (Reader/Writer trait + Console standard IO)
-    ("builtin/io/pack.kz", include_str!("../stdlib/builtin/io/pack.kz")),
-    ("builtin/io/Reader.kz", include_str!("../stdlib/builtin/io/Reader.kz")),
-    ("builtin/io/Writer.kz", include_str!("../stdlib/builtin/io/Writer.kz")),
-    ("builtin/io/Console.kz", include_str!("../stdlib/builtin/io/Console.kz")),
+    ("builtin/io/pack.frond", include_str!("../stdlib/builtin/io/pack.frond")),
+    ("builtin/io/Reader.frond", include_str!("../stdlib/builtin/io/Reader.frond")),
+    ("builtin/io/Writer.frond", include_str!("../stdlib/builtin/io/Writer.frond")),
+    ("builtin/io/Console.frond", include_str!("../stdlib/builtin/io/Console.frond")),
     // net module (pack declaration; Raw already loaded at the primitive layer)
-    ("builtin/net/pack.kz", include_str!("../stdlib/builtin/net/pack.kz")),
+    ("builtin/net/pack.frond", include_str!("../stdlib/builtin/net/pack.frond")),
     // time module (pack declaration; Raw already loaded at the primitive layer)
-    ("builtin/time/pack.kz", include_str!("../stdlib/builtin/time/pack.kz")),
+    ("builtin/time/pack.frond", include_str!("../stdlib/builtin/time/pack.frond")),
     // str module (UTF-8 decoding primitives; depended on by the iter module)
-    ("builtin/str/pack.kz", include_str!("../stdlib/builtin/str/pack.kz")),
-    ("builtin/str/Raw.kz", include_str!("../stdlib/builtin/str/Raw.kz")),
+    ("builtin/str/pack.frond", include_str!("../stdlib/builtin/str/pack.frond")),
+    ("builtin/str/Raw.frond", include_str!("../stdlib/builtin/str/Raw.frond")),
     // iter module
-    ("builtin/iter/pack.kz", include_str!("../stdlib/builtin/iter/pack.kz")),
-    ("builtin/iter/Iterator.kz", include_str!("../stdlib/builtin/iter/Iterator.kz")),
+    ("builtin/iter/pack.frond", include_str!("../stdlib/builtin/iter/pack.frond")),
+    ("builtin/iter/Iterator.frond", include_str!("../stdlib/builtin/iter/Iterator.frond")),
     // os module (process-environment domain primitives)
-    ("builtin/os/pack.kz", include_str!("../stdlib/builtin/os/pack.kz")),
-    ("builtin/os/Raw.kz", include_str!("../stdlib/builtin/os/Raw.kz")),
+    ("builtin/os/pack.frond", include_str!("../stdlib/builtin/os/pack.frond")),
+    ("builtin/os/Raw.frond", include_str!("../stdlib/builtin/os/Raw.frond")),
 ];
 
 /// Standard library module file manifest (requires `import std.xxx` to load).
@@ -71,39 +71,39 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
 /// reflect has moved to builtin/reflect (visible by default); Console has moved to builtin/io (visible by default)
 pub const STD_FILES: &[StdlibFile] = &[
     // io module (Console has moved to builtin/io)
-    ("std/os/pack.kz", include_str!("../stdlib/std/os/pack.kz")),
-    ("std/os/Env.kz", include_str!("../stdlib/std/os/Env.kz")),
-    ("std/os/Tty.kz", include_str!("../stdlib/std/os/Tty.kz")),
-    ("std/os/Proc.kz", include_str!("../stdlib/std/os/Proc.kz")),
-    ("std/os/Info.kz", include_str!("../stdlib/std/os/Info.kz")),
-    ("std/os/Os.kz", include_str!("../stdlib/std/os/Os.kz")),
-    ("std/io/pack.kz", include_str!("../stdlib/std/io/pack.kz")),
-    ("std/io/Path.kz", include_str!("../stdlib/std/io/Path.kz")),
-    ("std/io/File.kz", include_str!("../stdlib/std/io/File.kz")),
-    ("std/io/Buffered.kz", include_str!("../stdlib/std/io/Buffered.kz")),
-    ("std/io/Dir.kz", include_str!("../stdlib/std/io/Dir.kz")),
-    ("std/io/Fs.kz", include_str!("../stdlib/std/io/Fs.kz")),
+    ("std/os/pack.frond", include_str!("../stdlib/std/os/pack.frond")),
+    ("std/os/Env.frond", include_str!("../stdlib/std/os/Env.frond")),
+    ("std/os/Tty.frond", include_str!("../stdlib/std/os/Tty.frond")),
+    ("std/os/Proc.frond", include_str!("../stdlib/std/os/Proc.frond")),
+    ("std/os/Info.frond", include_str!("../stdlib/std/os/Info.frond")),
+    ("std/os/Os.frond", include_str!("../stdlib/std/os/Os.frond")),
+    ("std/io/pack.frond", include_str!("../stdlib/std/io/pack.frond")),
+    ("std/io/Path.frond", include_str!("../stdlib/std/io/Path.frond")),
+    ("std/io/File.frond", include_str!("../stdlib/std/io/File.frond")),
+    ("std/io/Buffered.frond", include_str!("../stdlib/std/io/Buffered.frond")),
+    ("std/io/Dir.frond", include_str!("../stdlib/std/io/Dir.frond")),
+    ("std/io/Fs.frond", include_str!("../stdlib/std/io/Fs.frond")),
     // time module
-    ("std/time/pack.kz", include_str!("../stdlib/std/time/pack.kz")),
-    ("std/time/Duration.kz", include_str!("../stdlib/std/time/Duration.kz")),
-    ("std/time/Instant.kz", include_str!("../stdlib/std/time/Instant.kz")),
-    ("std/time/SystemTime.kz", include_str!("../stdlib/std/time/SystemTime.kz")),
-    ("std/time/DateTime.kz", include_str!("../stdlib/std/time/DateTime.kz")),
-    ("std/time/Calendar.kz", include_str!("../stdlib/std/time/Calendar.kz")),
-    ("std/time/Timer.kz", include_str!("../stdlib/std/time/Timer.kz")),
+    ("std/time/pack.frond", include_str!("../stdlib/std/time/pack.frond")),
+    ("std/time/Duration.frond", include_str!("../stdlib/std/time/Duration.frond")),
+    ("std/time/Instant.frond", include_str!("../stdlib/std/time/Instant.frond")),
+    ("std/time/SystemTime.frond", include_str!("../stdlib/std/time/SystemTime.frond")),
+    ("std/time/DateTime.frond", include_str!("../stdlib/std/time/DateTime.frond")),
+    ("std/time/Calendar.frond", include_str!("../stdlib/std/time/Calendar.frond")),
+    ("std/time/Timer.frond", include_str!("../stdlib/std/time/Timer.frond")),
     // net module (TcpStream before TcpListener: TcpListener depends on __net_tcp_close defined in TcpStream)
-    ("std/net/pack.kz", include_str!("../stdlib/std/net/pack.kz")),
-    ("std/net/Addr.kz", include_str!("../stdlib/std/net/Addr.kz")),
-    ("std/net/Dns.kz", include_str!("../stdlib/std/net/Dns.kz")),
-    ("std/net/TcpStream.kz", include_str!("../stdlib/std/net/TcpStream.kz")),
-    ("std/net/TcpListener.kz", include_str!("../stdlib/std/net/TcpListener.kz")),
-    ("std/net/UdpSocket.kz", include_str!("../stdlib/std/net/UdpSocket.kz")),
+    ("std/net/pack.frond", include_str!("../stdlib/std/net/pack.frond")),
+    ("std/net/Addr.frond", include_str!("../stdlib/std/net/Addr.frond")),
+    ("std/net/Dns.frond", include_str!("../stdlib/std/net/Dns.frond")),
+    ("std/net/TcpStream.frond", include_str!("../stdlib/std/net/TcpStream.frond")),
+    ("std/net/TcpListener.frond", include_str!("../stdlib/std/net/TcpListener.frond")),
+    ("std/net/UdpSocket.frond", include_str!("../stdlib/std/net/UdpSocket.frond")),
     // math module
-    ("std/math/pack.kz",  include_str!("../stdlib/std/math/pack.kz")),
-    ("std/math/Math.kz",  include_str!("../stdlib/std/math/Math.kz")),
-    ("std/math/Power.kz", include_str!("../stdlib/std/math/Power.kz")),
-    ("std/math/Trig.kz",  include_str!("../stdlib/std/math/Trig.kz")),
-    ("std/math/Round.kz", include_str!("../stdlib/std/math/Round.kz")),
+    ("std/math/pack.frond",  include_str!("../stdlib/std/math/pack.frond")),
+    ("std/math/Math.frond",  include_str!("../stdlib/std/math/Math.frond")),
+    ("std/math/Power.frond", include_str!("../stdlib/std/math/Power.frond")),
+    ("std/math/Trig.frond",  include_str!("../stdlib/std/math/Trig.frond")),
+    ("std/math/Round.frond", include_str!("../stdlib/std/math/Round.frond")),
 ];
 
 /// Looks up a stdlib file by path.

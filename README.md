@@ -4,7 +4,7 @@
 
 # Frond
 
-Frond is a statically typed programming language implemented in Rust, featuring a dataflow-ready scheduling execution model. Source files use the `.kz` extension; compiled artifacts are cross-platform `.kzo` binaries.
+Frond is a statically typed programming language implemented in Rust, featuring a dataflow-ready scheduling execution model. Source files use the `.frond` extension; compiled artifacts are cross-platform `.fndo` binaries.
 
 ## Build
 
@@ -26,15 +26,15 @@ frond run
 # Or compile only
 frond build
 # Execute the artifact
-frond run out/myapp.kzo
+frond run out/myapp.fndo
 ```
 
 Generated project layout:
 
 ```
 myapp/
-├── frond.toml      # Project manifest
-└── src/Main.kz    # Entry point
+├── Root.toml        # Project manifest
+└── src/Main.frond   # Entry point
 ```
 
 Default entry:
@@ -95,8 +95,8 @@ println("sum = {1 + 2}, point = {p}")
 | Command | Description |
 |---------|-------------|
 | `frond init [name]` | Scaffold a new project |
-| `frond build [-O N]` | Compile to `.kzo` (`-O 0..3`, default 2) |
+| `frond build [-O N]` | Compile to `.fndo` (`-O 0..3`, default 2) |
 | `frond run [-O N]` | Compile and run |
-| `frond run <file.kzo>` | Execute a compiled artifact |
+| `frond run <file.fndo>` | Execute a compiled artifact |
 | `frond debug --stage S` | Diagnostics (`tokens`/`ast`/`check`/`emit-c`/`emit-ffi`/`full`) |
-| `frond inspect <file.kzo>` | Inspect `.kzo` metadata |
+| `frond inspect <file.fndo>` | Inspect `.fndo` metadata |

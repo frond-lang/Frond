@@ -1,15 +1,15 @@
-//! inspect subcommand — view .kzo metadata.
+//! inspect subcommand — view .fndo metadata.
 
 use std::process;
 
 pub fn cmd_inspect(file: &str, verbose: bool) {
-    if !file.ends_with(".kzo") {
-        eprintln!("error: expected .kzo file, got: {}", file);
+    if !file.ends_with(".fndo") {
+        eprintln!("error: expected .fndo file, got: {}", file);
         process::exit(1);
     }
     match crate::solidify::Format::inspect_solidify_from_file(file) {
         Ok(info) => {
-            println!("KZO File: {}", file);
+            println!("FNDO File: {}", file);
             println!("  Schema:       v{}", info.schema_version);
             println!("  ABI:          v{}", info.abi_version);
             println!("  Nodes:        {}", info.node_count);
@@ -44,7 +44,7 @@ pub fn cmd_inspect(file: &str, verbose: bool) {
             }
         }
         Err(e) => {
-            eprintln!("error: invalid .kzo file: {}", e);
+            eprintln!("error: invalid .fndo file: {}", e);
             process::exit(1);
         }
     }

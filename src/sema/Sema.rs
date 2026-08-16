@@ -1908,12 +1908,12 @@ pub fn populate_module<'a>(
 
 /// Convert a module file path to a logical module path.
 ///
-/// `std/io/Path.kz` → `std.io.Path`
-/// `stdlib/std/io/Path.kz` → `std.io.Path` (strips the stdlib/ prefix)
-/// `builtin/error/Err.kz` → `builtin.error.Err`
-/// Returns `None` if there is no `.kz` suffix or the path is empty.
+/// `std/io/Path.frond` → `std.io.Path`
+/// `stdlib/std/io/Path.frond` → `std.io.Path` (strips the stdlib/ prefix)
+/// `builtin/error/Err.frond` → `builtin.error.Err`
+/// Returns `None` if there is no `.frond` suffix or the path is empty.
 pub fn module_logical_path(name: &str) -> Option<String> {
-    let path = name.strip_suffix(".kz")?;
+    let path = name.strip_suffix(".frond")?;
     // Strip the stdlib/ prefix if present.
     let path = path.strip_prefix("stdlib/").unwrap_or(path);
     if path.is_empty() {

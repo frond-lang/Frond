@@ -2,7 +2,7 @@
 //!
 //! Split into data-flow-responsibility modules:
 //! - `Args`: CLI argument definitions (Cli/Commands/DebugStage)
-//! - `Manifest`: project manifest (frond.toml) loading + path resolution
+//! - `Manifest`: project manifest (Root.toml) loading + path resolution
 //! - `Pipeline`: shared compile pipeline (compile_graph + read_source)
 //! - `Init`/`Debug`/`Build`/`Run`/`Inspect`/`Fmt`/`Lint`/`Lsp`: per-subcommand implementations
 

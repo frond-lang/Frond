@@ -1,4 +1,4 @@
-//! build subcommand — compile only → out/<project_name>.kzo.
+//! build subcommand — compile only → out/<project_name>.fndo.
 
 use std::fs;
 use std::process;
@@ -19,7 +19,7 @@ pub fn cmd_build(output: Option<String>, opt_level_cli: Option<u8>) {
 
     let graph = compile_graph(&entry, opt_level, false);
 
-    // Output path: -o takes priority; otherwise output_dir/<project_name>.kzo
+    // Output path: -o takes priority; otherwise output_dir/<project_name>.fndo
     let out_path = match output {
         Some(o) => o,
         None => {
@@ -33,13 +33,13 @@ pub fn cmd_build(output: Option<String>, opt_level_cli: Option<u8>) {
                 eprintln!("error: could not create output directory '{}': {}", dir, e);
                 process::exit(1);
             }
-            format!("{}/{}.kzo", dir, manifest.package.name)
+            format!("{}/{}.fndo", dir, manifest.package.name)
         }
     };
 
-    // Serialize to .kzo (stability net: an internal serialization panic
+    // Serialize to .fndo (stability net: an internal serialization panic
     // becomes a clean internal-error exit, not a process crash).
-    let kzo_data = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let fndo_data = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::solidify::Format::serialize_solidify(&graph)
     })) {
         Ok(data) => data,
@@ -51,12 +51,12 @@ pub fn cmd_build(output: Option<String>, opt_level_cli: Option<u8>) {
             process::exit(1);
         }
     };
-    if let Err(e) = fs::write(&out_path, &kzo_data) {
+    if let Err(e) = fs::write(&out_path, &fndo_data) {
         eprintln!("error: could not write '{}': {}", out_path, e);
         process::exit(1);
     }
 
-    let size_kb = kzo_data.len() as f64 / 1024.0;
+    let size_kb = fndo_data.len() as f64 / 1024.0;
     eprintln!("Compiled {} → {} ({:.1} KB, {} nodes, {} subgraphs, opt-level {})",
         manifest.package.entry, out_path, size_kb,
         graph.nodes.len(), graph.subgraphs.len(), opt_level as u8);

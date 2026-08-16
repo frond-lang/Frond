@@ -1,0 +1,10 @@
+// builtin error package declaration (decision #20: subdirectories need a pack.frond)
+//
+// Exposes Err / Error / IOError / TimeError to all Frond user code as visible by default (decision #19: fully visible by default).
+// builtin packages are not loaded via the normal import mechanism, but are registered directly into the global environment by sema at startup.
+pub pack Err
+pub pack Error
+pub pack IOError
+pub pack TimeError
+pub pack OsError
+pub pack FfiError

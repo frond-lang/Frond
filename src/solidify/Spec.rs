@@ -1,6 +1,6 @@
 //! Solidify binary format spec layer.
 //!
-//! Defines the constants, Header, Section, string pool, and CRC32 of the `.kzo`
+//! Defines the constants, Header, Section, string pool, and CRC32 of the `.fndo`
 //! file format, plus the mapping functions between IR enums and bytes.
 //!
 //! This module only describes "what the format is"; serialization/deserialization
@@ -15,8 +15,8 @@ use crate::ir::Ir::*;
 
 // ==================== Format constants ====================
 
-/// Magic number: `b"KZO\x00"` (Frond abbreviation).
-pub const SOLIDIFY_MAGIC: [u8; 4] = *b"KZO\x00";
+/// Magic number: `b"FNDO"` (matches the `.fndo` artifact extension).
+pub const SOLIDIFY_MAGIC: [u8; 4] = *b"FNDO";
 /// Format schema version.
 ///
 /// v4 (2026-08-16): Lib interop — new sections `LibRetKinds` (62, sparse u8:
@@ -48,13 +48,13 @@ pub const SOLIDIFY_ABI_VERSION: u16 = 1;
 /// Derived from the actual table length (`ir::Ir::COMPUTE_FN_TABLE_LEN`,
 /// asserted at table build) — was previously a hand-maintained `314` that had
 /// drifted 23 entries behind the real table, defeating the load-time check.
-/// `.kzo` files written by binaries with a different count are rejected;
+/// `.fndo` files written by binaries with a different count are rejected;
 /// rebuilding the source regenerates them.
 pub const COMPUTE_FN_COUNT: u32 = crate::ir::Ir::COMPUTE_FN_TABLE_LEN;
 
 // ==================== Header (64B) ====================
 
-/// `.kzo` file header: a fixed 64-byte, little-endian layout.
+/// `.fndo` file header: a fixed 64-byte, little-endian layout.
 ///
 /// Does not use `#[repr(C, packed)]`; instead fields are read/written manually as
 /// LE bytes to avoid unaligned access.
@@ -210,7 +210,7 @@ pub enum SectionKind {
     RecordExtendInfos = 55,
     BatchInfos = 56,
     /// stdlib `#{ }#` inline-FFI call info (v2: serialized — closes the v1 gap
-    /// where `frond run <file>.kzo` panicked with "no dyn_ffi_info").
+    /// where `frond run <file>.fndo` panicked with "no dyn_ffi_info").
     DynFfiInfos = 57,
     // Shared region
     StringPool = 60,
@@ -291,7 +291,7 @@ impl std::ops::Deref for GraphBacking {
     }
 }
 
-/// In-memory representation of a parsed `.kzo` file, owning the backing bytes.
+/// In-memory representation of a parsed `.fndo` file, owning the backing bytes.
 ///
 /// Supports two backing kinds:
 /// - `Owned(Vec<u8>)`: the `fs::read` path, used for tests or small files.
@@ -319,7 +319,7 @@ impl GraphMemory {
         let file = std::fs::File::open(path)?;
         // SAFETY: memmap2's `unsafe { Mmap::map(&file) }` maps the file into read-only memory.
         // Safety precondition: the file contents will not be modified by an external process
-        // (`.kzo` is a compiled artifact and immutable once distributed).
+        // (`.fndo` is a compiled artifact and immutable once distributed).
         // If the file is tampered with, the CRC check will reject the load.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         Self::from_backing(GraphBacking::Mapped(mmap))

@@ -378,7 +378,7 @@ impl<'a> InferContext<'a> {
                     let (mod_path, module_env) = self.arena.module_ref_parts(recv_resolved_0a);
                     let found = self.env.lookup_local(module_env, method);
                     // Directory-module semantics: when lookup_local misses in the current module env,
-                    // search sibling modules in the same directory (e.g. Math.sqrt where sqrt lives in Power.kz,
+                    // search sibling modules in the same directory (e.g. Math.sqrt where sqrt lives in Power.frond,
                     // with Math and Power both under the std.math directory).
                     let found = found.or_else(|| {
                         self.lookup_sibling_module_fn(mod_path, module_env, method)

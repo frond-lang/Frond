@@ -467,7 +467,7 @@ compute_fn_ids! {
 /// Number of entries in `build_compute_fn_table()`.
 ///
 /// Single source of truth for the solidify header's `compute_fn_count`
-/// compatibility check (`solidify::Spec::COMPUTE_FN_COUNT`): a `.kzo` written
+/// compatibility check (`solidify::Spec::COMPUTE_FN_COUNT`): a `.fndo` written
 /// by a binary with a different table length is rejected at load instead of
 /// silently mis-dispatching node compute fns. `build_compute_fn_table()`
 /// asserts equality so this constant cannot drift silently.
@@ -2650,7 +2650,7 @@ pub struct DataFlowGraph {
     /// Debug-only sg → qualified function name (e.g. "std.io.File.remove"),
     /// parallel to `subgraphs`. Filled by the builder from its registration
     /// table, remapped by `rebuild`'s sg compaction, NEVER serialized (the
-    /// .kzo artifact carries no name table — loads leave this empty).
+    /// .fndo artifact carries no name table — loads leave this empty).
     /// Consumed by the execution-coverage instrumentation
     /// (`FROND_EXEC_COVERAGE=1`): the "never-executed std path" detector.
     pub sg_debug_names: Vec<Option<Box<str>>>,
@@ -2660,7 +2660,7 @@ pub struct DataFlowGraph {
     /// concrete type without boxing into a TraitVal.
     pub vtable_fallback_dispatch: rustc_hash::FxHashMap<(u16, Box<str>), SubGraphId>,
     /// String pool: ConstValue::Str { offset, len } references this pool.
-    /// Maintained by IrBuilder as intern during build; filled from the .kzo StringPool section during load.
+    /// Maintained by IrBuilder as intern during build; filled from the .fndo StringPool section during load.
     pub string_pool: Arc<[u8]>,
     /// GraphMemory (load path): binary backing of mmap or owned bytes.
     /// Build path is None (directly accesses owned Vec fields);
@@ -2680,12 +2680,12 @@ pub struct DataFlowGraph {
     pub select_info_offsets: Vec<u32>,
     pub trait_construct_info_offsets: Vec<u32>,
     pub record_extend_info_offsets: Vec<u32>,
-    /// Per-node inputs-pool offsets, materialized at load when the `.kzo` v2
+    /// Per-node inputs-pool offsets, materialized at load when the `.fndo` v2
     /// Nodes section elides them (inputs pool contiguous in node-id order).
     /// Build path / non-elided files: empty.
     pub node_input_offsets: Vec<u32>,
     /// Flat CSR downstream table, derived at load from inputs + gate condition
-    /// edges (the `.kzo` v2 format no longer serializes Downstreams).
+    /// edges (the `.fndo` v2 format no longer serializes Downstreams).
     /// `downstream_csr_offsets` has node_count+1 entries; slices of
     /// `downstream_csr_flat` are returned by `downstream_slice` on loaded graphs.
     /// Build path: empty (owned `downstreams` Vec is authoritative).
@@ -3117,7 +3117,7 @@ impl DataFlowGraph {
         }
     }
 
-    /// Computes the flat CSR downstream table for LOADED graphs (`.kzo` v2 no
+    /// Computes the flat CSR downstream table for LOADED graphs (`.fndo` v2 no
     /// longer serializes Downstreams). Works through the mem-agnostic
     /// accessors so both the mmap and owned backends derive identically.
     /// Mirrors `compute_downstreams` + `rebuild` step 4: input edges plus the
@@ -4096,7 +4096,7 @@ impl DataFlowGraph {
 
 /// Computes `nested_ranges` for all subgraphs: for each subgraph, the ranges
 /// of subgraphs DIRECTLY nested within its `node_range`. Called at build
-/// time, after every optimizer `rebuild`, and at `.kzo` load (v3: the section
+/// time, after every optimizer `rebuild`, and at `.fndo` load (v3: the section
 /// is no longer serialized — this is the derived source of truth). Empty
 /// ranges (collapsed or placeholder subgraphs) are never children.
 ///

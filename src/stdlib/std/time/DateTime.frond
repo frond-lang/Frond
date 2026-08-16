@@ -1,0 +1,170 @@
+// DateTime.frond — calendar representation + formatting (pure Frond)
+//
+// Design doc §5.7: DateTime newtype + arithmetic + strftime-like formatting
+// All calendar operations (add_days etc.) are delegated to pure functions of the Calendar module
+// Formatting helpers like pad_int / digit_char are all implemented in Frond — decision S11 (no __format_int primitive introduced)
+
+pub type DateTime = DateTime(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8, nanos: u32, weekday: u8, day_of_year: u16) {
+    // ─── Conversion to/from TimeComponents ────────────────────────────────────────
+
+    pub fun to_components(): TimeComponents {
+        TimeComponents(year, month, day, hour, minute, second, nanos, weekday, day_of_year)
+    }
+
+    // ─── Date arithmetic ─────────────────────────────────────────────
+
+    // Adds days (delegates to Calendar.add_days, recomputes weekday and day_of_year)
+    pub fun add_days(days: i64): DateTime {
+        val new_ymd = Calendar.add_days(year, month, day, days)
+        DateTime(new_ymd.year, new_ymd.month, new_ymd.day, hour, minute, second, nanos, Calendar.weekday_of(new_ymd.year, new_ymd.month, new_ymd.day), Calendar.day_of_year(new_ymd.year, new_ymd.month, new_ymd.day))
+    }
+
+    // Adds a Duration (round-trip conversion via UTC components, pure Frond algorithm)
+    // Calls pure Frond conversion functions of SystemTime (replacing the original __components_to_ns_utc / __systemtime_to_utc_components syscalls)
+    pub fun add_duration(d: Duration): Throw<DateTime, TimeError> {
+        val comp = to_components()
+        val ns = std.time.SystemTime.components_to_ns_utc(comp)?
+        val new_ns = ns + d.as_nanos()
+        val new_comp = std.time.SystemTime.to_utc_components(new_ns)
+        Ok(std.time.DateTime.from_components(new_comp))
+    }
+
+    // ─── strftime-like formatting ─────────────────────────────────────────
+
+    // Supported placeholders: %Y %m %d %H %M %S %y %j %A %a %B %b %e %%
+    // Uses an array to collect pieces + __str_array_join for a single O(n) concatenation, avoiding the O(n²) of loop result = result + piece
+    pub fun format(pattern: str): str {
+        var pieces: str[] = []
+        var i: usize = 0
+        while i < pattern.len() {
+            val c = pattern[i]
+            if c == '%' {
+                i = i + 1
+                if i >= pattern.len() {
+                    pieces = pieces ++ ["%"]
+                    break
+                }
+                val spec = pattern[i]
+                val piece = match spec {
+                    'Y' => pad_int(year as i64, 4),
+                    'm' => pad_int(month as i64, 2),
+                    'd' => pad_int(day as i64, 2),
+                    'H' => pad_int(hour as i64, 2),
+                    'M' => pad_int(minute as i64, 2),
+                    'S' => pad_int(second as i64, 2),
+                    'y' => pad_int((year % 100) as i64, 2),
+                    'j' => pad_int(day_of_year as i64, 3),
+                    'A' => weekday_name(weekday),
+                    'a' => weekday_abbr(weekday),
+                    'B' => month_name(month),
+                    'b' => month_abbr(month),
+                    'e' => if day < 10 {
+                        " " + pad_int(day as i64, 1)
+                    } else {
+                        pad_int(day as i64, 2)
+                    },
+                    '%' => "%",
+                    _ => "%" + spec as str,
+                }
+                pieces = pieces ++ [piece]
+            } else {
+                pieces = pieces ++ [c as str]
+            }
+            i = i + 1
+        }
+        __str_array_join(pieces, "")
+    }
+
+    // ─── ISO 8601 ─────────────────────────────────────────────────────
+
+    pub fun to_iso8601(): str {
+        pad_int(year as i64, 4) + "-" +
+        pad_int(month as i64, 2) + "-" +
+        pad_int(day as i64, 2) + "T" +
+        pad_int(hour as i64, 2) + ":" +
+        pad_int(minute as i64, 2) + ":" +
+        pad_int(second as i64, 2)
+    }
+}
+
+// ─── Top-level free functions (no this) ─────────────────────────────────────────
+
+pub fun from_components(comp: TimeComponents): DateTime {
+    DateTime(comp.year, comp.month, comp.day, comp.hour, comp.minute, comp.second, comp.nanos, comp.weekday, comp.day_of_year)
+}
+
+// ─── Formatting helpers ───────────────────────────────────────────────────
+
+// Integer to string + zero padding (pure Frond implementation, decision S11)
+pub fun pad_int(value: i64, width: usize): str {
+    val sign: str = if value < 0 { "-" } else { "" }
+    var abs_val = if value < 0 { -value } else { value }
+    var digits: str = ""
+    if abs_val == 0 {
+        digits = "0"
+    } else {
+        while abs_val > 0 {
+            digits = digit_char(abs_val % 10) + digits
+            abs_val = abs_val / 10
+        }
+    }
+    var total_len = digits.len()
+    var leading = ""
+    while total_len < width {
+        leading = leading + "0"
+        total_len = total_len + 1
+    }
+    sign + leading + digits
+}
+
+pub fun digit_char(d: i64): str {
+    match d {
+        0 => "0", 1 => "1", 2 => "2", 3 => "3", 4 => "4",
+        5 => "5", 6 => "6", 7 => "7", 8 => "8", 9 => "9",
+        _ => "?",
+    }
+}
+
+pub fun month_name(m: u8): str {
+    match m {
+        1 => "January",   2 => "February", 3 => "March",    4 => "April",
+        5 => "May",       6 => "June",     7 => "July",     8 => "August",
+        9 => "September", 10 => "October",  11 => "November", 12 => "December",
+        _ => "Unknown",
+    }
+}
+
+pub fun month_abbr(m: u8): str {
+    match m {
+        1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
+        5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
+        9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
+        _ => "???",
+    }
+}
+
+pub fun weekday_name(w: u8): str {
+    match w {
+        0 => "Sunday", 1 => "Monday", 2 => "Tuesday", 3 => "Wednesday",
+        4 => "Thursday", 5 => "Friday", 6 => "Saturday",
+        _ => "Unknown",
+    }
+}
+
+pub fun weekday_abbr(w: u8): str {
+    match w {
+        0 => "Sun", 1 => "Mon", 2 => "Tue", 3 => "Wed",
+        4 => "Thu", 5 => "Fri", 6 => "Sat",
+        _ => "???",
+    }
+}
+
+// parse implementation: parse an ISO 8601 string into a DateTime
+// Known blocker: the Frond engine has a bug where variable bindings are misaligned after
+// calling other functions within a function
+// (parse_digits_at returns the correct value when called directly outside parse, but when
+//   called inside parse, the year/month field values are misaligned when constructing the
+//   final Ok(DateTime(...)))
+// To be completed after the engine is fixed, refer to the verified logic below:
+// pub fun parse_digits_at(s: str, pos: usize, count: usize): i64 { ... }
+// pub fun parse(s: str): Throw<DateTime, TimeError> { ... }

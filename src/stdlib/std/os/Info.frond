@@ -1,0 +1,38 @@
+// Info.frond — host identification
+//
+// Sync API. All values are derived from compile-time platform macros or
+// cheap host calls, so they are safe to call anywhere.
+
+// Host operating system name: "windows" / "macos" / "linux" / "unknown".
+pub fun os_name(): str {
+    val buf: u8[] = [0u8, ..32]
+    val n = __os_platform_into(buf)
+    if n <= 0 { return "unknown" }
+    (buf[0..n as usize]) as str
+}
+
+// Host CPU architecture: "x86_64" / "aarch64" / "x86" / "arm" / "unknown".
+pub fun arch(): str {
+    val buf: u8[] = [0u8, ..32]
+    val n = __os_arch_into(buf)
+    if n <= 0 { return "unknown" }
+    (buf[0..n as usize]) as str
+}
+
+// Host machine name (computer name). Empty string on failure.
+pub fun hostname(): str {
+    val buf: u8[] = [0u8, ..256]
+    val n = __os_hostname_into(buf)
+    if n <= 0 { return "" }
+    (buf[0..n as usize]) as str
+}
+
+// Native path-component separator: "\\" on Windows, "/" elsewhere.
+pub fun path_sep(): str {
+    if os_name() == "windows" { "\\" } else { "/" }
+}
+
+// Native line separator: "\r\n" on Windows, "\n" elsewhere.
+pub fun line_sep(): str {
+    if os_name() == "windows" { "\r\n" } else { "\n" }
+}

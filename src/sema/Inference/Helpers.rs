@@ -231,7 +231,7 @@ impl<'a> InferContext<'a> {
     }
 
     /// The `FfiError` type as seen from the Lib builtin methods. Declared in
-    /// `builtin/error/FfiError.kz`; resolved by name here (Adt unify is
+    /// `builtin/error/FfiError.frond`; resolved by name here (Adt unify is
     /// name-based, so this handle interops with the declared one).
     pub(super) fn ffi_error_ty(&mut self) -> TypeHandle {
         self.arena.make_adt("FfiError".into(), Box::new([]))
@@ -343,7 +343,7 @@ pub(super) fn check_int_literal_range(raw: &str, tag: crate::types::ValueTag) ->
 /// Derived from `Type::BUILTIN_TABLE`: look up ValueTag by name, then dispatch to Type by ValueTag.
 /// The name → ValueTag mapping comes from a single source of truth.
 ///
-/// Type names are uniformly lower-case (consistent with .kz source syntax): null/void/bool/char/str
+/// Type names are uniformly lower-case (consistent with .frond source syntax): null/void/bool/char/str
 /// and the numeric types.
 pub(super) fn name_to_concrete(name: &str) -> Option<Type> {
     use crate::types::{builtin_info_by_name, ValueTag};

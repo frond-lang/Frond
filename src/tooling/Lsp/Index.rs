@@ -19,7 +19,7 @@ pub struct WorkspaceIndex {
 }
 
 impl WorkspaceIndex {
-    /// Build index by scanning .kz files under root.
+    /// Build index by scanning .frond files under root.
     pub fn build(root: &Path) -> Self {
         let mut idx = Self::default();
         idx.scan_directory(root);

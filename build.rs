@@ -2,18 +2,18 @@
 //!
 //! ## Design
 //!
-//! This script extracts `@extern("C")` functions from `builtin/*/Raw.kz` files
+//! This script extracts `@extern("C")` functions from `builtin/*/Raw.frond` files
 //! via **direct text parsing** — no frond binary dependency. This solves the
 //! bootstrap problem ("chicken-and-egg"): previously build.rs needed the frond
 //! binary to emit C code, but the binary didn't exist on first build.
 //!
-//! The text extraction logic parses the fixed `.kz` syntax (`@extern("C")` +
+//! The text extraction logic parses the fixed `.frond` syntax (`@extern("C")` +
 //! `fun sig #{ body }#`), and shares the type-mapping + code-generation code
 //! with the AST path via `include!("src/ffi/Gen.rs")`.
 //!
 //! ## Workflow
 //!
-//! 1. Scan `.kz` files listed in `EXTERN_FROND_FILES` (containing `@extern("C")` declarations).
+//! 1. Scan `.frond` files listed in `EXTERN_FROND_FILES` (containing `@extern("C")` declarations).
 //! 2. Text-extract each into `ExternCFunc` records (shared struct from `Gen.rs`).
 //! 3. Generate `.c` source for each file via `gen::generate_c_source`.
 //! 4. Compile all `.c` files into the `frond_extern` static library using the `cc` crate.
@@ -39,18 +39,18 @@ mod gen {
 
 use gen::{is_i128_return, is_str_return, type_to_c_params, type_to_c_return, ExternCFunc};
 
-/// List of `.kz` files containing `@extern("C")` declarations.
+/// List of `.frond` files containing `@extern("C")` declarations.
 ///
-/// `reflect/Raw.kz` is not in this list: its primitives are implemented on the Rust side as
-/// `#[no_mangle] extern "C" fn`, so emit-c is not needed. The Raw.kz file itself
+/// `reflect/Raw.frond` is not in this list: its primitives are implemented on the Rust side as
+/// `#[no_mangle] extern "C" fn`, so emit-c is not needed. The Raw.frond file itself
 /// is loaded directly by Sema (builtin) for type checking.
 const EXTERN_FROND_FILES: &[&str] = &[
-    "src/stdlib/builtin/io/Raw.kz",
-    "src/stdlib/builtin/net/Raw.kz",
-    "src/stdlib/builtin/time/Raw.kz",
-    "src/stdlib/builtin/cast/Raw.kz",
-    "src/stdlib/builtin/str/Raw.kz",
-    "src/stdlib/builtin/os/Raw.kz",
+    "src/stdlib/builtin/io/Raw.frond",
+    "src/stdlib/builtin/net/Raw.frond",
+    "src/stdlib/builtin/time/Raw.frond",
+    "src/stdlib/builtin/cast/Raw.frond",
+    "src/stdlib/builtin/str/Raw.frond",
+    "src/stdlib/builtin/os/Raw.frond",
 ];
 
 fn main() {
@@ -58,7 +58,7 @@ fn main() {
 
     let out_dir = env::var("OUT_DIR").unwrap();
 
-    // Collect existing .kz files
+    // Collect existing .frond files
     let frond_files: Vec<PathBuf> = EXTERN_FROND_FILES
         .iter()
         .map(PathBuf::from)
@@ -69,7 +69,7 @@ fn main() {
         return;
     }
 
-    // 1. Text-extract each .kz → ExternCFunc list, then generate .c into OUT_DIR
+    // 1. Text-extract each .frond → ExternCFunc list, then generate .c into OUT_DIR
     let mut c_files: Vec<PathBuf> = Vec::new();
 
     for frond_file in &frond_files {
@@ -183,8 +183,8 @@ fn frond_file_to_c_name(frond_file: &Path) -> String {
 
 // ============ Text extraction ============
 //
-// Parses .kz source text and extracts @extern("C") function declarations.
-// The .kz syntax for extern C is a fixed text pattern:
+// Parses .frond source text and extracts @extern("C") function declarations.
+// The .frond syntax for extern C is a fixed text pattern:
 //
 //   @c_include("header.h")      ← optional, zero or more
 //   @extern("C")
@@ -197,7 +197,7 @@ fn frond_file_to_c_name(frond_file: &Path) -> String {
 // use. Unknown types produce a warning and the function is skipped (same
 // behavior as the AST path in ExternC.rs).
 
-/// Parse a .kz source string and extract all @extern("C") functions.
+/// Parse a .frond source string and extract all @extern("C") functions.
 fn parse_kz_extern_c(source: &str) -> Result<Vec<ExternCFunc>, String> {
     let mut funcs = Vec::new();
 
@@ -235,7 +235,7 @@ fn parse_kz_extern_c(source: &str) -> Result<Vec<ExternCFunc>, String> {
         // Detect `fun` keyword — process if we have a pending @extern("C")
         if pending_extern_c && line.starts_with("fun ") {
             // Find the full function signature. It may span multiple lines but
-            // in practice all Raw.kz files keep it on one line. We search for
+            // in practice all Raw.frond files keep it on one line. We search for
             // `#{` to find the body start.
             //
             // Strategy: accumulate text from the `fun` line until we find `#{`,

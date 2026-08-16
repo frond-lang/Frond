@@ -262,8 +262,8 @@ pub fn run_from_project(opt_level: crate::pass::Optimizer::OptLevel, debug: bool
     let graph = compile_graph(&entry_path, opt_level, debug);
     // NOTE: zerocopy serialize/deserialize path temporarily disabled for debugging.
     // The zerocopy round-trip may lose call_target or node_range data.
-    // let kzo_data = crate::solidify::Format::serialize_solidify(&graph);
-    // let graph = match crate::solidify::Format::load_zerocopy_from_bytes(kzo_data) {
+    // let fndo_data = crate::solidify::Format::serialize_solidify(&graph);
+    // let graph = match crate::solidify::Format::load_zerocopy_from_bytes(fndo_data) {
     //     Ok(g) => g,
     //     Err(e) => {
     //         eprintln!("error: failed to load serialized graph: {}", e);

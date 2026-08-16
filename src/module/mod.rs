@@ -18,7 +18,7 @@
 //! ## Module path conventions
 //!
 //! `import std.io.File` → module_path = ["std", "io", "File"]
-//! → resolves to the file path "std/io/File.kz"
+//! → resolves to the file path "std/io/File.frond"
 //! → first checks the stdlib embed table, then the filesystem search paths
 //!
 //! ## File organization

@@ -219,7 +219,7 @@ pub(super) const BUILTIN_CTORS: &[(&str, BuiltinCtorLower)] = &[
 /// reflect top-level function → standalone compute_fn mapping.
 ///
 /// `format(x)` / `type_name(x)` are the two reflect entry points called from
-/// generic contexts (e.g. Console.kz `print<T>`). Lowering them directly to
+/// generic contexts (e.g. Console.frond `print<T>`). Lowering them directly to
 /// `CF_REFLECT_*` keeps the hot path off the FFI dispatch table.
 /// The remaining reflect primitives are only reachable as trait-style method
 /// calls (`x.kind()`, `x.field_count()`, ...) and are dispatched via
@@ -1159,7 +1159,7 @@ impl<'a> IrBuilder<'a> {
     ///      shape. An EXPLICIT qualifier outranks ambient package visibility:
     ///      `Instant.now()` inside std.time must bind Instant.now, not the
     ///      package key `std.time::now` (contested by SystemTime.now — the
-    ///      silent wrong-callee the tripwire exposed in Timer.kz);
+    ///      silent wrong-callee the tripwire exposed in Timer.frond);
     ///   4. package-scoped key `<cur_pkg>::<name>` (stdlib sibling files
     ///      calling each other bare within one package directory);
     ///   5. bare name — builtin (globally visible by design) and user/dep
@@ -1435,7 +1435,7 @@ impl<'a> IrBuilder<'a> {
                         }
                         // Package-scoped key (`std.math::fn`): stdlib modules commonly call
                         // siblings in the same package directory bare (`ldexp_f64_impl`
-                        // defined in Round.kz, called from Power.kz). This is package
+                        // defined in Round.frond, called from Power.frond). This is package
                         // visibility, not a global bare name — first registrant wins inside
                         // the package; two same-named functions in ONE package are a real
                         // ambiguity and get the same tripwire treatment.
