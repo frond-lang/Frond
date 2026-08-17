@@ -192,3 +192,641 @@ fun __os_system(cmd: str): i32 #{
         return -1;
     #endif
 }#
+
+
+// ─── Program arguments (engine-registered argv; see engine mod.rs ProgramArgs) ───
+
+// Argument count visible to the program (0 when the cli passed no `--` arguments).
+// Reads the Rust-side runtime slot via direct symbol reference (same binary).
+@internal
+@extern("C")
+fun __os_arg_count(): i32 #{
+    extern int frond_runtime_argc(void);
+    return frond_runtime_argc();
+}#
+
+// UTF-8 bytes of argument i copied into buf. -1 = out of range, -2 = buffer too small.
+@internal
+@extern("C")
+fun __os_arg_get_into(i: i32, buf: u8[]): i64 #{
+    extern int frond_runtime_argc(void);
+    extern const unsigned char* frond_runtime_arg_ptr(int i);
+    extern size_t frond_runtime_arg_len(int i);
+    if (i < 0 || i >= frond_runtime_argc()) return -1;
+    size_t n = frond_runtime_arg_len(i);
+    if (n >= buf_len) return -2;
+    const unsigned char* p = frond_runtime_arg_ptr(i);
+    if (n > 0 && p) memcpy(buf_data, p, n);
+    return (int64_t)n;
+}#
+
+// ─── Environment enumeration ───
+
+// Number of "KEY=VALUE" environment entries.
+@internal
+@extern("C")
+fun __os_env_vars_count(): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        LPCH block = GetEnvironmentStringsA();
+        if (!block) return 0;
+        int64_t count = 0;
+        for (LPCH p = block; *p; p += strlen(p) + 1) {
+            if (*p != '=') count++;  // skip Windows' leading-'=' pseudo entries
+        }
+        FreeEnvironmentStringsA(block);
+        return count;
+    #else
+        extern char** environ;
+        int64_t count = 0;
+        for (char** e = environ; *e; e++) count++;
+        return count;
+    #endif
+}#
+
+// The i-th "KEY=VALUE" entry copied into buf. -1 = out of range, -2 = buffer too small.
+@internal
+@extern("C")
+fun __os_env_var_get_into(i: i64, buf: u8[]): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        LPCH block = GetEnvironmentStringsA();
+        if (!block) return -1;
+        int64_t idx = 0;
+        for (LPCH p = block; *p; p += strlen(p) + 1) {
+            if (*p == '=') continue;
+            if (idx == (int64_t)i) {
+                size_t n = strlen(p);
+                FreeEnvironmentStringsA(block);
+                if (n >= buf_len) return -2;
+                memcpy(buf_data, p, n);
+                return (int64_t)n;
+            }
+            idx++;
+        }
+        FreeEnvironmentStringsA(block);
+        return -1;
+    #else
+        extern char** environ;
+        int64_t idx = 0;
+        for (char** e = environ; *e; e++) {
+            if (idx == (int64_t)i) {
+                size_t n = strlen(*e);
+                if (n >= buf_len) return -2;
+                memcpy(buf_data, *e, n);
+                return (int64_t)n;
+            }
+            idx++;
+        }
+        return -1;
+    #endif
+}#
+
+// ─── Common directories / user identification ───
+
+// Temporary directory. Windows GetTempPathA; POSIX TMPDIR with "/tmp" fallback.
+@internal
+@extern("C")
+fun __os_tmp_dir_into(buf: u8[]): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        DWORD n = GetTempPathA((DWORD)buf_len, (LPSTR)buf_data);
+        if (n == 0 || n >= buf_len) return -2;
+        while (n > 1 && ((char*)buf_data)[n-1] == '\\') n--;  // strip trailing separator
+        return (int64_t)n;
+    #else
+        const char* s = getenv("TMPDIR");
+        if (!s || !*s) s = "/tmp";
+        size_t n = strlen(s);
+        if (n >= buf_len) return -2;
+        memcpy(buf_data, s, n);
+        return (int64_t)n;
+    #endif
+}#
+
+// User home directory (USERPROFILE on Windows, HOME elsewhere). -1 = not set.
+@internal
+@extern("C")
+fun __os_home_dir_into(buf: u8[]): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        const char* s = getenv("USERPROFILE");
+    #else
+        const char* s = getenv("HOME");
+    #endif
+    if (!s) return -1;
+    size_t n = strlen(s);
+    if (n >= buf_len) return -2;
+    memcpy(buf_data, s, n);
+    return (int64_t)n;
+}#
+
+// Current user name (USERNAME on Windows, USER/LOGNAME elsewhere). -1 = not set.
+@internal
+@extern("C")
+fun __os_user_name_into(buf: u8[]): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        const char* s = getenv("USERNAME");
+    #else
+        const char* s = getenv("USER");
+        if (!s || !*s) s = getenv("LOGNAME");
+    #endif
+    if (!s) return -1;
+    size_t n = strlen(s);
+    if (n >= buf_len) return -2;
+    memcpy(buf_data, s, n);
+    return (int64_t)n;
+}#
+
+// ─── Child processes (spawn / wait / close) ───
+//
+// Handle convention: 0 = failure; Windows = HANDLE, POSIX = the child pid.
+// args_blob = NUL-separated argument strings, each followed by a NUL byte;
+// argv[0] is the program itself (passed separately as `program`).
+
+
+// Launch a child process inheriting stdio, without a shell. Returns the handle, 0 on failure.
+// cwd: "" = inherit the caller's working directory; otherwise the child's initial directory.
+// env_blob: empty = inherit the caller's environment; otherwise NUL-separated "KEY=VALUE"
+// entries REPLACING the environment entirely (Go semantics).
+@c_include("spawn.h")
+@c_include("sys/wait.h")
+@internal
+@extern("C")
+fun __os_spawn(program: str, args_blob: u8[], cwd: str, env_blob: u8[]): u64 #{
+    // Append one MSVCRT-quoted argument to cmd at w (macro emitted once per file).
+    #define FROND_APPEND_ARG(cmd, w, sd, sl) do { \
+        int frond_q_ = 0; \
+        for (size_t frond_k_ = 0; frond_k_ < (sl); frond_k_++) { \
+            char frond_c_ = (sd)[frond_k_]; \
+            if (frond_c_ == ' ' || frond_c_ == '\t' || frond_c_ == '"') { frond_q_ = 1; break; } \
+        } \
+        if ((w) > 0) (cmd)[(w)++] = ' '; \
+        if (frond_q_) (cmd)[(w)++] = '"'; \
+        size_t frond_bs_ = 0; \
+        for (size_t frond_k_ = 0; frond_k_ < (sl); frond_k_++) { \
+            char frond_c_ = (sd)[frond_k_]; \
+            if (frond_c_ == '\\') { frond_bs_++; continue; } \
+            if (frond_c_ == '"') { \
+                for (size_t frond_b_ = 0; frond_b_ < frond_bs_ * 2; frond_b_++) (cmd)[(w)++] = '\\'; \
+                (cmd)[(w)++] = '\\'; (cmd)[(w)++] = '"'; \
+            } else { \
+                for (size_t frond_b_ = 0; frond_b_ < frond_bs_; frond_b_++) (cmd)[(w)++] = '\\'; \
+                (cmd)[(w)++] = frond_c_; \
+            } \
+            frond_bs_ = 0; \
+        } \
+        if (frond_q_) { \
+            for (size_t frond_b_ = 0; frond_b_ < frond_bs_ * 2; frond_b_++) (cmd)[(w)++] = '\\'; \
+            (cmd)[(w)++] = '"'; \
+        } \
+    } while (0)
+    // Shared pre-scan: count NUL-separated segments + total bytes
+    // (Windows worst case: every byte doubles when quoted/escaped).
+    size_t argc = 0;
+    size_t blob_bytes = 0;
+    for (size_t i = 0; i < args_blob_len; ) {
+        size_t seg = 0;
+        while (i + seg < args_blob_len && args_blob_data[i + seg] != 0) seg++;
+        argc++;
+        blob_bytes += seg;
+        i += seg + 1;
+    }
+    #if defined(_WIN32) || defined(_WIN64)
+        size_t cmd_cap = program_len * 2 + 3 + blob_bytes * 2 + argc * 4 + 1;
+        char* cmd = (char*)malloc(cmd_cap);
+        if (!cmd) return 0;
+        size_t w = 0;
+        FROND_APPEND_ARG(cmd, w, program_data, program_len);
+        for (size_t i = 0; i < args_blob_len; ) {
+            size_t seg = 0;
+            while (i + seg < args_blob_len && args_blob_data[i + seg] != 0) seg++;
+            if (seg > 0) FROND_APPEND_ARG(cmd, w, (const char*)(args_blob_data + i), seg);
+            i += seg + 1;
+        }
+        cmd[w] = 0;
+        // Optional working directory + full environment replacement.
+        const char* dir = (cwd_len > 0) ? cwd_data : NULL;
+        char* env_block = NULL;
+        const char* env_ptr = NULL;
+        if (env_blob_len > 0) {
+            env_block = (char*)malloc(env_blob_len + 1);
+            if (!env_block) { free(cmd); return 0; }
+            memcpy(env_block, env_blob_data, env_blob_len);
+            env_block[env_blob_len] = 0;  // ANSI env block is double-NUL terminated
+            env_ptr = env_block;
+        }
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        ZeroMemory(&si, sizeof(si));
+        ZeroMemory(&pi, sizeof(pi));
+        si.cb = sizeof(si);
+        BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, env_ptr, dir, &si, &pi);
+        free(cmd);
+        free(env_block);
+        if (!ok) return 0;
+        CloseHandle(pi.hThread);
+        return (uint64_t)pi.hProcess;
+    #else
+        (void)blob_bytes;
+        extern char** environ;
+        char** argv = (char**)malloc((argc + 2) * sizeof(char*));
+        if (!argv) return 0;
+        argv[0] = (char*)program_data;
+        size_t ai = 1;
+        for (size_t i = 0; i < args_blob_len; ) {
+            size_t seg = 0;
+            while (i + seg < args_blob_len && args_blob_data[i + seg] != 0) seg++;
+            argv[ai++] = (char*)(args_blob_data + i);
+            i += seg + 1;
+        }
+        argv[ai] = NULL;
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        if (cwd_len > 0) {
+            if (posix_spawn_file_actions_addchdir_np(&fa, cwd_data) != 0) {
+                posix_spawn_file_actions_destroy(&fa);
+                free(argv);
+                return 0;
+            }
+        }
+        char** envp = environ;
+        char** env_parsed = NULL;
+        if (env_blob_len > 0) {
+            size_t envc = 0;
+            for (size_t i = 0; i < env_blob_len; ) {
+                size_t seg = 0;
+                while (i + seg < env_blob_len && env_blob_data[i + seg] != 0) seg++;
+                envc++;
+                i += seg + 1;
+            }
+            env_parsed = (char**)malloc((envc + 1) * sizeof(char*));
+            if (!env_parsed) { posix_spawn_file_actions_destroy(&fa); free(argv); return 0; }
+            size_t ei = 0;
+            for (size_t i = 0; i < env_blob_len; ) {
+                size_t seg = 0;
+                while (i + seg < env_blob_len && env_blob_data[i + seg] != 0) seg++;
+                env_parsed[ei++] = (char*)(env_blob_data + i);
+                i += seg + 1;
+            }
+            env_parsed[ei] = NULL;
+            envp = env_parsed;
+        }
+        pid_t pid = 0;
+        int r = posix_spawn(&pid, program_data, &fa, NULL, argv, envp);
+        posix_spawn_file_actions_destroy(&fa);
+        free(env_parsed);
+        free(argv);
+        if (r != 0) return 0;
+        return (uint64_t)pid;
+    #endif
+}#
+
+// The child's process id (display purposes).
+@internal
+@extern("C")
+fun __os_process_pid(handle: u64): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        return (int64_t)GetProcessId((HANDLE)handle);
+    #else
+        return (int64_t)handle;
+    #endif
+}#
+
+// Block until the child exits; returns its exit code (signaled: 128+signal), -1 = wait failed.
+@internal
+@extern("C")
+fun __os_process_wait(handle: u64): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        if (WaitForSingleObject((HANDLE)handle, INFINITE) != WAIT_OBJECT_0) return -1;
+        DWORD code = 0;
+        if (!GetExitCodeProcess((HANDLE)handle, &code)) return -1;
+        return (int32_t)code;
+    #else
+        int st = 0;
+        if (waitpid((pid_t)handle, &st, 0) < 0) return -1;
+        if (WIFEXITED(st)) return WEXITSTATUS(st);
+        if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
+        return -1;
+    #endif
+}#
+
+// Release the handle (Windows CloseHandle; POSIX pid needs no handle).
+@internal
+@extern("C")
+fun __os_process_close(handle: u64): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        return CloseHandle((HANDLE)handle) ? 0 : -1;
+    #else
+        (void)handle;
+        return 0;
+    #endif
+}#
+
+// ─── Captured child processes (stdout+stderr merged through one pipe) ───
+//
+// Handle convention: 0 = failure. The handle is a malloc'd two-slot block —
+// slot 0 = process handle (HANDLE / pid), slot 1 = read end of the output
+// pipe — released by __os_capture_finish (which also waits and closes).
+
+@c_include("windows.h")
+@c_include("spawn.h")
+@c_include("unistd.h")
+@c_include("fcntl.h")
+@internal
+@extern("C")
+fun __os_capture_spawn(program: str, args_blob: u8[], cwd: str, env_blob: u8[]): u64 #{
+    // MSVCRT quoting (same rules as __os_spawn; separate macro name so the
+    // per-file single-emission of FROND_APPEND_ARG is not disturbed).
+    #define FROND_APPEND_ARG_CAP(cmd, w, sd, sl) do { \
+        int frond_q_ = 0; \
+        for (size_t frond_k_ = 0; frond_k_ < (sl); frond_k_++) { \
+            char frond_c_ = (sd)[frond_k_]; \
+            if (frond_c_ == ' ' || frond_c_ == '\t' || frond_c_ == '"') { frond_q_ = 1; break; } \
+        } \
+        if ((w) > 0) (cmd)[(w)++] = ' '; \
+        if (frond_q_) (cmd)[(w)++] = '"'; \
+        size_t frond_bs_ = 0; \
+        for (size_t frond_k_ = 0; frond_k_ < (sl); frond_k_++) { \
+            char frond_c_ = (sd)[frond_k_]; \
+            if (frond_c_ == '\\') { frond_bs_++; continue; } \
+            if (frond_c_ == '"') { \
+                for (size_t frond_b_ = 0; frond_b_ < frond_bs_ * 2; frond_b_++) (cmd)[(w)++] = '\\'; \
+                (cmd)[(w)++] = '\\'; (cmd)[(w)++] = '"'; \
+            } else { \
+                for (size_t frond_b_ = 0; frond_b_ < frond_bs_; frond_b_++) (cmd)[(w)++] = '\\'; \
+                (cmd)[(w)++] = frond_c_; \
+            } \
+            frond_bs_ = 0; \
+        } \
+        if (frond_q_) { \
+            for (size_t frond_b_ = 0; frond_b_ < frond_bs_ * 2; frond_b_++) (cmd)[(w)++] = '\\'; \
+            (cmd)[(w)++] = '"'; \
+        } \
+    } while (0)
+    // Shared pre-scan: count NUL-separated segments + total bytes.
+    size_t argc = 0;
+    size_t blob_bytes = 0;
+    for (size_t i = 0; i < args_blob_len; ) {
+        size_t seg = 0;
+        while (i + seg < args_blob_len && args_blob_data[i + seg] != 0) seg++;
+        argc++;
+        blob_bytes += seg;
+        i += seg + 1;
+    }
+    #if defined(_WIN32) || defined(_WIN64)
+        size_t cmd_cap = program_len * 2 + 3 + blob_bytes * 2 + argc * 4 + 1;
+        char* cmd = (char*)malloc(cmd_cap);
+        if (!cmd) return 0;
+        size_t w = 0;
+        FROND_APPEND_ARG_CAP(cmd, w, program_data, program_len);
+        for (size_t i = 0; i < args_blob_len; ) {
+            size_t seg = 0;
+            while (i + seg < args_blob_len && args_blob_data[i + seg] != 0) seg++;
+            if (seg > 0) FROND_APPEND_ARG_CAP(cmd, w, (const char*)(args_blob_data + i), seg);
+            i += seg + 1;
+        }
+        cmd[w] = 0;
+        HANDLE rd = NULL, wr = NULL;
+        SECURITY_ATTRIBUTES sa_pipe;
+        ZeroMemory(&sa_pipe, sizeof(sa_pipe));
+        sa_pipe.nLength = sizeof(sa_pipe);
+        sa_pipe.bInheritHandle = TRUE;  // the write end must be inherited by the child
+        if (!CreatePipe(&rd, &wr, &sa_pipe, 0)) { free(cmd); return 0; }
+        // The read end must not leak into the child (the child holds only the
+        // write end, so the pipe reaches EOF when the child exits).
+        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+        // stdin = the NUL device (capture is non-interactive; Go's exec does
+        // the same). Inheriting the caller's console handle fails when the
+        // caller has no console (cmd exits 1 immediately).
+        SECURITY_ATTRIBUTES sa_nul;
+        ZeroMemory(&sa_nul, sizeof(sa_nul));
+        sa_nul.nLength = sizeof(sa_nul);
+        sa_nul.bInheritHandle = TRUE;
+        HANDLE nul = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa_nul, OPEN_EXISTING, 0, NULL);
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        ZeroMemory(&si, sizeof(si));
+        ZeroMemory(&pi, sizeof(pi));
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = (nul != INVALID_HANDLE_VALUE) ? nul : NULL;
+        si.hStdOutput = wr;
+        si.hStdError = wr;
+        // Optional working directory + full environment replacement (same
+        // conventions as __os_spawn).
+        char* env_block = NULL;
+        const char* env_ptr = NULL;
+        if (env_blob_len > 0) {
+            env_block = (char*)malloc(env_blob_len + 1);
+            if (!env_block) { free(cmd); CloseHandle(rd); CloseHandle(wr); return 0; }
+            memcpy(env_block, env_blob_data, env_blob_len);
+            env_block[env_blob_len] = 0;
+            env_ptr = env_block;
+        }
+        BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0,
+            env_ptr,
+            (cwd_len > 0) ? cwd_data : NULL, &si, &pi);
+        free(env_block);
+        free(cmd);
+        if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+        if (!ok) { CloseHandle(rd); CloseHandle(wr); return 0; }
+        CloseHandle(pi.hThread);
+        CloseHandle(wr);  // parent must drop the write end, or EOF never arrives
+        uint64_t* slots = (uint64_t*)malloc(2 * sizeof(uint64_t));
+        if (!slots) { CloseHandle(pi.hProcess); CloseHandle(rd); return 0; }
+        slots[0] = (uint64_t)pi.hProcess;
+        slots[1] = (uint64_t)rd;
+        return (uint64_t)(uintptr_t)slots;
+    #else
+        (void)blob_bytes;
+        extern char** environ;
+        char** argv = (char**)malloc((argc + 2) * sizeof(char*));
+        if (!argv) return 0;
+        argv[0] = (char*)program_data;
+        size_t ai = 1;
+        for (size_t i = 0; i < args_blob_len; ) {
+            size_t seg = 0;
+            while (i + seg < args_blob_len && args_blob_data[i + seg] != 0) seg++;
+            argv[ai++] = (char*)(args_blob_data + i);
+            i += seg + 1;
+        }
+        argv[ai] = NULL;
+        int fds[2];
+        if (pipe(fds) != 0) { free(argv); return 0; }
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        if (cwd_len > 0) {
+            if (posix_spawn_file_actions_addchdir_np(&fa, cwd_data) != 0) {
+                posix_spawn_file_actions_destroy(&fa);
+                free(argv);
+                close(fds[0]); close(fds[1]);
+                return 0;
+            }
+        }
+        posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+        posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+        posix_spawn_file_actions_adddup2(&fa, fds[1], STDERR_FILENO);
+        posix_spawn_file_actions_addclose(&fa, fds[0]);
+        char** envp = environ;
+        char** env_parsed = NULL;
+        if (env_blob_len > 0) {
+            size_t envc = 0;
+            for (size_t i = 0; i < env_blob_len; ) {
+                size_t seg = 0;
+                while (i + seg < env_blob_len && env_blob_data[i + seg] != 0) seg++;
+                envc++;
+                i += seg + 1;
+            }
+            env_parsed = (char**)malloc((envc + 1) * sizeof(char*));
+            if (!env_parsed) {
+                posix_spawn_file_actions_destroy(&fa);
+                free(argv);
+                close(fds[0]); close(fds[1]);
+                return 0;
+            }
+            size_t ei = 0;
+            for (size_t i = 0; i < env_blob_len; ) {
+                size_t seg = 0;
+                while (i + seg < env_blob_len && env_blob_data[i + seg] != 0) seg++;
+                env_parsed[ei++] = (char*)(env_blob_data + i);
+                i += seg + 1;
+            }
+            env_parsed[ei] = NULL;
+            envp = env_parsed;
+        }
+        pid_t pid = 0;
+        int r = posix_spawn(&pid, program_data, &fa, NULL, argv, envp);
+        posix_spawn_file_actions_destroy(&fa);
+        free(env_parsed);
+        free(argv);
+        if (r != 0) { close(fds[0]); close(fds[1]); return 0; }
+        close(fds[1]);  // parent drops the write end so read() sees EOF
+        int64_t* slots = (int64_t*)malloc(2 * sizeof(int64_t));
+        if (!slots) { close(fds[0]); return 0; }
+        slots[0] = (int64_t)pid;
+        slots[1] = (int64_t)fds[0];
+        return (uint64_t)(uintptr_t)slots;
+    #endif
+}#
+
+// Read one chunk of merged child output into buf. Returns the byte count
+// (0 never happens on anonymous pipes); -1 = EOF or failure.
+@c_include("windows.h")
+@c_include("unistd.h")
+@internal
+@extern("C")
+fun __os_capture_read_into(handle: u64, buf: u8[]): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        HANDLE rd = (HANDLE)((uint64_t*)(uintptr_t)handle)[1];
+        DWORD n = 0;
+        if (!ReadFile(rd, buf_data, (DWORD)buf_len, &n, NULL)) return -1;
+        return (int64_t)n;
+    #else
+        int fd = (int)((int64_t*)(uintptr_t)handle)[1];
+        ssize_t n = read(fd, buf_data, buf_len);
+        return n <= 0 ? -1 : (int64_t)n;
+    #endif
+}#
+
+// Wait for the captured child, then release pipe + process handles and the
+// slot block. Returns the exit code (signaled: 128+signal), -1 = wait failed.
+@c_include("windows.h")
+@c_include("unistd.h")
+@c_include("sys/wait.h")
+@c_include("stdlib.h")
+@internal
+@extern("C")
+fun __os_capture_finish(handle: u64): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        uint64_t* slots = (uint64_t*)(uintptr_t)handle;
+        int32_t code = -1;
+        if (WaitForSingleObject((HANDLE)slots[0], INFINITE) == WAIT_OBJECT_0) {
+            DWORD c = 0;
+            if (GetExitCodeProcess((HANDLE)slots[0], &c)) code = (int32_t)c;
+        }
+        CloseHandle((HANDLE)slots[0]);
+        CloseHandle((HANDLE)slots[1]);
+        free(slots);
+        return code;
+    #else
+        int64_t* slots = (int64_t*)(uintptr_t)handle;
+        int st = 0;
+        int32_t code = -1;
+        if (waitpid((pid_t)slots[0], &st, 0) >= 0) {
+            if (WIFEXITED(st)) code = WEXITSTATUS(st);
+            else if (WIFSIGNALED(st)) code = 128 + WTERMSIG(st);
+        }
+        close((int)slots[1]);
+        free(slots);
+        return code;
+    #endif
+}#
+
+// ─── Self executable path ───
+//
+// Windows: GetModuleFileNameA. POSIX: readlink("/proc/self/exe") — macOS has
+// no /proc, so the call returns -1 there (surfaces as Unsupported).
+
+@c_include("windows.h")
+@c_include("unistd.h")
+@internal
+@extern("C")
+fun __os_executable_into(buf: u8[]): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        DWORD n = GetModuleFileNameA(NULL, (LPSTR)buf_data, (DWORD)buf_len);
+        if (n == 0) return -1;
+        if (n >= buf_len) return -2;
+        return (int64_t)n;
+    #else
+        ssize_t n = readlink("/proc/self/exe", (char*)buf_data, buf_len);
+        if (n < 0) return -1;
+        if ((size_t)n >= buf_len) return -2;
+        return (int64_t)n;
+    #endif
+}#
+
+// Wait with a timeout. Returns the exit code, -1 = wait failed, -2 = timeout
+// expired (the child keeps running; the handle stays valid for wait/kill).
+// POSIX has no native timed waitpid: this polls with WNOHANG in 10ms steps.
+@c_include("windows.h")
+@c_include("unistd.h")
+@c_include("sys/wait.h")
+@internal
+@extern("C")
+fun __os_process_wait_timeout(handle: u64, timeout_ms: i64): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        DWORD ms = (timeout_ms < 0) ? 0 : (DWORD)timeout_ms;
+        DWORD w = WaitForSingleObject((HANDLE)handle, ms);
+        if (w == WAIT_TIMEOUT) return -2;
+        if (w != WAIT_OBJECT_0) return -1;
+        DWORD code = 0;
+        if (!GetExitCodeProcess((HANDLE)handle, &code)) return -1;
+        return (int32_t)code;
+    #else
+        int64_t waited = 0;
+        for (;;) {
+            int st = 0;
+            pid_t r = waitpid((pid_t)handle, &st, WNOHANG);
+            if (r == (pid_t)handle) {
+                if (WIFEXITED(st)) return WEXITSTATUS(st);
+                if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
+                return -1;
+            }
+            if (r < 0) return -1;
+            if (waited >= timeout_ms) return -2;
+            usleep(10000);  // 10ms poll step
+            waited += 10;
+        }
+    #endif
+}#
+
+// Terminate the child unconditionally (Windows: TerminateProcess with exit
+// code 1; POSIX: SIGKILL). Returns 0 on success.
+@c_include("windows.h")
+@c_include("signal.h")
+@internal
+@extern("C")
+fun __os_process_kill(handle: u64): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        return TerminateProcess((HANDLE)handle, 1) ? 0 : -1;
+    #else
+        return kill((pid_t)handle, SIGKILL) == 0 ? 0 : -1;
+    #endif
+}#

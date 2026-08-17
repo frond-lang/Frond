@@ -8,9 +8,23 @@ use super::Manifest::{load_manifest, opt_level_from};
 use super::Pipeline::run_from_project;
 
 /// `frond run` overloaded entry:
-/// - No args: compile + execute immediately within a project (like cargo run).
-/// - With args <file.fndo>: execute the specified artifact (.fndo load).
-pub fn cmd_run(file: Option<String>, opt_level_cli: Option<u8>) {
+/// - Project mode: compile + execute immediately within a project (like cargo run).
+/// - Artifact mode: the first trailing value ending in `.fndo` selects the artifact.
+/// - Trailing values (after `--`, or beyond the artifact path) are registered as the
+///   program's arguments, visible via `std.os.Proc.args()`.
+pub fn cmd_run(args: Vec<String>, opt_level_cli: Option<u8>) {
+    // Split: optional leading `.fndo` artifact path, rest = program args.
+    let (file, program_args) = match args.split_first() {
+        Some((first, rest)) if first.ends_with(".fndo") => (Some(first.clone()), rest.to_vec()),
+        _ => (None, args.clone()),
+    };
+    // clap drops the `--` separator in project mode but keeps it in artifact mode
+    // (mid-positional `--` with trailing_var_arg) — normalize by stripping a leading one.
+    let program_args = match program_args.split_first() {
+        Some((f, rest)) if f == "--" => rest.to_vec(),
+        _ => program_args,
+    };
+    crate::engine::set_program_args(program_args);
     match file {
         None => {
             // opt_level priority: CLI flag > manifest [build] opt_level > default O2

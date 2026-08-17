@@ -145,5 +145,5 @@ pub fun new_reader(file: File): BufReader {
 }
 
 pub fun new_writer(file: File): BufWriter {
-    BufWriter(file, [0u8, ..File.DEFAULT_BUF_SIZE], 0)
+    BufWriter(file, [0, ..File.DEFAULT_BUF_SIZE], 0)
 }

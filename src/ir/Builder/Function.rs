@@ -462,7 +462,15 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
                     _ => { self.compiling_builtin = prev_builtin; continue; }
                 };
                 let init_node = self.compile_subexpr(value_expr);
-                let slot = self.global_var_slots.get(name).copied()
+                // Resolve the slot the same way collection keyed it: mangled
+                // (module_path.name) first — the bare name is only a first-wins
+                // alias and points at ANOTHER module's slot when top-level vals
+                // share a name across modules (std.core.I8.MAX vs I64.MAX).
+                let mangled_slot = crate::sema::Sema::module_logical_path(module.name)
+                    .map(|mp| format!("{}.{}", mp, name))
+                    .and_then(|m| self.global_var_slots.get(&m).copied());
+                let slot = mangled_slot
+                    .or_else(|| self.global_var_slots.get(name).copied())
                     .expect("global var slot must exist after collection");
                 let store_node = self.compile_global_store(init_node, slot);
                 self.current_effect = Some(store_node);

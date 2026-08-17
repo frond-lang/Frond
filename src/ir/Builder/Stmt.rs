@@ -200,8 +200,32 @@ impl<'a> IrBuilder<'a> {
             }
             crate::ast::Ast::Stmt::VarDecl { name, value, .. } => {
                 let value_node = self.compile_subexpr(*value);
-                self.declare_var(name, value_node);
-                Some(value_node)
+                // A `var` initialized from an IDENTIFIER reference must own a FRESH
+                // slot. The initializer expression is an alias of the referenced
+                // binding's node; aliasing it as this var's home lets later
+                // WriteBacks (loop-body home sync) overwrite the SHARED node's
+                // slot, corrupting every other reader of that binding — observed
+                // as: loop-level `val st`, branch-local `var e = st`, inner-loop
+                // `e = e + 1` writebacks clobbering st (st read back as e's value).
+                // A one-input CF_SEQ node is a fresh identity copy; non-reference
+                // initializers already produce fresh exclusive nodes.
+                let is_ref = matches!(
+                    &self.current_module().arena.expr(*value).node,
+                    crate::ast::Ast::Expr::Ident(_)
+                );
+                let home = if is_ref {
+                    let off = self.graph.inputs_pool.push(&[value_node]);
+                    self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: 1,
+                        inputs_offset: off,
+                        compute_fn: CF_SEQ,
+                    })
+                } else {
+                    value_node
+                };
+                self.declare_var(name, home);
+                Some(home)
             }
             crate::ast::Ast::Stmt::Expression { expr } => {
                 let expr_node = self.compile_subexpr(*expr);
@@ -569,36 +593,53 @@ impl<'a> IrBuilder<'a> {
                     self.graph.set_call_target(reg_node, body_sg);
                     Some(reg_node)
                 } else {
-                    // defer expr -> compile expr as an independent subgraph and register it in the
-                    // current function subgraph's defer_table.
+                    // Function-level defer: execution-gated dynamic registration.
+                    //
+                    // Historically this pushed a static entry onto the function
+                    // subgraph's defer_table, which every frame-exit path drained
+                    // unconditionally — a defer whose statement was never reached
+                    // (error `?`-exit BEFORE the binding it captures) still ran,
+                    // reading an unbound frame slot; with an await inside the
+                    // body that fed garbage into the async machinery and crashed
+                    // natively (silent exit 127 on the second occurrence). Now
+                    // the register node sits in the statement stream, so only
+                    // reached defers run; it pushes onto the FUNCTION frame's
+                    // runtime defer_stack (see compute_block_defer_register),
+                    // which finish_frame / run_defers_sync drain at frame exit.
+                    //
+                    // The ONLY input is the effect dependency, captured BEFORE
+                    // compile_branch_subgraph: that helper compiles the body
+                    // expression into the parent's node space first (then carves
+                    // the same_function branch range out of it) and leaves
+                    // current_effect pointing at a node INSIDE that nested range
+                    // — a node the parent frame never executes, which would leave
+                    // this register permanently unready. Captured before, it
+                    // anchors the register after prior statements (await/call
+                    // bindings chain effects, so `val f = ...await()?; defer
+                    // f.close()` orders correctly). Captured variables are
+                    // deliberately NOT scheduling inputs (same nested-range
+                    // hazard); defer bodies read outer variables live via the
+                    // frame chain at drain time (Bug #47).
+                    let eff_input = self.current_effect;
                     let (body_sg, _branch_captures) = self.compile_branch_subgraph(*expr);
-                    // Unified capture model: resolve the defer's capture list from
-                    // Sema (all entries are Reference mode for defer — defer
-                    // semantics read the value at function/block exit). Each
-                    // captured variable's current NodeId is resolved via
-                    // `lookup_var` and stored in `DeferEntry.captured_inputs`.
-                    // At runtime, the defer frame injects these snapshot values
-                    // into its value table, mirroring the loop-defer path.
-                    let sema_captures = self.lookup_captures(*expr);
-                    let mut captured_inputs: Vec<NodeId> = Vec::new();
-                    for cap in sema_captures {
-                        if let Some(node) = self.lookup_var(cap.name.as_ref()) {
-                            captured_inputs.push(node);
-                        }
+                    // Bug #49 flag: mark the function sg so later local reassignments
+                    // emit WriteBacks (defer bodies read the LATEST value).
+                    if let Some(fn_sg) = self.current_function_sg {
+                        self.function_defer_sgs.insert(fn_sg);
                     }
-                    let trigger = self.compile_void_const();
-                    if let Some(cur_sg) = self.current_function_sg {
-                        let entry = DeferEntry {
-                            trigger_node: trigger,
-                            body_subgraph: body_sg,
-                            captured_inputs,
-                            registered: false,
-                        };
-                        self.graph.subgraphs[cur_sg.0 as usize]
-                            .defer_table
-                            .push(entry);
+                    let mut inputs: Vec<NodeId> = Vec::with_capacity(1);
+                    if let Some(eff) = eff_input {
+                        inputs.push(eff);
                     }
-                    None
+                    let inputs_off = self.graph.inputs_pool.push(&inputs);
+                    let reg_node = self.graph.add_node(Node {
+                        kind: NodeKind::Call,
+                        input_count: inputs.len() as u8,
+                        inputs_offset: inputs_off,
+                        compute_fn: CF_BLOCK_DEFER_REGISTER,
+                    });
+                    self.graph.set_call_target(reg_node, body_sg);
+                    Some(reg_node)
                 }
             }
             crate::ast::Ast::Stmt::LocalDecl { decl } => {

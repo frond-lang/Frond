@@ -46,12 +46,16 @@ pub type FileKind =
     | Other
 
 // Stat: file metadata (newtype record, constructed by syscall layer with type_name="Stat")
-pub type Stat = Stat(size: u64, mtime_ns: i64, ctime_ns: i64, kind: FileKind)
+pub type Stat = Stat(pub size: u64, pub mtime_ns: i64, pub ctime_ns: i64, pub kind: FileKind)
 
 // File: file handle (newtype record, publicly exported)
 // fd stored as i64 cross-platform (POSIX i32 extended, Windows HANDLE cast to integer)
-pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
+pub type File = File(fd: i64, pub path: Path, mode: OpenMode, is_closed: bool) {
     // ─── Instance methods (this : File) ────────────────────────────
+
+    // fd accessor: the raw handle stays private, callers that need it
+    // (e.g. Tty.is_tty) read it through here.
+    pub fun fd(): i64 { fd }
 
     pub async fun close(): Async<Throw<void, IOError>> {
         if is_closed {
@@ -70,30 +74,30 @@ pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
     // Currently calls synchronous C primitives directly; will switch to spawn + channel model once the IR/Engine async model is ready.
     pub async fun read(len: usize): Async<Throw<u8[], IOError>> {
         if is_closed {
-            throw IOError(InvalidInput, "file closed", 0, path)
+            throw IOError(InvalidInput, "file closed", 0, path.to_str())
         }
-        val buf: u8[] = [0u8, ..len]
+        val buf: u8[] = [0, ..len]
         val n = __file_read_into(fd, buf, len)
         if n < 0 {
-            throw IOError(Other, "file read failed", 0, path)
+            throw IOError(Other, "file read failed", 0, path.to_str())
         }
         Ok(buf[0..n as usize])
     }
 
     pub async fun write(buf: u8[], len: usize): Async<Throw<usize, IOError>> {
         if is_closed {
-            throw IOError(InvalidInput, "file closed", 0, path)
+            throw IOError(InvalidInput, "file closed", 0, path.to_str())
         }
         val n = __file_write(fd, buf, len)
         if n < 0 {
-            throw IOError(Other, "file write failed", 0, path)
+            throw IOError(Other, "file write failed", 0, path.to_str())
         }
         Ok(n as usize)
     }
 
     pub async fun seek(from: SeekFrom): Async<Throw<i64, IOError>> {
         if is_closed {
-            throw IOError(InvalidInput, "file closed", 0, path)
+            throw IOError(InvalidInput, "file closed", 0, path.to_str())
         }
         val offset = match from {
             Set(off) => off,
@@ -111,13 +115,13 @@ pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
     // tell is implemented by composing seek(Current(0)) (the original __file_tell syscall was removed — derivable from seek)
     // Kept as a std method to provide the semantic abstraction of "get current position", avoiding users writing Current(0) manually
     pub async fun tell(): Async<Throw<i64, IOError>> {
-        val pos: SeekFrom = Current(0i64)
+        val pos: SeekFrom = Current(0)
         seek(pos).await()?
     }
 
     pub async fun stat(): Async<Throw<Stat, IOError>> {
         if is_closed {
-            throw IOError(InvalidInput, "file closed", 0, path)
+            throw IOError(InvalidInput, "file closed", 0, path.to_str())
         }
         __file_fstat(fd)?
     }
@@ -128,7 +132,7 @@ pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
     // Accumulate slices with str (amortized O(n)), avoid O(n²) of u8[] ++
     pub async fun read_exact(len: usize): Async<Throw<u8[], IOError>> {
         if is_closed {
-            throw IOError(InvalidInput, "file closed", 0, path)
+            throw IOError(InvalidInput, "file closed", 0, path.to_str())
         }
         var result: str = ""
         var total: usize = 0
@@ -136,7 +140,7 @@ pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
             val remaining = len - total
             val chunk = read(remaining).await()?
             if chunk.len() == 0 {
-                throw IOError(UnexpectedEof, "read_exact: unexpected EOF", 0, path)
+                throw IOError(UnexpectedEof, "read_exact: unexpected EOF", 0, path.to_str())
             }
             result = result + chunk as str
             total = total + chunk.len()
@@ -147,7 +151,7 @@ pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
     // Write all bytes; throw BrokenPipe when write returns 0 (avoid infinite loop)
     pub async fun write_all(buf: u8[], len: usize): Async<Throw<void, IOError>> {
         if is_closed {
-            throw IOError(InvalidInput, "file closed", 0, path)
+            throw IOError(InvalidInput, "file closed", 0, path.to_str())
         }
         var written: usize = 0
         while written < len {
@@ -164,7 +168,7 @@ pub type File = File(fd: i64, path: str, mode: OpenMode, is_closed: bool) {
     // Copy all contents to dst, return the number of bytes copied
     pub async fun copy_to(dst: File): Async<Throw<usize, IOError>> {
         if is_closed {
-            throw IOError(InvalidInput, "source file closed", 0, path)
+            throw IOError(InvalidInput, "source file closed", 0, path.to_str())
         }
         if dst.is_closed {
             throw IOError(InvalidInput, "destination file closed", 0, dst.path)
@@ -289,13 +293,13 @@ fun __file_chmod(path: str, mode: i32): Throw<void, IOError> {
 @internal
 fun __read_u64_le(buf: u8[], offset: usize): u64 {
     ((buf[offset]) as u64)
-        | (((buf[offset + 1]) as u64) << 8u64)
-        | (((buf[offset + 2]) as u64) << 16u64)
-        | (((buf[offset + 3]) as u64) << 24u64)
-        | (((buf[offset + 4]) as u64) << 32u64)
-        | (((buf[offset + 5]) as u64) << 40u64)
-        | (((buf[offset + 6]) as u64) << 48u64)
-        | (((buf[offset + 7]) as u64) << 56u64)
+        | (((buf[offset + 1]) as u64) << 8)
+        | (((buf[offset + 2]) as u64) << 16)
+        | (((buf[offset + 3]) as u64) << 24)
+        | (((buf[offset + 4]) as u64) << 32)
+        | (((buf[offset + 5]) as u64) << 40)
+        | (((buf[offset + 6]) as u64) << 48)
+        | (((buf[offset + 7]) as u64) << 56)
 }
 
 @internal
@@ -306,9 +310,9 @@ fun __read_i64_le(buf: u8[], offset: usize): i64 {
 @internal
 fun __read_i32_le(buf: u8[], offset: usize): i32 {
     (((buf[offset]) as u32)
-        | (((buf[offset + 1]) as u32) << 8u32)
-        | (((buf[offset + 2]) as u32) << 16u32)
-        | (((buf[offset + 3]) as u32) << 24u32)) as i32
+        | (((buf[offset + 1]) as u32) << 8)
+        | (((buf[offset + 2]) as u32) << 16)
+        | (((buf[offset + 3]) as u32) << 24)) as i32
 }
 
 @internal
@@ -325,7 +329,7 @@ fun __kind_from_int(kind_int: i32): FileKind {
 // Fill 28-byte buffer via @extern("C") __file_stat_into, then parse
 @internal
 fun __file_stat(path: str): Throw<Stat, IOError> {
-    val buf: u8[] = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8]
+    val buf: u8[] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     val rc = __file_stat_into(path, buf)
     if rc < 0 {
         throw IOError(NotFound, "file stat failed", 0, path)
@@ -340,7 +344,7 @@ fun __file_stat(path: str): Throw<Stat, IOError> {
 // __file_fstat(fd: i64): Throw<Stat, IOError>
 @internal
 fun __file_fstat(fd: i64): Throw<Stat, IOError> {
-    val buf: u8[] = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8]
+    val buf: u8[] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     val rc = __file_fstat_into(fd, buf)
     if rc < 0 {
         throw IOError(Other, "file fstat failed", 0, null)
@@ -357,9 +361,9 @@ fun __file_fstat(fd: i64): Throw<Stat, IOError> {
 // Inside async function body, propagate Throw errors via ?; on success return T (auto-wrapped as Async<Throw<T, E>>)
 // See design doc §4.3
 
-pub async fun open(path: str, mode: OpenMode): Async<Throw<File, IOError>> {
+pub async fun open(path: Path, mode: OpenMode): Async<Throw<File, IOError>> {
     val flags = __compute_flags(mode)
-    val fd = __file_open(path, flags, DEFAULT_FILE_MODE)?
+    val fd = __file_open(path.to_str(), flags, DEFAULT_FILE_MODE)?
     Ok(File(fd, path, mode, false))
 }
 
@@ -367,21 +371,21 @@ pub async fun open(path: str, mode: OpenMode): Async<Throw<File, IOError>> {
 // Reason: Dir.cwd().statFile(path) and open()+fstat(fd) are not equivalent capabilities —
 // path-based stat does not open the file, has different semantics for directories/permission-restricted files/symlinks,
 // it is an independent host capability, not derivable from open+fstat+close combination.
-pub async fun stat_of(path: str): Async<Throw<Stat, IOError>> {
-    Ok(__file_stat(path)?)
+pub async fun stat_of(path: Path): Async<Throw<Stat, IOError>> {
+    Ok(__file_stat(path.to_str())?)
 }
 
-pub async fun remove(path: str): Async<Throw<void, IOError>> {
-    __file_remove(path)?
+pub async fun remove(path: Path): Async<Throw<void, IOError>> {
+    __file_remove(path.to_str())?
     Ok(void)
 }
 
-pub async fun rename(old: str, new: str): Async<Throw<void, IOError>> {
-    __file_rename(old, new)?
+pub async fun rename(old: Path, new: Path): Async<Throw<void, IOError>> {
+    __file_rename(old.to_str(), new.to_str())?
     Ok(void)
 }
 
-pub async fun chmod(path: str, mode: i32): Async<Throw<void, IOError>> {
-    __file_chmod(path, mode)?
+pub async fun chmod(path: Path, mode: i32): Async<Throw<void, IOError>> {
+    __file_chmod(path.to_str(), mode)?
     Ok(void)
 }

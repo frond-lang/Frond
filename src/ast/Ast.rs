@@ -240,6 +240,9 @@ pub struct TraitBound<'a> {
 pub struct RecordFieldType<'a> {
     pub name: &'a str,
     pub ty: TypeRef,
+    /// Field visibility: private (module-scoped) unless explicitly `pub`,
+    /// even when the type itself is pub.
+    pub is_pub: bool,
 }
 
 /// Record literal field: field name and field value expression.
@@ -254,6 +257,8 @@ pub struct RecordFieldExpr<'a> {
 pub struct ConstructorField<'a> {
     pub name: Option<&'a str>,
     pub ty: TypeRef,
+    /// Field visibility: private (module-scoped) unless explicitly `pub`.
+    pub is_pub: bool,
 }
 
 /// Part of a string interpolation: literal text or embedded expression.

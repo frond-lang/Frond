@@ -45,3 +45,62 @@ pub use Frame::{prepare_defer_frame_sync, prepare_same_function_frame_sync};
 // not be re-`use`d here, otherwise they conflict with the `EngineCore` module name in the type
 // namespace (E0255).
 use EngineCore::{PENDING_EXTERNAL, GOLDEN_RATIO_64, env_flag};
+
+// =========================================================================
+// Program argv — the engine-registered command-line view for std.os.Proc.args()
+// =========================================================================
+//
+// The cli sets the trailing arguments (after `--`) before execution; the
+// stdlib C primitive `__os_arg_count/__os_arg_get_into` reads them through the
+// `#[no_mangle]` accessors below (direct symbol references from the linked
+// frond_extern C objects — no dlsym needed). Never registered → argc 0 +
+// args() returns only what was set by the cli (nothing embeds the host argv:
+// a compiled .fndo run without `--` sees no arguments).
+mod ProgramArgs {
+    use std::sync::OnceLock;
+    use parking_lot::Mutex;
+
+    static ARGS: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+
+    pub fn set(args: Vec<String>) {
+        let slot = ARGS.get_or_init(|| Mutex::new(Vec::new()));
+        let mut g = slot.lock();
+        *g = args.into_iter().map(|a| a.into_bytes()).collect();
+    }
+
+    pub fn count() -> i32 {
+        ARGS.get().map(|m| m.lock().len() as i32).unwrap_or(0)
+    }
+
+    pub fn get(i: i32) -> Option<&'static [u8]> {
+        let m = ARGS.get()?;
+        let g = m.lock();
+        g.get(i as usize).map(|v| unsafe { std::mem::transmute::<&[u8], &'static [u8]>(v.as_slice()) })
+    }
+}
+
+/// Register the program arguments visible to `std.os.Proc.args()`.
+pub fn set_program_args(args: Vec<String>) {
+    ProgramArgs::set(args);
+}
+
+/// C accessor: argument count (0 when the cli passed no `--` arguments).
+#[no_mangle]
+pub extern "C" fn frond_runtime_argc() -> i32 {
+    ProgramArgs::count()
+}
+
+/// C accessor: pointer to argument i's UTF-8 bytes (NULL when out of range).
+#[no_mangle]
+pub extern "C" fn frond_runtime_arg_ptr(i: i32) -> *const u8 {
+    match ProgramArgs::get(i) {
+        Some(b) => b.as_ptr(),
+        None => core::ptr::null(),
+    }
+}
+
+/// C accessor: byte length of argument i (0 when out of range).
+#[no_mangle]
+pub extern "C" fn frond_runtime_arg_len(i: i32) -> usize {
+    ProgramArgs::get(i).map(|b| b.len()).unwrap_or(0)
+}

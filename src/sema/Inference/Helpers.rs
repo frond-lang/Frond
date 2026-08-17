@@ -70,6 +70,13 @@ impl<'a> InferContext<'a> {
         right_ty: TypeHandle,
         span: crate::ast::Ast::Span,
     ) {
+        // Nullable wrappers peel away: `a == 42` with a: i64? must undergo the
+        // SAME width/category check as `x == 42` with x: i64. Previously the
+        // nullable wrapper made is_int()/is_float() both false, silently
+        // skipping every check (mixed-width compared at runtime by tag → false).
+        let left_ty = self.unwrap_ref(left_ty);
+        let right_ty = self.unwrap_ref(right_ty);
+
         // If types are already equal, no issue.
         if types_equal(self.arena, left_ty, right_ty) {
             return;
@@ -498,5 +505,75 @@ impl<'a> InferContext<'a> {
             line,
             column,
         );
+    }
+}
+
+// =========================================================================
+// Visibility gates — fields/methods default to module-scoped unless `pub`
+// =========================================================================
+impl<'a> InferContext<'a> {
+    /// Privacy gate for record/ADT FIELDS. Returns Some(message) when `field`
+    /// of `type_name` is not accessible from the current module. Types without
+    /// a registered TypeDefInfo (builtin scalars/arrays) stay open.
+    pub(super) fn field_privacy_error(&self, type_name: &str, field: &str) -> Option<String> {
+        let def = self.sema_result.get_type_def(type_name)?;
+        let ctor = def.constructors.iter()
+            .find(|c| c.field_names.iter().any(|f| f.as_deref() == Some(field)))?;
+        if ctor.def_module.as_ref() == self.current_module_name.as_str() {
+            return None;
+        }
+        let idx = ctor.field_names.iter().position(|f| f.as_deref() == Some(field))?;
+        let is_pub = ctor.field_is_pub.get(idx).copied().unwrap_or(true);
+        if is_pub {
+            None
+        } else {
+            Some(format!(
+                "field '{}.{}' is private (module-scoped): mark it pub or use an accessor",
+                type_name, field
+            ))
+        }
+    }
+
+    /// Privacy gate for cross-module construction: rejected when the constructor
+    /// has ANY private NAMED field. Positional (unnamed) fields are enum payload,
+    /// not encapsulated data — they follow the type's own visibility (same rule
+    /// the newtype single field already uses), so `IpAddr.V4(x)` keeps working
+    /// cross-module while `File(fd, ...)` stays constructible only in-module.
+    pub(super) fn ctor_privacy_error(&self, type_name: &str, ctor_name: &str) -> Option<String> {
+        let def = self.sema_result.get_type_def(type_name)?;
+        let ctor = def.constructors.iter().find(|c| c.name.as_ref() == ctor_name)?;
+        if ctor.def_module.as_ref() == self.current_module_name.as_str() {
+            return None;
+        }
+        let any_private = ctor.field_names.iter().enumerate()
+            .any(|(i, f)| f.is_some() && !ctor.field_is_pub.get(i).copied().unwrap_or(true));
+        if any_private {
+            Some(format!(
+                "constructor '{}.{}' has private fields: cannot be constructed outside module '{}'",
+                type_name, ctor_name, ctor.def_module
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Privacy gate for TYPE METHODS: private (module-scoped) unless `pub`.
+    pub(super) fn method_privacy_error(&self, type_name: &str, method: &str) -> Option<String> {
+        let def = self.sema_result.get_type_def(type_name)?;
+        let def_module = def.constructors.first()
+            .map(|c| c.def_module.clone())
+            .unwrap_or_default();
+        if def_module.as_ref() == self.current_module_name.as_str() {
+            return None;
+        }
+        let m = def.methods.iter().find(|m| m.name.as_ref() == method)?;
+        if m.is_pub {
+            None
+        } else {
+            Some(format!(
+                "method '{}.{}' is private (module-scoped): mark it pub to call outside module '{}'",
+                type_name, method, def_module
+            ))
+        }
     }
 }

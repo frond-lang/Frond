@@ -26,11 +26,16 @@ pub enum Commands {
         #[arg(short = 'O', long = "opt-level", value_name = "LEVEL")]
         opt_level: Option<u8>,
     },
-    /// Compile + execute immediately (within a project, no args); or execute a specified artifact (with args).
+    /// Compile + execute immediately (within a project); or execute a specified
+    /// .fndo artifact. Trailing arguments after `--` are forwarded to the program
+    /// (visible via std.os.Proc.args()).
     Run {
-        /// .fndo artifact path (with args = execute the specified artifact, no project needed; without args = compile + execute within a project).
-        file: Option<String>,
-        /// Optimization level 0-3 (default 2, only effective in no-arg mode).
+        /// Trailing values: `[FILE.fndo] [--] [PROGRAM_ARGS...]`. The first value
+        /// ending in `.fndo` selects artifact mode; everything after `--` (or
+        /// beyond the artifact path) becomes the program's arguments.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Optimization level 0-3 (default 2, only effective in project mode).
         #[arg(short = 'O', long = "opt-level", value_name = "LEVEL")]
         opt_level: Option<u8>,
     },

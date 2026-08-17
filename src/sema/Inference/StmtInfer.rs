@@ -28,18 +28,36 @@ impl<'a> InferContext<'a> {
         let bind_ty = if let Some(ta) = type_annotation {
             let annot_ty = self.type_from_ast(ta, ast);
             if self.try_widen_unify(annot_ty, val_ty).is_err() {
-                // Bug #61: if the type annotation is a named type and is an alias, preserve the alias name rather than unfolding the underlying type.
-                let annot_str = self.display_type_annotation(ta, ast, annot_ty);
-                let val_str = format!("{}", self.arena.display(val_ty));
-                let span = ast.ty(ta).span;
-                self.add_error_at(
-                    &format!(
-                        "type annotation mismatch: expected '{}', found '{}'",
-                        annot_str, val_str
-                    ),
-                    span.line,
-                    span.column,
-                );
+                // Literal → nullable annotation: `val a: i64? = 42`. Bare
+                // literals never promote toward a Nullable expected type, so
+                // the literal stays i32 while the annotation is i64? —
+                // re-infer the literal against the INNER scalar (running the
+                // normal literal promotion) and accept when that unifies.
+                let mut unified = false;
+                if Self::expr_is_literal(ast, value) {
+                    let annot_resolved = self.arena.resolve(annot_ty);
+                    if let Type::Nullable(_) = self.arena.get(annot_resolved) {
+                        let inner = self.arena.nullable_inner(annot_resolved);
+                        let re_ty = self.infer_expr(value, ast, env, Some(inner));
+                        if self.try_widen_unify(inner, re_ty).is_ok() {
+                            unified = true;
+                        }
+                    }
+                }
+                if !unified {
+                    // Bug #61: if the type annotation is a named type and is an alias, preserve the alias name rather than unfolding the underlying type.
+                    let annot_str = self.display_type_annotation(ta, ast, annot_ty);
+                    let val_str = format!("{}", self.arena.display(val_ty));
+                    let span = ast.ty(ta).span;
+                    self.add_error_at(
+                        &format!(
+                            "type annotation mismatch: expected '{}', found '{}'",
+                            annot_str, val_str
+                        ),
+                        span.line,
+                        span.column,
+                    );
+                }
             }
             annot_ty
         } else {

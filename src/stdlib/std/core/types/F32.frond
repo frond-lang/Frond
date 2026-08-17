@@ -1,0 +1,8 @@
+// F32.frond — the f32 type module (part of std.core)
+
+pub val MAX: f32 = 3.4028234663852886e38
+pub val MIN: f32 = 1.1754943508222875e-38
+
+pub fun parse(s: str): f32? {
+    F64.parse(s) as f32?
+}

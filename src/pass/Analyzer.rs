@@ -1383,6 +1383,21 @@ pub fn analyze_purity(module: &Module, arena: &AstArena, cg: &CallGraph, sema: &
         table.put(fid, Purity::Pure);
     }
     let mut direct_impure: FxHashSet<FuncId> = FxHashSet::default();
+    // Module-level var/val names: writing any of them makes a function
+    // stateful (impure for inlining/memoization purposes).
+    let top_level_vars: FxHashSet<&str> = module
+        .declarations
+        .iter()
+        .filter_map(|d| match &d.node {
+            crate::ast::Ast::Decl::ExprDecl { stmt: Some(s), .. } => {
+                match &arena.stmt(*s).node {
+                    Stmt::VarDecl { name, .. } | Stmt::ValDecl { name, .. } => Some(*name),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
     // Unified traversal of FunDecl + Method (via cg.iter_funcs)
     let func_metas: Vec<(FuncId, &str, crate::ast::Ast::ExprId, bool)> = cg.iter_funcs(module)
         .map(|(fid, meta)| (fid, meta.name, meta.body, meta.is_async))
@@ -1399,7 +1414,7 @@ pub fn analyze_purity(module: &Module, arena: &AstArena, cg: &CallGraph, sema: &
                 continue;
             }
         }
-        if is_direct_impure(body, arena, name, sema) {
+        if is_direct_impure(body, arena, name, sema, &top_level_vars) {
             direct_impure.insert(caller);
         }
     }
@@ -1422,7 +1437,15 @@ pub fn analyze_purity(module: &Module, arena: &AstArena, cg: &CallGraph, sema: &
 
 /// Determines whether a function body is directly impure (contains impure built-in calls, method calls, select, spawn, etc.).
 /// Uses sema FuncSigInfo: async/throwing external functions (e.g., println) are also classified as impure.
-fn is_direct_impure(body: ExprId, arena: &AstArena, self_name: &str, sema: &SemaResult) -> bool {
+fn is_direct_impure(body: ExprId, arena: &AstArena, self_name: &str, sema: &SemaResult, top_level_vars: &FxHashSet<&str>) -> bool {
+    // Stateful functions are impure: a body that WRITES a module-level
+    // variable (directly or through an element/field of one) must never be
+    // inlined or memoized — the expanded body's stores bypass the global
+    // slot, freezing the state (rand's inlined next_u64 kept returning the
+    // first value forever).
+    if writes_top_level_var(body, arena, top_level_vars) {
+        return true;
+    }
     fn check(expr_id: ExprId, arena: &AstArena, self_name: &str, sema: &SemaResult) -> bool {
         let expr = &arena.expr(expr_id).node;
         match expr {
@@ -1529,6 +1552,72 @@ fn is_direct_impure(body: ExprId, arena: &AstArena, self_name: &str, sema: &Sema
         }
     }
     check(body, arena, self_name, sema)
+}
+
+/// Root identifier of an assignment target: `x` → `x`; `arr[i].f` → `arr`.
+fn assign_target_root_ident<'a>(target: crate::ast::Ast::ExprId, arena: &AstArena<'a>) -> Option<&'a str> {
+    let mut root = target;
+    loop {
+        match &arena.expr(root).node {
+            Expr::Ident(n) => return Some(n),
+            Expr::Index { recv, .. }
+            | Expr::FieldAccess { recv, .. }
+            | Expr::SafeAccess { recv, .. } => root = *recv,
+            _ => return None,
+        }
+    }
+}
+
+/// Whether any assignment inside the function body targets a module-level
+/// variable (or an element/field of one). Shadowing (a parameter/local named
+/// like a global) may over-approximate — that only forgoes an optimization.
+fn writes_top_level_var(expr_id: ExprId, arena: &AstArena, top: &FxHashSet<&str>) -> bool {
+    match &arena.expr(expr_id).node {
+        Expr::Assign { target, .. } | Expr::CompoundAssign { target, .. } => {
+            if assign_target_root_ident(*target, arena)
+                .map_or(false, |n| top.contains(n))
+            {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    let mut found = false;
+    walk_children_expr(expr_id, arena, |c| {
+        if !found {
+            found = writes_top_level_var(c, arena, top);
+        }
+    });
+    if !found {
+        walk_children_stmts_of_expr(expr_id, arena, |s| {
+            if !found {
+                found = writes_top_level_var_stmt(s, arena, top);
+            }
+        });
+    }
+    found
+}
+
+fn writes_top_level_var_stmt(stmt_id: StmtId, arena: &AstArena, top: &FxHashSet<&str>) -> bool {
+    match &arena.stmt(stmt_id).node {
+        Stmt::Assignment { target, value, .. } | Stmt::CompoundAssignment { target, value, .. } => {
+            assign_target_root_ident(*target, arena).map_or(false, |n| top.contains(n))
+                || writes_top_level_var(*value, arena, top)
+        }
+        Stmt::FieldAssignment { object, value, .. } => {
+            assign_target_root_ident(*object, arena).map_or(false, |n| top.contains(n))
+                || writes_top_level_var(*value, arena, top)
+        }
+        _ => {
+            let mut found = false;
+            walk_children_stmt(stmt_id, arena, |e| {
+                if !found {
+                    found = writes_top_level_var(e, arena, top);
+                }
+            });
+            found
+        }
+    }
 }
 
 // =========================================================================

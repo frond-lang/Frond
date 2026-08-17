@@ -462,6 +462,8 @@ compute_fn_ids! {
     340 => CF_LIB_HAS_SYMBOL,
     341 => CF_LIB_CLOSE,
     342 => CF_FFN_CALL,
+    // ── Emptiness check (343): `s.is_empty()` / `arr.is_empty()` (str/array builtin)
+    343 => CF_IS_EMPTY,
 }
 
 /// Number of entries in `build_compute_fn_table()`.
@@ -471,7 +473,7 @@ compute_fn_ids! {
 /// by a binary with a different table length is rejected at load instead of
 /// silently mis-dispatching node compute fns. `build_compute_fn_table()`
 /// asserts equality so this constant cannot drift silently.
-pub const COMPUTE_FN_TABLE_LEN: u32 = 343;
+pub const COMPUTE_FN_TABLE_LEN: u32 = 344;
 
 // =========================================================================
 // NodeKind — node category (not an op; 9 variants for readiness checks)
@@ -2153,6 +2155,8 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         340 => super::Compute::compute_lib_has_symbol,
         341 => super::Compute::compute_lib_close,
         342 => super::Compute::compute_ffn_call,
+        // Emptiness check (343): str/array is_empty
+        343 => super::Compute::compute_is_empty,
     };
     // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
     // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values
@@ -2259,7 +2263,7 @@ pub fn effect_class(cf: ComputeFnId) -> EffectClass {
     match cf.0 {
         // ── Pure: legacy arithmetic/comparison ranges (equivalence-tested) ──
         1..=27 | 50..=91 | 92..=259 => Pure,
-        34 | 260 | 261 | 265 | 274 | 276 | 278 | 279 | 287 => Pure, // reads/queries
+        34 | 260 | 261 | 265 | 274 | 276 | 278 | 279 | 287 | 343 => Pure, // reads/queries
         292..=300 | 302..=307 => Pure, // string/obj/bool/f128 comparison
         // ── Reads of mutable state (aliasing) ──
         30 | 32 | 35 | 275 => ReadMutable,      // field/array/pattern-ADT reads (aliasing_read_cfs)
@@ -4345,6 +4349,7 @@ mod effect_classification_tests {
         s.insert(CF_ARRAY_INDEX);
         s.insert(CF_IS_NULL);
         s.insert(CF_ARRAY_LEN);
+        s.insert(CF_IS_EMPTY);
         s.insert(CF_REF_EQ);
         s.insert(CF_REF_NEQ);
         s.insert(CF_ELVIS);

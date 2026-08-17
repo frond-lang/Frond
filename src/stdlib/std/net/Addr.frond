@@ -8,17 +8,17 @@
 //
 // Method dispatch is not yet supported; use module function call syntax (see std_instant/Main.frond):
 //   std.net.Addr.v4_loopback()
-//   std.net.Addr.v4_octet(addr, 0u8)
+//   std.net.Addr.v4_octet(addr, 0)
 
 // ─── Type definitions ──────────────────────────────────────────────────────
 
 // Ipv4Addr: newtype, fields = [__tag=0, bits=u32] (network byte order, big-endian)
-pub type Ipv4Addr = Ipv4Addr(bits: u32) {
+pub type Ipv4Addr = Ipv4Addr(pub bits: u32) {
     // ─── Ipv4Addr accessors ──────────────────────────────────────────────
 
     pub fun v4_octet(i: u8): u8 {
         val idx = (i as u32)
-        val shift = (3u32 - idx) * 8u32
+        val shift = (3 - idx) * 8
         ((bits >> shift) & 0xFFu32) as u8
     }
 
@@ -27,22 +27,22 @@ pub type Ipv4Addr = Ipv4Addr(bits: u32) {
     }
 
     pub fun v4_is_loopback(): bool {
-        v4_octet(0u8) == 127u8
+        v4_octet(0) == 127
     }
 
     pub fun v4_is_unspecified(): bool {
-        bits == 0u32
+        bits == 0
     }
 }
 
 // Ipv6Addr: newtype, fields = [__tag=0, hi=u64, lo=u64] (hi/lo each 8 bytes, big-endian)
-pub type Ipv6Addr = Ipv6Addr(hi: u64, lo: u64) {
+pub type Ipv6Addr = Ipv6Addr(pub hi: u64, pub lo: u64) {
     // ─── Ipv6Addr accessors ──────────────────────────────────────────────
 
     pub fun v6_segment(i: u8): u16 {
         val idx = (i as u64)
-        val word = if idx < 4u64 { hi } else { lo }
-        val shift = (3u64 - (idx % 4u64)) * 16u64
+        val word = if idx < 4 { hi } else { lo }
+        val shift = (3 - (idx % 4)) * 16
         ((word >> shift) & 0xFFFFu64) as u16
     }
 
@@ -55,11 +55,11 @@ pub type Ipv6Addr = Ipv6Addr(hi: u64, lo: u64) {
     }
 
     pub fun v6_is_loopback(): bool {
-        hi == 0u64 && lo == 1u64
+        hi == 0 && lo == 1
     }
 
     pub fun v6_is_unspecified(): bool {
-        hi == 0u64 && lo == 0u64
+        hi == 0 && lo == 0
     }
 }
 
@@ -81,7 +81,7 @@ pub type IpAddr = | V4(Ipv4Addr) | V6(Ipv6Addr) {
 }
 
 // SocketAddr: newtype, fields = [__tag=0, ip=IpAddr, port=u16]
-pub type SocketAddr = SocketAddr(ip: IpAddr, port: u16) {
+pub type SocketAddr = SocketAddr(pub ip: IpAddr, pub port: u16) {
     pub fun socket_ip(): IpAddr {
         ip
     }
@@ -94,7 +94,7 @@ pub type SocketAddr = SocketAddr(ip: IpAddr, port: u16) {
 // ─── Ipv4Addr constructors ──────────────────────────────────────────────
 
 pub fun v4_from_octets(a: u8, b: u8, c: u8, d: u8): Ipv4Addr {
-    Ipv4Addr(((a as u32) << 24u32) | ((b as u32) << 16u32) | ((c as u32) << 8u32) | (d as u32))
+    Ipv4Addr(((a as u32) << 24) | ((b as u32) << 16) | ((c as u32) << 8) | (d as u32))
 }
 
 pub fun v4_from_bits(bits: u32): Ipv4Addr {
@@ -102,18 +102,18 @@ pub fun v4_from_bits(bits: u32): Ipv4Addr {
 }
 
 pub fun v4_loopback(): Ipv4Addr {
-    v4_from_octets(127u8, 0u8, 0u8, 1u8)
+    v4_from_octets(127, 0, 0, 1)
 }
 
 pub fun v4_unspecified(): Ipv4Addr {
-    v4_from_bits(0u32)
+    v4_from_bits(0)
 }
 
 // ─── Ipv6Addr constructors ──────────────────────────────────────────────
 
 pub fun v6_from_segments(w0: u16, w1: u16, w2: u16, w3: u16, w4: u16, w5: u16, w6: u16, w7: u16): Ipv6Addr {
-    val hi = ((w0 as u64) << 48u64) | ((w1 as u64) << 32u64) | ((w2 as u64) << 16u64) | (w3 as u64)
-    val lo = ((w4 as u64) << 48u64) | ((w5 as u64) << 32u64) | ((w6 as u64) << 16u64) | (w7 as u64)
+    val hi = ((w0 as u64) << 48) | ((w1 as u64) << 32) | ((w2 as u64) << 16) | (w3 as u64)
+    val lo = ((w4 as u64) << 48) | ((w5 as u64) << 32) | ((w6 as u64) << 16) | (w7 as u64)
     Ipv6Addr(hi, lo)
 }
 
@@ -122,11 +122,11 @@ pub fun v6_from_bits(hi: u64, lo: u64): Ipv6Addr {
 }
 
 pub fun v6_loopback(): Ipv6Addr {
-    v6_from_bits(0u64, 1u64)
+    v6_from_bits(0, 1)
 }
 
 pub fun v6_unspecified(): Ipv6Addr {
-    v6_from_bits(0u64, 0u64)
+    v6_from_bits(0, 0)
 }
 
 // ─── IpAddr constructors and predicates ──────────────────────────────────

@@ -11,9 +11,9 @@
 // As a builtin error_newtype, it automatically gets the Error trait's message() default implementation (reads the msg field).
 // type_name() override returns "time error" for easy identification in logs.
 type TimeError: Err = TimeError(
-    kind: TimeErrorKind,
-    msg: str,
-    value: str,
+    pub kind: TimeErrorKind,
+    pub message: str,
+    pub value: str,
 ) {
     override fun type_name(): str { "time error" }
 }

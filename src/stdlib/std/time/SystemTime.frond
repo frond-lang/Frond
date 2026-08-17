@@ -9,7 +9,7 @@
 // Field order corresponds one-to-one with syscall/time.zig makeTimeComponents:
 //   year, month, day, hour, minute, second, nanos, weekday, day_of_year
 
-pub type TimeComponents = TimeComponents(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8, nanos: u32, weekday: u8, day_of_year: u16)
+pub type TimeComponents = TimeComponents(pub year: i32, pub month: u8, pub day: u8, pub hour: u8, pub minute: u8, pub second: u8, pub nanos: u32, pub weekday: u8, pub day_of_year: u16)
 
 // ─── SystemTime ────────────────────────────────────────────────────
 

@@ -7,7 +7,7 @@
 // ─── Type definitions ──────────────────────────────────────────────
 
 // Directory entry (name + kind), aligned with syscall/io.zig dir_list return structure
-pub type DirEntry = DirEntry(name: str, kind: FileKind)
+pub type DirEntry = DirEntry(pub name: str, pub kind: FileKind)
 
 // ─── Frond wrapper: @extern("C") raw return value → Throw ──────────
 
@@ -37,45 +37,26 @@ fun __dir_remove(path: str, recursive: bool): Throw<void, IOError> {
 @internal
 fun __dir_list(path: str): Throw<DirEntry[], IOError> {
     val max_count: usize = 256
-    var names_buf: u8[] = []
-    var name_offsets: u8[] = []
-    var kinds_buf: u8[] = []
-    var i: usize = 0
-    while i < 8192 {
-        names_buf = names_buf ++ [0u8]
-        i = i + 1
-    }
-    i = 0
-    while i < 1024 {
-        name_offsets = name_offsets ++ [0u8]
-        i = i + 1
-    }
-    i = 0
-    while i < 256 {
-        kinds_buf = kinds_buf ++ [0u8]
-        i = i + 1
-    }
+    var names_buf: u8[] = [0, ..8192]
+    var name_offsets: u8[] = [0, ..1024]
+    var kinds_buf: u8[] = [0, ..256]
     val count = __dir_list_into(path, names_buf, name_offsets, kinds_buf, max_count)
     if count < 0 {
         throw IOError(NotFound, "dir list failed", 0, path)
     }
-    // Parse buffer to assemble DirEntry[]
+    // Parse buffer to assemble DirEntry[] (single pass — the engine-level
+    // var-aliasing bug is fixed at the Builder, no workaround needed here).
     var entries: DirEntry[] = []
     var idx: usize = 0
     while idx < count as usize {
-        // Read kind (1 byte, offset = idx)
-        val kind_int = (kinds_buf[idx]) as i32
-        val kind = __kind_from_int(kind_int)
-        // Read name start offset (u32 LE, offset = idx * 4)
+        val kind = __kind_from_int((kinds_buf[idx]) as i32)
         val off_base = idx * 4
         val name_start = (__read_i32_le(name_offsets, off_base)) as usize
-        // Read next entry's start offset (or buffer end) as name end
         val name_end = if idx + 1 < count as usize {
             (__read_i32_le(name_offsets, off_base + 4)) as usize
         } else {
-            // Last entry: scan to first 0 byte
             var end_pos = name_start
-            while end_pos < names_buf.len() && names_buf[end_pos] != 0u8 {
+            while end_pos < names_buf.len() && names_buf[end_pos] != 0 {
                 end_pos = end_pos + 1
             }
             end_pos
@@ -94,48 +75,35 @@ fun __dir_list(path: str): Throw<DirEntry[], IOError> {
 // ─── Directory operations (async) ──────────────────────────────────
 
 // List direct child entries of directory
-pub async fun list(path: str): Async<Throw<DirEntry[], IOError>> {
-    __dir_list(path)?
-}
-
-// List direct child entries of directory (Path overload)
-pub async fun list_path(path: Path): Async<Throw<DirEntry[], IOError>> {
+pub async fun list(path: Path): Async<Throw<DirEntry[], IOError>> {
     __dir_list(path.to_str())?
 }
 
-// Create directory
-// When recursive=true, create parent directories recursively (like mkdir -p)
-pub async fun create(path: str, recursive: bool): Async<Throw<void, IOError>> {
-    __dir_create(path, recursive)?
+// Create a single directory (parent must exist)
+pub async fun create(path: Path): Async<Throw<void, IOError>> {
+    __dir_create(path.to_str(), false)?
     Ok(void)
 }
 
-// Create directory (Path overload)
-pub async fun create_path(path: Path, recursive: bool): Async<Throw<void, IOError>> {
-    __dir_create(path.to_str(), recursive)?
-    Ok(void)
-}
-
-// Remove directory
-// When recursive=true, recursively remove subdirectories and files (like rm -r)
-pub async fun remove(path: str, recursive: bool): Async<Throw<void, IOError>> {
-    __dir_remove(path, recursive)?
+// Remove an empty directory
+pub async fun remove(path: Path): Async<Throw<void, IOError>> {
+    __dir_remove(path.to_str(), false)?
     Ok(void)
 }
 
 // Recursively traverse directory tree (depth-first), return all entries (including entries in subdirectories)
 // Optimization: collect current-level entries into local array first (small array ++ has low overhead), batch concatenate subdirectory results,
 // avoid repeated ++ on accumulated large result causing O(n²)
-pub async fun walk(path: str): Async<Throw<DirEntry[], IOError>> {
-    val entries = __dir_list(path)?
+pub async fun walk(path: Path): Async<Throw<DirEntry[], IOError>> {
+    val entries = __dir_list(path.to_str())?
     // All current-level entries enter result at once (entries is already an array, used directly as initial value)
     var result: DirEntry[] = entries
     // Collect subdirectory paths, recurse uniformly then batch concatenate
-    var sub_paths: str[] = []
+    var sub_paths: Path[] = []
     for e in entries.iter() {
         match e.kind {
             Directory => {
-                sub_paths = sub_paths ++ [path + "/" + e.name]
+                sub_paths = sub_paths ++ [path.join_str(e.name)]
             },
             _ => {},
         }

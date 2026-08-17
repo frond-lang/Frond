@@ -1,6 +1,6 @@
 // Err trait: trait implemented by all error types
 //
-// The message() default implementation returns msg — all error_newtypes are required to have a msg: str field.
+// The message() default implementation returns msg — all error_newtypes are required to have a message: str field.
 // If a type has no msg field or needs a custom message, override message().
 // The type_name() default implementation returns "Error"; subtypes can override it.
 trait Err {

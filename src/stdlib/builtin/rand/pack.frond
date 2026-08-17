@@ -1,0 +1,5 @@
+// builtin rand package declaration
+//
+// Exposes the PRNG step primitive to std/rand (and any Frond user code that
+// wants to drive its own xorshift stream).
+pub pack Raw

@@ -15,7 +15,7 @@
 
 // Timer: a timer to be started, internally stores nanosecond-level duration.
 // await Timer → EventSourceKind::Timer → runtime lazily starts the timer and suspends the frame.
-pub type Timer = Timer(duration_ns: i64)
+pub type Timer = Timer(pub duration_ns: i64)
 
 // ─── sleep ─────────────────────────────────────────────────────────
 
@@ -36,7 +36,7 @@ pub async fun sleep_secs(secs: i64): Async<void> {
 pub async fun ticker_loop(ch: Channel<Instant>, period: Duration): Async<void> {
     loop {
         sleep(period).await()
-        ch.send(Instant.now())
+        ch.send(std.time.Instant.now())
     }
 }
 

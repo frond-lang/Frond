@@ -1740,7 +1740,13 @@ pub fn value_equals_with_arena(a: &Value, b: &Value, arena: &ValueArena) -> bool
         (Value::Null, Value::Null) | (Value::Void, Value::Void) => true,
         (Value::Scalar(av, at), Value::Scalar(bv, bt)) => {
             if at != bt {
-                return false;
+                // Cross-tag scalar pair: `i64? == 42` routes through this
+                // generic eq (the nullable dispatch in the IR builder sends
+                // all nullable ==/!= here) while the bare literal keeps i32.
+                // The dedicated scalar comparison paths promote numerically;
+                // this generic path must compare by numeric value too, not
+                // silently return false.
+                return scalar_cross_tag_eq(av, *at, bv, *bt);
             }
             // Compare the union field bit pattern by tag.
             // Note: when a match arm body starts with `unsafe {}`, Rust parses it as an "expression block"
@@ -1770,6 +1776,40 @@ pub fn value_equals_with_arena(a: &Value, b: &Value, arena: &ValueArena) -> bool
         }
         (Value::Ref(ax), Value::Ref(bx)) => heap_equals(ax.as_ref(), bx.as_ref(), arena),
         _ => false,
+    }
+}
+
+/// Numeric equality for a scalar pair whose tags differ. Mirrors the promotion
+/// the dedicated scalar comparison paths apply: integers compare exactly
+/// (signed/unsigned mixed by magnitude), floats compare by value (f128
+/// involved → compare as f128 to keep full precision).
+fn scalar_cross_tag_eq(av: &crate::value::ScalarValue, at: ValueTag, bv: &crate::value::ScalarValue, bt: ValueTag) -> bool {
+    use crate::value::ValueTag;
+    let unsigned = |t: ValueTag| {
+        matches!(
+            t,
+            ValueTag::U8 | ValueTag::U16 | ValueTag::U32 | ValueTag::U64 | ValueTag::U128 | ValueTag::Usize
+        )
+    };
+    let a = Value::Scalar(av.clone(), at);
+    let b = Value::Scalar(bv.clone(), bt);
+    match (at.is_int(), bt.is_int()) {
+        (true, true) => match (unsigned(at), unsigned(bt)) {
+            (false, false) => a.as_int_i128() == b.as_int_i128(),
+            (true, true) => a.as_u128() == b.as_u128(),
+            (true, false) => b.as_int_i128() >= 0 && a.as_u128() == (b.as_int_i128() as u128),
+            (false, true) => a.as_int_i128() >= 0 && b.as_u128() == (a.as_int_i128() as u128),
+        },
+        _ => {
+            // At least one float (mixed int/float pairs are rejected by sema;
+            // this is a defensive numeric comparison): compare via f128 when
+            // either side is f128, else via f64.
+            if at == ValueTag::F128 || bt == ValueTag::F128 {
+                a.as_f128() == b.as_f128()
+            } else {
+                a.as_float_f64() == b.as_float_f64()
+            }
+        }
     }
 }
 

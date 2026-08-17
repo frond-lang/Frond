@@ -193,6 +193,7 @@ const POSIX_ONLY_HEADERS: &[&str] = &[
     "sys/mman.h",
     "sys/wait.h",
     "pthread.h",
+    "spawn.h",
 ];
 
 /// Headers that only exist on Windows. Wrapped in `#if defined(_WIN32)` so

@@ -11,10 +11,10 @@
 // As a builtin error_newtype, it automatically gets the Error trait's message() default implementation (reads the msg field).
 // type_name() override returns "io error" for easy identification in logs.
 type IOError: Err = IOError(
-    kind: IOErrorKind,
-    msg: str,
-    os_err: i32,
-    path: str?,
+    pub kind: IOErrorKind,
+    pub message: str,
+    pub os_err: i32,
+    pub path: str?,
 ) {
     override fun type_name(): str { "io error" }
 }

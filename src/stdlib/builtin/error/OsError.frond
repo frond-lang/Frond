@@ -14,9 +14,9 @@
 // default implementation (reads the msg field). type_name() override returns
 // "os error" for easy identification in logs.
 type OsError: Err = OsError(
-    kind: OsErrorKind,
-    msg: str,
-    code: i32,
+    pub kind: OsErrorKind,
+    pub message: str,
+    pub code: i32,
 ) {
     override fun type_name(): str { "os error" }
 }

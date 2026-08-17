@@ -135,7 +135,7 @@ fun round_f128_impl(x: f128): f128 {
     else { t }
 }
 
-pub fun round<T>(x: T): T {
+pub fun nearest<T>(x: T): T {
     match x.type_name() {
         "f64" => (round_f64_impl(x as f64)) as T,
         "f32" => (round_f32_impl(x as f32)) as T,
@@ -196,7 +196,7 @@ fun fmod_f64_impl(x: f64, y: f64): f64 {
 }
 @internal
 fun fmod_f32_impl(x: f32, y: f32): f32 {
-    if y == 0.0 { return 0.0f32 / 0.0f32 }
+    if y == 0.0 { return Math.nan_f32() }
     val quotient = x / y
     val truncated = trunc_f32_impl(quotient)
     x - truncated * y
@@ -331,7 +331,7 @@ fun frexp_f64_exponent_impl(x: f64): i32 {
 fun frexp_f32_mantissa_impl(x: f32): f32 {
     if x == 0.0 { return 0.0 }
     if x != x { return x }
-    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return x }
+    if x == Math.inf_f32() || x == Math.neg_inf_f32() { return x }
     var m = if x < 0.0 { 0.0 - x } else { x }
     while m >= 1.0 { m = m / 2.0 }
     while m < 0.5 { m = m * 2.0 }
@@ -358,7 +358,7 @@ fun frexp_f32_exponent_impl(x: f32): i32 {
 fun frexp_f16_mantissa_impl(x: f16): f16 {
     if x == 0.0 { return 0.0 }
     if x != x { return x }
-    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return x }
+    if x == Math.inf_f16() || x == Math.neg_inf_f16() { return x }
     var m = if x < 0.0 { 0.0 - x } else { x }
     while m >= 1.0 { m = m / 2.0 }
     while m < 0.5 { m = m * 2.0 }
@@ -385,7 +385,7 @@ fun frexp_f16_exponent_impl(x: f16): i32 {
 fun frexp_f128_mantissa_impl(x: f128): f128 {
     if x == 0.0 { return 0.0 }
     if x != x { return x }
-    if x == 1.0 / 0.0 || x == -1.0 / 0.0 { return x }
+    if x == Math.inf_f128() || x == Math.neg_inf_f128() { return x }
     var m = if x < 0.0 { 0.0 - x } else { x }
     while m >= 1.0 { m = m / 2.0 }
     while m < 0.5 { m = m * 2.0 }

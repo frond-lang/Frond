@@ -4,7 +4,7 @@
 // All calendar operations (add_days etc.) are delegated to pure functions of the Calendar module
 // Formatting helpers like pad_int / digit_char are all implemented in Frond — decision S11 (no __format_int primitive introduced)
 
-pub type DateTime = DateTime(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8, nanos: u32, weekday: u8, day_of_year: u16) {
+pub type DateTime = DateTime(pub year: i32, pub month: u8, pub day: u8, pub hour: u8, pub minute: u8, pub second: u8, pub nanos: u32, pub weekday: u8, pub day_of_year: u16) {
     // ─── Conversion to/from TimeComponents ────────────────────────────────────────
 
     pub fun to_components(): TimeComponents {

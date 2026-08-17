@@ -36,7 +36,7 @@ fun __stderr_write(s: str): Throw<void, IOError> {
 // Reads into u8[] buffer via @extern("C") __stdin_readln_into, then casts to str.
 // Returns None = EOF, Some(s) = line with newline removed.
 fun __stdin_readln(): Throw<str?, IOError> {
-    val buf: u8[] = [0u8] * 4096
+    val buf: u8[] = [0, ..4096]
     val n = __stdin_readln_into(buf)
     if n < 0 {
         throw IOError(Other, "stdin read failed", 0, null)

@@ -1,0 +1,24 @@
+// U64.frond — the u64 integer type module (part of std.core)
+//
+// Boundary constants + decimal parse. parse returns null on malformed input
+// (empty, bad sign position, non-digit); accumulation wraps on overflow by
+// design — check ranges yourself when inputs are untrusted.
+
+pub val MAX: u64 = 18446744073709551615
+
+pub fun parse(s: str): u64? {
+    val b = s.bytes()
+    if b.len() == 0 { return null }
+    var neg = false
+    var i = 0 as usize
+    if b[0] == (45 as u8) { neg = true; i = 1 as usize }
+    if i >= b.len() { return null }
+    var v: u64 = 0
+    while i < b.len() {
+        val d = (b[i] as u64) - 48
+        if d < 0 || d > 9 { return null }
+        v = v * 10 + d
+        i = i + 1
+    }
+    if neg { 0 - v } else { v }
+}

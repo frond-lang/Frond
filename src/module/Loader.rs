@@ -173,10 +173,69 @@ impl ModuleLoader {
             }
         }
 
+        let dir_name = path_str.strip_suffix(".frond").unwrap_or(&path_str);
+
+        // 4a-embed. Directory module over the EMBEDDED stdlib table: same shape
+        // as the filesystem branch (4b) below, but pack.frond and the submodule
+        // files come from StdlibEmbed. Without this, `import std.math` /
+        // `import std.core` — a directory holding only pack.frond + submodule
+        // files, no DirectoryName.frond — failed with "module not found".
+        {
+            let pack_path_key = format!("{}/pack.frond", dir_name);
+            if let Some(pack_source) = find(&pack_path_key) {
+                let (pack_arena, pack_source_owned, pack_module) =
+                    match parse_source(&pack_path_key, pack_source) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            self.failed_paths.insert(path_str.clone());
+                            self.load_errors.push(LoadError::ParseFailed {
+                                path: path_str,
+                                line: err.line,
+                                column: err.column,
+                                message: err.message,
+                            });
+                            return None;
+                        }
+                    };
+                for sub_name in collect_pack_submodules(&pack_module) {
+                    let sub_path_str = format!("{}/{}.frond", dir_name, sub_name);
+                    if self.modules.contains_key(&sub_path_str) {
+                        continue;
+                    }
+                    if let Some(sub_source) = find(&sub_path_str) {
+                        if let Ok((sub_arena, sub_source_owned, sub_module)) =
+                            parse_source(&sub_path_str, sub_source)
+                        {
+                            let sub_exports = collect_exports(&sub_module);
+                            self.modules.insert(
+                                sub_path_str,
+                                LoadedModule {
+                                    _arena: sub_arena,
+                                    _source: sub_source_owned,
+                                    module: sub_module,
+                                    exports: sub_exports,
+                                },
+                            );
+                        }
+                    }
+                }
+                let pack_exports = collect_exports(&pack_module);
+                self.modules.insert(
+                    path_str.clone(),
+                    LoadedModule {
+                        _arena: pack_arena,
+                        _source: pack_source_owned,
+                        module: pack_module,
+                        exports: pack_exports,
+                    },
+                );
+                return self.modules.get(&path_str).map(|m| &m.module);
+            }
+        }
+
         // 4b. Directory module detection: `path` refers not to a file but to a directory (containing pack.frond).
         // e.g. `import Store` → Store.frond does not exist, but Store/pack.frond does.
         // Load pack.frond to obtain submodule declarations, then load each submodule file.
-        let dir_name = path_str.strip_suffix(".frond").unwrap_or(&path_str);
         for base in &self.search_paths {
             let pack_file = base.join(dir_name).join("pack.frond");
             if !pack_file.exists() {

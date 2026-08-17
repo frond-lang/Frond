@@ -10,8 +10,8 @@
 // Note: the engine raises these errors by type name ("FfiError") from the
 // compute layer; this declaration gives catch sites a concrete type to match.
 type FfiError: Err = FfiError(
-    kind: FfiErrorKind,
-    msg: str,
+    pub kind: FfiErrorKind,
+    pub message: str,
 ) {
     override fun type_name(): str { "ffi error" }
 }

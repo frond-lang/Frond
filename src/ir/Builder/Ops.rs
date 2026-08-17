@@ -519,8 +519,18 @@ impl<'a> IrBuilder<'a> {
         // Get the target type name.
         // In a generic context, target may be a type-parameter name (e.g. "T"); look up
         // current_type_args to replace it with the concrete type name.
+        // Nullable wrappers (`f32?`) peel to the inner scalar: the runtime Value
+        // of a nullable scalar IS the scalar (null is the Null sentinel), so the
+        // cast targets the base type and null passes through at runtime.
         let target_ty = {
-            let spanned = &self.current_module().arena.types[target.0 as usize];
+            let mut ty = target;
+            let spanned = loop {
+                let s = &self.current_module().arena.types[ty.0 as usize];
+                match &s.node {
+                    crate::ast::Ast::TypeNode::Nullable { inner } => ty = *inner,
+                    _ => break s,
+                }
+            };
             match &spanned.node {
                 crate::ast::Ast::TypeNode::Named { name } => {
                     let name = *name;
@@ -539,8 +549,13 @@ impl<'a> IrBuilder<'a> {
             }
         };
 
-        // Get the source type name (from Sema expr_types)
-        let source_ty = self.expr_type_name(expr).unwrap_or("i64").to_string();
+        // Get the source type name (from Sema expr_types; peel a trailing '?'
+        // the same way so scalar-tag matching sees the base scalar).
+        let source_ty = self
+            .expr_type_name(expr)
+            .unwrap_or("i64")
+            .trim_end_matches('?')
+            .to_string();
 
         let input = self.compile_subexpr(expr);
 

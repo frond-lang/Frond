@@ -3,24 +3,22 @@
 // Design doc §4.7: Fs convenience API
 // Combine File.open + read/write + close three steps into a single call,
 // suitable for scripting scenarios; for high-throughput scenarios use File + Buffered directly.
+//
+// API convention (2026-08-17): io APIs take/return Path only — the single
+// path currency across std (str spellings go through Path.from / .to_str()).
 
 // ─── Text IO ──────────────────────────────────────────────────────
 
 // One-shot read entire file content as str
-pub async fun read_file(path: str): Async<Throw<str, IOError>> {
+pub async fun read_file(path: Path): Async<Throw<str, IOError>> {
     val f = File.open(path, File.read_only()).await()?
     defer f.close().await()
     val reader = Buffered.new_reader(f)
     reader.read_to_string().await()?
 }
 
-// One-shot read entire file content as str (Path overload)
-pub async fun read_file_path(path: Path): Async<Throw<str, IOError>> {
-    read_file(path.to_str()).await()?
-}
-
 // One-shot write str to file (overwrite existing content)
-pub async fun write_file(path: str, content: str): Async<Throw<void, IOError>> {
+pub async fun write_file(path: Path, content: str): Async<Throw<void, IOError>> {
     val f = File.open(path, File.create_rw()).await()?
     defer f.close().await()
     val writer = Buffered.new_writer(f)
@@ -30,7 +28,7 @@ pub async fun write_file(path: str, content: str): Async<Throw<void, IOError>> {
 }
 
 // Append write str to end of file
-pub async fun append_file(path: str, content: str): Async<Throw<void, IOError>> {
+pub async fun append_file(path: Path, content: str): Async<Throw<void, IOError>> {
     val f = File.open(path, File.append_mode()).await()?
     defer f.close().await()
     val bytes = content.bytes()
@@ -41,7 +39,7 @@ pub async fun append_file(path: str, content: str): Async<Throw<void, IOError>> 
 // ─── Byte IO ──────────────────────────────────────────────────────
 
 // One-shot read entire file bytes
-pub async fun read_file_bytes(path: str): Async<Throw<u8[], IOError>> {
+pub async fun read_file_bytes(path: Path): Async<Throw<u8[], IOError>> {
     val f = File.open(path, File.read_only()).await()?
     defer f.close().await()
     val reader = Buffered.new_reader(f)
@@ -49,7 +47,7 @@ pub async fun read_file_bytes(path: str): Async<Throw<u8[], IOError>> {
 }
 
 // One-shot write bytes to file (overwrite existing content)
-pub async fun write_file_bytes(path: str, content: u8[]): Async<Throw<void, IOError>> {
+pub async fun write_file_bytes(path: Path, content: u8[]): Async<Throw<void, IOError>> {
     val f = File.open(path, File.create_rw()).await()?
     defer f.close().await()
     f.write(content, content.len()).await()?
@@ -60,37 +58,27 @@ pub async fun write_file_bytes(path: str, content: u8[]): Async<Throw<void, IOEr
 
 // Whether the path exists (false for a missing path is NOT an error;
 // a Throw Err is reserved for host-level failures).
-pub async fun exists(path: str): Async<Throw<bool, IOError>> {
-    Ok(__file_exists_raw(path) != 0)
-}
-
-// Exists overload (Path)
-pub async fun exists_path(path: Path): Async<Throw<bool, IOError>> {
-    exists(path.to_str()).await()
+pub async fun exists(path: Path): Async<Throw<bool, IOError>> {
+    Ok(__file_exists_raw(path.to_str()) != 0)
 }
 
 // Copy a file, overwriting dst if it exists. Metadata is not preserved
 // (a fresh destination file is created), matching a plain byte copy.
-pub async fun copy_file(src: str, dst: str): Async<Throw<void, IOError>> {
-    val rc = __file_copy_raw(src, dst)
+pub async fun copy_file(src: Path, dst: Path): Async<Throw<void, IOError>> {
+    val rc = __file_copy_raw(src.to_str(), dst.to_str())
     if rc < 0 {
-        throw IOError(Other, "copy failed: " + src + " -> " + dst, 0, dst)
+        throw IOError(Other, "copy failed: " + src.to_str() + " -> " + dst.to_str(), 0, dst.to_str())
     }
     Ok(void)
-}
-
-// Copy overload (Path)
-pub async fun copy_file_path(src: Path, dst: Path): Async<Throw<void, IOError>> {
-    copy_file(src.to_str(), dst.to_str()).await()
 }
 
 // Change file permission bits.
 // NOTE Windows semantics downgrade: only the read-only bit is honored
 // (setting any write bit clears read-only, clearing all write bits sets it).
-pub async fun chmod(path: str, mode: i32): Async<Throw<void, IOError>> {
-    val rc = __file_chmod_raw(path, mode)
+pub async fun chmod(path: Path, mode: i32): Async<Throw<void, IOError>> {
+    val rc = __file_chmod_raw(path.to_str(), mode)
     if rc < 0 {
-        throw IOError(Other, "chmod failed", 0, path)
+        throw IOError(Other, "chmod failed", 0, path.to_str())
     }
     Ok(void)
 }

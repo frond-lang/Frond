@@ -29,8 +29,8 @@ fun sin_f64_impl(x: f64): f64 {
 }
 @internal
 fun sin_f32_impl(x: f32): f32 {
-    val two_pi: f32 = 0x1.921fb6p+2f32
-    val pi: f32 = 0x1.921fb6p+1f32
+    val two_pi: f32 = 0x1.921fb6p+2
+    val pi: f32 = 0x1.921fb6p+1
     var r = fmod_f32_impl(x, two_pi)
     if r > pi { r = r - two_pi }
     if r < 0.0 - pi { r = r + two_pi }
@@ -107,7 +107,7 @@ fun cos_f64_impl(x: f64): f64 {
 }
 @internal
 fun cos_f32_impl(x: f32): f32 {
-    val pi_half: f32 = 0x1.921fb6p+0f32
+    val pi_half: f32 = 0x1.921fb6p+0
     sin_f32_impl(x + pi_half)
 }
 @internal
@@ -144,7 +144,7 @@ fun tan_f64_impl(x: f64): f64 {
 fun tan_f32_impl(x: f32): f32 {
     val s = sin_f32_impl(x)
     val c = cos_f32_impl(x)
-    if c == 0.0 { return 1.0f32 / 0.0f32 }
+    if c == 0.0 { return Math.inf_f32() }
     s / c
 }
 @internal
@@ -330,7 +330,7 @@ fun atan_f64_impl(x: f64): f64 {
 }
 @internal
 fun atan_f32_impl(x: f32): f32 {
-    val pi_half: f32 = 0x1.921fb6p+0f32
+    val pi_half: f32 = 0x1.921fb6p+0
     if x == 0.0 { return 0.0 }
     var a = if x < 0.0 { 0.0 - x } else { x }
     var inv = 0
@@ -427,8 +427,8 @@ fun asin_f64_impl(x: f64): f64 {
 }
 @internal
 fun asin_f32_impl(x: f32): f32 {
-    val pi_half: f32 = 0x1.921fb6p+0f32
-    if x > 1.0 || x < 0.0 - 1.0 { return 0.0f32 / 0.0f32 }
+    val pi_half: f32 = 0x1.921fb6p+0
+    if x > 1.0 || x < 0.0 - 1.0 { return Math.nan_f32() }
     if x == 1.0 { return pi_half }
     if x == 0.0 - 1.0 { return 0.0 - pi_half }
     atan_f32_impl(x / sqrt_f32_impl(1.0 - x * x))
@@ -469,7 +469,7 @@ fun acos_f64_impl(x: f64): f64 {
 }
 @internal
 fun acos_f32_impl(x: f32): f32 {
-    val pi_half: f32 = 0x1.921fb6p+0f32
+    val pi_half: f32 = 0x1.921fb6p+0
     pi_half - asin_f32_impl(x)
 }
 @internal
@@ -511,8 +511,8 @@ fun atan2_f64_impl(y: f64, x: f64): f64 {
 }
 @internal
 fun atan2_f32_impl(y: f32, x: f32): f32 {
-    val pi: f32 = 0x1.921fb6p+1f32
-    val pi_half: f32 = 0x1.921fb6p+0f32
+    val pi: f32 = 0x1.921fb6p+1
+    val pi_half: f32 = 0x1.921fb6p+0
     if x > 0.0 { return atan_f32_impl(y / x) }
     if x < 0.0 {
         if y >= 0.0 { return atan_f32_impl(y / x) + pi }
@@ -598,7 +598,7 @@ fun acosh_f64_impl(x: f64): f64 {
 }
 @internal
 fun acosh_f32_impl(x: f32): f32 {
-    if x < 1.0 { return 0.0f32 / 0.0f32 }
+    if x < 1.0 { return Math.nan_f32() }
     log_f32_impl(x + sqrt_f32_impl(x * x - 1.0))
 }
 @internal
@@ -632,7 +632,7 @@ fun atanh_f64_impl(x: f64): f64 {
 }
 @internal
 fun atanh_f32_impl(x: f32): f32 {
-    if x >= 1.0 || x <= 0.0 - 1.0 { return 0.0f32 / 0.0f32 }
+    if x >= 1.0 || x <= 0.0 - 1.0 { return Math.nan_f32() }
     0.5 * log_f32_impl((1.0 + x) / (1.0 - x))
 }
 @internal

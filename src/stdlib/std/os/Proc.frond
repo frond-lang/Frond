@@ -1,11 +1,32 @@
-// Proc.frond — current-process information and termination
+// Proc.frond — current-process information, termination, and child processes
 //
-// Sync API. Command-line arguments are intentionally NOT here: Frond passes
-// them to `main(args)` directly, which is the single source of truth.
+// Sync API. Command-line arguments: the cli registers everything after `--`
+// into the engine's argv slot (see engine ProgramArgs); `args()` reads that
+// slot — main's signature stays `(): void`.
+
+import std.io.Path
 
 // Process id of the current process.
 pub fun getpid(): i64 {
     __os_getpid()
+}
+
+// Command-line arguments of this program (set by the cli from the values
+// after `--`; empty when none were passed). Unlike Go os.Args this EXCLUDES
+// the program's own path — it is exactly what the operator forwarded.
+pub fun args(): str[] {
+    val n = __os_arg_count()
+    var out: str[] = []
+    var i = 0
+    while i < n {
+        val buf: u8[] = [0, ..4096]
+        val len = __os_arg_get_into(i, buf)
+        if len > 0 {
+            out = out ++ [(buf[0..len as usize]) as str]
+        }
+        i = i + 1
+    }
+    out
 }
 
 // Terminate the process immediately with the given exit code.
@@ -33,4 +54,164 @@ pub fun system(cmd: str): Throw<i32, OsError> {
         throw OsError(Other, "failed to launch shell command: " + cmd, 0)
     }
     Ok(rc)
+}
+
+// Pack argv into the NUL-separated blob the spawn primitives expect.
+fun pack_args(args: str[]): u8[] {
+    var blob: u8[] = []
+    var i = 0 as usize
+    while i < args.len() {
+        blob = blob ++ args[i].bytes() ++ [0]
+        i = i + 1
+    }
+    blob
+}
+
+// Pack an environment into the NUL-separated "KEY=VALUE" blob (same shape
+// as argv blobs). Empty array = inherit the caller's environment.
+fun pack_env(env: str[]): u8[] {
+    pack_args(env)
+}
+
+// Options for launching a child process. Defaults: cwd = null (inherit the
+// caller's working directory), env = [] (inherit the caller's environment).
+// A non-empty env REPLACES the environment entirely — Go semantics; compose
+// Env.vars() + your additions if you want the caller's vars carried over.
+pub type SpawnOptions = SpawnOptions(pub cwd: Path?, pub env: str[])
+
+fun options_cwd(options: SpawnOptions): str {
+    match options.cwd {
+        null => "",
+        p => p.to_str(),
+    }
+}
+
+// A launched child process (handle is internal: construct via spawn()).
+pub type Process = Process(handle: u64) {
+    // The child's process id (display purposes).
+    pub fun pid(): i64 { __os_process_pid(handle) }
+
+    // Block until the child exits and release the handle. Returns the exit
+    // code (a signaled child reports 128+signal on POSIX).
+    pub fun wait(): Throw<i32, OsError> {
+        val code = __os_process_wait(handle)
+        val _ = __os_process_close(handle)
+        if code == -1 {
+            throw OsError(Other, "failed to wait for child process", 0)
+        }
+        Ok(code)
+    }
+
+    // Like wait(), but gives up after timeout_ms. Ok(null) = the timeout
+    // expired while the child was still running (the handle stays valid:
+    // call wait()/wait_timeout()/kill() again); Ok(code) = the child exited.
+    pub fun wait_timeout(timeout_ms: i64): Throw<i32?, OsError> {
+        val code = __os_process_wait_timeout(handle, timeout_ms)
+        if code == -1 {
+            val _ = __os_process_close(handle)
+            throw OsError(Other, "failed to wait for child process", 0)
+        }
+        if code == -2 {
+            return Ok(null)
+        }
+        val _ = __os_process_close(handle)
+        Ok(code)
+    }
+
+    // Terminate the child unconditionally (SIGKILL on POSIX). Does not reap:
+    // call wait()/wait_timeout() afterwards to collect the exit code.
+    pub fun kill(): Throw<void, OsError> {
+        if __os_process_kill(handle) != 0 {
+            throw OsError(Other, "failed to terminate child process", 0)
+        }
+        Ok(void)
+    }
+}
+
+// Launch a child process WITHOUT a shell, inheriting stdio, and return the
+// Process immediately (non-blocking counterpart of run — call wait() to
+// collect the exit code).
+pub fun spawn(program: str, args: str[]): Throw<Process, OsError> {
+    spawn_with_options(program, args, SpawnOptions(null, []))
+}
+
+// spawn with a SpawnOptions (working directory / environment replacement).
+pub fun spawn_with_options(program: str, args: str[], options: SpawnOptions): Throw<Process, OsError> {
+    val handle = __os_spawn(program, pack_args(args), options_cwd(options), pack_env(options.env))
+    if handle == 0 {
+        throw OsError(NotFound, "failed to launch process: " + program, 0)
+    }
+    Ok(Process(handle))
+}
+
+// The merged output of a captured child (stdout and stderr combined).
+pub type CommandOutput = CommandOutput(pub exit_code: i32, pub output: str)
+
+// Launch a child process with stdout+stderr merged into one pipe, read until
+// EOF, wait for exit. v1 semantics: output arrives as one combined string
+// (Go's CombinedOutput shape), not separate streams.
+pub fun capture(program: str, args: str[]): Throw<CommandOutput, OsError> {
+    capture_with_options(program, args, SpawnOptions(null, []))
+}
+
+// capture with a SpawnOptions (working directory / environment replacement).
+pub fun capture_with_options(program: str, args: str[], options: SpawnOptions): Throw<CommandOutput, OsError> {
+    val handle = __os_capture_spawn(program, pack_args(args), options_cwd(options), pack_env(options.env))
+    if handle == 0 {
+        throw OsError(NotFound, "failed to launch process: " + program, 0)
+    }
+    var out: u8[] = []
+    val chunk: u8[] = [0, ..8192]
+    while true {
+        val n = __os_capture_read_into(handle, chunk)
+        if n <= 0 { break }
+        out = out ++ chunk[0..(n as usize)]
+    }
+    val code = __os_capture_finish(handle)
+    if code == -1 {
+        throw OsError(Other, "failed to wait for captured process: " + program, 0)
+    }
+    Ok(CommandOutput(code, (out[0..out.len()]) as str))
+}
+
+// The absolute path of the current executable (Windows: GetModuleFileName;
+// Linux: /proc/self/exe; platforms without a lookup surface throw
+// Unsupported).
+pub fun executable(): Throw<Path, OsError> {
+    val buf: u8[] = [0, ..4096]
+    val len = __os_executable_into(buf)
+    if len == -2 {
+        val big: u8[] = [0, ..65536]
+        val n2 = __os_executable_into(big)
+        if n2 <= 0 {
+            throw OsError(Unsupported, "failed to resolve the executable path", 0)
+        }
+        return Ok(Path.from((big[0..(n2 as usize)]) as str))
+    }
+    if len <= 0 {
+        throw OsError(Unsupported, "executable path is not available on this platform", 0)
+    }
+    Ok(Path.from((buf[0..(len as usize)]) as str))
+}
+
+// Launch a child process WITHOUT a shell, inheriting stdio, and block until it
+// exits. Returns the exit code (a signaled child reports 128+signal on POSIX).
+// The non-shell counterpart of system(): no quoting/escaping surprises, args
+// pass through verbatim (Windows uses MSVCRT quoting rules internally).
+pub fun run(program: str, args: str[]): Throw<i32, OsError> {
+    run_with_options(program, args, SpawnOptions(null, []))
+}
+
+// run with a SpawnOptions (working directory / environment replacement).
+pub fun run_with_options(program: str, args: str[], options: SpawnOptions): Throw<i32, OsError> {
+    val handle = __os_spawn(program, pack_args(args), options_cwd(options), pack_env(options.env))
+    if handle == 0 {
+        throw OsError(NotFound, "failed to launch process: " + program, 0)
+    }
+    val code = __os_process_wait(handle)
+    val _ = __os_process_close(handle)
+    if code == -1 {
+        throw OsError(Other, "failed to wait for child process", 0)
+    }
+    Ok(code)
 }

@@ -4,7 +4,7 @@
 // Internal storage nanos: i128, can express about ±10^11 seconds (3000+ years)
 // Differences between Instant / SystemTime / DateTime are all represented as Duration
 
-pub type Duration = Duration(nanos: i128) {
+pub type Duration = Duration(pub nanos: i128) {
     // ─── Converters (convert to various time units) ───────────────────────────────────
 
     pub fun as_secs(): i64 {

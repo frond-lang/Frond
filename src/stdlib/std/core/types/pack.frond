@@ -1,0 +1,21 @@
+// std/core package declaration
+//
+// One import (`import std.core.types`) exposes every value-type module as a
+// short-qualified namespace: Str (string algorithms), I8..I128/U8..U128
+// (integer bounds + parse), F16/F32/F64/F128 (float bounds + parse), Bool.
+pub pack Str
+pub pack I8
+pub pack I16
+pub pack I32
+pub pack I64
+pub pack I128
+pub pack U8
+pub pack U16
+pub pack U32
+pub pack U64
+pub pack U128
+pub pack F16
+pub pack F32
+pub pack F64
+pub pack F128
+pub pack Bool

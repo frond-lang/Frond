@@ -95,6 +95,13 @@ pub struct IrBuilder<'a> {
     /// to the original node, so the closure can read the latest value from the parent frame
     /// during a `same_function` call (capture-by-reference semantics).
     pub captured_vars: rustc_hash::FxHashMap<String, NodeId>,
+    /// Function subgraphs that contain a function-level defer (Bug #49). Historically this
+    /// was `!defer_table.is_empty()`; now that defers register dynamically at runtime
+    /// (CF_BLOCK_DEFER_REGISTER + frame.defer_stack), the table is always empty, so this
+    /// builder-side set is the flag. Local reassignment inside such functions emits a
+    /// WriteBack to the original node so the defer body reads the LATEST value
+    /// (Reference-mode captures).
+    pub function_defer_sgs: rustc_hash::FxHashSet<SubGraphId>,
     /// Type-field scope stack: constructor/type name -> field name list
     /// (managed in parallel with `scope_stack`).
     pub type_scope_stack: Vec<rustc_hash::FxHashMap<String, TypeFieldInfo>>,
@@ -332,6 +339,7 @@ impl<'a> IrBuilder<'a> {
             scope_stack: Vec::new(),
             captured_scopes: Vec::new(),
             captured_vars: rustc_hash::FxHashMap::default(),
+            function_defer_sgs: rustc_hash::FxHashSet::default(),
             current_function_id: 0,
             current_sg_start: 0,
             current_effect: None,
@@ -657,15 +665,12 @@ impl<'a> IrBuilder<'a> {
         node.0 >= self.current_sg_start
     }
 
-    /// Bug #49: check whether the current function subgraph has registered a defer (after defer
-    /// compilation, `defer_table` is non-empty).
+    /// Bug #49: check whether the current function subgraph contains a function-level defer.
     /// Used to decide whether a local variable reassignment needs a WriteBack to the original
-    /// node.
+    /// node (so defer bodies read the latest value, Reference-mode semantics).
     pub(super) fn current_function_has_defer(&self) -> bool {
         if let Some(sg_id) = self.current_function_sg {
-            if let Some(sg) = self.graph.subgraphs.get(sg_id.0 as usize) {
-                return !sg.defer_table.is_empty();
-            }
+            return self.function_defer_sgs.contains(&sg_id);
         }
         false
     }
@@ -1192,22 +1197,26 @@ impl<'a> IrBuilder<'a> {
                 return Some(Ok(sg));
             }
         }
-        // 2. current-module mangled
-        if let Some(ref mp) = cur_path {
-            let key = format!("{}.{}", mp, name);
-            if let Some(&sg) = self.func_subgraphs.get(key.as_str()) {
-                self.log_call_bind(site, name, recv, &key, sg);
-                return Some(Ok(sg));
-            }
-        }
-        // 3. recv short-qualified (`File.remove`) — explicit qualifier beats
-        // ambient package visibility (see doc comment).
+        // 2. recv short-qualified (`F64.parse`) — an EXPLICIT qualifier outranks
+        //    every ambient key. This must run BEFORE the current-module mangled
+        //    probe: while compiling std/core/F32.frond, a call to F64.parse(s)
+        //    (name="parse", recv="F64") used to hit "std.core.F32.parse" first —
+        //    binding the call to the CALLING function itself (infinite
+        //    self-recursion, scheduler deadlock).
         if let Some(rn) = recv {
             let key = format!("{}.{}", rn, name);
             if let Some(&sg) = self.func_subgraphs.get(key.as_str()) {
                 if let Some(diag) = self.conflict_diag(&key) {
                     return Some(Err(diag));
                 }
+                self.log_call_bind(site, name, recv, &key, sg);
+                return Some(Ok(sg));
+            }
+        }
+        // 3. current-module mangled
+        if let Some(ref mp) = cur_path {
+            let key = format!("{}.{}", mp, name);
+            if let Some(&sg) = self.func_subgraphs.get(key.as_str()) {
                 self.log_call_bind(site, name, recv, &key, sg);
                 return Some(Ok(sg));
             }
@@ -1587,14 +1596,29 @@ impl<'a> IrBuilder<'a> {
                         crate::ast::Ast::Stmt::ValDecl { name, .. } => *name,
                         _ => unreachable!(),
                     };
-                    if !self.global_var_slots.contains_key(name) {
-                        let slot = self.global_var_slots.len() as u32;
-                        self.global_var_slots.insert(name.to_string(), slot);
-                        self.top_level_var_decls.push((None, *stmt_id));
-                        // Register the mangled name (module_path.name) pointing to the same slot
-                        if let Some(ref mp) = crate::sema::Sema::module_logical_path(self.module.name) {
+                    // Slot keying: the mangled name (module_path.name) is the
+                    // primary key — every module's top-level val gets its OWN
+                    // slot (std.core.I8.MAX vs std.core.I64.MAX share the bare
+                    // name but are distinct variables). The bare name is only a
+                    // first-wins alias for same-module lookups.
+                    match crate::sema::Sema::module_logical_path(self.module.name) {
+                        Some(mp) => {
                             let mangled = format!("{}.{}", mp, name);
-                            self.global_var_slots.insert(mangled, slot);
+                            if !self.global_var_slots.contains_key(&mangled) {
+                                let slot = self.global_var_slots.len() as u32;
+                                self.global_var_slots.insert(mangled, slot);
+                                self.top_level_var_decls.push((None, *stmt_id));
+                                self.global_var_slots
+                                    .entry(name.to_string())
+                                    .or_insert(slot);
+                            }
+                        }
+                        None => {
+                            if !self.global_var_slots.contains_key(name) {
+                                let slot = self.global_var_slots.len() as u32;
+                                self.global_var_slots.insert(name.to_string(), slot);
+                                self.top_level_var_decls.push((None, *stmt_id));
+                            }
                         }
                     }
                 }
@@ -1610,14 +1634,25 @@ impl<'a> IrBuilder<'a> {
                             crate::ast::Ast::Stmt::ValDecl { name, .. } => *name,
                             _ => unreachable!(),
                         };
-                        if !self.global_var_slots.contains_key(name) {
-                            let slot = self.global_var_slots.len() as u32;
-                            self.global_var_slots.insert(name.to_string(), slot);
-                            self.top_level_var_decls.push((Some(i), *stmt_id));
-                            // Register the mangled name (module_path.name) pointing to the same slot
-                            if let Some(ref mp) = crate::sema::Sema::module_logical_path(m.name) {
+                        // Same mangled-primary / bare-alias keying as above.
+                        match crate::sema::Sema::module_logical_path(m.name) {
+                            Some(mp) => {
                                 let mangled = format!("{}.{}", mp, name);
-                                self.global_var_slots.insert(mangled, slot);
+                                if !self.global_var_slots.contains_key(&mangled) {
+                                    let slot = self.global_var_slots.len() as u32;
+                                    self.global_var_slots.insert(mangled, slot);
+                                    self.top_level_var_decls.push((Some(i), *stmt_id));
+                                    self.global_var_slots
+                                        .entry(name.to_string())
+                                        .or_insert(slot);
+                                }
+                            }
+                            None => {
+                                if !self.global_var_slots.contains_key(name) {
+                                    let slot = self.global_var_slots.len() as u32;
+                                    self.global_var_slots.insert(name.to_string(), slot);
+                                    self.top_level_var_decls.push((Some(i), *stmt_id));
+                                }
                             }
                         }
                     }

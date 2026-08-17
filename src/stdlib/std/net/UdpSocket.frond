@@ -91,7 +91,7 @@ pub type UdpSocket = UdpSocket(fd: i64, local_addr: SocketAddr, is_closed: bool)
         if is_closed {
             throw IOError(InvalidInput, "socket closed", 0, null)
         }
-        val buf: u8[] = [0u8] * len
+        val buf: u8[] = [0, ..len]
         val n = match local_addr.ip {
             V4(_) => __net_udp_recv_from_v4(fd, buf, len),
             V6(_) => __net_udp_recv_from_v6(fd, buf, len),

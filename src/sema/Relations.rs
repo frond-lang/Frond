@@ -864,6 +864,34 @@ pub fn peer_type(arena: &mut TypeArena, types: &[TypeHandle]) -> TypeHandle {
         return arena.make_throw(peer_val, peer_err);
     }
 
+    // All arrays → Array<first concrete element>. Mixed arms like
+    // `[65, 66]` (Array<u8>) vs `[]` (Array<TypeVar>, the empty-literal
+    // starting form) previously fell through to Unknown — the bound value then
+    // had no type name, and method calls on it (e.g. `bs.len()`) compiled to
+    // target-less Call nodes that panicked the engine at runtime. Joining by
+    // element keeps the match result a real array.
+    let all_array = non_trivial.iter().all(|&t| {
+        matches!(arena.get(arena.resolve(t)), Type::Array(_))
+    });
+    if all_array {
+        let elems: Vec<TypeHandle> = non_trivial
+            .iter()
+            .map(|&t| {
+                let resolved = arena.resolve(t);
+                arena.array_parts(resolved).0
+            })
+            .collect();
+        let first_concrete = elems.iter().copied().find(|&e| {
+            !matches!(
+                arena.get(arena.resolve(e)),
+                Type::TypeVar(_) | Type::Unknown
+            )
+        });
+        let elem = first_concrete
+            .unwrap_or_else(|| peer_type(arena, &elems));
+        return arena.make_array(elem, None);
+    }
+
     // Incompatible → Unknown
     arena.make(Type::Unknown)
 }

@@ -259,6 +259,9 @@ pub struct CtorDefInfo {
     pub type_name: Box<str>,
     pub field_names: Box<[Option<Box<str>>]>,
     pub field_types: Box<[TypeHandle]>,
+    /// Per-field visibility (aligned with `field_names`): private (module-scoped)
+    /// unless declared `pub`, even when the type itself is pub.
+    pub field_is_pub: Box<[bool]>,
     pub is_newtype: bool,
     /// Return type name of a GADT constructor (only valid for GADTs).
     pub return_type_name: Option<Box<str>>,
@@ -348,6 +351,9 @@ pub struct MethodSigInfo {
     /// the annotation coexists with a body (`override fun m(): R = A.m { ... }`),
     /// where it fixes the target of `super.m()` under multi-trait conflicts.
     pub delegate_trait: Option<Box<str>>,
+    /// Method visibility: private (module-scoped) unless declared `pub`,
+    /// even when the type is pub.
+    pub is_pub: bool,
 }
 
 /// Type definition info (replaces IRBuilder's type_table + ctor_table).
@@ -1393,6 +1399,7 @@ macro_rules! define_builtin_types {
                     intrinsic,
                     has_body: true,
                     delegate_trait: None,
+                    is_pub: true,
                 }
             }
 
@@ -1468,15 +1475,15 @@ define_builtin_types! {
         "Lib" : [] = [],
         "array" : ["T"] = [
             sig("len", vec![TypeRepr::ThisType], Some(TypeRepr::Named("usize".into())), Some(IntrinsicKind::UnOp(35))),
-            sig("is_empty", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), None),
+            sig("is_empty", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), Some(IntrinsicKind::UnOp(343))),
         ],
         "str" : [] = [
             sig("len", vec![TypeRepr::ThisType], Some(TypeRepr::Named("usize".into())), Some(IntrinsicKind::UnOp(35))),
-            sig("is_empty", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), None),
+            sig("is_empty", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), Some(IntrinsicKind::UnOp(343))),
             sig("bytes", vec![TypeRepr::ThisType], Some(TypeRepr::Array(Box::new(TypeRepr::Named("u8".into())), None)), Some(IntrinsicKind::UnOp(287))),
         ],
         "nullable" : ["T"] = [
-            sig("is_null", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), None),
+            sig("is_null", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), Some(IntrinsicKind::UnOp(34))),
         ],
     }
 }
@@ -2007,6 +2014,12 @@ fn build_method_sig_info<'a>(
         intrinsic: None,
         has_body: method.body.is_some(),
         delegate_trait: method.delegate.as_ref().map(|d| d.trait_name.into()),
+        // Trait implementations travel with the trait: override and delegate
+        // methods are public even without an explicit `pub`, mirroring the
+        // "trait methods are public with the trait" rule.
+        is_pub: matches!(method.visibility, crate::ast::Ast::Visibility::Public)
+            || method.is_override
+            || method.delegate.is_some(),
     }
 }
 
@@ -2178,6 +2191,8 @@ pub(crate) fn ast_type_decl_to_type_def<'a>(
                 type_name: name.clone(),
                 field_names: Box::new([Some("_0".into())]),
                 field_types: Box::new([target_ty]),
+                // Newtype 的单字段即值本身:构造即解构,newtype 保持可构造。
+                field_is_pub: Box::new([true]),
                 is_newtype: true,
                 return_type_name: None,
                 return_type_node: None,
@@ -2416,11 +2431,13 @@ fn constructor_def_to_ctor_info<'a>(
     let mut field_types: Vec<TypeHandle> = Vec::with_capacity(c.fields.len());
     let mut field_type_reprs: Vec<TypeRepr> = Vec::with_capacity(c.fields.len());
 
+    let mut field_is_pub: Vec<bool> = Vec::with_capacity(c.fields.len());
     for f in &c.fields {
         field_names.push(f.name.map(|n| n.into()));
         let ty = concretize_type(arena, f.ty, &[], ast, sema_result);
         field_types.push(ty);
         field_type_reprs.push(type_node_to_repr(&ast.ty(f.ty).node, ast));
+        field_is_pub.push(f.is_pub);
     }
 
     CtorDefInfo {
@@ -2428,6 +2445,7 @@ fn constructor_def_to_ctor_info<'a>(
         type_name: type_name.into(),
         field_names: field_names.into_boxed_slice(),
         field_types: field_types.into_boxed_slice(),
+        field_is_pub: field_is_pub.into_boxed_slice(),
         is_newtype: false,
         return_type_name: None,
         return_type_node: c.return_type,
@@ -2452,11 +2470,13 @@ fn record_fields_to_ctor_info<'a>(
     let mut field_types: Vec<TypeHandle> = Vec::with_capacity(fields.len());
     let mut field_type_reprs: Vec<TypeRepr> = Vec::with_capacity(fields.len());
 
+    let mut field_is_pub: Vec<bool> = Vec::with_capacity(fields.len());
     for f in fields {
         field_names.push(Some(f.name.into()));
         let ty = concretize_type(arena, f.ty, &[], ast, sema_result);
         field_types.push(ty);
         field_type_reprs.push(type_node_to_repr(&ast.ty(f.ty).node, ast));
+        field_is_pub.push(f.is_pub);
     }
 
     CtorDefInfo {
@@ -2464,6 +2484,7 @@ fn record_fields_to_ctor_info<'a>(
         type_name: type_name.into(),
         field_names: field_names.into_boxed_slice(),
         field_types: field_types.into_boxed_slice(),
+        field_is_pub: field_is_pub.into_boxed_slice(),
         is_newtype: false,
         return_type_name: None,
         return_type_node: None,

@@ -28,7 +28,7 @@ pub fn run() {
     match cli.command {
         Commands::Init { name } => Init::cmd_init(name),
         Commands::Build { output, opt_level } => Build::cmd_build(output, opt_level),
-        Commands::Run { file, opt_level } => Run::cmd_run(file, opt_level),
+        Commands::Run { args, opt_level } => Run::cmd_run(args, opt_level),
         Commands::Debug { file, stage } => Debug::cmd_debug(file, stage),
         Commands::Inspect { file, verbose } => Inspect::cmd_inspect(&file, verbose),
         Commands::Fmt { path, check, stdin } => Fmt::cmd_fmt(path, check, stdin),

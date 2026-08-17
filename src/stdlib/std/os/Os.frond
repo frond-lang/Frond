@@ -2,10 +2,12 @@
 //
 // Sync API. The working directory belongs to the process, not the file
 // system's structure, hence it lives in std.os rather than std.io.
+// Returns Path (io's path abstraction); use .to_str() for the raw string.
+import std.io.Path
 
-// Get the current working directory as an absolute path.
-pub fun current_dir(): Throw<str, OsError> {
-    val buf: u8[] = [0u8, ..4096]
+// Get the current working directory as an absolute Path.
+pub fun current_dir(): Throw<Path, OsError> {
+    val buf: u8[] = [0, ..4096]
     val n = __os_cwd_into(buf)
     if n < 0 {
         throw OsError(NotFound, "failed to get current directory", 0)
@@ -13,7 +15,7 @@ pub fun current_dir(): Throw<str, OsError> {
     if n == -2 || n as usize >= buf.len() {
         throw OsError(BufferTooSmall, "current directory exceeds buffer", 0)
     }
-    Ok((buf[0..n as usize]) as str)
+    Ok(Path.from((buf[0..n as usize]) as str))
 }
 
 // Change the current working directory.

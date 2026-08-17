@@ -32,7 +32,7 @@ fun sqrt_f64_impl(x: f64): f64 {
 }
 @internal
 fun sqrt_f32_impl(x: f32): f32 {
-    if x < 0.0 { return 0.0f32 / 0.0f32 }
+    if x < 0.0 { return Math.nan_f32() }
     if x == 0.0 { return 0.0 }
     var e = 0
     var m = x
@@ -241,7 +241,7 @@ fun exp_f64_impl(x: f64): f64 {
 fun exp_f32_impl(x: f32): f32 {
     val ln2: f32 = 0x1.62e42fefa39efp-1
     if x == 0.0 { return 1.0 }
-    if x > 88.722839052 { return 1.0f32 / 0.0f32 }
+    if x > 88.722839052 { return Math.inf_f32() }
     if x < -103.972085 { return 0.0 }
     val k = (floor_f32_impl(x / ln2 + 0.5)) as i32
     val r = x - k as f32 * ln2
@@ -257,7 +257,7 @@ fun exp_f32_impl(x: f32): f32 {
 }
 @internal
 fun exp_f16_impl(x: f16): f16 {
-    val ln2 = 0x1.63p-1f16
+    val ln2: f16 = 0x1.63p-1f16
     if x == 0.0 { return 1.0 }
     if x > 11.09 { return 1.0f16 / 0.0f16 }
     if x < -17.32 { return 0.0 }
@@ -337,9 +337,9 @@ fun log_f64_impl(x: f64): f64 {
 }
 @internal
 fun log_f32_impl(x: f32): f32 {
-    val ln2 = 0x1.62e42fefa39efp-1
-    if x == 0.0 { return -1.0f32 / 0.0f32 }
-    if x < 0.0 { return 0.0f32 / 0.0f32 }
+    val ln2: f32 = 0x1.62e42fefa39efp-1
+    if x == 0.0 { return Math.neg_inf_f32() }
+    if x < 0.0 { return Math.nan_f32() }
     var e = 0
     var m = x
     while m >= 2.0 {
@@ -364,7 +364,7 @@ fun log_f32_impl(x: f32): f32 {
 }
 @internal
 fun log_f16_impl(x: f16): f16 {
-    val ln2 = 0x1.63p-1f16
+    val ln2: f16 = 0x1.63p-1f16
     if x == 0.0 { return -1.0f16 / 0.0f16 }
     if x < 0.0 { return 0.0f16 / 0.0f16 }
     var e = 0
@@ -446,9 +446,9 @@ fun pow_f32_impl(base: f32, exp: f32): f32 {
     if base == 0.0 {
         if exp == 0.0 { return 1.0 }
         if exp > 0.0 { return 0.0 }
-        return 1.0f32 / 0.0f32
+        return Math.inf_f32()
     }
-    0.0 / 0.0
+    Math.nan_f32()
 }
 @internal
 fun pow_f16_impl(base: f16, exp: f16): f16 {
@@ -458,7 +458,7 @@ fun pow_f16_impl(base: f16, exp: f16): f16 {
         if exp > 0.0 { return 0.0 }
         return 1.0f16 / 0.0f16
     }
-    0.0 / 0.0
+    Math.nan_f16()
 }
 @internal
 fun pow_f128_impl(base: f128, exp: f128): f128 {
@@ -468,7 +468,7 @@ fun pow_f128_impl(base: f128, exp: f128): f128 {
         if exp > 0.0 { return 0.0 }
         return 1.0f128 / 0.0f128
     }
-    0.0 / 0.0
+    Math.nan_f128()
 }
 
 pub fun pow<T>(base: T, exp: T): T {
@@ -496,7 +496,7 @@ fun exp2_f32_impl(x: f32): f32 {
 }
 @internal
 fun exp2_f16_impl(x: f16): f16 {
-    val ln2 = 0x1.63p-1f16
+    val ln2: f16 = 0x1.63p-1f16
     exp_f16_impl(x * ln2)
 }
 @internal
@@ -556,12 +556,12 @@ fun log2_f64_impl(x: f64): f64 {
 }
 @internal
 fun log2_f32_impl(x: f32): f32 {
-    val ln2 = 0x1.62e42fefa39efp-1
+    val ln2: f32 = 0x1.62e42fefa39efp-1
     log_f32_impl(x) / ln2
 }
 @internal
 fun log2_f16_impl(x: f16): f16 {
-    val ln2 = 0x1.63p-1f16
+    val ln2: f16 = 0x1.63p-1f16
     log_f16_impl(x) / ln2
 }
 @internal
@@ -1155,7 +1155,7 @@ fun log1p_f64_impl(x: f64): f64 {
 }
 @internal
 fun log1p_f32_impl(x: f32): f32 {
-    if x <= -1.0 { return 0.0f32 / 0.0f32 }
+    if x <= -1.0 { return Math.nan_f32() }
     var a = if x < 0.0 { 0.0 - x } else { x }
     if a < 0.5 {
         var sum = x

@@ -63,6 +63,9 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     // os module (process-environment domain primitives)
     ("builtin/os/pack.frond", include_str!("../stdlib/builtin/os/pack.frond")),
     ("builtin/os/Raw.frond", include_str!("../stdlib/builtin/os/Raw.frond")),
+    // rand module (PRNG step primitive)
+    ("builtin/rand/pack.frond", include_str!("../stdlib/builtin/rand/pack.frond")),
+    ("builtin/rand/Raw.frond", include_str!("../stdlib/builtin/rand/Raw.frond")),
 ];
 
 /// Standard library module file manifest (requires `import std.xxx` to load).
@@ -104,6 +107,29 @@ pub const STD_FILES: &[StdlibFile] = &[
     ("std/math/Power.frond", include_str!("../stdlib/std/math/Power.frond")),
     ("std/math/Trig.frond",  include_str!("../stdlib/std/math/Trig.frond")),
     ("std/math/Round.frond", include_str!("../stdlib/std/math/Round.frond")),
+    // str module → migrated into std/core (type modules share one library)
+    // core module: type namespaces live under std.core.types (one import exposes
+    // Str + all integer/float/Bool type modules)
+    ("std/core/types/pack.frond", include_str!("../stdlib/std/core/types/pack.frond")),
+    ("std/core/types/Str.frond", include_str!("../stdlib/std/core/types/Str.frond")),
+    ("std/core/types/Bool.frond", include_str!("../stdlib/std/core/types/Bool.frond")),
+    ("std/core/types/F64.frond", include_str!("../stdlib/std/core/types/F64.frond")),
+    ("std/core/types/F32.frond", include_str!("../stdlib/std/core/types/F32.frond")),
+    ("std/core/types/F16.frond", include_str!("../stdlib/std/core/types/F16.frond")),
+    ("std/core/types/F128.frond", include_str!("../stdlib/std/core/types/F128.frond")),
+    ("std/core/types/I8.frond", include_str!("../stdlib/std/core/types/I8.frond")),
+    ("std/core/types/I16.frond", include_str!("../stdlib/std/core/types/I16.frond")),
+    ("std/core/types/I32.frond", include_str!("../stdlib/std/core/types/I32.frond")),
+    ("std/core/types/I64.frond", include_str!("../stdlib/std/core/types/I64.frond")),
+    ("std/core/types/I128.frond", include_str!("../stdlib/std/core/types/I128.frond")),
+    ("std/core/types/U8.frond", include_str!("../stdlib/std/core/types/U8.frond")),
+    ("std/core/types/U16.frond", include_str!("../stdlib/std/core/types/U16.frond")),
+    ("std/core/types/U32.frond", include_str!("../stdlib/std/core/types/U32.frond")),
+    ("std/core/types/U64.frond", include_str!("../stdlib/std/core/types/U64.frond")),
+    ("std/core/types/U128.frond", include_str!("../stdlib/std/core/types/U128.frond")),
+    // rand module (PRNG wrappers over builtin/rand)
+    ("std/rand/pack.frond", include_str!("../stdlib/std/rand/pack.frond")),
+    ("std/rand/Rand.frond", include_str!("../stdlib/std/rand/Rand.frond")),
 ];
 
 /// Looks up a stdlib file by path.
