@@ -470,6 +470,21 @@ impl_cmp_compute! {
     compute_ge_i128: >= for as_int_i128;
 }
 
+// ---- u128 comparisons (indices 344-349) ----
+// The u128 domain exceeds i128: reading through as_int_i128 bit-reinterprets
+// the top half as negative i128, INVERTING the ordering for values above
+// 2^127. These read via as_u128 (round-trips the bits exactly), comparing in
+// the true unsigned domain.
+
+impl_cmp_compute! {
+    compute_eq_u128: == for as_u128;
+    compute_ne_u128: != for as_u128;
+    compute_lt_u128: < for as_u128;
+    compute_gt_u128: > for as_u128;
+    compute_le_u128: <= for as_u128;
+    compute_ge_u128: >= for as_u128;
+}
+
 // ---- Integer bitwise operations (indices 78–92) ----
 // BitAnd/BitOr/BitXor for i32/i64/i128 families, Shl/Shr for i32/i64/i128 families.
 // Read uniformly via `as_int_i128`; results are constructed with the target type.

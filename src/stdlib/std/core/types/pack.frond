@@ -14,6 +14,8 @@ pub pack U16
 pub pack U32
 pub pack U64
 pub pack U128
+pub pack Usize
+pub pack Isize
 pub pack F16
 pub pack F32
 pub pack F64

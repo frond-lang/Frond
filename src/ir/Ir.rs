@@ -464,6 +464,12 @@ compute_fn_ids! {
     342 => CF_FFN_CALL,
     // ── Emptiness check (343): `s.is_empty()` / `arr.is_empty()` (str/array builtin)
     343 => CF_IS_EMPTY,
+    344 => CF_EQ_U128,
+    345 => CF_NE_U128,
+    346 => CF_LT_U128,
+    347 => CF_GT_U128,
+    348 => CF_LE_U128,
+    349 => CF_GE_U128,
 }
 
 /// Number of entries in `build_compute_fn_table()`.
@@ -473,7 +479,7 @@ compute_fn_ids! {
 /// by a binary with a different table length is rejected at load instead of
 /// silently mis-dispatching node compute fns. `build_compute_fn_table()`
 /// asserts equality so this constant cannot drift silently.
-pub const COMPUTE_FN_TABLE_LEN: u32 = 344;
+pub const COMPUTE_FN_TABLE_LEN: u32 = 350;
 
 // =========================================================================
 // NodeKind — node category (not an op; 9 variants for readiness checks)
@@ -2157,6 +2163,12 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         342 => super::Compute::compute_ffn_call,
         // Emptiness check (343): str/array is_empty
         343 => super::Compute::compute_is_empty,
+        344 => super::Compute::compute_eq_u128,
+        345 => super::Compute::compute_ne_u128,
+        346 => super::Compute::compute_lt_u128,
+        347 => super::Compute::compute_gt_u128,
+        348 => super::Compute::compute_le_u128,
+        349 => super::Compute::compute_ge_u128,
     };
     // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
     // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values
@@ -2264,6 +2276,7 @@ pub fn effect_class(cf: ComputeFnId) -> EffectClass {
         // ── Pure: legacy arithmetic/comparison ranges (equivalence-tested) ──
         1..=27 | 50..=91 | 92..=259 => Pure,
         34 | 260 | 261 | 265 | 274 | 276 | 278 | 279 | 287 | 343 => Pure, // reads/queries
+        344..=349 => Pure, // u128 comparisons (pure reads)
         292..=300 | 302..=307 => Pure, // string/obj/bool/f128 comparison
         // ── Reads of mutable state (aliasing) ──
         30 | 32 | 35 | 275 => ReadMutable,      // field/array/pattern-ADT reads (aliasing_read_cfs)
@@ -4340,11 +4353,13 @@ mod effect_classification_tests {
     /// Verbatim copy of the PRE-W1 hand-written pure set (the behavior W1 must
     /// preserve exactly). Keep frozen; if `pure_compute_fn_set()` drifts from
     /// this, the equivalence guarantee is broken.
+    /// (344..=349 — u128 comparisons — joined both sets when they were added.)
     fn legacy_pure_set() -> rustc_hash::FxHashSet<ComputeFnId> {
         let mut s = rustc_hash::FxHashSet::default();
         for id in 1..=27u32 { s.insert(ComputeFnId(id)); }
         for id in 50..=91u32 { s.insert(ComputeFnId(id)); }
         for id in 92..=259u32 { s.insert(ComputeFnId(id)); }
+        for id in 344..=349u32 { s.insert(ComputeFnId(id)); }
         s.insert(CF_RECORD_FIELD_GET);
         s.insert(CF_ARRAY_INDEX);
         s.insert(CF_IS_NULL);

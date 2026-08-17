@@ -128,6 +128,8 @@ pub const STD_FILES: &[StdlibFile] = &[
     ("std/core/types/U32.frond", include_str!("../stdlib/std/core/types/U32.frond")),
     ("std/core/types/U64.frond", include_str!("../stdlib/std/core/types/U64.frond")),
     ("std/core/types/U128.frond", include_str!("../stdlib/std/core/types/U128.frond")),
+    ("std/core/types/Usize.frond", include_str!("../stdlib/std/core/types/Usize.frond")),
+    ("std/core/types/Isize.frond", include_str!("../stdlib/std/core/types/Isize.frond")),
     // rand module (PRNG wrappers over builtin/rand)
     ("std/rand/pack.frond", include_str!("../stdlib/std/rand/pack.frond")),
     ("std/rand/Rand.frond", include_str!("../stdlib/std/rand/Rand.frond")),

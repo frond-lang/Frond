@@ -185,6 +185,20 @@ impl<'a> IrBuilder<'a> {
         // fam is the TypeFamily enum; use | to merge signed/unsigned integer variants to dispatch by bit-width (compiler exhaustive check)
         let fam = Self::int_family(ty_name);
         use crate::types::TypeFamily;
+        // u128 comparisons get dedicated computes: the i128 domain cannot hold
+        // the upper half of u128 (bit-reinterpretation inverts the ordering
+        // above 2^127). Routed before the cmp_arm cascade.
+        if matches!(fam, TypeFamily::UnsignedInt128) {
+            match op {
+                crate::ast::Ast::BinaryOp::Eq => return CF_EQ_U128,
+                crate::ast::Ast::BinaryOp::NotEq => return CF_NE_U128,
+                crate::ast::Ast::BinaryOp::Lt => return CF_LT_U128,
+                crate::ast::Ast::BinaryOp::Gt => return CF_GT_U128,
+                crate::ast::Ast::BinaryOp::LtEq => return CF_LE_U128,
+                crate::ast::Ast::BinaryOp::GtEq => return CF_GE_U128,
+                _ => {}
+            }
+        }
         // The 6 comparison ops share an f128->float->(bool)->i128->i64->i32 cascade; a macro removes the repetition.
         // Eq/NotEq have a Bool branch; Lt/Gt/LtEq/GtEq have no Bool branch (bool cannot be ordered).
         // The macro only expands the cascade block (=> right side); match patterns stay explicit to preserve the compiler's exhaustive check.
@@ -193,15 +207,22 @@ impl<'a> IrBuilder<'a> {
                 if is_f128 { $f128 }
                 else if is_float { $f64 }
                 else if fam == TypeFamily::Bool { $bool }
-                else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { $i128 }
-                else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { $i64 }
+                // Unsigned 64-bit (u64/usize): compare in the I128 domain —
+                // zero-extension preserves values, while the signed I64
+                // compares misread the sign bit (values above i63::MAX came
+                // out negative, e.g. `u >= 0` was false for a large usize).
+                // Eq/NotEq are bit-pattern exact in I128 too.
+                else if matches!(fam, TypeFamily::UnsignedInt64) { $i128 }
+                else if matches!(fam, TypeFamily::SignedInt128) { $i128 }
+                else if matches!(fam, TypeFamily::SignedInt64) { $i64 }
                 else { $i32 }
             };
             ($f128:ident, $f64:ident, $i128:ident, $i64:ident, $i32:ident) => {
                 if is_f128 { $f128 }
                 else if is_float { $f64 }
-                else if matches!(fam, TypeFamily::SignedInt128 | TypeFamily::UnsignedInt128) { $i128 }
-                else if matches!(fam, TypeFamily::SignedInt64 | TypeFamily::UnsignedInt64) { $i64 }
+                else if matches!(fam, TypeFamily::UnsignedInt64) { $i128 }
+                else if matches!(fam, TypeFamily::SignedInt128) { $i128 }
+                else if matches!(fam, TypeFamily::SignedInt64) { $i64 }
                 else { $i32 }
             };
         }

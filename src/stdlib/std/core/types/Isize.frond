@@ -1,0 +1,14 @@
+// Isize.frond — the isize type module (part of std.core.types)
+//
+// Boundary constants + decimal parse (platform width: 64-bit on all
+// supported targets). parse returns null on malformed input.
+
+pub val MAX: isize = 9223372036854775807
+pub val MIN: isize = -9223372036854775808
+
+pub fun parse(s: str): isize? {
+    match I64.parse(s) {
+        null => null,
+        v => v as isize,
+    }
+}

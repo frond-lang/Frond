@@ -1,40 +1,37 @@
 // Rand.frond — pseudo-random numbers (xorshift64*, single global stream)
 //
-// NOT cryptographic. The stream is a process-wide top-level var: seeding
-// makes runs reproducible, two seedings of the same value produce the same
-// sequence. state 0 is an xorshift fixed point, so seed(0) maps to the
-// default constant instead.
+// NOT cryptographic. The integer surface is usize-shaped (the platform's
+// natural integer): index/len arithmetic composes without width casts. Other
+// domains are one explicit cast away (`next() as u64`, `as i32`, ...).
+// The stream is a process-wide top-level var: seeding makes runs
+// reproducible; seed(0) maps to the default constant (xorshift's zero is a
+// fixed point).
 
 var state: u64 = 0x9E3779B97F4A7C15
 
 // Re-seed the global stream (0 falls back to the default constant).
-pub fun seed(v: u64): void {
+pub fun seed(v: usize): void {
     if v == 0 {
         state = 0x9E3779B97F4A7C15
     } else {
-        state = v
+        state = v as u64
     }
 }
 
-// Next raw 64-bit value, advancing the global stream.
-pub fun next_u64(): u64 {
+// Next raw value (full platform width), advancing the global stream.
+pub fun next(): usize {
     state = __rand_step(state)
-    state
-}
-
-// Next value in the low 32 bits.
-pub fun next_u32(): u32 {
-    (next_u64() >> 32) as u32
+    state as usize
 }
 
 // Next value in [0, 1) with 53 bits of mantissa precision.
 pub fun next_f64(): f64 {
-    (next_u64() >> 11) as f64 / 9007199254740992.0
+    ((next() as u64) >> 11) as f64 / 9007199254740992.0
 }
 
 // Next integer in [min, max] (inclusive both ends; max < min swaps them).
-pub fun range_u64(min: u64, max: u64): u64 {
-    if max < min { return range_u64(max, min) }
+pub fun range(min: usize, max: usize): usize {
+    if max < min { return range(max, min) }
     if max == min { return min }
-    min + next_u64() % (max - min + 1)
+    min + next() % (max - min + 1)
 }
