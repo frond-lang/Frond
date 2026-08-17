@@ -197,27 +197,19 @@ impl ModuleLoader {
                             return None;
                         }
                     };
+                // Each declared submodule may be a FILE (dir/name.frond) or a
+                // NESTED DIRECTORY module (dir/name/pack.frond — std.core's
+                // `pub pack types`). Recursing through resolve_and_load covers
+                // both with one path: it finds the file directly or re-enters
+                // the directory-module branch, and its cache keys line up.
                 for sub_name in collect_pack_submodules(&pack_module) {
-                    let sub_path_str = format!("{}/{}.frond", dir_name, sub_name);
-                    if self.modules.contains_key(&sub_path_str) {
+                    let sub_cache_key = format!("{}/{}.frond", dir_name, sub_name);
+                    if self.modules.contains_key(&sub_cache_key) {
                         continue;
                     }
-                    if let Some(sub_source) = find(&sub_path_str) {
-                        if let Ok((sub_arena, sub_source_owned, sub_module)) =
-                            parse_source(&sub_path_str, sub_source)
-                        {
-                            let sub_exports = collect_exports(&sub_module);
-                            self.modules.insert(
-                                sub_path_str,
-                                LoadedModule {
-                                    _arena: sub_arena,
-                                    _source: sub_source_owned,
-                                    module: sub_module,
-                                    exports: sub_exports,
-                                },
-                            );
-                        }
-                    }
+                    let sub_path = format!("{}/{}", dir_name, sub_name);
+                    let segs: Vec<&str> = sub_path.split('/').collect();
+                    let _ = self.resolve_and_load(&segs);
                 }
                 let pack_exports = collect_exports(&pack_module);
                 self.modules.insert(
@@ -260,30 +252,17 @@ impl ModuleLoader {
                         return None;
                     }
                 };
-            // Load each submodule declared by the pack
+            // Load each submodule declared by the pack. Like the embed branch
+            // (4a) above, recursion through resolve_and_load lets a declared
+            // submodule be a file OR a nested directory with its own pack.frond.
             for sub_name in collect_pack_submodules(&pack_module) {
-                let sub_path_str = format!("{}/{}.frond", dir_name, sub_name);
-                // The submodule may already be in the cache (e.g. loaded first via another path)
-                if self.modules.contains_key(&sub_path_str) {
+                let sub_cache_key = format!("{}/{}.frond", dir_name, sub_name);
+                if self.modules.contains_key(&sub_cache_key) {
                     continue;
                 }
-                let sub_full = base.join(&sub_path_str);
-                if let Ok(sub_source) = std::fs::read_to_string(&sub_full) {
-                    if let Ok((sub_arena, sub_source_owned, sub_module)) =
-                        parse_source(&sub_path_str, &sub_source)
-                    {
-                        let sub_exports = collect_exports(&sub_module);
-                        self.modules.insert(
-                            sub_path_str,
-                            LoadedModule {
-                                _arena: sub_arena,
-                                _source: sub_source_owned,
-                                module: sub_module,
-                                exports: sub_exports,
-                            },
-                        );
-                    }
-                }
+                let sub_path = format!("{}/{}", dir_name, sub_name);
+                let segs: Vec<&str> = sub_path.split('/').collect();
+                let _ = self.resolve_and_load(&segs);
             }
             // Register the pack module as the directory module representative (key is the original path_str, e.g. "Store.frond")
             let pack_exports = collect_exports(&pack_module);

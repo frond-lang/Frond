@@ -108,8 +108,9 @@ pub const STD_FILES: &[StdlibFile] = &[
     ("std/math/Trig.frond",  include_str!("../stdlib/std/math/Trig.frond")),
     ("std/math/Round.frond", include_str!("../stdlib/std/math/Round.frond")),
     // str module → migrated into std/core (type modules share one library)
-    // core module: type namespaces live under std.core.types (one import exposes
-    // Str + all integer/float/Bool type modules)
+    // core module: std/core/pack.frond makes `import std.core` load every
+    // sub-library; type namespaces live under types/.
+    ("std/core/pack.frond", include_str!("../stdlib/std/core/pack.frond")),
     ("std/core/types/pack.frond", include_str!("../stdlib/std/core/types/pack.frond")),
     ("std/core/types/Str.frond", include_str!("../stdlib/std/core/types/Str.frond")),
     ("std/core/types/Bool.frond", include_str!("../stdlib/std/core/types/Bool.frond")),
