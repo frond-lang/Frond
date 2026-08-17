@@ -159,12 +159,111 @@ pub fun weekday_abbr(w: u8): str {
     }
 }
 
-// parse implementation: parse an ISO 8601 string into a DateTime
-// Known blocker: the Frond engine has a bug where variable bindings are misaligned after
-// calling other functions within a function
-// (parse_digits_at returns the correct value when called directly outside parse, but when
-//   called inside parse, the year/month field values are misaligned when constructing the
-//   final Ok(DateTime(...)))
-// To be completed after the engine is fixed, refer to the verified logic below:
-// pub fun parse_digits_at(s: str, pos: usize, count: usize): i64 { ... }
-// pub fun parse(s: str): Throw<DateTime, TimeError> { ... }
+// ─── ISO 8601 parse ─────────────────────────────────────────────────────────
+
+// Parse exactly `count` decimal digits at `pos`, error on anything else.
+@internal
+fun __expect_digits(b: u8[], pos: usize, count: usize): Throw<i64, TimeError> {
+    var v: i64 = 0
+    var i: usize = 0
+    while i < count {
+        val idx = pos + i
+        if idx >= b.len() {
+            throw TimeError(ParseFailed, "unexpected end of input", "")
+        }
+        val d = (b[idx] as i64) - 48
+        if d < 0 || d > 9 {
+            throw TimeError(ParseFailed, "expected digit", "")
+        }
+        v = v * 10 + d
+        i = i + 1
+    }
+    Ok(v)
+}
+
+// Expect exactly one byte value at `pos`.
+@internal
+fun __expect_byte(b: u8[], pos: usize, expected: u8): Throw<void, TimeError> {
+    if pos >= b.len() || b[pos] != expected {
+        throw TimeError(ParseFailed, "unexpected separator", "")
+    }
+    Ok(void)
+}
+
+// Expect the date/time separator at `pos`: 'T' (ISO 8601), 't' or ' '
+// (RFC 3339 §5.6 NOTE allows a human-readable space).
+@internal
+fun __expect_date_sep(b: u8[], pos: usize): Throw<void, TimeError> {
+    if pos >= b.len() || (b[pos] != 84 && b[pos] != 116 && b[pos] != 32) {
+        throw TimeError(ParseFailed, "expected T separator", "")
+    }
+    Ok(void)
+}
+
+// Parse an ISO 8601 / RFC 3339 datetime string:
+//   YYYY-MM-DD[T t ]HH:MM:SS[.frac][Zz]
+// Fractional seconds beyond 9 digits are truncated (nanosecond storage).
+// Only the UTC marker Z is accepted — numeric ±HH:MM offsets are rejected
+// (ParseFailed) until DateTime grows timezone support.
+// Field range violations (month=13, day=32, ...) and pre-1970 dates surface
+// as InvalidDateTime/OutOfRange from components_to_ns_utc.
+// Round-trips with to_iso8601 (which never emits fraction or Z).
+//
+// History: this parse was stubbed out over an engine bug — variable bindings
+// misaligned after intra-function calls when constructing the final result.
+// That was the Builder slot-aliasing family, fixed 2026-08-17; this
+// implementation is also its regression anchor (helpers called per field,
+// result constructed from their returns).
+pub fun parse(s: str): Throw<DateTime, TimeError> {
+    val b = s.bytes()
+    if b.len() < 19 {
+        throw TimeError(ParseFailed, "too short for YYYY-MM-DDTHH:MM:SS", s)
+    }
+    val year = __expect_digits(b, 0, 4)?
+    __expect_byte(b, 4, 45)?        // '-'
+    val month = __expect_digits(b, 5, 2)?
+    __expect_byte(b, 7, 45)?        // '-'
+    val day = __expect_digits(b, 8, 2)?
+    __expect_date_sep(b, 10)?
+    val hour = __expect_digits(b, 11, 2)?
+    __expect_byte(b, 13, 58)?       // ':'
+    val minute = __expect_digits(b, 14, 2)?
+    __expect_byte(b, 16, 58)?       // ':'
+    val second = __expect_digits(b, 17, 2)?
+    // optional fractional seconds: '.' then 1+ digits (excess truncated at ns)
+    var pos: usize = 19
+    var nanos: i64 = 0
+    if pos < b.len() && b[pos] == 46 {
+        pos = pos + 1
+        if pos >= b.len() {
+            throw TimeError(ParseFailed, "dangling fraction point", s)
+        }
+        var scale: i64 = 100_000_000
+        var seen = false
+        while pos < b.len() && b[pos] >= 48 && b[pos] <= 57 {
+            if scale > 0 {
+                nanos = nanos + (((b[pos]) as i64) - 48) * scale
+                scale = scale / 10
+            }
+            seen = true
+            pos = pos + 1
+        }
+        if !seen {
+            throw TimeError(ParseFailed, "empty fraction", s)
+        }
+    }
+    // optional UTC marker — the only timezone spelling accepted
+    if pos < b.len() {
+        if b[pos] != 90 && b[pos] != 122 {
+            throw TimeError(ParseFailed, "only Z UTC marker supported, no offsets", s)
+        }
+        pos = pos + 1
+    }
+    if pos != b.len() {
+        throw TimeError(ParseFailed, "trailing characters", s)
+    }
+    // weekday/day_of_year are placeholders — the UTC round-trip below fills them
+    val comp = TimeComponents(year as i32, month as u8, day as u8, hour as u8, minute as u8, second as u8, nanos as u32, 0, 0)
+    val ns = std.time.SystemTime.components_to_ns_utc(comp)?
+    Ok(std.time.DateTime.from_components(std.time.SystemTime.to_utc_components(ns)))
+}

@@ -234,7 +234,7 @@ pub(super) const BUILTIN_CTORS: &[(&str, BuiltinCtorLower)] = &[
 pub(super) fn reflect_top_level_cf(name: &str) -> Option<ComputeFnId> {
     use crate::ir::Ir::*;
     match name {
-        "format" => Some(CF_REFLECT_FORMAT),
+        "repr" => Some(CF_REFLECT_FORMAT),
         "type_name" => Some(CF_REFLECT_TYPE_NAME),
         _ => None,
     }
@@ -243,7 +243,7 @@ pub(super) fn reflect_top_level_cf(name: &str) -> Option<ComputeFnId> {
 /// reflect method-name → (IntrinsicKind, arg_count) mapping.
 ///
 /// Used by `lookup_intrinsic` to give every value — regardless of its static
-/// type — access to reflect trait methods (`x.kind()`, `x.format()`, ...).
+/// type — access to reflect trait methods (`x.kind()`, `x.repr()`, ...).
 /// This is the "auto-impl" of `trait Type` / `trait Value`: rather than
 /// synthesizing witness-table entries and method bodies for every type, the
 /// Builder recognizes reflect method names structurally and lowers them
@@ -260,7 +260,7 @@ pub(super) fn reflect_method_intrinsic(method: &str) -> Option<(crate::sema::Sem
         "size" => un(330),              // CF_REFLECT_LAYOUT_SIZE (aggregate)
         "alignment" => un(331),         // CF_REFLECT_LAYOUT_ALIGN
         "field_count" => un(332),       // CF_REFLECT_FIELD_COUNT
-        "format" => un(290),            // CF_REFLECT_FORMAT
+        "repr" => un(290),               // CF_REFLECT_FORMAT (renamed from format 2026-08-17)
         "constructor" => un(336),       // CF_REFLECT_ADT_CTOR
         "field_name" => bin(333),       // CF_REFLECT_FIELD_NAME
         // field_value removed: its return type cannot be expressed without an "any"

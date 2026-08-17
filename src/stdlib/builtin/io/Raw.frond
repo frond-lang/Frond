@@ -457,3 +457,34 @@ fun __file_copy_raw(src: str, dst: str): i32 #{
         return 0;
     #endif
 }#
+
+// ─── Realpath ──────────────────────────────────────────────────────────────
+
+// Resolve a path to its absolute, separator-normalized, symlink- and
+// ../-resolved form. Windows: _fullpath (lexical only — the Windows io layer
+// has no symlink support) followed by an existence check for POSIX realpath
+// parity: a missing component is an error on both platforms. POSIX:
+// realpath. Resolves relative input against the current working directory.
+// Returns the byte length written; -1 = failure (missing path component),
+// -2 = buffer too small.
+@c_include("stdlib.h")
+@c_include("direct.h")
+@c_include("windows.h")
+@c_include("limits.h")
+@internal
+@extern("C")
+fun __fs_realpath_into(path: str, buf: u8[]): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        char* r = _fullpath((char*)buf_data, path_data, (size_t)buf_len);
+        if (!r) return -1;
+        if (GetFileAttributesA(r) == INVALID_FILE_ATTRIBUTES) return -1;
+        size_t n = strlen(r);
+        if (n >= (size_t)buf_len) return -2;
+        return (int64_t)n;
+    #else
+        if ((size_t)buf_len < PATH_MAX) return -2;
+        if (!realpath(path_data, (char*)buf_data)) return -1;
+        size_t n = strlen((char*)buf_data);
+        return (int64_t)n;
+    #endif
+}#

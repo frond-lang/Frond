@@ -1,0 +1,23 @@
+// JsonError: error type returned when a JSON operation fails
+//
+// Usage:
+//   - Json.parse returns Throw<_, JsonError> on malformed input
+//   - Field semantics (aligned with the error family):
+//       kind   : error category (exhaustive ADT)
+//       message: human readable description, includes the byte position
+//       value  : string representation of the input that triggered the error
+//
+// As a builtin error_newtype, it automatically gets the Error trait's
+// message() default implementation (reads the message field).
+// type_name() override returns "json error" for easy identification in logs.
+type JsonError: Err = JsonError(
+    pub kind: JsonErrorKind,
+    pub message: str,
+    pub value: str,
+) {
+    override fun type_name(): str { "json error" }
+}
+
+// JSON error categories (exhaustive ADT)
+type JsonErrorKind =
+    | ParseFailed   // malformed JSON text (bad escape, unterminated string/array/object, trailing junk, ...)

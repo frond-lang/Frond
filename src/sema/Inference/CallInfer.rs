@@ -556,18 +556,56 @@ impl<'a> InferContext<'a> {
                     if let Type::Fn(_) = self.arena.get(inst_fn) {
                         let (params, return_type) = self.arena.fn_parts(inst_fn);
                         let params: Vec<TypeHandle> = params.to_vec();
-                        // The first parameter is self/receiver: unify recv with params[0].
-                        // This lets the free function's generic parameters be inferred from the receiver's type (e.g. iter<T> infers T from arr: T[]).
-                        if !params.is_empty() {
-                            self.unify_or_constrain(params[0], recv_ty);
+                        // Candidacy gate (Bug #103): this fallback used to accept
+                        // ANY same-named binding — receiver type and arity were
+                        // never checked, so `x.format()` on i32 dispatched to
+                        // std Format.format (stdlib is globally env-visible by
+                        // design) and panicked at runtime. A binding is a
+                        // candidate only if its arity matches AND its first
+                        // parameter can accept the receiver: unify is the test
+                        // (it succeeds for str ↔ T[] — byte semantics — so
+                        // `"abc".iter()` keeps resolving here). A HARD failure
+                        // on two concrete types rejects the candidate and lets
+                        // resolution continue to the "no method" fallback;
+                        // TypeVar/Unknown receivers keep the lenient
+                        // constraint path (the solver may still bind them).
+                        let arity_ok = params.len() == args.len() + 1;
+                        let recv_ok = if params.is_empty() {
+                            true
+                        } else {
+                            match self.arena.unify(params[0], recv_ty) {
+                                Ok(_) => true,
+                                Err(_) => {
+                                    // Lenient only when a TypeVar survives ANYWHERE in
+                                    // either type (e.g. iter<T>'s `T[]`: head is a concrete
+                                    // Array but the element is fresh — the solver binds it
+                                    // later, which is how `"abc".iter()` resolves). Two
+                                    // fully-concrete types that cannot unify = hard reject.
+                                    let pending = |t: TypeHandle| type_contains_typevar(&self.arena, t);
+                                    if pending(params[0]) || pending(recv_ty) {
+                                        self.unify_or_constrain(params[0], recv_ty);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                            }
+                        };
+                        if arity_ok && recv_ok {
+                            // The first parameter is self/receiver: unify recv with params[0].
+                            // This lets the free function's generic parameters be inferred from the receiver's type (e.g. iter<T> infers T from arr: T[]).
+                            if !params.is_empty() {
+                                self.unify_or_constrain(params[0], recv_ty);
+                            }
+                            // The remaining parameters are inferred from args.
+                            let n = params.len().min(args.len() + 1);
+                            for i in 1..n {
+                                let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
+                                self.unify_or_constrain(params[i], arg_ty);
+                            }
+                            return return_type;
                         }
-                        // The remaining parameters are inferred from args.
-                        let n = params.len().min(args.len() + 1);
-                        for i in 1..n {
-                            let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
-                            self.unify_or_constrain(params[i], arg_ty);
-                        }
-                        return return_type;
+                        // Not a candidate: fall through to the paths below.
                     }
                 }
 
@@ -1329,4 +1367,22 @@ impl<'a> InferContext<'a> {
 
     // ── infer_stmt ──
 
+}
+
+/// Deep TypeVar scan (Bug #103 candidacy gate): true when a TypeVar survives
+/// anywhere in the type — top-level OR nested (e.g. `T[]`'s element). Such
+/// types stay on the lenient constraint path; only fully-concrete types can
+/// hard-reject a Path 0 free-function candidate.
+fn type_contains_typevar(arena: &crate::types::Arena::TypeArena, h: TypeHandle) -> bool {
+    let resolved = arena.resolve(h);
+    if matches!(arena.get(resolved), Type::TypeVar(_) | Type::Unknown) {
+        return true;
+    }
+    let mut found = false;
+    arena.for_each_child(resolved, |child| {
+        if !found && type_contains_typevar(arena, child) {
+            found = true;
+        }
+    });
+    found
 }

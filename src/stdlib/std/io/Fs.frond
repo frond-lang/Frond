@@ -82,3 +82,16 @@ pub async fun chmod(path: Path, mode: i32): Async<Throw<void, IOError>> {
     }
     Ok(void)
 }
+
+// Resolve a path to its absolute, normalized form (realpath(3) semantics:
+// resolves symlinks and ../ segments against the working directory).
+// Windows: _fullpath — separator normalization and ..-removal only, no
+// symlink resolution (the Windows io layer has no symlink support at all).
+pub async fun realpath(path: Path): Async<Throw<Path, IOError>> {
+    val buf: u8[] = [0, ..4096]
+    val n = __fs_realpath_into(path.to_str(), buf)
+    if n < 0 {
+        throw IOError(NotFound, "realpath failed: " + path.to_str(), 0, path.to_str())
+    }
+    Ok(Path.from((buf[0..n as usize]) as str))
+}

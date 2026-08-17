@@ -1085,10 +1085,13 @@ impl<'a> Lexer<'a> {
                         self.pos += 1;
                         self.column += 1;
                         let mut digit_count: usize = 0;
+                        let mut value: u32 = 0;
                         while self.pos < self.bytes.len() && self.bytes[self.pos] != b'}' {
                             if !is_hex_digit(self.bytes[self.pos]) {
                                 return Err(LexerError::InvalidUnicodeEscape);
                             }
+                            value = value.wrapping_mul(16)
+                                .wrapping_add((self.bytes[self.pos] as char).to_digit(16).unwrap_or(0));
                             self.pos += 1;
                             self.column += 1;
                             digit_count += 1;
@@ -1096,16 +1099,24 @@ impl<'a> Lexer<'a> {
                         if digit_count == 0 || self.pos >= self.bytes.len() {
                             return Err(LexerError::InvalidUnicodeEscape);
                         }
+                        if char::from_u32(value).is_none() {
+                            return Err(LexerError::InvalidUnicodeEscape);
+                        }
                         self.pos += 1;
                         self.column += 1;
                     } else {
-                        // \uXXXX without braces: exactly 4 hex digits
+                        // \uXXXX without braces: exactly 4 hex digits + range check
+                        let mut value: u32 = 0;
                         for _ in 0..4 {
                             if self.pos >= self.bytes.len() || !is_hex_digit(self.bytes[self.pos]) {
                                 return Err(LexerError::InvalidUnicodeEscape);
                             }
+                            value = value * 16 + (self.bytes[self.pos] as char).to_digit(16).unwrap_or(0);
                             self.pos += 1;
                             self.column += 1;
+                        }
+                        if char::from_u32(value).is_none() {
+                            return Err(LexerError::InvalidUnicodeEscape);
                         }
                     }
                 }
@@ -1191,10 +1202,13 @@ impl<'a> Lexer<'a> {
                             self.pos += 1;
                             self.column += 1;
                             let mut digit_count: usize = 0;
+                            let mut value: u32 = 0;
                             while self.pos < self.bytes.len() && self.bytes[self.pos] != b'}' {
                                 if !is_hex_digit(self.bytes[self.pos]) {
                                     return Err(LexerError::InvalidUnicodeEscape);
                                 }
+                                value = value.wrapping_mul(16)
+                                    .wrapping_add((self.bytes[self.pos] as char).to_digit(16).unwrap_or(0));
                                 self.pos += 1;
                                 self.column += 1;
                                 digit_count += 1;
@@ -1202,16 +1216,27 @@ impl<'a> Lexer<'a> {
                             if digit_count == 0 || self.pos >= self.bytes.len() {
                                 return Err(LexerError::InvalidUnicodeEscape);
                             }
+                            // Codepoint range: surrogates (D800-DFFF) and > U+10FFFF
+                            // have no char form — the unescape pass relies on this
+                            // check (char::from_u32 there would panic otherwise).
+                            if char::from_u32(value).is_none() {
+                                return Err(LexerError::InvalidUnicodeEscape);
+                            }
                             self.pos += 1;
                             self.column += 1;
                         } else {
-                            // \uXXXX without braces: exactly 4 hex digits
+                            // \uXXXX without braces: exactly 4 hex digits + range check
+                            let mut value: u32 = 0;
                             for _ in 0..4 {
                                 if self.pos >= self.bytes.len() || !is_hex_digit(self.bytes[self.pos]) {
                                     return Err(LexerError::InvalidUnicodeEscape);
                                 }
+                                value = value * 16 + (self.bytes[self.pos] as char).to_digit(16).unwrap_or(0);
                                 self.pos += 1;
                                 self.column += 1;
+                            }
+                            if char::from_u32(value).is_none() {
+                                return Err(LexerError::InvalidUnicodeEscape);
                             }
                         }
                     }

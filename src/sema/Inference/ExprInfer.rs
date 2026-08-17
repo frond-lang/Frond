@@ -481,6 +481,16 @@ impl<'a> InferContext<'a> {
                         let span = ast.expr(expr).span;
                         self.check_missing_return_value("lambda", annot_ty, *b, ast, span.line, span.column);
                     }
+                    // Sync lambda declaring Throw with a bare non-Throw tail —
+                    // the from_datetime_utc/scanln leak class.
+                    if !*is_async {
+                        let span = ast.expr(expr).span;
+                        let body_root = match body {
+                            LambdaBody::Block(b) => *b,
+                            LambdaBody::Expression(e) => *e,
+                        };
+                        self.check_throw_tail_wrapped("lambda", annot_ty, body_root, body_ty, ast, span.line, span.column);
+                    }
                     annot_ty
                 } else {
                     body_ty

@@ -41,6 +41,7 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     ("builtin/error/TimeError.frond", include_str!("../stdlib/builtin/error/TimeError.frond")),
     ("builtin/error/OsError.frond", include_str!("../stdlib/builtin/error/OsError.frond")),
     ("builtin/error/FfiError.frond", include_str!("../stdlib/builtin/error/FfiError.frond")),
+    ("builtin/error/JsonError.frond", include_str!("../stdlib/builtin/error/JsonError.frond")),
     // reflect module (runtime reflection, Raw.frond primitives + Reflect.frond wrapper)
     ("builtin/reflect/pack.frond", include_str!("../stdlib/builtin/reflect/pack.frond")),
     ("builtin/reflect/Raw.frond", include_str!("../stdlib/builtin/reflect/Raw.frond")),
@@ -133,6 +134,15 @@ pub const STD_FILES: &[StdlibFile] = &[
     // rand module (PRNG wrappers over builtin/rand)
     ("std/rand/pack.frond", include_str!("../stdlib/std/rand/pack.frond")),
     ("std/rand/Rand.frond", include_str!("../stdlib/std/rand/Rand.frond")),
+    // codec module (pure Frond hex/base64 byte-text codecs)
+    ("std/codec/pack.frond", include_str!("../stdlib/std/codec/pack.frond")),
+    ("std/codec/Hex.frond", include_str!("../stdlib/std/codec/Hex.frond")),
+    ("std/codec/Base64.frond", include_str!("../stdlib/std/codec/Base64.frond")),
+    // json module (pure Frond; layered: value ADT / parser / serializer)
+    ("std/json/pack.frond", include_str!("../stdlib/std/json/pack.frond")),
+    ("std/json/Json.frond", include_str!("../stdlib/std/json/Json.frond")),
+    ("std/json/Parse.frond", include_str!("../stdlib/std/json/Parse.frond")),
+    ("std/json/Format.frond", include_str!("../stdlib/std/json/Format.frond")),
 ];
 
 /// Looks up a stdlib file by path.

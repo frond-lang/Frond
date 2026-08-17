@@ -736,6 +736,18 @@ impl<'a> InferContext<'a> {
                         decl_span.line,
                         decl_span.column,
                     );
+                    // Sync Throw-returning function with a bare non-Throw tail:
+                    // the from_datetime_utc/scanln leak class. ret_ty arrives
+                    // Async-wrapped for async funs, which the helper filters out.
+                    self.check_throw_tail_wrapped(
+                        &format!("function '{}'", name),
+                        ret_ty,
+                        *body,
+                        body_ty,
+                        ast,
+                        decl_span.line,
+                        decl_span.column,
+                    );
                 }
                 if !type_params.is_empty() {
                     self.pop_type_bindings();
@@ -900,6 +912,20 @@ impl<'a> InferContext<'a> {
                         } else if self.unify_return_type(ret, body_ty).is_err() {
                             self.solver.add_equality(ret, body_ty);
                         }
+                        // Sync Throw-returning method with a bare non-Throw tail
+                        // (the from_datetime_utc/scanln leak class). ret_ty arrives
+                        // Async-wrapped for async methods, which the helper filters.
+                        if let Some(r) = ret_ty {
+                            self.check_throw_tail_wrapped(
+                                &format!("method '{}'", method.name),
+                                r,
+                                body,
+                                body_ty,
+                                ast,
+                                decl_span.line,
+                                decl_span.column,
+                            );
+                        }
                     }
                 }
                 self.current_type_decl_traits = None;
@@ -974,6 +1000,20 @@ impl<'a> InferContext<'a> {
                             self.unify_or_constrain(ret, body_ty);
                         } else if self.unify_return_type(ret, body_ty).is_err() {
                             self.solver.add_equality(ret, body_ty);
+                        }
+                        // Sync Throw-returning method with a bare non-Throw tail
+                        // (the from_datetime_utc/scanln leak class). ret_ty arrives
+                        // Async-wrapped for async methods, which the helper filters.
+                        if let Some(r) = ret_ty {
+                            self.check_throw_tail_wrapped(
+                                &format!("method '{}'", method.name),
+                                r,
+                                body,
+                                body_ty,
+                                ast,
+                                decl_span.line,
+                                decl_span.column,
+                            );
                         }
                     }
                 }

@@ -144,8 +144,11 @@ pub fun components_to_ns_utc(comp: TimeComponents): Throw<i128, TimeError> {
 
 // Constructs a SystemTime from a UTC DateTime (validates field legality)
 // Returns a TimeError on failure (field out of range / time exceeds the range after 1970)
+// NOTE: sync funs do NOT auto-wrap their last expression — a bare
+// `SystemTime(ns)` here would hand callers a non-Throw where Throw was
+// declared, and every downstream match Ok/Err would panic. Always wrap.
 pub fun from_datetime_utc(dt: DateTime): Throw<SystemTime, TimeError> {
     val comp = dt.to_components()
     val ns = components_to_ns_utc(comp)?
-    SystemTime(ns)
+    Ok(SystemTime(ns))
 }

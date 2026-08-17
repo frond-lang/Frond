@@ -1212,7 +1212,7 @@ fn resolve_instance_body_types<'a>(
 fn is_reflect_method_name(name: &str) -> bool {
     matches!(
         name,
-        "format" | "type_name" | "kind" | "constructor" | "size" | "alignment" | "field_count" | "field_name"
+        "repr" | "type_name" | "kind" | "constructor" | "size" | "alignment" | "field_count" | "field_name"
     )
 }
 

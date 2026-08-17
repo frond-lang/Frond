@@ -176,7 +176,7 @@ impl<'a> InferContext<'a> {
     pub(super) fn reflect_method_return_type(&mut self, method: &str, arg_count: usize) -> Option<TypeHandle> {
         // Nullary reflect methods (receiver only, arg_count == 0).
         let nullary: Option<TypeHandle> = match method {
-            "format" | "type_name" | "kind" | "constructor" => Some(self.make_builtin(Type::Str)),
+            "repr" | "type_name" | "kind" | "constructor" => Some(self.make_builtin(Type::Str)),
             "size" | "alignment" => Some(self.make_builtin(Type::U32)),
             "field_count" => Some(self.make_builtin(Type::U16)),
             _ => None,
@@ -501,6 +501,48 @@ impl<'a> InferContext<'a> {
         self.add_error_at(
             &format!(
                 "missing return value: {what} declares return type '{ret_str}' but its body has no trailing expression and no 'return'/'throw' statement"
+            ),
+            line,
+            column,
+        );
+    }
+
+    /// Bug class 2026-08-17 (from_datetime_utc / scanln): a SYNC function
+    /// declaring `Throw<..>` whose body tail is a bare non-Throw value leaks
+    /// the payload where Throw was declared — every caller-side
+    /// `match { Ok/Err }` then panics at runtime ("non-exhaustive match").
+    /// Async functions are exempt (their bare tails are engine-auto-wrapped;
+    /// `unify_return_type`'s Throw branch tolerates the payload on their
+    /// behalf), which is why `ret_ty` arrives Async-wrapped for async bodies
+    /// and the first check below filters them out. Unsolved TypeVars are
+    /// skipped: the fixpoint solver may still bind them to Throw.
+    pub(super) fn check_throw_tail_wrapped(
+        &mut self,
+        what: &str,
+        ret_ty: TypeHandle,
+        body: ExprId,
+        body_ty: TypeHandle,
+        ast: &AstArena<'_>,
+        line: u32,
+        column: u32,
+    ) {
+        if !matches!(self.arena.get(self.arena.resolve(ret_ty)), Type::Throw(_)) {
+            return;
+        }
+        match self.arena.get(self.arena.resolve(body_ty)) {
+            Type::Throw(_) | Type::TypeVar(_) | Type::Unknown | Type::Never | Type::Void => return,
+            _ => {}
+        }
+        // A block without a trailing expression has no tail value at all —
+        // check_missing_return_value owns that case; don't double-report.
+        if let Expr::Block { trailing: None, .. } = &ast.expr(body).node {
+            return;
+        }
+        let ret_str = format!("{}", self.arena.display(ret_ty));
+        let tail_str = format!("{}", self.arena.display(body_ty));
+        self.add_error_at(
+            &format!(
+                "{what} declares return type '{ret_str}' but its tail evaluates to '{tail_str}': wrap it in Ok(..) — sync functions do not auto-wrap (a trailing '?' unwraps)"
             ),
             line,
             column,

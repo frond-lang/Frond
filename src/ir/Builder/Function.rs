@@ -98,6 +98,9 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         // Unified memo-strategy query (memo_pass already makes the unique decision; mutually
         // exclusive).
         let strategy = self.lookup_memo_strategy(name, self_type);
+        if std::env::var("FROND_DEBUG_MEMO").is_ok() {
+            eprintln!("[MEMO] {}{} -> {:?}", self_type.unwrap_or(""), name, strategy.as_ref().map(|s| match s { crate::pass::Analyzer::MemoStrategy::TailRecToLoop { .. } => "TailRecToLoop", crate::pass::Analyzer::MemoStrategy::NonTailRecToLoop { .. } => "NonTailRecToLoop", crate::pass::Analyzer::MemoStrategy::Memoize { .. } => "Memoize", _ => "Other" }));
+        }
         let r = match strategy {
             Some(crate::pass::Analyzer::MemoStrategy::TailRecToLoop { info }) => {
                 self.compile_tail_rec_to_loop(name, body_expr, params, &info)

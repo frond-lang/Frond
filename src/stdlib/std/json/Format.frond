@@ -1,0 +1,97 @@
+// Format.frond — Json value -> JSON text (part of std.json)
+//
+// Mirrors Parse.frond — the two round-trip on everything the pack can
+// produce. NaN/Infinity format as null (JSON.stringify semantics).
+//
+// Serialize a Json value to JSON text (no inter-token whitespace).
+// The container arms recurse through this function directly — safe since
+// the builtin Reflect format was renamed to `repr` (no bare-name collision)
+// and Bug #102 fixed self-recursion from inside match arms.
+pub fun format(v: Json): str {
+    match v {
+        JNull => "null",
+        JBool(b) => if b { "true" } else { "false" },
+        JNum(n) => format_number(n),
+        JStr(s) => format_string(s),
+        JArr(items) => {
+            var out: str = "["
+            var i: usize = 0
+            while i < items.len() {
+                if i > 0 { out = out + "," }
+                out = out + format(items[i] ?? JNull)
+                i = i + 1
+            }
+            out + "]"
+        },
+        JObj(entries) => {
+            var out: str = "\{"
+            var i: usize = 0
+            while i < entries.len() {
+                if i > 0 { out = out + "," }
+                val ent = entries[i] ?? JEntry("", JNull)
+                out = out + format_string(ent.key) + ":" + format(ent.value)
+                i = i + 1
+            }
+            out + "\}"
+        },
+    }
+}
+
+// Number text; NaN/Infinity have no JSON spelling and format as null
+// (JSON.stringify semantics).
+fun format_number(n: f64): str {
+    if n != n { return "null" }
+    if n == (1.0 / 0.0) || n == (0.0 - 1.0 / 0.0) { return "null" }
+    "{n}"
+}
+
+// String with quotes: escapes " \ \b \f \n \r \t, other control bytes as
+// \u00xx, everything else (UTF-8) passes through.
+fun format_string(s: str): str {
+    val b = s.bytes()
+    var out: str = "\""
+    var i: usize = 0
+    while i < b.len() {
+        val c = b[i]
+        if c == 34u8 {
+            out = out + "\\\""
+            i = i + 1
+        } else if c == 92u8 {
+            out = out + "\\\\"
+            i = i + 1
+        } else if c == 10u8 {
+            out = out + "\\" + "n"
+            i = i + 1
+        } else if c == 13u8 {
+            out = out + "\\" + "r"
+            i = i + 1
+        } else if c == 9u8 {
+            out = out + "\\" + "t"
+            i = i + 1
+        } else if c == 8u8 {
+            out = out + "\\" + "b"
+            i = i + 1
+        } else if c == 12u8 {
+            out = out + "\\" + "f"
+            i = i + 1
+        } else if c < 32u8 {
+            val hi: u8[] = [hex_digit_byte(c >> 4)]
+            val lo: u8[] = [hex_digit_byte(c & 15)]
+            out = out + "\\" + "u00" + (hi as str) + (lo as str)
+            i = i + 1
+        } else {
+            // passthrough run: plain bytes (quote/backslash handled above)
+            val start = i
+            while i < b.len() && b[i] >= 32u8 && b[i] != 34u8 && b[i] != 92u8 {
+                i = i + 1
+            }
+            out = out + ((b[start..i]) as str)
+        }
+    }
+    out + "\""
+}
+
+// Hex digit byte for a nibble 0..15 (lowercase).
+fun hex_digit_byte(n: u8): u8 {
+    if n < 10 { (48 + (n as i32)) as u8 } else { (87 + (n as i32)) as u8 }
+}

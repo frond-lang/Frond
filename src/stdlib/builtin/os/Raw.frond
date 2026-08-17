@@ -830,3 +830,49 @@ fun __os_process_kill(handle: u64): i32 #{
         return kill((pid_t)handle, SIGKILL) == 0 ? 0 : -1;
     #endif
 }#
+
+// ─── Host resources ───────────────────────────────────────────────────
+
+// Number of logical processors available to the process. 0 = unknown.
+@c_include("windows.h")
+@c_include("unistd.h")
+@internal
+@extern("C")
+fun __os_cpu_count(): i64 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        return (int64_t)si.dwNumberOfProcessors;
+    #else
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        return n < 0 ? 0 : (int64_t)n;
+    #endif
+}#
+
+// Free/total space of the filesystem containing `path` (any path on the
+// volume works, existing or not). Fills buf with 16 bytes (LE):
+//   [0..8)  free   u64 (space available to the calling user, quota-aware)
+//   [8..16) total  u64
+// Returns 0 on success, -1 on failure.
+@c_include("windows.h")
+@c_include("sys/statvfs.h")
+@internal
+@extern("C")
+fun __os_disk_space_into(path: str, buf: u8[]): i32 #{
+    #if defined(_WIN32) || defined(_WIN64)
+        ULARGE_INTEGER free_avail;
+        ULARGE_INTEGER total;
+        if (!GetDiskFreeSpaceExA(path_data, &free_avail, &total, NULL)) return -1;
+        memcpy(buf_data, &free_avail.QuadPart, 8);
+        memcpy(buf_data + 8, &total.QuadPart, 8);
+        return 0;
+    #else
+        struct statvfs vfs;
+        if (statvfs(path_data, &vfs) < 0) return -1;
+        uint64_t free_b = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
+        uint64_t total_b = (uint64_t)vfs.f_blocks * (uint64_t)vfs.f_frsize;
+        memcpy(buf_data, &free_b, 8);
+        memcpy(buf_data + 8, &total_b, 8);
+        return 0;
+    #endif
+}#

@@ -8,7 +8,7 @@
 //      recognized structurally at Sema (Inference) and lowered at IR build
 //      (Builder::reflect_method_intrinsic → CF_REFLECT_* compute_fns).
 //   2. No top-level wrappers — call sites use the method form directly
-//      (e.g. Console.frond `print<T>` writes `x.format()`).
+//      (e.g. Console.frond `print<T>` writes `x.repr()`).
 //
 // No @builtin declarations remain. This file is kept as an empty placeholder
 // so the `builtin/reflect/` module layout stays stable; it contributes no

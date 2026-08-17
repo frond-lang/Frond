@@ -181,8 +181,17 @@ impl<S: LockStrategy> Engine<S> {
         // need parent-frame values copied. Direct self-recursion (child_sg.id == parent
         // subgraph_id) must not take this path — it needs a fresh call frame, not a parent-value
         // copy. Direct recursion takes the cross-function path.
+        // Bug #102: recursion FROM a branch subgraph of the same function (e.g. a self-call
+        // inside a match arm) also reaches here with child = the function BODY subgraph — the
+        // id != parent check alone does not catch it (arm id != body id). A true function-body
+        // subgraph (id == function_id) is always a CALL target: taking the branch path overlaps
+        // the value tables (child.node_offset = parent's), so the recursive frame clobbers the
+        // caller's slots — after the call returns, the caller's locals hold callee-leaved values
+        // (corruption) or the loop bookkeeping desyncs into livelock. Filter: only non-body
+        // subgraphs of the same function qualify as branches.
         let same_function = parent_sg.function_id == child_sg.function_id
-            && subgraph_id != parent_frame.subgraph_id;
+            && subgraph_id != parent_frame.subgraph_id
+            && subgraph_id.0 != child_sg.function_id;
 
         if super::env_flag("FROND_DEBUG_STALL") {
             let (cs, ce) = child_sg.node_range;

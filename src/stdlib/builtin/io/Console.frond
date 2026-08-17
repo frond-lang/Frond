@@ -51,13 +51,13 @@ fun __stdin_readln(): Throw<str?, IOError> {
 // ─── Standard output ──────────────────────────────────────────────────────
 
 pub fun print<T>(x: T): Throw<void, IOError> {
-    val s = x.format()
+    val s = x.repr()
     __stdout_write(s)?
     Ok(void)
 }
 
 pub fun println<T>(x: T): Throw<void, IOError> {
-    val s = x.format()
+    val s = x.repr()
     __stdout_write(s)?
     __stdout_write("\n")?
     Ok(void)
@@ -66,13 +66,13 @@ pub fun println<T>(x: T): Throw<void, IOError> {
 // ─── Standard error ──────────────────────────────────────────────────────
 
 pub fun eprint<T>(x: T): Throw<void, IOError> {
-    val s = x.format()
+    val s = x.repr()
     __stderr_write(s)?
     Ok(void)
 }
 
 pub fun eprintln<T>(x: T): Throw<void, IOError> {
-    val s = x.format()
+    val s = x.repr()
     __stderr_write(s)?
     __stderr_write("\n")?
     Ok(void)
@@ -81,8 +81,10 @@ pub fun eprintln<T>(x: T): Throw<void, IOError> {
 // ─── Standard input ─────────────────────────────────────────────────────
 
 // scanln: reads one line (without newline), returns null on EOF
+// Tail passthrough of the Throw value itself — a `?` tail here would unwrap
+// to a bare str? where Throw was declared (the from_datetime_utc bug class).
 pub fun scanln(): Throw<str?, IOError> {
-    __stdin_readln()?
+    __stdin_readln()
 }
 
 // scan: reads a whitespace-separated token, returns null if no token (EOF or blank line)

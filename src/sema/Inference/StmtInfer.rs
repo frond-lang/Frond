@@ -209,6 +209,34 @@ impl<'a> InferContext<'a> {
                                 span.column,
                             );
                         }
+                        // Sync Throw-returning functions must return a Throw VALUE.
+                        // A bare payload (often via `return expr?`, which unwraps)
+                        // leaks non-Throw where Throw was declared — the
+                        // from_datetime_utc/scanln bug class. Async funs are
+                        // exempt: their expected_return is Async-wrapped, so the
+                        // first check below filters them. TypeVar/Unknown values
+                        // may still solve to Throw via the fixpoint — skip them.
+                        if matches!(self.arena.get(self.arena.resolve(fn_ret)), Type::Throw(_)) {
+                            match self.arena.get(self.arena.resolve(val_ty)) {
+                                Type::Throw(_)
+                                | Type::TypeVar(_)
+                                | Type::Unknown
+                                | Type::Never => {}
+                                _ => {
+                                    let ret_str = format!("{}", self.arena.display(fn_ret));
+                                    let val_str = format!("{}", self.arena.display(val_ty));
+                                    let span = ast.stmt(stmt).span;
+                                    self.add_error_at(
+                                        &format!(
+                                            "'return' value must be Throw-wrapped: expected '{}', found '{}' (wrap in Ok(..)/Err(..) or return the Throw value directly; 'expr?' unwraps)",
+                                            ret_str, val_str
+                                        ),
+                                        span.line,
+                                        span.column,
+                                    );
+                                }
+                            }
+                        }
                     }
                     Some(val_ty)
                 } else {
