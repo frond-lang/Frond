@@ -128,6 +128,48 @@ impl<'a> InferContext<'a> {
 
             // ── Reference / dereference ──
             Expr::RefOf(operand) => {
+                // Place check: `&` requires a place — a variable, `arr[i]`,
+                // or `rec.field`. Rvalue borrows (`&(a+b)`, `&f()`,
+                // `&Type.Ctor`) and immutable str elements (`&s[i]`) are
+                // rejected here instead of compiling to a silent snapshot.
+                let node = &ast.expr(*operand).node;
+                let span = ast.expr(expr).span;
+                let is_place = matches!(
+                    node,
+                    Expr::Ident(_) | Expr::Index { .. } | Expr::FieldAccess { .. }
+                );
+                if !is_place {
+                    self.add_error_at(
+                        "cannot take a reference to this expression: only variables, arr[i], and rec.field are addressable",
+                        span.line,
+                        span.column,
+                    );
+                }
+                if let Expr::FieldAccess { recv, field } = node {
+                    if let Expr::Ident(type_name) = &ast.expr(*recv).node {
+                        if self.check_qualified_ctor(type_name, field).is_some() {
+                            self.add_error_at(
+                                &format!(
+                                    "'{}.{}' is a constructor call, not a variable; constructors are not addressable",
+                                    type_name, field
+                                ),
+                                span.line,
+                                span.column,
+                            );
+                        }
+                    }
+                }
+                if let Expr::Index { recv, .. } = node {
+                    let recv_ty = self.infer_expr(*recv, ast, env, None);
+                    let resolved = self.arena.resolve(recv_ty);
+                    if matches!(self.arena.get(resolved), Type::Str) {
+                        self.add_error_at(
+                            "cannot take a reference to a str element: str is immutable",
+                            span.line,
+                            span.column,
+                        );
+                    }
+                }
                 let inner_ty = self.infer_expr(*operand, ast, env, None);
                 self.arena.make_ref(inner_ty, false)
             }

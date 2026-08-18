@@ -2476,6 +2476,15 @@ pub enum HeapObj {
     Adt(AdtValue),
     Newtype(NewtypeValue),
     Cell(Cell),
+    /// Place reference (place model B-stage): handle to a mutable storage
+    /// location. `&arr[i]` creates this; `*r` reads the element LIVE (SoA
+    /// -aware) and `*r = v` stores in place (same semantics as `arr[i] = v`).
+    ArrayElemRef { arr: Value, idx: Value },
+    /// Place reference: `&rec.field` / `&this.field`. Field is by name
+    /// (records/ADTs store names); read/write mirror record_field_get/set.
+    RecordFieldRef { rec: Value, field: Box<str> },
+    /// Place reference: `&global` — indexes `graph.global_var_storage`.
+    GlobalSlotRef { slot: u32 },
     Range(Range),
     Closure(Closure),
     Partial(PartialApplication),
@@ -2505,7 +2514,7 @@ pub type HeapRef = Arc<HeapObj>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefKind {
     Str, Array, Record, Adt, Newtype, Cell, Range, Closure, Partial, Builtin,
-    TraitVal, LazyVal, ErrorVal, ThrowVal,
+    TraitVal, LazyVal, ErrorVal, ThrowVal, ArrayElemRef, RecordFieldRef, GlobalSlotRef,
     AtomicVal, AsyncVal, ChannelVal, SenderVal, ReceiverVal, CoroutineFrame,
     OpaquePtr, LibVal, ForeignFnVal,
 }
@@ -2546,6 +2555,9 @@ impl HeapObj {
             HeapObj::Adt(_) => RefKind::Adt,
             HeapObj::Newtype(_) => RefKind::Newtype,
             HeapObj::Cell(_) => RefKind::Cell,
+            HeapObj::ArrayElemRef { .. } => RefKind::ArrayElemRef,
+            HeapObj::RecordFieldRef { .. } => RefKind::RecordFieldRef,
+            HeapObj::GlobalSlotRef { .. } => RefKind::GlobalSlotRef,
             HeapObj::Range(_) => RefKind::Range,
             HeapObj::Closure(_) => RefKind::Closure,
             HeapObj::Partial(_) => RefKind::Partial,
@@ -2574,6 +2586,9 @@ impl HeapObj {
             HeapObj::Adt(_) => "adt",
             HeapObj::Newtype(_) => "newtype",
             HeapObj::Cell(_) => "cell",
+            HeapObj::ArrayElemRef { .. } => "array_elem_ref",
+            HeapObj::RecordFieldRef { .. } => "record_field_ref",
+            HeapObj::GlobalSlotRef { .. } => "global_slot_ref",
             HeapObj::Range(_) => "range",
             HeapObj::Closure(_) => "closure",
             HeapObj::Partial(_) => "partial",
@@ -2602,6 +2617,9 @@ impl HeapObj {
             HeapObj::Adt(_) => "adt",
             HeapObj::Newtype(_) => "newtype",
             HeapObj::Cell(_) => "cell",
+            HeapObj::ArrayElemRef { .. } => "array_elem_ref",
+            HeapObj::RecordFieldRef { .. } => "record_field_ref",
+            HeapObj::GlobalSlotRef { .. } => "global_slot_ref",
             HeapObj::Range(_) => "range",
             HeapObj::Closure(_) => "<closure>",
             HeapObj::Partial(_) => "<partial>",
@@ -2671,6 +2689,15 @@ impl Hash for HeapObj {
             HeapObj::Cell(c) => {
                 c.inner.lock().hash(state);
             }
+            HeapObj::ArrayElemRef { arr, idx } => {
+                arr.hash(state);
+                idx.hash(state);
+            }
+            HeapObj::RecordFieldRef { rec, field } => {
+                rec.hash(state);
+                field.hash(state);
+            }
+            HeapObj::GlobalSlotRef { slot } => slot.hash(state),
             HeapObj::Range(r) => {
                 r.start.hash(state);
                 r.end.hash(state);

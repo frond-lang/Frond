@@ -119,6 +119,9 @@ fn reflect_kind(v: &Value) -> u8 {
             crate::value::HeapObj::Adt(_) => k::ADT,
             crate::value::HeapObj::Newtype(_) => k::NEWTYPE,
             crate::value::HeapObj::Cell(_) => k::CELL,
+            crate::value::HeapObj::ArrayElemRef { .. }
+            | crate::value::HeapObj::RecordFieldRef { .. }
+            | crate::value::HeapObj::GlobalSlotRef { .. } => k::CELL,
             crate::value::HeapObj::Range(_) => k::RANGE,
             crate::value::HeapObj::Closure(_) => k::CLOSURE,
             crate::value::HeapObj::Partial(_) => k::PARTIAL,
@@ -153,6 +156,9 @@ fn reflect_kind_str(v: &Value) -> &'static str {
             crate::value::HeapObj::Adt(_) => "Adt",
             crate::value::HeapObj::Newtype(_) => "Newtype",
             crate::value::HeapObj::Cell(_) => "Cell",
+            crate::value::HeapObj::ArrayElemRef { .. }
+            | crate::value::HeapObj::RecordFieldRef { .. }
+            | crate::value::HeapObj::GlobalSlotRef { .. } => "Cell",
             crate::value::HeapObj::Range(_) => "Range",
             crate::value::HeapObj::Closure(_) => "Closure",
             crate::value::HeapObj::Partial(_) => "Partial",
@@ -222,6 +228,9 @@ fn reflect_type_name(v: &Value) -> String {
             crate::value::HeapObj::ReceiverVal(_) => "Receiver".to_string(),
             crate::value::HeapObj::CoroutineFrame => "Coroutine".to_string(),
             crate::value::HeapObj::Cell(_) => "Cell".to_string(),
+            crate::value::HeapObj::ArrayElemRef { .. }
+            | crate::value::HeapObj::RecordFieldRef { .. }
+            | crate::value::HeapObj::GlobalSlotRef { .. } => "Cell".to_string(),
             crate::value::HeapObj::Range(_) => "Range".to_string(),
             crate::value::HeapObj::Partial(_) => "Partial".to_string(),
             crate::value::HeapObj::Builtin(b) => b.name.clone(),
@@ -2377,13 +2386,38 @@ pub fn compute_non_null_assert(frame: &mut Frame, node: NodeId, ctx: &EvalContex
 /// (records, etc.), the same Arc is shared directly (no second wrapping needed).
 pub fn compute_ref_of(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
+    // Place-ref forms (input-count + side-entry dispatch keeps ONE compute fn,
+    // so the .fndo table stays compatible):
+    //   0 inputs + global_load_slot  -> `&global`   (GlobalSlotRef)
+    //   2 inputs                     -> `&arr[i]`   (ArrayElemRef)
+    //   1 input + field_set_name     -> `&rec.field` / `&this.field`
+    match n.input_count {
+        0 => {
+            let slot = graph
+                .global_load_slot(node.0 as usize)
+                .expect("global place-ref node has no slot");
+            return Value::ref_val(crate::value::HeapObj::GlobalSlotRef { slot });
+        }
+        2 => {
+            let arr = force_input(frame, inputs[0]);
+            let idx = force_input(frame, inputs[1]);
+            return Value::ref_val(crate::value::HeapObj::ArrayElemRef { arr, idx });
+        }
+        _ => {}
+    }
+    if let Some(field) = graph.field_set_name(node.0 as usize) {
+        let rec = force_input(frame, inputs[0]);
+        return Value::ref_val(crate::value::HeapObj::RecordFieldRef {
+            rec,
+            field: field.to_string().into_boxed_str(),
+        });
+    }
     let v = force_input(frame, inputs[0]);
     match &v {
-        // Scalar/Null/Void → wrap in a Cell AND upgrade the source slot to
-        // hold that same cell: `*r = v` (compute_deref_write) writes the cell
-        // and force_input unwraps cell slots on every read, so the write is
-        // visible to every reader of the binding. Without the slot upgrade
-        // the cell was an orphan snapshot and deref writes were silently lost.
+        // Scalar/Null/Void → wrap in a fresh Cell. Binding-level write-through
+        // (`&x` then `x = v` observed through the ref) is handled at COMPILE
+        // time by the Builder's static rebinding (name reads/writes route
+        // through this same Cell); the runtime ref itself is just the cell.
         Value::Scalar(_, _) | Value::Null | Value::Void => {
             let cell = crate::value::Cell::new(v.clone());
             Value::ref_val(crate::value::HeapObj::Cell(cell))
@@ -2403,7 +2437,54 @@ pub fn compute_deref_read(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
     let v = force_input(frame, inputs[0]);
     match v.heap_obj() {
         Some(crate::value::HeapObj::Cell(c)) => c.get(),
+        // Place refs read their location LIVE (SoA-aware for arrays), so
+        // container mutations between ref creation and read are observed.
+        Some(crate::value::HeapObj::ArrayElemRef { arr, idx }) => {
+            place_read_array_elem(arr, idx)
+        }
+        Some(crate::value::HeapObj::RecordFieldRef { rec, field }) => {
+            place_read_record_field(rec, field)
+        }
+        Some(crate::value::HeapObj::GlobalSlotRef { slot }) => {
+            let storage = &graph.global_var_storage;
+            storage[*slot as usize].lock().unwrap().clone().unwrap_or(Value::NULL)
+        }
         _ => v,
+    }
+}
+
+/// Place-ref live element read (mirrors compute_array_index's SoA-aware path
+/// and panic messages; OOB is a runtime panic like direct indexing).
+fn place_read_array_elem(arr: &Value, idx: &Value) -> Value {
+    let idx_raw = idx.as_i32();
+    if idx_raw < 0 {
+        panic!("index {} out of bounds (negative index)", idx_raw);
+    }
+    match arr.heap_obj() {
+        Some(crate::value::HeapObj::Array(a)) => a.get(idx_raw as usize).unwrap_or_else(|| {
+            panic!("index {} out of bounds (len {})", idx_raw, a.len())
+        }),
+        _ => panic!("place ref: index on non-array value"),
+    }
+}
+
+/// Place-ref live field read (Record by name position, Adt by field name).
+fn place_read_record_field(rec: &Value, field: &str) -> Value {
+    match rec.heap_obj() {
+        Some(crate::value::HeapObj::Record(r)) => r
+            .field_names
+            .iter()
+            .position(|n| n.as_deref() == Some(field))
+            .and_then(|i| r.fields.get(i))
+            .cloned()
+            .unwrap_or_else(|| panic!("place ref: record has no field '{}'", field)),
+        Some(crate::value::HeapObj::Adt(a)) => a
+            .fields
+            .iter()
+            .find(|f| f.name.as_deref() == Some(field))
+            .map(|f| f.value.clone())
+            .unwrap_or_else(|| panic!("place ref: variant has no field '{}'", field)),
+        _ => panic!("place ref: field access on non-record value"),
     }
 }
 
@@ -2418,8 +2499,29 @@ pub fn compute_deref_write(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     let ref_val = force_input(frame, inputs[0]);
     let new_val = force_input(frame, inputs[1]);
 
-    if let Some(crate::value::HeapObj::Cell(c)) = ref_val.heap_obj() {
-        c.set(new_val.clone());
+    match ref_val.heap_obj() {
+        Some(crate::value::HeapObj::Cell(c)) => c.set(new_val.clone()),
+        // Place refs store into their location — identical semantics to the
+        // direct statements (`arr[i] = v` / `rec.f = v` / `g = v`), including
+        // SoA materialization and in-place Arc mutation.
+        Some(crate::value::HeapObj::ArrayElemRef { arr, idx }) => {
+            let idx_raw = idx.as_i32();
+            if idx_raw < 0 {
+                panic!("index {} out of bounds (negative index)", idx_raw);
+            }
+            match arr.heap_ref() {
+                Some(arc) => array_store_inplace(&arc, idx_raw as usize, &new_val),
+                None => panic!("place ref: index on non-array value"),
+            }
+        }
+        Some(crate::value::HeapObj::RecordFieldRef { rec, field }) => match rec.heap_ref() {
+            Some(arc) => record_field_set_inplace(&arc, field, &new_val),
+            None => panic!("place ref: field access on non-record value"),
+        },
+        Some(crate::value::HeapObj::GlobalSlotRef { slot }) => {
+            *graph.global_var_storage[*slot as usize].lock().unwrap() = Some(new_val.clone());
+        }
+        _ => {}
     }
     new_val
 }
@@ -2457,27 +2559,39 @@ pub fn compute_record_field_set(frame: &mut Frame, node: NodeId, ctx: &EvalConte
     // drop), only the heap data is mutated.
     if let Some(val) = frame.value_table.get_value_mut(record_node_local.0 as usize) {
         if let Value::Ref(arc) = val {
-            let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::value::HeapObj;
-            unsafe {
-                match &mut *ptr {
-                    crate::value::HeapObj::Record(r) => {
-                        if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(field_name)) {
-                            if idx < r.fields.len() {
-                                    r.fields[idx] = new_value.clone();
-                            }
-                        }
-                    }
-                    crate::value::HeapObj::Adt(a) => {
-                        if let Some(idx) = a.fields.iter().position(|f| f.name.as_deref() == Some(field_name)) {
-                            a.fields[idx].value = new_value.clone();
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            record_field_set_inplace(arc, field_name, &new_value);
         }
     }
     Value::VOID
+}
+
+/// Shared in-place record/ADT field store (used by `rec.f = v` statements and
+/// place-ref deref writes). Mutates the heap object through `Arc::as_ptr`,
+/// bypassing COW so every owner of the Arc observes the write — see
+/// compute_record_field_set for the safety argument (single-threaded engine).
+pub(crate) fn record_field_set_inplace(
+    rec_arc: &std::sync::Arc<crate::value::HeapObj>,
+    field_name: &str,
+    new_value: &Value,
+) {
+    let ptr = std::sync::Arc::as_ptr(rec_arc) as *mut crate::value::HeapObj;
+    unsafe {
+        match &mut *ptr {
+            crate::value::HeapObj::Record(r) => {
+                if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(field_name)) {
+                    if idx < r.fields.len() {
+                        r.fields[idx] = new_value.clone();
+                    }
+                }
+            }
+            crate::value::HeapObj::Adt(a) => {
+                if let Some(idx) = a.fields.iter().position(|f| f.name.as_deref() == Some(field_name)) {
+                    a.fields[idx].value = new_value.clone();
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// compute_fn (idx 301): array index store `arr[i] = x`.
@@ -2498,48 +2612,61 @@ pub fn compute_array_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     let arr_node_local = NodeId(inputs[0].0.wrapping_sub(frame.node_offset));
     if let Some(val) = frame.value_table.get_value_mut(arr_node_local.0 as usize) {
         if let Value::Ref(arc) = val {
-            let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::value::HeapObj;
-            unsafe {
-                if let crate::value::HeapObj::Array(arr) = &mut *ptr {
-                    if idx >= arr.len() {
-                        // Single-source model: the live data may exist ONLY in
-                        // the SoA (elements can be an empty shell after a
-                        // single-source clone) — materialize elements from the
-                        // SoA first, then grow, then drop the SoA (it cannot
-                        // extend past the old length).
-                        if let Some(soa) = arr.scalar_soa.take() {
-                            arr.elements = (0..soa.soa_len())
-                                .map(|i| soa.get_value(i).unwrap_or(Value::VOID))
-                                .collect();
-                        }
-                        arr.elements.resize(idx + 1, Value::VOID);
-                    } else if arr.elements.len() <= idx {
-                        // In-bounds for the array but beyond the (possibly
-                        // empty/stale) elements shell: the SoA is the truth —
-                        // write it there; elements may stay stale.
-                        if let Some(ref mut soa) = arr.scalar_soa {
-                            if soa.try_store(idx, &new_value) {
-                                // Written to the truth; the stale elements
-                                // shell is skipped via the length check below.
-                            } else {
-                                arr.scalar_soa = None;
-                            }
-                        }
+            array_store_inplace(arc, idx, &new_value);
+        }
+    }
+    Value::VOID
+}
+
+/// Shared in-place array element store (used by `arr[i] = v` statements and
+/// place-ref deref writes). Mutates the heap object through `Arc::as_ptr`
+/// (same safety argument as compute_array_store). SoA is single-source truth:
+/// growth materializes from the SoA first, in-bounds writes keep the SoA in
+/// sync or invalidate it on type mismatch.
+pub(crate) fn array_store_inplace(
+    arr_arc: &std::sync::Arc<crate::value::HeapObj>,
+    idx: usize,
+    new_value: &Value,
+) {
+    let ptr = std::sync::Arc::as_ptr(arr_arc) as *mut crate::value::HeapObj;
+    unsafe {
+        if let crate::value::HeapObj::Array(arr) = &mut *ptr {
+            if idx >= arr.len() {
+                // Single-source model: the live data may exist ONLY in
+                // the SoA (elements can be an empty shell after a
+                // single-source clone) — materialize elements from the
+                // SoA first, then grow, then drop the SoA (it cannot
+                // extend past the old length).
+                if let Some(soa) = arr.scalar_soa.take() {
+                    arr.elements = (0..soa.soa_len())
+                        .map(|i| soa.get_value(i).unwrap_or(Value::VOID))
+                        .collect();
+                }
+                arr.elements.resize(idx + 1, Value::VOID);
+            } else if arr.elements.len() <= idx {
+                // In-bounds for the array but beyond the (possibly
+                // empty/stale) elements shell: the SoA is the truth —
+                // write it there; elements may stay stale.
+                if let Some(ref mut soa) = arr.scalar_soa {
+                    if soa.try_store(idx, new_value) {
+                        // Written to the truth; the stale elements
+                        // shell is skipped via the length check below.
+                    } else {
+                        arr.scalar_soa = None;
                     }
-                    if arr.elements.len() > idx {
-                        arr.elements[idx] = new_value.clone();
-                    }
-                    // Sync the SoA: if the type matches, write in place; otherwise invalidate the SoA cache.
-                    if let Some(ref mut soa) = arr.scalar_soa {
-                        if !soa.try_store(idx, &new_value) {
-                            arr.scalar_soa = None;
-                        }
-                    }
+                }
+            }
+            if arr.elements.len() > idx {
+                arr.elements[idx] = new_value.clone();
+            }
+            // Sync the SoA: if the type matches, write in place; otherwise invalidate the SoA cache.
+            if let Some(ref mut soa) = arr.scalar_soa {
+                if !soa.try_store(idx, new_value) {
+                    arr.scalar_soa = None;
                 }
             }
         }
     }
-    Value::VOID
 }
 
 /// compute_fn: null check (checks whether a value is null; returns `bool`).

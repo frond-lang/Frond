@@ -1973,6 +1973,31 @@ fn deep_clone_heap(
             let inner = c.inner.lock().clone();
             HeapObj::Cell(Cell::new(deep_clone_value(&inner, arena, cache)))
         }
+        // Place refs deep-clone as independent copies (same philosophy as
+
+        // Cell): the base container is deep-cloned, so the clone refers to a
+
+        // detached location. Live aliasing lives on the REF itself, not its
+
+        // deep clone (mem.clone contract).
+
+        HeapObj::ArrayElemRef { arr, idx } => HeapObj::ArrayElemRef {
+
+            arr: deep_clone_value(arr, arena, cache),
+
+            idx: idx.clone(),
+
+        },
+
+        HeapObj::RecordFieldRef { rec, field } => HeapObj::RecordFieldRef {
+
+            rec: deep_clone_value(rec, arena, cache),
+
+            field: field.clone(),
+
+        },
+
+        HeapObj::GlobalSlotRef { slot } => HeapObj::GlobalSlotRef { slot: *slot },
         HeapObj::Range(r) => HeapObj::Range(r.clone()),
         HeapObj::Closure(c) => {
             // upvalues have been migrated to Value; bound_args are still ValueHandles

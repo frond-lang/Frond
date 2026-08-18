@@ -720,6 +720,22 @@ impl<'a> IrBuilder<'a> {
         Some(entry)
     }
 
+    /// True when `recv.field` is the `Type.Ctor` qualified-constructor form —
+    /// constructors are rvalues, not places (defense in depth behind the sema
+    /// place check).
+    pub(super) fn is_qualified_ctor_place(
+        &self,
+        recv_id: crate::ast::Ast::ExprId,
+        field: &str,
+    ) -> bool {
+        if let crate::ast::Ast::Expr::Ident(type_name) =
+            &self.current_module().arena.expr(recv_id).node
+        {
+            return self.check_qualified_ctor_ir(type_name, field).is_some();
+        }
+        false
+    }
+
     /// Bug #49: check whether the current function subgraph contains a function-level defer.
     /// Used to decide whether a local variable reassignment needs a WriteBack to the original
     /// node (so defer bodies read the latest value, Reference-mode semantics).
@@ -968,6 +984,80 @@ impl<'a> IrBuilder<'a> {
             // Take a reference `&expr` -> `compute_ref_of` (280): scalars are boxed into a Cell;
             // heap objects share an Arc.
             crate::ast::Ast::Expr::RefOf(inner) => {
+                let inner_ast = &self.current_module().arena.expr(*inner).node;
+                // ── Place references (place model B-stage) ──
+                // `&arr[i]` → ArrayElemRef (live element location, SoA-aware).
+                if let crate::ast::Ast::Expr::Index { recv, index } = inner_ast {
+                    let recv_node = self.compile_subexpr(*recv);
+                    let idx_node = self.compile_subexpr(*index);
+                    let inputs_offset = self.graph.inputs_pool.push(&[recv_node, idx_node]);
+                    return self.graph.add_node(Node {
+                        kind: NodeKind::UnOp,
+                        input_count: 2,
+                        inputs_offset,
+                        compute_fn: CF_REF_OF,
+                    });
+                }
+                // `&rec.field` → RecordFieldRef (1 input + field name side
+                // entry). Implicit-this `&field` inside methods resolves to
+                // `&this.field`. Qualified constructors (`Type.Ctor`) are NOT
+                // places — leave them to the normal path (sema rejects them).
+                let field_place: Option<(crate::ast::Ast::ExprId, &str)> = match inner_ast {
+                    crate::ast::Ast::Expr::FieldAccess { recv, field } => Some((*recv, field)),
+                    _ => None,
+                };
+                if let Some((recv_id, field)) = field_place {
+                    if !self.is_qualified_ctor_place(recv_id, field) {
+                        let recv_node = self.compile_subexpr(recv_id);
+                        let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
+                        let ref_node = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: 1,
+                            inputs_offset,
+                            compute_fn: CF_REF_OF,
+                        });
+                        self.graph.set_field_set_name(ref_node, field.to_string());
+                        return ref_node;
+                    }
+                }
+                if let crate::ast::Ast::Expr::Ident(_) = inner_ast {
+                    if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) =
+                        self.expr_implicit_this(*inner).cloned()
+                    {
+                        let field_name = field.to_string();
+                        let this_node = self
+                            .lookup_var("this")
+                            .expect("this binding must exist in method body");
+                        let inputs_offset = self.graph.inputs_pool.push(&[this_node]);
+                        let ref_node = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: 1,
+                            inputs_offset,
+                            compute_fn: CF_REF_OF,
+                        });
+                        self.graph.set_field_set_name(ref_node, field_name);
+                        return ref_node;
+                    }
+                }
+                // `&global` → GlobalSlotRef (0 inputs + slot side entry) — a
+                // LIVE reference to the global slot, not a snapshot. Only
+                // when the name is NOT a local (locals take the Cell path).
+                if let crate::ast::Ast::Expr::Ident(name) = inner_ast {
+                    if self.lookup_var(name).is_none() {
+                        if let Some(slot) = self.lookup_global_var(name) {
+                            let inputs_offset = self.graph.inputs_pool.push(&[]);
+                            let ref_node = self.graph.add_node(Node {
+                                kind: NodeKind::UnOp,
+                                input_count: 0,
+                                inputs_offset,
+                                compute_fn: CF_REF_OF,
+                            });
+                            self.graph.set_global_load_slot(ref_node, slot);
+                            return ref_node;
+                        }
+                    }
+                }
+                // ── Binding references (locals; static rebinding) ──
                 let inner_node = self.compile_subexpr(*inner);
                 // Canonical cell: a second `&x` of the SAME binding reuses the
                 // first RefOf's Cell, so both references alias one storage
