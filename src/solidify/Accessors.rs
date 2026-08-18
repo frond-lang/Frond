@@ -1,6 +1,6 @@
 //! DataFlowGraph zerocopy accessor layer.
 //!
-//! When `DataFlowGraph.mem = Some(GraphMemory)` (the `.kzo` loading path):
+//! When `DataFlowGraph.mem = Some(GraphMemory)` (the `.fndo` loading path):
 //! - `nodes` and `inputs` are read directly from the mmap'd byte slices via
 //!   accessor methods (v2 packed 4B/8B node records; the inputs-offset column
 //!   is either in-record or a load-time prefix table), with no copy into
@@ -199,7 +199,7 @@ impl DataFlowGraph {
     }
 
     /// stdlib @extern("C") #{ }# inline FFI call info (materialized at load;
-    /// v2 serializes it — the v1 gap that panicked `frond run <file>.kzo` is
+    /// v2 serializes it — the v1 gap that panicked `frond run <file>.fndo` is
     /// closed).
     #[inline]
     pub fn dyn_ffi_info(&self, idx: usize) -> Option<DynFfiInfo> {

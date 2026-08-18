@@ -1,6 +1,6 @@
 //! Cross-version migration skeleton (reserved interface, no concrete migrations yet).
 //!
-//! When the `.kzo` format evolves (schema_version or abi_version bumps), older
+//! When the `.fndo` format evolves (schema_version or abi_version bumps), older
 //! artifacts must be migrated to the new version before they can be loaded. This
 //! module reserves a migration registry interface for that purpose.
 //!

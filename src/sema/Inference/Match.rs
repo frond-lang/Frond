@@ -636,6 +636,22 @@ impl<'a> InferContext<'a> {
                         .get_ctor_def(name)
                         .map(|c| c.field_type_reprs.clone())
                         .unwrap_or_else(|| Box::new([]));
+                    if field_type_reprs.is_empty() && self.sema_result.get_ctor_def(name).is_none() {
+                        // Unknown constructor name (e.g. Rust-style `Some(x)`/`None` —
+                        // nullable here has no constructors; match `null => ...` and bind
+                        // the value in the other arm instead). Reject at sema time:
+                        // the old silent fallback bound pattern vars to fresh TypeVars,
+                        // deferring the breakage to method-dispatch misses at IR time.
+                        let span = ast.pattern(pat).span;
+                        self.add_error_at(
+                            &format!(
+                                "unknown constructor pattern '{}': no constructor of this name exists (T? matches with `null => ...` plus a binding arm)",
+                                name
+                            ),
+                            span.line,
+                            span.column,
+                        );
+                    }
                     for (i, &sub_pat) in patterns.iter().enumerate() {
                         let sub_ty = if i < field_type_reprs.len() {
                             self.type_repr_to_handle(&field_type_reprs[i])

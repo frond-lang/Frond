@@ -1,12 +1,12 @@
-//! Project manifest (frond.toml) loading + path resolution.
+//! Project manifest (Root.toml) loading + path resolution.
 
 use std::fs;
 use std::process;
 
 /// Project manifest file name.
-pub const MANIFEST_NAME: &str = "frond.toml";
+pub const MANIFEST_NAME: &str = "Root.toml";
 /// Default entry file.
-pub const DEFAULT_ENTRY: &str = "src/Main.kz";
+pub const DEFAULT_ENTRY: &str = "src/Main.frond";
 /// Default output directory.
 pub const DEFAULT_OUTPUT_DIR: &str = "out";
 
@@ -16,7 +16,7 @@ pub const DEFAULT_OUTPUT_DIR: &str = "out";
 /// ```toml
 /// [package]
 /// name = "myapp"           # required
-/// entry = "src/Main.kz"  # optional, defaults to src/Main.kz
+/// entry = "src/Main.frond"  # optional, defaults to src/Main.frond
 ///
 /// [build]
 /// output_dir = "out"       # optional, defaults to "out"
@@ -80,7 +80,7 @@ pub fn find_project_root() -> Option<String> {
     None
 }
 
-/// Loads the project manifest: searches upward for the project root, then reads and parses frond.toml.
+/// Loads the project manifest: searches upward for the project root, then reads and parses Root.toml.
 /// Exits with an error if no manifest is found (project-based).
 pub fn load_manifest() -> (String, Manifest) {
     let root = find_project_root().unwrap_or_else(|| {

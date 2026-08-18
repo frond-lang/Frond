@@ -1,0 +1,9 @@
+// Bool.frond — the bool type module (part of std.core)
+
+pub fun parse(s: str): bool? {
+    match s {
+        "true" => true,
+        "false" => false,
+        _ => null,
+    }
+}

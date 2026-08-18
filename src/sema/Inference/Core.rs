@@ -62,7 +62,7 @@ pub struct InferContext<'a> {
     /// Module-specific EnvId of the module currently being checked.
     /// Looked up from module_envs at the start of check_module_with_env; used to register symbols during predeclare_declarations.
     pub current_module_env: Option<EnvId>,
-    /// Filename of the module currently being checked (e.g. "Math/Geometry.kz"), used as part of the expr_types composite key.
+    /// Filename of the module currently being checked (e.g. "Math/Geometry.frond"), used as part of the expr_types composite key.
     /// Prevents ExprIds from different modules from colliding in the global expr_types.
     pub current_module_name: String,
     /// Diagnostic trace table: records (TypeHandle, Span) for each expression's inference result, used to trace unresolved TypeVars back to their source locations.

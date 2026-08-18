@@ -1,0 +1,12 @@
+// std/json package declaration
+//
+// JSON support, split by layer (math/time style — one sub-pack per file):
+//   Json.frond   — value ADT (Json/JEntry) + get/as_* accessors
+//   Parse.frond  — text -> value (RFC 8259 subset, \uXXXX incl. surrogate pairs)
+//   Format.frond — value -> text (round-trips with Parse)
+// Objects are ordered entry arrays (JEntry[]) — the language has no map
+// type yet; key order is preserved by parse and replayed by format.
+// `import std.json` loads all three sub-packs.
+pub pack Json
+pub pack Parse
+pub pack Format

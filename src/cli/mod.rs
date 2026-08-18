@@ -2,7 +2,7 @@
 //!
 //! Split into data-flow-responsibility modules:
 //! - `Args`: CLI argument definitions (Cli/Commands/DebugStage)
-//! - `Manifest`: project manifest (frond.toml) loading + path resolution
+//! - `Manifest`: project manifest (Root.toml) loading + path resolution
 //! - `Pipeline`: shared compile pipeline (compile_graph + read_source)
 //! - `Init`/`Debug`/`Build`/`Run`/`Inspect`/`Fmt`/`Lint`/`Lsp`: per-subcommand implementations
 
@@ -28,7 +28,7 @@ pub fn run() {
     match cli.command {
         Commands::Init { name } => Init::cmd_init(name),
         Commands::Build { output, opt_level } => Build::cmd_build(output, opt_level),
-        Commands::Run { file, opt_level } => Run::cmd_run(file, opt_level),
+        Commands::Run { args, opt_level } => Run::cmd_run(args, opt_level),
         Commands::Debug { file, stage } => Debug::cmd_debug(file, stage),
         Commands::Inspect { file, verbose } => Inspect::cmd_inspect(&file, verbose),
         Commands::Fmt { path, check, stdin } => Fmt::cmd_fmt(path, check, stdin),

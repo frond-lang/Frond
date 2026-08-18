@@ -1,0 +1,27 @@
+// TimeError: error type returned when a time operation fails
+//
+// Usage:
+//   - __components_to_ns_utc returns Throw<_, TimeError> when datetime fields are out of range
+//   - DateTime.parse returns Throw<_, TimeError> on parse failure
+//   - Field semantics:
+//       kind  : error category (exhaustive ADT)
+//       msg   : error description (human readable)
+//       value : string representation of the input value that triggered the error (e.g. "month=13")
+//
+// As a builtin error_newtype, it automatically gets the Error trait's message() default implementation (reads the msg field).
+// type_name() override returns "time error" for easy identification in logs.
+type TimeError: Err = TimeError(
+    pub kind: TimeErrorKind,
+    pub message: str,
+    pub value: str,
+) {
+    override fun type_name(): str { "time error" }
+}
+
+// Time error categories (exhaustive ADT)
+type TimeErrorKind =
+    | InvalidDateTime    // datetime field out of range (e.g. month=13, day=32)
+    | InvalidFormat       // format string syntax error
+    | ParseFailed         // string parse failure
+    | OutOfRange          // value exceeds i128 range (e.g. ancient epoch)
+    | TimezoneNotFound   // timezone name not found (reserved, no timezone support in the first batch)

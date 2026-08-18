@@ -729,7 +729,24 @@ impl<'a> Lexer<'a> {
             b'0'..=b'9' => self.scan_number(start, start_line, start_col),
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.scan_identifier(start, start_line, start_col),
             // Unknown character: emit an error Token (does not abort scanning)
-            _ => Ok(Some(self.make_token(TokenKind::Err, start, start_line, start_col))),
+            _ => {
+                // Non-ASCII text outside literals: consume the full UTF-8 sequence so the
+                // lexeme slice ends on a char boundary (mirrors scan_char's non-ASCII branch).
+                // Source is a &str, so a lead byte is always followed by its continuation bytes.
+                let first = self.bytes[start];
+                if first >= 0xC0 {
+                    let utf8_len = if first < 0xE0 {
+                        2
+                    } else if first < 0xF0 {
+                        3
+                    } else {
+                        4
+                    };
+                    let end = std::cmp::min(start + utf8_len, self.bytes.len());
+                    self.pos = end;
+                }
+                Ok(Some(self.make_token(TokenKind::Err, start, start_line, start_col)))
+            }
         }
     }
 
@@ -1068,10 +1085,13 @@ impl<'a> Lexer<'a> {
                         self.pos += 1;
                         self.column += 1;
                         let mut digit_count: usize = 0;
+                        let mut value: u32 = 0;
                         while self.pos < self.bytes.len() && self.bytes[self.pos] != b'}' {
                             if !is_hex_digit(self.bytes[self.pos]) {
                                 return Err(LexerError::InvalidUnicodeEscape);
                             }
+                            value = value.wrapping_mul(16)
+                                .wrapping_add((self.bytes[self.pos] as char).to_digit(16).unwrap_or(0));
                             self.pos += 1;
                             self.column += 1;
                             digit_count += 1;
@@ -1079,16 +1099,24 @@ impl<'a> Lexer<'a> {
                         if digit_count == 0 || self.pos >= self.bytes.len() {
                             return Err(LexerError::InvalidUnicodeEscape);
                         }
+                        if char::from_u32(value).is_none() {
+                            return Err(LexerError::InvalidUnicodeEscape);
+                        }
                         self.pos += 1;
                         self.column += 1;
                     } else {
-                        // \uXXXX without braces: exactly 4 hex digits
+                        // \uXXXX without braces: exactly 4 hex digits + range check
+                        let mut value: u32 = 0;
                         for _ in 0..4 {
                             if self.pos >= self.bytes.len() || !is_hex_digit(self.bytes[self.pos]) {
                                 return Err(LexerError::InvalidUnicodeEscape);
                             }
+                            value = value * 16 + (self.bytes[self.pos] as char).to_digit(16).unwrap_or(0);
                             self.pos += 1;
                             self.column += 1;
+                        }
+                        if char::from_u32(value).is_none() {
+                            return Err(LexerError::InvalidUnicodeEscape);
                         }
                     }
                 }
@@ -1174,10 +1202,13 @@ impl<'a> Lexer<'a> {
                             self.pos += 1;
                             self.column += 1;
                             let mut digit_count: usize = 0;
+                            let mut value: u32 = 0;
                             while self.pos < self.bytes.len() && self.bytes[self.pos] != b'}' {
                                 if !is_hex_digit(self.bytes[self.pos]) {
                                     return Err(LexerError::InvalidUnicodeEscape);
                                 }
+                                value = value.wrapping_mul(16)
+                                    .wrapping_add((self.bytes[self.pos] as char).to_digit(16).unwrap_or(0));
                                 self.pos += 1;
                                 self.column += 1;
                                 digit_count += 1;
@@ -1185,16 +1216,27 @@ impl<'a> Lexer<'a> {
                             if digit_count == 0 || self.pos >= self.bytes.len() {
                                 return Err(LexerError::InvalidUnicodeEscape);
                             }
+                            // Codepoint range: surrogates (D800-DFFF) and > U+10FFFF
+                            // have no char form — the unescape pass relies on this
+                            // check (char::from_u32 there would panic otherwise).
+                            if char::from_u32(value).is_none() {
+                                return Err(LexerError::InvalidUnicodeEscape);
+                            }
                             self.pos += 1;
                             self.column += 1;
                         } else {
-                            // \uXXXX without braces: exactly 4 hex digits
+                            // \uXXXX without braces: exactly 4 hex digits + range check
+                            let mut value: u32 = 0;
                             for _ in 0..4 {
                                 if self.pos >= self.bytes.len() || !is_hex_digit(self.bytes[self.pos]) {
                                     return Err(LexerError::InvalidUnicodeEscape);
                                 }
+                                value = value * 16 + (self.bytes[self.pos] as char).to_digit(16).unwrap_or(0);
                                 self.pos += 1;
                                 self.column += 1;
+                            }
+                            if char::from_u32(value).is_none() {
+                                return Err(LexerError::InvalidUnicodeEscape);
                             }
                         }
                     }
@@ -1851,7 +1893,15 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 continue;
             }
             if at_decl_kw {
+                let before_sync = self.current;
                 self.synchronize();
+                if self.current == before_sync && !self.is_at_end() {
+                    // synchronize stops on any declaration-start token —
+                    // including the one it is currently stuck on. Force
+                    // progress so a failed declaration probe can never
+                    // spin the recovery loop forever.
+                    self.advance();
+                }
                 continue;
             }
             let before_expr = self.current;
@@ -2167,15 +2217,14 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     if self.check(TokenKind::Identifier) {
                         self.advance();
                         if self.check(TokenKind::Colon) {
-                            // name: Type -> record-style parameter
-                            self.current = saved2;
-                            let mut _params = Vec::new();
-                            self.parse_param_list(&mut _params)?;
-                            if self.expect(TokenKind::RParen, "expected ')'").is_err() {
-                                self.current = saved;
-                                let target = self.parse_type()?;
-                                return Ok(TypeDef::Alias { target });
-                            }
+                            // name: Type — named constructor fields. Parsed
+                            // entirely by the generic single-ctor ADT probe
+                            // below (which understands per-field `pub`). A
+                            // param-list probe here used to emit phantom
+                            // "expected parameter name" diagnostics on `pub`
+                            // fields and, when its error propagated, strand
+                            // `current` mid-field so the module recovery loop
+                            // wedged on the stray `pub` forever.
                             self.current = saved;
                             if let Some(def) = self.try_parse_single_ctor_adt() {
                                 return Ok(def);
@@ -2230,10 +2279,11 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 }],
             });
         }
-        // Named fields
-        if self.check(TokenKind::Identifier)
-            && self.current + 1 < self.tokens.len()
-            && self.tokens[self.current + 1].kind == TokenKind::Colon
+        // Named fields (an optional  visibility prefix precedes the name)
+        let name_idx = if self.check(TokenKind::KwPub) { self.current + 1 } else { self.current };
+        if name_idx + 1 < self.tokens.len()
+            && self.tokens[name_idx].kind == TokenKind::Identifier
+            && self.tokens[name_idx + 1].kind == TokenKind::Colon
         {
             let mut fields = Vec::new();
             if self.parse_constructor_field_list(&mut fields).is_err() {
@@ -2259,6 +2309,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             let mut fields = vec![ConstructorField {
                 name: None,
                 ty: first_type,
+                is_pub: false,
             }];
             while self.match_token(TokenKind::Comma) {
                 if self.check(TokenKind::RParen) {
@@ -2268,7 +2319,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     Ok(t) => t,
                     Err(_) => return None,
                 };
-                fields.push(ConstructorField { name: None, ty });
+                fields.push(ConstructorField { name: None, ty, is_pub: false });
             }
             if self.expect(TokenKind::RParen, "expected ')'").is_err() {
                 return None;
@@ -2293,7 +2344,8 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     /// Attempt to parse a record type definition
     fn try_parse_record_type_def(&mut self) -> Option<TypeDef<'a>> {
         self.advance(); // '('
-        if self.peek().kind == TokenKind::Identifier {
+        if self.peek().kind == TokenKind::Identifier || self.peek().kind == TokenKind::KwPub {
+            let is_pub0 = self.match_token(TokenKind::KwPub);
             let name = self.advance();
             if self.check(TokenKind::Colon) {
                 self.advance();
@@ -2301,17 +2353,20 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 let mut fields = vec![RecordFieldType {
                     name: name.lexeme,
                     ty,
+                    is_pub: is_pub0,
                 }];
                 while self.match_token(TokenKind::Comma) {
                     if self.check(TokenKind::RParen) {
                         break;
                     }
+                    let f_pub = self.match_token(TokenKind::KwPub);
                     let field_name = self.expect(TokenKind::Identifier, "expected field name").ok()?;
                     let _ = self.expect(TokenKind::Colon, "expected ':'");
                     let field_ty = self.parse_type().ok()?;
                     fields.push(RecordFieldType {
                         name: field_name.lexeme,
                         ty: field_ty,
+                        is_pub: f_pub,
                     });
                 }
                 let _ = self.expect(TokenKind::RParen, "expected ')'");
@@ -2358,20 +2413,22 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
 
     /// Parse a single constructor field
     fn parse_constructor_field(&mut self) -> ParseResult<ConstructorField<'a>> {
-        if self.peek().kind == TokenKind::Identifier {
+        if self.peek().kind == TokenKind::Identifier || self.peek().kind == TokenKind::KwPub {
             let saved = self.current;
+            let is_pub = self.match_token(TokenKind::KwPub);
             let name = self.advance();
             if self.match_token(TokenKind::Colon) {
                 let ty = self.parse_type()?;
                 return Ok(ConstructorField {
                     name: Some(name.lexeme),
                     ty,
+                    is_pub,
                 });
             }
             self.current = saved;
         }
         let ty = self.parse_type()?;
-        Ok(ConstructorField { name: None, ty })
+        Ok(ConstructorField { name: None, ty, is_pub: false })
     }
 
     /// Parse a trait declaration
@@ -2973,23 +3030,27 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         let span = token_span(&lparen);
         let mut fields = Vec::new();
         if !self.check(TokenKind::RParen) {
+            let f_pub0 = self.match_token(TokenKind::KwPub);
             let name_tok = self.expect(TokenKind::Identifier, "expected field name")?;
             let _ = self.expect(TokenKind::Colon, "expected ':'");
             let ty = self.parse_type()?;
             fields.push(RecordFieldType {
                 name: name_tok.lexeme,
                 ty,
+                is_pub: f_pub0,
             });
             while self.match_token(TokenKind::Comma) {
                 if self.check(TokenKind::RParen) {
                     break;
                 }
+                let f_pub = self.match_token(TokenKind::KwPub);
                 let field_name = self.expect(TokenKind::Identifier, "expected field name")?;
                 let _ = self.expect(TokenKind::Colon, "expected ':'");
                 let field_ty = self.parse_type()?;
                 fields.push(RecordFieldType {
                     name: field_name.lexeme,
                     ty: field_ty,
+                    is_pub: f_pub,
                 });
             }
         }
@@ -3488,9 +3549,11 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             let tok = self.advance();
             return Ok(self.alloc_expr(token_span(&tok), Expr::Ident("super")));
         }
+        // `channel` is lexed as a keyword but used as a constructor-style callee
+        // (`channel<T>(cap)`), so it parses as a plain identifier here.
         if matches!(
             self.peek().kind,
-            TokenKind::Identifier | TokenKind::KwVal | TokenKind::KwVar | TokenKind::KwChannel
+            TokenKind::Identifier | TokenKind::KwChannel
         ) {
             // void in expression position denotes the unit value
             if self.check(TokenKind::Identifier) && self.peek().lexeme == "void" {
@@ -3499,6 +3562,16 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             }
             let tok = self.advance();
             return Ok(self.alloc_expr(token_span(&tok), Expr::Ident(tok.lexeme)));
+        }
+        if self.check(TokenKind::Err) {
+            let shown: String = self.peek().lexeme.chars().take(4).collect();
+            self.report_error(&format!("unexpected character '{}'", shown))?;
+        }
+        if matches!(self.peek().kind, TokenKind::KwVal | TokenKind::KwVar) {
+            let what = if self.check(TokenKind::KwVal) { "val" } else { "var" };
+            self.report_error(&format!(
+                "expected expression; '{what}' starts a declaration, wrap the body in {{ ... }}"
+            ))?;
         }
         self.report_error("expected expression")?;
         unreachable!()

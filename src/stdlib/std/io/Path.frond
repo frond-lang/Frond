@@ -1,0 +1,236 @@
+// Path.frond — Cross-platform path abstraction (pure Frond implementation, no syscall dependency)
+//
+// Design doc §4.4: Path newtype + path operations
+// Path internally stores segments (normalized non-empty segment list) + a root prefix:
+//   ""    relative
+//   "/"   POSIX root (on Windows: rooted against the current drive — not absolute)
+//   "X:/" Windows drive root (absolute)
+//   "X:"  Windows drive-relative (rare; not absolute)
+//   "//"  UNC-style root, preserved as two leading slashes (absolute)
+// Drive/UNC prefixes are recognized on Windows only — whether "C:/x" is absolute
+// is a fact about the host OS (same rule as Go filepath / Rust std::path), so the
+// same input parses differently per host.
+//
+// Separator normalization: '\' → '/', remove redundant '.'
+// Path splitting: split by '/' and filter empty segments and current directory markers
+
+// Host platform check: reads the same builtin primitive as std.os.Info.os_name.
+// (A std.io → std.os cross-pack import has no precedent; the builtin layer is
+// fully visible to all std modules.)
+@internal
+fun __path_host_is_windows(): bool {
+    val buf: u8[] = [0, ..32]
+    val n = __os_platform_into(buf)
+    if n != 7 {
+        return false
+    }
+    (buf[0..7]) as str == "windows"
+}
+
+pub type Path = Path(segments: str[], prefix: str) {
+    // ─── Conversion ─────────────────────────────────────────────────
+
+    pub fun to_str(): str {
+        join_segments_to_str(segments, prefix)
+    }
+
+    // ─── Join ───────────────────────────────────────────────────────
+
+    pub fun join(other: Path): Path {
+        Path(segments ++ other.segments, prefix)
+    }
+
+    pub fun join_str(other: str): Path {
+        join(from(other))
+    }
+
+    // ─── Path decomposition ─────────────────────────────────────────
+
+    // Parent directory: remove the last segment. Root path or empty segments return null
+    pub fun parent(): Path? {
+        val len = segments.len()
+        if len == 0 {
+            null
+        } else {
+            val parent_segs = segments[0..len - 1]
+            Path(parent_segs, prefix)
+        }
+    }
+
+    // Trailing segment (filename). Empty segments return null
+    pub fun filename(): str? {
+        val len = segments.len()
+        if len == 0 {
+            null
+        } else {
+            segments[len - 1]
+        }
+    }
+
+    // Extension (without dot). No dot or dot at first position returns null
+    pub fun extension(): str? {
+        val fname = filename()
+        match fname {
+            null => null,
+            name => {
+                val dot = std.io.Path.last_index_of(name, '.')
+                if dot <= 0 {
+                    null
+                } else {
+                    val dot_idx = dot as usize
+                    name[dot_idx + 1..name.len()]
+                }
+            },
+        }
+    }
+
+    // Filename (without extension). No dot returns full filename
+    pub fun file_stem(): str? {
+        match filename() {
+            null => null,
+            name => {
+                val dot = last_index_of(name, '.')
+                if dot <= 0 {
+                    name
+                } else {
+                    val dot_idx = dot as usize
+                    name[0..dot_idx]
+                }
+            },
+        }
+    }
+
+    // ─── Query ─────────────────────────────────────────────────────────
+
+    // Absolute means resolvable without any implicit reference (cwd or current
+    // drive). Host-OS truth: "/x" is absolute only off Windows; "X:" is rooted
+    // against the drive's cwd. UNC "//" and drive roots "X:/" are absolute.
+    pub fun is_absolute_path(): bool {
+        if prefix == "//" {
+            return true
+        }
+        if prefix == "/" {
+            return !__path_host_is_windows()
+        }
+        if prefix == "" {
+            return false
+        }
+        // "X:/" (3 chars) absolute; "X:" (2 chars) drive-relative
+        prefix.len() == 3
+    }
+
+    pub fun is_relative_path(): bool { !is_absolute_path() }
+}
+
+// ─── Helper functions ────────────────────────────────────────────
+
+// Path separator normalization: '\' → '/'
+// Does not call syscall, pure string scan and replace
+pub fun normalize_seps(s: str): str {
+    var out: str = ""
+    var i: usize = 0
+    var seg_start: usize = 0
+    // Accumulate by segment: on backslash record the previous segment and append '/', otherwise append as-is
+    while i < s.len() {
+        val c = s[i]
+        if c == '\\' {
+            if i > seg_start {
+                out = out + s[seg_start..i]
+            }
+            out = out + "/"
+            seg_start = i + 1
+        }
+        i = i + 1
+    }
+    // Append trailing segment
+    if seg_start < s.len() {
+        out = out + s[seg_start..s.len()]
+    }
+    out
+}
+
+// Split string by separator, filter empty segments and "." (current directory)
+// Return list of segments that are non-empty and not "."
+pub fun split_segments(s: str): str[] {
+    var result: str[] = []
+    var start: usize = 0
+    var i: usize = 0
+    while i < s.len() {
+        val c = s[i]
+        if c == '/' || c == '\\' {
+            if i > start {
+                val seg = s[start..i]
+                if seg != "." && seg != "" {
+                    result = result ++ [seg]
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    // Handle trailing segment
+    if start < s.len() {
+        val seg = s[start..s.len()]
+        if seg != "." && seg != "" {
+            result = result ++ [seg]
+        }
+    }
+    result
+}
+
+// Reconstruct: root prefix + segments joined by "/" (single-pass via __str_array_join)
+pub fun join_segments_to_str(segs: str[], prefix: str): str {
+    prefix + __str_array_join(segs, "/")
+}
+
+// Find the last position of a character in a string (character index, Unicode scalar value)
+// Returns -1 if not found
+pub fun last_index_of(s: str, ch: char): i64 {
+    var i: usize = s.len()
+    while i > 0 {
+        i = i - 1
+        if s[i] == ch {
+            return i as i64
+        }
+    }
+    return -1
+}
+
+// ─── Construction ────────────────────────────────────────────────
+
+// Construct Path from string: normalize separators → detect root prefix
+// (Windows drive / UNC) → split the remainder into segments.
+pub fun from(s: str): Path {
+    val normalized = normalize_seps(s)
+    var prefix: str = ""
+    var rest: str = normalized
+    // Windows drive: "X:/..." or "X:..." with an ASCII drive letter
+    if __path_host_is_windows() && normalized.len() >= 2 && normalized[1] == ':' {
+        val cp = __str_utf8_decode_at(normalized, 0)
+        if (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122) {
+            if normalized.len() >= 3 && normalized[2] == '/' {
+                prefix = normalized[0..3]
+                rest = normalized[3..normalized.len()]
+            } else {
+                prefix = normalized[0..2]
+                rest = normalized[2..normalized.len()]
+            }
+        }
+    }
+    // Lone "." (and "./"): the current-directory marker would otherwise be
+    // filtered into an EMPTY path by split_segments — preserve it as the
+    // single segment "." so to_str() round-trips and C calls see ".".
+    if prefix == "" && (normalized == "." || normalized == "./") {
+        return Path(["."], "")
+    }
+    if prefix == "" && normalized.len() >= 1 && normalized[0] == '/' {
+        if normalized.len() >= 2 && normalized[1] == '/' {
+            prefix = "//"
+            rest = normalized[2..normalized.len()]
+        } else {
+            prefix = "/"
+            rest = normalized[1..normalized.len()]
+        }
+    }
+    Path(split_segments(rest), prefix)
+}

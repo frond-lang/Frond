@@ -35,29 +35,120 @@ const MAX_MONOMORPH_DEPTH: usize = 256;
 //   Record index offset bug in the Zig version.
 // =========================================================================
 
-/// Compute a stable identity hash for a TypeHandle (for monomorph cache keys).
-/// Builtins hash by canonical type_id; user types hash by name; composites by family name.
+/// Compute a stable STRUCTURAL identity hash for a TypeHandle (monomorph cache keys).
+///
+/// The old fast path (`ty.type_id()`) is unsound for Ref-tagged types:
+/// `to_value_tag` maps Str, Lib and EVERY composite (Adt/Record/Throw/…) to the
+/// same `ValueTag::Ref`, so they all shared one type_id and hashed identically.
+/// Consequence: `foo<str>` and `foo<SomeRecord>` produced the SAME cache key —
+/// the second call site silently reused the first one's instance and ran code
+/// compiled for the wrong key type (e.g. record `==` lowered to CF_EQ_STR,
+/// always false; found via str-instance-before-record-instance repro). Only
+/// types whose value tag is uniquely theirs (scalars, Null/Void) may use the
+/// canonical type_id; Ref-tagged types hash by family discriminant + name +
+/// nested type arguments.
 fn type_identity_hash(arena: &TypeArena, h: TypeHandle) -> u64 {
+    fn fnv(hash: &mut u64, bytes: &[u8]) {
+        for b in bytes {
+            *hash ^= *b as u64;
+            *hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    let mut hash: u64 = 0xcbf29ce484222325;
+
     let resolved = arena.resolve(h);
     let ty = arena.get(resolved);
-    // Builtins: use canonical type_id
-    if let Some(tid) = ty.type_id() {
-        return tid as u64;
+
+    // Unambiguous builtins: canonical type_id fast path (tag owned by exactly one type).
+    if ty.to_value_tag() != crate::value::ValueTag::Ref {
+        if let Some(tid) = ty.type_id() {
+            fnv(&mut hash, &tid.to_le_bytes());
+            return hash;
+        }
     }
-    // User types: use name as identity
-    let name: &str = match &ty {
-        Type::Adt(_) => arena.adt_parts(resolved).0,
-        Type::Generic(_) => arena.generic_parts(resolved).0,
-        Type::Trait(_) => arena.trait_parts(resolved).0,
-        Type::TraitObject(_) => arena.trait_object_parts(resolved).0,
-        _ => ty.name(),
-    };
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for b in name.bytes() {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+
+    // Ref-tagged types: family discriminant first (a user type named "str" must
+    // not collide with builtin str), then name, then nested type arguments.
+    fnv(&mut hash, ty.name().as_bytes());
+    fnv(&mut hash, b":");
+    match &ty {
+        Type::Str | Type::Lib => {}
+        Type::Adt(_) => {
+            let (name, args) = arena.adt_parts(resolved);
+            fnv(&mut hash, name.as_bytes());
+            for a in args {
+                let sub = type_identity_hash(arena, *a);
+                fnv(&mut hash, &sub.to_le_bytes());
+            }
+        }
+        Type::Generic(_) => {
+            let (name, args) = arena.generic_parts(resolved);
+            fnv(&mut hash, name.as_bytes());
+            for a in args {
+                let sub = type_identity_hash(arena, *a);
+                fnv(&mut hash, &sub.to_le_bytes());
+            }
+        }
+        Type::Trait(_) => {
+            let (name, args) = arena.trait_parts(resolved);
+            fnv(&mut hash, name.as_bytes());
+            for a in args {
+                let sub = type_identity_hash(arena, *a);
+                fnv(&mut hash, &sub.to_le_bytes());
+            }
+        }
+        Type::TraitObject(_) => {
+            let (name, methods) = arena.trait_object_parts(resolved);
+            fnv(&mut hash, name.as_bytes());
+            for m in methods {
+                fnv(&mut hash, m.name.as_bytes());
+            }
+        }
+        Type::Record(_) => {
+            if let Some(n) = arena.record_name(resolved) {
+                fnv(&mut hash, n.as_bytes());
+            }
+        }
+        Type::Throw(_) => {
+            let (v, e) = arena.throw_parts(resolved);
+            let a = type_identity_hash(arena, v);
+            let b = type_identity_hash(arena, e);
+            fnv(&mut hash, &a.to_le_bytes());
+            fnv(&mut hash, &b.to_le_bytes());
+        }
+        Type::Channel(_) => fold_param(arena, &mut hash, arena.channel_elem(resolved)),
+        Type::Async(_) => fold_param(arena, &mut hash, arena.async_value(resolved)),
+        Type::Lazy(_) => fold_param(arena, &mut hash, arena.lazy_value(resolved)),
+        Type::Atomic(_) => fold_param(arena, &mut hash, arena.atomic_elem(resolved)),
+        Type::Sender(_) => fold_param(arena, &mut hash, arena.sender_elem(resolved)),
+        Type::Receiver(_) => fold_param(arena, &mut hash, arena.receiver_elem(resolved)),
+        Type::ForeignFn(_) => fold_param(arena, &mut hash, arena.foreign_fn_ret(resolved)),
+        Type::Array(_) => {
+            let (elem, len) = arena.array_parts(resolved);
+            fold_param(arena, &mut hash, elem);
+            if let Some(n) = len {
+                fnv(&mut hash, &n.to_le_bytes());
+            }
+        }
+        Type::Nullable(_) => fold_param(arena, &mut hash, arena.nullable_inner(resolved)),
+        Type::Fn(_) => {
+            let (params, ret) = arena.fn_parts(resolved);
+            for p in params {
+                fold_param(arena, &mut hash, *p);
+            }
+            fold_param(arena, &mut hash, ret);
+        }
+        _ => {}
     }
     hash
+}
+
+fn fold_param(arena: &TypeArena, hash: &mut u64, param: TypeHandle) {
+    let sub = type_identity_hash(arena, param);
+    for b in sub.to_le_bytes() {
+        *hash ^= b as u64;
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
 }
 
 /// FNV-1a 64-bit hash (migrated from monomorph.zig:hashTypeArgs).
@@ -1212,7 +1303,7 @@ fn resolve_instance_body_types<'a>(
 fn is_reflect_method_name(name: &str) -> bool {
     matches!(
         name,
-        "format" | "type_name" | "kind" | "constructor" | "size" | "alignment" | "field_count" | "field_name"
+        "repr" | "type_name" | "kind" | "constructor" | "size" | "alignment" | "field_count" | "field_name"
     )
 }
 

@@ -1,0 +1,188 @@
+// TcpStream.frond — TCP stream
+//
+// Design doc §6.3: TcpStream newtype + read/write/close.
+// All IO operations are async, return Async<Throw<T, IOError>>.
+// Single-shot read/write semantics (no looping block, consistent with File.read).
+//
+// Underlying @extern("C") primitives (__net_tcp_connect_v4 / __net_tcp_close_raw etc.)
+// are declared in builtin/net/Raw.frond. This file defines Frond wrappers that convert C raw
+// return values to Throw.
+// async function bodies currently call synchronous primitives directly; spawn semantics
+// will be added once the IR/Engine async model is ready.
+//
+// read_until maintains an internal buffer across calls (rbuf/rpos/rcap), supporting correct
+// scanning of delimiters that span batch boundaries.
+// The read primitive calls __net_tcp_read directly without touching the buffer; the two
+// buffers are isolated, mixing them requires attention to data ordering.
+
+// ─── Frond wrapper: @extern("C") raw return value → Throw ──────────────
+
+// __net_tcp_connect(ip: IpAddr, port: u16, timeout_ns: i64): Throw<i64, IOError>
+// Extracts v4 bits from IpAddr, calls __net_tcp_connect_v4
+// IPv6 is not yet supported, throws NotSupported
+@internal
+fun __net_tcp_connect(ip: IpAddr, port: u16, timeout_ns: i64): Throw<i64, IOError> {
+    match ip {
+        V4(v4_addr) => {
+            val fd = __net_tcp_connect_v4(v4_addr.bits, port, timeout_ns)
+            if fd < 0 {
+                throw IOError(ConnectionRefused, "tcp connect failed", 0, null)
+            }
+            Ok(fd)
+        },
+        V6(v6_addr) => {
+            val fd = __net_tcp_connect_v6(v6_addr.hi, v6_addr.lo, port, timeout_ns)
+            if fd < 0 {
+                throw IOError(ConnectionRefused, "tcp connect failed", 0, null)
+            }
+            Ok(fd)
+        },
+    }
+}
+
+// __net_tcp_close(fd: i64): Throw<void, IOError>
+// Shared close for TCP/UDP (both are close(fd) underneath)
+@internal
+fun __net_tcp_close(fd: i64): Throw<void, IOError> {
+    val rc = __net_tcp_close_raw(fd)
+    if rc < 0 {
+        throw IOError(Other, "tcp close failed", 0, null)
+    }
+    Ok(void)
+}
+
+// ─── Constants ──────────────────────────────────────────────────────────
+
+pub val DEFAULT_BUF_SIZE: usize = 8192
+
+// ─── Type definitions ──────────────────────────────────────────────────────
+
+// TcpStream: newtype, fd is cross-platform i64 storage handle
+// rbuf/rpos/rcap are the internal buffer for read_until (lazily allocated); rpos is the
+// current read position, rcap is the filled length
+pub type TcpStream = TcpStream(fd: i64, peer_addr: SocketAddr, is_closed: bool, rbuf: u8[], rpos: usize, rcap: usize) {
+    // Returns the peer address (peer address passed in at construction)
+    pub fun peer_addr(): SocketAddr {
+        peer_addr
+    }
+
+    // Reads data from the stream, returns the byte array read (empty array = EOF).
+    // Single-shot read semantics (no looping block).
+    // Currently calls synchronous C primitive directly; will switch to spawn + channel
+    // mode once the IR/Engine async model is ready.
+    pub async fun read(len: usize): Async<Throw<u8[], IOError>> {
+        if is_closed {
+            throw IOError(InvalidInput, "stream closed", 0, null)
+        }
+        val buf: u8[] = [0, ..len]
+        val n = __net_tcp_read(fd, buf, len)
+        if n < 0 {
+            throw IOError(ConnectionReset, "tcp read failed", 0, null)
+        }
+        Ok(buf[0..n as usize])
+    }
+
+    // Writes data to the stream, returns the actual number of bytes written.
+    pub async fun write(buf: u8[], len: usize): Async<Throw<usize, IOError>> {
+        if is_closed {
+            throw IOError(InvalidInput, "stream closed", 0, null)
+        }
+        val n = __net_tcp_write(fd, buf, len)
+        if n < 0 {
+            throw IOError(BrokenPipe, "tcp write failed", 0, null)
+        }
+        Ok(n as usize)
+    }
+
+    // Closes the stream. Idempotent: repeated close does not error.
+    pub async fun close(): Async<Throw<void, IOError>> {
+        if is_closed {
+            Ok(void)
+        } else {
+            is_closed = true
+            __net_tcp_close(fd)?
+            Ok(void)
+        }
+    }
+
+    // ─── Composite semantics methods (composed from read/write primitives, pure Frond) ──────
+
+    // Writes all bytes; throws BrokenPipe when write returns 0 (avoids infinite loop)
+    pub async fun write_all(buf: u8[], len: usize): Async<Throw<void, IOError>> {
+        if is_closed {
+            throw IOError(InvalidInput, "stream closed", 0, null)
+        }
+        var written: usize = 0
+        while written < len {
+            val chunk = buf[written..len]
+            val n = write(chunk, chunk.len()).await()?
+            if n == 0 {
+                throw IOError(BrokenPipe, "write_all: write returned 0", 32, null)
+            }
+            written = written + n
+        }
+        Ok(void)
+    }
+
+    // Reads until the delimiter byte is encountered, returns u8[] including the delimiter
+    // Internal buffer (rbuf/rpos/rcap) is shared across calls, supporting correct scanning
+    // of delimiters that span batch boundaries:
+    //   - First consume the remaining buffer [rpos, rcap) from last time; if delim is found,
+    //     return the slice
+    //   - If not found, append the remainder to result, call read to batch-read as a new
+    //     buffer and scan again
+    //   - On EOF, return the accumulated result
+    // rbuf directly references the array returned by read (no pre-allocation needed); the
+    // buffer is only used internally by read_until, the read primitive does not touch the
+    // buffer; mixing the two will cause data ordering confusion.
+    pub async fun read_until(delim: u8): Async<Throw<u8[], IOError>> {
+        if is_closed {
+            throw IOError(InvalidInput, "stream closed", 0, null)
+        }
+        var result: u8[] = []
+        loop {
+            // Scan buffer [rpos, rcap) for delim
+            var found = false
+            val seg_start = rpos
+            while rpos < rcap {
+                val b = rbuf[rpos]
+                rpos = rpos + 1
+                if b == delim {
+                    found = true
+                    break
+                }
+            }
+            // Append this segment (excluding delim; if found, up to the position before delim) to result
+            val seg_end = if found { rpos - 1 } else { rpos }
+            if seg_end > seg_start {
+                result = result ++ rbuf[seg_start..seg_end]
+            }
+            if found {
+                return Ok(result ++ [delim])
+            }
+            // Buffer fully scanned but delim not found, read next batch as new buffer
+            val chunk = read(DEFAULT_BUF_SIZE).await()?
+            if chunk.len() == 0 {
+                // EOF: return accumulated content (may be empty)
+                return Ok(result)
+            }
+            rbuf = chunk
+            rpos = 0
+            rcap = chunk.len()
+        }
+    }
+}
+
+// ─── Top-level async functions ("static method" semantics) ───────────────────────────
+
+// Initiates a TCP connection. When timeout_ns <= 0, no timeout.
+pub async fun connect(addr: SocketAddr, timeout_ns: i64): Async<Throw<TcpStream, IOError>> {
+    val fd = __net_tcp_connect(addr.ip, addr.port, timeout_ns)?
+    Ok(TcpStream(fd, addr, false, [], 0, 0))
+}
+
+// Constructs a TcpStream from the fd returned by accept (used by the server side).
+// AcceptResult.stream_fd + AcceptResult.peer_addr → TcpStream
+pub fun from_accept_fd(fd: i64, peer: SocketAddr): TcpStream {
+    TcpStream(fd, peer, false, [], 0, 0)
+}

@@ -12,7 +12,7 @@
 //! ```
 //!
 //! Characteristics:
-//! - The load path reads a `.kzo` back into owned `Vec`s to construct a `DataFlowGraph`
+//! - The load path reads a `.fndo` back into owned `Vec`s to construct a `DataFlowGraph`
 //!   (without modifying DFG fields).
 //! - No mmap / zerocopy; pure `Vec<u8>` + manual LE read/write.
 //! - Validates round-trip: serialize -> load -> fields match.
@@ -51,7 +51,7 @@ macro_rules! ser_bool_table {
 
 // ==================== Serialization ====================
 
-/// Serializes a `DataFlowGraph` into a `.kzo` byte stream.
+/// Serializes a `DataFlowGraph` into a `.fndo` byte stream.
 pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
     let n = graph.nodes.len();
     let mut string_pool = StringPool::new();
@@ -517,7 +517,7 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
         finish_sparse!(sections, SectionKind::BatchInfos, index, blob, count);
     }
 
-    // DynFfiInfos (v2: closes the v1 gap — `frond run <file>.kzo` previously
+    // DynFfiInfos (v2: closes the v1 gap — `frond run <file>.fndo` previously
     // panicked with "no dyn_ffi_info" since these were never serialized).
     {
         let mut index: Vec<u8> = Vec::new();
@@ -680,13 +680,13 @@ pub(crate) fn parse_dyn_ffi_info(r: &[u8], mem: &GraphMemory) -> DynFfiInfo {
     }
 }
 
-/// Loads a `DataFlowGraph` from a `.kzo` byte stream (owned path, used for tests).
+/// Loads a `DataFlowGraph` from a `.fndo` byte stream (owned path, used for tests).
 pub fn load_solidify_from_bytes(data: &[u8]) -> io::Result<DataFlowGraph> {
     let mem = GraphMemory::from_bytes(data)?;
     load_from_graph_memory(&mem)
 }
 
-/// Loads a `DataFlowGraph` from a `.kzo` file via mmap (zero-copy file reading).
+/// Loads a `DataFlowGraph` from a `.fndo` file via mmap (zero-copy file reading).
 ///
 /// The file is mapped directly into the address space, avoiding the kernel-to-userspace
 /// copy of `fs::read`. `GraphMemory` owns the `Mmap` and automatically unmaps it when the
@@ -1236,7 +1236,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         downstream_csr_flat: Vec::new(),
     };
     // W5: rebuild the flattened condition-tree reset plans (kept out of the
-    // .kzo format; recomputed at load).
+    // .fndo format; recomputed at load).
     // v3: nested_ranges are derived (no longer serialized) — must run BEFORE
     // precompute_reset_plans, whose condition-tree walk reads them.
     graph.compute_nested_ranges();
@@ -1630,7 +1630,7 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         downstream_csr_flat: Vec::new(),
     };
     // W5: rebuild the flattened condition-tree reset plans (kept out of the
-    // .kzo format; recomputed at load). Works through the mem-agnostic
+    // .fndo format; recomputed at load). Works through the mem-agnostic
     // accessors on the zerocopy backing.
     // v3: nested_ranges are derived (no longer serialized) — must run BEFORE
     // precompute_reset_plans, whose condition-tree walk reads them.
@@ -1652,7 +1652,7 @@ pub fn load_zerocopy_from_bytes(data: Vec<u8>) -> io::Result<DataFlowGraph> {
 
 // ==================== inspect ====================
 
-/// `.kzo` file metadata (for the inspect command).
+/// `.fndo` file metadata (for the inspect command).
 pub struct SolidifyInfo {
     pub schema_version: u16,
     pub abi_version: u16,
@@ -1671,7 +1671,7 @@ pub struct SolidifyInfo {
     pub sections: Vec<(u8, u32, u32)>,
 }
 
-/// Reads `.kzo` file metadata (header only, does not load the full graph); mmap path.
+/// Reads `.fndo` file metadata (header only, does not load the full graph); mmap path.
 pub fn inspect_solidify_from_file(path: &str) -> io::Result<SolidifyInfo> {
     let mem = GraphMemory::from_file(path)?;
     let h = mem.header();
@@ -1694,7 +1694,7 @@ pub fn inspect_solidify_from_file(path: &str) -> io::Result<SolidifyInfo> {
     })
 }
 
-/// Reads `.kzo` byte-stream metadata (header only, does not load the full graph); owned path.
+/// Reads `.fndo` byte-stream metadata (header only, does not load the full graph); owned path.
 pub fn inspect_solidify(data: &[u8]) -> io::Result<SolidifyInfo> {
     let mem = GraphMemory::from_bytes(data)?;
     let h = mem.header();

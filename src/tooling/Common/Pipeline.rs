@@ -42,7 +42,7 @@ pub fn parse_entry_module_or_exit<'a>(
 }
 
 /// Loads all modules (builtin + std + user dependencies), returning (loader, std_keys, dep_keys).
-/// The directory containing the entry file is added as a search path to resolve user modules (e.g. Math/Geometry.kz).
+/// The directory containing the entry file is added as a search path to resolve user modules (e.g. Math/Geometry.frond).
 pub fn load_all_modules_or_exit(
     entry_module: &Module,
     entry_path: &str,
@@ -58,7 +58,7 @@ pub fn load_all_modules_or_exit(
         .map(|(p, _)| p.to_string())
         .collect();
     for key in &std_keys {
-        let parts: Vec<&str> = key.strip_suffix(".kz").unwrap().split('/').collect();
+        let parts: Vec<&str> = key.strip_suffix(".frond").unwrap().split('/').collect();
         let _ = loader.resolve_and_load(&parts);
     }
 
@@ -101,7 +101,7 @@ pub fn run_sema_pipeline_or_exit(
     let module_logical_paths: Vec<String> = loader
         .loaded_keys()
         .iter()
-        .filter_map(|k| k.strip_suffix(".kz").map(|s| s.replace('/', ".")))
+        .filter_map(|k| k.strip_suffix(".frond").map(|s| s.replace('/', ".")))
         .collect();
     ctx.register_module_aliases(root_env, &module_logical_paths);
 
@@ -332,7 +332,7 @@ pub fn run_sema_pipeline_lsp(
     let module_logical_paths: Vec<String> = loader
         .loaded_keys()
         .iter()
-        .filter_map(|k| k.strip_suffix(".kz").map(|s| s.replace('/', ".")))
+        .filter_map(|k| k.strip_suffix(".frond").map(|s| s.replace('/', ".")))
         .collect();
     ctx.register_module_aliases(root_env, &module_logical_paths);
 
@@ -537,7 +537,7 @@ pub fn run_sema_incremental(
     let module_logical_paths: Vec<String> = loader
         .loaded_keys()
         .iter()
-        .filter_map(|k| k.strip_suffix(".kz").map(|s| s.replace('/', ".")))
+        .filter_map(|k| k.strip_suffix(".frond").map(|s| s.replace('/', ".")))
         .collect();
     ctx.register_module_aliases(root_env, &module_logical_paths);
 

@@ -2013,7 +2013,7 @@ pub struct ThrowValue {
     pub payload: ThrowPayload,
 }
 
-// ---- iterator.rs → fully migrated to Frond builtin (Iterator.kz) ----
+// ---- iterator.rs → fully migrated to Frond builtin (Iterator.frond) ----
 // Note: ArrayIterator / StringIterator / RangeIterator have all been migrated to the Frond builtin.
 
 // ---- concurrent.rs → AtomicValue, AsyncStatus, AsyncHandle, ChannelValue, SenderValue, ReceiverValue ----

@@ -462,16 +462,24 @@ compute_fn_ids! {
     340 => CF_LIB_HAS_SYMBOL,
     341 => CF_LIB_CLOSE,
     342 => CF_FFN_CALL,
+    // ── Emptiness check (343): `s.is_empty()` / `arr.is_empty()` (str/array builtin)
+    343 => CF_IS_EMPTY,
+    344 => CF_EQ_U128,
+    345 => CF_NE_U128,
+    346 => CF_LT_U128,
+    347 => CF_GT_U128,
+    348 => CF_LE_U128,
+    349 => CF_GE_U128,
 }
 
 /// Number of entries in `build_compute_fn_table()`.
 ///
 /// Single source of truth for the solidify header's `compute_fn_count`
-/// compatibility check (`solidify::Spec::COMPUTE_FN_COUNT`): a `.kzo` written
+/// compatibility check (`solidify::Spec::COMPUTE_FN_COUNT`): a `.fndo` written
 /// by a binary with a different table length is rejected at load instead of
 /// silently mis-dispatching node compute fns. `build_compute_fn_table()`
 /// asserts equality so this constant cannot drift silently.
-pub const COMPUTE_FN_TABLE_LEN: u32 = 343;
+pub const COMPUTE_FN_TABLE_LEN: u32 = 350;
 
 // =========================================================================
 // NodeKind — node category (not an op; 9 variants for readiness checks)
@@ -2153,6 +2161,14 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         340 => super::Compute::compute_lib_has_symbol,
         341 => super::Compute::compute_lib_close,
         342 => super::Compute::compute_ffn_call,
+        // Emptiness check (343): str/array is_empty
+        343 => super::Compute::compute_is_empty,
+        344 => super::Compute::compute_eq_u128,
+        345 => super::Compute::compute_ne_u128,
+        346 => super::Compute::compute_lt_u128,
+        347 => super::Compute::compute_gt_u128,
+        348 => super::Compute::compute_le_u128,
+        349 => super::Compute::compute_ge_u128,
     };
     // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
     // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values
@@ -2259,7 +2275,8 @@ pub fn effect_class(cf: ComputeFnId) -> EffectClass {
     match cf.0 {
         // ── Pure: legacy arithmetic/comparison ranges (equivalence-tested) ──
         1..=27 | 50..=91 | 92..=259 => Pure,
-        34 | 260 | 261 | 265 | 274 | 276 | 278 | 279 | 287 => Pure, // reads/queries
+        34 | 260 | 261 | 265 | 274 | 276 | 278 | 279 | 287 | 343 => Pure, // reads/queries
+        344..=349 => Pure, // u128 comparisons (pure reads)
         292..=300 | 302..=307 => Pure, // string/obj/bool/f128 comparison
         // ── Reads of mutable state (aliasing) ──
         30 | 32 | 35 | 275 => ReadMutable,      // field/array/pattern-ADT reads (aliasing_read_cfs)
@@ -2650,7 +2667,7 @@ pub struct DataFlowGraph {
     /// Debug-only sg → qualified function name (e.g. "std.io.File.remove"),
     /// parallel to `subgraphs`. Filled by the builder from its registration
     /// table, remapped by `rebuild`'s sg compaction, NEVER serialized (the
-    /// .kzo artifact carries no name table — loads leave this empty).
+    /// .fndo artifact carries no name table — loads leave this empty).
     /// Consumed by the execution-coverage instrumentation
     /// (`FROND_EXEC_COVERAGE=1`): the "never-executed std path" detector.
     pub sg_debug_names: Vec<Option<Box<str>>>,
@@ -2660,7 +2677,7 @@ pub struct DataFlowGraph {
     /// concrete type without boxing into a TraitVal.
     pub vtable_fallback_dispatch: rustc_hash::FxHashMap<(u16, Box<str>), SubGraphId>,
     /// String pool: ConstValue::Str { offset, len } references this pool.
-    /// Maintained by IrBuilder as intern during build; filled from the .kzo StringPool section during load.
+    /// Maintained by IrBuilder as intern during build; filled from the .fndo StringPool section during load.
     pub string_pool: Arc<[u8]>,
     /// GraphMemory (load path): binary backing of mmap or owned bytes.
     /// Build path is None (directly accesses owned Vec fields);
@@ -2680,12 +2697,12 @@ pub struct DataFlowGraph {
     pub select_info_offsets: Vec<u32>,
     pub trait_construct_info_offsets: Vec<u32>,
     pub record_extend_info_offsets: Vec<u32>,
-    /// Per-node inputs-pool offsets, materialized at load when the `.kzo` v2
+    /// Per-node inputs-pool offsets, materialized at load when the `.fndo` v2
     /// Nodes section elides them (inputs pool contiguous in node-id order).
     /// Build path / non-elided files: empty.
     pub node_input_offsets: Vec<u32>,
     /// Flat CSR downstream table, derived at load from inputs + gate condition
-    /// edges (the `.kzo` v2 format no longer serializes Downstreams).
+    /// edges (the `.fndo` v2 format no longer serializes Downstreams).
     /// `downstream_csr_offsets` has node_count+1 entries; slices of
     /// `downstream_csr_flat` are returned by `downstream_slice` on loaded graphs.
     /// Build path: empty (owned `downstreams` Vec is authoritative).
@@ -3117,7 +3134,7 @@ impl DataFlowGraph {
         }
     }
 
-    /// Computes the flat CSR downstream table for LOADED graphs (`.kzo` v2 no
+    /// Computes the flat CSR downstream table for LOADED graphs (`.fndo` v2 no
     /// longer serializes Downstreams). Works through the mem-agnostic
     /// accessors so both the mmap and owned backends derive identically.
     /// Mirrors `compute_downstreams` + `rebuild` step 4: input edges plus the
@@ -4096,7 +4113,7 @@ impl DataFlowGraph {
 
 /// Computes `nested_ranges` for all subgraphs: for each subgraph, the ranges
 /// of subgraphs DIRECTLY nested within its `node_range`. Called at build
-/// time, after every optimizer `rebuild`, and at `.kzo` load (v3: the section
+/// time, after every optimizer `rebuild`, and at `.fndo` load (v3: the section
 /// is no longer serialized — this is the derived source of truth). Empty
 /// ranges (collapsed or placeholder subgraphs) are never children.
 ///
@@ -4336,15 +4353,18 @@ mod effect_classification_tests {
     /// Verbatim copy of the PRE-W1 hand-written pure set (the behavior W1 must
     /// preserve exactly). Keep frozen; if `pure_compute_fn_set()` drifts from
     /// this, the equivalence guarantee is broken.
+    /// (344..=349 — u128 comparisons — joined both sets when they were added.)
     fn legacy_pure_set() -> rustc_hash::FxHashSet<ComputeFnId> {
         let mut s = rustc_hash::FxHashSet::default();
         for id in 1..=27u32 { s.insert(ComputeFnId(id)); }
         for id in 50..=91u32 { s.insert(ComputeFnId(id)); }
         for id in 92..=259u32 { s.insert(ComputeFnId(id)); }
+        for id in 344..=349u32 { s.insert(ComputeFnId(id)); }
         s.insert(CF_RECORD_FIELD_GET);
         s.insert(CF_ARRAY_INDEX);
         s.insert(CF_IS_NULL);
         s.insert(CF_ARRAY_LEN);
+        s.insert(CF_IS_EMPTY);
         s.insert(CF_REF_EQ);
         s.insert(CF_REF_NEQ);
         s.insert(CF_ELVIS);

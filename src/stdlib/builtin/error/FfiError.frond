@@ -1,0 +1,26 @@
+// FfiError: error type returned when a Lib (native-library interop) operation fails
+//
+// Usage:
+//   - Lib.open / Lib.embed / lib.lookup / f.call return Throw<_, FfiError> when
+//     loading, symbol resolution, signature parsing, or the ABI call fails.
+//   - Field semantics:
+//       kind : error category (exhaustive ADT, used for match handling)
+//       msg  : error description (human readable, includes paths/symbols)
+//
+// Note: the engine raises these errors by type name ("FfiError") from the
+// compute layer; this declaration gives catch sites a concrete type to match.
+type FfiError: Err = FfiError(
+    pub kind: FfiErrorKind,
+    pub message: str,
+) {
+    override fun type_name(): str { "ffi error" }
+}
+
+// Ffi error categories (exhaustive ADT)
+type FfiErrorKind =
+    | OpenFailed         // Lib.open/Lib.embed: library file missing / bad arch / dependency error
+    | SymbolNotFound     // lib.lookup: symbol not exported by the library
+    | BadSignature       // lib.lookup: unknown or malformed signature-string atom
+    | LibClosed          // lookup/call after lib.close()
+    | CallFailed         // f.call: marshal or ABI dispatch failure
+    | Other              // unclassified

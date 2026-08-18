@@ -46,6 +46,20 @@ impl<'a> InferContext<'a> {
                 //      select the unique constructor matching by arity
                 let callee_ty = if let Expr::Ident(name) = &ast.expr(*callee).node {
                     let ctors = self.sema_result.get_ctor_defs(name);
+                    // Privacy gate for BARE constructor calls (same-module calls
+                    // pass naturally inside ctor_privacy_error): cross-module
+                    // construction through a constructor with any private field
+                    // is rejected. Single mapping is decided here; ambiguous
+                    // mappings are gated after disambiguation below.
+                    if ctors.len() == 1 {
+                        let c = &ctors[0];
+                        let gate = self.ctor_privacy_error(&c.type_name, &c.name);
+                        if let Some(msg) = gate {
+                            let span = ast.expr(expr).span;
+                            self.add_error_at(&msg, span.line, span.column);
+                            return self.arena.fresh_type_var();
+                        }
+                    }
                     if ctors.len() > 1 {
                         let selected: Option<(Box<str>, Box<[TypeRepr]>)> = {
                             let mut found: Option<&CtorDefInfo> = None;
@@ -75,6 +89,13 @@ impl<'a> InferContext<'a> {
                         };
                         match selected {
                             Some((type_name, field_type_reprs)) => {
+                                // Privacy gate: ambiguous mapping resolved to a
+                                // cross-module constructor with private fields.
+                                if let Some(msg) = self.ctor_privacy_error(&type_name, name) {
+                                    let span = ast.expr(expr).span;
+                                    self.add_error_at(&msg, span.line, span.column);
+                                    return self.arena.fresh_type_var();
+                                }
                                 let param_types: Vec<TypeHandle> = field_type_reprs
                                     .iter()
                                     .map(|r| self.type_repr_to_handle(r))
@@ -123,7 +144,8 @@ impl<'a> InferContext<'a> {
                         // [Implicit this] Try resolving as this.method(args) before
                         // falling through to infer_expr (which would report undefined).
                         if let Some(this_ty) = self.current_this_type() {
-                            if let Some(fn_ty) = self.lookup_method_type(this_ty, name) {
+                            let call_span = ast.expr(expr).span;
+                            if let Some(fn_ty) = self.lookup_method_type(this_ty, name, call_span.line, call_span.column) {
                                 let inst_fn = self.instantiate_fn_type(fn_ty);
                                 if let Type::Fn(_) = self.arena.get(inst_fn) {
                                     let (params, return_type) = self.arena.fn_parts(inst_fn);
@@ -324,6 +346,13 @@ impl<'a> InferContext<'a> {
                     if let Some((ctor_type_name, field_type_reprs)) =
                         self.check_qualified_ctor(type_name, method)
                     {
+                        // Privacy gate: cross-module construction through a
+                        // constructor with any private field is rejected.
+                        if let Some(msg) = self.ctor_privacy_error(type_name, method) {
+                            let span = ast.expr(expr).span;
+                            self.add_error_at(&msg, span.line, span.column);
+                            return self.arena.fresh_type_var();
+                        }
                         if !field_type_reprs.is_empty() {
                             // Constructor with arguments: build a function type and go through call inference
                             let param_types: Vec<TypeHandle> = field_type_reprs
@@ -378,7 +407,7 @@ impl<'a> InferContext<'a> {
                     let (mod_path, module_env) = self.arena.module_ref_parts(recv_resolved_0a);
                     let found = self.env.lookup_local(module_env, method);
                     // Directory-module semantics: when lookup_local misses in the current module env,
-                    // search sibling modules in the same directory (e.g. Math.sqrt where sqrt lives in Power.kz,
+                    // search sibling modules in the same directory (e.g. Math.sqrt where sqrt lives in Power.frond,
                     // with Math and Power both under the std.math directory).
                     let found = found.or_else(|| {
                         self.lookup_sibling_module_fn(mod_path, module_env, method)
@@ -417,6 +446,27 @@ impl<'a> InferContext<'a> {
                         let (type_name, _) = self.arena.adt_parts(ret_resolved);
                         if let Some(&mod_env) = self.ctor_module_envs.get(type_name) {
                             if let Some(fn_ty) = self.env.lookup_local(mod_env, method) {
+                                // Guard: `TypeName.method(args)` must not dispatch to a TYPE
+                                // method. Type methods carry an implicit `this` at param slot 0
+                                // while this call site passes no receiver, so the IR would land
+                                // every argument one slot left of its parameter (silent garbage).
+                                // Type methods are callable via an instance `x.m(args)` or the
+                                // bare form `m(recv, args)`; factories belong at module level
+                                // (e.g. Instant.now()).
+                                let is_type_method = self.sema_result.get_type_def(type_name)
+                                    .map(|def| def.methods.iter().any(|m| m.name.as_ref() == *method))
+                                    .unwrap_or(false);                                if is_type_method {
+                                    let span = ast.expr(expr).span;
+                                    self.add_error_at(
+                                        &format!(
+                                            "method '{}.{}' cannot be called through the type name; call it on an instance (x.{}(..)) or via the bare form {}(instance, ..), or move the factory to module level",
+                                            type_name, method, method, method
+                                        ),
+                                        span.line,
+                                        span.column,
+                                    );
+                                    return self.arena.fresh_type_var();
+                                }
                                 let inst_fn = self.instantiate_fn_type(fn_ty);
                                 if let Type::Fn(_) = self.arena.get(inst_fn) {
                                     let (params, return_type) = self.arena.fn_parts(inst_fn);
@@ -476,7 +526,10 @@ impl<'a> InferContext<'a> {
                 // Path 1 (preferred): type-aware method lookup.
                 // lookup_method_type looks up the receiver's type against witness_table / func_sigs / builtin methods,
                 // ensuring same-named methods (e.g. Instant.add_duration vs DateTime.add_duration) dispatch to the correct signature.
-                let method_fn_ty = self.lookup_method_type(recv_ty, method);
+                let method_fn_ty = {
+                    let call_span = ast.expr(expr).span;
+                    self.lookup_method_type(recv_ty, method, call_span.line, call_span.column)
+                };
                 if let Some(fn_ty) = method_fn_ty {
                     let inst_fn = self.instantiate_fn_type(fn_ty);
                     if let Type::Fn(_) = self.arena.get(inst_fn) {
@@ -503,18 +556,56 @@ impl<'a> InferContext<'a> {
                     if let Type::Fn(_) = self.arena.get(inst_fn) {
                         let (params, return_type) = self.arena.fn_parts(inst_fn);
                         let params: Vec<TypeHandle> = params.to_vec();
-                        // The first parameter is self/receiver: unify recv with params[0].
-                        // This lets the free function's generic parameters be inferred from the receiver's type (e.g. iter<T> infers T from arr: T[]).
-                        if !params.is_empty() {
-                            self.unify_or_constrain(params[0], recv_ty);
+                        // Candidacy gate (Bug #103): this fallback used to accept
+                        // ANY same-named binding — receiver type and arity were
+                        // never checked, so `x.format()` on i32 dispatched to
+                        // std Format.format (stdlib is globally env-visible by
+                        // design) and panicked at runtime. A binding is a
+                        // candidate only if its arity matches AND its first
+                        // parameter can accept the receiver: unify is the test
+                        // (it succeeds for str ↔ T[] — byte semantics — so
+                        // `"abc".iter()` keeps resolving here). A HARD failure
+                        // on two concrete types rejects the candidate and lets
+                        // resolution continue to the "no method" fallback;
+                        // TypeVar/Unknown receivers keep the lenient
+                        // constraint path (the solver may still bind them).
+                        let arity_ok = params.len() == args.len() + 1;
+                        let recv_ok = if params.is_empty() {
+                            true
+                        } else {
+                            match self.arena.unify(params[0], recv_ty) {
+                                Ok(_) => true,
+                                Err(_) => {
+                                    // Lenient only when a TypeVar survives ANYWHERE in
+                                    // either type (e.g. iter<T>'s `T[]`: head is a concrete
+                                    // Array but the element is fresh — the solver binds it
+                                    // later, which is how `"abc".iter()` resolves). Two
+                                    // fully-concrete types that cannot unify = hard reject.
+                                    let pending = |t: TypeHandle| type_contains_typevar(&self.arena, t);
+                                    if pending(params[0]) || pending(recv_ty) {
+                                        self.unify_or_constrain(params[0], recv_ty);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                            }
+                        };
+                        if arity_ok && recv_ok {
+                            // The first parameter is self/receiver: unify recv with params[0].
+                            // This lets the free function's generic parameters be inferred from the receiver's type (e.g. iter<T> infers T from arr: T[]).
+                            if !params.is_empty() {
+                                self.unify_or_constrain(params[0], recv_ty);
+                            }
+                            // The remaining parameters are inferred from args.
+                            let n = params.len().min(args.len() + 1);
+                            for i in 1..n {
+                                let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
+                                self.unify_or_constrain(params[i], arg_ty);
+                            }
+                            return return_type;
                         }
-                        // The remaining parameters are inferred from args.
-                        let n = params.len().min(args.len() + 1);
-                        for i in 1..n {
-                            let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
-                            self.unify_or_constrain(params[i], arg_ty);
-                        }
-                        return return_type;
+                        // Not a candidate: fall through to the paths below.
                     }
                 }
 
@@ -866,6 +957,8 @@ impl<'a> InferContext<'a> {
         &mut self,
         recv_ty: TypeHandle,
         method: &str,
+        line: u32,
+        column: u32,
     ) -> Option<TypeHandle> {
         let resolved = self.arena.resolve(recv_ty);
 
@@ -879,17 +972,25 @@ impl<'a> InferContext<'a> {
                 // other methods are recursively forwarded to the inner type.
                 if method != "is_null" {
                     let inner = self.arena.nullable_inner(resolved);
-                    return self.lookup_method_type(inner, method);
+                    return self.lookup_method_type(inner, method, line, column);
                 }
             }
             Type::Ref(_) => {
                 // Ref auto-deref: method lookup on &T forwards to T.
                 let inner = self.arena.ref_parts(resolved).0;
-                return self.lookup_method_type(inner, method);
+                return self.lookup_method_type(inner, method, line, column);
             }
             _ => {}
         }
 
+        // Privacy gate: type methods are module-scoped unless `pub`. Report and
+        // still resolve the signature — returning None sends the caller into a
+        // lookup-retry fallback loop that can wedge the fixpoint solver.
+        if let Some(tn) = self.arena.type_name(resolved).map(|s| s.to_string()) {
+            if let Some(msg) = self.method_privacy_error(&tn, method) {
+                self.add_error_at(&msg, line, column);
+            }
+        }
         // Push recv_ty as the Self type so that, inside build_fn_type_from_sig,
         // type_repr_to_handle(ThisType) resolves to the receiver type correctly,
         // without special-casing the first parameter by position.
@@ -1179,6 +1280,12 @@ impl<'a> InferContext<'a> {
         let type_name = self.arena.type_name(resolved).map(|s| s.to_string());
         if let Some(name) = type_name {
             if let Some(field_id) = self.sema_result.lookup_field_id(&name, field) {
+                // Privacy gate: fields are module-scoped unless `pub`. Record the
+                // error but keep resolving the REAL field type — returning Unknown
+                // here sends the fixpoint solver into a unify loop.
+                if let Some(msg) = self.field_privacy_error(&name, field) {
+                    self.add_error_at(&msg, line, column);
+                }
                 // Look up the constructor from the TYPE definition (not ctor_def_index,
                 // which can return a wrong constructor when multiple types share the same
                 // constructor name, e.g. FileKind.File vs type File = File(...)).
@@ -1260,4 +1367,22 @@ impl<'a> InferContext<'a> {
 
     // ── infer_stmt ──
 
+}
+
+/// Deep TypeVar scan (Bug #103 candidacy gate): true when a TypeVar survives
+/// anywhere in the type — top-level OR nested (e.g. `T[]`'s element). Such
+/// types stay on the lenient constraint path; only fully-concrete types can
+/// hard-reject a Path 0 free-function candidate.
+fn type_contains_typevar(arena: &crate::types::Arena::TypeArena, h: TypeHandle) -> bool {
+    let resolved = arena.resolve(h);
+    if matches!(arena.get(resolved), Type::TypeVar(_) | Type::Unknown) {
+        return true;
+    }
+    let mut found = false;
+    arena.for_each_child(resolved, |child| {
+        if !found && type_contains_typevar(arena, child) {
+            found = true;
+        }
+    });
+    found
 }

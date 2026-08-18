@@ -1157,18 +1157,17 @@ impl<'a> IrBuilder<'a> {
                 );
                 let inst_id = self.sema.call_instantiations.get(&call_inst_key);
                 let mangled = inst_id.map(|&id| format!("{}#{}", method, id));
-                // Qualified-first: Sema classified the recv identifier as a
-                // module name, so it carries the qualifier a bare lookup
-                // would discard. `resolve_func` tries current-module mangled
-                // → instance → package key → `Recv.method` (this shape) →
-                // bare. The liveness/DCE gaps that forced the earlier revert
-                // are closed structurally now (NodeRef door + unified
-                // liveness closure in the Optimizer).
-                let recv_ident = match &self.current_module().arena.expr(recv).node {
-                    crate::ast::Ast::Expr::Ident(n) => Some(*n),
-                    _ => None,
-                };
-                match self.resolve_func("path0_module_recv", method, mangled.as_deref(), recv_ident) {
+                // Qualified-first: Sema classified the receiver as a module
+                // namespace, so the qualifier it carries must reach
+                // resolve_func — including DOTTED receivers. A bare Ident
+                // (`Instant.now()`) yields the short key; a dotted chain
+                // (`std.time.Instant.now()`) yields the full module path, so
+                // step 3 probes the full mangled key instead of discarding the
+                // qualifier and falling through to the package/bare families,
+                // which trip on cross-module duplicate names (`now` exists in
+                // both SystemTime and Instant).
+                let recv_qualifier = self.dotted_qualifier_of(recv);
+                match self.resolve_func("path0_module_recv", method, mangled.as_deref(), recv_qualifier.as_deref()) {
                     Some(Ok(target_sg)) => {
                         let mut inputs = Vec::with_capacity(args.len() + 1);
                         for &arg in args {
@@ -1191,9 +1190,39 @@ impl<'a> IrBuilder<'a> {
                         self.errors.push(diag);
                     }
                     None => {
+                        // Module-qualified type-constructor call
+                        // (`std.time.DateTime.DateTime(...)`): the trailing
+                        // segment names a type / ADT constructor — lower to
+                        // the same record-construct node the bare
+                        // `DateTime(...)` / short `DateTime.DateTime(...)`
+                        // forms use. Depth-general: only the final segment
+                        // matters; the qualifier chain just selects the
+                        // module (already validated by sema).
+                        let tf_info = self.lookup_type_field_names(method)
+                            .or_else(|| self.lookup_constructor_field_names(method));
+                        if let Some(info) = tf_info {
+                            let mut inputs = Vec::with_capacity(args.len());
+                            for &arg in args {
+                                inputs.push(self.compile_subexpr(arg));
+                            }
+                            let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                            let node = self.graph.add_node(Node {
+                                kind: NodeKind::BinOp,
+                                input_count: inputs.len() as u8,
+                                inputs_offset,
+                                compute_fn: CF_RECORD_CONSTRUCT,
+                            });
+                            self.graph.set_record_lit_info(node, RecordLitInfo {
+                                type_name: info.type_name.clone(),
+                                field_names: info.field_names.into_iter().map(Some).collect(),
+                                constructor: method.to_string(),
+                                kind: info.kind,
+                            });
+                            return node;
+                        }
                         self.errors.push(format!(
                             "module function call '{}.{}' did not resolve to any target subgraph",
-                            recv_ident.unwrap_or("<?>"), method
+                            recv_qualifier.as_deref().unwrap_or("<?>"), method
                         ));
                     }
                 }
@@ -1299,6 +1328,22 @@ impl<'a> IrBuilder<'a> {
                 return call_node;
             }
 
+            // No dispatch path resolved: report at compile time instead of
+            // leaving a target-less Call node that panics the engine at
+            // runtime ("no call_target ... broken compiler invariant"). The
+            // usual cause is a receiver whose inferred type degraded to
+            // Unknown/TypeVar (e.g. a match whose arms failed to join).
+            {
+                let recv_desc = self
+                    .expr_type_name(recv)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "unknown type".to_string());
+                let span = self.current_module().arena.expr(call_expr_id).span;
+                self.errors.push(format!(
+                    "cannot dispatch method '{}' on receiver of {} at line {}, column {}",
+                    method, recv_desc, span.line, span.column
+                ));
+            }
             call_node
         }
     }
@@ -1394,6 +1439,30 @@ impl<'a> IrBuilder<'a> {
     ///
     /// Intrinsic methods of built-in types (e.g. Async.await, Channel.send, Array.len) have the intrinsic
     /// field annotated when Sema registers the synthetic TypeDefInfo; this lookups uniformly, without special-casing by method name.
+    /// Flatten a pure `a.b.c` identifier/field-access chain into its dotted
+    /// text ("a.b.c"); None when the chain root is not an identifier.
+    /// Depth-general: the whole receiver chain becomes the qualifier, which
+    /// for a module-qualified receiver (`std.time.Instant`) equals the module
+    /// logical path — exactly the full mangled key func_subgraphs registers
+    /// (`std.time.Instant.now`).
+    fn dotted_qualifier_of(&self, mut expr: crate::ast::Ast::ExprId) -> Option<String> {
+        let mut parts: Vec<&'a str> = Vec::new();
+        loop {
+            match &self.current_module().arena.expr(expr).node {
+                crate::ast::Ast::Expr::FieldAccess { recv, field, .. } => {
+                    parts.push(field);
+                    expr = *recv;
+                }
+                crate::ast::Ast::Expr::Ident(n) => {
+                    parts.push(n);
+                    parts.reverse();
+                    return Some(parts.join("."));
+                }
+                _ => return None,
+            }
+        }
+    }
+
     pub(super) fn lookup_intrinsic(
         &self,
         recv: crate::ast::Ast::ExprId,
@@ -1410,6 +1479,19 @@ impl<'a> IrBuilder<'a> {
                 .is_some();
             if !shadows {
                 return Some(kind);
+            }
+        }
+        // `T?.is_null()`: nullable is a type constructor with no dispatch table,
+        // so the (type_id, method_idx) path below cannot see it — lower directly
+        // to CF_IS_NULL (34). Sema's lookup_method_type special-cases the same
+        // call for typing; without this the call built a no-target Call node
+        // and panicked the engine at runtime.
+        if method == "is_null" {
+            if let Some(h) = self.expr_type_handle(recv) {
+                let r = self.type_arena.resolve(h);
+                if matches!(self.type_arena.get(r), crate::types::Type::Nullable(_)) {
+                    return Some(crate::sema::Sema::IntrinsicKind::UnOp(34));
+                }
             }
         }
         let type_name = self.expr_type_name(recv)?;

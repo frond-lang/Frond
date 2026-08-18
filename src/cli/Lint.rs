@@ -22,7 +22,7 @@ pub fn cmd_lint(path: Option<String>, format: Option<String>, deny: Option<Strin
         let diags = lint_file_string("<stdin>", &source, &config);
         (diags, "<stdin>".to_string())
     } else {
-        // find_project_root() returns the project root directory (containing frond.toml),
+        // find_project_root() returns the project root directory (containing Root.toml),
         // so join "src" directly to get the default lint target (same as fmt).
         let target = path.unwrap_or_else(|| {
             find_project_root()
@@ -73,7 +73,7 @@ fn lint_dir(dir: &str, config: &LintConfig) -> Vec<crate::tooling::Common::Diagn
         let path = entry.path();
         if path.is_dir() {
             all.extend(lint_dir(&path.to_string_lossy(), config));
-        } else if path.extension().map(|e| e == "kz").unwrap_or(false) {
+        } else if path.extension().map(|e| e == "frond").unwrap_or(false) {
             all.extend(lint_file(&path.to_string_lossy(), config));
         }
     }
@@ -83,7 +83,7 @@ fn lint_dir(dir: &str, config: &LintConfig) -> Vec<crate::tooling::Common::Diagn
 /// Lint a source string directly (for --stdin).
 fn lint_file_string(filename: &str, source: &str, config: &LintConfig) -> Vec<crate::tooling::Common::Diagnostic::Diagnostic> {
     // Write to a temp file, then lint it
-    let temp_path = format!("/tmp/lint_{}.kz", std::process::id());
+    let temp_path = format!("/tmp/lint_{}.frond", std::process::id());
     let _ = fs::write(&temp_path, source);
     let result = lint_file(&temp_path, config);
     let _ = fs::remove_file(&temp_path);

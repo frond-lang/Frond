@@ -1,0 +1,64 @@
+// IOError: error type returned when an IO operation fails
+//
+// Usage:
+//   - Constructed by __file_* / __dir_* primitives in syscall/io.zig when the host syscall fails
+//   - Field semantics:
+//       kind   : error category (exhaustive ADT, used for match handling)
+//       msg    : error description (human readable)
+//       os_err : host raw errno (0 means no OS error code, > 0 corresponds to errno)
+//       path   : associated file/directory path (null for pathless scenarios like stdin/stdout)
+//
+// As a builtin error_newtype, it automatically gets the Error trait's message() default implementation (reads the msg field).
+// type_name() override returns "io error" for easy identification in logs.
+type IOError: Err = IOError(
+    pub kind: IOErrorKind,
+    pub message: str,
+    pub os_err: i32,
+    pub path: str?,
+) {
+    override fun type_name(): str { "io error" }
+}
+
+// IO error categories (exhaustive ADT)
+// errno mapping rules (maintained in Zig layer syscall/util.zig):
+//   ENOENT        → NotFound
+//   EACCES/EPERM  → PermissionDenied
+//   EEXIST        → AlreadyExists
+//   EBUSY/EAGAIN  → Busy
+//   EINVAL        → InvalidInput
+//   EPIPE         → BrokenPipe
+//   EINTR         → Interrupted
+//   ENOMEM        → OutOfMemory
+//   ECONNREFUSED  → ConnectionRefused
+//   ECONNRESET    → ConnectionReset
+//   ECONNABORTED  → ConnectionAborted
+//   ENOTCONN      → NotConnected
+//   EADDRINUSE    → AddrInUse
+//   EADDRNOTAVAIL → AddrNotAvailable
+//   ETIMEDOUT     → TimedOut
+//   EHOSTUNREACH  → HostUnreachable
+//   ENETUNREACH   → NetworkUnreachable
+//   ENETDOWN      → NetworkDown
+//   other         → Other (errno preserved in os_err field)
+type IOErrorKind =
+    | NotFound            // file/directory does not exist
+    | PermissionDenied    // insufficient permissions
+    | AlreadyExists       // already exists (on creation)
+    | Busy                // resource busy (temporary)
+    | InvalidInput        // invalid parameter (e.g. malformed path)
+    | UnexpectedEof       // reached EOF but more data was needed
+    | BrokenPipe          // writing to a closed pipe
+    | OutOfMemory         // out of memory (mapped from host)
+    | Interrupted         // interrupted by signal (should retry)
+    | Other               // unclassified (check os_err)
+    // ── Net errors ──
+    | ConnectionRefused      // connection refused (ECONNREFUSED)
+    | ConnectionReset        // connection reset by peer (ECONNRESET)
+    | ConnectionAborted      // connection aborted (ECONNABORTED)
+    | NotConnected           // not connected (ENOTCONN)
+    | AddrInUse              // address already in use (EADDRINUSE)
+    | AddrNotAvailable       // address not available (EADDRNOTAVAIL)
+    | TimedOut               // operation timed out (ETIMEDOUT or Future cancel)
+    | HostUnreachable        // host unreachable (EHOSTUNREACH)
+    | NetworkUnreachable     // network unreachable (ENETUNREACH)
+    | NetworkDown            // network subsystem failure (ENETDOWN)

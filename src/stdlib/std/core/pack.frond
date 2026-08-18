@@ -1,0 +1,9 @@
+// std/core package declaration
+//
+// std.core is the root library: each sub-library is a directory whose
+// pack.frond declares its packs. `import std.core` loads EVERY sub-library
+// declared below; individual sub-libraries stay importable on their own
+// (`import std.core.types`).
+//
+//   types/  — value-type namespaces: Str, I8..I128, U8..U128, F16..F128, Bool
+pub pack types

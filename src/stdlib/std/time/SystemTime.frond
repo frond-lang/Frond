@@ -1,0 +1,154 @@
+// SystemTime.frond — wall clock (synchronous) + TimeComponents
+//
+// Design doc §5.2 + §5.5: SystemTime newtype + TimeComponents record
+// SystemTime is based on CLOCK_REALTIME (Unix epoch nanoseconds), suitable for getting wall-clock time.
+// Synchronous implementation — decision S04.
+// TimeComponents is a 9-field record, constructed by the syscall layer via makeRecordWithNames.
+
+// ─── TimeComponents (record type shared between syscall layer and Frond layer) ──────
+// Field order corresponds one-to-one with syscall/time.zig makeTimeComponents:
+//   year, month, day, hour, minute, second, nanos, weekday, day_of_year
+
+pub type TimeComponents = TimeComponents(pub year: i32, pub month: u8, pub day: u8, pub hour: u8, pub minute: u8, pub second: u8, pub nanos: u32, pub weekday: u8, pub day_of_year: u16)
+
+// ─── SystemTime ────────────────────────────────────────────────────
+
+pub type SystemTime = SystemTime(nanos: i128) {
+    // ─── Add/subtract Duration ─────────────────────────────────────────────────
+
+    pub fun add_duration(d: Duration): SystemTime {
+        SystemTime(nanos + d.nanos)
+    }
+
+    pub fun sub_duration(d: Duration): SystemTime {
+        SystemTime(nanos - d.nanos)
+    }
+
+    // The length of time of this relative to earlier
+    pub fun duration_since(earlier: SystemTime): Duration {
+        Duration(nanos - earlier.nanos)
+    }
+
+    // ─── Conversion to/from DateTime ──────────────────────────────────────────────
+
+    // Converts to a DateTime in the local timezone
+    pub fun to_local(): DateTime {
+        val comp = to_local_components(nanos)
+        DateTime.from_components(comp)
+    }
+
+    // Converts to a DateTime in UTC
+    pub fun to_utc(): DateTime {
+        val comp = to_utc_components(nanos)
+        DateTime.from_components(comp)
+    }
+
+    // ─── Comparison ──────────────────────────────────────────────────────────
+
+    pub fun is_before(other: SystemTime): bool {
+        nanos < other.nanos
+    }
+
+    pub fun is_after(other: SystemTime): bool {
+        nanos > other.nanos
+    }
+}
+
+// Unix epoch (1970-01-01 00:00:00 UTC)
+pub val UNIX_EPOCH: SystemTime = SystemTime(0)
+
+// Gets the current wall-clock time
+pub fun now(): SystemTime {
+    SystemTime(__systemtime_now_ns())
+}
+
+// ─── Pure Frond time component conversion (replacing the original syscall implementation) ─────────────────
+//
+// The original three syscalls __systemtime_to_utc_components / __systemtime_to_local_components /
+// __components_to_ns_utc have been lowered to pure Frond algorithms (calling Calendar's
+// days_from_civil / civil_from_days / weekday_from_days), following the syscall minimization
+// principle — pure algorithms do not depend on host capabilities and should not occupy syscall slots.
+//
+// Algorithm: Howard Hinnant days_from_civil + intra-day seconds decomposition, equivalent to the
+// original Zig implementation.
+// Supports negative ns (before 1970), uses floor division to ensure correct semantics.
+
+// i128 nanoseconds → UTC TimeComponents (pure Frond algorithm)
+pub fun to_utc_components(ns: i128): TimeComponents {
+    val ns_per_sec: i128 = (1_000_000_000) as i128
+    val secs_per_day: i128 = 86400 as i128
+
+    val total_sec = Calendar.floor_div_i128(ns, ns_per_sec)
+    val sub_ns = Calendar.floor_mod_i128(ns, ns_per_sec)
+    val days_i128 = Calendar.floor_div_i128(total_sec, secs_per_day)
+    val secs_of_day = Calendar.floor_mod_i128(total_sec, secs_per_day)
+
+    val days = days_i128 as i64
+    val ymd = Calendar.civil_from_days(days)
+    val weekday = Calendar.weekday_from_days(days)
+    val doy = Calendar.day_of_year(ymd.year, ymd.month, ymd.day)
+
+    val hour = secs_of_day / 3600 as i128
+    val minute = (secs_of_day % 3600 as i128) / 60 as i128
+    val second = secs_of_day % 60 as i128
+
+    TimeComponents(
+        ymd.year,
+        ymd.month,
+        ymd.day,
+        hour as u8,
+        minute as u8,
+        second as u8,
+        sub_ns as u32,
+        weekday,
+        doy,
+    )
+}
+
+// i128 nanoseconds → local TimeComponents (UTC + local timezone offset)
+// Only __localtime_offset_minutes remains as a syscall (depends on libc/kernel32)
+pub fun to_local_components(ns: i128): TimeComponents {
+    val offset_min = __localtime_offset_minutes()
+    val offset_ns = offset_min as i128 * (60_000_000_000i128) as i128
+    to_utc_components(ns + offset_ns)
+}
+
+// TimeComponents → i128 nanoseconds (UTC), validates field legality
+// Pure Frond algorithm + field validation, consistent with the original syscall components_to_ns_utc behavior
+pub fun components_to_ns_utc(comp: TimeComponents): Throw<i128, TimeError> {
+    if comp.month < 1 || comp.month > 12 {
+        throw TimeError(InvalidDateTime, "month out of range", "")
+    }
+    val max_day = Calendar.days_in_month(comp.year, comp.month)
+    if comp.day < 1 || comp.day > max_day {
+        throw TimeError(InvalidDateTime, "day out of range", "")
+    }
+    if comp.hour > 23 || comp.minute > 59 || comp.second > 59 {
+        throw TimeError(InvalidDateTime, "time field out of range", "")
+    }
+    if comp.nanos >= 1_000_000_000 {
+        throw TimeError(InvalidDateTime, "nanos >= 1e9", "")
+    }
+
+    val days = Calendar.days_from_civil(comp.year, comp.month, comp.day)
+    val epoch_secs = days as i128 * 86400 as i128 +
+        (comp.hour) as i128 * 3600 as i128 +
+        (comp.minute) as i128 * 60 as i128 +
+        (comp.second) as i128
+    if epoch_secs < 0 {
+        throw TimeError(OutOfRange, "before 1970", "")
+    }
+    val ns = epoch_secs * (1_000_000_000) as i128 + (comp.nanos) as i128
+    Ok(ns)
+}
+
+// Constructs a SystemTime from a UTC DateTime (validates field legality)
+// Returns a TimeError on failure (field out of range / time exceeds the range after 1970)
+// NOTE: sync funs do NOT auto-wrap their last expression — a bare
+// `SystemTime(ns)` here would hand callers a non-Throw where Throw was
+// declared, and every downstream match Ok/Err would panic. Always wrap.
+pub fun from_datetime_utc(dt: DateTime): Throw<SystemTime, TimeError> {
+    val comp = dt.to_components()
+    val ns = components_to_ns_utc(comp)?
+    Ok(SystemTime(ns))
+}

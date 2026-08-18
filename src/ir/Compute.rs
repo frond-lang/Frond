@@ -470,6 +470,21 @@ impl_cmp_compute! {
     compute_ge_i128: >= for as_int_i128;
 }
 
+// ---- u128 comparisons (indices 344-349) ----
+// The u128 domain exceeds i128: reading through as_int_i128 bit-reinterprets
+// the top half as negative i128, INVERTING the ordering for values above
+// 2^127. These read via as_u128 (round-trips the bits exactly), comparing in
+// the true unsigned domain.
+
+impl_cmp_compute! {
+    compute_eq_u128: == for as_u128;
+    compute_ne_u128: != for as_u128;
+    compute_lt_u128: < for as_u128;
+    compute_gt_u128: > for as_u128;
+    compute_le_u128: <= for as_u128;
+    compute_ge_u128: >= for as_u128;
+}
+
 // ---- Integer bitwise operations (indices 78–92) ----
 // BitAnd/BitOr/BitXor for i32/i64/i128 families, Shl/Shr for i32/i64/i128 families.
 // Read uniformly via `as_int_i128`; results are constructed with the target type.
@@ -1691,6 +1706,22 @@ pub fn compute_str_array_join(frame: &mut Frame, node: NodeId, ctx: &EvalContext
     Value::ref_val(HeapObj::Str(Str::from_rust_str(&buf)))
 }
 
+/// compute_fn (idx 343): `s.is_empty()` / `arr.is_empty()`.
+///
+/// Previously declared in Sema with no implementation (phantom method): calling
+/// it built a Call node with no target and panicked the engine. Now lowered as
+/// an intrinsic on str/array receivers.
+pub fn compute_is_empty(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::HeapObj;
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
+    let v = force_input(frame, inputs[0]);
+    match v.heap_obj() {
+        Some(HeapObj::Str(s)) => Value::bool_val(s.byte_len() == 0),
+        Some(HeapObj::Array(a)) => Value::bool_val(a.is_empty()),
+        _ => make_error_throw("TypeError", "is_empty on non-str/non-array operand"),
+    }
+}
+
 /// compute_fn (idx 270): global variable read.
 ///
 /// No inputs; reads the value from `graph.global_var_storage[slot]`.
@@ -2161,6 +2192,11 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     use crate::value::ValueTag;
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let val = force_input(frame, inputs[0]);
+    // Nullable source (`v as f32?` where v is f64?): null stays null — the
+    // cast only touches the present (scalar) payload.
+    if val.is_null() {
+        return Value::Null;
+    }
     let target_ty = graph.cast_target_type(node.0 as usize)
         .expect("cast_scalar node has no target type");
 
@@ -3087,13 +3123,12 @@ fn run_frame_sync(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
     result
 }
 
-/// Executes the defer bodies in the frame's `defer_table` (LIFO order).
+/// Executes the defer bodies registered on the frame's runtime `defer_stack`
+/// (LIFO order; only defers whose registration node executed are present).
 /// A defer body is an independent subgraph; a new frame is created and run
 /// synchronously via `run_frame_sync`.
 fn run_defers_sync(frame: &mut Frame, graph: &DataFlowGraph) {
-    let sg_id = frame.subgraph_id;
-    let defer_entries: Vec<crate::ir::Ir::DeferEntry> =
-        graph.subgraphs[sg_id.0 as usize].defer_table.clone();
+    let defer_entries: Vec<RuntimeDefer> = std::mem::take(&mut frame.defer_stack);
     for entry in defer_entries.iter().rev() {
         let mut defer_frame = crate::engine::prepare_defer_frame_sync(
             frame,
@@ -3780,15 +3815,28 @@ pub fn compute_defer_register(frame: &mut Frame, node: NodeId, ctx: &EvalContext
     NodeResult::Value(Value::VOID)
 }
 
-/// compute_block_defer_register (idx 324): block-scoped defer registration.
+/// compute_block_defer_register (idx 324): function-level defer registration.
 ///
-/// Identical to `compute_defer_register` except that **input[0]** is an explicit effect
-/// dependency (used solely for dataflow ordering so the node does not fire before the block's
-/// prior effects complete); the actual captured NodeIds are **inputs[1..]**. This exists
-/// because, unlike the loop case (where the register node is naturally ordered by its
-/// captured loop-variable inputs), a block-scoped defer may have zero captures (e.g. a defer
-/// that only touches globals), which would leave the node with zero inputs and let the
-/// scheduler fire it prematurely at frame start. The leading effect input prevents that.
+/// Emitted in the statement stream at the defer's position (execution-gated: a
+/// defer never reached — e.g. an error `?`-exit before the binding it captures —
+/// never registers and never runs; the old static defer_table drained
+/// unconditionally on every exit path, which crashed natively on unbound slots).
+///
+/// input[0] is an explicit effect dependency (used solely for dataflow ordering
+/// so zero-capture defers do not fire at frame start); captured NodeIds are
+/// inputs[1..] (scheduling only — the drain reads captures live via the frame
+/// chain, Bug #47).
+///
+/// The entry is pushed onto the CURRENTLY EXECUTING frame's defer_stack:
+/// - defer at function top level → the function body frame → drained at
+///   function exit (finish_frame / run_defers_sync);
+/// - defer inside a branch block → the branch frame → drained at block exit
+///   (block-scoped semantics, matching the old Bug #66 inline cleanup);
+/// - recursive/nested calls each own their frame → per-call LIFO unwind.
+/// root_frame_ptr must NOT be used: recursive calls of the same function share
+/// the root-frame chain, which misroutes inner calls' defers onto the outermost
+/// frame (observed: every recursion level's defer reading the deepest call's
+/// values).
 pub fn compute_block_defer_register(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
     let graph = ctx.graph;
     let n = graph.node(node.0 as usize);
@@ -3808,9 +3856,9 @@ pub fn compute_block_defer_register(frame: &mut Frame, node: NodeId, ctx: &EvalC
         captured_nodes,
         captured_values,
     };
-    // Push onto THIS frame's defer_stack (block defers are not loop-scoped, so do not walk to
-    // parent_frame_ptr — the draining CF_DEFER_RUN node runs in the same frame and reads the
-    // same stack).
+    if std::env::var("FROND_DEBUG_DEFER").is_ok() {
+        eprintln!("[DEFER-REG] sg={:?} frame_sg={:?} captures={}", body_sg, frame.subgraph_id, entry.captured_nodes.len());
+    }
     frame.defer_stack.push(entry);
     NodeResult::Value(Value::VOID)
 }

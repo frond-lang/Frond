@@ -18,7 +18,7 @@ use super::StdlibEmbed::{BUILTIN_FILES, STD_FILES, find};
 /// Merges the stdlib embed table and the filesystem as two backends, transparently to the caller.
 /// builtin modules are fully preloaded in `new()`.
 pub struct ModuleLoader {
-    /// Module cache: relative path (e.g. `"std/io/File.kz"`) → `LoadedModule`.
+    /// Module cache: relative path (e.g. `"std/io/File.frond"`) → `LoadedModule`.
     modules: FxHashMap<String, LoadedModule>,
     /// Filesystem search paths for user modules.
     search_paths: Vec<PathBuf>,
@@ -54,7 +54,7 @@ impl ModuleLoader {
 
     /// Preloads the builtin modules (visible by default, no import needed).
     ///
-    /// Iterates over `BUILTIN_FILES`, parsing and caching each `.kz` file.
+    /// Iterates over `BUILTIN_FILES`, parsing and caching each `.frond` file.
     /// builtin modules are ordered by dependency (error → io → iter), ensuring dependencies
     /// are ready when subsequent checks run. Parse failures are recorded in `load_errors`
     /// to avoid silently swallowing errors.
@@ -88,7 +88,7 @@ impl ModuleLoader {
 
     /// Resolves and loads a module by its path segments.
     ///
-    /// `path = ["std", "io", "File"]` → looks up `"std/io/File.kz"`
+    /// `path = ["std", "io", "File"]` → looks up `"std/io/File.frond"`
     /// Lookup order: cache → stdlib embed table → filesystem search paths
     ///
     /// Returns a reference to the loaded `Module`. On load failure (module not found /
@@ -173,12 +173,63 @@ impl ModuleLoader {
             }
         }
 
-        // 4b. Directory module detection: `path` refers not to a file but to a directory (containing pack.kz).
-        // e.g. `import Store` → Store.kz does not exist, but Store/pack.kz does.
-        // Load pack.kz to obtain submodule declarations, then load each submodule file.
-        let dir_name = path_str.strip_suffix(".kz").unwrap_or(&path_str);
+        let dir_name = path_str.strip_suffix(".frond").unwrap_or(&path_str);
+
+        // 4a-embed. Directory module over the EMBEDDED stdlib table: same shape
+        // as the filesystem branch (4b) below, but pack.frond and the submodule
+        // files come from StdlibEmbed. Without this, `import std.math` /
+        // `import std.core` — a directory holding only pack.frond + submodule
+        // files, no DirectoryName.frond — failed with "module not found".
+        {
+            let pack_path_key = format!("{}/pack.frond", dir_name);
+            if let Some(pack_source) = find(&pack_path_key) {
+                let (pack_arena, pack_source_owned, pack_module) =
+                    match parse_source(&pack_path_key, pack_source) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            self.failed_paths.insert(path_str.clone());
+                            self.load_errors.push(LoadError::ParseFailed {
+                                path: path_str,
+                                line: err.line,
+                                column: err.column,
+                                message: err.message,
+                            });
+                            return None;
+                        }
+                    };
+                // Each declared submodule may be a FILE (dir/name.frond) or a
+                // NESTED DIRECTORY module (dir/name/pack.frond — std.core's
+                // `pub pack types`). Recursing through resolve_and_load covers
+                // both with one path: it finds the file directly or re-enters
+                // the directory-module branch, and its cache keys line up.
+                for sub_name in collect_pack_submodules(&pack_module) {
+                    let sub_cache_key = format!("{}/{}.frond", dir_name, sub_name);
+                    if self.modules.contains_key(&sub_cache_key) {
+                        continue;
+                    }
+                    let sub_path = format!("{}/{}", dir_name, sub_name);
+                    let segs: Vec<&str> = sub_path.split('/').collect();
+                    let _ = self.resolve_and_load(&segs);
+                }
+                let pack_exports = collect_exports(&pack_module);
+                self.modules.insert(
+                    path_str.clone(),
+                    LoadedModule {
+                        _arena: pack_arena,
+                        _source: pack_source_owned,
+                        module: pack_module,
+                        exports: pack_exports,
+                    },
+                );
+                return self.modules.get(&path_str).map(|m| &m.module);
+            }
+        }
+
+        // 4b. Directory module detection: `path` refers not to a file but to a directory (containing pack.frond).
+        // e.g. `import Store` → Store.frond does not exist, but Store/pack.frond does.
+        // Load pack.frond to obtain submodule declarations, then load each submodule file.
         for base in &self.search_paths {
-            let pack_file = base.join(dir_name).join("pack.kz");
+            let pack_file = base.join(dir_name).join("pack.frond");
             if !pack_file.exists() {
                 continue;
             }
@@ -186,7 +237,7 @@ impl ModuleLoader {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let pack_path_key = format!("{}/pack.kz", dir_name);
+            let pack_path_key = format!("{}/pack.frond", dir_name);
             let (pack_arena, pack_source_owned, pack_module) =
                 match parse_source(&pack_path_key, &pack_source) {
                     Ok(result) => result,
@@ -201,32 +252,19 @@ impl ModuleLoader {
                         return None;
                     }
                 };
-            // Load each submodule declared by the pack
+            // Load each submodule declared by the pack. Like the embed branch
+            // (4a) above, recursion through resolve_and_load lets a declared
+            // submodule be a file OR a nested directory with its own pack.frond.
             for sub_name in collect_pack_submodules(&pack_module) {
-                let sub_path_str = format!("{}/{}.kz", dir_name, sub_name);
-                // The submodule may already be in the cache (e.g. loaded first via another path)
-                if self.modules.contains_key(&sub_path_str) {
+                let sub_cache_key = format!("{}/{}.frond", dir_name, sub_name);
+                if self.modules.contains_key(&sub_cache_key) {
                     continue;
                 }
-                let sub_full = base.join(&sub_path_str);
-                if let Ok(sub_source) = std::fs::read_to_string(&sub_full) {
-                    if let Ok((sub_arena, sub_source_owned, sub_module)) =
-                        parse_source(&sub_path_str, &sub_source)
-                    {
-                        let sub_exports = collect_exports(&sub_module);
-                        self.modules.insert(
-                            sub_path_str,
-                            LoadedModule {
-                                _arena: sub_arena,
-                                _source: sub_source_owned,
-                                module: sub_module,
-                                exports: sub_exports,
-                            },
-                        );
-                    }
-                }
+                let sub_path = format!("{}/{}", dir_name, sub_name);
+                let segs: Vec<&str> = sub_path.split('/').collect();
+                let _ = self.resolve_and_load(&segs);
             }
-            // Register the pack module as the directory module representative (key is the original path_str, e.g. "Store.kz")
+            // Register the pack module as the directory module representative (key is the original path_str, e.g. "Store.frond")
             let pack_exports = collect_exports(&pack_module);
             self.modules
                 .insert(path_str.clone(), LoadedModule {
@@ -240,7 +278,7 @@ impl ModuleLoader {
 
         // 5. Neither stdlib nor the filesystem matched: check whether this is a type/symbol
         // exported by a sibling module. For example `import std.time.TimeComponents` →
-        // TimeComponents is a type exported by SystemTime.kz, not a standalone module file.
+        // TimeComponents is a type exported by SystemTime.frond, not a standalone module file.
         // In this case no error is reported; the symbol is visible through the already-loaded sibling module.
         if let Some(symbol_name) = extract_last_segment(&path_str) {
             let parent_prefix = parent_directory(&path_str);
@@ -331,7 +369,7 @@ impl ModuleLoader {
     /// modules have already been populated into the `SemaResult`.
     /// builtin modules are preloaded in `new()` and are not included in the return value.
     ///
-    /// Returns the module cache keys (in file-path form, e.g. `"std/io/File.kz"`) ordered for checking.
+    /// Returns the module cache keys (in file-path form, e.g. `"std/io/File.frond"`) ordered for checking.
     pub fn load_transitive_imports(&mut self, module: &Module<'_>) -> Vec<String> {
         let mut order: Vec<String> = Vec::new();
         // visited: finalized modules (already registered in `order`)
@@ -369,8 +407,8 @@ impl ModuleLoader {
                             child_path.iter().map(|s| s.to_string()).collect::<Vec<String>>(),
                         );
                     }
-                    // Directory module: submodules declared in pack.kz must also be added to the check order
-                    // e.g. `import Store` → pack.kz declares `pub pack Memory` → submodule path ["Store", "Memory"]
+                    // Directory module: submodules declared in pack.frond must also be added to the check order
+                    // e.g. `import Store` → pack.frond declares `pub pack Memory` → submodule path ["Store", "Memory"]
                     for sub_name in collect_pack_submodules(dep) {
                         let mut child_segs: Vec<String> = path_segments.clone();
                         child_segs.push(sub_name.to_string());
@@ -419,12 +457,12 @@ impl ModuleLoader {
         order
     }
 
-    /// Returns the loaded module by cache key (key is the return value of `module_path_to_file`, e.g. `"std/io/File.kz"`).
+    /// Returns the loaded module by cache key (key is the return value of `module_path_to_file`, e.g. `"std/io/File.frond"`).
     pub fn get_module_by_key(&self, key: &str) -> Option<&Module<'static>> {
         self.modules.get(key).map(|m| &m.module)
     }
 
-    /// Returns the cache keys of all loaded modules (in file-path form, e.g. `"std/io/File.kz"`).
+    /// Returns the cache keys of all loaded modules (in file-path form, e.g. `"std/io/File.frond"`).
     pub fn loaded_keys(&self) -> Vec<String> {
         self.modules.keys().map(|s| s.to_string()).collect()
     }
@@ -519,27 +557,27 @@ impl Default for ModuleLoader {
 // ─── Helper functions ──────────────────────────────────────────────
 
 /// Converts module path segments to a file path.
-/// `["std", "io", "File"]` → `"std/io/File.kz"`
+/// `["std", "io", "File"]` → `"std/io/File.frond"`
 fn module_path_to_file(path: &[&str]) -> String {
     let joined = path.join("/");
-    if joined.ends_with(".kz") {
+    if joined.ends_with(".frond") {
         joined
     } else {
-        format!("{}.kz", joined)
+        format!("{}.frond", joined)
     }
 }
 
-/// Extracts the last path segment as the module name (stripping the `.kz` suffix).
-/// `"std/time/TimeComponents.kz"` → `"TimeComponents"`
+/// Extracts the last path segment as the module name (stripping the `.frond` suffix).
+/// `"std/time/TimeComponents.frond"` → `"TimeComponents"`
 fn extract_last_segment(path: &str) -> Option<String> {
     path.rsplit('/')
         .next()
-        .and_then(|last| last.strip_suffix(".kz"))
+        .and_then(|last| last.strip_suffix(".frond"))
         .map(|s| s.to_string())
 }
 
 /// Returns the parent directory prefix of a file path.
-/// `"std/time/TimeComponents.kz"` → `"std/time/"`
+/// `"std/time/TimeComponents.frond"` → `"std/time/"`
 fn parent_directory(path: &str) -> String {
     match path.rfind('/') {
         Some(idx) => path[..=idx].to_string(),
@@ -637,8 +675,8 @@ fn collect_exports(module: &Module<'_>) -> FxHashSet<String> {
 
 /// Extracts the list of submodule names from a module's `pub pack <Name>` declarations.
 ///
-/// A directory module's `pack.kz` declares its contained submodules via `PackDecl`.
-/// For example, `pub pack Memory` in `Store/pack.kz` → returns `["Memory"]`.
+/// A directory module's `pack.frond` declares its contained submodules via `PackDecl`.
+/// For example, `pub pack Memory` in `Store/pack.frond` → returns `["Memory"]`.
 /// `load_transitive_imports` uses this result to construct submodule paths (e.g. `["Store", "Memory"]`),
 /// ensuring submodules are added to the check order.
 fn collect_pack_submodules<'a>(module: &'a Module<'a>) -> Vec<&'a str> {

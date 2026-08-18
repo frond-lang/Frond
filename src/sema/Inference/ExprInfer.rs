@@ -99,8 +99,31 @@ impl<'a> InferContext<'a> {
 
             // ── Type cast `expr as T` ──
             Expr::As { expr: src, target } => {
+                let target_ty = self.type_from_ast(*target, ast);
                 let _ = self.infer_expr(*src, ast, env, None);
-                self.type_from_ast(*target, ast)
+                // Bare numeric literals promote toward a NUMERIC cast target:
+                // `5000000000 as i64` used to leave the literal typed i32 (no
+                // expected hint), and the IR constant parser then rejected it
+                // as out of i32 range. Re-infer the literal with the target
+                // (nullable-peeled) as expected so it takes the target's width.
+                // Non-numeric pairs (e.g. `42 as str`) keep their behavior.
+                {
+                    let lit_numeric = match &ast.expr(*src).node {
+                        Expr::IntLit { .. } | Expr::FloatLit { .. } => true,
+                        _ => false,
+                    };
+                    if lit_numeric {
+                        let resolved = self.arena.resolve(target_ty);
+                        let cmp = match self.arena.get(resolved) {
+                            Type::Nullable(_) => self.arena.nullable_inner(resolved),
+                            _ => resolved,
+                        };
+                        if self.arena.get(cmp).is_numeric() {
+                            let _ = self.infer_expr(*src, ast, env, Some(cmp));
+                        }
+                    }
+                }
+                target_ty
             }
 
             // ── Reference / dereference ──
@@ -457,6 +480,16 @@ impl<'a> InferContext<'a> {
                     if let LambdaBody::Block(b) = body {
                         let span = ast.expr(expr).span;
                         self.check_missing_return_value("lambda", annot_ty, *b, ast, span.line, span.column);
+                    }
+                    // Sync lambda declaring Throw with a bare non-Throw tail —
+                    // the from_datetime_utc/scanln leak class.
+                    if !*is_async {
+                        let span = ast.expr(expr).span;
+                        let body_root = match body {
+                            LambdaBody::Block(b) => *b,
+                            LambdaBody::Expression(e) => *e,
+                        };
+                        self.check_throw_tail_wrapped("lambda", annot_ty, body_root, body_ty, ast, span.line, span.column);
                     }
                     annot_ty
                 } else {
@@ -819,16 +852,19 @@ impl<'a> InferContext<'a> {
                     BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
                         let rl = self.arena.resolve(left_unwrapped);
                         let rr = self.arena.resolve(right_unwrapped);
-                        // Bug I: arrays must use `++` (ConcatList) for concatenation, not `+`.
-                        // `+` on arrays previously type-checked (returning an array type) but produced
-                        // garbage at runtime (len=0). Note: `*` is a legitimate array-repeat idiom
-                        // (e.g. `[0u8] * 4096`), so only `Add` is rejected here.
-                        if *op == BinaryOp::Add {
+                        // Bug I: arrays support NO arithmetic. `+` previously type-checked
+                        // (returning an array type) but produced garbage at runtime (len=0);
+                        // the original fix spared `*` believing `[0u8] * 4096` was a repeat
+                        // idiom — it never was a language feature (the stdlib sites using it
+                        // were silently broken the same way; they now use `[0, ..n]` fill).
+                        // Design rule: the ONLY array fill syntax is `[v, ..n]`; concatenation
+                        // is `++`.
+                        {
                             let left_is_array = matches!(self.arena.get(rl), Type::Array(_));
                             let right_is_array = matches!(self.arena.get(rr), Type::Array(_));
                             if left_is_array || right_is_array {
                                 self.add_error_at(
-                                    "cannot use + on arrays; use ++ for concatenation",
+                                    "arrays support no arithmetic; use ++ for concatenation and [v, ..n] for fill",
                                     bin_span.line,
                                     bin_span.column,
                                 );
@@ -870,14 +906,31 @@ impl<'a> InferContext<'a> {
                     | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
                         let rl = self.arena.resolve(left_unwrapped);
                         let rr = self.arena.resolve(right_unwrapped);
-                        if self.arena.get(rl).is_numeric() && self.arena.get(rr).is_numeric() {
+                        // Nullable operands peel to the inner numeric for the
+                        // comparison check: `a == 42` with a: i64? must undergo
+                        // the SAME width/category check and literal promotion
+                        // as `x == 42` (null semantics live at runtime, not in
+                        // the type check — Nullable.is_numeric() is false, so
+                        // without this peel the whole numeric branch was
+                        // skipped: mixed widths passed silently and bare
+                        // literals never promoted, leaving tag-mismatched
+                        // operands for the runtime equality).
+                        let l_cmp = match self.arena.get(rl) {
+                            Type::Nullable(_) => self.arena.nullable_inner(rl),
+                            _ => rl,
+                        };
+                        let r_cmp = match self.arena.get(rr) {
+                            Type::Nullable(_) => self.arena.nullable_inner(rr),
+                            _ => rr,
+                        };
+                        if self.arena.get(l_cmp).is_numeric() && self.arena.get(r_cmp).is_numeric() {
                             // Bug #73/#74: same strict checking for comparison ops.
-                            self.check_numeric_binop_compat(ast, *lhs, *rhs, rl, rr, bin_span);
+                            self.check_numeric_binop_compat(ast, *lhs, *rhs, l_cmp, r_cmp, bin_span);
                             // v2 convergence: comparison ops use peer_type_binary to unify operand types.
                             let peer_ty = peer_type_binary(
                                 self.arena,
-                                left_unwrapped,
-                                right_unwrapped,
+                                l_cmp,
+                                r_cmp,
                                 left_is_lit,
                                 right_is_lit,
                             );

@@ -16,7 +16,7 @@ pub struct DocState {
     pub symbols: Vec<SymbolInfo>,
     /// Previous declaration signatures — for is_api_change detection on next didChange.
     pub prev_decls: Option<Vec<DeclSignature>>,
-    /// Cached module key (e.g. "src/Foo.kz") for incremental sema loader lookup.
+    /// Cached module key (e.g. "src/Foo.frond") for incremental sema loader lookup.
     pub module_key: Option<String>,
 }
 
@@ -90,7 +90,7 @@ impl DocState {
     /// Phase 1: full recheck on every call (no incremental).
     pub fn recheck(&mut self, state: &super::Server::ServerState) -> Vec<Diagnostic> {
         let arena = Bump::new();
-        let filename = "lsp_buffer.kz";
+        let filename = "lsp_buffer.frond";
 
         // Parse (LSP-safe, never exits)
         let parse_result = Pipeline::parse_entry_module_lsp(&arena, &self.text, filename);

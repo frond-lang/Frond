@@ -1,0 +1,5 @@
+// Error: generic error type
+//
+// Used for the throw Error("msg") syntax, constructs an anonymous error instance
+type Error: Err = Error(pub message: str) {
+}

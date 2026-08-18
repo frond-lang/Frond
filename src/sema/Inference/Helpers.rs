@@ -70,6 +70,13 @@ impl<'a> InferContext<'a> {
         right_ty: TypeHandle,
         span: crate::ast::Ast::Span,
     ) {
+        // Nullable wrappers peel away: `a == 42` with a: i64? must undergo the
+        // SAME width/category check as `x == 42` with x: i64. Previously the
+        // nullable wrapper made is_int()/is_float() both false, silently
+        // skipping every check (mixed-width compared at runtime by tag → false).
+        let left_ty = self.unwrap_ref(left_ty);
+        let right_ty = self.unwrap_ref(right_ty);
+
         // If types are already equal, no issue.
         if types_equal(self.arena, left_ty, right_ty) {
             return;
@@ -169,7 +176,7 @@ impl<'a> InferContext<'a> {
     pub(super) fn reflect_method_return_type(&mut self, method: &str, arg_count: usize) -> Option<TypeHandle> {
         // Nullary reflect methods (receiver only, arg_count == 0).
         let nullary: Option<TypeHandle> = match method {
-            "format" | "type_name" | "kind" | "constructor" => Some(self.make_builtin(Type::Str)),
+            "repr" | "type_name" | "kind" | "constructor" => Some(self.make_builtin(Type::Str)),
             "size" | "alignment" => Some(self.make_builtin(Type::U32)),
             "field_count" => Some(self.make_builtin(Type::U16)),
             _ => None,
@@ -231,7 +238,7 @@ impl<'a> InferContext<'a> {
     }
 
     /// The `FfiError` type as seen from the Lib builtin methods. Declared in
-    /// `builtin/error/FfiError.kz`; resolved by name here (Adt unify is
+    /// `builtin/error/FfiError.frond`; resolved by name here (Adt unify is
     /// name-based, so this handle interops with the declared one).
     pub(super) fn ffi_error_ty(&mut self) -> TypeHandle {
         self.arena.make_adt("FfiError".into(), Box::new([]))
@@ -343,7 +350,7 @@ pub(super) fn check_int_literal_range(raw: &str, tag: crate::types::ValueTag) ->
 /// Derived from `Type::BUILTIN_TABLE`: look up ValueTag by name, then dispatch to Type by ValueTag.
 /// The name → ValueTag mapping comes from a single source of truth.
 ///
-/// Type names are uniformly lower-case (consistent with .kz source syntax): null/void/bool/char/str
+/// Type names are uniformly lower-case (consistent with .frond source syntax): null/void/bool/char/str
 /// and the numeric types.
 pub(super) fn name_to_concrete(name: &str) -> Option<Type> {
     use crate::types::{builtin_info_by_name, ValueTag};
@@ -498,5 +505,117 @@ impl<'a> InferContext<'a> {
             line,
             column,
         );
+    }
+
+    /// Bug class 2026-08-17 (from_datetime_utc / scanln): a SYNC function
+    /// declaring `Throw<..>` whose body tail is a bare non-Throw value leaks
+    /// the payload where Throw was declared — every caller-side
+    /// `match { Ok/Err }` then panics at runtime ("non-exhaustive match").
+    /// Async functions are exempt (their bare tails are engine-auto-wrapped;
+    /// `unify_return_type`'s Throw branch tolerates the payload on their
+    /// behalf), which is why `ret_ty` arrives Async-wrapped for async bodies
+    /// and the first check below filters them out. Unsolved TypeVars are
+    /// skipped: the fixpoint solver may still bind them to Throw.
+    pub(super) fn check_throw_tail_wrapped(
+        &mut self,
+        what: &str,
+        ret_ty: TypeHandle,
+        body: ExprId,
+        body_ty: TypeHandle,
+        ast: &AstArena<'_>,
+        line: u32,
+        column: u32,
+    ) {
+        if !matches!(self.arena.get(self.arena.resolve(ret_ty)), Type::Throw(_)) {
+            return;
+        }
+        match self.arena.get(self.arena.resolve(body_ty)) {
+            Type::Throw(_) | Type::TypeVar(_) | Type::Unknown | Type::Never | Type::Void => return,
+            _ => {}
+        }
+        // A block without a trailing expression has no tail value at all —
+        // check_missing_return_value owns that case; don't double-report.
+        if let Expr::Block { trailing: None, .. } = &ast.expr(body).node {
+            return;
+        }
+        let ret_str = format!("{}", self.arena.display(ret_ty));
+        let tail_str = format!("{}", self.arena.display(body_ty));
+        self.add_error_at(
+            &format!(
+                "{what} declares return type '{ret_str}' but its tail evaluates to '{tail_str}': wrap it in Ok(..) — sync functions do not auto-wrap (a trailing '?' unwraps)"
+            ),
+            line,
+            column,
+        );
+    }
+}
+
+// =========================================================================
+// Visibility gates — fields/methods default to module-scoped unless `pub`
+// =========================================================================
+impl<'a> InferContext<'a> {
+    /// Privacy gate for record/ADT FIELDS. Returns Some(message) when `field`
+    /// of `type_name` is not accessible from the current module. Types without
+    /// a registered TypeDefInfo (builtin scalars/arrays) stay open.
+    pub(super) fn field_privacy_error(&self, type_name: &str, field: &str) -> Option<String> {
+        let def = self.sema_result.get_type_def(type_name)?;
+        let ctor = def.constructors.iter()
+            .find(|c| c.field_names.iter().any(|f| f.as_deref() == Some(field)))?;
+        if ctor.def_module.as_ref() == self.current_module_name.as_str() {
+            return None;
+        }
+        let idx = ctor.field_names.iter().position(|f| f.as_deref() == Some(field))?;
+        let is_pub = ctor.field_is_pub.get(idx).copied().unwrap_or(true);
+        if is_pub {
+            None
+        } else {
+            Some(format!(
+                "field '{}.{}' is private (module-scoped): mark it pub or use an accessor",
+                type_name, field
+            ))
+        }
+    }
+
+    /// Privacy gate for cross-module construction: rejected when the constructor
+    /// has ANY private NAMED field. Positional (unnamed) fields are enum payload,
+    /// not encapsulated data — they follow the type's own visibility (same rule
+    /// the newtype single field already uses), so `IpAddr.V4(x)` keeps working
+    /// cross-module while `File(fd, ...)` stays constructible only in-module.
+    pub(super) fn ctor_privacy_error(&self, type_name: &str, ctor_name: &str) -> Option<String> {
+        let def = self.sema_result.get_type_def(type_name)?;
+        let ctor = def.constructors.iter().find(|c| c.name.as_ref() == ctor_name)?;
+        if ctor.def_module.as_ref() == self.current_module_name.as_str() {
+            return None;
+        }
+        let any_private = ctor.field_names.iter().enumerate()
+            .any(|(i, f)| f.is_some() && !ctor.field_is_pub.get(i).copied().unwrap_or(true));
+        if any_private {
+            Some(format!(
+                "constructor '{}.{}' has private fields: cannot be constructed outside module '{}'",
+                type_name, ctor_name, ctor.def_module
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Privacy gate for TYPE METHODS: private (module-scoped) unless `pub`.
+    pub(super) fn method_privacy_error(&self, type_name: &str, method: &str) -> Option<String> {
+        let def = self.sema_result.get_type_def(type_name)?;
+        let def_module = def.constructors.first()
+            .map(|c| c.def_module.clone())
+            .unwrap_or_default();
+        if def_module.as_ref() == self.current_module_name.as_str() {
+            return None;
+        }
+        let m = def.methods.iter().find(|m| m.name.as_ref() == method)?;
+        if m.is_pub {
+            None
+        } else {
+            Some(format!(
+                "method '{}.{}' is private (module-scoped): mark it pub to call outside module '{}'",
+                type_name, method, def_module
+            ))
+        }
     }
 }

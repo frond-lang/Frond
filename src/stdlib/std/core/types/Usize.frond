@@ -1,0 +1,22 @@
+// Usize.frond — the usize type module (part of std.core.types)
+//
+// Boundary constants + decimal parse (platform width: 64-bit on all
+// supported targets). parse returns null on malformed input; accumulation
+// wraps on overflow by design.
+
+pub val MAX: usize = 18446744073709551615
+
+pub fun parse(s: str): usize? {
+    val b = s.bytes()
+    if b.len() == 0 { return null }
+    var i = 0 as usize
+    if b[0] == (45 as u8) { return null }
+    var v: usize = 0
+    while i < b.len() {
+        val d = (b[i] as usize) - 48
+        if d < 0 || d > 9 { return null }
+        v = v * 10 + d
+        i = i + 1
+    }
+    v
+}

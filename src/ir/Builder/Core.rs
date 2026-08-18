@@ -40,8 +40,8 @@ pub struct IrBuilder<'a> {
     /// Global unique-name index across ALL modules (std included): bare name
     /// → sg. The sema layer predeclares every loaded module's functions into
     /// the root env, so a bare call to a GLOBALLY UNIQUE name type-checks
-    /// from anywhere (e.g. `fg_bright_yellow()` after `import
-    /// std.terminal.Ansi`); the IR must honor the same contract. Names
+    /// from anywhere (e.g. `is_tty(0)` after `import
+    /// std.os.Tty`); the IR must honor the same contract. Names
     /// contested by ≥2 distinct functions go to the tripwire instead —
     /// first registrant stays indexed, and any bare call through the
     /// contested name is a hard error.
@@ -95,6 +95,13 @@ pub struct IrBuilder<'a> {
     /// to the original node, so the closure can read the latest value from the parent frame
     /// during a `same_function` call (capture-by-reference semantics).
     pub captured_vars: rustc_hash::FxHashMap<String, NodeId>,
+    /// Function subgraphs that contain a function-level defer (Bug #49). Historically this
+    /// was `!defer_table.is_empty()`; now that defers register dynamically at runtime
+    /// (CF_BLOCK_DEFER_REGISTER + frame.defer_stack), the table is always empty, so this
+    /// builder-side set is the flag. Local reassignment inside such functions emits a
+    /// WriteBack to the original node so the defer body reads the LATEST value
+    /// (Reference-mode captures).
+    pub function_defer_sgs: rustc_hash::FxHashSet<SubGraphId>,
     /// Type-field scope stack: constructor/type name -> field name list
     /// (managed in parallel with `scope_stack`).
     pub type_scope_stack: Vec<rustc_hash::FxHashMap<String, TypeFieldInfo>>,
@@ -219,7 +226,7 @@ pub(super) const BUILTIN_CTORS: &[(&str, BuiltinCtorLower)] = &[
 /// reflect top-level function → standalone compute_fn mapping.
 ///
 /// `format(x)` / `type_name(x)` are the two reflect entry points called from
-/// generic contexts (e.g. Console.kz `print<T>`). Lowering them directly to
+/// generic contexts (e.g. Console.frond `print<T>`). Lowering them directly to
 /// `CF_REFLECT_*` keeps the hot path off the FFI dispatch table.
 /// The remaining reflect primitives are only reachable as trait-style method
 /// calls (`x.kind()`, `x.field_count()`, ...) and are dispatched via
@@ -227,7 +234,7 @@ pub(super) const BUILTIN_CTORS: &[(&str, BuiltinCtorLower)] = &[
 pub(super) fn reflect_top_level_cf(name: &str) -> Option<ComputeFnId> {
     use crate::ir::Ir::*;
     match name {
-        "format" => Some(CF_REFLECT_FORMAT),
+        "repr" => Some(CF_REFLECT_FORMAT),
         "type_name" => Some(CF_REFLECT_TYPE_NAME),
         _ => None,
     }
@@ -236,7 +243,7 @@ pub(super) fn reflect_top_level_cf(name: &str) -> Option<ComputeFnId> {
 /// reflect method-name → (IntrinsicKind, arg_count) mapping.
 ///
 /// Used by `lookup_intrinsic` to give every value — regardless of its static
-/// type — access to reflect trait methods (`x.kind()`, `x.format()`, ...).
+/// type — access to reflect trait methods (`x.kind()`, `x.repr()`, ...).
 /// This is the "auto-impl" of `trait Type` / `trait Value`: rather than
 /// synthesizing witness-table entries and method bodies for every type, the
 /// Builder recognizes reflect method names structurally and lowers them
@@ -253,7 +260,7 @@ pub(super) fn reflect_method_intrinsic(method: &str) -> Option<(crate::sema::Sem
         "size" => un(330),              // CF_REFLECT_LAYOUT_SIZE (aggregate)
         "alignment" => un(331),         // CF_REFLECT_LAYOUT_ALIGN
         "field_count" => un(332),       // CF_REFLECT_FIELD_COUNT
-        "format" => un(290),            // CF_REFLECT_FORMAT
+        "repr" => un(290),               // CF_REFLECT_FORMAT (renamed from format 2026-08-17)
         "constructor" => un(336),       // CF_REFLECT_ADT_CTOR
         "field_name" => bin(333),       // CF_REFLECT_FIELD_NAME
         // field_value removed: its return type cannot be expressed without an "any"
@@ -332,6 +339,7 @@ impl<'a> IrBuilder<'a> {
             scope_stack: Vec::new(),
             captured_scopes: Vec::new(),
             captured_vars: rustc_hash::FxHashMap::default(),
+            function_defer_sgs: rustc_hash::FxHashSet::default(),
             current_function_id: 0,
             current_sg_start: 0,
             current_effect: None,
@@ -657,15 +665,12 @@ impl<'a> IrBuilder<'a> {
         node.0 >= self.current_sg_start
     }
 
-    /// Bug #49: check whether the current function subgraph has registered a defer (after defer
-    /// compilation, `defer_table` is non-empty).
+    /// Bug #49: check whether the current function subgraph contains a function-level defer.
     /// Used to decide whether a local variable reassignment needs a WriteBack to the original
-    /// node.
+    /// node (so defer bodies read the latest value, Reference-mode semantics).
     pub(super) fn current_function_has_defer(&self) -> bool {
         if let Some(sg_id) = self.current_function_sg {
-            if let Some(sg) = self.graph.subgraphs.get(sg_id.0 as usize) {
-                return !sg.defer_table.is_empty();
-            }
+            return self.function_defer_sgs.contains(&sg_id);
         }
         false
     }
@@ -1159,7 +1164,7 @@ impl<'a> IrBuilder<'a> {
     ///      shape. An EXPLICIT qualifier outranks ambient package visibility:
     ///      `Instant.now()` inside std.time must bind Instant.now, not the
     ///      package key `std.time::now` (contested by SystemTime.now — the
-    ///      silent wrong-callee the tripwire exposed in Timer.kz);
+    ///      silent wrong-callee the tripwire exposed in Timer.frond);
     ///   4. package-scoped key `<cur_pkg>::<name>` (stdlib sibling files
     ///      calling each other bare within one package directory);
     ///   5. bare name — builtin (globally visible by design) and user/dep
@@ -1192,22 +1197,26 @@ impl<'a> IrBuilder<'a> {
                 return Some(Ok(sg));
             }
         }
-        // 2. current-module mangled
-        if let Some(ref mp) = cur_path {
-            let key = format!("{}.{}", mp, name);
-            if let Some(&sg) = self.func_subgraphs.get(key.as_str()) {
-                self.log_call_bind(site, name, recv, &key, sg);
-                return Some(Ok(sg));
-            }
-        }
-        // 3. recv short-qualified (`File.remove`) — explicit qualifier beats
-        // ambient package visibility (see doc comment).
+        // 2. recv short-qualified (`F64.parse`) — an EXPLICIT qualifier outranks
+        //    every ambient key. This must run BEFORE the current-module mangled
+        //    probe: while compiling std/core/F32.frond, a call to F64.parse(s)
+        //    (name="parse", recv="F64") used to hit "std.core.F32.parse" first —
+        //    binding the call to the CALLING function itself (infinite
+        //    self-recursion, scheduler deadlock).
         if let Some(rn) = recv {
             let key = format!("{}.{}", rn, name);
             if let Some(&sg) = self.func_subgraphs.get(key.as_str()) {
                 if let Some(diag) = self.conflict_diag(&key) {
                     return Some(Err(diag));
                 }
+                self.log_call_bind(site, name, recv, &key, sg);
+                return Some(Ok(sg));
+            }
+        }
+        // 3. current-module mangled
+        if let Some(ref mp) = cur_path {
+            let key = format!("{}.{}", mp, name);
+            if let Some(&sg) = self.func_subgraphs.get(key.as_str()) {
                 self.log_call_bind(site, name, recv, &key, sg);
                 return Some(Ok(sg));
             }
@@ -1236,8 +1245,8 @@ impl<'a> IrBuilder<'a> {
         // 5b. Global unique-name index (std included): the sema layer
         // predeclares every loaded module's functions into the root env, so
         // a bare call to a globally-UNIQUE name type-checks from anywhere —
-        // honor the same contract (`fg_bright_yellow()` after importing
-        // std.terminal.Ansi). Contested names were recorded by the tripwire
+        // honor the same contract (`is_tty(0)` after importing
+        // std.os.Tty). Contested names were recorded by the tripwire
         // and error here.
         if let Some(&sg) = self.global_bare_index.get(name) {
             if let Some(diag) = self.conflict_diag(name) {
@@ -1435,7 +1444,7 @@ impl<'a> IrBuilder<'a> {
                         }
                         // Package-scoped key (`std.math::fn`): stdlib modules commonly call
                         // siblings in the same package directory bare (`ldexp_f64_impl`
-                        // defined in Round.kz, called from Power.kz). This is package
+                        // defined in Round.frond, called from Power.frond). This is package
                         // visibility, not a global bare name — first registrant wins inside
                         // the package; two same-named functions in ONE package are a real
                         // ambiguity and get the same tripwire treatment.
@@ -1587,14 +1596,29 @@ impl<'a> IrBuilder<'a> {
                         crate::ast::Ast::Stmt::ValDecl { name, .. } => *name,
                         _ => unreachable!(),
                     };
-                    if !self.global_var_slots.contains_key(name) {
-                        let slot = self.global_var_slots.len() as u32;
-                        self.global_var_slots.insert(name.to_string(), slot);
-                        self.top_level_var_decls.push((None, *stmt_id));
-                        // Register the mangled name (module_path.name) pointing to the same slot
-                        if let Some(ref mp) = crate::sema::Sema::module_logical_path(self.module.name) {
+                    // Slot keying: the mangled name (module_path.name) is the
+                    // primary key — every module's top-level val gets its OWN
+                    // slot (std.core.I8.MAX vs std.core.I64.MAX share the bare
+                    // name but are distinct variables). The bare name is only a
+                    // first-wins alias for same-module lookups.
+                    match crate::sema::Sema::module_logical_path(self.module.name) {
+                        Some(mp) => {
                             let mangled = format!("{}.{}", mp, name);
-                            self.global_var_slots.insert(mangled, slot);
+                            if !self.global_var_slots.contains_key(&mangled) {
+                                let slot = self.global_var_slots.len() as u32;
+                                self.global_var_slots.insert(mangled, slot);
+                                self.top_level_var_decls.push((None, *stmt_id));
+                                self.global_var_slots
+                                    .entry(name.to_string())
+                                    .or_insert(slot);
+                            }
+                        }
+                        None => {
+                            if !self.global_var_slots.contains_key(name) {
+                                let slot = self.global_var_slots.len() as u32;
+                                self.global_var_slots.insert(name.to_string(), slot);
+                                self.top_level_var_decls.push((None, *stmt_id));
+                            }
                         }
                     }
                 }
@@ -1610,14 +1634,25 @@ impl<'a> IrBuilder<'a> {
                             crate::ast::Ast::Stmt::ValDecl { name, .. } => *name,
                             _ => unreachable!(),
                         };
-                        if !self.global_var_slots.contains_key(name) {
-                            let slot = self.global_var_slots.len() as u32;
-                            self.global_var_slots.insert(name.to_string(), slot);
-                            self.top_level_var_decls.push((Some(i), *stmt_id));
-                            // Register the mangled name (module_path.name) pointing to the same slot
-                            if let Some(ref mp) = crate::sema::Sema::module_logical_path(m.name) {
+                        // Same mangled-primary / bare-alias keying as above.
+                        match crate::sema::Sema::module_logical_path(m.name) {
+                            Some(mp) => {
                                 let mangled = format!("{}.{}", mp, name);
-                                self.global_var_slots.insert(mangled, slot);
+                                if !self.global_var_slots.contains_key(&mangled) {
+                                    let slot = self.global_var_slots.len() as u32;
+                                    self.global_var_slots.insert(mangled, slot);
+                                    self.top_level_var_decls.push((Some(i), *stmt_id));
+                                    self.global_var_slots
+                                        .entry(name.to_string())
+                                        .or_insert(slot);
+                                }
+                            }
+                            None => {
+                                if !self.global_var_slots.contains_key(name) {
+                                    let slot = self.global_var_slots.len() as u32;
+                                    self.global_var_slots.insert(name.to_string(), slot);
+                                    self.top_level_var_decls.push((Some(i), *stmt_id));
+                                }
                             }
                         }
                     }

@@ -1,0 +1,7 @@
+// std/codec package declaration
+//
+// Byte-text codecs: encode/decode between u8[] and str. decode returns
+// T? (null on malformed input) — same convention as the parse family in
+// std.core.types, not Throw: bad input is expected data, not a host failure.
+pub pack Hex
+pub pack Base64

@@ -1,0 +1,111 @@
+// Iterator<T>: iterator trait (builtin Frond implementation)
+//
+// Four built-in implementations:
+//   ArrayIter<T>     — array iterator, next() returns T?
+//   RangeIterator    — range iterator, next() returns i64?
+//   StringIterator   — string iterator, next() returns i64? (Unicode code point)
+//   HashIterator<E>  — lazy bucket-walking iterator over E[][] (hash containers)
+//
+// After a user-defined type implements Iterator, it can be used by For loops:
+//   type MyRange: (Iterator<i32>) = MyRange(lo: i32, hi: i32) { pub fun &next(): i32? { ... } }
+//   for x in MyRange(1, 10) { ... }  // static dispatch, zero overhead
+//
+// Usage:
+//   for x in arr.iter() { ... }   // arrays need explicit .iter()
+//   for x in range_iter(1, 10, false) { ... }  // RangeIterator used directly
+//   for e in m.entries() { ... }  // hash containers expose entries()/items() explicitly
+
+// ---- Iterator trait ----
+trait Iterator<T> {
+    // Returns the next element, null means exhausted
+    // &next takes the receiver by reference (iterator has mutable state, next modifies pos)
+    fun &next(): T?
+}
+
+// ---- Array iterator ----
+type ArrayIter<T>: (Iterator<T>) = ArrayIter(data: T[], pos: usize) {
+    pub fun &next(): T? {
+        if pos >= data.len() {
+            return null
+        }
+        val v = data[pos]
+        pos = pos + 1
+        return v
+    }
+}
+
+pub fun iter<T>(arr: T[]): ArrayIter<T> {
+    ArrayIter(arr, 0)
+}
+
+// ---- Hash-table iterator ----
+//
+// Lazily walks an E[][] bucket array (separate-chaining layout) without
+// materializing a snapshot — O(n) iteration, zero allocation. Generic over the
+// entry type E, so any hash container (stdlib or user-defined) can expose it.
+//
+// Mutation-during-iteration semantics (deterministic, never invalid):
+//   - in-place slot writes (buckets[b][i] = e) and bucket rebinds
+//     (buckets[b] = new_row) are VISIBLE in buckets not yet walked;
+//   - a full rehash (rebinding the table itself) is NOT visible: the iterator
+//     holds the old bucket array and finishes walking it safely.
+pub type HashIterator<E>: (Iterator<E>) = HashIterator(buckets: E[][], bucket: usize, index: usize) {
+    pub fun &next(): E? {
+        while bucket < buckets.len() {
+            val row = buckets[bucket]
+            if index < row.len() {
+                val e = row[index]
+                index = index + 1
+                return e
+            }
+            bucket = bucket + 1
+            index = 0
+        }
+        null
+    }
+}
+
+pub fun hash_iter<E>(buckets: E[][]): HashIterator<E> {
+    HashIterator(buckets, 0, 0)
+}
+
+// ---- Range iterator ----
+type RangeIterator: (Iterator<i64>) = RangeIterator(current: i64, end: i64, inclusive: bool) {
+    pub fun &next(): i64? {
+        if inclusive {
+            if current > end { return null }
+        } else {
+            if current >= end { return null }
+        }
+        val v = current
+        current = current + 1
+        return v
+    }
+}
+
+pub fun range_iter(start: i64, end: i64, inclusive: bool): RangeIterator {
+    RangeIterator(start, end, inclusive)
+}
+
+// ---- String iterator ----
+// Iterates the string character by character by Unicode code point, next() returns i64? (code point, null means exhausted).
+// UTF-8 decoding is provided by the @extern("C") primitives in builtin/str/Raw.frond.
+// pos is the byte offset (not the code point index), termination is detected via char_len==0 (returns 0 when offset is out of bounds).
+type StringIterator: (Iterator<i64>) = StringIterator(data: str, pos: usize) {
+    pub fun &next(): i64? {
+        val len = __str_utf8_char_len_at(data, pos)
+        if len == 0 {
+            return null
+        }
+        val cp = __str_utf8_decode_at(data, pos)
+        if cp < 0 {
+            return null
+        }
+        pos = pos + len
+        return cp
+    }
+}
+
+pub fun str_iter(s: str): StringIterator {
+    StringIterator(s, 0)
+}

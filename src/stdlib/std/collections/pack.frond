@@ -1,0 +1,17 @@
+// std/collections package declaration
+//
+// Hash containers. HashMap/HashSet take fully generic keys: hashing goes
+// through the key's `"{k}"` representation (every value formats) and equality
+// uses engine-level deep `==`, so any type — str, scalars, bool, records,
+// ADTs, arrays — works as a key. IntMap/IntSet are the i64 fast path (direct
+// integer hashing, no per-op string formatting).
+//
+//   HashMap<K, V> — generic keys   HashSet<K> — generic elements
+//   IntMap<V>     — i64 → V fast   IntSet     — i64 fast
+//
+// All containers are separate-chaining tables: bucket arrays hold small
+// entry arrays, grow ×2 at load factor 2, and rebuild buckets on remove.
+pub pack HashMap
+pub pack IntMap
+pub pack HashSet
+pub pack IntSet

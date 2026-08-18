@@ -28,18 +28,36 @@ impl<'a> InferContext<'a> {
         let bind_ty = if let Some(ta) = type_annotation {
             let annot_ty = self.type_from_ast(ta, ast);
             if self.try_widen_unify(annot_ty, val_ty).is_err() {
-                // Bug #61: if the type annotation is a named type and is an alias, preserve the alias name rather than unfolding the underlying type.
-                let annot_str = self.display_type_annotation(ta, ast, annot_ty);
-                let val_str = format!("{}", self.arena.display(val_ty));
-                let span = ast.ty(ta).span;
-                self.add_error_at(
-                    &format!(
-                        "type annotation mismatch: expected '{}', found '{}'",
-                        annot_str, val_str
-                    ),
-                    span.line,
-                    span.column,
-                );
+                // Literal → nullable annotation: `val a: i64? = 42`. Bare
+                // literals never promote toward a Nullable expected type, so
+                // the literal stays i32 while the annotation is i64? —
+                // re-infer the literal against the INNER scalar (running the
+                // normal literal promotion) and accept when that unifies.
+                let mut unified = false;
+                if Self::expr_is_literal(ast, value) {
+                    let annot_resolved = self.arena.resolve(annot_ty);
+                    if let Type::Nullable(_) = self.arena.get(annot_resolved) {
+                        let inner = self.arena.nullable_inner(annot_resolved);
+                        let re_ty = self.infer_expr(value, ast, env, Some(inner));
+                        if self.try_widen_unify(inner, re_ty).is_ok() {
+                            unified = true;
+                        }
+                    }
+                }
+                if !unified {
+                    // Bug #61: if the type annotation is a named type and is an alias, preserve the alias name rather than unfolding the underlying type.
+                    let annot_str = self.display_type_annotation(ta, ast, annot_ty);
+                    let val_str = format!("{}", self.arena.display(val_ty));
+                    let span = ast.ty(ta).span;
+                    self.add_error_at(
+                        &format!(
+                            "type annotation mismatch: expected '{}', found '{}'",
+                            annot_str, val_str
+                        ),
+                        span.line,
+                        span.column,
+                    );
+                }
             }
             annot_ty
         } else {
@@ -190,6 +208,34 @@ impl<'a> InferContext<'a> {
                                 span.line,
                                 span.column,
                             );
+                        }
+                        // Sync Throw-returning functions must return a Throw VALUE.
+                        // A bare payload (often via `return expr?`, which unwraps)
+                        // leaks non-Throw where Throw was declared — the
+                        // from_datetime_utc/scanln bug class. Async funs are
+                        // exempt: their expected_return is Async-wrapped, so the
+                        // first check below filters them. TypeVar/Unknown values
+                        // may still solve to Throw via the fixpoint — skip them.
+                        if matches!(self.arena.get(self.arena.resolve(fn_ret)), Type::Throw(_)) {
+                            match self.arena.get(self.arena.resolve(val_ty)) {
+                                Type::Throw(_)
+                                | Type::TypeVar(_)
+                                | Type::Unknown
+                                | Type::Never => {}
+                                _ => {
+                                    let ret_str = format!("{}", self.arena.display(fn_ret));
+                                    let val_str = format!("{}", self.arena.display(val_ty));
+                                    let span = ast.stmt(stmt).span;
+                                    self.add_error_at(
+                                        &format!(
+                                            "'return' value must be Throw-wrapped: expected '{}', found '{}' (wrap in Ok(..)/Err(..) or return the Throw value directly; 'expr?' unwraps)",
+                                            ret_str, val_str
+                                        ),
+                                        span.line,
+                                        span.column,
+                                    );
+                                }
+                            }
                         }
                     }
                     Some(val_ty)

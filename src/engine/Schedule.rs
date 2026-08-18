@@ -964,7 +964,7 @@ impl<S: LockStrategy> Engine<S> {
         fid: FrameId,
         queue: &QueueHandle<'_>,
         depth: u32,
-        graph: &DataFlowGraph,
+        _graph: &DataFlowGraph,
     ) {
         // Frame suspended: do not execute defer, do not mark Completed.
         if frame.state == FrameState::Suspended {
@@ -973,8 +973,8 @@ impl<S: LockStrategy> Engine<S> {
 
         // Frame cancelled: execute defer cleanup + mark Failed (spec 5.3).
         if frame.state == FrameState::Cancelling {
-            let defer_entries: &[DeferEntry] =
-                &graph.subgraphs[frame.subgraph_id.0 as usize].defer_table;
+            let defer_entries: Vec<crate::ir::Ir::RuntimeDefer> =
+                std::mem::take(&mut frame.defer_stack);
             for entry in defer_entries.iter().rev() {
                 let defer_fid = self.init_defer_frame(entry.body_subgraph, frame);
                 let mut defer_frame = self.frames.lock().remove(&defer_fid);
@@ -991,9 +991,14 @@ impl<S: LockStrategy> Engine<S> {
             return;
         }
 
-        // Execute defer (LIFO): any termination path runs defer.
-        let defer_entries: &[DeferEntry] =
-            &graph.subgraphs[frame.subgraph_id.0 as usize].defer_table;
+        // Execute defer (LIFO): any termination path drains the frame's runtime
+        // defer_stack. Only defers whose registration node actually EXECUTED are
+        // on the stack — unreached defers (error `?`-exit before their statement)
+        // never registered and never run, so they can no longer read unbound
+        // slots (the old static defer_table was drained unconditionally and
+        // crashed natively on that path).
+        let defer_entries: Vec<crate::ir::Ir::RuntimeDefer> =
+            std::mem::take(&mut frame.defer_stack);
         let mut pending_defer_count: u32 = 0;
         for entry in defer_entries.iter().rev() {
             let defer_fid = self.init_defer_frame(entry.body_subgraph, frame);

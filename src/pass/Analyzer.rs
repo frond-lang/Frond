@@ -1383,6 +1383,21 @@ pub fn analyze_purity(module: &Module, arena: &AstArena, cg: &CallGraph, sema: &
         table.put(fid, Purity::Pure);
     }
     let mut direct_impure: FxHashSet<FuncId> = FxHashSet::default();
+    // Module-level var/val names: writing any of them makes a function
+    // stateful (impure for inlining/memoization purposes).
+    let top_level_vars: FxHashSet<&str> = module
+        .declarations
+        .iter()
+        .filter_map(|d| match &d.node {
+            crate::ast::Ast::Decl::ExprDecl { stmt: Some(s), .. } => {
+                match &arena.stmt(*s).node {
+                    Stmt::VarDecl { name, .. } | Stmt::ValDecl { name, .. } => Some(*name),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
     // Unified traversal of FunDecl + Method (via cg.iter_funcs)
     let func_metas: Vec<(FuncId, &str, crate::ast::Ast::ExprId, bool)> = cg.iter_funcs(module)
         .map(|(fid, meta)| (fid, meta.name, meta.body, meta.is_async))
@@ -1399,7 +1414,7 @@ pub fn analyze_purity(module: &Module, arena: &AstArena, cg: &CallGraph, sema: &
                 continue;
             }
         }
-        if is_direct_impure(body, arena, name, sema) {
+        if is_direct_impure(body, arena, name, module.name, sema, &top_level_vars) {
             direct_impure.insert(caller);
         }
     }
@@ -1422,7 +1437,25 @@ pub fn analyze_purity(module: &Module, arena: &AstArena, cg: &CallGraph, sema: &
 
 /// Determines whether a function body is directly impure (contains impure built-in calls, method calls, select, spawn, etc.).
 /// Uses sema FuncSigInfo: async/throwing external functions (e.g., println) are also classified as impure.
-fn is_direct_impure(body: ExprId, arena: &AstArena, self_name: &str, sema: &SemaResult) -> bool {
+fn is_direct_impure(body: ExprId, arena: &AstArena, self_name: &str, module_name: &str, sema: &SemaResult, top_level_vars: &FxHashSet<&str>) -> bool {
+    // Stateful functions are impure: a body that WRITES a module-level
+    // variable (directly or through an element/field of one) must never be
+    // inlined or memoized — the expanded body's stores bypass the global
+    // slot, freezing the state (rand's inlined next_u64 kept returning the
+    // first value forever).
+    if writes_top_level_var(body, arena, top_level_vars) {
+        return true;
+    }
+    // Reference writes are equally observable: records and arrays are shared
+    // by reference, so `this.field = v` (implicit-this sugar inside methods),
+    // `obj.field = v`, `arr[i] = v` and `*r = v` mutate state every alias can
+    // see — callers, sibling loop iterations, other methods. A mutating
+    // method (`&fn` like an iterator's `&next`) classified pure led to its
+    // call being eliminated as a dead `val` declaration (#104) and to unsafe
+    // inline/memo plans of the same shape as the rand freeze above.
+    if writes_through_reference(body, arena, module_name, sema) {
+        return true;
+    }
     fn check(expr_id: ExprId, arena: &AstArena, self_name: &str, sema: &SemaResult) -> bool {
         let expr = &arena.expr(expr_id).node;
         match expr {
@@ -1529,6 +1562,136 @@ fn is_direct_impure(body: ExprId, arena: &AstArena, self_name: &str, sema: &Sema
         }
     }
     check(body, arena, self_name, sema)
+}
+
+/// Root identifier of an assignment target: `x` → `x`; `arr[i].f` → `arr`.
+fn assign_target_root_ident<'a>(target: crate::ast::Ast::ExprId, arena: &AstArena<'a>) -> Option<&'a str> {
+    let mut root = target;
+    loop {
+        match &arena.expr(root).node {
+            Expr::Ident(n) => return Some(n),
+            Expr::Index { recv, .. }
+            | Expr::FieldAccess { recv, .. }
+            | Expr::SafeAccess { recv, .. } => root = *recv,
+            _ => return None,
+        }
+    }
+}
+
+/// Whether any assignment inside the function body targets a module-level
+/// variable (or an element/field of one). Shadowing (a parameter/local named
+/// like a global) may over-approximate — that only forgoes an optimization.
+/// Whether an assignment target writes THROUGH a reference (observable
+/// mutation): field writes (`obj.f = v`, including implicit-this `f = v`
+/// inside methods), array element writes (`arr[i] = v`) and deref writes
+/// (`*r = v`). Plain local-variable assignments are NOT reference writes —
+/// they are function-internal and invisible to callers.
+fn writes_through_reference(expr_id: ExprId, arena: &AstArena, module_name: &str, sema: &SemaResult) -> bool {
+    match &arena.expr(expr_id).node {
+        Expr::Assign { target, .. } | Expr::CompoundAssign { target, .. } => {
+            if assign_target_writes_reference(*target, arena, module_name, sema) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    let mut found = false;
+    walk_children_expr(expr_id, arena, |c| {
+        if !found {
+            found = writes_through_reference(c, arena, module_name, sema);
+        }
+    });
+    if !found {
+        walk_children_stmts_of_expr(expr_id, arena, |s| {
+            if !found {
+                found = writes_through_reference_stmt(s, arena, module_name, sema);
+            }
+        });
+    }
+    found
+}
+
+fn writes_through_reference_stmt(stmt_id: StmtId, arena: &AstArena, module_name: &str, sema: &SemaResult) -> bool {
+    match &arena.stmt(stmt_id).node {
+        Stmt::Assignment { target, .. } | Stmt::CompoundAssignment { target, .. } => {
+            assign_target_writes_reference(*target, arena, module_name, sema)
+        }
+        // Explicit field-assignment statements (`obj.f = v` shape): always a
+        // reference write regardless of the receiver's root.
+        Stmt::FieldAssignment { .. } => true,
+        _ => {
+            let mut found = false;
+            walk_children_stmt(stmt_id, arena, |e| {
+                if !found {
+                    found = writes_through_reference(e, arena, module_name, sema);
+                }
+            });
+            found
+        }
+    }
+}
+
+/// One assignment target: is it a write through a reference?
+fn assign_target_writes_reference(target: ExprId, arena: &AstArena, module_name: &str, sema: &SemaResult) -> bool {
+    match &arena.expr(target).node {
+        // obj.f = v / arr[i] = v / *r = v
+        Expr::FieldAccess { .. } | Expr::SafeAccess { .. } | Expr::Index { .. } | Expr::Deref(_) => true,
+        // `f = v` inside a method body resolving to `this.f = v`
+        Expr::Ident(_) => {
+            let key = module_expr_key(module_name, target.0 as u64);
+            sema.expr_types.get(&key).and_then(|info| info.implicit_this.as_ref()).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn writes_top_level_var(expr_id: ExprId, arena: &AstArena, top: &FxHashSet<&str>) -> bool {
+    match &arena.expr(expr_id).node {
+        Expr::Assign { target, .. } | Expr::CompoundAssign { target, .. } => {
+            if assign_target_root_ident(*target, arena)
+                .map_or(false, |n| top.contains(n))
+            {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    let mut found = false;
+    walk_children_expr(expr_id, arena, |c| {
+        if !found {
+            found = writes_top_level_var(c, arena, top);
+        }
+    });
+    if !found {
+        walk_children_stmts_of_expr(expr_id, arena, |s| {
+            if !found {
+                found = writes_top_level_var_stmt(s, arena, top);
+            }
+        });
+    }
+    found
+}
+
+fn writes_top_level_var_stmt(stmt_id: StmtId, arena: &AstArena, top: &FxHashSet<&str>) -> bool {
+    match &arena.stmt(stmt_id).node {
+        Stmt::Assignment { target, value, .. } | Stmt::CompoundAssignment { target, value, .. } => {
+            assign_target_root_ident(*target, arena).map_or(false, |n| top.contains(n))
+                || writes_top_level_var(*value, arena, top)
+        }
+        Stmt::FieldAssignment { object, value, .. } => {
+            assign_target_root_ident(*object, arena).map_or(false, |n| top.contains(n))
+                || writes_top_level_var(*value, arena, top)
+        }
+        _ => {
+            let mut found = false;
+            walk_children_stmt(stmt_id, arena, |e| {
+                if !found {
+                    found = writes_top_level_var(e, arena, top);
+                }
+            });
+            found
+        }
+    }
 }
 
 // =========================================================================

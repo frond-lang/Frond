@@ -1,0 +1,43 @@
+// builtin/reflect/Reflect.frond — runtime reflection (builtin, visible by default)
+//
+// Go-style reflection via two auto-impl trait concepts:
+//   - trait Type  : type-metadata queries (type_name/kind/size/field_count/...) — auto-impl'd for every type
+//   - trait Value : value-level operations (format/constructor) — auto-impl'd for every type
+//
+// "Auto-impl" here is structural: the compiler recognizes reflect method names
+// at both the Sema layer (Inference: any receiver type passes type-check) and
+// the IR layer (Builder: `lookup_intrinsic` + `reflect_method_intrinsic` lower
+// the call directly to a CF_REFLECT_* compute_fn). No witness-table entry, no
+// method body, no @builtin — the method name *is* the dispatch.
+//
+// Usage (builtin visible by default, no import needed):
+//   val p = Point(1, 2)
+//   p.type_name()      // -> "Point"        (trait Type)
+//   p.kind()           // -> "Adt"          (trait Type)
+//   p.repr()           // -> "Point(x: 1, y: 2)"  (trait Value)
+//   p.field_count()    // -> 2              (trait Type)
+//   p.field_name(0)    // -> "x"            (trait Type)
+//   p.constructor()    // -> ctor name      (trait Value, ADTs only)
+//   p.size()           // -> layout size    (trait Type)
+//   p.alignment()      // -> layout align   (trait Type)
+//
+// There are no top-level format()/type_name() wrappers — call sites use the
+// method form directly (e.g. Console.frond `print<T>` writes `x.repr()`).
+
+// ─── trait Type: type-metadata queries (auto-impl for every type) ───────────────
+trait Type {
+    fun type_name(): str
+    fun kind(): str
+    fun size(): u32
+    fun alignment(): u32
+    fun field_count(): u16
+    fun field_name(index: u16): str
+}
+
+// ─── trait Value: runtime value-level operations (auto-impl for every type) ─────
+// Note: array length is NOT here — arrays already have a builtin `.len()` method
+// (IntrinsicKind::UnOp(35)). Adding `array_len()` would duplicate it.
+trait Value {
+    fun repr(): str
+    fun constructor(): str
+}

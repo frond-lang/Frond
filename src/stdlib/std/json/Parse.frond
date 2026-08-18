@@ -1,0 +1,378 @@
+// Parse.frond — JSON text -> Json value (part of std.json)
+//
+// Recursive descent over a byte cursor (promoted 2026-08-17 from the
+// dogfood_json regression program, which battle-tested the shape).
+// RFC 8259 subset: null / true / false / number (sign, fraction, exponent) /
+// string (" \ \/ \b \f \n \r \t \uXXXX escapes — including surrogate pairs —
+// and UTF-8 passthrough) / array / object. Errors carry the byte position.
+
+// ─── Parser (module-internal) ──────────────────────────────────────
+
+type Parser = Parser(data: u8[], pos: usize) {
+
+    fun fail(message: str): Throw<Json, JsonError> {
+        throw JsonError(ParseFailed, "at byte {pos}: {message}", "")
+    }
+
+    fun skip_ws(): void {
+        while pos < data.len() {
+            val c = data[pos]
+            if c == 32u8 || c == 9u8 || c == 10u8 || c == 13u8 {
+                pos = pos + 1
+            } else {
+                break
+            }
+        }
+    }
+
+    // Entry point: parse one value + reject trailing content
+    fun parse(): Throw<Json, JsonError> {
+        skip_ws()
+        val v = parse_value()?
+        skip_ws()
+        if pos != data.len() {
+            fail("trailing characters")?
+        }
+        Ok(v)
+    }
+
+    fun parse_value(): Throw<Json, JsonError> {
+        if pos >= data.len() {
+            return fail("unexpected end of input")
+        }
+        val c = data[pos]
+        if c == 123u8 {
+            parse_object()
+        } else if c == 91u8 {
+            parse_array()
+        } else if c == 34u8 {
+            parse_string()
+        } else if c == 116u8 {
+            expect_lit("true", JBool(true))
+        } else if c == 102u8 {
+            expect_lit("false", JBool(false))
+        } else if c == 110u8 {
+            expect_lit("null", JNull)
+        } else if c == 45u8 || (c >= 48u8 && c <= 57u8) {
+            parse_number()
+        } else {
+            fail("unexpected character")
+        }
+    }
+
+    fun expect_lit(lit: str, result: Json): Throw<Json, JsonError> {
+        val bytes = lit.bytes()
+        if pos + bytes.len() > data.len() {
+            return fail("unexpected end of literal")
+        }
+        var i: usize = 0
+        while i < bytes.len() {
+            if data[pos + i] != bytes[i] {
+                return fail("invalid literal")
+            }
+            i = i + 1
+        }
+        pos = pos + bytes.len()
+        Ok(result)
+    }
+
+    fun parse_string(): Throw<Json, JsonError> {
+        pos = pos + 1
+        var out: str = ""
+        while pos < data.len() {
+            val c = data[pos]
+            if c == 34u8 {
+                pos = pos + 1
+                return Ok(JStr(out))
+            }
+            if c == 92u8 {
+                pos = pos + 1
+                if pos >= data.len() {
+                    return fail("unterminated escape")
+                }
+                val esc = data[pos]
+                pos = pos + 1
+                if esc == 34u8 {
+                    out = out + "\""
+                } else if esc == 92u8 {
+                    out = out + "\\"
+                } else if esc == 47u8 {
+                    out = out + "/"
+                } else if esc == 110u8 {
+                    out = out + "\n"
+                } else if esc == 116u8 {
+                    out = out + "\t"
+                } else if esc == 114u8 {
+                    out = out + "\r"
+                } else if esc == 98u8 {
+                    // \b backspace — byte 8; built via array cast (no \b literal escape)
+                    out = out + ([8u8] as str)
+                } else if esc == 102u8 {
+                    // \f form feed — byte 12
+                    out = out + ([12u8] as str)
+                } else if esc == 117u8 {
+                    // \uXXXX (surrogate pairs supported)
+                    val hi = read_hex4()?
+                    var cp = hi
+                    if hi >= 55296 && hi <= 56319 {
+                        // high surrogate: a low surrogate must follow
+                        if pos + 1 < data.len() && data[pos] == 92u8 && data[pos + 1] == 117u8 {
+                            pos = pos + 2
+                            val lo = read_hex4()?
+                            if lo >= 56320 && lo <= 57343 {
+                                cp = 65536 + ((hi - 55296) << 10) + (lo - 56320)
+                            } else {
+                                return fail("invalid low surrogate")
+                            }
+                        } else {
+                            return fail("unpaired surrogate")
+                        }
+                    } else if hi >= 56320 && hi <= 57343 {
+                        return fail("unpaired low surrogate")
+                    }
+                    out = out + (utf8_encode(cp) as str)
+                } else {
+                    return fail("invalid escape")
+                }
+            } else if c < 32u8 {
+                return fail("control character in string")
+            } else {
+                val start = pos
+                while pos < data.len() && data[pos] != 34u8 && data[pos] != 92u8 && data[pos] >= 32u8 {
+                    pos = pos + 1
+                }
+                out = out + slice_str(start, pos)
+            }
+        }
+        fail("unterminated string")
+    }
+
+    // 4 hex digits at pos → codepoint, advancing pos
+    fun read_hex4(): Throw<i64, JsonError> {
+        var v: i64 = 0
+        var i: usize = 0
+        while i < 4 {
+            if pos >= data.len() {
+                throw JsonError(ParseFailed, "at byte {pos}: unterminated unicode escape", "")
+            }
+            val d = hex_digit(data[pos])
+            if d < 0 {
+                throw JsonError(ParseFailed, "at byte {pos}: invalid unicode escape digit", "")
+            }
+            v = v * 16 + (d as i64)
+            pos = pos + 1
+            i = i + 1
+        }
+        Ok(v)
+    }
+
+    fun slice_str(from: usize, to: usize): str {
+        (data[from..to]) as str
+    }
+
+    fun parse_number(): Throw<Json, JsonError> {
+        val start = pos
+        if pos < data.len() && data[pos] == 45u8 {
+            pos = pos + 1
+        }
+        while pos < data.len() && data[pos] >= 48u8 && data[pos] <= 57u8 {
+            pos = pos + 1
+        }
+        if pos < data.len() && data[pos] == 46u8 {
+            pos = pos + 1
+            while pos < data.len() && data[pos] >= 48u8 && data[pos] <= 57u8 {
+                pos = pos + 1
+            }
+        }
+        if pos < data.len() && (data[pos] == 101u8 || data[pos] == 69u8) {
+            pos = pos + 1
+            if pos < data.len() && (data[pos] == 43u8 || data[pos] == 45u8) {
+                pos = pos + 1
+            }
+            while pos < data.len() && data[pos] >= 48u8 && data[pos] <= 57u8 {
+                pos = pos + 1
+            }
+        }
+        val text = slice_str(start, pos)
+        val n = str_to_f64(text)?
+        Ok(JNum(n))
+    }
+
+    // Number parsing with kept semantics: sign/integer/fraction/exponent
+    // accumulated separately (no library call; exponent applied by repeated
+    // multiply/divide like F64.parse).
+    fun str_to_f64(text: str): Throw<f64, JsonError> {
+        val b = text.bytes()
+        var i: usize = 0
+        var neg = false
+        if i < b.len() && b[i] == 45u8 {
+            neg = true
+            i = i + 1
+        }
+        var int_part: f64 = 0.0
+        while i < b.len() && b[i] >= 48u8 && b[i] <= 57u8 {
+            int_part = int_part * 10.0 + (b[i] - 48u8) as f64
+            i = i + 1
+        }
+        var frac: f64 = 0.0
+        var frac_scale: f64 = 1.0
+        if i < b.len() && b[i] == 46u8 {
+            i = i + 1
+            while i < b.len() && b[i] >= 48u8 && b[i] <= 57u8 {
+                frac = frac * 10.0 + (b[i] - 48u8) as f64
+                frac_scale = frac_scale * 10.0
+                i = i + 1
+            }
+        }
+        var exp: i64 = 0
+        var exp_neg = false
+        if i < b.len() && (b[i] == 101u8 || b[i] == 69u8) {
+            i = i + 1
+            if i < b.len() && b[i] == 45u8 {
+                exp_neg = true
+                i = i + 1
+            } else if i < b.len() && b[i] == 43u8 {
+                i = i + 1
+            }
+            while i < b.len() && b[i] >= 48u8 && b[i] <= 57u8 {
+                exp = exp * 10 + (b[i] - 48u8) as i64
+                i = i + 1
+            }
+        }
+        if i != b.len() {
+            throw JsonError(ParseFailed, "at byte {pos}: malformed number", "")
+        }
+        var value = int_part
+        if frac_scale > 1.0 {
+            value = value + frac / frac_scale
+        }
+        if exp != 0 {
+            var k: i64 = 0
+            var pow: f64 = 1.0
+            val mag = exp
+            while k < mag {
+                pow = pow * 10.0
+                k = k + 1
+            }
+            if exp_neg {
+                value = value / pow
+            } else {
+                value = value * pow
+            }
+        }
+        if neg {
+            value = 0.0 - value
+        }
+        Ok(value)
+    }
+
+    fun parse_array(): Throw<Json, JsonError> {
+        pos = pos + 1
+        var items: Json[] = []
+        skip_ws()
+        if pos < data.len() && data[pos] == 93u8 {
+            pos = pos + 1
+            return Ok(JArr(items))
+        }
+        while true {
+            skip_ws()
+            val v = parse_value()?
+            items = items ++ [v]
+            skip_ws()
+            if pos >= data.len() {
+                return fail("unterminated array")
+            }
+            val c = data[pos]
+            if c == 44u8 {
+                pos = pos + 1
+            } else if c == 93u8 {
+                pos = pos + 1
+                return Ok(JArr(items))
+            } else {
+                return fail("expected comma or bracket in array")
+            }
+        }
+    }
+
+    fun parse_object(): Throw<Json, JsonError> {
+        pos = pos + 1
+        var entries: JEntry[] = []
+        skip_ws()
+        if pos < data.len() && data[pos] == 125u8 {
+            pos = pos + 1
+            return Ok(JObj(entries))
+        }
+        while true {
+            skip_ws()
+            if pos >= data.len() || data[pos] != 34u8 {
+                return fail("expected string key")
+            }
+            val k = parse_string()?
+            val key = match k {
+                JStr(s) => s
+                _ => ""
+            }
+            skip_ws()
+            if pos >= data.len() || data[pos] != 58u8 {
+                return fail("expected colon after key")
+            }
+            pos = pos + 1
+            skip_ws()
+            val v = parse_value()?
+            entries = entries ++ [JEntry(key, v)]
+            skip_ws()
+            if pos >= data.len() {
+                return fail("unterminated object")
+            }
+            val c = data[pos]
+            if c == 44u8 {
+                pos = pos + 1
+            } else if c == 125u8 {
+                pos = pos + 1
+                return Ok(JObj(entries))
+            } else {
+                return fail("expected comma or brace in object")
+            }
+        }
+    }
+}
+
+// ─── Byte helpers (parse side) ────────────────────────────────────
+
+// Hex digit value of a byte, -1 if not a hex digit.
+fun hex_digit(c: u8): i32 {
+    if c >= 48 && c <= 57 { (c as i32) - 48 }
+    else if c >= 97 && c <= 102 { (c as i32) - 87 }
+    else if c >= 65 && c <= 70 { (c as i32) - 55 }
+    else { -1 }
+}
+
+// One-codepoint UTF-8 encoding (1..4 bytes).
+fun utf8_encode(cp: i64): u8[] {
+    if cp < 128 {
+        [(cp as u8)]
+    } else if cp < 2048 {
+        val b0 = 192 + (cp >> 6)
+        val b1 = 128 + (cp & 63)
+        [(b0 as u8), (b1 as u8)]
+    } else if cp < 65536 {
+        val b0 = 224 + (cp >> 12)
+        val b1 = 128 + ((cp >> 6) & 63)
+        val b2 = 128 + (cp & 63)
+        [(b0 as u8), (b1 as u8), (b2 as u8)]
+    } else {
+        val b0 = 240 + (cp >> 18)
+        val b1 = 128 + ((cp >> 12) & 63)
+        val b2 = 128 + ((cp >> 6) & 63)
+        val b3 = 128 + (cp & 63)
+        [(b0 as u8), (b1 as u8), (b2 as u8), (b3 as u8)]
+    }
+}
+
+// ─── Public API ───────────────────────────────────────────────────
+
+// Parse a JSON document. Errors carry the byte position in message.
+pub fun parse(text: str): Throw<Json, JsonError> {
+    val p = Parser(text.bytes(), 0)
+    p.parse()
+}

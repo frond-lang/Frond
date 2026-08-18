@@ -1,0 +1,10 @@
+// F128.frond — the f128 (quad-precision) type module (part of std.core)
+//
+// No MAX/MIN constants: the boundary values (~1.19e4932) are not writable as
+// literals (they overflow the f64 literal pipeline); use Math.inf_f128() for
+// infinities. parse goes through f64, so more than ~17 significant digits or
+// exponents beyond ±308 lose precision.
+
+pub fun parse(s: str): f128? {
+    F64.parse(s) as f128?
+}

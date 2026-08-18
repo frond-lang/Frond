@@ -1,0 +1,8 @@
+// F16.frond — the f16 (half-precision) type module (part of std.core)
+
+pub val MAX: f16 = 65504.0
+pub val MIN: f16 = 0.000059604644775390625
+
+pub fun parse(s: str): f16? {
+    F64.parse(s) as f16?
+}

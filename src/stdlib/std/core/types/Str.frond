@@ -1,0 +1,179 @@
+// Str.frond — string algorithms
+//
+// Byte-indexed semantics: every index/offset refers to s.bytes() positions,
+// NOT codepoint counts (str.len() counts Unicode chars). Boundaries produced
+// by split/index_of/replace are always UTF-8-safe (they fall on matched
+// separator edges); substring slices raw bytes, so the caller keeps non-ASCII
+// ranges on codepoint boundaries. to_upper_ascii/to_lower_ascii touch ASCII
+// letters only.
+
+// Byte offset of the first occurrence of needle in hay at or after `from`;
+// -1 when absent. Empty needle matches at `from`.
+fun find_bytes(hay: u8[], needle: u8[], from: usize): i64 {
+    val hlen = hay.len()
+    val nlen = needle.len()
+    if nlen == 0 { return from as i64 }
+    var i = from
+    while i + nlen <= hlen {
+        var matched = true
+        var j = 0 as usize
+        while matched && j < nlen {
+            if hay[i + j] != needle[j] { matched = false }
+            j = j + 1
+        }
+        if matched { return i as i64 }
+        i = i + 1
+    }
+    -1
+}
+
+// Byte offset of the first occurrence of sub in s, -1 when absent.
+pub fun index_of(s: str, sub: str): i64 {
+    find_bytes(s.bytes(), sub.bytes(), 0 as usize)
+}
+
+pub fun contains(s: str, sub: str): bool {
+    index_of(s, sub) >= 0
+}
+
+pub fun starts_with(s: str, prefix: str): bool {
+    val sb = s.bytes()
+    val pb = prefix.bytes()
+    if pb.len() > sb.len() { return false }
+    var i = 0 as usize
+    var same = true
+    while same && i < pb.len() {
+        if sb[i] != pb[i] { same = false }
+        i = i + 1
+    }
+    same
+}
+
+pub fun ends_with(s: str, suffix: str): bool {
+    val sb = s.bytes()
+    val fb = suffix.bytes()
+    if fb.len() > sb.len() { return false }
+    val off = sb.len() - fb.len()
+    var i = 0 as usize
+    var same = true
+    while same && i < fb.len() {
+        if sb[off + i] != fb[i] { same = false }
+        i = i + 1
+    }
+    same
+}
+
+// Split s by sep. Empty sep returns [s]; no occurrence returns [s].
+// Trailing/leading separators produce empty pieces (Go strings.Split shape).
+pub fun split(s: str, sep: str): str[] {
+    val sb = s.bytes()
+    val pb = sep.bytes()
+    var out: str[] = []
+    if pb.len() == 0 { return out ++ [s] }
+    var start = 0 as usize
+    while true {
+        val hit = find_bytes(sb, pb, start)
+        if hit < 0 { break }
+        out = out ++ [(sb[start..(hit as usize)]) as str]
+        start = (hit as usize) + pb.len()
+    }
+    out = out ++ [(sb[start..sb.len()]) as str]
+    out
+}
+
+fun is_space_byte(b: u8): bool {
+    b == (32 as u8) || b == (9 as u8) || b == (10 as u8) || b == (13 as u8)
+}
+
+// Leading ASCII whitespace (space, \t, \r, \n) removed.
+pub fun trim_start(s: str): str {
+    val sb = s.bytes()
+    var i = 0 as usize
+    while i < sb.len() && is_space_byte(sb[i]) { i = i + 1 }
+    (sb[i..sb.len()]) as str
+}
+
+// Trailing ASCII whitespace removed.
+pub fun trim_end(s: str): str {
+    val sb = s.bytes()
+    var end = sb.len()
+    while end > (0 as usize) && is_space_byte(sb[end - 1]) { end = end - 1 }
+    (sb[0..end]) as str
+}
+
+// Both ends trimmed.
+pub fun trim(s: str): str {
+    trim_start(trim_end(s))
+}
+
+// ASCII letters a-z → A-Z (other bytes untouched).
+pub fun to_upper_ascii(s: str): str {
+    val sb = s.bytes()
+    var out: u8[] = []
+    var i = 0 as usize
+    while i < sb.len() {
+        val b = sb[i]
+        if b >= (97 as u8) && b <= (122 as u8) {
+            out = out ++ [(b - (32 as u8)) as u8]
+        } else {
+            out = out ++ [b]
+        }
+        i = i + 1
+    }
+    (out[0..out.len()]) as str
+}
+
+// ASCII letters A-Z → a-z (other bytes untouched).
+pub fun to_lower_ascii(s: str): str {
+    val sb = s.bytes()
+    var out: u8[] = []
+    var i = 0 as usize
+    while i < sb.len() {
+        val b = sb[i]
+        if b >= (65 as u8) && b <= (90 as u8) {
+            out = out ++ [(b + (32 as u8)) as u8]
+        } else {
+            out = out ++ [b]
+        }
+        i = i + 1
+    }
+    (out[0..out.len()]) as str
+}
+
+// Replace every occurrence of `from` with `to`. Empty `from` returns s.
+pub fun replace(s: str, from: str, to: str): str {
+    val sb = s.bytes()
+    val fb = from.bytes()
+    val tb = to.bytes()
+    if fb.len() == 0 { return s }
+    var out: u8[] = []
+    var start = 0 as usize
+    while true {
+        val hit = find_bytes(sb, fb, start)
+        if hit < 0 { break }
+        out = out ++ sb[start..(hit as usize)] ++ tb
+        start = (hit as usize) + fb.len()
+    }
+    out = out ++ sb[start..sb.len()]
+    (out[0..out.len()]) as str
+}
+
+// s concatenated n times. n <= 0 returns "".
+pub fun repeat(s: str, n: i32): str {
+    val sb = s.bytes()
+    var out: u8[] = []
+    var i = 0
+    while i < n {
+        out = out ++ sb
+        i = i + 1
+    }
+    (out[0..out.len()]) as str
+}
+
+// Byte slice [start, end). Out-of-range or inverted ranges return "".
+// UTF-8 note: keep non-ASCII ranges on codepoint boundaries.
+pub fun substring(s: str, start: usize, end: usize): str {
+    val sb = s.bytes()
+    if start >= end || end > sb.len() { return "" }
+    (sb[start..end]) as str
+}

@@ -14,7 +14,7 @@ impl<'a> InferContext<'a> {
         );
         self.env.define(env, "Panic", panic_fn);
 
-        // type/type_name has been converted to a frond wrapper (see Reflect.kz::type_name).
+        // type/type_name has been converted to a frond wrapper (see Reflect.frond::type_name).
         // Sema no longer registers the `type` builtin.
 
         // Ok: ∀T,E. (T) -> Throw<T, E>
@@ -104,7 +104,7 @@ impl<'a> InferContext<'a> {
 
     /// Directory module semantics: look up a function in sibling modules' envs.
     ///
-    /// When `sqrt` in `Math.sqrt` is defined in `Power.kz` (rather than `Math.kz`),
+    /// When `sqrt` in `Math.sqrt` is defined in `Power.frond` (rather than `Math.frond`),
     /// derives the directory prefix (e.g. "std.math") from `mod_path` (e.g. "std.math.Math"),
     /// then iterates over the envs of all sibling modules in the same directory
     /// ("std.math.Power", "std.math.Trig", ...) looking up the function by its bare `method` name.
@@ -174,7 +174,7 @@ impl<'a> InferContext<'a> {
     /// - Selective import `import std.io.File { open }` → look up the symbol in the target
     ///   module's env and register it as an alias.
     pub(super) fn process_import_decls(&mut self, module: &Module<'_>, env: EnvId) {
-        // Register the current module's own path prefix (e.g. std/io/Path.kz → std.io.Path)
+        // Register the current module's own path prefix (e.g. std/io/Path.frond → std.io.Path)
         // so in-module self-references (e.g. std.io.Path.last_index_of) can resolve.
         if let Some(logical_path) = module_logical_path(module.name) {
             // ensure_module_env creates the hierarchy env and registers the first-segment
@@ -623,7 +623,7 @@ impl<'a> InferContext<'a> {
                 // be declared anywhere inside the stdlib, but never in user code.
                 // The builtin check is based on the module-name path prefix
                 // (`current_module_name` is set from `module.name` in `check_module_with_env`;
-                // builtin module names look like "builtin/io/Raw.kz").
+                // builtin module names look like "builtin/io/Raw.frond").
                 let is_builtin = self.current_module_name.starts_with("builtin/");
                 let is_stdlib = is_builtin || self.current_module_name.starts_with("std/");
                 if !is_builtin {
@@ -732,6 +732,18 @@ impl<'a> InferContext<'a> {
                         &format!("function '{}'", name),
                         ret_ty,
                         *body,
+                        ast,
+                        decl_span.line,
+                        decl_span.column,
+                    );
+                    // Sync Throw-returning function with a bare non-Throw tail:
+                    // the from_datetime_utc/scanln leak class. ret_ty arrives
+                    // Async-wrapped for async funs, which the helper filters out.
+                    self.check_throw_tail_wrapped(
+                        &format!("function '{}'", name),
+                        ret_ty,
+                        *body,
+                        body_ty,
                         ast,
                         decl_span.line,
                         decl_span.column,
@@ -900,6 +912,20 @@ impl<'a> InferContext<'a> {
                         } else if self.unify_return_type(ret, body_ty).is_err() {
                             self.solver.add_equality(ret, body_ty);
                         }
+                        // Sync Throw-returning method with a bare non-Throw tail
+                        // (the from_datetime_utc/scanln leak class). ret_ty arrives
+                        // Async-wrapped for async methods, which the helper filters.
+                        if let Some(r) = ret_ty {
+                            self.check_throw_tail_wrapped(
+                                &format!("method '{}'", method.name),
+                                r,
+                                body,
+                                body_ty,
+                                ast,
+                                decl_span.line,
+                                decl_span.column,
+                            );
+                        }
                     }
                 }
                 self.current_type_decl_traits = None;
@@ -974,6 +1000,20 @@ impl<'a> InferContext<'a> {
                             self.unify_or_constrain(ret, body_ty);
                         } else if self.unify_return_type(ret, body_ty).is_err() {
                             self.solver.add_equality(ret, body_ty);
+                        }
+                        // Sync Throw-returning method with a bare non-Throw tail
+                        // (the from_datetime_utc/scanln leak class). ret_ty arrives
+                        // Async-wrapped for async methods, which the helper filters.
+                        if let Some(r) = ret_ty {
+                            self.check_throw_tail_wrapped(
+                                &format!("method '{}'", method.name),
+                                r,
+                                body,
+                                body_ty,
+                                ast,
+                                decl_span.line,
+                                decl_span.column,
+                            );
                         }
                     }
                 }
