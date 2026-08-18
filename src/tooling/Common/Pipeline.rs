@@ -98,21 +98,39 @@ pub fn run_sema_pipeline_or_exit(
     let root_env = ctx.sema_result.env.root();
     ctx.register_builtins(root_env);
 
+    // Bug #103 layering: std declarations live on a dedicated layer whose
+    // parent is root_env. Std modules attach to the std layer (their
+    // cross-module bare calls keep working); USER modules attach to root_env
+    // directly, so un-imported std bare names / method-sugar fallbacks /
+    // short-name qualifiers no longer resolve — the import statement is the
+    // only channel that re-exports std symbols into user scope.
+    let std_env = ctx.sema_result.env.child(root_env);
+    // Expose the std layer to the import re-export (process_import_decls
+    // filters std_binding_origins against it).
+    ctx.sema_result
+        .module_envs
+        .insert("std.layer".to_string(), std_env);
+
     let module_logical_paths: Vec<String> = loader
         .loaded_keys()
         .iter()
         .filter_map(|k| k.strip_suffix(".frond").map(|s| s.replace('/', ".")))
         .collect();
-    ctx.register_module_aliases(root_env, &module_logical_paths);
+    ctx.register_module_aliases(root_env, std_env, &module_logical_paths);
 
-    // predeclare: register all module functions and type constructors into root_env first,
+    // predeclare: register all module functions and type constructors first,
     // to resolve cross-module forward references. check_module_with_env will predeclare again internally (idempotent).
     for (_, m) in loader.builtin_modules() {
         ctx.predeclare_declarations(m, root_env);
     }
     for key in std_keys {
         if let Some(m) = loader.get_module_by_key(key) {
-            ctx.predeclare_declarations(m, root_env);
+            // Origin manifest: strip ".frond" and '/'→'.' for the logical path.
+            let logical = key
+                .strip_suffix(".frond")
+                .map(|s| s.replace('/', "."))
+                .unwrap_or_default();
+            ctx.predeclare_declarations_with_origin(m, std_env, Some(&logical));
         }
     }
     for k in dep_keys {
@@ -174,7 +192,7 @@ pub fn run_sema_pipeline_or_exit(
     }
     for key in std_keys {
         if let Some(m) = loader.get_module_by_key(key) {
-            ctx.check_module_with_env(m, root_env, &all_modules);
+            ctx.check_module_with_env(m, std_env, &all_modules);
             for err in &ctx.sema_result.errors[prev_err_len..] {
                 eprintln!("{}:{}:{}: {}", key, err.line, err.column, err.message);
             }
@@ -334,7 +352,7 @@ pub fn run_sema_pipeline_lsp(
         .iter()
         .filter_map(|k| k.strip_suffix(".frond").map(|s| s.replace('/', ".")))
         .collect();
-    ctx.register_module_aliases(root_env, &module_logical_paths);
+    ctx.register_module_aliases(root_env, root_env, &module_logical_paths);
 
     for (_, m) in loader.builtin_modules() {
         ctx.predeclare_declarations(m, root_env);
@@ -539,7 +557,7 @@ pub fn run_sema_incremental(
         .iter()
         .filter_map(|k| k.strip_suffix(".frond").map(|s| s.replace('/', ".")))
         .collect();
-    ctx.register_module_aliases(root_env, &module_logical_paths);
+    ctx.register_module_aliases(root_env, root_env, &module_logical_paths);
 
     // 4. Predeclare ALL modules into root_env (builtins first for name priority).
     // The env arena is shared (SemaResult.env) and module envs are reused via

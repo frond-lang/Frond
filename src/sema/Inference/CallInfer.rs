@@ -154,7 +154,8 @@ impl<'a> InferContext<'a> {
                                     let n = params.len().min(args.len() + 1);
                                     for i in 1..n {
                                         let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
-                                        self.unify_or_constrain(params[i], arg_ty);
+                                        let sp = ast.expr(args[i - 1]).span;
+                                        self.unify_call_arg(params[i], arg_ty, sp.line, sp.column);
                                     }
                                     // Store callee's ExprInfo so that pending_implicit_this
                                     // (flushed in infer_expr) can attach the implicit_this marker.
@@ -259,8 +260,10 @@ impl<'a> InferContext<'a> {
                     if params.len() == args.len() {
                         for (&param_ty, &arg) in params.iter().zip(args.iter()) {
                             let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
-                            // On unify failure, register a constraint (rather than discarding) so the fixpoint iteration can solve the argument type.
-                            self.unify_or_constrain(param_ty, arg_ty);
+                            // Hard-concrete mismatch fails now; TypeVars keep the
+                            // constraint path (see unify_call_arg).
+                            let sp = ast.expr(arg).span;
+                            self.unify_call_arg(param_ty, arg_ty, sp.line, sp.column);
                         }
                     }
                     // Always return the declared return type, to avoid cascading type loss from argument mismatches.
@@ -420,7 +423,8 @@ impl<'a> InferContext<'a> {
                             let n = params.len().min(args.len());
                             for i in 0..n {
                                 let arg_ty = self.infer_expr(args[i], ast, env, Some(params[i]));
-                                self.unify_or_constrain(params[i], arg_ty);
+                                let sp = ast.expr(args[i]).span;
+                                self.unify_call_arg(params[i], arg_ty, sp.line, sp.column);
                             }
                             // Mark recv as a module-function-call receiver so IR compilation does not pass recv.
                             // (Consistent with path 0b: ModuleRef recv has Module.fun(args) semantics.)
@@ -474,7 +478,8 @@ impl<'a> InferContext<'a> {
                                     let n = params.len().min(args.len());
                                     for i in 0..n {
                                         let arg_ty = self.infer_expr(args[i], ast, env, Some(params[i]));
-                                        self.unify_or_constrain(params[i], arg_ty);
+                                        let sp = ast.expr(args[i]).span;
+                                        self.unify_call_arg(params[i], arg_ty, sp.line, sp.column);
                                     }
                                     // Mark recv as a module-function-call receiver so IR compilation does not pass recv.
                                     let recv_key = module_expr_key(
@@ -539,7 +544,8 @@ impl<'a> InferContext<'a> {
                         let n = params.len().min(args.len() + 1);
                         for i in 1..n {
                             let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
-                            self.unify_or_constrain(params[i], arg_ty);
+                            let sp = ast.expr(args[i - 1]).span;
+                            self.unify_call_arg(params[i], arg_ty, sp.line, sp.column);
                         }
                         return return_type;
                     }
@@ -601,7 +607,8 @@ impl<'a> InferContext<'a> {
                             let n = params.len().min(args.len() + 1);
                             for i in 1..n {
                                 let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
-                                self.unify_or_constrain(params[i], arg_ty);
+                                let sp = ast.expr(args[i - 1]).span;
+                                self.unify_call_arg(params[i], arg_ty, sp.line, sp.column);
                             }
                             return return_type;
                         }
@@ -621,7 +628,7 @@ impl<'a> InferContext<'a> {
                 // This is the Sema-side recognition that pairs with Builder::lookup_intrinsic +
                 // reflect_method_intrinsic — the method call type-checks here, and lowers to a
                 // CF_REFLECT_* compute_fn at IR build time.
-                if let Some(ret_ty) = self.reflect_method_return_type(*method, args.len()) {
+                if let Some(ret_ty) = self.reflect_method_return_type(*method, args.len(), recv_ty) {
                     // Infer args (for type-checking side effects) but discard their constraints.
                     for &a in args.iter() {
                         let _ = self.infer_expr(a, ast, env, None);
@@ -934,7 +941,8 @@ impl<'a> InferContext<'a> {
             let n = param_types.len().min(args.len() + 1);
             for i in 1..n {
                 let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(param_types[i]));
-                self.unify_or_constrain(param_types[i], arg_ty);
+                let sp = ast.expr(args[i - 1]).span;
+                self.unify_call_arg(param_types[i], arg_ty, sp.line, sp.column);
             }
             if let Some(exp) = expected {
                 self.unify_or_constrain(ret_ty, exp);
@@ -1373,7 +1381,7 @@ impl<'a> InferContext<'a> {
 /// anywhere in the type — top-level OR nested (e.g. `T[]`'s element). Such
 /// types stay on the lenient constraint path; only fully-concrete types can
 /// hard-reject a Path 0 free-function candidate.
-fn type_contains_typevar(arena: &crate::types::Arena::TypeArena, h: TypeHandle) -> bool {
+pub(super) fn type_contains_typevar(arena: &crate::types::Arena::TypeArena, h: TypeHandle) -> bool {
     let resolved = arena.resolve(h);
     if matches!(arena.get(resolved), Type::TypeVar(_) | Type::Unknown) {
         return true;

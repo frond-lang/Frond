@@ -36,6 +36,10 @@ pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> 
     // strings, but Str's Arc<str> has no trailing NULL; u8[]: the buffer doubles as
     // the writeback target for C-side mutations).
     let mut str_buffers: Vec<Vec<u8>> = Vec::new();
+    // Heap address of each buffer's source array (null for str-arg buffers):
+    // alias detection so the SAME array passed as two u8[] params shares ONE
+    // buffer instead of round-tripping stale bytes over each other's writeback.
+    let mut buf_owners: Vec<*const core::ffi::c_void> = Vec::new();
     let mut writebacks: Vec<(Value, usize)> = Vec::new();
     let mut slots = Vec::with_capacity(sig.params.len());
     let mut arg_idx = 0usize;
@@ -59,11 +63,33 @@ pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> 
             && matches!(sig.params[param_idx + 1], AbiType::Int { .. })
         {
             if let Some(HeapObj::Array(arr)) = arg.heap_obj() {
-                let bytes = arr.collect_u8_bytes();
-                let len = bytes.len();
-                let ptr = bytes.as_ptr();
-                str_buffers.push(bytes);
-                let buf_idx = str_buffers.len() - 1;
+                // Aliased u8[] args (the SAME array as two u8[] params, e.g.
+                // __mem_copy(dst, .., src, ..) with dst === src) must share ONE
+                // buffer: per-arg copies would have C mutate dst's copy only,
+                // then apply_writebacks writes src's stale copy back over it —
+                // the whole call silently becomes a no-op. Sharing the buffer
+                // lets C see the true overlapping windows (memmove semantics
+                // hold) and the duplicate writebacks are idempotent.
+                let owner = match arg {
+                    Value::Ref(arc) => std::sync::Arc::as_ptr(arc) as *const core::ffi::c_void,
+                    _ => core::ptr::null(),
+                };
+                let existing = if owner.is_null() {
+                    None
+                } else {
+                    buf_owners.iter().position(|p| !p.is_null() && *p == owner)
+                };
+                let buf_idx = match existing {
+                    Some(i) => i,
+                    None => {
+                        let bytes = arr.collect_u8_bytes();
+                        str_buffers.push(bytes);
+                        buf_owners.push(owner);
+                        str_buffers.len() - 1
+                    }
+                };
+                let ptr = str_buffers[buf_idx].as_ptr();
+                let len = str_buffers[buf_idx].len();
                 slots.push(AbiSlot::Ptr(ptr as *mut core::ffi::c_void));
                 slots.push(AbiSlot::Int(len as u64));
                 writebacks.push((arg.clone(), buf_idx));
@@ -92,6 +118,9 @@ pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> 
             let len = bytes.len();
             let ptr = buf.as_ptr();
             str_buffers.push(buf);
+            // str buffers never join the u8[] writeback path; keep the owners
+            // index aligned by pushing a null entry.
+            buf_owners.push(core::ptr::null());
             slots.push(AbiSlot::Ptr(ptr as *mut core::ffi::c_void));
             slots.push(AbiSlot::Int(len as u64));
             param_idx += 2;
@@ -170,7 +199,7 @@ fn write_bytes_back(val: &Value, bytes: &[u8]) {
                     data[..n].copy_from_slice(&bytes[..n]);
                     return;
                 }
-                let n = bytes.len().min(arr.elements.len());
+                let n = bytes.len().min(arr.len());
                 for i in 0..n {
                     arr.elements[i] = Value::u8(bytes[i]);
                 }

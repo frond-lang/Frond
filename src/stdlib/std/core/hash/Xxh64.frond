@@ -70,6 +70,12 @@ pub fun xxh64<T>(data: T): u64 {
             xxh64_bytes(s.bytes())
         },
         "u8[]" => xxh64_bytes(data as u8[]),
+        // Empty (and non-uniform) arrays: no bytes to digest — same answer
+        // as xxh64_bytes(empty), consistent with the str/u8[] arms.
+        "array" => {
+            val none: u8[] = []
+            xxh64_bytes(none)
+        },
         _ => 0
     }
 }

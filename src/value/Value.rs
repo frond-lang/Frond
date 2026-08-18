@@ -1695,23 +1695,154 @@ impl ScalarSoA {
             _ => false, // type mismatch
         }
     }
+
+    /// Element count of the contiguous storage.
+    pub fn soa_len(&self) -> usize {
+        match self {
+            ScalarSoA::I8(v) => v.len(),
+            ScalarSoA::I16(v) => v.len(),
+            ScalarSoA::I32(v) => v.len(),
+            ScalarSoA::I64(v) => v.len(),
+            ScalarSoA::U8(v) => v.len(),
+            ScalarSoA::U16(v) => v.len(),
+            ScalarSoA::U32(v) => v.len(),
+            ScalarSoA::U64(v) => v.len(),
+            ScalarSoA::I128(v) => v.len(),
+            ScalarSoA::U128(v) => v.len(),
+            ScalarSoA::Isize(v) => v.len(),
+            ScalarSoA::Usize(v) => v.len(),
+            ScalarSoA::Bool(v) => v.len(),
+            ScalarSoA::Char(v) => v.len(),
+            ScalarSoA::F16(v) => v.len(),
+            ScalarSoA::F32(v) => v.len(),
+            ScalarSoA::F64(v) => v.len(),
+            ScalarSoA::F128(v) => v.len(),
+        }
+    }
+
+    /// The scalar tag this storage holds (mirrors the element type name).
+    pub fn tag(&self) -> crate::value::ValueTag {
+        match self {
+            ScalarSoA::I8(_) => crate::value::ValueTag::I8,
+            ScalarSoA::I16(_) => crate::value::ValueTag::I16,
+            ScalarSoA::I32(_) => crate::value::ValueTag::I32,
+            ScalarSoA::I64(_) => crate::value::ValueTag::I64,
+            ScalarSoA::U8(_) => crate::value::ValueTag::U8,
+            ScalarSoA::U16(_) => crate::value::ValueTag::U16,
+            ScalarSoA::U32(_) => crate::value::ValueTag::U32,
+            ScalarSoA::U64(_) => crate::value::ValueTag::U64,
+            ScalarSoA::I128(_) => crate::value::ValueTag::I128,
+            ScalarSoA::U128(_) => crate::value::ValueTag::U128,
+            ScalarSoA::Isize(_) => crate::value::ValueTag::Isize,
+            ScalarSoA::Usize(_) => crate::value::ValueTag::Usize,
+            ScalarSoA::Bool(_) => crate::value::ValueTag::Bool,
+            ScalarSoA::Char(_) => crate::value::ValueTag::Char,
+            ScalarSoA::F16(_) => crate::value::ValueTag::F16,
+            ScalarSoA::F32(_) => crate::value::ValueTag::F32,
+            ScalarSoA::F64(_) => crate::value::ValueTag::F64,
+            ScalarSoA::F128(_) => crate::value::ValueTag::F128,
+        }
+    }
+
+    /// Element type name ("u8", "i32", ...) via the ValueTag mapping.
+    pub fn type_name(&self) -> &'static str {
+        self.tag().type_name()
+    }
+
+    /// Read-side mirror of `try_store`: the Value at idx, or None when out of
+    /// bounds. Never resizes. SoA is the source of truth when present, so
+    /// scalar reads materialize straight from the contiguous storage.
+    pub fn get_value(&self, idx: usize) -> Option<Value> {
+        match self {
+            ScalarSoA::I8(v) => v.get(idx).map(|&x| Value::i8(x)),
+            ScalarSoA::I16(v) => v.get(idx).map(|&x| Value::i16(x)),
+            ScalarSoA::I32(v) => v.get(idx).map(|&x| Value::i32(x)),
+            ScalarSoA::I64(v) => v.get(idx).map(|&x| Value::i64(x)),
+            ScalarSoA::U8(v) => v.get(idx).map(|&x| Value::u8(x)),
+            ScalarSoA::U16(v) => v.get(idx).map(|&x| Value::u16(x)),
+            ScalarSoA::U32(v) => v.get(idx).map(|&x| Value::u32(x)),
+            ScalarSoA::U64(v) => v.get(idx).map(|&x| Value::u64(x)),
+            ScalarSoA::I128(v) => v.get(idx).map(|&x| Value::i128(x)),
+            ScalarSoA::U128(v) => v.get(idx).map(|&x| Value::u128(x)),
+            ScalarSoA::Isize(v) => v.get(idx).map(|&x| Value::isize_val(x)),
+            ScalarSoA::Usize(v) => v.get(idx).map(|&x| Value::usize_val(x)),
+            ScalarSoA::Bool(v) => v.get(idx).map(|&x| Value::bool_val(x)),
+            ScalarSoA::Char(v) => v.get(idx).map(|&x| Value::char_val(char::from_u32(x).unwrap_or(' '))),
+            ScalarSoA::F16(v) => v.get(idx).map(|&x| Value::f16(F16(x))),
+            ScalarSoA::F32(v) => v.get(idx).map(|&x| Value::f32(x)),
+            ScalarSoA::F64(v) => v.get(idx).map(|&x| Value::f64(x)),
+            ScalarSoA::F128(v) => v.get(idx).map(|&x| Value::f128(x)),
+        }
+    }
 }
 
 impl ArrayValue {
     pub fn new(elements: Vec<Value>) -> Self {
-        Self { elements, fixed_size: None, elem_is_ref: false, scalar_soa: None }
+        let mut s = Self { elements, fixed_size: None, elem_is_ref: false, scalar_soa: None };
+        s.optimize_soa();
+        s
     }
     pub fn new_fixed(elements: Vec<Value>, size: u64) -> Self {
-        Self { elements, fixed_size: Some(size), elem_is_ref: false, scalar_soa: None }
+        let mut s = Self { elements, fixed_size: Some(size), elem_is_ref: false, scalar_soa: None };
+        s.optimize_soa();
+        s
     }
+    /// Length: SoA-first. In the single-source model a cloned SoA array may
+    /// carry an EMPTY elements vector (deep clone copies only the contiguous
+    /// storage); elements.len() would report 0.
     pub fn len(&self) -> usize {
+        if let Some(soa) = &self.scalar_soa {
+            return soa.soa_len();
+        }
         self.elements.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.elements.is_empty()
+        self.len() == 0
     }
-    pub fn get(&self, index: usize) -> Option<&Value> {
-        self.elements.get(index)
+    /// Element read. SoA is the source of truth when present (marshal
+    /// writebacks may leave `elements` stale); scalar construction from the
+    /// contiguous storage costs the same as cloning a scalar Value.
+    pub fn get(&self, index: usize) -> Option<Value> {
+        if let Some(soa) = &self.scalar_soa {
+            return soa.get_value(index);
+        }
+        self.elements.get(index).cloned()
+    }
+    /// Fill the SoA fast-path storage when every element is a scalar of the
+    /// same tag (same criteria as the former ValueArena::optimize_array_soa,
+    /// moved here so EVERY construction site gets it automatically).
+    pub fn optimize_soa(&mut self) {
+        if self.elements.is_empty() { return; }
+        let tag = match self.elements[0].scalar_tag() {
+            Some(t) => t,
+            None => return,
+        };
+        if !self.elements.iter().all(|h| h.scalar_tag() == Some(tag)) {
+            return;
+        }
+        self.scalar_soa = Some(match tag {
+            ValueTag::I8 => ScalarSoA::I8(self.elements.iter().map(|h| h.as_i8()).collect()),
+            ValueTag::I16 => ScalarSoA::I16(self.elements.iter().map(|h| h.as_i16()).collect()),
+            ValueTag::I32 => ScalarSoA::I32(self.elements.iter().map(|h| h.as_i32()).collect()),
+            ValueTag::I64 => ScalarSoA::I64(self.elements.iter().map(|h| h.as_i64()).collect()),
+            ValueTag::U8 => ScalarSoA::U8(self.elements.iter().map(|h| h.as_u8()).collect()),
+            ValueTag::U16 => ScalarSoA::U16(self.elements.iter().map(|h| h.as_u16()).collect()),
+            ValueTag::U32 => ScalarSoA::U32(self.elements.iter().map(|h| h.as_u32()).collect()),
+            ValueTag::U64 => ScalarSoA::U64(self.elements.iter().map(|h| h.as_u64()).collect()),
+            ValueTag::Bool => ScalarSoA::Bool(self.elements.iter().map(|h| h.as_bool()).collect()),
+            ValueTag::Char => ScalarSoA::Char(self.elements.iter().map(|h| h.as_char() as u32).collect()),
+            ValueTag::F32 => ScalarSoA::F32(self.elements.iter().map(|h| h.as_f32()).collect()),
+            ValueTag::F64 => ScalarSoA::F64(self.elements.iter().map(|h| h.as_f64()).collect()),
+            ValueTag::I128 => ScalarSoA::I128(self.elements.iter().map(|h| h.as_i128()).collect()),
+            ValueTag::U128 => ScalarSoA::U128(self.elements.iter().map(|h| h.as_u128()).collect()),
+            ValueTag::Isize => ScalarSoA::Isize(self.elements.iter().map(|h| h.as_isize()).collect()),
+            ValueTag::Usize => ScalarSoA::Usize(self.elements.iter().map(|h| h.as_usize()).collect()),
+            ValueTag::F16 => ScalarSoA::F16(self.elements.iter().map(|h| h.as_u16()).collect()),
+            ValueTag::F128 => ScalarSoA::F128(self.elements.iter().map(|h| h.as_f128()).collect()),
+            // scalar_tag() only yields the 18 scalar tags; Null/Void/Ref are
+            // unreachable here but must be covered for exhaustiveness.
+            ValueTag::Null | ValueTag::Void | ValueTag::Ref => return,
+        });
     }
     pub fn push(&mut self, val: Value) {
         self.elements.push(val);
@@ -2487,7 +2618,7 @@ impl Hash for HeapObj {
         match self {
             HeapObj::Str(s) => s.hash(state),
             HeapObj::Array(a) => {
-                a.elements.len().hash(state);
+                a.len().hash(state);
                 // SoA SIMD fast path: batch-hash scalars
                 if let Some(soa) = &a.scalar_soa {
                     simd_hash_soa(soa, state);

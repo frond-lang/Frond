@@ -298,6 +298,44 @@ pub fn generate_c_source(funcs: &[ExternCFunc]) -> Result<String, String> {
     }
     out.push('\n');
 
+    // Shared encoding helpers: Frond `str` is UTF-8 at the language level;
+    // Windows wide-char APIs are bridged here so ANSI code pages (GBK etc.)
+    // can never leak into str values. Self-contained (own includes) so any
+    // module's generated file compiles whether or not it uses Windows headers.
+    // POSIX is byte-transparent (UTF-8 by convention) and compiles none of it.
+    out.push_str(concat!(
+        "#if defined(_WIN32) || defined(_WIN64)\n",
+        "#include <windows.h>\n",
+        "#include <stdlib.h>\n",
+        "// UTF-8 (length-delimited, no NUL required) -> UTF-16. Returns a\n",
+        "// malloc'd NUL-terminated string, or NULL on conversion/allocation\n",
+        "// failure (invalid UTF-8 included — strict, no silent replacement).\n",
+        "static wchar_t* frond_utf8_to_utf16(const char* s, size_t n) {\n",
+        "    if (!s) return NULL;\n",
+        "    int need = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, (int)n, NULL, 0);\n",
+        "    if (need <= 0) return NULL;\n",
+        "    wchar_t* w = (wchar_t*)malloc(sizeof(wchar_t) * (size_t)(need + 1));\n",
+        "    if (!w) return NULL;\n",
+        "    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, (int)n, w, need) != need) {\n",
+        "        free(w); return NULL;\n",
+        "    }\n",
+        "    w[need] = 0;\n",
+        "    return w;\n",
+        "}\n",
+        "// UTF-16 (NUL-terminated) -> UTF-8 bytes into out[0..cap), no NUL.\n",
+        "// Returns the byte count; -1 = out too small; -2 = conversion failure.\n",
+        "static int64_t frond_utf16_to_utf8_into(const wchar_t* w, char* out, size_t cap) {\n",
+        "    int need = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, w, -1, NULL, 0, NULL, NULL);\n",
+        "    if (need <= 0) return -2;\n",
+        "    size_t bytes = (size_t)need - 1;\n",
+        "    if (bytes > cap) return -1;\n",
+        "    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, w, -1, out, need, NULL, NULL) != need) return -2;\n",
+        "    return (int64_t)bytes;\n",
+        "}\n",
+        "#endif\n",
+        "\n",
+    ));
+
     for func in funcs {
         let params_str = if func.c_params.is_empty() {
             "void".to_string()

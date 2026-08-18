@@ -181,6 +181,11 @@ fn reflect_kind_str(v: &Value) -> &'static str {
 /// from the values (SoA stays parallel to `elements`, which is
 /// authoritative).
 fn array_type_name(arr: &crate::value::ArrayValue) -> String {
+    // SoA presence implies uniform scalar elements — O(1) instead of an
+    // O(n) per-element reflect walk (1M-element buffers spent ~20ms there).
+    if let Some(soa) = &arr.scalar_soa {
+        return format!("{}[]", soa.type_name());
+    }
     match arr.elements.first() {
         None => TYPE_NAME_ARRAY.to_string(),
         Some(first) => {
@@ -1355,7 +1360,7 @@ pub fn compute_reflect_field_count(frame: &mut Frame, node: NodeId, ctx: &EvalCo
         Some(crate::value::HeapObj::Record(rec)) => rec.fields.len().min(u16::MAX as usize) as u16,
         Some(crate::value::HeapObj::Adt(a)) => a.fields.len().min(u16::MAX as usize) as u16,
         Some(crate::value::HeapObj::Newtype(_)) => 1,
-        Some(crate::value::HeapObj::Array(a)) => a.elements.len().min(u16::MAX as usize) as u16,
+        Some(crate::value::HeapObj::Array(a)) => a.len().min(u16::MAX as usize) as u16,
         _ => 0,
     };
     Value::u16(count)
@@ -1410,7 +1415,7 @@ pub fn compute_reflect_array_len(frame: &mut Frame, node: NodeId, ctx: &EvalCont
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let len = match v.heap_obj() {
-        Some(crate::value::HeapObj::Array(a)) => a.elements.len(),
+        Some(crate::value::HeapObj::Array(a)) => a.len(),
         _ => 0,
     };
     Value::usize_val(len)
@@ -1559,7 +1564,7 @@ pub fn compute_array_index(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     let idx = idx_raw as usize;
     match recv_val.heap_obj() {
         Some(crate::value::HeapObj::Array(arr)) => {
-            arr.get(idx).cloned().unwrap_or_else(|| {
+            arr.get(idx).unwrap_or_else(|| {
                 panic!("index {} out of bounds (len {})", idx, arr.len())
             })
         }
@@ -1599,7 +1604,12 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Valu
             if s > e {
                 return make_err(&format!("slice start {} > end {}", s, e));
             }
-            let sliced: Vec<Value> = arr.elements[s..e].to_vec();
+            // SoA is truth after marshal writebacks; slice from it when present.
+            let sliced: Vec<Value> = if let Some(soa) = &arr.scalar_soa {
+                (s..e).map(|i| soa.get_value(i).unwrap_or(Value::VOID)).collect()
+            } else {
+                arr.elements[s..e].to_vec()
+            };
             Value::ref_val(HeapObj::Array(ArrayValue {
                 elements: sliced,
                 fixed_size: None,
@@ -2295,8 +2305,12 @@ pub fn compute_cast_array(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
     if same_tag {
         return val.clone();
     }
-    let elements: Vec<Value> = arr
-        .elements
+    let src_elems: Vec<Value> = if let Some(soa) = &arr.scalar_soa {
+        (0..arr.len()).map(|i| soa.get_value(i).unwrap_or(Value::VOID)).collect()
+    } else {
+        arr.elements.clone()
+    };
+    let elements: Vec<Value> = src_elems
         .iter()
         .map(|e| cast_scalar_value(e, target_tag))
         .collect();
@@ -2482,13 +2496,35 @@ pub fn compute_array_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
             let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::value::HeapObj;
             unsafe {
                 if let crate::value::HeapObj::Array(arr) = &mut *ptr {
-                    if idx >= arr.elements.len() {
+                    if idx >= arr.len() {
+                        // Single-source model: the live data may exist ONLY in
+                        // the SoA (elements can be an empty shell after a
+                        // single-source clone) — materialize elements from the
+                        // SoA first, then grow, then drop the SoA (it cannot
+                        // extend past the old length).
+                        if let Some(soa) = arr.scalar_soa.take() {
+                            arr.elements = (0..soa.soa_len())
+                                .map(|i| soa.get_value(i).unwrap_or(Value::VOID))
+                                .collect();
+                        }
                         arr.elements.resize(idx + 1, Value::VOID);
-                        // SOA layout must be rebuilt after resize (new elements are padded with Void; SOA cannot simply extend).
-                        arr.scalar_soa = None;
+                    } else if arr.elements.len() <= idx {
+                        // In-bounds for the array but beyond the (possibly
+                        // empty/stale) elements shell: the SoA is the truth —
+                        // write it there; elements may stay stale.
+                        if let Some(ref mut soa) = arr.scalar_soa {
+                            if soa.try_store(idx, &new_value) {
+                                // Written to the truth; the stale elements
+                                // shell is skipped via the length check below.
+                            } else {
+                                arr.scalar_soa = None;
+                            }
+                        }
                     }
-                    arr.elements[idx] = new_value.clone();
-                    // Sync the SOA: if the type matches, write in place; otherwise invalidate the SOA cache.
+                    if arr.elements.len() > idx {
+                        arr.elements[idx] = new_value.clone();
+                    }
+                    // Sync the SoA: if the type matches, write in place; otherwise invalidate the SoA cache.
                     if let Some(ref mut soa) = arr.scalar_soa {
                         if !soa.try_store(idx, &new_value) {
                             arr.scalar_soa = None;
@@ -2583,8 +2619,17 @@ pub fn compute_concat_list(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     match (lhs.heap_obj(), rhs.heap_obj()) {
         (Some(HeapObj::Array(a)), Some(HeapObj::Array(b))) => {
             let mut elements = Vec::with_capacity(a.len() + b.len());
-            elements.extend(a.elements.iter().cloned());
-            elements.extend(b.elements.iter().cloned());
+            let push_truth = |arr: &crate::value::ArrayValue, out: &mut Vec<Value>| {
+                if let Some(soa) = &arr.scalar_soa {
+                    for i in 0..arr.len() {
+                        out.push(soa.get_value(i).unwrap_or(Value::VOID));
+                    }
+                } else {
+                    out.extend(arr.elements.iter().cloned());
+                }
+            };
+            push_truth(a, &mut elements);
+            push_truth(b, &mut elements);
             Value::ref_val(HeapObj::Array(ArrayValue::new(elements)))
         }
         _ => make_error_throw("TypeError", "list concat on non-array operand"),
@@ -4020,4 +4065,16 @@ pub fn compute_defer_run(frame: &mut Frame, _node: NodeId, ctx: &EvalContext) ->
     };
     run_defer_entries_sync(loop_frame, &defers, &graph);
     NodeResult::Value(Value::VOID)
+}
+
+/// compute_fn (351): `v.clone()` — deep copy of the data domain.
+///
+/// Arrays (incl. SoA scalar storage) and records recurse into fresh heap
+/// objects; immutable leaves and runtime identities (closures, channels,
+/// FFI pointers, ...) share the Arc — see `value::Arena::deep_clone_data_value`.
+pub fn compute_reflect_clone(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
+    let v = force_input(frame, inputs[0]);
+    let v = force_lazy_value_sync(frame, &v);
+    crate::value::Arena::deep_clone_data_value(&v)
 }

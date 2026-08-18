@@ -16,6 +16,12 @@ pub fun adler32<T>(data: T): u32 {
             adler32_bytes(s.bytes())
         },
         "u8[]" => adler32_bytes(data as u8[]),
+        // Empty (and non-uniform) arrays: no bytes to digest — same answer
+        // as adler32_bytes(empty), consistent with the str/u8[] arms.
+        "array" => {
+            val none: u8[] = []
+            adler32_bytes(none)
+        },
         _ => 0
     }
 }

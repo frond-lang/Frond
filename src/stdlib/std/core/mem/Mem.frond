@@ -1,0 +1,107 @@
+// Mem.frond — T[] generic container primitives (part of std.core.mem)
+//
+// Grown from Frond's own model (no port of Go bytes / Rust mem / C mem.h):
+// values are typed, T[] is a reference-shared container, there are no raw
+// pointers — so "memory operations" here means container-wide writes, moves,
+// and comparisons over any element type, with u8[] routed to libc
+// (memset/memmove/memcmp) where the win is 4 orders of magnitude.
+//
+// Bounds contract: index/range violations panic (abort with a diagnostic in
+// the C path, the engine's index trap in the generic path). A zero count is
+// a no-op with no constraint on the offsets.
+//
+// Assignment semantics reminder: `val b = a`, element reads, and slices all
+// SHARE (no deep copy exists at the language level); use Mem.clone once
+// available for structural independence.
+
+// Fills the whole buffer with value.
+pub fun fill<T>(buf: T[], value: T): void {
+    if buf.type_name() == "u8[]" {
+        __mem_fill(buf as u8[], value as u8)
+    } else {
+        var i = 0 as usize
+        while i < buf.len() {
+            buf[i] = value
+            i = i + 1
+        }
+    }
+}
+
+// Copies src[src_at..src_at+count] into dst[dst_at..dst_at+count]. Overlapping
+// windows of the same buffer are safe (as-if taken out first, then written).
+// Offsets must be explicit — slices are copies here, they cannot pass a window.
+pub fun copy<T>(dst: T[], dst_at: usize, src: T[], src_at: usize, count: usize): void {
+    if dst.type_name() == "u8[]" {
+        __mem_copy(dst as u8[], dst_at, src as u8[], src_at, count)
+    } else {
+        var i = 0 as usize
+        while i < count {
+            dst[dst_at + i] = src[src_at + i]
+            i = i + 1
+        }
+    }
+}
+
+// Swaps buf[i] and buf[j].
+pub fun swap<T>(buf: T[], i: usize, j: usize): void {
+    if buf.type_name() == "u8[]" {
+        __mem_swap(buf as u8[], i, j)
+    } else {
+        val t = buf[i]
+        buf[i] = buf[j]
+        buf[j] = t
+    }
+}
+
+// Reverses the buffer in place.
+pub fun reverse<T>(buf: T[]): void {
+    if buf.type_name() == "u8[]" {
+        __mem_reverse(buf as u8[])
+    } else {
+        var i = 0 as usize
+        var j = buf.len() - 1
+        while i < j {
+            val t = buf[i]
+            buf[i] = buf[j]
+            buf[j] = t
+            i = i + 1
+            j = j - 1
+        }
+    }
+}
+
+// New array = pattern repeated count times (length pattern.len() * count).
+// Empty pattern or count == 0 yields an empty array.
+pub fun repeat<T>(pattern: T[], count: usize): T[] {
+    if pattern.len() == 0 || count == 0 {
+        return []
+    }
+    val n = pattern.len() * count
+    var out: T[] = [pattern[0], ..n]
+    var i = 0 as usize
+    while i < n {
+        out[i] = pattern[i % pattern.len()]
+        i = i + 1
+    }
+    out
+}
+
+// Byte-wise (u8[]) / structural (any T[]) equality: same length and same
+// elements. Identical in meaning to the builtin array `==`; exists as the
+// performance form — memcmp is two orders faster than element-wise compare.
+pub fun equal<T>(a: T[], b: T[]): bool {
+    if a.type_name() == "u8[]" {
+        __mem_equal(a as u8[], b as u8[]) != 0
+    } else {
+        a == b
+    }
+}
+
+// Deep copy: arrays (incl. nested) and records recurse into fresh structure;
+// immutable leaves and runtime identities (closures/channels/FFI handles)
+// share. The only user-level deep-copy path — plain assignment, element
+// reads, and slices all SHARE, so this is how independent nested structure
+// is obtained.
+pub fun clone<T>(v: T): T {
+    v.clone()
+}

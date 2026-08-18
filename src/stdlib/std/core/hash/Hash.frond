@@ -11,14 +11,20 @@
 //       since hashes were internal-only.
 //   key — FNV-1a over a value's "{k}" printed representation: the
 //       collections generic-key scheme (HashMap/HashSet), valid for every
-//       formattable type and paired with `==` equality.
+//       formattable type and paired with `==` equality. The printed form
+//       is normalized first so IEEE-equal floats hash equal ("-0" tokens
+//       drop their sign — see normalize_zero).
 //   mix_i64 — fmix64 finalizer (murmur3's "splitmix64-style" mixer):
 //       avalanches an integer so nearby keys (-1/-2, 1/2) land in different
 //       buckets; IntMap/IntSet use it. Bijective on 64 bits.
 
 // FNV-1a 64: offset basis, then per byte h = (h ^ byte) * prime.
 // Generic entry digests str and u8[] directly (engine: element-aware
-// type_name + array casts); anything else hashes as 0.
+// type_name + array casts); anything else hashes as 0. Empty arrays have
+// no elements to derive an element type from, so type_name reports the
+// bare "array" — they digest as the empty byte sequence (= offset basis,
+// consistent with fnv1a_bytes(empty) and fnv1a("")); non-uniform arrays
+// report the same name and take the same path.
 pub fun fnv1a<T>(data: T): u64 {
     match data.type_name() {
         "str" => {
@@ -26,6 +32,10 @@ pub fun fnv1a<T>(data: T): u64 {
             fnv1a_bytes(s.bytes())
         },
         "u8[]" => fnv1a_bytes(data as u8[]),
+        "array" => {
+            val none: u8[] = []
+            fnv1a_bytes(none)
+        },
         _ => 0
     }
 }
@@ -44,9 +54,48 @@ pub fun fnv1a_bytes(data: u8[]): u64 {
 
 // Collections generic-key hash: FNV-1a over the printed representation —
 // every value formats, equal values print equal, so it pairs with `==`.
+// The printed form is normalized first: IEEE says -0.0 == 0.0 but the
+// printer distinguishes them, so without normalization a key inserted as
+// -0.0 and looked up as 0.0 lands in different buckets.
 pub fun key<K>(k: K): u64 {
     val s = "{k}"
-    fnv1a_bytes(s.bytes())
+    fnv1a_bytes(normalize_zero(s).bytes())
+}
+
+// Drop the sign of "-0" tokens in a printed form. Applies to top-level
+// float keys and to floats nested in records/arrays (their printed forms
+// embed the float's digits). Token scan, not substring replace: a "-0"
+// followed by a digit or "." belongs to a longer number ("-0.5") and
+// keeps its sign. A str key that literally contains "-0" normalizes too
+// — that only creates a hash collision with "0", which `==` still
+// disambiguates; normalization can never split ==-equal values.
+@internal
+fun normalize_zero(s: str): str {
+    val b = s.bytes()
+    var out: u8[] = [0, ..b.len()]
+    var w: usize = 0
+    var i: usize = 0
+    var hit = false
+    while i < b.len() {
+        if b[i] == 45 && i + 1 < b.len() && b[i + 1] == 48 {
+            val next: u8 = if i + 2 < b.len() { b[i + 2] } else { 0 }
+            if !((next >= 48 && next <= 57) || next == 46) {
+                out[w] = 48
+                w = w + 1
+                hit = true
+                i = i + 2
+            } else {
+                out[w] = b[i]
+                w = w + 1
+                i = i + 1
+            }
+        } else {
+            out[w] = b[i]
+            w = w + 1
+            i = i + 1
+        }
+    }
+    if hit { (out[0..w]) as str } else { s }
 }
 
 // fmix64 finalizer: x ^= x>>33; x *= c1; x ^= x>>33; x *= c2; x ^= x>>33.

@@ -324,8 +324,12 @@ impl<'a> IrBuilder<'a> {
             // Enter a scope to bind pattern variables
             self.enter_scope();
 
-            // Compile the pattern: produce the discriminant node + bind variables to field-extraction nodes
+            // Compile the pattern: produce the discriminant node + bind variables to field-extraction nodes.
+            // The scrutinee's static type drives literal-pattern equality routing
+            // (see pattern_scrutinee_ty / int_pattern_eq_fn).
+            self.pattern_scrutinee_ty = self.expr_type_name(scrutinee).map(Box::from);
             let pattern_node = self.compile_pattern_match(scrutinee_in_frame, arm.pattern);
+            self.pattern_scrutinee_ty = None;
 
             // Guard condition: pattern_match && guard
             let cond_node = if let Some(guard) = arm.guard {
@@ -513,7 +517,7 @@ impl<'a> IrBuilder<'a> {
             }
             crate::ast::Ast::PatternLiteral::Int(s) => {
                 let lit_node = self.compile_pattern_literal(pl);
-                let compute_fn = self.select_literal_eq_fn(s, false);
+                let compute_fn = self.int_pattern_eq_fn(s);
                 let off = self.graph.inputs_pool.push(&[scrutinee_node, lit_node]);
                 self.graph.add_node(Node {
                     kind: NodeKind::BinOp,
@@ -528,9 +532,20 @@ impl<'a> IrBuilder<'a> {
                 // f64 or no suffix uses CF_EQ_F64 (f32/f16->f64 is lossless)
                 let cleaned: String = s.chars().filter(|c| *c != '_').collect();
                 let (_, suffix) = detect_float_suffix(&cleaned);
-                let compute_fn = match suffix {
-                    Some("f128") | Some("f32") | Some("f16") => CF_EQ_OBJ,
-                    _ => CF_EQ_F64,
+                // The scrutinee's width wins over the literal's spelling: an
+                // f128 scrutinee must not compare via as_f64 (60-bit loss).
+                let scrutinee_is_f128 = self
+                    .pattern_scrutinee_ty
+                    .as_deref()
+                    .and_then(crate::value::ValueTag::from_name)
+                    .is_some_and(|t| matches!(t, crate::value::ValueTag::F128));
+                let compute_fn = if scrutinee_is_f128 {
+                    CF_EQ_OBJ
+                } else {
+                    match suffix {
+                        Some("f128") | Some("f32") | Some("f16") => CF_EQ_OBJ,
+                        _ => CF_EQ_F64,
+                    }
                 };
                 let off = self.graph.inputs_pool.push(&[scrutinee_node, lit_node]);
                 self.graph.add_node(Node {
@@ -564,6 +579,34 @@ impl<'a> IrBuilder<'a> {
     }
 
     /// Select the compute_fn for integer literal equality discriminant.
+    /// Equality compute_fn for an integer literal pattern, routed by the
+    /// scrutinee's static type (exact-width comparison) when known. The legacy
+    /// route guessed from the literal's suffix and defaulted to eq_i32, which
+    /// truncates both operands: i64 4294967296 falsely matched pattern 0.
+    /// Float scrutinees and soft-typed (typevar/composite) scrutinees fall to
+    /// the generic comparator — its numeric cross-tag equality is width-exact.
+    pub(super) fn int_pattern_eq_fn(&self, s: &str) -> ComputeFnId {
+        use crate::value::ValueTag;
+        if let Some(t) = self.pattern_scrutinee_ty.as_deref() {
+            return match ValueTag::from_name(t) {
+                Some(ValueTag::U128) => CF_EQ_U128,
+                Some(ValueTag::I128) => CF_EQ_I128,
+                Some(ValueTag::I64 | ValueTag::U64 | ValueTag::Isize | ValueTag::Usize) => CF_EQ_I64,
+                Some(ValueTag::Bool) => CF_EQ_BOOL,
+                // Integer literals on float scrutinees: generic numeric (as_f64
+                // on the int pattern loses nothing below 2^53, but the generic
+                // path is exact at every magnitude).
+                Some(ValueTag::F16 | ValueTag::F32 | ValueTag::F64 | ValueTag::F128) => CF_EQ_OBJ,
+                // 8/16/32-bit integers and char: as_i32 is injective within
+                // these widths, so eq_i32 is exact.
+                Some(_) => CF_EQ_I32,
+                // Soft typevar / unknown type name: generic numeric comparison.
+                None => CF_EQ_OBJ,
+            };
+        }
+        self.select_literal_eq_fn(s, false)
+    }
+
     pub(super) fn select_literal_eq_fn(&self, s: &str, _is_unsigned: bool) -> ComputeFnId {
         // Strip hex/binary/octal prefix so 'x'/'b'/'o' is not mistaken for a type suffix.
         let stripped = if s.starts_with("0x") || s.starts_with("0X")
@@ -628,8 +671,12 @@ impl<'a> IrBuilder<'a> {
             });
             self.graph.set_pattern_field_index(field_get_node, i as u16);
 
-            // Recursively compile the sub-pattern (may bind variables)
+            // Recursively compile the sub-pattern (may bind variables). The
+            // outer scrutinee's type does not describe this FIELD: drop it so
+            // nested literal patterns keep their legacy literal-based routing.
+            let outer_scrutinee_ty = self.pattern_scrutinee_ty.take();
             let sub_match = self.compile_pattern_match(field_get_node, sub_pattern_id);
+            self.pattern_scrutinee_ty = outer_scrutinee_ty;
 
             // result = result && sub_match
             // field_get_node is an extra dependency input: ensures the variable-bound field-extraction node
@@ -665,8 +712,12 @@ impl<'a> IrBuilder<'a> {
             });
             self.graph.set_field_set_name(field_get_node, field.name.to_string());
 
-            // Recursively compile the sub-pattern
+            // Recursively compile the sub-pattern. The outer scrutinee's type
+            // does not describe this FIELD: drop it so nested literal patterns
+            // keep their legacy literal-based routing.
+            let outer_scrutinee_ty = self.pattern_scrutinee_ty.take();
             let sub_match = self.compile_pattern_match(field_get_node, field.pattern);
+            self.pattern_scrutinee_ty = outer_scrutinee_ty;
 
             // field_get_node is an extra dependency input (same as compile_pattern_constructor)
             let and_off = self.graph.inputs_pool.push(&[result, sub_match, field_get_node]);
@@ -701,12 +752,32 @@ impl<'a> IrBuilder<'a> {
                 // After the prefix, find the type suffix (first alphabetic char)
                 let after_prefix = &cleaned[skip_prefix..];
                 let suffix_pos = after_prefix.find(|c: char| c.is_ascii_alphabetic());
-                let digits = if let Some(pos) = suffix_pos {
-                    &after_prefix[..pos]
+                let (digits, suffix) = if let Some(pos) = suffix_pos {
+                    (&after_prefix[..pos], Some(&after_prefix[pos..]))
                 } else {
-                    after_prefix
+                    (after_prefix, None)
                 };
-                i32::from_str_radix(digits, radix).ok().map(ConstValue::I32)
+                // Parse at the literal's own width: i32 first, widening to
+                // i64/i128 when the digits overflow or the suffix names a
+                // 64-bit-or-wider type. The old i32-only parse overflowed to
+                // None for out-of-range literals, leaving the arm's const
+                // unpopulated — pattern 4294967296 could never match anything.
+                let needs_wide = matches!(suffix, Some("i64" | "u64" | "i128" | "u128" | "isize" | "usize"));
+                if !needs_wide {
+                    if let Ok(v) = i32::from_str_radix(digits, radix) {
+                        Some(ConstValue::I32(v))
+                    } else {
+                        i64::from_str_radix(digits, radix)
+                            .ok()
+                            .map(ConstValue::I64)
+                            .or_else(|| i128::from_str_radix(digits, radix).ok().map(ConstValue::I128))
+                    }
+                } else {
+                    i64::from_str_radix(digits, radix)
+                        .ok()
+                        .map(ConstValue::I64)
+                        .or_else(|| i128::from_str_radix(digits, radix).ok().map(ConstValue::I128))
+                }
             }
             crate::ast::Ast::PatternLiteral::Float(s) => {
                 // Strip underscore separators + type suffix (f64/f32/f16/f128)

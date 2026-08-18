@@ -94,6 +94,7 @@ impl Engine<Single> {
             defer_frames: RefCell::new(HashSet::new()),
             defer_waiters: RefCell::new(HashMap::new()),
             result: RefCell::new(None),
+            panic_payload: RefCell::new(None),
             frame_pool: RefCell::new(Vec::new()),
             ready_frames: Some(RefCell::new(std::collections::VecDeque::new())),
             global_queue: None,
@@ -203,6 +204,7 @@ impl Engine<Multi> {
             defer_frames: ParkingMutex::new(HashSet::new()),
             defer_waiters: ParkingMutex::new(HashMap::new()),
             result: ParkingMutex::new(None),
+            panic_payload: ParkingMutex::new(None),
             frame_pool: ParkingMutex::new(Vec::new()),
             ready_frames: None,
             global_queue: Some(Injector::new()),
@@ -240,7 +242,15 @@ impl Engine<Multi> {
         self.result
             .lock()
             .take()
-            .expect("no result produced: all workers exited without completion")
+            .unwrap_or_else(|| {
+                // A worker panicked (poison) — re-panic with the ORIGINAL
+                // message so the caller's catch_unwind reports the true cause
+                // instead of a generic "no result".
+                let msg = self.panic_payload.lock().take().unwrap_or_else(|| {
+                    "no result produced: all workers exited without completion".to_string()
+                });
+                panic!("{}", msg);
+            })
     }
 }
 
@@ -249,7 +259,34 @@ impl Engine<Multi> {
 // =========================================================================
 
 /// Worker main loop: pop_local -> try_steal -> try_global -> park.
+/// Wrapped in catch_unwind so a panicking worker POISONS the engine (survivors
+/// see `panic_payload` and exit) instead of parking forever: async programs
+/// keep `event_waiters` non-empty, so the all-workers-idle exit never fires
+/// once one worker is gone — the process used to hang with no diagnostic.
 fn worker_main(
+    worker_id: usize,
+    local_queue: DequeWorker<FrameId>,
+    stealers: Vec<Stealer<FrameId>>,
+    shared: Arc<Engine<Multi>>,
+) {
+    let shared_for_loop = shared.clone();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        worker_loop(worker_id, local_queue, stealers, shared_for_loop)
+    }));
+    if let Err(payload) = outcome {
+        {
+            let mut p = shared.panic_payload.lock();
+            if p.is_none() {
+                *p = Some(crate::pass::Optimizer::panic_payload_message(&payload));
+            }
+        }
+        // Wake every parked worker so the loop-start check observes the poison.
+        let _g = shared.wakeup.as_ref().unwrap().0.lock();
+        shared.wakeup.as_ref().unwrap().1.notify_all();
+    }
+}
+
+fn worker_loop(
     worker_id: usize,
     local_queue: DequeWorker<FrameId>,
     stealers: Vec<Stealer<FrameId>>,
@@ -258,8 +295,8 @@ fn worker_main(
     let mut steal_seed: u64 = worker_id as u64 ^ GOLDEN_RATIO_64;
 
     loop {
-        // A result has been produced: exit.
-        if shared.result.lock().is_some() {
+        // A result has been produced — or a co-worker poisoned the engine: exit.
+        if shared.result.lock().is_some() || shared.panic_payload.lock().is_some() {
             return;
         }
 
@@ -302,7 +339,7 @@ fn worker_main(
         // so a notification cannot slip between the decrement and wait_for.
         {
             let mut guard = shared.wakeup.as_ref().unwrap().0.lock();
-            if shared.result.lock().is_some() {
+            if shared.result.lock().is_some() || shared.panic_payload.lock().is_some() {
                 let mut active = shared.active_count.as_ref().unwrap().lock();
                 *active += 1;
                 return;

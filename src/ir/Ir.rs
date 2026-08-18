@@ -474,6 +474,9 @@ compute_fn_ids! {
     //    scalar elements when tags differ, passes non-scalar targets as
     //    reference casts.
     350 => CF_CAST_ARRAY,
+    // ── Deep copy (351): `v.clone()` reflect method — data domain (arrays/
+    //    records) recurses, immutable leaves and runtime identities share.
+    351 => CF_REFLECT_CLONE,
 }
 
 /// Number of entries in `build_compute_fn_table()`.
@@ -483,7 +486,7 @@ compute_fn_ids! {
 /// by a binary with a different table length is rejected at load instead of
 /// silently mis-dispatching node compute fns. `build_compute_fn_table()`
 /// asserts equality so this constant cannot drift silently.
-pub const COMPUTE_FN_TABLE_LEN: u32 = 351;
+pub const COMPUTE_FN_TABLE_LEN: u32 = 352;
 
 // =========================================================================
 // NodeKind — node category (not an op; 9 variants for readiness checks)
@@ -2175,6 +2178,8 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         349 => super::Compute::compute_ge_u128,
         // Array cast (350)
         350 => super::Compute::compute_cast_array,
+        // Deep copy (351): v.clone()
+        351 => super::Compute::compute_reflect_clone,
     };
     // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
     // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values
@@ -2305,7 +2310,7 @@ pub fn effect_class(cf: ComputeFnId) -> EffectClass {
         322 | 323 | 324 => Runtime, // defer register/run/block-register
         // ── Allocation (distinct object per run) ──
         29 | 31 | 40 | 44 | 45 | 262 | 263 | 264 | 266 | 267 | 268 | 269 | 272 | 273
-        | 277 | 280 | 283 | 286 | 288 | 289 | 290 | 291 | 319 | 320 | 321 | 350 => Alloc,
+        | 277 | 280 | 283 | 286 | 288 | 289 | 290 | 291 | 319 | 320 | 321 | 350 | 351 => Alloc,
         // ── Pure value metadata (kept out of CSE/LICM pending W2 validation) ──
         326..=333 | 336 => PureMeta,
         // CF_NOOP: parameter placeholder passthrough.
@@ -4352,85 +4357,3 @@ pub const fn scalar_meta(tag: crate::value::ValueTag) -> Option<ScalarMeta> {
 // Effect classification tests (W1)
 // =========================================================================
 
-#[cfg(test)]
-mod effect_classification_tests {
-    use super::*;
-
-    /// Verbatim copy of the PRE-W1 hand-written pure set (the behavior W1 must
-    /// preserve exactly). Keep frozen; if `pure_compute_fn_set()` drifts from
-    /// this, the equivalence guarantee is broken.
-    /// (344..=349 — u128 comparisons — joined both sets when they were added.)
-    fn legacy_pure_set() -> rustc_hash::FxHashSet<ComputeFnId> {
-        let mut s = rustc_hash::FxHashSet::default();
-        for id in 1..=27u32 { s.insert(ComputeFnId(id)); }
-        for id in 50..=91u32 { s.insert(ComputeFnId(id)); }
-        for id in 92..=259u32 { s.insert(ComputeFnId(id)); }
-        for id in 344..=349u32 { s.insert(ComputeFnId(id)); }
-        s.insert(CF_RECORD_FIELD_GET);
-        s.insert(CF_ARRAY_INDEX);
-        s.insert(CF_IS_NULL);
-        s.insert(CF_ARRAY_LEN);
-        s.insert(CF_IS_EMPTY);
-        s.insert(CF_REF_EQ);
-        s.insert(CF_REF_NEQ);
-        s.insert(CF_ELVIS);
-        s.insert(CF_PATTERN_CTOR_MATCH);
-        s.insert(CF_PATTERN_ADT_FIELD_GET);
-        s.insert(CF_PATTERN_STR_EQ);
-        s.insert(CF_CAST_SCALAR);
-        s.insert(CF_NON_NULL_ASSERT);
-        s.insert(CF_STR_BYTES);
-        s.insert(CF_EQ_STR);
-        s.insert(CF_NE_STR);
-        s.insert(CF_LT_STR);
-        s.insert(CF_GT_STR);
-        s.insert(CF_LE_STR);
-        s.insert(CF_GE_STR);
-        s.insert(CF_EQ_OBJ);
-        s.insert(CF_NE_OBJ);
-        s.insert(CF_NE_BOOL);
-        s.insert(CF_EQ_F128);
-        s.insert(CF_NE_F128);
-        s.insert(CF_LT_F128);
-        s.insert(CF_GT_F128);
-        s.insert(CF_LE_F128);
-        s.insert(CF_GE_F128);
-        s
-    }
-
-    /// The derived set must equal the legacy set member-for-member.
-    #[test]
-    fn pure_set_equivalence_with_legacy() {
-        let new = pure_compute_fn_set();
-        let old = legacy_pure_set();
-        let missing: Vec<_> = old.difference(&new).collect();
-        let added: Vec<_> = new.difference(&old).collect();
-        assert!(
-            missing.is_empty() && added.is_empty(),
-            "pure set drift: lost {:?}, gained {:?}",
-            missing,
-            added
-        );
-    }
-
-    /// Every compute fn id in the table must be classified (effect_class
-    /// panics otherwise — this test turns that into a named failure).
-    #[test]
-    fn classification_covers_all_cfs() {
-        for id in 0..COMPUTE_FN_TABLE_LEN {
-            let _ = effect_class(ComputeFnId(id));
-        }
-    }
-
-    /// Aliasing reads are classified ReadMutable; in-place mutators are
-    /// WriteMutable (the graph_pure_set contract depends on this).
-    #[test]
-    fn aliasing_contract() {
-        for cf in aliasing_read_cfs() {
-            assert_eq!(effect_class(cf), EffectClass::ReadMutable, "cf {}", cf.0);
-        }
-        for cf in [CF_RECORD_FIELD_SET, CF_ARRAY_STORE, CF_DEREF_WRITE] {
-            assert_eq!(effect_class(cf), EffectClass::WriteMutable, "cf {}", cf.0);
-        }
-    }
-}

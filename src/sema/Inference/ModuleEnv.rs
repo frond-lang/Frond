@@ -144,23 +144,38 @@ impl<'a> InferContext<'a> {
     /// → ModuleRef in root_env, so that same-package modules can be accessed directly via their
     /// short name (e.g. `Calendar` → `ModuleRef("std.time.Calendar", env)`).
     /// Existing bindings are not overwritten (user's explicit import takes priority).
-    pub fn register_module_aliases(&mut self, root_env: EnvId, module_paths: &[String]) {
+    /// Registers trailing short-name ModuleRefs for module paths. Local
+    /// (non-std) modules go to `root_env` — same-package short-name access is
+    /// a user-domain feature. Std modules go to `std_env`: user code only sees
+    /// std short names via the import re-export in process_import_decls
+    /// (Bug #103: root-level registration made un-imported `Fmt.dec(..)`
+    /// resolve).
+    pub fn register_module_aliases(
+        &mut self,
+        root_env: EnvId,
+        std_env: EnvId,
+        module_paths: &[String],
+    ) {
         for path in module_paths {
             if path.is_empty() {
                 continue;
             }
+            let is_std = path == "std" || path.starts_with("std.");
+            // The hierarchy is anchored on the std layer for std paths (its
+            // intermediate ModuleRefs live there too) and on root for locals.
+            let anchor = if is_std { std_env } else { root_env };
             // Ensure the module hierarchy env exists (including intermediate path prefixes).
-            let module_env = self.ensure_module_env(path, root_env);
-            // Register the trailing short name in root_env (for same-package short-name access).
+            let module_env = self.ensure_module_env(path, anchor);
+            // Register the trailing short name (for same-package short-name access).
             if let Some(last_seg) = path.rsplit('.').next() {
                 if !last_seg.is_empty() && path.contains('.') {
                     // Do not overwrite existing bindings.
-                    if self.sema_result.env.lookup(root_env, last_seg).is_none() {
+                    if self.sema_result.env.lookup(anchor, last_seg).is_none() {
                         let mod_ref_ty = self.arena.make_module_ref(
                             path.clone().into_boxed_str(),
                             module_env,
                         );
-                        self.sema_result.env.define(root_env, last_seg, mod_ref_ty);
+                        self.sema_result.env.define(anchor, last_seg, mod_ref_ty);
                     }
                 }
             }
@@ -191,6 +206,92 @@ impl<'a> InferContext<'a> {
                 // Ensure the imported module's hierarchy env exists (including intermediate path
                 // prefixes and first-segment ModuleRef registration).
                 let module_env = self.ensure_module_env(&full_path, env);
+                // Bug #103 layering: the std layer is invisible to user code,
+                // so the import statement is the channel that re-exports it.
+                // Re-export every std-layer binding whose origin module lies
+                // under the imported path (packs, type constructors, module
+                // functions), plus the first path segment (`std.` qualified
+                // chains keep working).
+                {
+                    // Directory-package semantics (Go-style): an import grants
+                    // the module's own subtree AND its sibling file modules in
+                    // the same directory — `import std.io.File` also exposes
+                    // Path/Dir/Fs (established user-facing form); a directory
+                    // import (`import std.core`) covers its whole subtree.
+                    // Sibling directories are NOT granted (import std.io does
+                    // not pull std.net).
+                    let import_parent = match full_path.rfind('.') {
+                        Some(i) => full_path[..i].to_string(),
+                        None => String::new(),
+                    };
+                    let same_dir = |origin: &str| {
+                        !import_parent.is_empty()
+                            && match origin.rfind('.') {
+                                Some(i) => &origin[..i] == import_parent,
+                                None => false,
+                            }
+                    };
+                    let prefix = full_path.clone();
+                    let mut origins: Vec<String> = self
+                        .sema_result
+                        .std_binding_origins
+                        .values()
+                        .flatten()
+                        .filter(|origin| {
+                            origin.as_str() == prefix.as_str()
+                                || origin.starts_with(&(prefix.clone() + "."))
+                                || same_dir(origin)
+                        })
+                        .cloned()
+                        .collect();
+                    origins.sort();
+                    origins.dedup();
+                    if std::env::var("FROND_DEBUG_IMPORT").is_ok() {
+                        let po = self.sema_result.std_binding_origins.get("parse").cloned();
+                        eprintln!("[import-reexport] import={} origins={:?} parse={:?}", full_path, origins, po);
+                    }
+                    // First path segment ModuleRef (`std.` qualified chains):
+                    // the hierarchy anchor lives on the std layer, invisible
+                    // to user code — re-register it into the importing env.
+                    if let Some(first) = full_path.split('.').next() {
+                        if let Some(&first_env) = self.sema_result.module_envs.get(first) {
+                            if self.sema_result.env.lookup(env, first).is_none() {
+                                let mod_ref = self.arena.make_module_ref(
+                                    first.to_string().into_boxed_str(),
+                                    first_env,
+                                );
+                                self.sema_result.env.define(env, first, mod_ref);
+                            }
+                        }
+                    }
+                    for origin in origins {
+                        if let Some(&origin_env) = self.sema_result.module_envs.get(&origin) {
+                            // Re-export every binding of the origin module env
+                            // (functions, type constructors): importing a module
+                            // is an explicit visibility grant.
+                            let names: Vec<String> =
+                                self.sema_result.env.snapshot_names(origin_env).into_iter().collect();
+                            for name in names {
+                                if let Some(sym_ty) =
+                                    self.sema_result.env.lookup_local(origin_env, &name)
+                                {
+                                    self.sema_result.env.define(env, &name, sym_ty);
+                                }
+                            }
+                            // Trailing short-name ModuleRef (e.g. `Hash` for
+                            // std.core.hash.Hash) — qualified short form.
+                            if let Some(short) = origin.rsplit('.').next() {
+                                if self.sema_result.env.lookup(env, short).is_none() {
+                                    let mod_ref_ty = self.arena.make_module_ref(
+                                        origin.clone().into_boxed_str(),
+                                        origin_env,
+                                    );
+                                    self.sema_result.env.define(env, short, mod_ref_ty);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Selective import: look up symbols in the target module env and register them
                 // into the current env.
@@ -346,6 +447,44 @@ impl<'a> InferContext<'a> {
     /// still access global builtins.
     /// Callers resolve symbols directly by bare name in the module env via the env reference
     /// carried by ModuleRef, without needing mangled names.
+    /// When `origin_prefix` is Some, every name newly defined by this
+    /// predeclare pass is recorded into `std_binding_origins` — the manifest
+    /// the import re-export uses to decide which std-layer bindings belong to
+    /// a given `import std.x.y` (Bug #103 layering).
+    pub fn predeclare_declarations_with_origin(
+        &mut self,
+        module: &Module<'_>,
+        root_env: EnvId,
+        origin_prefix: Option<&str>,
+    ) {
+        // predeclare defines into the module's OWN env (ensure_module_env), not
+        // the passed anchor — snapshot that env to capture what this pass added.
+        let module_env = match origin_prefix {
+            Some(lp) => Some(self.ensure_module_env(lp, root_env)),
+            None => None,
+        };
+        let before: std::collections::HashSet<String> = match module_env {
+            Some(e) => self.sema_result.env.snapshot_names(e),
+            None => Default::default(),
+        };
+        self.predeclare_declarations(module, root_env);
+        if let (Some(prefix), Some(e)) = (origin_prefix, module_env) {
+            let after = self.sema_result.env.snapshot_names(e);
+            for name in after {
+                if !before.contains(&name) {
+                    let entry = self
+                        .sema_result
+                        .std_binding_origins
+                        .entry(name)
+                        .or_default();
+                    if !entry.iter().any(|o| o == prefix) {
+                        entry.push(prefix.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     pub fn predeclare_declarations(&mut self, module: &Module<'_>, root_env: EnvId) {
         let module_path = module_logical_path(module.name);
         // Get or create the module-dedicated env (idempotent: ensure_module_env reuses existing envs).

@@ -167,6 +167,12 @@ pub struct IrBuilder<'a> {
     /// Used by `compile_method_call` to dispatch implicit-this method calls (where `recv`
     /// is the callee Ident, not the receiver — the receiver is `this`).
     pub current_method_type: Option<(Box<str>, u16)>,
+    /// Static type name of the match scrutinee currently being pattern-compiled
+    /// (`None` outside `compile_match`). Literal patterns route their equality
+    /// compute_fn by this: the literal's own spelling (suffix/magnitude) cannot
+    /// recover the scrutinee's width, and the eq_i32 default truncated both
+    /// sides (i64 4294967296 falsely matched pattern 0).
+    pub pattern_scrutinee_ty: Option<Box<str>>,
     /// Compile-time error list (unimplemented features, missing functions, etc.; inspectable
     /// after compilation).
     pub errors: Vec<String>,
@@ -262,6 +268,7 @@ pub(super) fn reflect_method_intrinsic(method: &str) -> Option<(crate::sema::Sem
         "field_count" => un(332),       // CF_REFLECT_FIELD_COUNT
         "repr" => un(290),               // CF_REFLECT_FORMAT (renamed from format 2026-08-17)
         "constructor" => un(336),       // CF_REFLECT_ADT_CTOR
+        "clone" => un(351),             // CF_REFLECT_CLONE (deep copy, data domain)
         "field_name" => bin(333),       // CF_REFLECT_FIELD_NAME
         // field_value removed: its return type cannot be expressed without an "any"
         // type in Frond's type system. CF_REFLECT_FIELD_VALUE (334) remains implemented
@@ -354,6 +361,7 @@ impl<'a> IrBuilder<'a> {
             current_type_args: Vec::new(),
             current_instance_id: None,
             current_method_type: None,
+            pattern_scrutinee_ty: None,
             errors: Vec::new(),
             global_var_slots: rustc_hash::FxHashMap::default(),
             top_level_var_decls: Vec::new(),

@@ -1,0 +1,81 @@
+// builtin/mem/Raw.frond — u8[] buffer primitives over libc mem* (builtin, visible by default)
+//
+// The C fast path of std.core.mem: u8[] buffers route here (memset/memmove/
+// memcmp are 4 orders of magnitude faster than the pure-Frond element loop —
+// measured ~2s/MB interpreted vs tens of µs/MB in C). The generic T[] facade
+// dispatches on type_name(); every other element type falls back to the
+// pure-Frond loop in std/core/mem/Mem.frond.
+//
+// Bounds contract (panic, mirroring the engine's index-out-of-bounds trap):
+// a zero count is a no-op with no constraint; a positive count requires
+// [at, at+count) inside the buffer, violated → diagnostic on stderr + abort.
+
+@c_include("string.h")
+@c_include("stdio.h")
+@c_include("stdlib.h")
+
+// Fills the whole buffer with byte (memset).
+@internal
+@extern("C")
+fun __mem_fill(buf: u8[], byte: u8): void #{
+    memset(buf_data, byte, buf_len);
+}#
+
+// Copies count bytes src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy(dst: u8[], dst_at: usize, src: u8[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove(dst_data + dst_at, src_data + src_at, count);
+}#
+
+// Byte-wise equality: 1 when lengths match and contents are equal, else 0.
+@internal
+@extern("C")
+fun __mem_equal(a: u8[], b: u8[]): i32 #{
+    if (a_len != b_len) return 0;
+    return memcmp(a_data, b_data, a_len) == 0 ? 1 : 0;
+}#
+
+// Swaps buf[i] and buf[j].
+@internal
+@extern("C")
+fun __mem_swap(buf: u8[], i: usize, j: usize): void #{
+    if (i >= buf_len || j >= buf_len) {
+        fprintf(stderr, "mem.swap: index %llu or %llu out of bounds (len %llu)\n",
+                (unsigned long long)i, (unsigned long long)j,
+                (unsigned long long)buf_len);
+        abort();
+    }
+    uint8_t t = buf_data[i];
+    buf_data[i] = buf_data[j];
+    buf_data[j] = t;
+}#
+
+// Reverses the buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse(buf: u8[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        uint8_t t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#

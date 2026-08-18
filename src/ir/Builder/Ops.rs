@@ -159,7 +159,13 @@ impl<'a> IrBuilder<'a> {
             if let Some(b) = base {
                 return ComputeFnId(b + off);
             }
-            // Unknown type falls back to the i32 path
+            // Unknown type falls back to the i32 path. CAUTION: this is
+            // load-bearing — monomorphized generic arithmetic routinely lands
+            // here with junk type names ('offset', '_', soft typevars), and
+            // as_i32/as_int reads the runtime int values correctly for the
+            // 32-bit range. Erroring here breaks the stdlib build; the real
+            // fix is hardening soft types so concrete arithmetic never
+            // reaches this fallback (floats/large i64s silently truncate).
             return ComputeFnId(116 + off);
         }
 
@@ -177,7 +183,7 @@ impl<'a> IrBuilder<'a> {
                 if let Some(b) = base {
                     return ComputeFnId(b + off);
                 }
-                return ComputeFnId(CF_ADD_I32_FULL.0 + off); // fall back to i32
+                return ComputeFnId(CF_ADD_I32_FULL.0 + off); // fall back to i32 (see arithmetic note above)
             }
         }
 

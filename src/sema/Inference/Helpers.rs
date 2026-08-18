@@ -173,12 +173,20 @@ impl<'a> InferContext<'a> {
     /// Must stay in sync with:
     /// - `ir/Builder.rs::reflect_method_intrinsic` (method-name → IntrinsicKind)
     /// - `ir/Compute.rs` compute_reflect_* (the runtime implementation)
-    pub(super) fn reflect_method_return_type(&mut self, method: &str, arg_count: usize) -> Option<TypeHandle> {
+    pub(super) fn reflect_method_return_type(
+        &mut self,
+        method: &str,
+        arg_count: usize,
+        recv_ty: TypeHandle,
+    ) -> Option<TypeHandle> {
         // Nullary reflect methods (receiver only, arg_count == 0).
         let nullary: Option<TypeHandle> = match method {
             "repr" | "type_name" | "kind" | "constructor" => Some(self.make_builtin(Type::Str)),
             "size" | "alignment" => Some(self.make_builtin(Type::U32)),
             "field_count" => Some(self.make_builtin(Type::U16)),
+            // Deep copy returns the receiver's own type (resolved: a TypeVar
+            // receiver in a generic context clones to the same typevar).
+            "clone" => Some(self.arena.resolve(recv_ty)),
             _ => None,
         };
         if let Some(ty) = nullary {

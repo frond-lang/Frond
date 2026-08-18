@@ -142,6 +142,13 @@ pub struct Engine<S: LockStrategy> {
     /// number of defer frames still pending. When the count reaches zero the frame is resumed.
     pub defer_waiters: S::Mutex<HashMap<FrameId, u32>>,
     pub result: S::Mutex<Option<Value>>,
+    /// Poison state for the multi-threaded engine: the panic message captured
+    /// when a worker dies. Once set, every worker exits its park loop, the
+    /// scope joins, and `run_multi` panics with this ORIGINAL message (instead
+    /// of hanging forever waiting for a result that can never be produced —
+    /// async programs keep `event_waiters` non-empty, so the normal
+    /// all-workers-idle exit never triggers after a worker is gone).
+    pub panic_payload: S::Mutex<Option<String>>,
     /// Frame pool: reclaims completed `Box<Frame>` for reuse, eliminating frequent Vec
     /// allocation/deallocation.
     pub frame_pool: S::Mutex<Vec<Box<crate::ir::Ir::Frame>>>,

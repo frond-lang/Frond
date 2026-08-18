@@ -100,6 +100,16 @@ impl EnvArena {
         id
     }
 
+    /// Names currently defined in `env` (local only, no parent traversal) —
+    /// used for predeclare origin manifests.
+    pub fn snapshot_names(&self, env: EnvId) -> std::collections::HashSet<String> {
+        self.envs[env.0 as usize]
+            .bindings
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// Define a binding in `env`; returns `false` if a binding with the same name
     /// already exists.
     pub fn define(&mut self, env: EnvId, name: &str, ty: TypeHandle) -> bool {
@@ -669,6 +679,11 @@ pub struct ModuleOwnership {
 /// metadata needed to build the graph. All fields own their data (`Box<str>` /
 /// `Vec` / `FxHashMap`), requiring no additional arena ownership.
 pub struct SemaResult {
+    /// Bug #103 layering manifest: std-layer binding name → origin module
+    /// logical paths (multi-valued: `parse` lives in std.core.types.I8 AND
+    /// std.json.Parse — a single-valued map silently dropped the earlier
+    /// origin). The import re-export filters on this.
+    pub std_binding_origins: rustc_hash::FxHashMap<String, Vec<String>>,
     /// Expression → type info (determines channel width); key = AST expression
     /// handle address.
     pub expr_types: FxHashMap<u64, ExprInfo>,
@@ -845,6 +860,7 @@ macro_rules! define_table_registry {
 impl SemaResult {
     pub fn new() -> Self {
         SemaResult {
+            std_binding_origins: FxHashMap::default(),
             expr_types: FxHashMap::default(),
             errors: Vec::new(),
             warnings: Vec::new(),

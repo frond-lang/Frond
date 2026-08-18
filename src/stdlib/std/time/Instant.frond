@@ -9,6 +9,10 @@ pub type Instant = Instant(nanos: i128) {
     // ─── Time intervals ──────────────────────────────────────────────────────
 
     // The length of time from now to this
+    /// Raw nanoseconds since the epoch clock (perf harnesses / external
+    /// interop); the positional field stays private.
+    pub fun ns(): i128 { nanos }
+
     pub fun elapsed(): Duration {
         Duration(__instant_now_ns() - nanos)
     }

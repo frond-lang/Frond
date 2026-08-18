@@ -127,6 +127,20 @@ impl<'a> InferContext<'a> {
                 }
             }
             Stmt::Assignment { target, value } => {
+                // `*ref = value` compiles but the store is silently lost at runtime
+                // (compute_deref_write boxes scalars into an orphan Cell; heap refs
+                // are a no-op), so reject it until true write-through lands. The
+                // in-place paths that DO work keep compiling: `(*ref).field = v`
+                // (record_field_set) and `(*ref)[i] = v` (array element store).
+                if matches!(ast.expr(*target).node, crate::ast::Ast::Expr::Deref(_)) {
+                    let span = ast.stmt(stmt).span;
+                    self.add_error_at(
+                        "cannot assign through `*ref`: dereference writes are not implemented; \
+                         mutate in place via `(*ref).field = ...` or `(*ref)[index] = ...` instead",
+                        span.line,
+                        span.column,
+                    );
+                }
                 let target_ty = self.infer_expr(*target, ast, env, None);
                 let val_ty = self.infer_expr(*value, ast, env, Some(target_ty));
                 if self.arena.unify(target_ty, val_ty).is_err() {
@@ -150,6 +164,17 @@ impl<'a> InferContext<'a> {
                 None
             }
             Stmt::CompoundAssignment { target, value, .. } => {
+                // Same silent-store hole as plain assignment: `*ref += value`
+                // lowers to a deref write that never reaches the binding.
+                if matches!(ast.expr(*target).node, crate::ast::Ast::Expr::Deref(_)) {
+                    let span = ast.stmt(stmt).span;
+                    self.add_error_at(
+                        "cannot compound-assign through `*ref`: dereference writes are not implemented; \
+                         mutate in place via `(*ref).field = ...` or `(*ref)[index] = ...` instead",
+                        span.line,
+                        span.column,
+                    );
+                }
                 let target_ty = self.infer_expr(*target, ast, env, None);
                 let value_ty = self.infer_expr(*value, ast, env, None);
                 // Bug #95: compound assignment must enforce the same strict numeric

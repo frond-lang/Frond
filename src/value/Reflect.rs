@@ -101,9 +101,13 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                 }
                 HeapObj::Array(a) => {
                     let mut out = String::from("[");
-                    for (i, e) in a.elements.iter().enumerate() {
+                    // SoA-first: elements can be an empty shell (single-source
+                    // clones keep data only in the contiguous storage).
+                    let n = a.len();
+                    for i in 0..n {
                         if i > 0 { out.push_str(", "); }
-                        out.push_str(&format_value(e, depth + 1));
+                        let e = a.get(i).unwrap_or(crate::value::Value::VOID);
+                        out.push_str(&format_value(&e, depth + 1));
                     }
                     out.push(']');
                     out

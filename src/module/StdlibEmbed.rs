@@ -42,6 +42,7 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     ("builtin/error/OsError.frond", include_str!("../stdlib/builtin/error/OsError.frond")),
     ("builtin/error/FfiError.frond", include_str!("../stdlib/builtin/error/FfiError.frond")),
     ("builtin/error/JsonError.frond", include_str!("../stdlib/builtin/error/JsonError.frond")),
+    ("builtin/error/FmtError.frond", include_str!("../stdlib/builtin/error/FmtError.frond")),
     // reflect module (runtime reflection, Raw.frond primitives + Reflect.frond wrapper)
     ("builtin/reflect/pack.frond", include_str!("../stdlib/builtin/reflect/pack.frond")),
     ("builtin/reflect/Raw.frond", include_str!("../stdlib/builtin/reflect/Raw.frond")),
@@ -67,6 +68,9 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     // rand module (PRNG step primitive)
     ("builtin/rand/pack.frond", include_str!("../stdlib/builtin/rand/pack.frond")),
     ("builtin/rand/Raw.frond", include_str!("../stdlib/builtin/rand/Raw.frond")),
+    // mem module (u8[] buffer primitives over libc mem*)
+    ("builtin/mem/pack.frond", include_str!("../stdlib/builtin/mem/pack.frond")),
+    ("builtin/mem/Raw.frond", include_str!("../stdlib/builtin/mem/Raw.frond")),
 ];
 
 /// Standard library module file manifest (requires `import std.xxx` to load).
@@ -140,6 +144,9 @@ pub const STD_FILES: &[StdlibFile] = &[
     ("std/core/hash/Crc32.frond", include_str!("../stdlib/std/core/hash/Crc32.frond")),
     ("std/core/hash/Adler32.frond", include_str!("../stdlib/std/core/hash/Adler32.frond")),
     ("std/core/hash/Xxh64.frond", include_str!("../stdlib/std/core/hash/Xxh64.frond")),
+    // mem sub-library of std/core: generic T[] container primitives
+    ("std/core/mem/pack.frond", include_str!("../stdlib/std/core/mem/pack.frond")),
+    ("std/core/mem/Mem.frond", include_str!("../stdlib/std/core/mem/Mem.frond")),
     // rand module (PRNG wrappers over builtin/rand)
     ("std/rand/pack.frond", include_str!("../stdlib/std/rand/pack.frond")),
     ("std/rand/Rand.frond", include_str!("../stdlib/std/rand/Rand.frond")),

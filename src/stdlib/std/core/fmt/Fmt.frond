@@ -47,34 +47,45 @@ fun radix_i128(x: i128, base: u8): str {
 }
 
 // Integer → digits in radix 2..36 (lowercase, "-" prefixes negatives).
-// Out-of-range bases and non-integer arguments format as "".
-pub fun radix<T>(x: T, base: u8): str {
-    if base < 2 || base > 36 { return "" }
+// Throws FmtError: InvalidBase when base is outside 2..36, NotAnInteger
+// when T is not an integer type (floats/bool/str/... have no radix form).
+// These used to return "" silently — a bad argument punched a hole in the
+// output instead of raising.
+pub fun radix<T>(x: T, base: u8): Throw<str, FmtError> {
+    if base < 2 || base > 36 {
+        throw FmtError(InvalidBase, "base {base} out of range 2..36", "{x}")
+    }
     match x.type_name() {
-        "u8" => mag_digits(x as u128, base),
-        "u16" => mag_digits(x as u128, base),
-        "u32" => mag_digits(x as u128, base),
-        "u64" => mag_digits(x as u128, base),
-        "u128" => mag_digits(x as u128, base),
-        "usize" => mag_digits(x as u128, base),
-        "i8" => radix_i128(x as i128, base),
-        "i16" => radix_i128(x as i128, base),
-        "i32" => radix_i128(x as i128, base),
-        "i64" => radix_i128(x as i128, base),
-        "i128" => radix_i128(x as i128, base),
-        "isize" => radix_i128(x as i128, base),
-        _ => ""
+        "u8" => Ok(mag_digits(x as u128, base)),
+        "u16" => Ok(mag_digits(x as u128, base)),
+        "u32" => Ok(mag_digits(x as u128, base)),
+        "u64" => Ok(mag_digits(x as u128, base)),
+        "u128" => Ok(mag_digits(x as u128, base)),
+        "usize" => Ok(mag_digits(x as u128, base)),
+        "i8" => Ok(radix_i128(x as i128, base)),
+        "i16" => Ok(radix_i128(x as i128, base)),
+        "i32" => Ok(radix_i128(x as i128, base)),
+        "i64" => Ok(radix_i128(x as i128, base)),
+        "i128" => Ok(radix_i128(x as i128, base)),
+        "isize" => Ok(radix_i128(x as i128, base)),
+        _ => {
+            val t = x.type_name()
+            throw FmtError(NotAnInteger, "radix formats integer types, got {t}", "{x}")
+        }
     }
 }
 
-// Common radix conveniences.
-pub fun dec<T>(x: T): str { radix(x, 10) }
-pub fun hex<T>(x: T): str { radix(x, 16) }
-pub fun oct<T>(x: T): str { radix(x, 8) }
-pub fun bin<T>(x: T): str { radix(x, 2) }
+// Common radix conveniences (base is always valid here, so the only
+// FmtError they can raise is NotAnInteger; it propagates to the caller).
+pub fun dec<T>(x: T): Throw<str, FmtError> { radix(x, 10) }
+pub fun hex<T>(x: T): Throw<str, FmtError> { radix(x, 16) }
+pub fun oct<T>(x: T): Throw<str, FmtError> { radix(x, 8) }
+pub fun bin<T>(x: T): Throw<str, FmtError> { radix(x, 2) }
 
 // Pad s on the left with `fill` up to `width` bytes; no-op when already
-// long enough. Compose for zero-padded hex: pad_left(hex(255), 4, 48).
+// long enough. Compose for zero-padded hex: unwrap Fmt.hex first —
+// `pad_left(s, 4, 48)` with s from `match Fmt.hex(255) { Ok(s) => s, ... }`,
+// or `Fmt.hex(255)?` inside a throwing function.
 pub fun pad_left(s: str, width: usize, fill: u8): str {
     val b = s.bytes()
     if b.len() >= width { return s }
