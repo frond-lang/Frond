@@ -1240,7 +1240,7 @@ impl ValueTrait for ValueHandle {
             ValueTag::F64 => {
                 arena.get_f64(*self).to_bits() == arena.get_f64(*other).to_bits()
             }
-            ValueTag::F128 => arena.get_f128(*self) == arena.get_f128(*other),
+            ValueTag::F128 => arena.get_f128(*self).ieee_eq(&arena.get_f128(*other)),
             ValueTag::Ref => {
                 let a = arena.get_ref(*self);
                 let b = arena.get_ref(*other);
@@ -1285,12 +1285,15 @@ fn try_simd_soa_equals(a: &ScalarSoA, b: &ScalarSoA) -> Option<bool> {
         (ScalarSoA::U128(va), ScalarSoA::U128(vb)) => Some(va == vb),
         (ScalarSoA::Isize(va), ScalarSoA::Isize(vb)) => Some(va == vb),
         (ScalarSoA::Usize(va), ScalarSoA::Usize(vb)) => Some(va == vb),
-        // F16: numeric semantics via f32 (storage is raw u16 bits); F128 stays
-        // bit-pattern per the 2026-08-18 ruling (value_equals parity).
+        // F16: numeric semantics via f32 (storage is raw u16 bits); F128:
+        // numeric semantics via exact bit-decomposition ieee_eq (2026-08-18
+        // ruling — all four float types now IEEE-numeric).
         (ScalarSoA::F16(va), ScalarSoA::F16(vb)) => Some(va.iter().zip(vb.iter()).all(|(x, y)| {
             crate::value::F16(*x).to_f32() == crate::value::F16(*y).to_f32()
         })),
-        (ScalarSoA::F128(va), ScalarSoA::F128(vb)) => Some(va == vb),
+        (ScalarSoA::F128(va), ScalarSoA::F128(vb)) => Some(
+            va.iter().zip(vb.iter()).all(|(x, y)| x.ieee_eq(y)),
+        ),
         _ => None, // type mismatch, fall back
     }
 }

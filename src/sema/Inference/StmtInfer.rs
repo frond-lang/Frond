@@ -127,16 +127,15 @@ impl<'a> InferContext<'a> {
                 }
             }
             Stmt::Assignment { target, value } => {
-                // `*ref = value` compiles but the store is silently lost at runtime
-                // (compute_deref_write boxes scalars into an orphan Cell; heap refs
-                // are a no-op), so reject it until true write-through lands. The
-                // in-place paths that DO work keep compiling: `(*ref).field = v`
-                // (record_field_set) and `(*ref)[i] = v` (array element store).
+                // `*ref = value`: the write node is currently unreachable in
+                // scheduling (a consumer-less effect node) — the store is
+                // silently lost. Reject at compile time until the effect-root
+                // plumbing lands. Working in-place paths: `(*ref).field = v`,
+                // `(*ref)[i] = v`.
                 if matches!(ast.expr(*target).node, crate::ast::Ast::Expr::Deref(_)) {
                     let span = ast.stmt(stmt).span;
                     self.add_error_at(
-                        "cannot assign through `*ref`: dereference writes are not implemented; \
-                         mutate in place via `(*ref).field = ...` or `(*ref)[index] = ...` instead",
+                        "cannot assign through `*ref`: dereference writes are not implemented;                          mutate in place via `(*ref).field = ...` or `(*ref)[index] = ...` instead",
                         span.line,
                         span.column,
                     );
@@ -164,13 +163,10 @@ impl<'a> InferContext<'a> {
                 None
             }
             Stmt::CompoundAssignment { target, value, .. } => {
-                // Same silent-store hole as plain assignment: `*ref += value`
-                // lowers to a deref write that never reaches the binding.
                 if matches!(ast.expr(*target).node, crate::ast::Ast::Expr::Deref(_)) {
                     let span = ast.stmt(stmt).span;
                     self.add_error_at(
-                        "cannot compound-assign through `*ref`: dereference writes are not implemented; \
-                         mutate in place via `(*ref).field = ...` or `(*ref)[index] = ...` instead",
+                        "cannot compound-assign through `*ref`: dereference writes are not implemented;                          mutate in place via `(*ref).field = ...` or `(*ref)[index] = ...` instead",
                         span.line,
                         span.column,
                     );

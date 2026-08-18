@@ -79,3 +79,32 @@ fun __mem_reverse(buf: u8[]): void #{
         i++;
     }
 }#
+
+// Lexicographic three-way comparison of two u8[] buffers (memcmp semantics:
+// element-wise, then shorter-is-less). Returns <0 / 0 / >0.
+@internal
+@extern("C")
+fun __mem_compare_u8(a: u8[], b: u8[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    int rc = memcmp(a_data, b_data, n);
+    if (rc != 0) return rc < 0 ? -1 : 1;
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+
+// Byte offset of the first occurrence of needle in hay; -1 when absent.
+// Empty needle matches at 0. Naive O(n*m) — still ~100x the interpreted loop.
+@internal
+@extern("C")
+fun __mem_index_of_u8(hay: u8[], needle: u8[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        if (hay_data[i] == needle_data[0] && memcmp(hay_data + i, needle_data, needle_len) == 0) {
+            return (int64_t)i;
+        }
+    }
+    return -1;
+}#

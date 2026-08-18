@@ -395,6 +395,25 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct F128(pub [u8; 16]);
 
+
+impl F128 {
+    /// IEEE 754 numeric equality (the 2026-08-18 ruling aligning F128 with
+    /// F16/F32/F64): +0.0 == -0.0, NaN != NaN. Bit-exact otherwise — no
+    /// lossy f64 roundtrip (binary128 has a 113-bit mantissa).
+    pub fn ieee_eq(&self, other: &F128) -> bool {
+        let a = u128::from_le_bytes(self.0);
+        let b = u128::from_le_bytes(other.0);
+        let sign = 1u128 << 127;
+        let expo = 0x7FFFu128 << 112;
+        let mag_a = a & !sign;
+        let mag_b = b & !sign;
+        let a_nan = (mag_a & expo) == expo && (mag_a & !expo) != 0;
+        let b_nan = (mag_b & expo) == expo && (mag_b & !expo) != 0;
+        if a_nan || b_nan { return false; }
+        if mag_a == 0 && mag_b == 0 { return true; } // ±0.0
+        a == b
+    }
+}
 /// f64→f128 is lossless (f64's 53-bit mantissa shifted left by 60 fills binary128's 113 bits with no loss).
 /// f128→f64 (to_f64) implements round-to-nearest-even, correctly rounding the low bits beyond f64 precision.
 /// Therefore f64→f128→f64 round-trips losslessly; f128→f64→f128 only rounds when the f128 value exceeds f64 precision (per IEEE 754 semantics).

@@ -280,6 +280,12 @@ pub fn force_input(frame: &mut Frame, global_node: NodeId) -> Value {
                 // Not yet forced: run the thunk via force_lazy_value_sync.
                 return force_lazy_value_sync(frame, &v);
             }
+            // Shared-cell slot (the binding was targeted by `&x`): reads see
+            // the CURRENT cell payload — this is what makes `*r = v` write
+            // through to every reader of the binding.
+            if let crate::value::HeapObj::Cell(c) = &**r {
+                return c.get();
+            }
             v
         }
         _ => v,
@@ -2379,10 +2385,19 @@ pub fn compute_ref_of(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Val
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let v = force_input(frame, inputs[0]);
     match &v {
-        // Scalar/Null/Void → wrap in a Cell.
+        // Scalar/Null/Void → wrap in a Cell AND upgrade the source slot to
+        // hold that same cell: `*r = v` (compute_deref_write) writes the cell
+        // and force_input unwraps cell slots on every read, so the write is
+        // visible to every reader of the binding. Without the slot upgrade
+        // the cell was an orphan snapshot and deref writes were silently lost.
         Value::Scalar(_, _) | Value::Null | Value::Void => {
             let cell = crate::value::Cell::new(v.clone());
-            Value::ref_val(crate::value::HeapObj::Cell(cell))
+            let cell_val = Value::ref_val(crate::value::HeapObj::Cell(cell));
+            let src_local = NodeId(inputs[0].0.wrapping_sub(frame.node_offset));
+            if let Some(slot) = frame.value_table.get_value_mut(src_local.0 as usize) {
+                *slot = cell_val.clone();
+            }
+            cell_val
         }
         // Already a heap reference: share the Arc directly (reference semantics, no deep copy).
         Value::Ref(_) => v,
