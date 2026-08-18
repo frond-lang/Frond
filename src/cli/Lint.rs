@@ -73,7 +73,7 @@ fn lint_dir(dir: &str, config: &LintConfig) -> Vec<crate::tooling::Common::Diagn
         let path = entry.path();
         if path.is_dir() {
             all.extend(lint_dir(&path.to_string_lossy(), config));
-        } else if path.extension().map(|e| e == "kz").unwrap_or(false) {
+        } else if path.extension().map(|e| e == "frond").unwrap_or(false) {
             all.extend(lint_file(&path.to_string_lossy(), config));
         }
     }

@@ -16,14 +16,23 @@
 //! 1. Scan `.frond` files listed in `EXTERN_FROND_FILES` (containing `@extern("C")` declarations).
 //! 2. Text-extract each into `ExternCFunc` records (shared struct from `Gen.rs`).
 //! 3. Generate `.c` source for each file via `gen::generate_c_source`.
-//! 4. Compile all `.c` files into the `frond_extern` static library using the `cc` crate.
-//! 5. Delete intermediate `.c` artifacts from `OUT_DIR`.
+//! 4. Generate a symbol registry `.c` (function-pointer table) + matching Rust
+//!    bindings in OUT_DIR.
+//! 5. Compile all `.c` files into the `frond_extern` static library using the `cc` crate.
+//! 6. Delete intermediate `.c` artifacts from `OUT_DIR`.
 //!
-//! Symbol resolution: no Rust FFI binding table (`bindings_addr`) is generated
-//! anymore. At runtime, frond resolves in-process symbols via dlsym (GetProcAddress)
-//! self-lookup (see `platform::ResolveSelfSymbol`). C functions are exported on Windows
-//! via the `FROND_EXPORT` macro (`__declspec(dllexport)`); on Linux/macOS they are
-//! exported by default and visible to dlsym.
+//! ## Symbol resolution
+//!
+//! The Rust side references `frond_extern_registry` / `frond_extern_registry_names`
+//! (generated in OUT_DIR, included by `src/ffi/Symbols.rs`). The table references
+//! every primitive, which keeps them alive through linker dead-stripping —
+//! macOS rustc links executables with `-Wl,-dead_strip`, Linux with `--gc-sections`,
+//! MSVC release with `/OPT:REF`; a whole-archive link alone does NOT protect
+//! unreferenced symbols from any of these. At runtime `ffi::Symbols` resolves
+//! names by scanning the table; `dlsym`/`GetProcAddress` self-lookup remains as
+//! a fallback (see `platform::ResolveSelfSymbol`). C functions are exported on
+//! Windows via the `FROND_EXPORT` macro (`__declspec(dllexport)`); on Linux/macOS
+//! they are exported by default.
 
 use std::env;
 use std::fs;
@@ -67,11 +76,14 @@ fn main() {
         .collect();
 
     if frond_files.is_empty() {
+        write_registry_stub(&out_dir);
         return;
     }
 
     // 1. Text-extract each .frond → ExternCFunc list, then generate .c into OUT_DIR
     let mut c_files: Vec<PathBuf> = Vec::new();
+    // Every extracted function across all files — input for the symbol registry.
+    let mut all_funcs: Vec<gen::ExternCFunc> = Vec::new();
 
     for frond_file in &frond_files {
         let content = match fs::read_to_string(frond_file) {
@@ -111,12 +123,32 @@ fn main() {
         }
         c_files.push(c_path);
 
+        // Only functions whose .c was generated successfully enter the registry;
+        // a registry entry for a skipped function would be an undefined symbol.
+        for f in funcs {
+            if !all_funcs.iter().any(|e| e.c_name == f.c_name) {
+                all_funcs.push(f);
+            }
+        }
+
         println!("cargo::rerun-if-changed={}", frond_file.display());
     }
 
     if c_files.is_empty() {
+        write_registry_stub(&out_dir);
         return;
     }
+
+    // 1.5 Generate the symbol registry .c (function-pointer table). Rust-side
+    // references to this table are what keeps every primitive alive through
+    // linker dead-stripping; see the module doc comment.
+    let registry_path = Path::new(&out_dir).join("frond_extern_registry.c");
+    if let Err(e) = fs::write(&registry_path, generate_registry_c(&all_funcs)) {
+        println!("cargo:warning=Write registry .c failed: {}", e);
+        write_registry_stub(&out_dir);
+        return;
+    }
+    c_files.push(registry_path);
 
     // 2. Compile all .c files with cc::Build into the frond_extern static library.
     //
@@ -141,6 +173,8 @@ fn main() {
     }
     match build.try_compile("frond_extern") {
         Ok(_) => {
+            // Rust bindings for the registry table (real table this time).
+            write_registry_rs(&out_dir, &all_funcs);
             // Emit link directives manually: whole-archive forces full linkage.
             // Output the library search path (try_compile already placed the .lib in
             // OUT_DIR, but cargo_metadata(false) does not emit link-search automatically).
@@ -168,8 +202,117 @@ fn main() {
             }
         }
         Err(e) => {
-            println!("cargo:warning=C compilation failed, skipping has_extern_c cfg: {}", e);
+            // A frond binary without the builtin C primitives is functionally broken:
+            // println/fs/net/time/os/rand all resolve to nothing at runtime and fail
+            // silently (the Throw error is discarded when the call result is unused).
+            // Fail the build loudly instead of shipping a degraded binary; the env
+            // escape hatch exists for platforms without a C toolchain on purpose.
+            if env::var("FROND_ALLOW_NO_EXTERN_C").ok().as_deref() == Some("1") {
+                println!("cargo::warning=C compilation failed, building without builtin @extern(\"C\") primitives (FROND_ALLOW_NO_EXTERN_C=1): {}", e);
+                write_registry_stub(&out_dir);
+            } else {
+                panic!(
+                    "builtin @extern(\"C\") C compilation failed: {}\n  set FROND_ALLOW_NO_EXTERN_C=1 to build without builtin primitives (println/fs/net will not work)",
+                    e
+                );
+            }
         }
+    }
+}
+
+// ============ Symbol registry generation ============
+
+/// Generate `frond_extern_registry.c`: a function-pointer table + parallel name
+/// table + length. The Rust side (frond_extern_registry.rs) references these
+/// statics, and the table references every primitive function — making them
+/// reachable from Rust code and therefore immune to dead-strip/gc-sections.
+fn generate_registry_c(funcs: &[gen::ExternCFunc]) -> String {
+    let mut out = String::new();
+    out.push_str("// Auto-generated symbol registry — DO NOT EDIT\n");
+    out.push_str("#include <stdint.h>\n");
+    out.push_str("#include <stddef.h>\n\n");
+    for f in funcs {
+        let params = if f.c_params.is_empty() {
+            "void".to_string()
+        } else {
+            f.c_params
+                .iter()
+                .map(|p| format!("{} {}", p.c_type, p.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        out.push_str(&format!("extern {} {}({});\n", f.c_return, f.c_name, params));
+    }
+    out.push_str("\nvoid* const frond_extern_registry[] = {\n");
+    for f in funcs {
+        out.push_str(&format!("    (void*){},\n", f.c_name));
+    }
+    out.push_str("};\n\n");
+    out.push_str("const char* const frond_extern_registry_names[] = {\n");
+    for f in funcs {
+        out.push_str(&format!("    \"{}\",\n", f.c_name));
+    }
+    out.push_str("};\n\n");
+    out.push_str(&format!(
+        "const uint64_t frond_extern_registry_len = {};\n",
+        funcs.len()
+    ));
+    out
+}
+
+/// Write the real Rust registry bindings into OUT_DIR. Included by
+/// `src/ffi/Symbols.rs` via `include!(concat!(env!("OUT_DIR"), ...))`.
+fn write_registry_rs(out_dir: &str, funcs: &[gen::ExternCFunc]) {
+    let n = funcs.len();
+    let rs = format!(
+        r#"// Auto-generated by build.rs — symbol registry bindings. DO NOT EDIT.
+
+pub const FROND_EXTERN_REGISTRY_LEN: usize = {n};
+
+extern "C" {{
+    static frond_extern_registry: [*mut core::ffi::c_void; {n}];
+    static frond_extern_registry_names: [*const core::ffi::c_char; {n}];
+}}
+
+/// Linear name → address lookup over the linked registry table. The references
+/// to the extern statics are what keeps the table (and transitively every
+/// @extern("C") primitive) alive through linker dead-stripping.
+pub fn registry_lookup(symbol: &str) -> Option<*mut core::ffi::c_void> {{
+    let bytes = symbol.as_bytes();
+    unsafe {{
+        for i in 0..FROND_EXTERN_REGISTRY_LEN {{
+            let p = frond_extern_registry_names[i] as *const u8;
+            if p.is_null() {{
+                continue;
+            }}
+            let mut len = 0usize;
+            while *p.add(len) != 0 {{
+                len += 1;
+            }}
+            if core::slice::from_raw_parts(p, len) == bytes {{
+                return Some(frond_extern_registry[i]);
+            }}
+        }}
+    }}
+    None
+}}
+"#,
+        n = n
+    );
+    if let Err(e) = fs::write(Path::new(out_dir).join("frond_extern_registry.rs"), rs) {
+        // The include! in Symbols.rs fails the build if the file is missing,
+        // so surface this as a build error rather than continuing.
+        panic!("failed to write frond_extern_registry.rs: {}", e);
+    }
+}
+
+/// Write a stub registry (no table available). Keeps `include!` in Symbols.rs
+/// valid on the FROND_ALLOW_NO_EXTERN_C=1 path.
+fn write_registry_stub(out_dir: &str) {
+    let rs = "// Auto-generated stub — builtin @extern(\"C\") C library unavailable.\n\
+              pub fn registry_lookup(_symbol: &str) -> Option<*mut core::ffi::c_void> {\n    None\n}\n";
+    if let Err(e) = fs::write(Path::new(out_dir).join("frond_extern_registry.rs"), rs) {
+        panic!("failed to write frond_extern_registry.rs stub: {}", e);
     }
 }
 

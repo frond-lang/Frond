@@ -170,6 +170,7 @@ impl<'a> IrBuilder<'a> {
     /// Compile a statement, returning an effect node (to be sequentially linked into the block result node).
     /// Returns None for pure declarations (variable bindings); their value node is automatically reachable via variable references.
     pub(super) fn compile_stmt(&mut self, stmt_id: crate::ast::Ast::StmtId) -> Option<NodeId> {
+
         // Skip analyzer-flagged dead statements (unreachable code / dead declarations / dead stores); emit no IR nodes
         if self.is_dead_stmt(stmt_id) {
             return None;

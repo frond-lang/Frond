@@ -257,9 +257,17 @@ pub fn generate_c_source(funcs: &[ExternCFunc]) -> Result<String, String> {
     out.push_str("#include <stddef.h>\n");
     // Symbol export macro: Windows needs __declspec(dllexport) so the symbols
     // appear in the .exe export table and can be found by dlsym(GetProcAddress).
-    // Linux/macOS export extern "C" globals by default — macro expands to nothing.
+    // Linux/macOS export extern "C" globals by default — macro expands to a
+    // no-op there. On Apple, additionally mark `used`: rustc links macOS
+    // executables with -dead_strip, and an unreferenced function is removed
+    // even when force_loaded; `used` emits `.no_dead_strip` in the object,
+    // keeping the symbol (and the dlsym fallback path) alive. On ELF `used`
+    // alone does not protect from --gc-sections (needs `retain` + new
+    // binutils), which is why the runtime uses the registry table instead.
     out.push_str("#if defined(_WIN32) || defined(_WIN64)\n");
     out.push_str("  #define FROND_EXPORT __declspec(dllexport)\n");
+    out.push_str("#elif defined(__APPLE__)\n");
+    out.push_str("  #define FROND_EXPORT __attribute__((used))\n");
     out.push_str("#else\n");
     out.push_str("  #define FROND_EXPORT\n");
     out.push_str("#endif\n");

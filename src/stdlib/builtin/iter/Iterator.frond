@@ -1,9 +1,10 @@
 // Iterator<T>: iterator trait (builtin Frond implementation)
 //
-// Three built-in implementations:
+// Four built-in implementations:
 //   ArrayIter<T>     — array iterator, next() returns T?
 //   RangeIterator    — range iterator, next() returns i64?
 //   StringIterator   — string iterator, next() returns i64? (Unicode code point)
+//   HashIterator<E>  — lazy bucket-walking iterator over E[][] (hash containers)
 //
 // After a user-defined type implements Iterator, it can be used by For loops:
 //   type MyRange: (Iterator<i32>) = MyRange(lo: i32, hi: i32) { pub fun &next(): i32? { ... } }
@@ -12,6 +13,7 @@
 // Usage:
 //   for x in arr.iter() { ... }   // arrays need explicit .iter()
 //   for x in range_iter(1, 10, false) { ... }  // RangeIterator used directly
+//   for e in m.entries() { ... }  // hash containers expose entries()/items() explicitly
 
 // ---- Iterator trait ----
 trait Iterator<T> {
@@ -34,6 +36,37 @@ type ArrayIter<T>: (Iterator<T>) = ArrayIter(data: T[], pos: usize) {
 
 pub fun iter<T>(arr: T[]): ArrayIter<T> {
     ArrayIter(arr, 0)
+}
+
+// ---- Hash-table iterator ----
+//
+// Lazily walks an E[][] bucket array (separate-chaining layout) without
+// materializing a snapshot — O(n) iteration, zero allocation. Generic over the
+// entry type E, so any hash container (stdlib or user-defined) can expose it.
+//
+// Mutation-during-iteration semantics (deterministic, never invalid):
+//   - in-place slot writes (buckets[b][i] = e) and bucket rebinds
+//     (buckets[b] = new_row) are VISIBLE in buckets not yet walked;
+//   - a full rehash (rebinding the table itself) is NOT visible: the iterator
+//     holds the old bucket array and finishes walking it safely.
+pub type HashIterator<E>: (Iterator<E>) = HashIterator(buckets: E[][], bucket: usize, index: usize) {
+    pub fun &next(): E? {
+        while bucket < buckets.len() {
+            val row = buckets[bucket]
+            if index < row.len() {
+                val e = row[index]
+                index = index + 1
+                return e
+            }
+            bucket = bucket + 1
+            index = 0
+        }
+        null
+    }
+}
+
+pub fun hash_iter<E>(buckets: E[][]): HashIterator<E> {
+    HashIterator(buckets, 0, 0)
 }
 
 // ---- Range iterator ----

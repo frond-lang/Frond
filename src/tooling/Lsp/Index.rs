@@ -36,7 +36,7 @@ impl WorkspaceIndex {
                         continue;
                     }
                     self.scan_directory(&path);
-                } else if path.extension().map(|e| e == "kz").unwrap_or(false) {
+                } else if path.extension().map(|e| e == "frond").unwrap_or(false) {
                     self.index_file(&path);
                 }
             }

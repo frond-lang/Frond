@@ -1414,7 +1414,7 @@ pub fn analyze_purity(module: &Module, arena: &AstArena, cg: &CallGraph, sema: &
                 continue;
             }
         }
-        if is_direct_impure(body, arena, name, sema, &top_level_vars) {
+        if is_direct_impure(body, arena, name, module.name, sema, &top_level_vars) {
             direct_impure.insert(caller);
         }
     }
@@ -1437,13 +1437,23 @@ pub fn analyze_purity(module: &Module, arena: &AstArena, cg: &CallGraph, sema: &
 
 /// Determines whether a function body is directly impure (contains impure built-in calls, method calls, select, spawn, etc.).
 /// Uses sema FuncSigInfo: async/throwing external functions (e.g., println) are also classified as impure.
-fn is_direct_impure(body: ExprId, arena: &AstArena, self_name: &str, sema: &SemaResult, top_level_vars: &FxHashSet<&str>) -> bool {
+fn is_direct_impure(body: ExprId, arena: &AstArena, self_name: &str, module_name: &str, sema: &SemaResult, top_level_vars: &FxHashSet<&str>) -> bool {
     // Stateful functions are impure: a body that WRITES a module-level
     // variable (directly or through an element/field of one) must never be
     // inlined or memoized — the expanded body's stores bypass the global
     // slot, freezing the state (rand's inlined next_u64 kept returning the
     // first value forever).
     if writes_top_level_var(body, arena, top_level_vars) {
+        return true;
+    }
+    // Reference writes are equally observable: records and arrays are shared
+    // by reference, so `this.field = v` (implicit-this sugar inside methods),
+    // `obj.field = v`, `arr[i] = v` and `*r = v` mutate state every alias can
+    // see — callers, sibling loop iterations, other methods. A mutating
+    // method (`&fn` like an iterator's `&next`) classified pure led to its
+    // call being eliminated as a dead `val` declaration (#104) and to unsafe
+    // inline/memo plans of the same shape as the rand freeze above.
+    if writes_through_reference(body, arena, module_name, sema) {
         return true;
     }
     fn check(expr_id: ExprId, arena: &AstArena, self_name: &str, sema: &SemaResult) -> bool {
@@ -1571,6 +1581,70 @@ fn assign_target_root_ident<'a>(target: crate::ast::Ast::ExprId, arena: &AstAren
 /// Whether any assignment inside the function body targets a module-level
 /// variable (or an element/field of one). Shadowing (a parameter/local named
 /// like a global) may over-approximate — that only forgoes an optimization.
+/// Whether an assignment target writes THROUGH a reference (observable
+/// mutation): field writes (`obj.f = v`, including implicit-this `f = v`
+/// inside methods), array element writes (`arr[i] = v`) and deref writes
+/// (`*r = v`). Plain local-variable assignments are NOT reference writes —
+/// they are function-internal and invisible to callers.
+fn writes_through_reference(expr_id: ExprId, arena: &AstArena, module_name: &str, sema: &SemaResult) -> bool {
+    match &arena.expr(expr_id).node {
+        Expr::Assign { target, .. } | Expr::CompoundAssign { target, .. } => {
+            if assign_target_writes_reference(*target, arena, module_name, sema) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    let mut found = false;
+    walk_children_expr(expr_id, arena, |c| {
+        if !found {
+            found = writes_through_reference(c, arena, module_name, sema);
+        }
+    });
+    if !found {
+        walk_children_stmts_of_expr(expr_id, arena, |s| {
+            if !found {
+                found = writes_through_reference_stmt(s, arena, module_name, sema);
+            }
+        });
+    }
+    found
+}
+
+fn writes_through_reference_stmt(stmt_id: StmtId, arena: &AstArena, module_name: &str, sema: &SemaResult) -> bool {
+    match &arena.stmt(stmt_id).node {
+        Stmt::Assignment { target, .. } | Stmt::CompoundAssignment { target, .. } => {
+            assign_target_writes_reference(*target, arena, module_name, sema)
+        }
+        // Explicit field-assignment statements (`obj.f = v` shape): always a
+        // reference write regardless of the receiver's root.
+        Stmt::FieldAssignment { .. } => true,
+        _ => {
+            let mut found = false;
+            walk_children_stmt(stmt_id, arena, |e| {
+                if !found {
+                    found = writes_through_reference(e, arena, module_name, sema);
+                }
+            });
+            found
+        }
+    }
+}
+
+/// One assignment target: is it a write through a reference?
+fn assign_target_writes_reference(target: ExprId, arena: &AstArena, module_name: &str, sema: &SemaResult) -> bool {
+    match &arena.expr(target).node {
+        // obj.f = v / arr[i] = v / *r = v
+        Expr::FieldAccess { .. } | Expr::SafeAccess { .. } | Expr::Index { .. } | Expr::Deref(_) => true,
+        // `f = v` inside a method body resolving to `this.f = v`
+        Expr::Ident(_) => {
+            let key = module_expr_key(module_name, target.0 as u64);
+            sema.expr_types.get(&key).and_then(|info| info.implicit_this.as_ref()).is_some()
+        }
+        _ => false,
+    }
+}
+
 fn writes_top_level_var(expr_id: ExprId, arena: &AstArena, top: &FxHashSet<&str>) -> bool {
     match &arena.expr(expr_id).node {
         Expr::Assign { target, .. } | Expr::CompoundAssign { target, .. } => {

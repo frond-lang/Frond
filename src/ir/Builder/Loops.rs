@@ -280,7 +280,27 @@ impl<'a> IrBuilder<'a> {
         // forever, causing a deadlock.
         let prev_effect = self.current_effect;
         self.current_effect = None;
-        let cond_node = self.compile_subexpr(condition);
+        let mut cond_node = self.compile_subexpr(condition);
+        // A bare-variable condition (`while cont`) compiles to the variable's
+        // EXISTING binding node, which physically lives in the enclosing
+        // function body — OUTSIDE this while subgraph. The per-iteration
+        // reset_condition_tree DFS only collects in-sg nodes, so an external
+        // cond_node leaves the loop with nothing to re-evaluate: after the
+        // first body round the ready queue stays empty and the loop silently
+        // exits — unless a WriteBack happens to poke the gate, which is why
+        // loops whose condition variable is (re)written every round masked
+        // the bug (#104 layer 2). Wrap external conditions in an in-sg
+        // identity node (CF_SEQ) so each iteration re-reads the current slot
+        // value and re-fires the gate.
+        if cond_node.0 < node_start {
+            let off = self.graph.inputs_pool.push(&[cond_node]);
+            cond_node = self.graph.add_node(Node {
+                kind: NodeKind::UnOp,
+                input_count: 1,
+                inputs_offset: off,
+                compute_fn: CF_SEQ,
+            });
+        }
         // body subgraph (trailing tail-recursive call to while_sg).
         let body_sg = self.compile_loop_body_subgraph(body, sg_id);
         // void subgraph (false branch; loop ends): includes CF_DEFER_RUN for defer-in-loop.

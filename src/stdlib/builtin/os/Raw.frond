@@ -426,9 +426,32 @@ fun __os_spawn(program: str, args_blob: u8[], cwd: str, env_blob: u8[]): u64 #{
     #else
         (void)blob_bytes;
         extern char** environ;
+        // posix_spawn does no PATH lookup (unlike Windows CreateProcessA):
+        // resolve a bare program name against $PATH so spawn("sh", ...) works.
+        const char* prog = program_data;
+        char prog_buf[4096];
+        if (strchr(program_data, '/') == NULL) {
+            const char* path_env = getenv("PATH");
+            if (path_env) {
+                const char* cur = path_env;
+                while (*cur) {
+                    const char* colon = strchr(cur, ':');
+                    size_t dlen = colon ? (size_t)(colon - cur) : strlen(cur);
+                    if (dlen > 0 && dlen + 1 + program_len + 1 <= sizeof(prog_buf)) {
+                        memcpy(prog_buf, cur, dlen);
+                        prog_buf[dlen] = '/';
+                        memcpy(prog_buf + dlen + 1, program_data, program_len);
+                        prog_buf[dlen + 1 + program_len] = 0;
+                        if (access(prog_buf, X_OK) == 0) { prog = prog_buf; break; }
+                    }
+                    if (!colon) break;
+                    cur = colon + 1;
+                }
+            }
+        }
         char** argv = (char**)malloc((argc + 2) * sizeof(char*));
         if (!argv) return 0;
-        argv[0] = (char*)program_data;
+        argv[0] = (char*)prog;
         size_t ai = 1;
         for (size_t i = 0; i < args_blob_len; ) {
             size_t seg = 0;
@@ -469,7 +492,7 @@ fun __os_spawn(program: str, args_blob: u8[], cwd: str, env_blob: u8[]): u64 #{
             envp = env_parsed;
         }
         pid_t pid = 0;
-        int r = posix_spawn(&pid, program_data, &fa, NULL, argv, envp);
+        int r = posix_spawn(&pid, prog, &fa, NULL, argv, envp);
         posix_spawn_file_actions_destroy(&fa);
         free(env_parsed);
         free(argv);
@@ -639,7 +662,29 @@ fun __os_capture_spawn(program: str, args_blob: u8[], cwd: str, env_blob: u8[]):
         extern char** environ;
         char** argv = (char**)malloc((argc + 2) * sizeof(char*));
         if (!argv) return 0;
-        argv[0] = (char*)program_data;
+        // Same PATH resolution as __os_spawn (posix_spawn does no PATH lookup).
+        const char* prog = program_data;
+        char prog_buf[4096];
+        if (strchr(program_data, '/') == NULL) {
+            const char* path_env = getenv("PATH");
+            if (path_env) {
+                const char* cur = path_env;
+                while (*cur) {
+                    const char* colon = strchr(cur, ':');
+                    size_t dlen = colon ? (size_t)(colon - cur) : strlen(cur);
+                    if (dlen > 0 && dlen + 1 + program_len + 1 <= sizeof(prog_buf)) {
+                        memcpy(prog_buf, cur, dlen);
+                        prog_buf[dlen] = '/';
+                        memcpy(prog_buf + dlen + 1, program_data, program_len);
+                        prog_buf[dlen + 1 + program_len] = 0;
+                        if (access(prog_buf, X_OK) == 0) { prog = prog_buf; break; }
+                    }
+                    if (!colon) break;
+                    cur = colon + 1;
+                }
+            }
+        }
+        argv[0] = (char*)prog;
         size_t ai = 1;
         for (size_t i = 0; i < args_blob_len; ) {
             size_t seg = 0;
@@ -692,7 +737,7 @@ fun __os_capture_spawn(program: str, args_blob: u8[], cwd: str, env_blob: u8[]):
             envp = env_parsed;
         }
         pid_t pid = 0;
-        int r = posix_spawn(&pid, program_data, &fa, NULL, argv, envp);
+        int r = posix_spawn(&pid, prog, &fa, NULL, argv, envp);
         posix_spawn_file_actions_destroy(&fa);
         free(env_parsed);
         free(argv);
@@ -761,8 +806,8 @@ fun __os_capture_finish(handle: u64): i32 #{
 
 // ─── Self executable path ───
 //
-// Windows: GetModuleFileNameA. POSIX: readlink("/proc/self/exe") — macOS has
-// no /proc, so the call returns -1 there (surfaces as Unsupported).
+// Windows: GetModuleFileNameA. Linux: readlink("/proc/self/exe").
+// macOS: no /proc — _NSGetExecutablePath (dyld API), canonicalized via realpath.
 
 @c_include("windows.h")
 @c_include("unistd.h")
@@ -774,6 +819,21 @@ fun __os_executable_into(buf: u8[]): i64 #{
         if (n == 0) return -1;
         if (n >= buf_len) return -2;
         return (int64_t)n;
+    #elif defined(__APPLE__)
+        // Declared by hand: including <mach-o/dyld.h> inside a function body
+        // pulls in headers with function definitions (OSByteOrder.h), which C
+        // forbids. Prototype taken from dyld.h (returns 0 on success, -1 when
+        // *bufsize is too small and receives the required size).
+        extern int _NSGetExecutablePath(char* buf, uint32_t* bufsize);
+        uint32_t size = (uint32_t)buf_len;
+        if (_NSGetExecutablePath((char*)buf_data, &size) != 0) return -2;
+        // The dyld path may contain symlinks (e.g. /tmp → /private/tmp); canonicalize.
+        char resolved[4096];
+        if (realpath((const char*)buf_data, resolved) != NULL && strlen(resolved) < buf_len) {
+            memcpy(buf_data, resolved, strlen(resolved));
+            return (int64_t)strlen(resolved);
+        }
+        return (int64_t)strlen((const char*)buf_data);
     #else
         ssize_t n = readlink("/proc/self/exe", (char*)buf_data, buf_len);
         if (n < 0) return -1;

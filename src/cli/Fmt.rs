@@ -89,7 +89,7 @@ fn format_dir(dir: &std::path::Path, config: &FmtConfig, check: bool) -> bool {
         let path = entry.path();
         if path.is_dir() {
             all_ok &= format_dir(&path, config, check);
-        } else if path.extension().map(|e| e == "kz").unwrap_or(false) {
+        } else if path.extension().map(|e| e == "frond").unwrap_or(false) {
             all_ok &= format_file(&path, config, check);
         }
     }

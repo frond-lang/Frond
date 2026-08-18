@@ -11,6 +11,17 @@
 // - Return value convention: fd as i64 on success, -1 on error (POSIX) / SOCKET_ERROR mapped to -1 (Windows).
 // - Winsock requires WSAStartup before any socket call; the four socket-creating entry points
 //   (tcp_connect_v4/v6, tcp_listen_v4/v6, udp_bind_v4/v6) lazily initialize it via a refcount guard.
+//
+// POSIX headers: the #else branches below call socket()/connect()/bind()/getaddrinfo etc.
+// On Windows winsock2.h + ws2tcpip.h declare everything, but POSIX needs the headers below
+// (socket/bind/listen/accept + socklen_t, sockaddr_in/in6 + htons/htonl, getaddrinfo).
+// They are in Gen.rs POSIX_ONLY_HEADERS, so the generated C only pulls them in off-Windows.
+
+@c_include("sys/socket.h")
+@c_include("sys/types.h")
+@c_include("netinet/in.h")
+@c_include("arpa/inet.h")
+@c_include("netdb.h")
 
 // ─── TCP IPv4 ──────────────────────────────────────────────────────────
 //

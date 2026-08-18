@@ -143,6 +143,12 @@ pub const STD_FILES: &[StdlibFile] = &[
     ("std/json/Json.frond", include_str!("../stdlib/std/json/Json.frond")),
     ("std/json/Parse.frond", include_str!("../stdlib/std/json/Parse.frond")),
     ("std/json/Format.frond", include_str!("../stdlib/std/json/Format.frond")),
+    // collections module (pure Frond hash containers: str/i64 keyed maps & sets)
+    ("std/collections/pack.frond", include_str!("../stdlib/std/collections/pack.frond")),
+    ("std/collections/HashMap.frond", include_str!("../stdlib/std/collections/HashMap.frond")),
+    ("std/collections/IntMap.frond", include_str!("../stdlib/std/collections/IntMap.frond")),
+    ("std/collections/HashSet.frond", include_str!("../stdlib/std/collections/HashSet.frond")),
+    ("std/collections/IntSet.frond", include_str!("../stdlib/std/collections/IntSet.frond")),
 ];
 
 /// Looks up a stdlib file by path.
