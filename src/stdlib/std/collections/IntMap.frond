@@ -1,21 +1,13 @@
 // IntMap.frond — i64 → V hash map (part of std.collections)
 //
 // Same structure as HashMap<V> (separate chaining, ×2 growth at load factor
-// 2, bucket rebuild on remove); keys hash through a splitmix64-style mixer so
-// dense and negative key patterns spread evenly. `i64 as u64` keeps the bit
-// pattern, so -1 and -2 hash differently.
+// 2, bucket rebuild on remove); keys hash through Hash.mix_i64 (std.core.hash
+// fmix64 mixer) so dense and negative key patterns spread evenly. `i64 as u64`
+// keeps the bit pattern, so -1 and -2 hash differently.
+
+import std.core.hash
 
 pub type IntEntry<V> = IntEntry(pub key: i64, pub value: V)
-
-fun map_mix_i64(k: i64): u64 {
-    var x = k as u64
-    x = x ^ (x >> 33)
-    x = x * 0xff51afd7ed558ccd
-    x = x ^ (x >> 33)
-    x = x * 0xc4ceb9fe1a85ec53
-    x = x ^ (x >> 33)
-    x
-}
 
 type IntMap<V> = IntMap(buckets: IntEntry<V>[][], count: usize) {
 
@@ -24,7 +16,7 @@ type IntMap<V> = IntMap(buckets: IntEntry<V>[][], count: usize) {
     pub fun is_empty(): bool { count == 0 }
 
     pub fun has(key: i64): bool {
-        val row = buckets[(map_mix_i64(key) & ((buckets.len() - 1) as u64)) as usize]
+        val row = buckets[(Hash.mix_i64(key) & ((buckets.len() - 1) as u64)) as usize]
         var i = 0 as usize
         while i < row.len() {
             if row[i].key == key { return true }
@@ -34,7 +26,7 @@ type IntMap<V> = IntMap(buckets: IntEntry<V>[][], count: usize) {
     }
 
     pub fun get(key: i64): V? {
-        val row = buckets[(map_mix_i64(key) & ((buckets.len() - 1) as u64)) as usize]
+        val row = buckets[(Hash.mix_i64(key) & ((buckets.len() - 1) as u64)) as usize]
         var i = 0 as usize
         while i < row.len() {
             if row[i].key == key { return row[i].value }
@@ -44,7 +36,7 @@ type IntMap<V> = IntMap(buckets: IntEntry<V>[][], count: usize) {
     }
 
     pub fun &set(key: i64, value: V): void {
-        val slot = (map_mix_i64(key) & ((buckets.len() - 1) as u64)) as usize
+        val slot = (Hash.mix_i64(key) & ((buckets.len() - 1) as u64)) as usize
         val row = buckets[slot]
         var i = 0 as usize
         while i < row.len() {
@@ -60,7 +52,7 @@ type IntMap<V> = IntMap(buckets: IntEntry<V>[][], count: usize) {
     }
 
     pub fun &remove(key: i64): bool {
-        val slot = (map_mix_i64(key) & ((buckets.len() - 1) as u64)) as usize
+        val slot = (Hash.mix_i64(key) & ((buckets.len() - 1) as u64)) as usize
         val row = buckets[slot]
         var kept: IntEntry<V>[] = []
         var found = false
@@ -147,7 +139,7 @@ type IntMap<V> = IntMap(buckets: IntEntry<V>[][], count: usize) {
         var k = 0 as usize
         while k < all.len() {
             val e = all[k]
-            val slot = (map_mix_i64(e.key) & ((buckets.len() - 1) as u64)) as usize
+            val slot = (Hash.mix_i64(e.key) & ((buckets.len() - 1) as u64)) as usize
             buckets[slot] = buckets[slot] ++ [e]
             k = k + 1
         }

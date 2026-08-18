@@ -1,0 +1,61 @@
+// Hash.frond — hash primitives (part of std.core.hash)
+//
+// Two schemes, both deterministic and portable (pure Frond arithmetic),
+// neither cryptographic:
+//
+//   fnv1a — FNV-1a 64: fast, byte-serial, good for checksums and
+//       non-adversarial bucketing. Generic entry digests str and u8[]
+//       directly; anything else hashes as 0. Matches the FNV spec vectors
+//       ("" = 0xcbf29ce484222325); the copy that used to live in
+//       collections had a truncated basis — behavior-neutral there,
+//       since hashes were internal-only.
+//   key — FNV-1a over a value's "{k}" printed representation: the
+//       collections generic-key scheme (HashMap/HashSet), valid for every
+//       formattable type and paired with `==` equality.
+//   mix_i64 — fmix64 finalizer (murmur3's "splitmix64-style" mixer):
+//       avalanches an integer so nearby keys (-1/-2, 1/2) land in different
+//       buckets; IntMap/IntSet use it. Bijective on 64 bits.
+
+// FNV-1a 64: offset basis, then per byte h = (h ^ byte) * prime.
+// Generic entry digests str and u8[] directly (engine: element-aware
+// type_name + array casts); anything else hashes as 0.
+pub fun fnv1a<T>(data: T): u64 {
+    match data.type_name() {
+        "str" => {
+            val s = data as str
+            fnv1a_bytes(s.bytes())
+        },
+        "u8[]" => fnv1a_bytes(data as u8[]),
+        _ => 0
+    }
+}
+
+// FNV-1a 64 over raw bytes — the algorithm's native input domain, and the
+// substrate every other entry here builds on.
+pub fun fnv1a_bytes(data: u8[]): u64 {
+    var h: u64 = 14695981039346656037
+    var i: usize = 0
+    while i < data.len() {
+        h = (h ^ (data[i] as u64)) * 1099511628211
+        i = i + 1
+    }
+    h
+}
+
+// Collections generic-key hash: FNV-1a over the printed representation —
+// every value formats, equal values print equal, so it pairs with `==`.
+pub fun key<K>(k: K): u64 {
+    val s = "{k}"
+    fnv1a_bytes(s.bytes())
+}
+
+// fmix64 finalizer: x ^= x>>33; x *= c1; x ^= x>>33; x *= c2; x ^= x>>33.
+pub fun mix_i64(k: i64): u64 {
+    var x = k as u64
+    x = x ^ (x >> 33)
+    x = x * 0xff51afd7ed558ccd
+    x = x ^ (x >> 33)
+    x = x * 0xc4ceb9fe1a85ec53
+    x = x ^ (x >> 33)
+    x
+}

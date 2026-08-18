@@ -95,7 +95,7 @@ pub fn run_sema_pipeline_or_exit(
     let mut ctx = InferContext::new(&mut type_arena, &mut sema_result);
 
     ctx.reset_state();
-    let root_env = ctx.env.root();
+    let root_env = ctx.sema_result.env.root();
     ctx.register_builtins(root_env);
 
     let module_logical_paths: Vec<String> = loader
@@ -326,7 +326,7 @@ pub fn run_sema_pipeline_lsp(
     let mut ctx = InferContext::new(&mut type_arena, &mut sema_result);
 
     ctx.reset_state();
-    let root_env = ctx.env.root();
+    let root_env = ctx.sema_result.env.root();
     ctx.register_builtins(root_env);
 
     let module_logical_paths: Vec<String> = loader
@@ -530,7 +530,7 @@ pub fn run_sema_incremental(
     // 3. Construct InferContext from existing state (preserves clean modules' sema products)
     let mut ctx = InferContext::from_existing(prev_type_arena, prev_sema_result);
     ctx.reset_state();
-    let root_env = ctx.env.root();
+    let root_env = ctx.sema_result.env.root();
     ctx.register_builtins(root_env);
 
     // Register module aliases for all loaded modules
@@ -542,7 +542,9 @@ pub fn run_sema_incremental(
     ctx.register_module_aliases(root_env, &module_logical_paths);
 
     // 4. Predeclare ALL modules into root_env (builtins first for name priority).
-    // from_existing creates a fresh env, so all symbol bindings must be restored.
+    // The env arena is shared (SemaResult.env) and module envs are reused via
+    // the shared module_envs table, so re-predeclaring redefines bindings in
+    // place — no fresh-env restore needed.
     for (_, m) in loader.builtin_modules() {
         ctx.predeclare_declarations(m, root_env);
     }

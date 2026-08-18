@@ -1,0 +1,6 @@
+// std/core/fmt package declaration
+//
+// Number formatting beyond "{x}" interpolation: integer radix conversion
+// (2..36, lowercase digits, "-" prefix), hex/oct/bin/dec conveniences, and
+// width padding. One import (`import std.core.fmt`) exposes the Fmt pack.
+pub pack Fmt

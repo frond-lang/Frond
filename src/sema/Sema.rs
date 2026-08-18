@@ -55,8 +55,13 @@ struct EnvNode {
 
 /// Type-environment arena: manages environment nodes by index, supports parent
 /// sharing, and uses no `Rc`/`RefCell`.
+///
+/// Nodes are append-only and NEVER freed: EnvIds are baked into arena types
+/// (ModuleRef carries its module's env), so removing nodes would invalidate
+/// live types. A full re-sema builds a fresh arena (SemaResult::new).
 pub struct EnvArena {
     envs: Vec<EnvNode>,
+    root_id: Option<EnvId>,
 }
 
 impl Default for EnvArena {
@@ -67,16 +72,21 @@ impl Default for EnvArena {
 
 impl EnvArena {
     pub fn new() -> Self {
-        EnvArena { envs: Vec::new() }
+        EnvArena { envs: Vec::new(), root_id: None }
     }
 
-    /// Create the top-level environment (no parent).
+    /// The top-level environment (no parent) — get-or-create, so every
+    /// caller across passes and incremental rechecks shares one root.
     pub fn root(&mut self) -> EnvId {
+        if let Some(id) = self.root_id {
+            return id;
+        }
         let id = EnvId(self.envs.len() as u32);
         self.envs.push(EnvNode {
             bindings: FxHashMap::default(),
             parent: None,
         });
+        self.root_id = Some(id);
         id
     }
 
@@ -399,6 +409,8 @@ pub struct FnSigRef {
 pub struct FuncSigInfo {
     /// Function name or mangled name (TypeName.method).
     pub name: Box<str>,
+    /// Owning module (registration-qualified; top-level funs only).
+    pub module_name: Box<str>,
     pub type_params: Box<[Box<str>]>,
     pub return_type: TypeHandle,
     /// Whether each parameter has `&T` reference semantics.
@@ -687,8 +699,29 @@ pub struct SemaResult {
     pub func_sigs: FxHashMap<u16, FuncSigInfo>,
     /// u16 index allocator for `func_sigs` (never recycles).
     pub next_func_sig_id: u16,
-    /// Function name → index into `func_sigs`.
+    /// Function name → index into `func_sigs` (module-qualified keys,
+    /// "module\x00name").
     pub func_sig_index: FxHashMap<String, u16>,
+    /// Bare function name → owning modules in registration order (bare-name
+    /// resolution for `get_func_sig`: unique owner wins, contested → first).
+    pub func_sig_owners: FxHashMap<String, Vec<String>>,
+    /// Shared variable/symbol environment arena (moved from InferContext).
+    ///
+    /// One arena for the whole compile: EnvIds baked into arena types
+    /// (ModuleRef carries its module's env) stay valid in EVERY context —
+    /// the temporary InferContext that monomorphization builds to re-infer
+    /// generic bodies used to have a private arena, so replayed HM-pass
+    /// types (instantiation mode resolves Idents through recorded
+    /// expr_types) indexed a 2-node arena with env ids from the original
+    /// pass and panicked (out of bounds) on any module-qualified call
+    /// inside a generic function body.
+    pub env: EnvArena,
+    /// Module path (dotted) → module-specific EnvId (shared with the env
+    /// arena). Kept across incremental rechecks so a re-checked module
+    /// REUSES its env and redefines bindings in place — EnvIds baked into
+    /// recorded types (ModuleRef) then resolve to the EDITED symbols, not
+    /// stale pre-edit bindings.
+    pub module_envs: FxHashMap<String, EnvId>,
     /// Coroutine metadata table.
     pub coroutine_metas: Vec<CoroutineMeta>,
     /// Constructor name → list of (type_def_index << 16 | ctor_index).
@@ -826,6 +859,9 @@ impl SemaResult {
             func_sigs: FxHashMap::default(),
             next_func_sig_id: 0,
             func_sig_index: FxHashMap::default(),
+            func_sig_owners: FxHashMap::default(),
+            env: EnvArena::new(),
+            module_envs: FxHashMap::default(),
             coroutine_metas: Vec::new(),
             ctor_def_index: FxHashMap::default(),
             import_aliases: FxHashMap::default(),
@@ -1026,9 +1062,10 @@ impl SemaResult {
         self.field_id_map.get(&key).copied()
     }
 
-    /// Look up a type definition by name.
+    /// Look up a type definition by name (concrete array names map to the
+    /// synthetic builtin "array" def — see `canonical_type_name`).
     pub fn get_type_def(&self, name: &str) -> Option<&TypeDefInfo> {
-        let idx = *self.type_def_index.get(name)?;
+        let idx = *self.type_def_index.get(Self::canonical_type_name(name))?;
         self.type_defs.get(&idx)
     }
 
@@ -1086,12 +1123,97 @@ impl SemaResult {
     define_table_registry!(put_trait_def, get_trait_def, trait_defs, trait_def_index, TraitDefInfo, next_trait_def_id);
 
     // ── Function signatures ──
-    define_table_registry!(put_func_sig, get_func_sig, func_sigs, func_sig_index, FuncSigInfo, next_func_sig_id);
+    // Module-qualified registry ("module\x00name") — hand-written, not the
+    // shared define_table_registry! macro. The legacy bare-name keying made
+    // same-named top-level functions in different modules collide:
+    // put_func_sig silently dropped every sig after the first (first-wins),
+    // and bare lookups then answered with the wrong module's flags/arity.
+    // Registration keys by (module, name); the bare-name `get_func_sig`
+    // resolves through the owner table (unique owner wins; contested names
+    // answer with the first-registered module — callers with module context
+    // use `get_func_sig_in`).
+
+    fn func_sig_qualified_key(module: &str, name: &str) -> String {
+        let mut k = String::with_capacity(module.len() + name.len() + 1);
+        k.push_str(module);
+        k.push('\x00');
+        k.push_str(name);
+        k
+    }
+
+    /// Insert a signature under its (module, name) key; returns `false` on a
+    /// same-module redefinition. The u16 index is allocated from
+    /// `next_func_sig_id` and never recycles.
+    pub fn put_func_sig(&mut self, sig: FuncSigInfo) -> bool {
+        let qualified = Self::func_sig_qualified_key(&sig.module_name, &sig.name);
+        if self.func_sig_index.contains_key(&qualified) {
+            return false;
+        }
+        assert!(
+            self.next_func_sig_id < u16::MAX,
+            "func_sigs index overflow: too many entries"
+        );
+        let idx = self.next_func_sig_id;
+        self.next_func_sig_id += 1;
+        self.func_sig_owners
+            .entry(sig.name.to_string())
+            .or_default()
+            .push(sig.module_name.to_string());
+        self.func_sig_index.insert(qualified, idx);
+        self.func_sigs.insert(idx, sig);
+        true
+    }
+
+    /// Bare-name lookup, STRICT: `Some` only when exactly one module defines
+    /// `name` — a contested name has no single correct answer, so it resolves
+    /// to `None` (no legacy first-registered fallback). Callers with module
+    /// context use `get_func_sig_in`; callers checking a property
+    /// conservatively use `func_sigs_named`.
+    pub fn get_func_sig(&self, name: &str) -> Option<&FuncSigInfo> {
+        let owners = self.func_sig_owners.get(name)?;
+        if owners.len() != 1 {
+            return None;
+        }
+        let module = owners.first()?;
+        let idx = *self
+            .func_sig_index
+            .get(&Self::func_sig_qualified_key(module, name))?;
+        self.func_sigs.get(&idx)
+    }
+
+    /// Every signature registered under a bare name (cross-module same-name
+    /// aware) — for conservative checks ("is ANY owner async/throwing") where
+    /// picking a single owner would be unsound.
+    pub fn func_sigs_named(&self, name: &str) -> Vec<&FuncSigInfo> {
+        match self.func_sig_owners.get(name) {
+            None => Vec::new(),
+            Some(owners) => owners
+                .iter()
+                .filter_map(|m| {
+                    let idx = *self
+                        .func_sig_index
+                        .get(&Self::func_sig_qualified_key(m, name))?;
+                    self.func_sigs.get(&idx)
+                })
+                .collect(),
+        }
+    }
+
+    /// Module-qualified lookup — the exact signature of `module`'s `name`.
+    pub fn get_func_sig_in(&self, module: &str, name: &str) -> Option<&FuncSigInfo> {
+        let idx = *self
+            .func_sig_index
+            .get(&Self::func_sig_qualified_key(module, name))?;
+        self.func_sigs.get(&idx)
+    }
 
     /// Record that a func_sig belongs to a module (for incremental purge).
-    /// Looks up the current index by name; call after a successful `put_func_sig`.
+    /// Looks up the current index by (module, name); call after a successful `put_func_sig`.
     pub fn record_func_sig_owner(&mut self, name: &str, module_name: &str) {
-        if let Some(&idx) = self.func_sig_index.get(name) {
+        if let Some(&idx) = self
+            .func_sig_index
+            .get(&Self::func_sig_qualified_key(module_name, name))
+        {
             self.module_ownership.func_sig_indices
                 .entry(module_name.to_string())
                 .or_default()
@@ -1119,13 +1241,24 @@ impl SemaResult {
     /// `method_subgraphs`. Returning `None` means the type has no such method
     /// (it may be a trait default method; consult the witness_table).
     pub fn lookup_method_idx(&self, type_name: &str, method_name: &str) -> Option<u16> {
-        let &type_idx = self.type_def_index.get(type_name)?;
+        let &type_idx = self.type_def_index.get(Self::canonical_type_name(type_name))?;
         let type_def = &self.type_defs[&type_idx];
         type_def
             .methods
             .iter()
             .position(|m| m.name.as_ref() == method_name)
             .map(|i| i as u16)
+    }
+
+    /// Canonical registry name for type-name-keyed lookups: concrete array
+    /// names ("u8[]", nested "u8[][]" — from ExprInfo.type_name /
+    /// expr_type_name) address the synthetic builtin "array" TypeDefInfo.
+    pub fn canonical_type_name(name: &str) -> &str {
+        if name.ends_with("[]") {
+            "array"
+        } else {
+            name
+        }
     }
 
     /// Get the method signature by `type_id` and `method_idx`.
@@ -1264,7 +1397,16 @@ impl SemaResult {
         if let Some(indices) = self.module_ownership.func_sig_indices.remove(module_name) {
             for idx in indices {
                 if let Some(sig) = self.func_sigs.remove(&idx) {
-                    self.func_sig_index.remove(sig.name.as_ref());
+                    // Qualified key + owner-list cleanup (see put_func_sig).
+                    self.func_sig_index.remove(
+                        Self::func_sig_qualified_key(&sig.module_name, &sig.name).as_str(),
+                    );
+                    if let Some(owners) = self.func_sig_owners.get_mut(sig.name.as_ref()) {
+                        owners.retain(|m| m != sig.module_name.as_ref());
+                        if owners.is_empty() {
+                            self.func_sig_owners.remove(sig.name.as_ref());
+                        }
+                    }
                 }
             }
         }
@@ -1864,7 +2006,7 @@ pub fn populate_sema_result_from_ast<'a>(
 ) -> bool {
     match &decl.node {
         Decl::FunDecl { name, type_params, params, return_type, is_async, .. } => {
-            if ast_fun_decl_to_func_sig(arena, sema_result, name, type_params, params, *return_type, *is_async, ast) {
+            if ast_fun_decl_to_func_sig(arena, sema_result, name, type_params, params, *return_type, *is_async, ast, module_name) {
                 sema_result.record_func_sig_owner(name, module_name);
                 true
             } else {
@@ -1947,9 +2089,8 @@ pub fn module_expr_key(module_name: &str, expr_id: u64) -> u64 {
 
 /// fun_decl → FuncSigInfo, registered into `sema_result.func_sigs`.
 ///
-/// Top-level functions are registered under their bare name. Methods inside a
-/// type block are registered with a mangled name `TypeName.method` via
-/// `ast_method_to_func_sig`.
+/// Top-level functions are registered under their module-qualified key
+/// (module, bare name) — see `put_func_sig`.
 fn ast_fun_decl_to_func_sig<'a>(
     arena: &mut TypeArena,
     sema_result: &mut SemaResult,
@@ -1959,9 +2100,10 @@ fn ast_fun_decl_to_func_sig<'a>(
     return_type: Option<AstTypeRef>,
     is_async: bool,
     ast: &AstArena<'a>,
+    module_name: &str,
 ) -> bool {
     let name: Box<str> = name.into();
-    ast_fun_decl_to_func_sig_inner(arena, sema_result, name, type_params, params, return_type, is_async, ast)
+    ast_fun_decl_to_func_sig_inner(arena, sema_result, name, type_params, params, return_type, is_async, ast, module_name)
 }
 
 /// Construct a `MethodSigInfo` from an AST `MethodDecl` (not registered into
@@ -2069,6 +2211,7 @@ fn ast_fun_decl_to_func_sig_inner<'a>(
     return_type: Option<AstTypeRef>,
     is_async: bool,
     ast: &AstArena<'a>,
+    module_name: &str,
 ) -> bool {
 
     // type_params: take each TypeParam's name.
@@ -2099,6 +2242,7 @@ fn ast_fun_decl_to_func_sig_inner<'a>(
 
     let sig = FuncSigInfo {
         name,
+        module_name: module_name.into(),
         type_params,
         return_type: return_ty,
         param_is_ref: param_is_ref.into_boxed_slice(),

@@ -945,6 +945,23 @@ impl TypeArena {
         }
     }
 
+    /// Owned, structure-aware type name: `Array` renders element-concretely
+    /// ("u8[]", nested "u8[][]"), everything else delegates to `type_name`.
+    /// `Ty::name()` cannot do this — its `&'static str` signature cannot
+    /// allocate, and the element DetailId lives in the arena, not the `Type`
+    /// (`Ty::name()` keeps "array" as the allocation-free last-resort
+    /// fallback).
+    pub fn type_name_concrete(&self, ty: TypeHandle) -> Option<String> {
+        if let Type::Array(_) = self.get(ty) {
+            let (elem, _size) = self.array_parts(ty);
+            let elem_name = self
+                .type_name_concrete(elem)
+                .unwrap_or_else(|| self.get(elem).name().to_string());
+            return Some(format!("{}[]", elem_name));
+        }
+        self.type_name(ty).map(|s| s.to_string())
+    }
+
     /// Construct a `TypeDisplay` wrapper, usable as `format!("{}", arena.display(h))`.
     #[inline]
     pub fn display(&self, ty: TypeHandle) -> TypeDisplay<'_> {

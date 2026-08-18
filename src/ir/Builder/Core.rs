@@ -1272,14 +1272,18 @@ impl<'a> IrBuilder<'a> {
         if cands.len() < 2 {
             return None;
         }
+        // Suggest the fully-qualified form of the first candidate: its head
+        // is the qualifier, the key's tail is the method (`A.f` + key "f" →
+        // "A.f(...)", not "f.f(...)").
+        let example = match cands.first().and_then(|c| c.rsplit_once('.')) {
+            Some((qual, _)) => format!("{}.{}(...)", qual, key.rsplit('.').next().unwrap_or(key)),
+            None => format!("{}(...)", key),
+        };
         Some(format!(
-            "ambiguous call '{}': [{}] — qualify the call (e.g. {}.{}(...))",
+            "ambiguous call '{}': [{}] — qualify the call (e.g. {})",
             key,
             cands.join(", "),
-            cands.first()
-                .and_then(|c| c.rsplit_once('.').map(|(_, tail)| tail))
-                .unwrap_or(key),
-            key.rsplit('.').next().unwrap_or(key),
+            example,
         ))
     }
 
@@ -1728,7 +1732,7 @@ impl<'a> IrBuilder<'a> {
         for inst in self.sema.monomorph_instances.iter().filter(|inst| !inst.type_args.is_empty()) {
             let mangled = format!("{}#{}", inst.func_name, inst.instance_id);
             if !self.func_subgraphs.contains_key(mangled.as_str()) {
-                let param_count = self.sema.get_func_sig(&inst.func_name)
+                let param_count = self.sema.get_func_sig_in(&inst.module_name, &inst.func_name)
                     .map(|sig| sig.param_is_ref.len() as u8)
                     .unwrap_or(0);
                 let sg_id = self.register_subgraph_placeholder(&mangled, param_count, inst.is_async);

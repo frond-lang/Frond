@@ -1680,9 +1680,11 @@ impl<'a> IrBuilder<'a> {
             .type_name
             .as_deref()
             .unwrap_or_else(|| self.type_arena.get(info.ty).name());
+        // Concrete array names ("u8[]") address the synthetic builtin "array"
+        // type def.
         self.sema
             .type_def_index
-            .get(type_name)
+            .get(crate::sema::Sema::SemaResult::canonical_type_name(type_name))
             .map(|&idx| crate::types::dynamic_type_id(idx))
     }
 

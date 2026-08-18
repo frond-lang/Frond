@@ -1,0 +1,34 @@
+// Adler32.frond — Adler-32 checksum (part of std.core.hash)
+//
+// zlib's companion checksum: two running sums mod 65521, packed s2:s1.
+// Per-byte modulo (zlib defers it in 5552-byte blocks for speed — same
+// values, this just spends a division per byte). adler32("") = 1.
+
+// Adler-32 via the generic entry: str and u8[] digest directly ("" = 1);
+// anything else sums as 0. (Named
+// adler32, not sum: the engine's monomorph cache keys generic
+// instantiations by bare name, so same-named generics across packs would
+// collide.)
+pub fun adler32<T>(data: T): u32 {
+    match data.type_name() {
+        "str" => {
+            val s = data as str
+            adler32_bytes(s.bytes())
+        },
+        "u8[]" => adler32_bytes(data as u8[]),
+        _ => 0
+    }
+}
+
+// Adler-32 of raw bytes — the algorithm's native input domain.
+pub fun adler32_bytes(data: u8[]): u32 {
+    var s1: u32 = 1
+    var s2: u32 = 0
+    var i: usize = 0
+    while i < data.len() {
+        s1 = (s1 + (data[i] as u32)) % 65521
+        s2 = (s2 + s1) % 65521
+        i = i + 1
+    }
+    (s2 << 16) | s1
+}

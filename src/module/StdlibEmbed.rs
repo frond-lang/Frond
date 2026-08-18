@@ -131,6 +131,15 @@ pub const STD_FILES: &[StdlibFile] = &[
     ("std/core/types/U128.frond", include_str!("../stdlib/std/core/types/U128.frond")),
     ("std/core/types/Usize.frond", include_str!("../stdlib/std/core/types/Usize.frond")),
     ("std/core/types/Isize.frond", include_str!("../stdlib/std/core/types/Isize.frond")),
+    // fmt sub-library of std/core: number formatting (radix 2..36, padding)
+    ("std/core/fmt/pack.frond", include_str!("../stdlib/std/core/fmt/pack.frond")),
+    ("std/core/fmt/Fmt.frond", include_str!("../stdlib/std/core/fmt/Fmt.frond")),
+    // hash sub-library of std/core: algorithm collection (FNV/CRC32/Adler32/xxHash64)
+    ("std/core/hash/pack.frond", include_str!("../stdlib/std/core/hash/pack.frond")),
+    ("std/core/hash/Hash.frond", include_str!("../stdlib/std/core/hash/Hash.frond")),
+    ("std/core/hash/Crc32.frond", include_str!("../stdlib/std/core/hash/Crc32.frond")),
+    ("std/core/hash/Adler32.frond", include_str!("../stdlib/std/core/hash/Adler32.frond")),
+    ("std/core/hash/Xxh64.frond", include_str!("../stdlib/std/core/hash/Xxh64.frond")),
     // rand module (PRNG wrappers over builtin/rand)
     ("std/rand/pack.frond", include_str!("../stdlib/std/rand/pack.frond")),
     ("std/rand/Rand.frond", include_str!("../stdlib/std/rand/Rand.frond")),

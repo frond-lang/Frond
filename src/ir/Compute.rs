@@ -174,6 +174,26 @@ fn reflect_kind_str(v: &Value) -> &'static str {
     }
 }
 
+/// Element-aware array type name: `"u8[]"`, `"i32[]"`, `"str[]"`,
+/// `"Point[]"`, nested `"u8[][]"`, ... Falls back to `"array"` when there
+/// are no elements to inspect (empty) or they are not uniform — type_name
+/// is reflect metadata, not a static type, so the element type is derived
+/// from the values (SoA stays parallel to `elements`, which is
+/// authoritative).
+fn array_type_name(arr: &crate::value::ArrayValue) -> String {
+    match arr.elements.first() {
+        None => TYPE_NAME_ARRAY.to_string(),
+        Some(first) => {
+            let first_name = reflect_type_name(first);
+            if arr.elements.iter().all(|e| reflect_type_name(e) == first_name) {
+                format!("{}[]", first_name)
+            } else {
+                TYPE_NAME_ARRAY.to_string()
+            }
+        }
+    }
+}
+
 /// Returns the type name of a `Value` (single source of truth, shared by FFI,
 /// fallback, and `cast_to_str`).
 fn reflect_type_name(v: &Value) -> String {
@@ -183,7 +203,7 @@ fn reflect_type_name(v: &Value) -> String {
         Value::Scalar(_, tag) => tag.type_name().to_string(),
         Value::Ref(r) => match &**r {
             crate::value::HeapObj::Str(_) => TYPE_NAME_STR.to_string(),
-            crate::value::HeapObj::Array(_) => TYPE_NAME_ARRAY.to_string(),
+            crate::value::HeapObj::Array(arr) => array_type_name(arr),
             crate::value::HeapObj::Record(rec) => rec.type_name.clone(),
             crate::value::HeapObj::Adt(a) => a.type_name.clone(),
             crate::value::HeapObj::Newtype(n) => n.type_name.clone(),
@@ -2164,13 +2184,28 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
         Value::Ref(r) => match r.as_ref() {
             HeapObj::Str(frond_str) => frond_str.bytes().to_string(),
             HeapObj::Array(arr) => {
-                // u8[] → str: extract bytes from SoA or elements
+                // u8[] → str: lossless when the bytes are valid UTF-8; str is
+                // UTF-8 by construction (Arc<str>), so invalid bytes are a
+                // programming error and fail loudly (previously they were
+                // silently replaced with U+FFFD, corrupting binary data).
                 use crate::value::ScalarSoA;
                 if let Some(ScalarSoA::U8(bytes)) = &arr.scalar_soa {
-                    String::from_utf8_lossy(bytes).into_owned()
+                    match String::from_utf8(bytes.clone()) {
+                        Ok(s) => s,
+                        Err(e) => panic!(
+                            "u8[] as str: invalid UTF-8 at byte {} — bytes are not text, keep them as u8[]",
+                            e.utf8_error().valid_up_to()
+                        ),
+                    }
                 } else if !arr.elem_is_ref {
                     let bytes: Vec<u8> = arr.elements.iter().map(|v| v.as_int_i128() as u8).collect();
-                    String::from_utf8_lossy(&bytes).into_owned()
+                    match String::from_utf8(bytes) {
+                        Ok(s) => s,
+                        Err(e) => panic!(
+                            "u8[] as str: invalid UTF-8 at byte {} — bytes are not text, keep them as u8[]",
+                            e.utf8_error().valid_up_to()
+                        ),
+                    }
                 } else {
                     "<non-scalar>".to_string()
                 }
@@ -2179,6 +2214,98 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
         },
     };
     Value::ref_val(HeapObj::Str(Str::new(s)))
+}
+
+/// Convert one scalar `Value` to the target tag (shared by the scalar and
+/// array casters: int↔int truncate/extend, int↔float, float↔float).
+fn cast_scalar_value(val: &Value, target_tag: crate::value::ValueTag) -> Value {
+    use crate::value::ValueTag;
+    // Whether the source value is a float.
+    let src_is_float = matches!(
+        val,
+        Value::Scalar(_, ValueTag::F16 | ValueTag::F32 | ValueTag::F64 | ValueTag::F128)
+    );
+    // Read the source value uniformly as f64: floats use `as_float_f64`, integers use `as_int_i128 as f64`.
+    let src_f64 = if src_is_float { val.as_float_f64() } else { val.as_int_i128() as f64 };
+
+    match target_tag {
+        ValueTag::I8 => Value::i8(if src_is_float { src_f64 as i8 } else { val.as_i8() }),
+        ValueTag::I16 => Value::i16(if src_is_float { src_f64 as i16 } else { val.as_i16() }),
+        ValueTag::I32 => Value::i32(if src_is_float { src_f64 as i32 } else { val.as_i32() }),
+        ValueTag::I64 => Value::i64(if src_is_float { src_f64 as i64 } else { val.as_i64() }),
+        ValueTag::I128 => Value::i128(if src_is_float { src_f64 as i128 } else { val.as_i128() }),
+        ValueTag::U8 => Value::u8(if src_is_float { src_f64 as u8 } else { val.as_u8() }),
+        ValueTag::U16 => Value::u16(if src_is_float { src_f64 as u16 } else { val.as_u16() }),
+        ValueTag::U32 => Value::u32(if src_is_float { src_f64 as u32 } else { val.as_u32() }),
+        ValueTag::U64 => Value::u64(if src_is_float { src_f64 as u64 } else { val.as_u64() }),
+        ValueTag::U128 => Value::u128(if src_is_float { src_f64 as u128 } else { val.as_u128() }),
+        ValueTag::Isize => Value::isize_val(if src_is_float { src_f64 as isize } else { val.as_isize() }),
+        ValueTag::Usize => Value::usize_val(if src_is_float { src_f64 as usize } else { val.as_usize() }),
+        ValueTag::F16 => Value::f16(crate::value::F16::from_f64(src_f64)),
+        ValueTag::F32 => Value::f32(src_f64 as f32),
+        ValueTag::F64 => Value::f64(src_f64),
+        // Use the precise `as_f128()` accessor: integer sources go through from_i128/from_u128, float sources go through to_f64 (already precisely rounded).
+        ValueTag::F128 => Value::f128(val.as_f128()),
+        ValueTag::Bool => Value::bool_val(if src_is_float { src_f64 != 0.0 } else { val.as_int_i128() != 0 }),
+        ValueTag::Char => Value::char_val(char_from_u32_or_nul(if src_is_float { src_f64 as u32 } else { val.as_int_i128() as u32 })),
+        _ => unreachable!("non-scalar target_tag {:?} in cast", target_tag),
+    }
+}
+
+/// compute_fn (idx 350): array cast — `x as T[]`.
+///
+/// Carries the array through: same-tag scalar elements pass the whole value
+/// untouched (SoA kept); different scalar element tags convert element-wise
+/// through the shared scalar caster; non-scalar element targets (str[],
+/// records, ...) are reference casts (passthrough). Null passes through.
+/// The previous lowering never reached a cast like this — array targets were
+/// misread as "i64" and the optimistic scalar cast destroyed the value.
+pub fn compute_cast_array(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::{ArrayValue, HeapObj, ValueTag};
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
+    let val = force_input(frame, inputs[0]);
+    if val.is_null() {
+        return Value::Null;
+    }
+    let target_ty = graph
+        .cast_target_type(node.0 as usize)
+        .expect("cast_array node has no target type");
+    let elem_name = target_ty.strip_suffix("[]").unwrap_or(&target_ty);
+    let target_tag = match ValueTag::from_name(elem_name) {
+        Some(tag) => tag,
+        // Non-scalar element target (str[], record arrays): reference cast.
+        None => return val.clone(),
+    };
+    let arr = match &val {
+        Value::Ref(r) => match r.as_ref() {
+            HeapObj::Array(a) => a,
+            // Permissive passthrough for nonsense casts (`x as i32[]` on a
+            // scalar), matching the legacy scalar-cast behavior these call
+            // sites used to get.
+            _ => return val.clone(),
+        },
+        _ => return val.clone(),
+    };
+    // Same-tag fast path (also covers empty arrays): value passes through.
+    let same_tag = arr
+        .elements
+        .first()
+        .map(|e| e.scalar_tag() == Some(target_tag))
+        .unwrap_or(true);
+    if same_tag {
+        return val.clone();
+    }
+    let elements: Vec<Value> = arr
+        .elements
+        .iter()
+        .map(|e| cast_scalar_value(e, target_tag))
+        .collect();
+    Value::ref_val(HeapObj::Array(ArrayValue {
+        elements,
+        fixed_size: arr.fixed_size,
+        elem_is_ref: false,
+        scalar_soa: None,
+    }))
 }
 
 /// compute_fn: generic type conversion — scalar → scalar (idx 278).
@@ -2211,37 +2338,7 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
             };
         }
     };
-
-    // Whether the source value is a float.
-    let src_is_float = matches!(
-        &val,
-        Value::Scalar(_, ValueTag::F16 | ValueTag::F32 | ValueTag::F64 | ValueTag::F128)
-    );
-    // Read the source value uniformly as f64: floats use `as_float_f64`, integers use `as_int_i128 as f64`.
-    let src_f64 = if src_is_float { val.as_float_f64() } else { val.as_int_i128() as f64 };
-
-    match target_tag {
-        ValueTag::I8 => Value::i8(if src_is_float { src_f64 as i8 } else { val.as_i8() }),
-        ValueTag::I16 => Value::i16(if src_is_float { src_f64 as i16 } else { val.as_i16() }),
-        ValueTag::I32 => Value::i32(if src_is_float { src_f64 as i32 } else { val.as_i32() }),
-        ValueTag::I64 => Value::i64(if src_is_float { src_f64 as i64 } else { val.as_i64() }),
-        ValueTag::I128 => Value::i128(if src_is_float { src_f64 as i128 } else { val.as_i128() }),
-        ValueTag::U8 => Value::u8(if src_is_float { src_f64 as u8 } else { val.as_u8() }),
-        ValueTag::U16 => Value::u16(if src_is_float { src_f64 as u16 } else { val.as_u16() }),
-        ValueTag::U32 => Value::u32(if src_is_float { src_f64 as u32 } else { val.as_u32() }),
-        ValueTag::U64 => Value::u64(if src_is_float { src_f64 as u64 } else { val.as_u64() }),
-        ValueTag::U128 => Value::u128(if src_is_float { src_f64 as u128 } else { val.as_u128() }),
-        ValueTag::Isize => Value::isize_val(if src_is_float { src_f64 as isize } else { val.as_isize() }),
-        ValueTag::Usize => Value::usize_val(if src_is_float { src_f64 as usize } else { val.as_usize() }),
-        ValueTag::F16 => Value::f16(crate::value::F16::from_f64(src_f64)),
-        ValueTag::F32 => Value::f32(src_f64 as f32),
-        ValueTag::F64 => Value::f64(src_f64),
-        // Use the precise `as_f128()` accessor: integer sources go through from_i128/from_u128, float sources go through to_f64 (already precisely rounded).
-        ValueTag::F128 => Value::f128(val.as_f128()),
-        ValueTag::Bool => Value::bool_val(if src_is_float { src_f64 != 0.0 } else { val.as_int_i128() != 0 }),
-        ValueTag::Char => Value::char_val(char_from_u32_or_nul(if src_is_float { src_f64 as u32 } else { val.as_int_i128() as u32 })),
-        _ => unreachable!("non-scalar target_tag {:?} in cast", target_tag),
-    }
+    cast_scalar_value(&val, target_tag)
 }
 
 /// compute_fn (idx 279): non-null assertion `expr!`.

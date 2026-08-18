@@ -1,8 +1,9 @@
 // HashMap.frond — K → V hash map with generic keys (part of std.collections)
 //
-// Any K works: keys hash by FNV-1a over their `"{k}"` representation (every
-// value formats) and compare with `==` (engine-level deep equality), so equal
-// keys always match — hash collisions only cost bucket walks. Records, ADTs,
+// Any K works: keys hash with Hash.key (std.core.hash: FNV-1a over the
+// `"{k}"` representation, every value formats) and compare with `==`
+// (engine-level deep equality), so equal keys always match — hash
+// collisions only cost bucket walks. Records, ADTs,
 // arrays, bool, str, scalars are all valid keys (NaN keys never match since
 // NaN != NaN; wrap them if needed).
 //
@@ -14,20 +15,9 @@
 //   m.set("a", 1)
 //   m.set(Point(1, 2), "origin")   // record key: compared by content
 
-pub type MapEntry<K, V> = MapEntry(pub key: K, pub value: V)
+import std.core.hash
 
-// FNV-1a over the key's printed representation.
-fun map_hash_key<K>(k: K): u64 {
-    val s = "{k}"
-    var h: u64 = 1469598103934665603
-    val b = s.bytes()
-    var i = 0 as usize
-    while i < b.len() {
-        h = (h ^ (b[i] as u64)) * 1099511628211
-        i = i + 1
-    }
-    h
-}
+pub type MapEntry<K, V> = MapEntry(pub key: K, pub value: V)
 
 type HashMap<K, V> = HashMap(buckets: MapEntry<K, V>[][], count: usize) {
 
@@ -36,7 +26,7 @@ type HashMap<K, V> = HashMap(buckets: MapEntry<K, V>[][], count: usize) {
     pub fun is_empty(): bool { count == 0 }
 
     pub fun has(key: K): bool {
-        val row = buckets[(map_hash_key(key) & ((buckets.len() - 1) as u64)) as usize]
+        val row = buckets[(Hash.key(key) & ((buckets.len() - 1) as u64)) as usize]
         var i = 0 as usize
         while i < row.len() {
             if row[i].key == key { return true }
@@ -46,7 +36,7 @@ type HashMap<K, V> = HashMap(buckets: MapEntry<K, V>[][], count: usize) {
     }
 
     pub fun get(key: K): V? {
-        val row = buckets[(map_hash_key(key) & ((buckets.len() - 1) as u64)) as usize]
+        val row = buckets[(Hash.key(key) & ((buckets.len() - 1) as u64)) as usize]
         var i = 0 as usize
         while i < row.len() {
             if row[i].key == key { return row[i].value }
@@ -56,7 +46,7 @@ type HashMap<K, V> = HashMap(buckets: MapEntry<K, V>[][], count: usize) {
     }
 
     pub fun &set(key: K, value: V): void {
-        val slot = (map_hash_key(key) & ((buckets.len() - 1) as u64)) as usize
+        val slot = (Hash.key(key) & ((buckets.len() - 1) as u64)) as usize
         val row = buckets[slot]
         var i = 0 as usize
         while i < row.len() {
@@ -72,7 +62,7 @@ type HashMap<K, V> = HashMap(buckets: MapEntry<K, V>[][], count: usize) {
     }
 
     pub fun &remove(key: K): bool {
-        val slot = (map_hash_key(key) & ((buckets.len() - 1) as u64)) as usize
+        val slot = (Hash.key(key) & ((buckets.len() - 1) as u64)) as usize
         val row = buckets[slot]
         var kept: MapEntry<K, V>[] = []
         var found = false
@@ -163,7 +153,7 @@ type HashMap<K, V> = HashMap(buckets: MapEntry<K, V>[][], count: usize) {
         var k = 0 as usize
         while k < all.len() {
             val e = all[k]
-            val slot = (map_hash_key(e.key) & ((buckets.len() - 1) as u64)) as usize
+            val slot = (Hash.key(e.key) & ((buckets.len() - 1) as u64)) as usize
             buckets[slot] = buckets[slot] ++ [e]
             k = k + 1
         }

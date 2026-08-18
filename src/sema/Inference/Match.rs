@@ -519,7 +519,7 @@ impl<'a> InferContext<'a> {
 
                 let mut arm_tys: Vec<TypeHandle> = Vec::new();
                 for arm in arms.iter() {
-                    let child_env = self.env.child(env);
+                    let child_env = self.sema_result.env.child(env);
 
                     // sema v2: enter the match-arm scope and apply ConstructorMatch narrowing.
                     self.flow_ctx.push_scope();
@@ -623,7 +623,7 @@ impl<'a> InferContext<'a> {
                         );
                     }
                 } else {
-                    self.env.define(env, name, expected_ty);
+                    self.sema_result.env.define(env, name, expected_ty);
                 }
             }
             Pattern::Constructor { name, patterns } => {

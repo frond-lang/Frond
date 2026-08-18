@@ -12,7 +12,7 @@ impl<'a> InferContext<'a> {
             vec![str_ty].into_boxed_slice(),
             void_ty,
         );
-        self.env.define(env, "Panic", panic_fn);
+        self.sema_result.env.define(env, "Panic", panic_fn);
 
         // type/type_name has been converted to a frond wrapper (see Reflect.frond::type_name).
         // Sema no longer registers the `type` builtin.
@@ -27,7 +27,7 @@ impl<'a> InferContext<'a> {
             vec![val_ty].into_boxed_slice(),
             throw_ty,
         );
-        self.env.define(env, "Ok", ok_fn);
+        self.sema_result.env.define(env, "Ok", ok_fn);
 
         // Numeric type constructors: i8/i16/.../f64 etc. as ∀T. (T) -> Self.
         // Registered with rigid vars; instantiated by instantiate_fn_type at call sites.
@@ -38,7 +38,7 @@ impl<'a> InferContext<'a> {
                 vec![param].into_boxed_slice(),
                 ret_ty,
             );
-            self.env.define(env, name, fn_ty);
+            self.sema_result.env.define(env, name, fn_ty);
         }
 
         // channel<T>(capacity: usize) -> Channel<T>
@@ -50,7 +50,7 @@ impl<'a> InferContext<'a> {
             vec![usize_ty].into_boxed_slice(),
             chan_ret,
         );
-        self.env.define(env, "channel", chan_fn);
+        self.sema_result.env.define(env, "channel", chan_fn);
     }
 
     // ── check_module ──
@@ -69,7 +69,7 @@ impl<'a> InferContext<'a> {
     /// Returns the EnvId corresponding to the given path.
     pub(super) fn ensure_module_env(&mut self, full_path: &str, root_env: EnvId) -> EnvId {
         // Cached: return directly.
-        if let Some(&eid) = self.module_envs.get(full_path) {
+        if let Some(&eid) = self.sema_result.module_envs.get(full_path) {
             return eid;
         }
         let segments: Vec<&str> = full_path.split('.').collect();
@@ -81,11 +81,11 @@ impl<'a> InferContext<'a> {
             }
             current_path.push_str(seg);
             // Env for the current path segment: reuse if present, otherwise create.
-            let env_id = if let Some(&eid) = self.module_envs.get(&current_path) {
+            let env_id = if let Some(&eid) = self.sema_result.module_envs.get(&current_path) {
                 eid
             } else {
-                let eid = self.env.child(parent_env);
-                self.module_envs.insert(current_path.clone(), eid);
+                let eid = self.sema_result.env.child(parent_env);
+                self.sema_result.module_envs.insert(current_path.clone(), eid);
                 eid
             };
             // Register the current segment's short name → ModuleRef in the parent env so that
@@ -96,7 +96,7 @@ impl<'a> InferContext<'a> {
                 env_id,
             );
             // Do not overwrite existing bindings (user's explicit import / constructor takes priority).
-            self.env.define(parent_env, seg, mod_ref_ty);
+            self.sema_result.env.define(parent_env, seg, mod_ref_ty);
             parent_env = env_id;
         }
         parent_env
@@ -121,7 +121,7 @@ impl<'a> InferContext<'a> {
         let sibling_prefix = format!("{}.", dir_prefix); // "std.math."
 
         // Iterate over sibling modules in module_envs that start with "std.math.".
-        for (path, &env_id) in self.module_envs.iter() {
+        for (path, &env_id) in self.sema_result.module_envs.iter() {
             if !path.starts_with(&sibling_prefix) {
                 continue;
             }
@@ -131,7 +131,7 @@ impl<'a> InferContext<'a> {
             if env_id == self_env {
                 continue; // Skip self env.
             }
-            if let Some(ty) = self.env.lookup_local(env_id, method) {
+            if let Some(ty) = self.sema_result.env.lookup_local(env_id, method) {
                 return Some(ty);
             }
         }
@@ -155,12 +155,12 @@ impl<'a> InferContext<'a> {
             if let Some(last_seg) = path.rsplit('.').next() {
                 if !last_seg.is_empty() && path.contains('.') {
                     // Do not overwrite existing bindings.
-                    if self.env.lookup(root_env, last_seg).is_none() {
+                    if self.sema_result.env.lookup(root_env, last_seg).is_none() {
                         let mod_ref_ty = self.arena.make_module_ref(
                             path.clone().into_boxed_str(),
                             module_env,
                         );
-                        self.env.define(root_env, last_seg, mod_ref_ty);
+                        self.sema_result.env.define(root_env, last_seg, mod_ref_ty);
                     }
                 }
             }
@@ -198,8 +198,8 @@ impl<'a> InferContext<'a> {
                     for item in items.iter() {
                         // Look up the symbol by bare name in the module env (does not traverse
                         // the parent env, to avoid importing global symbols).
-                        if let Some(sym_ty) = self.env.lookup_local(module_env, item.name) {
-                            self.env.define(env, item.alias.unwrap_or(item.name), sym_ty);
+                        if let Some(sym_ty) = self.sema_result.env.lookup_local(module_env, item.name) {
+                            self.sema_result.env.define(env, item.alias.unwrap_or(item.name), sym_ty);
                             // Register the alias for the IR binding layer
                             // (sema.import_aliases → IrBuilder's func_subgraphs /
                             // global_var_slots alias keys). Without this the
@@ -417,8 +417,8 @@ impl<'a> InferContext<'a> {
                     // Also register into root_env to make it globally visible (cross-module
                     // bare-name reference compatibility):
                     //   define does not overwrite existing bindings; the first registration wins.
-                    self.env.define(module_env, name, fn_ty);
-                    self.env.define(root_env, name, fn_ty);
+                    self.sema_result.env.define(module_env, name, fn_ty);
+                    self.sema_result.env.define(root_env, name, fn_ty);
                     // Generic function: pop type_bindings (symmetric with check_decl).
                     if !type_params.is_empty() {
                         self.pop_type_bindings();
@@ -441,7 +441,7 @@ impl<'a> InferContext<'a> {
                         crate::ast::Ast::TypeDef::Adt { constructors } => {
                             for ctor in constructors.iter() {
                                 let ctor_fn_ty = self.build_ctor_fn_type(ctor, name, &module.arena);
-                                self.env.redefine(root_env, ctor.name, ctor_fn_ty);
+                                self.sema_result.env.redefine(root_env, ctor.name, ctor_fn_ty);
                                 // Record constructor short name → module env (Zig @This semantics),
                                 // so `TypeName.free_func(args)` can fall back to lookup a
                                 // in-module free function.
@@ -455,7 +455,7 @@ impl<'a> InferContext<'a> {
                                 vec![inner_ty].into_boxed_slice(),
                                 self_ty,
                             );
-                            self.env.redefine(root_env, ctor_name, ctor_fn_ty);
+                            self.sema_result.env.redefine(root_env, ctor_name, ctor_fn_ty);
                             // Record constructor short name → module env (Zig @This semantics),
                             // so `TypeName.free_func(args)` can fall back to lookup a
                             // in-module free function.
@@ -660,7 +660,7 @@ impl<'a> InferContext<'a> {
                     );
                 }
                 // Create a child environment for the function.
-                let fn_env = self.env.child(env);
+                let fn_env = self.sema_result.env.child(env);
                 // Type parameter bindings.
                 if !type_params.is_empty() {
                     self.push_type_bindings(
@@ -684,7 +684,7 @@ impl<'a> InferContext<'a> {
                         Some(ta) => self.type_from_ast(ta, ast),
                         None => self.arena.fresh_type_var(),
                     };
-                    self.env.define(fn_env, p.name, param_ty);
+                    self.sema_result.env.define(fn_env, p.name, param_ty);
                     param_ty
                 }).collect();
                 // Return type (use fresh_type_var when unannotated; later unified with the body type).
@@ -705,8 +705,8 @@ impl<'a> InferContext<'a> {
                     param_types.into_boxed_slice(),
                     ret_ty,
                 );
-                self.env.define(fn_env, *name, fn_ty);
-                self.env.define(env, *name, fn_ty);
+                self.sema_result.env.define(fn_env, *name, fn_ty);
+                self.sema_result.env.define(env, *name, fn_ty);
                 // Set the expected return type.
                 let prev_return = self.expected_return;
                 self.expected_return = Some(ret_ty);
@@ -805,7 +805,7 @@ impl<'a> InferContext<'a> {
                             param_types.into_boxed_slice(),
                             self_ty,
                         );
-                        self.env.define(env, *name, fn_ty);
+                        self.sema_result.env.define(env, *name, fn_ty);
                     }
                     crate::ast::Ast::TypeDef::Adt { constructors } => {
                         for ctor in constructors {
@@ -821,7 +821,7 @@ impl<'a> InferContext<'a> {
                                     self_ty,
                                 )
                             };
-                            self.env.define(env, ctor.name, fn_ty);
+                            self.sema_result.env.define(env, ctor.name, fn_ty);
                         }
                     }
                     crate::ast::Ast::TypeDef::Alias { .. } | crate::ast::Ast::TypeDef::Newtype { .. } => {}
@@ -859,11 +859,11 @@ impl<'a> InferContext<'a> {
                         m_param_types.into_boxed_slice(),
                         m_ret_ty,
                     );
-                    self.env.define(env, method.name, m_fn_ty);
+                    self.sema_result.env.define(env, method.name, m_fn_ty);
                 }
                 for method in methods.iter() {
                     if let Some(body) = method.body {
-                        let method_env = self.env.child(env);
+                        let method_env = self.sema_result.env.child(env);
                         for param in method.params.iter() {
                             let param_ty = if self.is_this_param(param.type_annotation, ast) {
                                 self.infer_this_param(param.type_annotation, ast)
@@ -873,7 +873,7 @@ impl<'a> InferContext<'a> {
                                     None => self.arena.fresh_type_var(),
                                 }
                             };
-                            self.env.define(method_env, param.name, param_ty);
+                            self.sema_result.env.define(method_env, param.name, param_ty);
                         }
                         let prev_return = self.expected_return;
                         let ret_ty_raw = method.return_type.map(|rt| self.type_from_ast(rt, ast));
@@ -952,7 +952,7 @@ impl<'a> InferContext<'a> {
                 self.current_trait_name = Some((*name).to_string().into_boxed_str());
                 for method in methods.iter() {
                     if let Some(body) = method.body {
-                        let method_env = self.env.child(env);
+                        let method_env = self.sema_result.env.child(env);
                         for param in method.params.iter() {
                             let param_ty = if self.is_this_param(param.type_annotation, ast) {
                                 self.infer_this_param(param.type_annotation, ast)
@@ -962,7 +962,7 @@ impl<'a> InferContext<'a> {
                                     None => self.arena.fresh_type_var(),
                                 }
                             };
-                            self.env.define(method_env, param.name, param_ty);
+                            self.sema_result.env.define(method_env, param.name, param_ty);
                         }
                         let prev_return = self.expected_return;
                         let ret_ty_raw = method.return_type.map(|rt| self.type_from_ast(rt, ast));

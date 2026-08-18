@@ -470,6 +470,10 @@ compute_fn_ids! {
     347 => CF_GT_U128,
     348 => CF_LE_U128,
     349 => CF_GE_U128,
+    // ── Array cast (350): `x as T[]` — carries the array through, converts
+    //    scalar elements when tags differ, passes non-scalar targets as
+    //    reference casts.
+    350 => CF_CAST_ARRAY,
 }
 
 /// Number of entries in `build_compute_fn_table()`.
@@ -479,7 +483,7 @@ compute_fn_ids! {
 /// by a binary with a different table length is rejected at load instead of
 /// silently mis-dispatching node compute fns. `build_compute_fn_table()`
 /// asserts equality so this constant cannot drift silently.
-pub const COMPUTE_FN_TABLE_LEN: u32 = 350;
+pub const COMPUTE_FN_TABLE_LEN: u32 = 351;
 
 // =========================================================================
 // NodeKind — node category (not an op; 9 variants for readiness checks)
@@ -2169,6 +2173,8 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         347 => super::Compute::compute_gt_u128,
         348 => super::Compute::compute_le_u128,
         349 => super::Compute::compute_ge_u128,
+        // Array cast (350)
+        350 => super::Compute::compute_cast_array,
     };
     // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
     // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values
@@ -2299,7 +2305,7 @@ pub fn effect_class(cf: ComputeFnId) -> EffectClass {
         322 | 323 | 324 => Runtime, // defer register/run/block-register
         // ── Allocation (distinct object per run) ──
         29 | 31 | 40 | 44 | 45 | 262 | 263 | 264 | 266 | 267 | 268 | 269 | 272 | 273
-        | 277 | 280 | 283 | 286 | 288 | 289 | 290 | 291 | 319 | 320 | 321 => Alloc,
+        | 277 | 280 | 283 | 286 | 288 | 289 | 290 | 291 | 319 | 320 | 321 | 350 => Alloc,
         // ── Pure value metadata (kept out of CSE/LICM pending W2 validation) ──
         326..=333 | 336 => PureMeta,
         // CF_NOOP: parameter placeholder passthrough.

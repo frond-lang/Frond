@@ -32,7 +32,6 @@ pub struct InferContext<'a> {
     /// identifier/call resolves to an instance field/method. Consumed by infer_expr
     /// after store_expr_info to update the staged ExprInfo.
     pub pending_implicit_this: Option<(ExprId, crate::sema::Sema::ImplicitThisAccess)>,
-    pub env: EnvArena,
     /// Expected return type of the current function (used for reverse inference of throw expressions, etc.).
     pub expected_return: Option<TypeHandle>,
     /// sema v2: constraint solver (lazy solving + snapshot/rollback).
@@ -41,26 +40,13 @@ pub struct InferContext<'a> {
     pub flow_ctx: FlowContext,
     /// sema v2: witness table (static dispatch table for trait implementations).
     pub witness_table: WitnessTable,
-    /// Module path → module-specific EnvId mapping.
-    ///
-    /// Each module (including path prefixes) creates its own env at registration time (parent points to root_env or the parent path's env).
-    /// The module's functions/types are registered in this env. ModuleRef lookups search by bare name directly in the corresponding env, with no mangled name required.
-    ///
-    /// Hierarchical example:
-    ///   "std"            → env_std (parent=root_env), binds "io"→ModuleRef("std.io", env_std_io)
-    ///   "std.io"         → env_std_io (parent=env_std), binds "File"→ModuleRef("std.io.File", env_std_io_file)
-    ///   "std.io.File"    → env_std_io_file (parent=env_std_io), binds "open"→Fn(...)
-    ///
-    /// This makes lookups for `std.io.File.open(...)` fully structured through the env chain:
-    ///   std → env_std.lookup("io") → ModuleRef("std.io", env_std_io)
-    ///       → env_std_io.lookup("File") → ModuleRef("std.io.File", env_std_io_file)
-    ///       → Call: env_std_io_file.lookup("open") → Fn(...)
-    pub module_envs: FxHashMap<String, EnvId>,
     /// Logical path of the module currently being checked (e.g. "Math.Geometry"), used to register mangled names.
     /// Set at the start of check_module_with_env for use by methods like infer_stmt that do not take a module parameter.
     pub current_module_logical_path: Option<String>,
     /// Module-specific EnvId of the module currently being checked.
-    /// Looked up from module_envs at the start of check_module_with_env; used to register symbols during predeclare_declarations.
+    /// Looked up from the shared `sema_result.module_envs` at the start of
+    /// check_module_with_env; used to register symbols during
+    /// predeclare_declarations.
     pub current_module_env: Option<EnvId>,
     /// Filename of the module currently being checked (e.g. "Math/Geometry.frond"), used as part of the expr_types composite key.
     /// Prevents ExprIds from different modules from colliding in the global expr_types.
@@ -103,12 +89,10 @@ impl<'a> InferContext<'a> {
             type_binding_stack: TypeBindingStack::new(),
             this_binding_stack: ThisBindingStack::new(),
             pending_implicit_this: None,
-            env: EnvArena::new(),
             expected_return: None,
             solver: ConstraintSolver::new(),
             flow_ctx: FlowContext::new(),
             witness_table: WitnessTable::new(),
-            module_envs: FxHashMap::default(),
             current_module_logical_path: None,
             current_module_env: None,
             current_module_name: String::new(),
@@ -138,12 +122,10 @@ impl<'a> InferContext<'a> {
             type_binding_stack: TypeBindingStack::new(),
             this_binding_stack: ThisBindingStack::new(),
             pending_implicit_this: None,
-            env: EnvArena::new(),
             expected_return: None,
             solver: ConstraintSolver::new(),
             flow_ctx: FlowContext::new(),
             witness_table,
-            module_envs: FxHashMap::default(),
             current_module_logical_path: None,
             current_module_env: None,
             current_module_name: String::new(),
@@ -426,7 +408,7 @@ impl<'a> InferContext<'a> {
     pub fn check_module(&mut self, module: &Module<'_>) -> bool {
         // Single-module check: create a new root_env, register builtins, check the module.
         self.reset_state();
-        let root_env = self.env.root();
+        let root_env = self.sema_result.env.root();
         self.register_builtins(root_env);
         let all_modules = [module];
         self.check_module_with_env(module, root_env, &all_modules)

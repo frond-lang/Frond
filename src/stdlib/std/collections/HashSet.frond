@@ -1,21 +1,12 @@
 // HashSet.frond — generic hash set (part of std.collections)
 //
-// Same hashing scheme as HashMap<K, V>: FNV-1a over the key's `"{k}"`
-// representation plus `==` deep equality — any type works as an element.
-// add() reports whether the key was newly inserted. For i64 elements prefer
-// IntSet (integer hashing, no string formatting per operation).
+// Same hashing scheme as HashMap<K, V>: Hash.key (std.core.hash: FNV-1a
+// over the `"{k}"` representation) plus `==` deep equality — any type works
+// as an element. add() reports whether the key was newly inserted. For i64
+// elements prefer IntSet (integer hashing, no string formatting per
+// operation).
 
-fun set_hash_key<K>(k: K): u64 {
-    val s = "{k}"
-    var h: u64 = 1469598103934665603
-    val b = s.bytes()
-    var i = 0 as usize
-    while i < b.len() {
-        h = (h ^ (b[i] as u64)) * 1099511628211
-        i = i + 1
-    }
-    h
-}
+import std.core.hash
 
 type HashSet<K> = HashSet(buckets: K[][], count: usize) {
 
@@ -24,7 +15,7 @@ type HashSet<K> = HashSet(buckets: K[][], count: usize) {
     pub fun is_empty(): bool { count == 0 }
 
     pub fun has(key: K): bool {
-        val row = buckets[(set_hash_key(key) & ((buckets.len() - 1) as u64)) as usize]
+        val row = buckets[(Hash.key(key) & ((buckets.len() - 1) as u64)) as usize]
         var i = 0 as usize
         while i < row.len() {
             if row[i] == key { return true }
@@ -35,7 +26,7 @@ type HashSet<K> = HashSet(buckets: K[][], count: usize) {
 
     // Returns true when the key was newly inserted, false when it was present.
     pub fun &add(key: K): bool {
-        val slot = (set_hash_key(key) & ((buckets.len() - 1) as u64)) as usize
+        val slot = (Hash.key(key) & ((buckets.len() - 1) as u64)) as usize
         val row = buckets[slot]
         var i = 0 as usize
         while i < row.len() {
@@ -49,7 +40,7 @@ type HashSet<K> = HashSet(buckets: K[][], count: usize) {
     }
 
     pub fun &remove(key: K): bool {
-        val slot = (set_hash_key(key) & ((buckets.len() - 1) as u64)) as usize
+        val slot = (Hash.key(key) & ((buckets.len() - 1) as u64)) as usize
         val row = buckets[slot]
         var kept: K[] = []
         var found = false
@@ -122,7 +113,7 @@ type HashSet<K> = HashSet(buckets: K[][], count: usize) {
         var k = 0 as usize
         while k < all.len() {
             val key = all[k]
-            val slot = (set_hash_key(key) & ((buckets.len() - 1) as u64)) as usize
+            val slot = (Hash.key(key) & ((buckets.len() - 1) as u64)) as usize
             buckets[slot] = buckets[slot] ++ [key]
             k = k + 1
         }

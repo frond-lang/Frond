@@ -15,7 +15,10 @@ impl<'a> InferContext<'a> {
     pub(super) fn store_expr_info(&mut self, expr: ExprId, ty: TypeHandle) {
         let resolved = self.arena.resolve(ty);
         let ct = self.arena.get(resolved);
-        let type_name: Option<String> = self.arena.type_name(resolved).map(|s| s.to_string());
+        // Concrete name: arrays render element-concretely ("u8[]") instead of
+        // the bare "array" (ExprInfo.type_name feeds the IR builder's
+        // expr_type_name).
+        let type_name: Option<String> = self.arena.type_name_concrete(resolved);
         let is_ref = matches!(ct, Type::Ref(_));
         let is_raw_ref = matches!(ct, Type::Ref(_)) && self.arena.ref_parts(resolved).1;
 

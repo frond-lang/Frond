@@ -1,0 +1,119 @@
+// Xxh64.frond — xxHash64 (part of std.core.hash)
+//
+// xxHash64 with seed 0 (spec: github.com/Cyan4973/xxHash): the standard
+// fast non-crypto digest. Inputs >= 32 bytes take the 4-lane stripe path;
+// the tail consumes 8/4/1-byte lanes, then an fmix-style avalanche. All
+// rotations are fixed spec constants, spelled as literal shifts. Not
+// cryptographic. Spec vectors: xxh64("") = 0xEF46DB3751D8E999,
+// sum("a") = 0xD24EC4F1A98C6E5B.
+
+val P1: u64 = 0x9E3779B185EBCA87
+val P2: u64 = 0xC2B2AE3D27D4EB4F
+val P3: u64 = 0x165667B19E3779F9
+val P4: u64 = 0x85EBCA77C2B2AE63
+val P5: u64 = 0x27D4EB2F165667C5
+
+// Fixed rotations used by the spec (literal shift amounts, no table).
+@internal fun rotl1(x: u64): u64 { (x << 1) | (x >> 63) }
+@internal fun rotl7(x: u64): u64 { (x << 7) | (x >> 57) }
+@internal fun rotl11(x: u64): u64 { (x << 11) | (x >> 53) }
+@internal fun rotl12(x: u64): u64 { (x << 12) | (x >> 52) }
+@internal fun rotl18(x: u64): u64 { (x << 18) | (x >> 46) }
+@internal fun rotl23(x: u64): u64 { (x << 23) | (x >> 41) }
+@internal fun rotl27(x: u64): u64 { (x << 27) | (x >> 37) }
+@internal fun rotl31(x: u64): u64 { (x << 31) | (x >> 33) }
+
+// Stripe round: acc = rotl31(acc + lane*P2) * P1.
+@internal
+fun round_lane(acc: u64, lane: u64): u64 {
+    rotl31(acc + lane * P2) * P1
+}
+
+// Merge a finished lane into the accumulator.
+@internal
+fun merge_lane(acc: u64, lane: u64): u64 {
+    (acc ^ round_lane(0, lane)) * P1 + P4
+}
+
+// Little-endian 8-byte lane at offset i (caller guarantees the bounds).
+@internal
+fun read_u64_le(b: u8[], i: usize): u64 {
+    var v = b[i] as u64
+    v = v | ((b[i + 1] as u64) << 8)
+    v = v | ((b[i + 2] as u64) << 16)
+    v = v | ((b[i + 3] as u64) << 24)
+    v = v | ((b[i + 4] as u64) << 32)
+    v = v | ((b[i + 5] as u64) << 40)
+    v = v | ((b[i + 6] as u64) << 48)
+    v = v | ((b[i + 7] as u64) << 56)
+    v
+}
+
+// Little-endian 4-byte lane at offset i (caller guarantees the bounds).
+@internal
+fun read_u32_le(b: u8[], i: usize): u32 {
+    var v = b[i] as u32
+    v = v | ((b[i + 1] as u32) << 8)
+    v = v | ((b[i + 2] as u32) << 16)
+    v = v | ((b[i + 3] as u32) << 24)
+    v
+}
+
+// xxHash64 (seed 0) via the generic entry: str and u8[] digest directly;
+// anything else sums as 0. (Named xxh64,
+// not sum: the engine's monomorph cache keys generic instantiations by
+// bare name, so same-named generics across packs would collide.)
+pub fun xxh64<T>(data: T): u64 {
+    match data.type_name() {
+        "str" => {
+            val s = data as str
+            xxh64_bytes(s.bytes())
+        },
+        "u8[]" => xxh64_bytes(data as u8[]),
+        _ => 0
+    }
+}
+
+// xxHash64 (seed 0) of raw bytes — the algorithm's native input domain.
+pub fun xxh64_bytes(data: u8[]): u64 {
+    val n = data.len()
+    var i: usize = 0
+    var h: u64 = P5
+    if n >= 32 {
+        var v1: u64 = P1 + P2
+        var v2: u64 = P2
+        var v3: u64 = 0
+        var v4: u64 = 0 - P2
+        while i + 32 <= n {
+            v1 = round_lane(v1, read_u64_le(data, i))
+            v2 = round_lane(v2, read_u64_le(data, i + 8))
+            v3 = round_lane(v3, read_u64_le(data, i + 16))
+            v4 = round_lane(v4, read_u64_le(data, i + 24))
+            i = i + 32
+        }
+        h = rotl1(v1) + rotl7(v2) + rotl12(v3) + rotl18(v4)
+        h = merge_lane(h, v1)
+        h = merge_lane(h, v2)
+        h = merge_lane(h, v3)
+        h = merge_lane(h, v4)
+    }
+    h = h + (n as u64)
+    while i + 8 <= n {
+        h = rotl27(h ^ round_lane(0, read_u64_le(data, i))) * P1 + P4
+        i = i + 8
+    }
+    if i + 4 <= n {
+        h = rotl23(h ^ ((read_u32_le(data, i) as u64) * P1)) * P2 + P3
+        i = i + 4
+    }
+    while i < n {
+        h = rotl11(h ^ ((data[i] as u64) * P5)) * P1
+        i = i + 1
+    }
+    h = h ^ (h >> 33)
+    h = h * P2
+    h = h ^ (h >> 29)
+    h = h * P3
+    h = h ^ (h >> 32)
+    h
+}

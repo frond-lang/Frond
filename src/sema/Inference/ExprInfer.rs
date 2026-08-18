@@ -179,7 +179,7 @@ impl<'a> InferContext<'a> {
                 let recv_resolved = self.arena.resolve(recv_ty);
                 if let Type::ModuleRef(_) = self.arena.get(recv_resolved) {
                     let (path, module_env) = self.arena.module_ref_parts(recv_resolved);
-                    if self.env.lookup_local(module_env, field).is_some() {
+                    if self.sema_result.env.lookup_local(module_env, field).is_some() {
                         let mangled = format!("{}.{}", path, field);
                         let recv_key = crate::sema::Sema::module_expr_key(
                             &self.current_module_name,
@@ -415,7 +415,7 @@ impl<'a> InferContext<'a> {
                 if return_type.is_none() {
                     self.add_error("lambda requires an explicit return type annotation: fun(params): T { ... }");
                 }
-                let child_env = self.env.child(env);
+                let child_env = self.sema_result.env.child(env);
                 let param_types: Vec<TypeHandle> = params
                     .iter()
                     .map(|p| {
@@ -423,7 +423,7 @@ impl<'a> InferContext<'a> {
                             Some(ta) => self.type_from_ast(ta, ast),
                             None => self.arena.fresh_type_var(),
                         };
-                        self.env.define(child_env, p.name, param_ty);
+                        self.sema_result.env.define(child_env, p.name, param_ty);
                         param_ty
                     })
                     .collect();
@@ -515,10 +515,10 @@ impl<'a> InferContext<'a> {
                     ast,
                     *cond,
                     env,
-                    &self.env,
+                    &self.sema_result.env,
                 );
 
-                let then_env = self.env.child(env);
+                let then_env = self.sema_result.env.child(env);
                 // Enter the then scope and apply the then facts.
                 self.flow_ctx.push_scope();
                 for fact in &then_facts {
@@ -528,7 +528,7 @@ impl<'a> InferContext<'a> {
                 self.flow_ctx.pop_scope();
 
                 if let Some(else_br) = else_branch {
-                    let else_env = self.env.child(env);
+                    let else_env = self.sema_result.env.child(env);
                     // Enter the else scope and apply the else facts.
                     self.flow_ctx.push_scope();
                     for fact in &else_facts {
@@ -552,7 +552,7 @@ impl<'a> InferContext<'a> {
 
             // ── Block expressions ──
             Expr::Block { stmts, trailing } => {
-                let child_env = self.env.child(env);
+                let child_env = self.sema_result.env.child(env);
                 let mut diverges = false;
                 for &stmt in stmts.iter() {
                     if diverges {
@@ -622,7 +622,7 @@ impl<'a> InferContext<'a> {
             Expr::Select(arms) => {
                 let mut arm_tys: Vec<TypeHandle> = Vec::new();
                 for arm in arms.iter() {
-                    let child_env = self.env.child(env);
+                    let child_env = self.sema_result.env.child(env);
                     self.flow_ctx.push_scope();
                     match arm {
                         crate::ast::Ast::SelectArm::Receive { channel_expr, binding, body } => {
@@ -644,7 +644,7 @@ impl<'a> InferContext<'a> {
                                 _ => chan_ty,
                             };
                             if let Some(name) = binding {
-                                let _ = self.env.define(child_env, name, elem_ty);
+                                let _ = self.sema_result.env.define(child_env, name, elem_ty);
                             }
                             let body_ty = self.infer_expr(*body, ast, child_env, None);
                             arm_tys.push(body_ty);
@@ -759,7 +759,7 @@ impl<'a> InferContext<'a> {
                 let this_ty_opt = self.current_this_type();
                 if let Some(this_ty) = this_ty_opt {
                     // 1. Local variables and parameters only.
-                    if let Some(scheme) = self.env.lookup_local(env, name) {
+                    if let Some(scheme) = self.sema_result.env.lookup_local(env, name) {
                         return self.freshen_type(scheme);
                     }
                     let is_typevar = matches!(
@@ -777,7 +777,7 @@ impl<'a> InferContext<'a> {
                         }
                     }
                     // 3. Full lookup (methods registered in parent env, top-level functions).
-                    if let Some(scheme) = self.env.lookup(env, name) {
+                    if let Some(scheme) = self.sema_result.env.lookup(env, name) {
                         return self.freshen_type(scheme);
                     }
                     // 4. Trait default methods: permissive field fallback (TypeVar can't
@@ -793,7 +793,7 @@ impl<'a> InferContext<'a> {
                     }
                 } else {
                     // Outside methods: full env lookup.
-                    if let Some(scheme) = self.env.lookup(env, name) {
+                    if let Some(scheme) = self.sema_result.env.lookup(env, name) {
                         return self.freshen_type(scheme);
                     }
                 }
@@ -1100,13 +1100,13 @@ impl<'a> InferContext<'a> {
                     // This is the data source for IR-compile-time type queries (e.g. str + str → concat).
                     for m in methods.iter() {
                         if let Some(body) = m.body {
-                            let method_env = self.env.child(env);
+                            let method_env = self.sema_result.env.child(env);
                             for param in m.params.iter() {
                                 let param_ty = match param.type_annotation {
                                     Some(ta) => self.type_from_ast(ta, ast),
                                     None => self.arena.fresh_type_var(),
                                 };
-                                self.env.define(method_env, param.name, param_ty);
+                                self.sema_result.env.define(method_env, param.name, param_ty);
                             }
                             let prev_return = self.expected_return;
                             self.expected_return =

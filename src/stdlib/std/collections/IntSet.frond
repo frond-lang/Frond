@@ -1,17 +1,9 @@
 // IntSet.frond — i64 hash set (part of std.collections)
 //
-// Same table shape as HashSet; keys hash through the splitmix64-style mixer
-// so dense and negative key patterns spread evenly.
+// Same table shape as HashSet; keys hash through Hash.mix_i64 (std.core.hash
+// fmix64 mixer) so dense and negative key patterns spread evenly.
 
-fun set_mix_i64(k: i64): u64 {
-    var x = k as u64
-    x = x ^ (x >> 33)
-    x = x * 0xff51afd7ed558ccd
-    x = x ^ (x >> 33)
-    x = x * 0xc4ceb9fe1a85ec53
-    x = x ^ (x >> 33)
-    x
-}
+import std.core.hash
 
 type IntSet = IntSet(buckets: i64[][], count: usize) {
 
@@ -20,7 +12,7 @@ type IntSet = IntSet(buckets: i64[][], count: usize) {
     pub fun is_empty(): bool { count == 0 }
 
     pub fun has(key: i64): bool {
-        val row = buckets[(set_mix_i64(key) & ((buckets.len() - 1) as u64)) as usize]
+        val row = buckets[(Hash.mix_i64(key) & ((buckets.len() - 1) as u64)) as usize]
         var i = 0 as usize
         while i < row.len() {
             if row[i] == key { return true }
@@ -31,7 +23,7 @@ type IntSet = IntSet(buckets: i64[][], count: usize) {
 
     // Returns true when the key was newly inserted, false when it was present.
     pub fun &add(key: i64): bool {
-        val slot = (set_mix_i64(key) & ((buckets.len() - 1) as u64)) as usize
+        val slot = (Hash.mix_i64(key) & ((buckets.len() - 1) as u64)) as usize
         val row = buckets[slot]
         var i = 0 as usize
         while i < row.len() {
@@ -45,7 +37,7 @@ type IntSet = IntSet(buckets: i64[][], count: usize) {
     }
 
     pub fun &remove(key: i64): bool {
-        val slot = (set_mix_i64(key) & ((buckets.len() - 1) as u64)) as usize
+        val slot = (Hash.mix_i64(key) & ((buckets.len() - 1) as u64)) as usize
         val row = buckets[slot]
         var kept: i64[] = []
         var found = false
@@ -118,7 +110,7 @@ type IntSet = IntSet(buckets: i64[][], count: usize) {
         var k = 0 as usize
         while k < all.len() {
             val key = all[k]
-            val slot = (set_mix_i64(key) & ((buckets.len() - 1) as u64)) as usize
+            val slot = (Hash.mix_i64(key) & ((buckets.len() - 1) as u64)) as usize
             buckets[slot] = buckets[slot] ++ [key]
             k = k + 1
         }

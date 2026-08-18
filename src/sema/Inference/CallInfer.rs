@@ -183,7 +183,7 @@ impl<'a> InferContext<'a> {
                     if let Type::ModuleRef(_) = self.arena.get(resolved_callee) {
                         let (path, module_env) = self.arena.module_ref_parts(resolved_callee);
                         if let Some(func_name) = path.rsplit('.').next() {
-                            if let Some(fn_ty) = self.env.lookup_local(module_env, func_name) {
+                            if let Some(fn_ty) = self.sema_result.env.lookup_local(module_env, func_name) {
                                 let inst_fn = self.instantiate_fn_type(fn_ty);
                                 if let Type::Fn(_) = self.arena.get(inst_fn) {
                                     let (params, return_type) = self.arena.fn_parts(inst_fn);
@@ -230,7 +230,7 @@ impl<'a> InferContext<'a> {
                     let (path, module_env) = self.arena.module_ref_parts(resolved_callee);
                     // The trailing segment is the function name (e.g. "std.reflect.Reflect.format" → "format").
                     if let Some(func_name) = path.rsplit('.').next() {
-                        if let Some(fn_ty) = self.env.lookup_local(module_env, func_name) {
+                        if let Some(fn_ty) = self.sema_result.env.lookup_local(module_env, func_name) {
                             // Instantiate the polymorphic function type to avoid type-constraint clashes across calls.
                             let inst_fn = self.instantiate_fn_type(fn_ty);
                             if let Type::Fn(_) = self.arena.get(inst_fn) {
@@ -312,7 +312,7 @@ impl<'a> InferContext<'a> {
                 // BEFORE receiver inference. A local binding named `Lib` shadows it.
                 if let Expr::Ident("Lib") = &ast.expr(*recv).node {
                     let shadowed = self
-                        .env
+                        .sema_result.env
                         .lookup_with_pred(env, "Lib", |_| true)
                         .is_some();
                     if !shadowed && (*method == "open" || *method == "embed") {
@@ -405,7 +405,7 @@ impl<'a> InferContext<'a> {
                 let recv_resolved_0a = self.arena.resolve(recv_ty);
                 if let Type::ModuleRef(_) = self.arena.get(recv_resolved_0a) {
                     let (mod_path, module_env) = self.arena.module_ref_parts(recv_resolved_0a);
-                    let found = self.env.lookup_local(module_env, method);
+                    let found = self.sema_result.env.lookup_local(module_env, method);
                     // Directory-module semantics: when lookup_local misses in the current module env,
                     // search sibling modules in the same directory (e.g. Math.sqrt where sqrt lives in Power.frond,
                     // with Math and Power both under the std.math directory).
@@ -445,7 +445,7 @@ impl<'a> InferContext<'a> {
                     if let Type::Adt(_) = self.arena.get(ret_resolved) {
                         let (type_name, _) = self.arena.adt_parts(ret_resolved);
                         if let Some(&mod_env) = self.ctor_module_envs.get(type_name) {
-                            if let Some(fn_ty) = self.env.lookup_local(mod_env, method) {
+                            if let Some(fn_ty) = self.sema_result.env.lookup_local(mod_env, method) {
                                 // Guard: `TypeName.method(args)` must not dispatch to a TYPE
                                 // method. Type methods carry an implicit `this` at param slot 0
                                 // while this call site passes no receiver, so the IR would land
@@ -548,7 +548,7 @@ impl<'a> InferContext<'a> {
                 // Path 0 (fallback): look up a binding named after the method as an Fn type in env (free function with a self parameter).
                 // Use lookup_with_pred to skip same-named non-function bindings (e.g. a local variable shadowing a free function).
                 // In Frond `recv.method(args)` is sugar for `method(recv, args)`.
-                if let Some(fn_ty) = self.env.lookup_with_pred(env, method, |ty| {
+                if let Some(fn_ty) = self.sema_result.env.lookup_with_pred(env, method, |ty| {
                     let r = self.arena.resolve(ty);
                     matches!(self.arena.get(r), Type::Fn(_))
                 }) {
@@ -1266,7 +1266,7 @@ impl<'a> InferContext<'a> {
         // On miss, report an error; no string concatenation or prefix check is needed.
         if let Type::ModuleRef(_) = self.arena.get(resolved) {
             let (path, module_env) = self.arena.module_ref_parts(resolved);
-            if let Some(sym_ty) = self.env.lookup_local(module_env, field) {
+            if let Some(sym_ty) = self.sema_result.env.lookup_local(module_env, field) {
                 return sym_ty;
             }
             self.add_error_at(
