@@ -10,6 +10,26 @@ impl<'a> IrBuilder<'a> {
         expr_id: crate::ast::Ast::ExprId,
         name: &str,
     ) -> NodeId {
+        // Static reference rebinding: after `&x` registered this binding, name
+        // reads route through the shared Cell (CF_DEREF_READ on the RefOf
+        // node), so `*r = v` writes are observed in source order.
+        // `current_effect` is appended as a DIRECT input (scheduler-ordering
+        // only — the compute fn reads inputs[0]): a CF_SEQ wrapper would not
+        // stop the read from firing before a prior cell/deref write (the SEQ
+        // merely waits for both, it does not order input computation). Same
+        // pattern as `compile_global_load`.
+        if let Some(entry) = self.ref_rebind_active(name) {
+            let (input_count, inputs_offset) = match self.current_effect {
+                Some(eff) => (2, self.graph.inputs_pool.push(&[entry.ref_node, eff])),
+                None => (1, self.graph.inputs_pool.push(&[entry.ref_node])),
+            };
+            return self.graph.add_node(Node {
+                kind: NodeKind::UnOp,
+                input_count,
+                inputs_offset,
+                compute_fn: CF_DEREF_READ,
+            });
+        }
         match self.lookup_var(name) {
             Some(node_id) => {
                 // When `current_effect` exists, create a CF_SEQ dependency node to ensure the
@@ -89,6 +109,24 @@ impl<'a> IrBuilder<'a> {
         let target_expr = &self.current_module().arena.expr(target).node;
         match target_expr {
             crate::ast::Ast::Expr::Ident(name) => {
+                // Static reference rebinding (mirror of Stmt::Assignment): `x = v`
+                // where `&x` registered this binding writes through the shared
+                // Cell; no rebind (reads route through the cell). Effect rides
+                // as a direct trailing input (scheduler ordering only).
+                if let Some(entry) = self.ref_rebind_active(name) {
+                    let (input_count, inputs_offset) = match self.current_effect {
+                        Some(eff) => (3, self.graph.inputs_pool.push(&[entry.ref_node, val_node, eff])),
+                        None => (2, self.graph.inputs_pool.push(&[entry.ref_node, val_node])),
+                    };
+                    let write_node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count,
+                        inputs_offset,
+                        compute_fn: CF_DEREF_WRITE,
+                    });
+                    self.current_effect = Some(write_node);
+                    return self.compile_void_const();
+                }
                 // Implicit-this field assignment: `field = value` inside a method body
                 // resolves to `this.field = value`. Without this, the bare name would
                 // create a local binding instead of mutating the instance field.

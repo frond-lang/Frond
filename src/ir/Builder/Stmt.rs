@@ -251,7 +251,54 @@ impl<'a> IrBuilder<'a> {
                     });
                     return Some(store_node);
                 }
+                // `*ref = value` → CF_DEREF_WRITE through the shared Cell.
+                // MUST return the node: falling through to None silently
+                // dropped the store (this branch was missing entirely — the
+                // Assign.rs copy serves a different, unreachable path — so
+                // `*r = v` never emitted a node and never executed).
+                // `current_effect` rides as a direct trailing input (scheduler
+                // ordering only): consecutive deref writes must not fire out
+                // of order (the value-side chain does not order the write
+                // itself).
+                if let crate::ast::Ast::Expr::Deref(ref_inner) = target_expr {
+                    let ref_node = self.compile_subexpr(*ref_inner);
+                    let (input_count, inputs_offset) = match self.current_effect {
+                        Some(eff) => (3, self.graph.inputs_pool.push(&[ref_node, val_node, eff])),
+                        None => (2, self.graph.inputs_pool.push(&[ref_node, val_node])),
+                    };
+                    let write_node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count,
+                        inputs_offset,
+                        compute_fn: CF_DEREF_WRITE,
+                    });
+                    return Some(write_node);
+                }
                 if let crate::ast::Ast::Expr::Ident(name) = target_expr {
+                    // Static reference rebinding: `x = v` where `&x` registered
+                    // this binding — write through the shared Cell (same node
+                    // shape as `*r = v`) and do NOT rebind the name: reads
+                    // route through the cell, and a rebind would fork the two
+                    // stores (plain node vs cell). `current_effect` is a
+                    // direct trailing input (scheduler ordering only): without
+                    // it, consecutive cell writes could fire out of order and
+                    // the LAST-scheduled write would win.
+                    if let Some(entry) = self.ref_rebind_active(name) {
+                        let (input_count, inputs_offset) = match self.current_effect {
+                            Some(eff) => (
+                                3,
+                                self.graph.inputs_pool.push(&[entry.ref_node, val_node, eff]),
+                            ),
+                            None => (2, self.graph.inputs_pool.push(&[entry.ref_node, val_node])),
+                        };
+                        let write_node = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count,
+                            inputs_offset,
+                            compute_fn: CF_DEREF_WRITE,
+                        });
+                        return Some(write_node);
+                    }
                     // Implicit-this field assignment: `field = value` inside a method body
                     // resolves to `this.field = value`.
                     if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) = self.expr_implicit_this(*target).cloned() {
@@ -342,9 +389,97 @@ impl<'a> IrBuilder<'a> {
             }
             crate::ast::Ast::Stmt::CompoundAssignment { target, op, value } => {
                 let target_expr = &self.current_module().arena.expr(*target).node;
+                // `*ref op= value` → deref-read, op, deref-write through the
+                // shared Cell (statement-level branch; previously missing, the
+                // compound store was silently dropped).
+                if let crate::ast::Ast::Expr::Deref(ref_inner) = target_expr {
+                    let raw_val = self.compile_subexpr(*value);
+                    let val_node = self.chain_effects(self.current_effect, raw_val);
+                    let ref_node = self.compile_subexpr(*ref_inner);
+                    // Read carries the effect as a direct trailing input —
+                    // without it the read can fire before prior writes and
+                    // compound from a stale cell value.
+                    let (r_count, r_off) = match self.current_effect {
+                        Some(eff) => (2, self.graph.inputs_pool.push(&[ref_node, eff])),
+                        None => (1, self.graph.inputs_pool.push(&[ref_node])),
+                    };
+                    let read_node = self.graph.add_node(Node {
+                        kind: NodeKind::UnOp,
+                        input_count: r_count,
+                        inputs_offset: r_off,
+                        compute_fn: CF_DEREF_READ,
+                    });
+                    let bin_compute = self.compound_assign_op_to_compute_fn(*op, *target);
+                    let bin_off = self.graph.inputs_pool.push(&[read_node, val_node]);
+                    let result_node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: 2,
+                        inputs_offset: bin_off,
+                        compute_fn: bin_compute,
+                    });
+                    // Effect rides as a direct trailing input (scheduler
+                    // ordering only) — consecutive deref writes must not fire
+                    // out of order.
+                    let (w_count, w_off) = match self.current_effect {
+                        Some(eff) => (3, self.graph.inputs_pool.push(&[ref_node, result_node, eff])),
+                        None => (2, self.graph.inputs_pool.push(&[ref_node, result_node])),
+                    };
+                    let write_node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: w_count,
+                        inputs_offset: w_off,
+                        compute_fn: CF_DEREF_WRITE,
+                    });
+                    return Some(write_node);
+                }
                 if let crate::ast::Ast::Expr::Ident(name) = target_expr {
                     let val_node = self.compile_subexpr(*value);
                     let bin_compute = self.compound_assign_op_to_compute_fn(*op, *target);
+                    // Static reference rebinding: `x op= v` where `&x`
+                    // registered this binding — read-modify-write through the
+                    // shared Cell; no name rebind (reads route through the
+                    // cell).
+                    if let Some(entry) = self.ref_rebind_active(name) {
+                        // Read carries the effect as a direct trailing input
+                        // too: without it the read can fire before prior
+                        // cell/deref writes and compound from a stale value.
+                        let (r_count, r_off) = match self.current_effect {
+                            Some(eff) => (2, self.graph.inputs_pool.push(&[entry.ref_node, eff])),
+                            None => (1, self.graph.inputs_pool.push(&[entry.ref_node])),
+                        };
+                        let read_node = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: r_count,
+                            inputs_offset: r_off,
+                            compute_fn: CF_DEREF_READ,
+                        });
+                        let bin_off = self.graph.inputs_pool.push(&[read_node, val_node]);
+                        let raw_result = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: 2,
+                            inputs_offset: bin_off,
+                            compute_fn: bin_compute,
+                        });
+                        let result_node = self.chain_effects(self.current_effect, raw_result);
+                        // Write carries the effect as a direct trailing input
+                        // (scheduler ordering only) — see the Assignment
+                        // rebinding branch for why the SEQ wrapper is not
+                        // enough for the write itself.
+                        let (w_count, w_off) = match self.current_effect {
+                            Some(eff) => (
+                                3,
+                                self.graph.inputs_pool.push(&[entry.ref_node, result_node, eff]),
+                            ),
+                            None => (2, self.graph.inputs_pool.push(&[entry.ref_node, result_node])),
+                        };
+                        let write_node = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: w_count,
+                            inputs_offset: w_off,
+                            compute_fn: CF_DEREF_WRITE,
+                        });
+                        return Some(write_node);
+                    }
                     // Implicit-this field compound assignment: `field op= value` inside a
                     // method body resolves to `this.field op= value`.
                     if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) = self.expr_implicit_this(*target).cloned() {

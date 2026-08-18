@@ -127,19 +127,11 @@ impl<'a> InferContext<'a> {
                 }
             }
             Stmt::Assignment { target, value } => {
-                // `*ref = value`: the write node is currently unreachable in
-                // scheduling (a consumer-less effect node) — the store is
-                // silently lost. Reject at compile time until the effect-root
-                // plumbing lands. Working in-place paths: `(*ref).field = v`,
-                // `(*ref)[i] = v`.
-                if matches!(ast.expr(*target).node, crate::ast::Ast::Expr::Deref(_)) {
-                    let span = ast.stmt(stmt).span;
-                    self.add_error_at(
-                        "cannot assign through `*ref`: dereference writes are not implemented;                          mutate in place via `(*ref).field = ...` or `(*ref)[index] = ...` instead",
-                        span.line,
-                        span.column,
-                    );
-                }
+                // `*ref = value` is a real deref write (CF_DEREF_WRITE through
+                // the shared Cell); name reads of the referenced binding are
+                // statically rebound through the same Cell (Builder
+                // `active_ref_bindings`), so the write is observed in source
+                // order.
                 let target_ty = self.infer_expr(*target, ast, env, None);
                 let val_ty = self.infer_expr(*value, ast, env, Some(target_ty));
                 if self.arena.unify(target_ty, val_ty).is_err() {
@@ -163,14 +155,8 @@ impl<'a> InferContext<'a> {
                 None
             }
             Stmt::CompoundAssignment { target, value, .. } => {
-                if matches!(ast.expr(*target).node, crate::ast::Ast::Expr::Deref(_)) {
-                    let span = ast.stmt(stmt).span;
-                    self.add_error_at(
-                        "cannot compound-assign through `*ref`: dereference writes are not implemented;                          mutate in place via `(*ref).field = ...` or `(*ref)[index] = ...` instead",
-                        span.line,
-                        span.column,
-                    );
-                }
+                // `*ref op= value` lowers read-op-write through the shared
+                // Cell (see Stmt::Assignment above).
                 let target_ty = self.infer_expr(*target, ast, env, None);
                 let value_ty = self.infer_expr(*value, ast, env, None);
                 // Bug #95: compound assignment must enforce the same strict numeric

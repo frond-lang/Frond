@@ -90,6 +90,11 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         // Bug #100: var homes are per-function (the same name in different functions
         // maps to unrelated nodes); save/clear on entry, restore on exit.
         let prev_var_home = std::mem::take(&mut self.var_home);
+        // Static reference rebinding is per-function: same-named locals in
+        // different functions are unrelated bindings (the binding-identity
+        // guard already blocks cross-function leaks; this keeps the table
+        // small and semantically scoped).
+        let prev_ref_rebinds = std::mem::take(&mut self.active_ref_bindings);
         // Bug #66: Mark that the next compile_block call is the function body's top-level block.
         // compile_block reads and resets this flag so that only nested blocks extract
         // block-scoped defers; function-level defers stay in defer_table for function-exit execution.
@@ -129,6 +134,7 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         self.in_tail_position = prev_tail;
         self.fn_returns_throw = prev_fn_throw;
         self.var_home = prev_var_home;
+        self.active_ref_bindings = prev_ref_rebinds;
         self.in_function_top_block = prev_top_block;
         r
     }

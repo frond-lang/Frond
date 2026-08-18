@@ -3,6 +3,24 @@
 
 use super::*;
 
+/// Static reference rebinding entry: after `&x` (scalar Ident) is compiled,
+/// later NAME reads/writes of the SAME binding route through the RefOf node's
+/// shared Cell (CF_DEREF_READ / CF_DEREF_WRITE on `ref_node`), so `*r = v` is
+/// observed by `x` and vice versa. Guards key off `binding_node` identity:
+/// any rebind (shadow decl, loop var, capture) breaks the identity check and
+/// silently restores plain dataflow reads.
+#[derive(Clone, Copy)]
+pub struct RefRebinding {
+    /// The RefOf node holding the shared Cell.
+    pub ref_node: NodeId,
+    /// `current_sg_start` at registration: emission requires the reader to be
+    /// in the same subgraph or deeper (branch/loop bodies), never shallower
+    /// (a ref taken inside a loop body must not leak to post-loop reads).
+    pub home_sg_start: u32,
+    /// The binding node the name pointed at when the reference was taken.
+    pub binding_node: NodeId,
+}
+
 /// 2. Compile the body of each function.
 /// 3. Compute fan-out (downstreams).
 ///
@@ -95,6 +113,12 @@ pub struct IrBuilder<'a> {
     /// to the original node, so the closure can read the latest value from the parent frame
     /// during a `same_function` call (capture-by-reference semantics).
     pub captured_vars: rustc_hash::FxHashMap<String, NodeId>,
+    /// Static reference rebinding: variable name -> registration (see `RefRebinding`).
+    /// Populated by the RefOf branch for scalar Ident references of plain
+    /// same-scope locals; consumed by `compile_ident` (reads) and the
+    /// Assignment/CompoundAssignment Ident branches (writes). Per-function
+    /// hygiene: taken/restored in `compile_function_body` alongside `var_home`.
+    pub active_ref_bindings: rustc_hash::FxHashMap<String, RefRebinding>,
     /// Function subgraphs that contain a function-level defer (Bug #49). Historically this
     /// was `!defer_table.is_empty()`; now that defers register dynamically at runtime
     /// (CF_BLOCK_DEFER_REGISTER + frame.defer_stack), the table is always empty, so this
@@ -346,6 +370,7 @@ impl<'a> IrBuilder<'a> {
             scope_stack: Vec::new(),
             captured_scopes: Vec::new(),
             captured_vars: rustc_hash::FxHashMap::default(),
+            active_ref_bindings: rustc_hash::FxHashMap::default(),
             function_defer_sgs: rustc_hash::FxHashSet::default(),
             current_function_id: 0,
             current_sg_start: 0,
@@ -673,6 +698,28 @@ impl<'a> IrBuilder<'a> {
         node.0 >= self.current_sg_start
     }
 
+    /// Guard for consuming an `active_ref_bindings` entry at a read/write site:
+    /// the site must not be inside a lambda body (`captured_scopes` non-empty —
+    /// outer-name reads there route through the capture machinery instead),
+    /// must be in the registration subgraph or deeper (branch/loop bodies read
+    /// outer refs fine via the frame snapshot; a loop-body ref must NOT leak to
+    /// shallower scopes), and the name must still point at the registered
+    /// binding (a shadow decl / loop var / rebind silently restores plain
+    /// dataflow reads).
+    pub(super) fn ref_rebind_active(&self, name: &str) -> Option<RefRebinding> {
+        let entry = *self.active_ref_bindings.get(name)?;
+        if !self.captured_scopes.is_empty() {
+            return None;
+        }
+        if self.current_sg_start < entry.home_sg_start {
+            return None;
+        }
+        if self.lookup_var(name) != Some(entry.binding_node) {
+            return None;
+        }
+        Some(entry)
+    }
+
     /// Bug #49: check whether the current function subgraph contains a function-level defer.
     /// Used to decide whether a local variable reassignment needs a WriteBack to the original
     /// node (so defer bodies read the latest value, Reference-mode semantics).
@@ -922,13 +969,53 @@ impl<'a> IrBuilder<'a> {
             // heap objects share an Arc.
             crate::ast::Ast::Expr::RefOf(inner) => {
                 let inner_node = self.compile_subexpr(*inner);
+                // Canonical cell: a second `&x` of the SAME binding reuses the
+                // first RefOf's Cell, so both references alias one storage
+                // (independent RefOf nodes would fork two cells and writes
+                // through one would be invisible through the other).
+                if let crate::ast::Ast::Expr::Ident(name) =
+                    &self.current_module().arena.expr(*inner).node
+                {
+                    if let Some(entry) = self.ref_rebind_active(name) {
+                        return entry.ref_node;
+                    }
+                }
                 let inputs_offset = self.graph.inputs_pool.push(&[inner_node]);
-                self.graph.add_node(Node {
+                let ref_node = self.graph.add_node(Node {
                     kind: NodeKind::UnOp,
                     input_count: 1,
                     inputs_offset,
                     compute_fn: CF_REF_OF,
-                })
+                });
+                // Static reference rebinding: register scalar Ident references
+                // of plain same-scope locals so later name reads/writes of the
+                // binding route through the shared Cell. Guarded off for
+                // lambda bodies (capture machinery owns outer-name reads
+                // there), already-captured names, non-scalar types (heap
+                // values share an Arc — `*r = v` is not a rebinding write),
+                // and non-local bindings (globals/params of outer frames).
+                if self.captured_scopes.is_empty() {
+                    if let crate::ast::Ast::Expr::Ident(name) =
+                        &self.current_module().arena.expr(*inner).node
+                    {
+                        if let Some(binding) = self.lookup_var(name) {
+                            if self.is_in_current_subgraph(binding)
+                                && !self.captured_vars.contains_key(*name)
+                                && self.expr_type_is_scalar(*inner)
+                            {
+                                self.active_ref_bindings.insert(
+                                    name.to_string(),
+                                    RefRebinding {
+                                        ref_node,
+                                        home_sg_start: self.current_sg_start,
+                                        binding_node: binding,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                ref_node
             }
 
             // Dereference read `*ref` -> `compute_deref_read` (281): returns the inner value for a

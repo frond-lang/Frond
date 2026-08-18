@@ -651,8 +651,10 @@ impl<'a> IrBuilder<'a> {
     ) -> NodeId {
         self.enter_scope();
         // Compile actuals and bind to formal names (actual nodes are compiled in the current scope context)
+        let mut arg_nodes = Vec::with_capacity(params.len());
         for (param, &arg) in params.iter().zip(args.iter()) {
             let arg_node = self.compile_subexpr(arg);
+            arg_nodes.push(arg_node);
             self.bind_var(param.name, arg_node);
         }
         // W4c: bodies with early `return` / `?` cannot be compiled straight into
@@ -668,6 +670,15 @@ impl<'a> IrBuilder<'a> {
                 || crate::pass::Analyzer::has_propagate(body, arena)
         };
         if early_exit {
+            // The wrap Gate's branch reads outer nodes (the actuals) via the
+            // FRAME SNAPSHOT, not through SSA edges — so the actuals must be
+            // COMPUTED before the Gate fires. `compile_subexpr` does not feed
+            // current_effect, so chain the arg nodes in explicitly; otherwise
+            // the Gate can launch the branch while an arg (e.g. a `&x` RefOf)
+            // is still uncomputed and the branch body reads null.
+            for arg_node in arg_nodes {
+                self.current_effect = Some(self.chain_effects(self.current_effect, arg_node));
+            }
             let body_node = self.compile_inline_wrap(body);
             self.exit_scope();
             return body_node;
