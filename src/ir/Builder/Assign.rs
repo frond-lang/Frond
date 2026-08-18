@@ -10,18 +10,30 @@ impl<'a> IrBuilder<'a> {
         expr_id: crate::ast::Ast::ExprId,
         name: &str,
     ) -> NodeId {
-        // Static reference rebinding: after `&x` registered this binding, name
-        // reads route through the shared Cell (CF_DEREF_READ on the RefOf
-        // node), so `*r = v` writes are observed in source order.
-        // `current_effect` is appended as a DIRECT input (scheduler-ordering
-        // only — the compute fn reads inputs[0]): a CF_SEQ wrapper would not
-        // stop the read from firing before a prior cell/deref write (the SEQ
-        // merely waits for both, it does not order input computation). Same
-        // pattern as `compile_global_load`.
-        if let Some(entry) = self.ref_rebind_active(name) {
+        // Cell-backed binding (place model): name reads route through the
+        // shared Cell (CF_DEREF_READ on the cell node), so `*r = v` and
+        // `x = v` writes are observed in source order.
+        // COMPILE-TIME FORWARDING (C1-③, the mem2reg equivalent): when the
+        // Builder knows the cell's current value (last store, non-escaped),
+        // the read reuses that node directly — a zero-cost SSA edge, exactly
+        // the pre-place-model lowering for straight-line code. Barriers
+        // (loop bodies, branch exits, defer bodies) drop the memory and fall
+        // back to real loads.
+        // `current_effect` is appended as a DIRECT input on the load path
+        // (scheduler-ordering only — the compute fn reads inputs[0]): a
+        // CF_SEQ wrapper would not stop the read from firing before a prior
+        // cell/deref write (the SEQ merely waits for both, it does not order
+        // input computation). Same pattern as `compile_global_load`.
+        if let Some(cell_node) = self.lookup_cell_binding(name) {
+            if let Some(value_node) = self.cell_forwarded_value(cell_node) {
+                return match self.current_effect {
+                    Some(eff) => self.chain_effects(Some(eff), value_node),
+                    None => value_node,
+                };
+            }
             let (input_count, inputs_offset) = match self.current_effect {
-                Some(eff) => (2, self.graph.inputs_pool.push(&[entry.ref_node, eff])),
-                None => (1, self.graph.inputs_pool.push(&[entry.ref_node])),
+                Some(eff) => (2, self.graph.inputs_pool.push(&[cell_node, eff])),
+                None => (1, self.graph.inputs_pool.push(&[cell_node])),
             };
             return self.graph.add_node(Node {
                 kind: NodeKind::UnOp,
@@ -109,14 +121,14 @@ impl<'a> IrBuilder<'a> {
         let target_expr = &self.current_module().arena.expr(target).node;
         match target_expr {
             crate::ast::Ast::Expr::Ident(name) => {
-                // Static reference rebinding (mirror of Stmt::Assignment): `x = v`
-                // where `&x` registered this binding writes through the shared
-                // Cell; no rebind (reads route through the cell). Effect rides
-                // as a direct trailing input (scheduler ordering only).
-                if let Some(entry) = self.ref_rebind_active(name) {
+                // Cell-backed binding (mirror of Stmt::Assignment): `x = v`
+                // writes through the shared Cell; no rebind (reads route
+                // through the cell). Effect rides as a direct trailing input
+                // (scheduler ordering only).
+                if let Some(cell_node) = self.lookup_cell_binding(name) {
                     let (input_count, inputs_offset) = match self.current_effect {
-                        Some(eff) => (3, self.graph.inputs_pool.push(&[entry.ref_node, val_node, eff])),
-                        None => (2, self.graph.inputs_pool.push(&[entry.ref_node, val_node])),
+                        Some(eff) => (3, self.graph.inputs_pool.push(&[cell_node, val_node, eff])),
+                        None => (2, self.graph.inputs_pool.push(&[cell_node, val_node])),
                     };
                     let write_node = self.graph.add_node(Node {
                         kind: NodeKind::BinOp,
@@ -124,6 +136,7 @@ impl<'a> IrBuilder<'a> {
                         inputs_offset,
                         compute_fn: CF_DEREF_WRITE,
                     });
+                    self.track_cell_store(cell_node, val_node);
                     self.current_effect = Some(write_node);
                     return self.compile_void_const();
                 }

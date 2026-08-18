@@ -3,24 +3,6 @@
 
 use super::*;
 
-/// Static reference rebinding entry: after `&x` (scalar Ident) is compiled,
-/// later NAME reads/writes of the SAME binding route through the RefOf node's
-/// shared Cell (CF_DEREF_READ / CF_DEREF_WRITE on `ref_node`), so `*r = v` is
-/// observed by `x` and vice versa. Guards key off `binding_node` identity:
-/// any rebind (shadow decl, loop var, capture) breaks the identity check and
-/// silently restores plain dataflow reads.
-#[derive(Clone, Copy)]
-pub struct RefRebinding {
-    /// The RefOf node holding the shared Cell.
-    pub ref_node: NodeId,
-    /// `current_sg_start` at registration: emission requires the reader to be
-    /// in the same subgraph or deeper (branch/loop bodies), never shallower
-    /// (a ref taken inside a loop body must not leak to post-loop reads).
-    pub home_sg_start: u32,
-    /// The binding node the name pointed at when the reference was taken.
-    pub binding_node: NodeId,
-}
-
 /// 2. Compile the body of each function.
 /// 3. Compute fan-out (downstreams).
 ///
@@ -113,12 +95,35 @@ pub struct IrBuilder<'a> {
     /// to the original node, so the closure can read the latest value from the parent frame
     /// during a `same_function` call (capture-by-reference semantics).
     pub captured_vars: rustc_hash::FxHashMap<String, NodeId>,
-    /// Static reference rebinding: variable name -> registration (see `RefRebinding`).
-    /// Populated by the RefOf branch for scalar Ident references of plain
-    /// same-scope locals; consumed by `compile_ident` (reads) and the
-    /// Assignment/CompoundAssignment Ident branches (writes). Per-function
-    /// hygiene: taken/restored in `compile_function_body` alongside `var_home`.
-    pub active_ref_bindings: rustc_hash::FxHashMap<String, RefRebinding>,
+    /// Place-model C1-①: names of THIS function whose address is taken
+    /// (`&x` outside lambda/nested-fn bodies), collected by the pre-pass in
+    /// `compile_function_body`. Their `val`/`var` declarations lower to a
+    /// Cell allocation at the DECL SITE and every name read/write routes
+    /// through it (`&x` then costs nothing — the cell already exists).
+    pub fn_address_taken: rustc_hash::FxHashSet<String>,
+    /// Names read inside lambda / nested-function bodies in this function.
+    /// A binding both address-taken AND captured stays plain: the capture
+    /// machinery snapshots the binding node, which must remain the raw value.
+    pub fn_lambda_captured: rustc_hash::FxHashSet<String>,
+    /// Scope-parallel stack of cell-backed bindings: name -> (cell node, owner
+    /// `current_function_id`). Pushed/popped with `scope_stack`; the owner tag
+    /// blocks cross-function leakage through the shared scope chain. A
+    /// cell-backed name's `scope_stack` entry points at the cell node itself.
+    pub cell_bound: Vec<rustc_hash::FxHashMap<String, (NodeId, u32)>>,
+    /// Place-model all-vars (C1-③④): true while compiling a function whose
+    /// scalar `var`s are ALL cell-backed (every non-transformed function).
+    /// Drives decl-site backing and the compile-time store→load forwarding.
+    pub fn_all_vars_slot: bool,
+    /// Compile-time forwarding memory: cell node -> the node producing its
+    /// CURRENT value. Reads of a tracked cell forward to that node directly
+    /// (zero-cost SSA edge, the mem2reg equivalent); stores update it;
+    /// barriers (loop bodies, branch exits, defer bodies) snapshot/clear it.
+    /// Only non-escaped cells are tracked (`no_forward_cells`).
+    pub cell_values: rustc_hash::FxHashMap<NodeId, NodeId>,
+    /// Cells whose reference escaped (`&x`): calls or stored refs may write
+    /// them, so forwarding would read stale compile-time values. Reads of
+    /// these cells always emit CF_DEREF_READ loads.
+    pub no_forward_cells: rustc_hash::FxHashSet<NodeId>,
     /// Function subgraphs that contain a function-level defer (Bug #49). Historically this
     /// was `!defer_table.is_empty()`; now that defers register dynamically at runtime
     /// (CF_BLOCK_DEFER_REGISTER + frame.defer_stack), the table is always empty, so this
@@ -370,7 +375,12 @@ impl<'a> IrBuilder<'a> {
             scope_stack: Vec::new(),
             captured_scopes: Vec::new(),
             captured_vars: rustc_hash::FxHashMap::default(),
-            active_ref_bindings: rustc_hash::FxHashMap::default(),
+            fn_address_taken: rustc_hash::FxHashSet::default(),
+            fn_lambda_captured: rustc_hash::FxHashSet::default(),
+            cell_bound: Vec::new(),
+            fn_all_vars_slot: false,
+            cell_values: rustc_hash::FxHashMap::default(),
+            no_forward_cells: rustc_hash::FxHashSet::default(),
             function_defer_sgs: rustc_hash::FxHashSet::default(),
             current_function_id: 0,
             current_sg_start: 0,
@@ -499,12 +509,14 @@ impl<'a> IrBuilder<'a> {
     pub(super) fn enter_scope(&mut self) {
         self.scope_stack.push(rustc_hash::FxHashMap::default());
         self.type_scope_stack.push(rustc_hash::FxHashMap::default());
+        self.cell_bound.push(rustc_hash::FxHashMap::default());
     }
 
     /// Exit a scope (variables and type fields are popped together).
     pub(super) fn exit_scope(&mut self) {
         self.scope_stack.pop();
         self.type_scope_stack.pop();
+        self.cell_bound.pop();
     }
 
     /// Register type field info in the current scope (constructor name / type name ->
@@ -698,26 +710,104 @@ impl<'a> IrBuilder<'a> {
         node.0 >= self.current_sg_start
     }
 
-    /// Guard for consuming an `active_ref_bindings` entry at a read/write site:
-    /// the site must not be inside a lambda body (`captured_scopes` non-empty —
-    /// outer-name reads there route through the capture machinery instead),
-    /// must be in the registration subgraph or deeper (branch/loop bodies read
-    /// outer refs fine via the frame snapshot; a loop-body ref must NOT leak to
-    /// shallower scopes), and the name must still point at the registered
-    /// binding (a shadow decl / loop var / rebind silently restores plain
-    /// dataflow reads).
-    pub(super) fn ref_rebind_active(&self, name: &str) -> Option<RefRebinding> {
-        let entry = *self.active_ref_bindings.get(name)?;
+    /// Guard for cell-backed name traffic (reads/writes/`&name`): the site
+    /// must not be inside a lambda body (`captured_scopes` non-empty —
+    /// outer-name reads there route through the capture machinery) and the
+    /// name must have a cell binding visible from the current scope, owned by
+    /// the function being compiled (the owner tag blocks cross-function
+    /// leakage through the shared scope chain).
+    pub(super) fn lookup_cell_binding(&self, name: &str) -> Option<NodeId> {
         if !self.captured_scopes.is_empty() {
             return None;
         }
-        if self.current_sg_start < entry.home_sg_start {
+        let owner = self.current_function_id;
+        self.cell_bound
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+            .filter(|(_, o)| *o == owner)
+            .map(|(node, _)| *node)
+    }
+
+    /// Register a cell-backed binding in the current scope and rebind the
+    /// name in `scope_stack` to the cell node.
+    pub(super) fn bind_cell(&mut self, name: &str, cell_node: NodeId) {
+        let owner = self.current_function_id;
+        if let Some(scope) = self.cell_bound.last_mut() {
+            scope.insert(name.to_string(), (cell_node, owner));
+        }
+        self.bind_var(name, cell_node);
+    }
+
+    /// Decl-site cell-backing eligibility (place model):
+    /// - `var` decls in all-vars functions (C1-③④): every scalar binding not
+    ///   captured by a lambda / nested fn, not declared inside a lambda body.
+    /// - `val` decls and `var` decls in non-all-vars functions: only when
+    ///   address-taken (C1-① shape).
+    pub(super) fn decl_cell_backing_eligible(
+        &self,
+        name: &str,
+        value_expr: crate::ast::Ast::ExprId,
+        is_var: bool,
+    ) -> bool {
+        if self.captured_scopes.is_empty() {
+            let scalar = self.expr_type_is_scalar(value_expr);
+            if scalar && !self.fn_lambda_captured.contains(name) {
+                return if is_var {
+                    self.fn_all_vars_slot || self.fn_address_taken.contains(name)
+                } else {
+                    self.fn_address_taken.contains(name)
+                };
+            }
+        }
+        false
+    }
+
+    /// Record the value a cell-backed binding holds right after its cell
+    /// allocation, and mark address-taken cells non-forwardable.
+    pub(super) fn track_cell_decl(&mut self, name: &str, cell_node: NodeId, value_node: NodeId) {
+        if self.fn_address_taken.contains(name) {
+            self.no_forward_cells.insert(cell_node);
+        } else {
+            self.cell_values.insert(cell_node, value_node);
+        }
+    }
+
+    /// A store to a tracked cell updates the forwarding memory.
+    pub(super) fn track_cell_store(&mut self, cell_node: NodeId, value_node: NodeId) {
+        if !self.no_forward_cells.contains(&cell_node) {
+            self.cell_values.insert(cell_node, value_node);
+        }
+    }
+
+    /// Forwarding lookup for a read of `cell_node`: the remembered current
+    /// value node, when the cell is tracked.
+    pub(super) fn cell_forwarded_value(&self, cell_node: NodeId) -> Option<NodeId> {
+        if self.no_forward_cells.contains(&cell_node) {
             return None;
         }
-        if self.lookup_var(name) != Some(entry.binding_node) {
-            return None;
-        }
-        Some(entry)
+        self.cell_values.get(&cell_node).copied()
+    }
+
+    /// Barrier (subgraph body, branch- AND loop-like): snapshot the
+    /// forwarding memory and clear it. Correctness rule: a body that
+    /// re-executes (loop) or executes conditionally (branch) invalidates
+    /// compile-time values BOTH ways — pre-entry values are stale after it,
+    /// and stores made inside it must not leak to code after it. Reads
+    /// inside and after the body emit real loads (stores still forward
+    /// WITHIN one body execution).
+    pub(super) fn cell_barrier_enter(&mut self) -> rustc_hash::FxHashMap<NodeId, NodeId> {
+        std::mem::take(&mut self.cell_values)
+    }
+
+    /// Defer-body barrier exit: RESTORE the pre-entry snapshot. The defer
+    /// body runs at exit time, so the enclosing function's subsequent code
+    /// still sees pre-defer values (the defer's stores must not leak).
+    pub(super) fn cell_barrier_exit_defer(
+        &mut self,
+        saved: rustc_hash::FxHashMap<NodeId, NodeId>,
+    ) {
+        self.cell_values = saved;
     }
 
     /// True when `recv.field` is the `Type.Ctor` qualified-constructor form —
@@ -1057,19 +1147,18 @@ impl<'a> IrBuilder<'a> {
                         }
                     }
                 }
-                // ── Binding references (locals; static rebinding) ──
-                let inner_node = self.compile_subexpr(*inner);
-                // Canonical cell: a second `&x` of the SAME binding reuses the
-                // first RefOf's Cell, so both references alias one storage
-                // (independent RefOf nodes would fork two cells and writes
-                // through one would be invisible through the other).
+                // ── Binding references (locals/params; C1-① cell backing) ──
+                // Cell-backed binding: the decl site (or a previous `&x`)
+                // already allocated THE cell — the reference is that node
+                // itself, zero cost, and all aliases share one storage.
                 if let crate::ast::Ast::Expr::Ident(name) =
                     &self.current_module().arena.expr(*inner).node
                 {
-                    if let Some(entry) = self.ref_rebind_active(name) {
-                        return entry.ref_node;
+                    if let Some(cell_node) = self.lookup_cell_binding(name) {
+                        return cell_node;
                     }
                 }
+                let inner_node = self.compile_subexpr(*inner);
                 let inputs_offset = self.graph.inputs_pool.push(&[inner_node]);
                 let ref_node = self.graph.add_node(Node {
                     kind: NodeKind::UnOp,
@@ -1077,31 +1166,27 @@ impl<'a> IrBuilder<'a> {
                     inputs_offset,
                     compute_fn: CF_REF_OF,
                 });
-                // Static reference rebinding: register scalar Ident references
-                // of plain same-scope locals so later name reads/writes of the
-                // binding route through the shared Cell. Guarded off for
-                // lambda bodies (capture machinery owns outer-name reads
-                // there), already-captured names, non-scalar types (heap
-                // values share an Arc — `*r = v` is not a rebinding write),
-                // and non-local bindings (globals/params of outer frames).
+                // LAZY cell backing: the first `&x` of a binding that did not
+                // get decl-site backing (a param the entry loop skipped —
+                // non-annotated or non-scalar-checked, or a local the
+                // pre-pass skipped in a strategy-transformed function).
+                // Registers the cell so later name reads/writes route through
+                // it; the name is NOT value-tracked (forwarding is disabled:
+                // `val r = &x` binds a COPY of the cell node, so deref stores
+                // through `r` cannot be mapped back to the cell at compile
+                // time — a stale forward would be worse than a load).
                 if self.captured_scopes.is_empty() {
                     if let crate::ast::Ast::Expr::Ident(name) =
                         &self.current_module().arena.expr(*inner).node
                     {
-                        if let Some(binding) = self.lookup_var(name) {
-                            if self.is_in_current_subgraph(binding)
-                                && !self.captured_vars.contains_key(*name)
-                                && self.expr_type_is_scalar(*inner)
-                            {
-                                self.active_ref_bindings.insert(
-                                    name.to_string(),
-                                    RefRebinding {
-                                        ref_node,
-                                        home_sg_start: self.current_sg_start,
-                                        binding_node: binding,
-                                    },
-                                );
-                            }
+                        let eligible = self.lookup_var(name)
+                            .map(|b| self.is_in_current_subgraph(b))
+                            .unwrap_or(false)
+                            && !self.fn_lambda_captured.contains(*name)
+                            && self.expr_type_is_scalar(*inner);
+                        if eligible {
+                            self.bind_cell(name, ref_node);
+                            self.no_forward_cells.insert(ref_node);
                         }
                     }
                 }

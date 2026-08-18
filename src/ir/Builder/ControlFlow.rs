@@ -127,6 +127,12 @@ impl<'a> IrBuilder<'a> {
         let prev_branch_sg = self.current_branch_sg;
         self.current_branch_sg = Some(sg_id);
 
+        // Place-model forwarding barrier (branch-like): values stored BEFORE
+        // the branch dominate the body (forwarding stays valid inside), while
+        // stores made INSIDE must not survive the exit — snapshot now,
+        // restore after the body compile.
+        let cell_barrier = self.cell_barrier_enter();
+
         let raw_return = self.compile_expr(expr);
         // Link any pending effect into the return node so side-effecting expressions
         // (e.g. `defer b.v = 77` compiles to an Assign with a field_set in current_effect)
@@ -136,6 +142,7 @@ impl<'a> IrBuilder<'a> {
             Some(eff) if eff != raw_return => self.chain_effects(Some(eff), raw_return),
             _ => raw_return,
         };
+        // Branch-like: values stay cleared — reads after the branch load.
         self.current_sg_start = prev_sg_start;
         self.current_branch_sg = prev_branch_sg;
         self.exit_scope();

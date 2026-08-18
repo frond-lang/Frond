@@ -867,6 +867,11 @@ impl<'a> IrBuilder<'a> {
         let node_start = self.graph.nodes.len() as u32;
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
+        // Place-model forwarding barrier (loop-like): pre-loop values are
+        // stale from iteration 2 on, and post-loop reads must load — clear
+        // the forwarding memory for the rest of the function (stores made
+        // inside the body still forward within one iteration).
+        self.cell_barrier_enter();
         // Push the loop context (continue jump target; While/Loop have no iterator parameter)
         self.loop_stack.push(LoopContext {
             sg: loop_sg,

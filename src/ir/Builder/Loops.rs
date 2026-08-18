@@ -190,6 +190,7 @@ impl<'a> IrBuilder<'a> {
 
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
+        self.cell_barrier_enter();
         let prev_in_loop = self.in_loop_body;
         self.in_loop_body = true;
         let body_last = self.compile_expr(body);
@@ -268,6 +269,11 @@ impl<'a> IrBuilder<'a> {
             reset_plan: None,
         });
 
+        // Place-model forwarding barrier (loop-like): the condition and body
+        // re-evaluate every iteration — reads must not forward pre-loop
+        // values (stale from iteration 2 on). Clears for the rest of the
+        // function; the body's own stores forward within one iteration.
+        self.cell_barrier_enter();
         // Bug #100: loop-modified variables must be read through their canonical home
         // slot in the condition, so each re-evaluation sees the WriteBack-updated value
         // instead of a stale pre-loop snapshot.

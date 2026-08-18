@@ -90,11 +90,6 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         // Bug #100: var homes are per-function (the same name in different functions
         // maps to unrelated nodes); save/clear on entry, restore on exit.
         let prev_var_home = std::mem::take(&mut self.var_home);
-        // Static reference rebinding is per-function: same-named locals in
-        // different functions are unrelated bindings (the binding-identity
-        // guard already blocks cross-function leaks; this keeps the table
-        // small and semantically scoped).
-        let prev_ref_rebinds = std::mem::take(&mut self.active_ref_bindings);
         // Bug #66: Mark that the next compile_block call is the function body's top-level block.
         // compile_block reads and resets this flag so that only nested blocks extract
         // block-scoped defers; function-level defers stay in defer_table for function-exit execution.
@@ -105,6 +100,59 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         let strategy = self.lookup_memo_strategy(name, self_type);
         if std::env::var("FROND_DEBUG_MEMO").is_ok() {
             eprintln!("[MEMO] {}{} -> {:?}", self_type.unwrap_or(""), name, strategy.as_ref().map(|s| match s { crate::pass::Analyzer::MemoStrategy::TailRecToLoop { .. } => "TailRecToLoop", crate::pass::Analyzer::MemoStrategy::NonTailRecToLoop { .. } => "NonTailRecToLoop", crate::pass::Analyzer::MemoStrategy::Memoize { .. } => "Memoize", _ => "Other" }));
+        }
+        // Place-model C1-① pre-pass: collect address-taken / lambda-captured
+        // names for THIS function. Skipped for strategy-transformed functions
+        // (tailrec-to-loop / memoize restructure assignments themselves —
+        // cell routing there falls back to the lazy `&x` path or plain
+        // lowering). `cell_bound` needs no hygiene: entries carry the owner
+        // `current_function_id` and lookups filter on it.
+        let prev_address_taken = std::mem::take(&mut self.fn_address_taken);
+        let prev_lambda_captured = std::mem::take(&mut self.fn_lambda_captured);
+        let transforms_fn = matches!(
+            strategy,
+            Some(crate::pass::Analyzer::MemoStrategy::TailRecToLoop { .. })
+                | Some(crate::pass::Analyzer::MemoStrategy::NonTailRecToLoop { .. })
+                | Some(crate::pass::Analyzer::MemoStrategy::Memoize { .. })
+        );
+        // All-vars slot backing (C1-③④): every scalar non-captured `var` of a
+        // non-transformed function is cell-backed; reads forward to the last
+        // store's value node at compile time (the mem2reg equivalent), so
+        // straight-line code lowers to the same SSA shape as before.
+        let prev_all_vars_slot = self.fn_all_vars_slot;
+        self.fn_all_vars_slot = !transforms_fn;
+        let prev_cell_values = std::mem::take(&mut self.cell_values);
+        let prev_no_forward = std::mem::take(&mut self.no_forward_cells);
+        if !transforms_fn {
+            let mut at = std::mem::take(&mut self.fn_address_taken);
+            let mut lc = std::mem::take(&mut self.fn_lambda_captured);
+            self.collect_place_names(body_expr, &mut at, &mut lc);
+            self.fn_address_taken = at;
+            self.fn_lambda_captured = lc;
+        }
+        // Param slot backing: scalar, annotated, non-captured params get a
+        // cell at entry (name rebinds to it; the Const placeholder param node
+        // only feeds the cell allocation). Non-annotated params stay plain
+        // (conservative — scalar-ness unprovable without inference output).
+        if self.fn_all_vars_slot {
+            for param in params {
+                if self.captured_scopes.is_empty()
+                    && !self.fn_lambda_captured.contains(param.name)
+                    && self.param_type_ref_is_scalar(param.type_annotation)
+                {
+                    if let Some(param_node) = self.lookup_var(param.name) {
+                        let off = self.graph.inputs_pool.push(&[param_node]);
+                        let cell_node = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: 1,
+                            inputs_offset: off,
+                            compute_fn: CF_REF_OF,
+                        });
+                        self.bind_cell(param.name, cell_node);
+                        self.track_cell_decl(param.name, cell_node, param_node);
+                    }
+                }
+            }
         }
         let r = match strategy {
             Some(crate::pass::Analyzer::MemoStrategy::TailRecToLoop { info }) => {
@@ -134,7 +182,11 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         self.in_tail_position = prev_tail;
         self.fn_returns_throw = prev_fn_throw;
         self.var_home = prev_var_home;
-        self.active_ref_bindings = prev_ref_rebinds;
+        self.fn_address_taken = prev_address_taken;
+        self.fn_lambda_captured = prev_lambda_captured;
+        self.fn_all_vars_slot = prev_all_vars_slot;
+        self.cell_values = prev_cell_values;
+        self.no_forward_cells = prev_no_forward;
         self.in_function_top_block = prev_top_block;
         r
     }
