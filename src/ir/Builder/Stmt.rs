@@ -209,7 +209,7 @@ impl<'a> IrBuilder<'a> {
                         kind: NodeKind::UnOp,
                         input_count: 1,
                         inputs_offset: off,
-                        compute_fn: CF_REF_OF,
+                        compute_fn: CF_CELL_ALLOC,
                     });
                     self.bind_cell(name, cell_node);
                     self.track_cell_decl(name, cell_node, copy_node);
@@ -252,7 +252,7 @@ impl<'a> IrBuilder<'a> {
                         kind: NodeKind::UnOp,
                         input_count: 1,
                         inputs_offset: off,
-                        compute_fn: CF_REF_OF,
+                        compute_fn: CF_CELL_ALLOC,
                     });
                     self.bind_cell(name, cell_node);
                     self.track_cell_decl(name, cell_node, home);
@@ -351,62 +351,18 @@ impl<'a> IrBuilder<'a> {
                         self.graph.set_field_set_name(set_node, field.to_string());
                         return Some(set_node);
                     }
-                    // Check whether this is a lambda-captured variable: captured_scopes records, per lambda
-                    // layer, the captured variable names and their corresponding outer node. Assigning a
-                    // captured variable requires a WriteBack to the outer node so the change is visible
-                    // to the outer layer (by-reference capture semantics).
-                    let captured_source = self.captured_scopes.iter().rev()
-                        .find_map(|scope| scope.iter()
-                            .find(|(n, _)| n.as_str() == *name)
-                            .map(|(_, node)| *node));
-                    if let Some(source) = captured_source {
-                        let wb_node = self.compile_writeback_node(val_node, source);
-                        self.bind_var(name, val_node);
-                        return Some(wb_node);
-                    } else if let Some(outer_node) = self.lookup_var(name) {
-                        if !self.is_in_current_subgraph(outer_node) {
-                            // Outer variable -> WriteBack. Use the root-frame declaration as
-                            // WriteBack target, not the intermediate node returned by lookup_var
-                            // (which may be in a same_function branch subgraph like a while body).
-                            // This ensures WriteBack writes to the correct root-frame slot.
-                            let wb_target = self.lookup_root_frame_var(name).unwrap_or(outer_node);
-                            let wb_node = self.compile_writeback_node(val_node, wb_target);
-                            self.bind_var(name, val_node);
-                            return Some(wb_node);
-                        } else if let Some(&captured_node) = self.captured_vars.get(*name) {
-                            // Local variable captured by an inner lambda -> WriteBack
-                            let wb_node = self.compile_writeback_node(val_node, captured_node);
-                            self.bind_var(name, val_node);
-                            return Some(wb_node);
-                        } else if self.current_function_has_defer() {
-                            // Bug #49: when a function contains defer, reassigning a local variable requires a
-                            // WriteBack to the original node, so the defer body (which references the original
-                            // node) reads the latest value rather than the compile-time snapshot.
-                            let wb_node = self.compile_writeback_node(val_node, outer_node);
-                            self.bind_var(name, val_node);
-                            return Some(wb_node);
-                        } else {
-                            // Same_function branch subgraph (e.g. loop body): a prior assignment
-                            // already bind_var'd the variable into the current subgraph, so
-                            // lookup_var returns a local node. Use lookup_root_frame_var to find
-                            // the outermost binding (root-frame declaration) for WriteBack, so
-                            // the new value propagates back to the root frame.
-                            if let Some(original_outer) = self.lookup_root_frame_var(name) {
-                                if !self.is_in_current_subgraph(original_outer) {
-                                    let wb_node = self.compile_writeback_node(val_node, original_outer);
-                                    self.bind_var(name, val_node);
-                                    return Some(wb_node);
-                                }
-                            }
-                            self.bind_var(name, val_node);
-                        }
-                    } else if let Some(slot) = self.lookup_global_var(name) {
+                    // B/C deletion (2026-08-22): the WriteBack ladder is gone —
+                    // every assigned name is cell-backed (all-vars: locals,
+                    // assigned params, captured vars via ④'s shared-cell
+                    // upvalues; converters via B2/B3 register cells), so the
+                    // cell path above already handled the assignable shapes.
+                    // What remains: global stores and plain local rebinds.
+                    if let Some(slot) = self.lookup_global_var(name) {
                         // Global variable -> global_store, returning an effect node to ensure scheduled execution
                         let store_node = self.compile_global_store(val_node, slot);
                         return Some(store_node);
-                    } else {
-                        self.bind_var(name, val_node);
                     }
+                    self.bind_var(name, val_node);
                 }
                 None
             }
@@ -551,11 +507,9 @@ impl<'a> IrBuilder<'a> {
                         self.graph.set_field_set_name(set_node, field.to_string());
                         return Some(set_node);
                     }
-                    // Check whether this is a lambda-captured variable
-                    let captured_source = self.captured_scopes.iter().rev()
-                        .find_map(|scope| scope.iter()
-                            .find(|(n, _)| n.as_str() == *name)
-                            .map(|(_, node)| *node));
+                    // B/C deletion: the WriteBack ladder is gone (all assigned
+                    // names are cell-backed; the cell store path higher up
+                    // handles them). Remaining: globals store, plain rebind.
                     // Read current value: local var > global var > placeholder
                     let cur_node = if let Some(n) = self.lookup_var(name) {
                         n
@@ -573,11 +527,7 @@ impl<'a> IrBuilder<'a> {
                     });
                     // Link current_effect: prevents a compound assignment after continue from running early
                     let result_node = self.chain_effects(self.current_effect, raw_result);
-                    if captured_source.is_some() {
-                        self.compile_writeback_node(result_node, captured_source.unwrap());
-                        self.bind_var(name, result_node);
-                        None
-                    } else if self.lookup_global_var(name).is_some() && self.lookup_var(name).is_none() {
+                    if self.lookup_global_var(name).is_some() && self.lookup_var(name).is_none() {
                         // Global variable -> global_store. Return the store node so it is chained
                         // into the block's effect chain (last_effect), otherwise the store would be
                         // orphaned and dropped (the global has no local binding to keep it alive).
@@ -585,15 +535,6 @@ impl<'a> IrBuilder<'a> {
                         let store_node = self.compile_global_store(result_node, slot);
                         self.current_effect = Some(store_node);
                         Some(store_node)
-                    } else if !self.is_in_current_subgraph(cur_node) {
-                        // Outer variable -> WriteBack + bind a local reference
-                        self.compile_writeback_node(result_node, cur_node);
-                        self.bind_var(name, result_node);
-                        None
-                    } else if let Some(&captured_node) = self.captured_vars.get(*name) {
-                        self.compile_writeback_node(result_node, captured_node);
-                        self.bind_var(name, result_node);
-                        None
                     } else {
                         self.bind_var(name, result_node);
                         None
@@ -680,25 +621,28 @@ impl<'a> IrBuilder<'a> {
                 Some(n)
             }
             crate::ast::Ast::Stmt::While { condition, body } => {
-                // Sync pre-loop assignments of loop-modified vars into their home slots
-                // BEFORE registration (the home slot is what the rebind'd condition and
-                // post-loop reads see; without this sync a pre-loop `i = i - 1` was
-                // invisible to the loop).
-                self.sync_modified_vars_to_home(*body);
                 let while_sg = self.register_while_subgraph(*condition, *body);
-                let call_node = self.compile_recursive_call(while_sg);
-                // Bug #100 (residual): statements AFTER the loop must read loop-assigned
-                // variables through their home slot (kept current by WriteBacks), not
-                // through the loop-body chain node whose enclosing-frame slot is a stale
-                // snapshot (e.g. `if exp != 0` after the exponent loop always saw 0).
-                self.rebind_modified_vars_to_home(*body);
+                // Launch call with the loop-carried params' initial values
+                // (args FIRST — compute_call_launch takes inputs[..param_count]
+                // — then the effect dependency).
+                let entry_args = std::mem::take(&mut self.while_entry_args);
+                let mut call_inputs = entry_args;
+                if let Some(eff) = self.current_effect {
+                    call_inputs.push(eff);
+                }
+                let inputs_off = self.graph.inputs_pool.push(&call_inputs);
+                let call_node = self.graph.add_node(Node {
+                    kind: NodeKind::Call,
+                    input_count: call_inputs.len() as u8,
+                    inputs_offset: inputs_off,
+                    compute_fn: CF_CALL_LAUNCH,
+                });
+                self.graph.set_call_target(call_node, while_sg);
                 Some(call_node)
             }
             crate::ast::Ast::Stmt::Loop { body } => {
-                self.sync_modified_vars_to_home(*body);
                 let loop_sg = self.register_loop_subgraph(*body);
                 let call_node = self.compile_recursive_call(loop_sg);
-                self.rebind_modified_vars_to_home(*body);
                 Some(call_node)
             }
             crate::ast::Ast::Stmt::For {
@@ -719,7 +663,6 @@ impl<'a> IrBuilder<'a> {
                 );
                 // Start the loop: Call(for_sg, [iterable_node])
                 let call_node = self.make_call(for_sg, &[iterable_node]);
-                self.rebind_modified_vars_to_home(*body);
                 Some(call_node)
             }
             crate::ast::Ast::Stmt::Defer { expr } => {

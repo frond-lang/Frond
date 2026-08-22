@@ -14,8 +14,6 @@
 //!   subgraph or an ancestor subgraph (containment = dominance). References
 //!   into sibling branches, child subgraphs, or outside all subgraphs are
 //!   bugs (Bug #45 / #24 class).
-//! - V3 writeback: `writeback_targets` must point at a node in the same or an
-//!   ancestor subgraph of the writeback node.
 //! - V4 subgraph integrity: entry/return/cond/iter/reset nodes and
 //!   event-source declarations inside their subgraph range (Bug #24); defer
 //!   bodies same-function; upvalue outer nodes strictly outside; call targets
@@ -53,7 +51,6 @@ pub fn verify_with_stage(graph: &DataFlowGraph, stage: &str) -> Vec<Violation> {
     let regions = crate::ir::Region::RegionTree::build(graph);
     let innermost = regions.innermost_all(graph.node_count());
     verify_scoping(graph, &regions, &innermost, &mut v);
-    verify_writebacks(graph, &regions, &innermost, &mut v);
     verify_subgraphs(graph, &regions, &mut v);
     verify_downstreams(graph, &mut v);
     verify_loop_versioning(graph, &mut v);
@@ -171,8 +168,7 @@ fn dump_node_scope(graph: &DataFlowGraph, target: u32) {
         );
         eprintln!("downstreams={:?}", graph.downstream_slice(target as usize));
         eprintln!(
-            "writeback_target={:?} call_target={:?}",
-            graph.writeback_target(target as usize),
+            "call_target={:?}",
             graph.call_target(target as usize)
         );
     }
@@ -323,42 +319,6 @@ fn verify_scoping(
     }
 }
 
-// =========================================================================
-// V3 — writeback targets
-// =========================================================================
-
-fn verify_writebacks(
-    graph: &DataFlowGraph,
-    regions: &crate::ir::Region::RegionTree,
-    innermost: &[Option<SubGraphId>],
-    out: &mut Vec<Violation>,
-) {
-    let n = graph.node_count();
-    for idx in 0..n {
-        let Some(target) = graph.writeback_target(idx) else { continue };
-        let msg = |detail: String| Violation {
-            check: "V3-writeback",
-            message: format!("writeback node {} -> target {}: {}", idx, target.0, detail),
-        };
-        if (target.0 as usize) >= n {
-            out.push(msg("target out of bounds".into()));
-            continue;
-        }
-        let user_sg = innermost[idx];
-        let target_sg = innermost[target.0 as usize];
-        match (user_sg, target_sg) {
-            (Some(u), Some(t)) => {
-                if !(t == u || regions.is_ancestor(t, u)) {
-                    out.push(msg(format!(
-                        "target sg {} does not dominate writeback sg {}",
-                        t.0, u.0
-                    )));
-                }
-            }
-            _ => out.push(msg("target or writeback outside every subgraph".into())),
-        }
-    }
-}
 
 // =========================================================================
 // V4 — subgraph integrity

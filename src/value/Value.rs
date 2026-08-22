@@ -1963,25 +1963,35 @@ pub struct NewtypeValue {
 /// `*r = v` writes the Cell. Multiple references share the same Arc; writes are visible to all references.
 #[derive(Debug)]
 pub struct Cell {
-    pub inner: parking_lot::Mutex<Value>,
+    inner: std::cell::UnsafeCell<Value>,
 }
+
+// Safety: the engine executes user graphs single-threaded (the same argument
+// as the `Arc::as_ptr` in-place mutation in compute_record_field_set /
+// compute_array_store — frames are suspended while callees run; async is
+// cooperative; rayon only parallelizes arena construction, never graph
+// execution). Cell get/set therefore need no lock; the previous
+// parking_lot::Mutex cost an uncontended lock per scalar `var` store, which
+// the all-vars place model made per-iteration in hot loops.
+unsafe impl Send for Cell {}
+unsafe impl Sync for Cell {}
 
 impl Clone for Cell {
     fn clone(&self) -> Self {
-        Self { inner: parking_lot::Mutex::new(self.get()) }
+        Self { inner: std::cell::UnsafeCell::new(self.get()) }
     }
 }
 
 impl Cell {
     pub fn new(val: Value) -> Self {
-        Self { inner: parking_lot::Mutex::new(val) }
+        Self { inner: std::cell::UnsafeCell::new(val) }
     }
     /// Returns a clone of the inner value.
     pub fn get(&self) -> Value {
-        self.inner.lock().clone()
+        unsafe { (*self.inner.get()).clone() }
     }
     pub fn set(&self, val: Value) {
-        *self.inner.lock() = val;
+        unsafe { *self.inner.get() = val; }
     }
 
     /// Returns a Weak reference to itself (used to break reference cycles).
@@ -2687,7 +2697,7 @@ impl Hash for HeapObj {
                 n.inner.hash(state);
             }
             HeapObj::Cell(c) => {
-                c.inner.lock().hash(state);
+                c.get().hash(state);
             }
             HeapObj::ArrayElemRef { arr, idx } => {
                 arr.hash(state);

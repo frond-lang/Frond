@@ -213,9 +213,9 @@ fn dump_ir(graph: &crate::ir::Ir::DataFlowGraph) {
     eprintln!("=== IR DUMP: {} nodes, {} subgraphs, entry={:?} ===",
         graph.nodes.len(), graph.subgraphs.len(), graph.entry_subgraph);
     for (si, sg) in graph.subgraphs.iter().enumerate() {
-        eprintln!("[sg {}] range={:?} params={} entry={:?} ret={:?} loop={:?} fn_id={} suspend={}",
+        eprintln!("[sg {}] range={:?} params={} entry={:?} ret={:?} loop={:?} fn_id={} suspend={} conv={}",
             si, (sg.node_range.0 .0, sg.node_range.1 .0), sg.param_count,
-            sg.entry_node.0, sg.return_node.0, format!("{:?}", sg.loop_kind), sg.function_id, sg.has_suspend);
+            sg.entry_node.0, sg.return_node.0, format!("{:?}", sg.loop_kind), sg.function_id, sg.has_suspend, sg.converter_generated);
         for n in sg.node_range.0 .0..sg.node_range.1 .0 {
             let node = &graph.nodes[n as usize];
             let inputs: Vec<u32> = graph.inputs_pool

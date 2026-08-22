@@ -1,0 +1,39 @@
+cargo::rustc-check-cfg=cfg(has_extern_c)
+cargo::rerun-if-changed=src/stdlib/builtin/io/Raw.frond
+cargo::rerun-if-changed=src/stdlib/builtin/net/Raw.frond
+cargo::rerun-if-changed=src/stdlib/builtin/time/Raw.frond
+cargo::rerun-if-changed=src/stdlib/builtin/str/Raw.frond
+cargo::rerun-if-changed=src/stdlib/builtin/os/Raw.frond
+cargo::rerun-if-changed=src/stdlib/builtin/rand/Raw.frond
+cargo::rerun-if-changed=src/stdlib/builtin/mem/Raw.frond
+src_stdlib_builtin_io_Raw.c
+src_stdlib_builtin_net_Raw.c
+F:\Projects\Rust\frond-lang\Frond\target_e7\release\build\frond-727e0c82ad018516\out\src_stdlib_builtin_io_Raw.c(1): warning C4819: The file contains a character that cannot be represented in the current code page (936). Save the file in Unicode format to prevent data loss
+F:\Projects\Rust\frond-lang\Frond\target_e7\release\build\frond-727e0c82ad018516\out\src_stdlib_builtin_net_Raw.c(1): warning C4819: The file contains a character that cannot be represented in the current code page (936). Save the file in Unicode format to prevent data loss
+src_stdlib_builtin_time_Raw.c
+src_stdlib_builtin_str_Raw.c
+F:\Projects\Rust\frond-lang\Frond\target_e7\release\build\frond-727e0c82ad018516\out\src_stdlib_builtin_time_Raw.c(1): warning C4819: The file contains a character that cannot be represented in the current code page (936). Save the file in Unicode format to prevent data loss
+F:\Projects\Rust\frond-lang\Frond\target_e7\release\build\frond-727e0c82ad018516\out\src_stdlib_builtin_str_Raw.c(1): warning C4819: The file contains a character that cannot be represented in the current code page (936). Save the file in Unicode format to prevent data loss
+src_stdlib_builtin_os_Raw.c
+F:\Projects\Rust\frond-lang\Frond\target_e7\release\build\frond-727e0c82ad018516\out\src_stdlib_builtin_os_Raw.c(1): warning C4819: The file contains a character that cannot be represented in the current code page (936). Save the file in Unicode format to prevent data loss
+src_stdlib_builtin_rand_Raw.c
+F:\Projects\Rust\frond-lang\Frond\target_e7\release\build\frond-727e0c82ad018516\out\src_stdlib_builtin_rand_Raw.c(1): warning C4819: The file contains a character that cannot be represented in the current code page (936). Save the file in Unicode format to prevent data loss
+src_stdlib_builtin_mem_Raw.c
+frond_extern_registry.c
+F:\Projects\Rust\frond-lang\Frond\target_e7\release\build\frond-727e0c82ad018516\out\src_stdlib_builtin_mem_Raw.c(1): warning C4819: The file contains a character that cannot be represented in the current code page (936). Save the file in Unicode format to prevent data loss
+F:\Projects\Rust\frond-lang\Frond\target_e7\release\build\frond-727e0c82ad018516\out\frond_extern_registry.c(1): warning C4819: The file contains a character that cannot be represented in the current code page (936). Save the file in Unicode format to prevent data loss
+F:\Projects\Rust\frond-lang\Frond\target_e7\release\build\frond-727e0c82ad018516\out\src_stdlib_builtin_os_Raw.c(211): warning C4210: nonstandard extension used: function given file scope
+F:\Projects\Rust\frond-lang\Frond\target_e7\release\build\frond-727e0c82ad018516\out\src_stdlib_builtin_os_Raw.c(217): warning C4210: nonstandard extension used: function given file scope
+F:\Projects\Rust\frond-lang\Frond\target_e7\release\build\frond-727e0c82ad018516\out\src_stdlib_builtin_os_Raw.c(218): warning C4210: nonstandard extension used: function given file scope
+F:\Projects\Rust\frond-lang\Frond\target_e7\release\build\frond-727e0c82ad018516\out\src_stdlib_builtin_os_Raw.c(725): warning C4819: The file contains a character that cannot be represented in the current code page (936). Save the file in Unicode format to prevent data loss
+exit code: 0
+exit code: 0
+exit code: 0
+exit code: 0
+exit code: 0
+exit code: 0
+exit code: 0
+exit code: 0
+cargo::rustc-link-search=native=F:\Projects\Rust\frond-lang\Frond\target_e7\release\build\frond-727e0c82ad018516\out
+cargo::rustc-link-arg-bin=frond=/WHOLEARCHIVE:frond_extern.lib
+cargo::rustc-cfg=has_extern_c

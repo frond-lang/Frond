@@ -106,6 +106,7 @@ impl<'a> IrBuilder<'a> {
         // (Bug #24).
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
+            converter_generated: false,
             id: sg_id,
             node_range: (NodeId(node_start), NodeId(node_start)),
             param_count: 0,
@@ -142,7 +143,8 @@ impl<'a> IrBuilder<'a> {
             Some(eff) if eff != raw_return => self.chain_effects(Some(eff), raw_return),
             _ => raw_return,
         };
-        // Branch-like: values stay cleared — reads after the branch load.
+        drop(cell_barrier);
+        self.cell_barrier_exit();
         self.current_sg_start = prev_sg_start;
         self.current_branch_sg = prev_branch_sg;
         self.exit_scope();
@@ -170,6 +172,7 @@ impl<'a> IrBuilder<'a> {
         self.graph.const_values[node.0 as usize] = Some(ConstValue::Void);
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
+            converter_generated: false,
             id: sg_id,
             node_range: (node, NodeId(node.0 + 1)),
             param_count: 0,
@@ -207,6 +210,7 @@ impl<'a> IrBuilder<'a> {
         });
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
+            converter_generated: false,
             id: sg_id,
             node_range: (node, NodeId(node.0 + 1)),
             param_count: 0,
@@ -240,6 +244,7 @@ impl<'a> IrBuilder<'a> {
         });
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
+            converter_generated: false,
             id: sg_id,
             node_range: (node, NodeId(node.0 + 1)),
             param_count: 0,
@@ -413,6 +418,7 @@ impl<'a> IrBuilder<'a> {
                 let wrap_end = self.graph.nodes.len() as u32;
                 let wrap_sg = SubGraphId(self.graph.subgraphs.len() as u32);
                 self.graph.add_subgraph(SubGraph {
+                    converter_generated: false,
                     id: wrap_sg,
                     node_range: (NodeId(ad.wrap_start), NodeId(wrap_end)),
                     param_count: 1,

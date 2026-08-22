@@ -8,7 +8,7 @@
 
 use crate::ir::Ir::{
     CF_ARRAY_STORE, CF_CALL_LAUNCH, CF_GLOBAL_LOAD, CF_GLOBAL_STORE, CF_NOOP,
-    CF_RECORD_FIELD_SET, CF_SEQ, CF_WRITEBACK, ConstValue, ComputeFnId, DataFlowGraph,
+    CF_RECORD_FIELD_SET, CF_SEQ, ConstValue, ComputeFnId, DataFlowGraph,
     Node, NodeId, NodeKind, SubGraphId,
 };
 use crate::pass::Analyzer::{AnalysisReport, UnrollInfo};
@@ -90,62 +90,62 @@ pub fn try_fold(cf: ComputeFnId, args: &[ConstValue]) -> Option<ConstValue> {
         25 => { let a = cv_i32(args.get(0)?)?; Some(ConstValue::I32(V::arith_neg_i32(a))) }
         26 => { let a = cv_f64(args.get(0)?)?; Some(ConstValue::F64(V::arith_neg_f64(a))) }
 
-        // ── i64 arithmetic + comparison (50-61) ──
-        50 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_add_i64(a, b))) }
-        51 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_sub_i64(a, b))) }
-        52 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_mul_i64(a, b))) }
-        53 => { let (a, b) = two(args, cv_i64)?; V::arith_div_i64(a, b).map(|v| ConstValue::I64(v)) }
-        54 => { let (a, b) = two(args, cv_i64)?; V::arith_mod_i64(a, b).map(|v| ConstValue::I64(v)) }
-        55 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a == b)) }
-        56 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a != b)) }
-        57 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a < b)) }
-        58 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a > b)) }
-        59 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a <= b)) }
-        60 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a >= b)) }
-        61 => { let a = cv_i64(args.get(0)?)?; Some(ConstValue::I64(V::arith_neg_i64(a))) }
-        // ── bitnot (62-63, 76) ──
-        62 => { let a = cv_i32(args.get(0)?)?; Some(ConstValue::I32(V::arith_bitnot_i32(a))) }
-        63 => { let a = cv_i64(args.get(0)?)?; Some(ConstValue::I64(V::arith_bitnot_i64(a))) }
-        76 => { let a = cv_i128(args.get(0)?)?; Some(ConstValue::I128(V::arith_bitnot_i128(a))) }
+        // ── i64 arithmetic + comparison (48-59) ──
+        48 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_add_i64(a, b))) }
+        49 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_sub_i64(a, b))) }
+        50 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_mul_i64(a, b))) }
+        51 => { let (a, b) = two(args, cv_i64)?; V::arith_div_i64(a, b).map(|v| ConstValue::I64(v)) }
+        52 => { let (a, b) = two(args, cv_i64)?; V::arith_mod_i64(a, b).map(|v| ConstValue::I64(v)) }
+        53 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a == b)) }
+        54 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a != b)) }
+        55 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a < b)) }
+        56 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a > b)) }
+        57 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a <= b)) }
+        58 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::Bool(a >= b)) }
+        59 => { let a = cv_i64(args.get(0)?)?; Some(ConstValue::I64(V::arith_neg_i64(a))) }
+        // ── bitnot (60-61, 74) ──
+        60 => { let a = cv_i32(args.get(0)?)?; Some(ConstValue::I32(V::arith_bitnot_i32(a))) }
+        61 => { let a = cv_i64(args.get(0)?)?; Some(ConstValue::I64(V::arith_bitnot_i64(a))) }
+        74 => { let a = cv_i128(args.get(0)?)?; Some(ConstValue::I128(V::arith_bitnot_i128(a))) }
 
-        // ── i128 arithmetic + comparison (64-75) ──
-        64 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_add_i128(a, b))) }
-        65 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_sub_i128(a, b))) }
-        66 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_mul_i128(a, b))) }
-        67 => { let (a, b) = two(args, cv_i128)?; V::arith_div_i128(a, b).map(|v| ConstValue::I128(v)) }
-        68 => { let (a, b) = two(args, cv_i128)?; V::arith_mod_i128(a, b).map(|v| ConstValue::I128(v)) }
-        69 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a == b)) }
-        70 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a != b)) }
-        71 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a < b)) }
-        72 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a > b)) }
-        73 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a <= b)) }
-        74 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a >= b)) }
-        75 => { let a = cv_i128(args.get(0)?)?; Some(ConstValue::I128(V::arith_neg_i128(a))) }
+        // ── i128 arithmetic + comparison (62-73) ──
+        62 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_add_i128(a, b))) }
+        63 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_sub_i128(a, b))) }
+        64 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_mul_i128(a, b))) }
+        65 => { let (a, b) = two(args, cv_i128)?; V::arith_div_i128(a, b).map(|v| ConstValue::I128(v)) }
+        66 => { let (a, b) = two(args, cv_i128)?; V::arith_mod_i128(a, b).map(|v| ConstValue::I128(v)) }
+        67 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a == b)) }
+        68 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a != b)) }
+        69 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a < b)) }
+        70 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a > b)) }
+        71 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a <= b)) }
+        72 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::Bool(a >= b)) }
+        73 => { let a = cv_i128(args.get(0)?)?; Some(ConstValue::I128(V::arith_neg_i128(a))) }
 
-        // ── Bitwise i32 (77-79) ──
-        77 => { let (a, b) = two(args, cv_i32)?; Some(ConstValue::I32(V::arith_bitand_i32(a, b))) }
-        78 => { let (a, b) = two(args, cv_i32)?; Some(ConstValue::I32(V::arith_bitor_i32(a, b))) }
-        79 => { let (a, b) = two(args, cv_i32)?; Some(ConstValue::I32(V::arith_bitxor_i32(a, b))) }
-        // ── Bitwise i64 (80-82) ──
-        80 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_bitand_i64(a, b))) }
-        81 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_bitor_i64(a, b))) }
-        82 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_bitxor_i64(a, b))) }
-        // ── Bitwise i128 (83-85) ──
-        83 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_bitand_i128(a, b))) }
-        84 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_bitor_i128(a, b))) }
-        85 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_bitxor_i128(a, b))) }
-        // ── Shifts i32 (86-87): shift amount is i32 ──
-        86 => { let a = cv_i32(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shl_i32(a, s).map(|v| ConstValue::I32(v)) }
-        87 => { let a = cv_i32(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shr_i32(a, s).map(|v| ConstValue::I32(v)) }
-        // ── Shifts i64 (88-89) ──
-        88 => { let a = cv_i64(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shl_i64(a, s).map(|v| ConstValue::I64(v)) }
-        89 => { let a = cv_i64(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shr_i64(a, s).map(|v| ConstValue::I64(v)) }
-        // ── Shifts i128 (90-91) ──
-        90 => { let a = cv_i128(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shl_i128(a, s).map(|v| ConstValue::I128(v)) }
-        91 => { let a = cv_i128(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shr_i128(a, s).map(|v| ConstValue::I128(v)) }
+        // ── Bitwise i32 (75-77) ──
+        75 => { let (a, b) = two(args, cv_i32)?; Some(ConstValue::I32(V::arith_bitand_i32(a, b))) }
+        76 => { let (a, b) = two(args, cv_i32)?; Some(ConstValue::I32(V::arith_bitor_i32(a, b))) }
+        77 => { let (a, b) = two(args, cv_i32)?; Some(ConstValue::I32(V::arith_bitxor_i32(a, b))) }
+        // ── Bitwise i64 (78-80) ──
+        78 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_bitand_i64(a, b))) }
+        79 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_bitor_i64(a, b))) }
+        80 => { let (a, b) = two(args, cv_i64)?; Some(ConstValue::I64(V::arith_bitxor_i64(a, b))) }
+        // ── Bitwise i128 (81-83) ──
+        81 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_bitand_i128(a, b))) }
+        82 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_bitor_i128(a, b))) }
+        83 => { let (a, b) = two(args, cv_i128)?; Some(ConstValue::I128(V::arith_bitxor_i128(a, b))) }
+        // ── Shifts i32 (84-85): shift amount is i32 ──
+        84 => { let a = cv_i32(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shl_i32(a, s).map(|v| ConstValue::I32(v)) }
+        85 => { let a = cv_i32(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shr_i32(a, s).map(|v| ConstValue::I32(v)) }
+        // ── Shifts i64 (86-87) ──
+        86 => { let a = cv_i64(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shl_i64(a, s).map(|v| ConstValue::I64(v)) }
+        87 => { let a = cv_i64(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shr_i64(a, s).map(|v| ConstValue::I64(v)) }
+        // ── Shifts i128 (88-89) ──
+        88 => { let a = cv_i128(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shl_i128(a, s).map(|v| ConstValue::I128(v)) }
+        89 => { let a = cv_i128(args.get(0)?)?; let s = cv_i32(args.get(1)?)?; V::arith_shr_i128(a, s).map(|v| ConstValue::I128(v)) }
 
-        // ── All primitive type arithmetic (92-259) ──
-        id if id >= 92 && id <= 259 => fold_basic_range(id, args),
+        // ── All primitive type arithmetic (90-257) ──
+        id if id >= 90 && id <= 257 => fold_basic_range(id, args),
 
         _ => None,
     }
@@ -188,13 +188,13 @@ macro_rules! fold_float_arith {
     }};
 }
 
-/// Primitive type arithmetic folding (92-259).
-/// Integers: 12 types × 12 operations (92-235), floats: 4 types × 6 operations (236-259).
+/// Primitive type arithmetic folding (90-257).
+/// Integers: 12 types × 12 operations (90-233), floats: 4 types × 6 operations (234-257).
 /// f16/f128 have no ConstValue variant; skipped (returns None).
 fn fold_basic_range(id: u32, args: &[ConstValue]) -> Option<ConstValue> {
-    if id <= 235 {
-        // Integers: 12 types × 12 operations (92-235)
-        let offset = id - 92;
+    if id <= 233 {
+        // Integers: 12 types × 12 operations (90-233)
+        let offset = id - 90;
         let type_idx = (offset / 12) as usize;
         let op_idx = (offset % 12) as usize;
         // op: 0=add 1=sub 2=mul 3=div 4=mod 5=bitand 6=bitor 7=bitxor 8=shl 9=shr 10=neg 11=bitnot
@@ -214,8 +214,8 @@ fn fold_basic_range(id: u32, args: &[ConstValue]) -> Option<ConstValue> {
             _ => return None,
         }
     } else {
-        // Floats: 4 types × 6 operations (236-259)
-        let offset = id - 236;
+        // Floats: 4 types × 6 operations (234-257)
+        let offset = id - 234;
         let type_idx = (offset / 6) as usize;
         let op_idx = (offset % 6) as usize;
         // op: 0=add 1=sub 2=mul 3=div 4=mod 5=neg
@@ -276,25 +276,11 @@ impl OptimizerContext {
 
 /// Checks whether a node has side effects (cannot be eliminated or redirected by CSE/CopyProp/DCE).
 fn has_side_effect(graph: &DataFlowGraph, idx: usize) -> bool {
-    graph.writeback_targets.get(idx).map_or(false, |o| o.is_some())
-    || graph.field_set_names.get(idx).map_or(false, |o| o.is_some())
+    graph.field_set_names.get(idx).map_or(false, |o| o.is_some())
     || graph.global_store_slots.get(idx).map_or(false, |o| o.is_some())
     || crate::ir::Ir::is_control_flow_compute_fn(graph.nodes[idx].compute_fn)
     || graph.ffi_call_names.get(idx).map_or(false, |o| o.is_some())
     || graph.tail_call_flags.get(idx).copied().unwrap_or(false)
-}
-
-/// Collects all writeback target node IDs.
-/// These nodes' runtime values are overwritten by writeback; they cannot serve as CSE merge
-/// targets or ConstFold constant sources.
-fn collect_writeback_targets(graph: &DataFlowGraph) -> FxHashSet<NodeId> {
-    let mut set = FxHashSet::default();
-    for opt_wt in &graph.writeback_targets {
-        if let Some(wt) = opt_wt {
-            set.insert(*wt);
-        }
-    }
-    set
 }
 
 // =========================================================================
@@ -482,7 +468,7 @@ pub fn compute_liveness(graph: &DataFlowGraph, ctx: &OptimizerContext) -> Livene
 /// B depending on A can also fold).
 pub fn pass_const_fold(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext) {
     let node_count = graph.nodes.len();
-    let wb_targets = collect_writeback_targets(graph);
+    let wb_targets: FxHashSet<NodeId> = FxHashSet::default(); // WriteBack machinery deleted (B/C 2026-08-22)
     let mut total_folded = 0usize;
 
     loop {
@@ -559,7 +545,7 @@ pub fn pass_const_fold(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext) {
 /// etc.) are not incorrectly merged.
 pub fn pass_cse(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &FxHashSet<ComputeFnId>) {
     let mut seen: FxHashMap<(ComputeFnId, Vec<NodeId>, u64), NodeId> = FxHashMap::default();
-    let wb_targets = collect_writeback_targets(graph);
+    let wb_targets: FxHashSet<NodeId> = FxHashSet::default(); // WriteBack machinery deleted (B/C 2026-08-22)
     let regions = crate::ir::Region::RegionTree::build(graph);
     let innermost = regions.innermost_all(graph.nodes.len());
 
@@ -830,12 +816,12 @@ fn make_shift_const(n: u32) -> ConstValue {
 }
 
 /// Derives the shl compute_fn for the corresponding type from a mul compute_fn.
-/// Integer full range (92-235): mul(offset 2) → shl(offset 8).
+/// Integer full range (90-233): mul(offset 2) → shl(offset 8).
 /// Float mul does not support strength reduction; returns None.
 fn mul_to_shl(cf: ComputeFnId) -> Option<ComputeFnId> {
     let id = cf.0;
-    if id >= 92 && id <= 235 {
-        let offset = id - 92;
+    if id >= 90 && id <= 233 {
+        let offset = id - 90;
         let op = offset % 12;
         if op == 2 { // mul
             let type_base = id - op;
@@ -846,14 +832,14 @@ fn mul_to_shl(cf: ComputeFnId) -> Option<ComputeFnId> {
 }
 
 /// Derives the shr compute_fn for the corresponding type from an unsigned div compute_fn.
-/// Integer full range (92-235): div(offset 3) → shr(offset 9).
+/// Integer full range (90-233): div(offset 3) → shr(offset 9).
 /// Signed division cannot be safely converted to right shift (negative truncation semantics differ);
 /// only unsigned types are applicable.
 /// type_idx >= 5 denotes the unsigned type range starting from u8.
 fn div_to_shr(cf: ComputeFnId) -> Option<ComputeFnId> {
     let id = cf.0;
-    if id >= 92 && id <= 235 {
-        let offset = id - 92;
+    if id >= 90 && id <= 233 {
+        let offset = id - 90;
         let op = offset % 12;
         let type_idx = offset / 12;
         if op == 3 && type_idx >= 5 { // div and unsigned type (starting from u8)
@@ -865,12 +851,12 @@ fn div_to_shr(cf: ComputeFnId) -> Option<ComputeFnId> {
 }
 
 /// Derives the bitand compute_fn for the corresponding type from an unsigned mod compute_fn.
-/// Integer full range (92-235): mod(offset 4) → bitand(offset 5).
+/// Integer full range (90-233): mod(offset 4) → bitand(offset 5).
 /// `x % 2^n` → `x & (2^n - 1)`, safe only for unsigned types (signed modulo sign follows the dividend).
 fn mod_to_bitand(cf: ComputeFnId) -> Option<ComputeFnId> {
     let id = cf.0;
-    if id >= 92 && id <= 235 {
-        let offset = id - 92;
+    if id >= 90 && id <= 233 {
+        let offset = id - 90;
         let op = offset % 12;
         let type_idx = offset / 12;
         if op == 4 && type_idx >= 5 { // mod and unsigned type (starting from u8)
@@ -917,7 +903,7 @@ fn cv_set_u128(cv: &ConstValue, val: u128) -> Option<ConstValue> {
 /// node cross-sub-graph range issues.
 /// Triggers the next fixpoint iteration round via the ctx.mutated flag.
 pub fn pass_strength_reduction(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext) {
-    let wb_targets = collect_writeback_targets(graph);
+    let wb_targets: FxHashSet<NodeId> = FxHashSet::default(); // WriteBack machinery deleted (B/C 2026-08-22)
     let node_count = graph.nodes.len();
     let mut changed = false;
 
@@ -1084,15 +1070,14 @@ pub fn pass_strength_reduction(graph: &mut DataFlowGraph, ctx: &mut OptimizerCon
 /// under W2 together with storage versioning.
 fn is_store_node(graph: &DataFlowGraph, idx: usize) -> bool {
     let cf = graph.nodes[idx].compute_fn;
-    cf == CF_WRITEBACK
-        || cf == CF_RECORD_FIELD_SET
+    cf == CF_RECORD_FIELD_SET
         || cf == CF_ARRAY_STORE
         || cf == CF_GLOBAL_STORE
 }
 
 /// DSE pass: eliminates store nodes whose results are not consumed.
 ///
-/// Store nodes (CF_WRITEBACK/CF_RECORD_FIELD_SET/CF_ARRAY_STORE/global_store)
+/// Store nodes (CF_RECORD_FIELD_SET/CF_ARRAY_STORE/global_store)
 /// typically return VOID and are not consumed by downstream nodes. However, if a store node's
 /// downstreams are empty and it is not referenced by any live node's metadata (not triggered by
 /// cond/return/defer/event), then it is a dead store and can be safely eliminated.
@@ -1215,16 +1200,6 @@ pub fn pass_dse(graph: &DataFlowGraph, ctx: &mut OptimizerContext) {
         if all_refs.contains(&id) { continue; }
 
         let cf = node.compute_fn;
-
-        // WriteBack: target not read by any non-store live node → dead store
-        if cf == CF_WRITEBACK {
-            if let Some(Some(wt)) = graph.writeback_targets.get(idx).map(|o| o.as_ref()) {
-                let wt_resolved = ctx.resolve(*wt);
-                if read_refs.contains(&wt_resolved) || struct_refs.contains(&wt_resolved) {
-                    continue;
-                }
-            }
-        }
 
         // FieldSet/ArrayStore: modified heap object not read by any non-store live node → dead store
         if cf == CF_RECORD_FIELD_SET || cf == CF_ARRAY_STORE {
@@ -1358,7 +1333,7 @@ pub fn optimize_with_analysis(
     }
 
     // W1: single derivation point (pure CFs minus aliasing reads when the
-    // graph contains in-place mutators — Bug #99).
+    // graph contains in-place mutators — Bug #97).
     let pure_set = crate::ir::Ir::graph_pure_set(graph);
     let no_fold = std::env::var("FROND_NO_FOLD").is_ok();
     let no_cse = std::env::var("FROND_NO_CSE").is_ok();
@@ -1397,7 +1372,7 @@ pub fn optimize_with_analysis(
 
     // ── Phase 2: fixpoint iteration (Inline + traditional optimization, level >= 1) ──
     let dbg_iter = std::env::var("FROND_INLINE_DBG").is_ok();
-    // Termination guard (replaces the former fixed 50/200-round cap): the loop stops
+    // Termination guard (replaces the former fixed 48/198-round cap): the loop stops
     // after `stall_window` consecutive rounds without a strict decrease of the
     // progress measure `(call sites, nodes)`, lexicographic. Every productive round
     // strictly decreases it — Inline removes a call site (even when it grows the node
@@ -2068,7 +2043,7 @@ fn inline_call(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext, candidate:
     }
 
     // Replace call_node in place: turn it into a CF_SEQ sequence node.
-    // CF_SEQ (idx 48) waits for all inputs to be ready, then returns the last input's value (sequence semantics).
+    // CF_SEQ (idx 47) waits for all inputs to be ready, then returns the last input's value (sequence semantics).
     // Same pattern as Builder.rs's chain_effects: inputs = [prev_effect, current_value].
     // redirect is not used (redirect would remove call_node during rebuild, breaking the effect chain).
     //

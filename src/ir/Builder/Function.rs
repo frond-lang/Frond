@@ -89,7 +89,6 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         self.fn_returns_throw = fn_returns_throw;
         // Bug #100: var homes are per-function (the same name in different functions
         // maps to unrelated nodes); save/clear on entry, restore on exit.
-        let prev_var_home = std::mem::take(&mut self.var_home);
         // Bug #66: Mark that the next compile_block call is the function body's top-level block.
         // compile_block reads and resets this flag so that only nested blocks extract
         // block-scoped defers; function-level defers stay in defer_table for function-exit execution.
@@ -102,67 +101,103 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
             eprintln!("[MEMO] {}{} -> {:?}", self_type.unwrap_or(""), name, strategy.as_ref().map(|s| match s { crate::pass::Analyzer::MemoStrategy::TailRecToLoop { .. } => "TailRecToLoop", crate::pass::Analyzer::MemoStrategy::NonTailRecToLoop { .. } => "NonTailRecToLoop", crate::pass::Analyzer::MemoStrategy::Memoize { .. } => "Memoize", _ => "Other" }));
         }
         // Place-model C1-① pre-pass: collect address-taken / lambda-captured
-        // names for THIS function. Skipped for strategy-transformed functions
-        // (tailrec-to-loop / memoize restructure assignments themselves —
-        // cell routing there falls back to the lazy `&x` path or plain
-        // lowering). `cell_bound` needs no hygiene: entries carry the owner
+        // names for THIS function (all functions — B1 2026-08-22 removed the
+        // strategy-fn skip along with the writeback lowering it protected).
+        // `cell_bound` needs no hygiene: entries carry the owner
         // `current_function_id` and lookups filter on it.
         let prev_address_taken = std::mem::take(&mut self.fn_address_taken);
         let prev_lambda_captured = std::mem::take(&mut self.fn_lambda_captured);
-        let transforms_fn = matches!(
-            strategy,
-            Some(crate::pass::Analyzer::MemoStrategy::TailRecToLoop { .. })
-                | Some(crate::pass::Analyzer::MemoStrategy::NonTailRecToLoop { .. })
-                | Some(crate::pass::Analyzer::MemoStrategy::Memoize { .. })
-        );
-        // All-vars slot backing (C1-③④): every scalar non-captured `var` of a
-        // non-transformed function is cell-backed; reads forward to the last
-        // store's value node at compile time (the mem2reg equivalent), so
-        // straight-line code lowers to the same SSA shape as before.
+
+        // All-vars slot backing (C1-③④): every `var` of every function is
+        // cell-backed (B/C 2026-08-22: unconditional — the WriteBack ladder is
+        // physically deleted, so the non-cell lowering no longer exists);
+        // reads forward to the last store's value node at compile time (the
+        // mem2reg equivalent), so straight-line code lowers to the same SSA
+        // shape as before.
+        //
+        // The FROND_ALL_VARS=0 escape hatch is gone with the machinery: without
+        // slot backing there is no correct assignment lowering left.
+        // The one honest cost: loop-carried first reads are one load node per
+        // iteration (~112ns — the engine's per-node dispatch cost). Closing it
+        // is the optimizer phi-reconstruction pass; slot-mutation mirroring was
+        // evaluated and rejected (it rebuilds the #99 bug family the place
+        // model exists to eliminate).
         let prev_all_vars_slot = self.fn_all_vars_slot;
-        self.fn_all_vars_slot = !transforms_fn;
+        self.fn_all_vars_slot = true;
         let prev_cell_values = std::mem::take(&mut self.cell_values);
         let prev_no_forward = std::mem::take(&mut self.no_forward_cells);
-        if !transforms_fn {
+        {
             let mut at = std::mem::take(&mut self.fn_address_taken);
             let mut lc = std::mem::take(&mut self.fn_lambda_captured);
             self.collect_place_names(body_expr, &mut at, &mut lc);
             self.fn_address_taken = at;
             self.fn_lambda_captured = lc;
         }
-        // Param slot backing: scalar, annotated, non-captured params get a
-        // cell at entry (name rebinds to it; the Const placeholder param node
-        // only feeds the cell allocation). Non-annotated params stay plain
-        // (conservative — scalar-ness unprovable without inference output).
+        // Param slot backing (③): only params ASSIGNED in this function get
+        // a cell at entry — their assignments become cell stores, replacing
+        // the rebind+WriteBack machinery in loops/branches. Never-assigned
+        // params (the hot-call shape: fib's `n`) stay plain — a cell per such
+        // param is a heap allocation per call (fib regressed ~70% when ALL
+        // params were slotted). Captured params stay plain (the capture
+        // machinery snapshots binding nodes). `&param` continues to work
+        // through the lazy RefOf path for non-slotted params.
         if self.fn_all_vars_slot {
+            let mut assigned_params = rustc_hash::FxHashSet::default();
+            collect_assigned_names_deep(
+                &self.current_module().arena,
+                body_expr,
+                &mut assigned_params,
+            );
             for param in params {
-                if self.captured_scopes.is_empty()
-                    && !self.fn_lambda_captured.contains(param.name)
-                    && self.param_type_ref_is_scalar(param.type_annotation)
-                {
+                if assigned_params.contains(param.name) {
                     if let Some(param_node) = self.lookup_var(param.name) {
                         let off = self.graph.inputs_pool.push(&[param_node]);
                         let cell_node = self.graph.add_node(Node {
                             kind: NodeKind::UnOp,
                             input_count: 1,
                             inputs_offset: off,
-                            compute_fn: CF_REF_OF,
+                            compute_fn: CF_CELL_ALLOC,
                         });
                         self.bind_cell(param.name, cell_node);
                         self.track_cell_decl(param.name, cell_node, param_node);
+                        // Chain the alloc into the effect stream: WITHOUT this,
+                        // a subsequent branch's store depends on the cell via a
+                        // cross-frame edge, and when the branch launches before
+                        // the alloc executed (a bare-param gate condition is
+                        // ready at frame start), the alloc's completion cannot
+                        // satisfy the branch frame's pending — the store is
+                        // skipped silently. Local decls get this ordering for
+                        // free (the decl statement chains the alloc); params
+                        // must chain explicitly.
+                        self.current_effect =
+                            Some(self.chain_effects(self.current_effect, cell_node));
                     }
                 }
             }
         }
         let r = match strategy {
+            // converter scope: stamp generated sgs (E7 exclusion). Only the three
+            // machine-building converters — LoopInvariantHoist is a plain rewrite.
             Some(crate::pass::Analyzer::MemoStrategy::TailRecToLoop { info }) => {
-                self.compile_tail_rec_to_loop(name, body_expr, params, &info)
+                let prev = self.graph.converter_scope;
+                self.graph.converter_scope = true;
+                let r = self.compile_tail_rec_to_loop(name, body_expr, params, &info);
+                self.graph.converter_scope = prev;
+                r
             }
             Some(crate::pass::Analyzer::MemoStrategy::NonTailRecToLoop { info }) => {
-                self.compile_non_tail_rec_to_loop(name, body_expr, params, &info)
+                let prev = self.graph.converter_scope;
+                self.graph.converter_scope = true;
+                let r = self.compile_non_tail_rec_to_loop(name, body_expr, params, &info);
+                self.graph.converter_scope = prev;
+                r
             }
             Some(crate::pass::Analyzer::MemoStrategy::Memoize { cache_key, .. }) => {
-                self.compile_memoize(name, body_expr, params, &cache_key)
+                let prev = self.graph.converter_scope;
+                self.graph.converter_scope = true;
+                let r = self.compile_memoize(name, body_expr, params, &cache_key);
+                self.graph.converter_scope = prev;
+                r
             }
             _ => {
                 let node = self.compile_expr(body_expr);
@@ -181,7 +216,6 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         };
         self.in_tail_position = prev_tail;
         self.fn_returns_throw = prev_fn_throw;
-        self.var_home = prev_var_home;
         self.fn_address_taken = prev_address_taken;
         self.fn_lambda_captured = prev_lambda_captured;
         self.fn_all_vars_slot = prev_all_vars_slot;
@@ -275,6 +309,7 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
             let node_end = self.graph.nodes.len() as u32;
             let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
             self.graph.add_subgraph(crate::ir::Ir::SubGraph {
+                converter_generated: false,
                 id: sg_id,
                 node_range: (NodeId(node_start), NodeId(node_end)),
                 param_count: 0,
@@ -337,6 +372,7 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
             let node_end = self.graph.nodes.len() as u32;
             let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
             self.graph.add_subgraph(crate::ir::Ir::SubGraph {
+                converter_generated: false,
                 id: sg_id,
                 node_range: (NodeId(node_start), NodeId(node_end)),
                 param_count: 0,

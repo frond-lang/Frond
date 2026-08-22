@@ -900,7 +900,7 @@ pub fn compute_throw_err(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> 
     Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(v) }))
 }
 
-/// compute_fn (idx 47): the `?` operator (Propagate).
+/// compute_fn (idx 46): the `?` operator (Propagate).
 ///
 /// Input is a `ThrowVal`:
 /// - `Ok(val)` → returns `NodeResult::Value(val)` (unwrapped).
@@ -1272,7 +1272,7 @@ pub fn compute_ffn_call(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> V
 //   - the lazy-force logic is colocated with the reflect formatting logic.
 // =========================================================================
 
-/// compute_fn (idx 290): `format(x)` / `x.format()` — any value → str.
+/// compute_fn (idx 288): `format(x)` / `x.format()` — any value → str.
 ///
 /// Before formatting, forces evaluation of the LazyValue (if the input is
 /// lazy), then calls `value::format_value`. Does not depend on
@@ -1285,7 +1285,7 @@ pub fn compute_reflect_format(frame: &mut Frame, node: NodeId, ctx: &EvalContext
     Value::ref_val(crate::value::HeapObj::Str(crate::value::Str::from_rust_str(&s)))
 }
 
-/// compute_fn (idx 291): scalar value → str.
+/// compute_fn (idx 289): scalar value → str.
 ///
 /// Semantically identical to `compute_reflect_format` (both go through
 /// `format_value`); kept as a distinct id for historical compatibility
@@ -1456,7 +1456,14 @@ pub fn compute_record_construct(frame: &mut Frame, node: NodeId, ctx: &EvalConte
     let info: &RecordLitInfo = info
         .as_ref()
         .expect("record construct node has no RecordLitInfo");
-    match info.kind {
+    // E8 nullary cache: a 0-input construct's value is metadata-determined —
+    // build once per node, Arc-clone thereafter.
+    if inputs.is_empty() {
+        if let Some(&(_, ref v)) = frame.construct_cache.iter().find(|(g, _)| *g == node.0) {
+            return v.clone();
+        }
+    }
+    let built = match info.kind {
         RecordLitKind::Record => {
             Value::ref_val(HeapObj::Record(RecordValue {
                 type_name: info.type_name.clone(),
@@ -1490,7 +1497,11 @@ pub fn compute_record_construct(frame: &mut Frame, node: NodeId, ctx: &EvalConte
                 inner,
             }))
         }
+    };
+    if inputs.is_empty() {
+        frame.construct_cache.push((node.0, built.clone()));
     }
+    built
 }
 
 /// compute_fn: record field access (fetches a field value from a Record/Adt by field name).
@@ -1662,7 +1673,7 @@ pub fn compute_str_concat(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
     }
 }
 
-/// compute_fn (idx 319): multi-input string concatenation.
+/// compute_fn (idx 316): multi-input string concatenation.
 ///
 /// All inputs (>=2) are concatenated into a single str in one pass, O(n) time complexity.
 /// Used for the compile-time lowering of string interpolation `"a{b}c{d}e"`, replacing the chained `compute_str_concat` which is O(n^2).
@@ -1698,7 +1709,7 @@ pub fn compute_str_multi_concat(frame: &mut Frame, node: NodeId, ctx: &EvalConte
     Value::ref_val(HeapObj::Str(Str::from_rust_str(&buf)))
 }
 
-/// compute_fn (idx 320): string array join — `str[] + sep → str`.
+/// compute_fn (idx 317): string array join — `str[] + sep → str`.
 ///
 /// One-shot O(n) concat, replacing the stdlib loop `result = result + seg` (O(n^2)).
 /// inputs[0] = str[] array, inputs[1] = sep separator.
@@ -1745,7 +1756,7 @@ pub fn compute_str_array_join(frame: &mut Frame, node: NodeId, ctx: &EvalContext
     Value::ref_val(HeapObj::Str(Str::from_rust_str(&buf)))
 }
 
-/// compute_fn (idx 343): `s.is_empty()` / `arr.is_empty()`.
+/// compute_fn (idx 340): `s.is_empty()` / `arr.is_empty()`.
 ///
 /// Previously declared in Sema with no implementation (phantom method): calling
 /// it built a Call node with no target and panicked the engine. Now lowered as
@@ -1761,7 +1772,7 @@ pub fn compute_is_empty(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> V
     }
 }
 
-/// compute_fn (idx 270): global variable read.
+/// compute_fn (idx 268): global variable read.
 ///
 /// No inputs; reads the value from `graph.global_var_storage[slot]`.
 /// The slot index is obtained from `graph.global_load_slots[node]`.
@@ -1775,7 +1786,7 @@ pub fn compute_global_load(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
     val
 }
 
-/// compute_fn (idx 271): global variable write.
+/// compute_fn (idx 269): global variable write.
 ///
 /// `inputs[0]` is the value-source node; the value is written to
 /// `graph.global_var_storage[slot]`. The slot index is obtained from
@@ -1791,7 +1802,7 @@ pub fn compute_global_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) 
     val
 }
 
-/// compute_fn (idx 308): memoization cache lookup.
+/// compute_fn (idx 306): memoization cache lookup.
 ///
 /// `inputs[0..param_count]` are the parameter values (used as the cache key).
 /// `MemoInfo.table_index` indexes into `graph.memo_tables`'s hash table.
@@ -1848,7 +1859,7 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
     }
 }
 
-/// compute_fn (idx 309): memoization cache write.
+/// compute_fn (idx 307): memoization cache write.
 ///
 /// `inputs[0..param_count]` are the parameter values (used as the cache key),
 /// and `inputs[param_count]` is the result value. Writes the result into the
@@ -1882,7 +1893,7 @@ pub fn compute_memo_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
     result_val
 }
 
-/// compute_fn (idx 272): record extension.
+/// compute_fn (idx 270): record extension.
 ///
 /// `inputs[0]` is the base RecordValue; `inputs[1..]` are the updated field
 /// values. `RecordExtendInfo.update_names` gives the field names corresponding
@@ -1941,7 +1952,7 @@ pub fn compute_record_extend(frame: &mut Frame, node: NodeId, ctx: &EvalContext)
     }))
 }
 
-/// compute_fn (idx 273): atomic construction.
+/// compute_fn (idx 271): atomic construction.
 ///
 /// `inputs[0]` is the initial-value node; it is wrapped in an `AtomicValue`
 /// (an atomic container sharing the underlying memory). `AtomicValue.data` is a
@@ -1953,7 +1964,7 @@ pub fn compute_atomic_construct(frame: &mut Frame, node: NodeId, ctx: &EvalConte
     Value::ref_val(HeapObj::AtomicVal(AtomicValue::new(val)))
 }
 
-/// compute_fn (idx 315): atomic load.
+/// compute_fn (idx 312): atomic load.
 ///
 /// Input: the Atomic<T> reference. Returns a clone of the inner value.
 pub fn compute_atomic_load(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
@@ -1965,7 +1976,7 @@ pub fn compute_atomic_load(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     }
 }
 
-/// compute_fn (idx 316): atomic store.
+/// compute_fn (idx 313): atomic store.
 ///
 /// Inputs: [Atomic<T>, new_value]. Stores `new_value` into the atomic and returns void.
 pub fn compute_atomic_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
@@ -1978,7 +1989,7 @@ pub fn compute_atomic_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) 
     Value::VOID
 }
 
-/// compute_fn (idx 317): atomic swap.
+/// compute_fn (idx 314): atomic swap.
 ///
 /// Inputs: [Atomic<T>, new_value]. Replaces the inner value with `new_value` and
 /// returns the previous value.
@@ -1992,7 +2003,7 @@ pub fn compute_atomic_swap(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     }
 }
 
-/// compute_fn (idx 318): atomic compare-and-exchange.
+/// compute_fn (idx 315): atomic compare-and-exchange.
 ///
 /// Inputs: [Atomic<T>, expected, new]. If the current value equals `expected`,
 /// replaces it with `new` and returns true; otherwise returns false.
@@ -2017,7 +2028,18 @@ pub fn compute_atomic_compare_exchange(frame: &mut Frame, node: NodeId, ctx: &Ev
 /// Returns `bool`.
 pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
-    let val = force_input(frame, inputs[0]);
+    // Peek (borrow) instead of force_input (clone): pattern tests fire 2-3x per
+    // match per iteration; the scrutinee's Arc incref/decref pair per test is
+    // pure overhead. Lazy thunks still need forcing (rare — fall through).
+    let peeked = frame.peek_value_by_global(inputs[0]);
+    let forced;
+    let val: &Value = match peeked {
+        Some(v) if !matches!(v, Value::Ref(r) if matches!(**r, crate::value::HeapObj::LazyVal(_))) => v,
+        _ => {
+            forced = force_input(frame, inputs[0]);
+            &forced
+        }
+    };
     let ctor_name = graph.pattern_ctor_name(node.0 as usize)
         .expect("pattern ctor match node has no ctor name");
     let type_name = graph.pattern_type_name(node.0 as usize);
@@ -2271,7 +2293,7 @@ fn cast_scalar_value(val: &Value, target_tag: crate::value::ValueTag) -> Value {
     }
 }
 
-/// compute_fn (idx 350): array cast — `x as T[]`.
+/// compute_fn (idx 347): array cast — `x as T[]`.
 ///
 /// Carries the array through: same-tag scalar elements pass the whole value
 /// untouched (SoA kept); different scalar element tags convert element-wise
@@ -2364,7 +2386,7 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     cast_scalar_value(&val, target_tag)
 }
 
-/// compute_fn (idx 279): non-null assertion `expr!`.
+/// compute_fn (idx 277): non-null assertion `expr!`.
 ///
 /// Input is a nullable value: `Null` → panic (a programming error, not a
 /// recoverable flow); non-Null → returned as-is (Scalar/Ref pass-through, i.e.
@@ -2378,7 +2400,7 @@ pub fn compute_non_null_assert(frame: &mut Frame, node: NodeId, ctx: &EvalContex
     v
 }
 
-/// compute_fn (idx 280): take a reference `&expr` (RefOf).
+/// compute_fn (idx 278): take a reference `&expr` (RefOf).
 ///
 /// Wraps the input value in an `Arc<HeapObj::Cell>` and returns
 /// `Value::Ref(arc)`. Multiple references share the same Cell (via Arc clone),
@@ -2427,13 +2449,49 @@ pub fn compute_ref_of(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Val
     }
 }
 
-/// compute_fn (idx 281): dereference read `*ref` (Deref).
+/// compute_fn (idx 349): unconditional Cell allocation (place-model
+/// decl-site slotting). Boxes ANY value into a fresh Cell — scalars and heap
+/// objects alike. Unlike `compute_ref_of` (which shares heap-object Arcs to
+/// preserve `&rec` object-reference semantics), this creates the binding's
+/// STORAGE location: name reads are loads of this cell, name assignments are
+/// stores into it.
+pub fn compute_cell_alloc(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
+    let v = force_input(frame, inputs[0]);
+    let cell = crate::value::Cell::new(v);
+    Value::ref_val(crate::value::HeapObj::Cell(cell))
+}
+
+/// compute_fn (idx 279): dereference read `*ref` (Deref).
 ///
 /// Input is an `Arc<HeapObj::Cell>`: returns the value inside the Cell.
 /// Input is any other Ref (record/array, etc.): returned as-is (`&rec` shares
 /// the Arc, so `*r` is just `rec` itself).
 pub fn compute_deref_read(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
+    // Hot path: borrow the ref value from the input slot directly — no Arc
+    // clone per cell read (place-model loops do this every iteration). Cell
+    // get() is a scalar copy; place-ref reads borrow the heap object's own
+    // fields. Falls through to force_input for pending/lazy inputs and for
+    // non-ref pass-through values.
+    if let Some(Value::Ref(arc)) = frame.peek_value_by_global(inputs[0]) {
+        match &**arc {
+            crate::value::HeapObj::Cell(c) => {
+                return c.get();
+            }
+            crate::value::HeapObj::ArrayElemRef { arr, idx } => {
+                return place_read_array_elem(arr, idx)
+            }
+            crate::value::HeapObj::RecordFieldRef { rec, field } => {
+                return place_read_record_field(rec, field)
+            }
+            crate::value::HeapObj::GlobalSlotRef { slot } => {
+                let storage = &graph.global_var_storage;
+                return storage[*slot as usize].lock().unwrap().clone().unwrap_or(Value::NULL);
+            }
+            _ => {}
+        }
+    }
     let v = force_input(frame, inputs[0]);
     match v.heap_obj() {
         Some(crate::value::HeapObj::Cell(c)) => c.get(),
@@ -2488,7 +2546,7 @@ fn place_read_record_field(rec: &Value, field: &str) -> Value {
     }
 }
 
-/// compute_fn (idx 282): dereference write `*ref = value` (DerefAssign).
+/// compute_fn (idx 280): dereference write `*ref = value` (DerefAssign).
 ///
 /// `inputs[0]` is the reference (Cell); `inputs[1]` is the new value. Writes
 /// the new value into the Cell and returns the written value (for chained use).
@@ -2496,6 +2554,23 @@ fn place_read_record_field(rec: &Value, field: &str) -> Value {
 /// writes go through `record_field_set`).
 pub fn compute_deref_write(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
+    // Hot path (same borrow trick as compute_deref_read): skip the Arc clone
+    // on the ref input when its slot is ready. The Cell escapes the immutable
+    // frame borrow as a raw pointer so force_input can take &mut frame.
+    if let Some(Value::Ref(arc)) = frame.peek_value_by_global(inputs[0]) {
+        let cell_raw: *const crate::value::Cell = match &**arc {
+            crate::value::HeapObj::Cell(c) => c as *const _,
+            _ => std::ptr::null(),
+        };
+        if !cell_raw.is_null() {
+            let new_val = force_input(frame, inputs[1]);
+            // SAFETY: the frame (and its slot's Arc) outlives this compute_fn
+            // call and the engine executes single-threaded — the Cell is
+            // neither freed nor concurrently mutated.
+            unsafe { (*cell_raw).set(new_val.clone()) };
+            return new_val;
+        }
+    }
     let ref_val = force_input(frame, inputs[0]);
     let new_val = force_input(frame, inputs[1]);
 
@@ -2594,7 +2669,7 @@ pub(crate) fn record_field_set_inplace(
     }
 }
 
-/// compute_fn (idx 301): array index store `arr[i] = x`.
+/// compute_fn (idx 299): array index store `arr[i] = x`.
 ///
 /// Three inputs: arr, index, value. Mutates the Array heap object's `elements`
 /// vector in place. Same semantics as `record_field_set`: mutates the heap data
@@ -2968,6 +3043,12 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
             node, cond_raw, cond, frame.subgraph_id.0, frame.node_offset,
             sg.node_range.0 .0, sg.node_range.1 .0,
             branches.branches.iter().map(|(c, sg, _)| (*c, sg.0)).collect::<Vec<_>>());
+        if node.0 == 27947 && std::env::var("FROND_DBG_PHI").is_ok() {
+            let l36 = frame.get_value_by_global(NodeId(27936));
+            let p32 = frame.get_value_by_global(NodeId(27932));
+            let a35 = frame.get_value_by_global(NodeId(27935));
+            eprintln!("[PHI] gate27947 ctx: lt={:?} param_si={:?} assert={:?}", l36, p32, a35);
+        }
     }
 
     // Select a branch (borrowed — no branch-inputs clone per Gate execution).
@@ -3889,7 +3970,7 @@ pub fn compute_continue(_frame: &mut Frame, _node: NodeId, _ctx: &EvalContext) -
     NodeResult::Continue
 }
 
-/// compute_fn (idx 314): match fallback — panics when no match arm matches.
+/// compute_fn (idx 311): match fallback — panics when no match arm matches.
 /// This is a runtime safety net; sema's exhaustiveness check should prevent
 /// reaching this node for ADT matches. For non-ADT matches without a catch-all,
 /// this serves as the unconditional panic.
@@ -3897,7 +3978,7 @@ pub fn compute_match_fallback(_frame: &mut Frame, _node: NodeId, _ctx: &EvalCont
     panic!("non-exhaustive match: no arm matched at runtime");
 }
 
-/// compute_fn (idx 48): sequence node — waits for all inputs to be ready, then returns
+/// compute_fn (idx 47): sequence node — waits for all inputs to be ready, then returns
 /// the value of the last input.
 ///
 /// Used for statement sequencing: `inputs = [prev_effect, current_value]`, returns `current_value`.
@@ -3910,146 +3991,6 @@ pub fn compute_seq(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value 
     }
     let last_input = inputs[n.input_count as usize - 1];
     frame.get_value_by_global(last_input)
-}
-
-/// compute_writeback (idx 49): assigns an outer variable, writing back to the function
-/// root frame via `root_frame_ptr`.
-///
-/// `inputs[0]` = value source (a node in the current frame),
-/// `writeback_targets[node]` = the outer global `NodeId`.
-/// Non-blocking: the write completes directly inside the `compute_fn` — no pending state,
-/// no Engine-layer consumption.
-///
-/// Three writeback paths (in priority order):
-/// 1. `parent_frame_ptr` chain: same-function closure call, writes to the nearest parent
-///    frame containing the target.
-/// 2. `root_frame_ptr`: same-function closure call, writes to the function root frame
-///    (so other `same_function` calls can observe the latest value).
-/// 3. `closure_val` Cell: escaped closure (cross-function call, frame chain is null),
-///    updates the closure upvalues via the `Cell`'s interior mutability so the next call
-///    reads the latest value.
-pub fn compute_writeback(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
-    let graph = ctx.graph;
-    let n = graph.node(node.0 as usize);
-    if n.input_count == 0 {
-        return NodeResult::Value(Value::VOID);
-    }
-    let val_node = graph.inputs(n.inputs_offset, n.input_count)[0];
-    let val = frame.get_value_by_global(val_node);
-    let target = graph.writeback_target(node.0 as usize)
-        .expect("WriteBack node missing target");
-    let consumer_count = graph.downstream_count(target.0 as usize);
-
-    if env_flag("FROND_DEBUG_WB") {
-        let sg = &graph.subgraphs[frame.subgraph_id.0 as usize];
-        eprintln!("[WB] node={:?} target={:?} val={:?} val_node={:?} frame.sg={} frame.offset={} sg.range=[{},{}) sg.func_id={} vt_len={}",
-            node, target, val, val_node, frame.subgraph_id.0, frame.node_offset,
-            sg.node_range.0 .0, sg.node_range.1 .0, sg.function_id, frame.value_table.len());
-    }
-
-    // Path 0: write to the current frame (same_function closure call scenario).
-    // The value table of a same_function frame is extended to the parent frame size,
-    // so the target may fall within the current frame's range.
-    // If the current frame is not written: after a() modifies `log`, WriteBack only
-    // writes the parent frame chain (the main frame); the `log` in a's own child frame
-    // remains stale. A subsequent b() reading the upvalue from a's child frame
-    // (parent_frame) gets a stale value, breaking mutable capture sharing across the
-    // closure chain (Bug #31).
-    let cur_local = target.0.wrapping_sub(frame.node_offset);
-    if (cur_local as usize) < frame.value_table.len() {
-        frame.set_value(NodeId(cur_local), val.clone(), consumer_count);
-    }
-
-    // Path 1: walk the `parent_frame_ptr` chain, writing to every ancestor frame that
-    // contains the target.
-    // We cannot break after writing only the nearest parent: in nested same_function
-    // subgraphs (e.g. if branch -> loop body -> loop frame -> main), intermediate frames
-    // (the loop frame) also need updating; otherwise the next iteration's body reads a
-    // stale value when copying from the loop frame.
-    // SAFETY: `parent_frame_ptr` points to a same-function frame (set by `setup_frame_chain`);
-    // the caller frame is in the Suspended state while the callee executes, so there is no
-    // concurrent access.
-    let mut written_parent = false;
-    let mut ptr = frame.parent_frame_ptr;
-    while !ptr.is_null() {
-        let f = unsafe { &mut *ptr };
-        let local = target.0.wrapping_sub(f.node_offset);
-        if (local as usize) < f.value_table.len() {
-            f.set_value(NodeId(local), val.clone(), consumer_count);
-            written_parent = true;
-        }
-        ptr = f.parent_frame_ptr;
-    }
-
-    // Path 2: write to `root_frame_ptr` (the function root frame) so that same-function
-    // closure calls can read the latest value from the root frame.
-    if !frame.root_frame_ptr.is_null() {
-        let root = unsafe { &mut *frame.root_frame_ptr };
-        let local = target.0.wrapping_sub(root.node_offset);
-        if (local as usize) < root.value_table.len() {
-            root.set_value(NodeId(local), val.clone(), consumer_count);
-        } else {
-            return NodeResult::Return(make_error_throw("InternalError",
-                &format!("writeback target {:?} out of root frame range", target)));
-        }
-    } else if !written_parent {
-        // Path 3: escaped closure (frame chain is null) — write back the upvalue via the
-        // `closure_val`'s Cell.
-        // When an escaped closure is called across functions, both `parent` and `root`
-        // are null, so writeback via the frame chain is impossible.
-        // The upvalues inside `closure_val` are wrapped in Cells (see `compute_closure_construct`);
-        // we persist the mutation via `Cell::set` so the next call reads the latest value.
-        let mut written_cell = false;
-        if let Some(ref closure_val) = frame.closure_val {
-            if let Value::Ref(arc) = closure_val {
-                let upvalues: &[Value] = match arc.as_ref() {
-                    crate::value::HeapObj::Closure(c) => &c.upvalues,
-                    crate::value::HeapObj::Partial(p) => &p.upvalues,
-                    _ => &[],
-                };
-                if !upvalues.is_empty() {
-                    let sg_idx = frame.subgraph_id.0 as usize;
-                    for (i, &outer_node) in frame.graph.sg_upvalue_outer_nodes(sg_idx).iter().enumerate() {
-                        if outer_node == target && i < upvalues.len() {
-                            if let Some(crate::value::HeapObj::Cell(cell)) = upvalues[i].heap_obj() {
-                                cell.set(val.clone());
-                                written_cell = true;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        // Path 4: non-escaped closure root-frame scenario (assignment inside a top-level
-        // function) — write to the current frame.
-        if !written_cell {
-            let local = target.0.wrapping_sub(frame.node_offset);
-            if (local as usize) < frame.value_table.len() {
-                frame.set_value(NodeId(local), val.clone(), consumer_count);
-            } else {
-                return NodeResult::Return(make_error_throw("InternalError",
-                    &format!("writeback target {:?} out of current frame range", target)));
-            }
-        }
-    }
-    NodeResult::Value(val)
-}
-
-/// compute_tailrec_writeback (idx 310): a WriteBack specialized for tail-recursion-to-iteration.
-///
-/// Performs the same writeback logic as `compute_writeback`, but additionally returns
-/// `NodeResult::Continue`.
-/// In a TailRec loop, when `body_sg` completes:
-/// - `Continue` (returned by the rec arm's WriteBack) -> `reset_loop_iteration` (loop continues)
-/// - `None` (base arm has no WriteBack) -> loop exits, returning `body_sg`'s return value
-pub fn compute_tailrec_writeback(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
-    // Normal writeback -> Continue (loop continues); out-of-bounds and other errors
-    // (NodeResult::Return) -> propagate upward (not silent).
-    match compute_writeback(frame, node, ctx) {
-        NodeResult::Value(_) => NodeResult::Continue,
-        other => other,
-    }
 }
 
 /// compute_defer_register (idx 322): registers a defer body onto the loop frame's

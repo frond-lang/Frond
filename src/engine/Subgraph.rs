@@ -24,6 +24,12 @@ pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubG
 
     // Clear value_table (prepare_frame_nodes does not do this).
     frame.value_table.reset_all();
+    frame.value_table.disable_dirty_tracking();
+    // E7: the re-targeted frame is a different subgraph — stale same-frame
+    // branch relays reference the old table layout (resize may shrink it).
+    frame.branch_relays.clear();
+    // E8 construct cache: gid-keyed values stay VALID across retargets
+    // (metadata is immutable) — kept; cleared only on pool reuse.
     frame.ready_queue.clear();
     frame.control_signal = ControlSignal::None;
     frame.cached_child_frame = None;
@@ -95,6 +101,11 @@ pub(super) fn finish_call_in_caller(
     }
 
     caller_frame.set_value(call_node, return_value, consumer_count);
+    // E7: the call node may be a same-frame branch's return relay target
+    // (an arm whose value is itself a call) — fire the relay chain.
+    if !caller_frame.branch_relays.is_empty() {
+        super::Schedule::relay_branch_value(caller_frame, graph, call_node);
+    }
 
     // Control-signal propagation — same matrix as complete_and_wake_caller (see the full
     // rationale there): capture gates never propagate; cross-function and lambda returns are
@@ -636,6 +647,9 @@ impl<S: LockStrategy> Engine<S> {
                 }
 
                 caller_frame.set_value(call_node, return_value, consumer_count);
+                if !caller_frame.branch_relays.is_empty() {
+                    super::Schedule::relay_branch_value(caller_frame, &self.graph, call_node);
+                }
                 caller_frame.state = FrameState::Ready;
                 caller_frame.suspend_state = SuspendState::NotSuspended;
                 caller_frame.suspend_event = None;

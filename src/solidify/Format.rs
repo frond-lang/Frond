@@ -114,6 +114,7 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
             debug_assert!(loop_kind <= 0b1111);
             let mut flags: u8 = sg.has_suspend as u8;
             flags |= (sg.reset_plan.is_some() as u8) << 1;
+            flags |= (sg.converter_generated as u8) << 2;
             flags |= loop_kind << 4;
 
             write_u32(&mut sg_buf, sg.node_range.0.0);
@@ -171,6 +172,16 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
                 for nid in &rp.reset_to_one { write_u32(&mut reset_plan_buf, nid.0); }
                 write_u32(&mut reset_plan_buf, rp.reset_condition_tree.len() as u32);
                 for nid in &rp.reset_condition_tree { write_u32(&mut reset_plan_buf, nid.0); }
+                write_u32(&mut reset_plan_buf, rp.carries_value.len() as u32);
+                for (p, v) in &rp.carries_value {
+                    write_u32(&mut reset_plan_buf, p.0);
+                    write_u32(&mut reset_plan_buf, v.0);
+                }
+                write_u32(&mut reset_plan_buf, rp.carries_cell.len() as u32);
+                for (p, c) in &rp.carries_cell {
+                    write_u32(&mut reset_plan_buf, p.0);
+                    write_u32(&mut reset_plan_buf, c.0);
+                }
             }
         }
 
@@ -228,7 +239,6 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
     ser_sparse_opt!(sections, graph, field_access_infos, FieldAccessInfos, |b, v| write_u16(b, *v));
     ser_sparse_opt!(sections, graph, vtable_call_methods, VtableCallMethods, |b, v| write_u16(b, *v));
     ser_sparse_opt!(sections, graph, await_event_sources, AwaitEventSources, |b, v| write_u32(b, v.0));
-    ser_sparse_opt!(sections, graph, writeback_targets, WritebackTargets, |b, v| write_u32(b, v.0));
     ser_sparse_opt!(sections, graph, global_load_slots, GlobalLoadSlots, |b, v| write_u32(b, *v));
     ser_sparse_opt!(sections, graph, global_store_slots, GlobalStoreSlots, |b, v| write_u32(b, *v));
     ser_sparse_opt!(sections, graph, pattern_field_indices, PatternFieldIndices, |b, v| write_u16(b, *v));
@@ -787,6 +797,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
             let has_suspend = flags & 1 != 0;
             let has_rp = flags & 0b10 != 0;
             let loop_kind = u8_to_loop_kind(flags >> 4);
+            let converter_generated = flags & 0b100 != 0;
             let upvalue_count = read_u8(&mut sr_r);
             let loop_parent_sg = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(SubGraphId(v)) } };
             let cond_node = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(NodeId(v)) } };
@@ -835,13 +846,14 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
             }
 
             subgraphs.push(SubGraph {
+                converter_generated,
                 id: SubGraphId(i as u32),
                 node_range, param_count, entry_node, return_node, has_suspend,
                 event_source_decls, defer_table, loop_kind, loop_parent_sg, cond_node,
                 function_id, iter_next_node, upvalue_count, upvalue_outer_nodes,
                 nested_ranges: Vec::new(), // derived post-assembly (v3)
                 reset_plan: None,           // filled below once slice ends are known
-            });
+                    });
 
             // Reset plans parse in the pass below (a plan's slice ends where
             // the next sg's slice starts); park a marker on the struct now.
@@ -849,6 +861,8 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
                 subgraphs[i].reset_plan = Some(ResetPlan {
                     reset_to_zero: Vec::new(), reset_to_one: Vec::new(),
                     reset_condition_tree: Vec::new(), condition_tree_plan: Vec::new(),
+                        carries_value: Vec::new(), carries_cell: Vec::new(),
+                    fused_carries: Vec::new(),
                 });
             }
         }
@@ -865,7 +879,15 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
                 let reset_to_one: Vec<NodeId> = (0..ro_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
                 let rc_len = read_u32(&mut rp_r) as usize;
                 let reset_condition_tree: Vec<NodeId> = (0..rc_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
-                sg.reset_plan = Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree, condition_tree_plan: Vec::new() });
+                let cv_len = read_u32(&mut rp_r) as usize;
+                let carries_value: Vec<(NodeId, NodeId)> = (0..cv_len)
+                    .map(|_| (NodeId(read_u32(&mut rp_r)), NodeId(read_u32(&mut rp_r))))
+                    .collect();
+                let cc_len = read_u32(&mut rp_r) as usize;
+                let carries_cell: Vec<(NodeId, NodeId)> = (0..cc_len)
+                    .map(|_| (NodeId(read_u32(&mut rp_r)), NodeId(read_u32(&mut rp_r))))
+                    .collect();
+                sg.reset_plan = Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree, condition_tree_plan: Vec::new(), carries_value, carries_cell, fused_carries: Vec::new() });
             }
         }
         subgraphs
@@ -910,8 +932,6 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     let call_targets: Vec<Option<SubGraphId>> = scatter_a_u32(SectionKind::CallTargets)
         .into_iter().map(|o| o.map(SubGraphId)).collect();
     let await_event_sources: Vec<Option<NodeId>> = scatter_a_u32(SectionKind::AwaitEventSources)
-        .into_iter().map(|o| o.map(NodeId)).collect();
-    let writeback_targets: Vec<Option<NodeId>> = scatter_a_u32(SectionKind::WritebackTargets)
         .into_iter().map(|o| o.map(NodeId)).collect();
     let global_load_slots: Vec<Option<u32>> = scatter_a_u32(SectionKind::GlobalLoadSlots);
     let global_store_slots: Vec<Option<u32>> = scatter_a_u32(SectionKind::GlobalStoreSlots);
@@ -1178,6 +1198,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         sg_initial_seed: Vec::new(),
         downstream_counts: Vec::new(),
         linear_plans: Vec::new(),
+        converter_scope: false,
         nodes,
         inputs_pool,
         subgraphs,
@@ -1201,7 +1222,6 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         embed_infos,
         resources,
         select_infos,
-        writeback_targets,
         tail_call_flags,
         safe_op_flags,
         hoisted_node,
@@ -1287,6 +1307,7 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
             let has_suspend = flags & 1 != 0;
             let has_rp = flags & 0b10 != 0;
             let loop_kind = u8_to_loop_kind(flags >> 4);
+            let converter_generated = flags & 0b100 != 0;
             let upvalue_count = read_u8(&mut sr_r);
             let loop_parent_sg = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(SubGraphId(v)) } };
             let cond_node = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(NodeId(v)) } };
@@ -1331,18 +1352,21 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
             }
 
             subgraphs.push(SubGraph {
+                converter_generated,
                 id: SubGraphId(i as u32),
                 node_range, param_count, entry_node, return_node, has_suspend,
                 event_source_decls, defer_table, loop_kind, loop_parent_sg, cond_node,
                 function_id, iter_next_node, upvalue_count, upvalue_outer_nodes,
                 nested_ranges: Vec::new(), // derived post-assembly (v3)
                 reset_plan: None,
-            });
+                    });
 
             if has_rp {
                 subgraphs[i].reset_plan = Some(ResetPlan {
                     reset_to_zero: Vec::new(), reset_to_one: Vec::new(),
                     reset_condition_tree: Vec::new(), condition_tree_plan: Vec::new(),
+                        carries_value: Vec::new(), carries_cell: Vec::new(),
+                    fused_carries: Vec::new(),
                 });
             }
         }
@@ -1358,7 +1382,15 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
                 let reset_to_one: Vec<NodeId> = (0..ro_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
                 let rc_len = read_u32(&mut rp_r) as usize;
                 let reset_condition_tree: Vec<NodeId> = (0..rc_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
-                sg.reset_plan = Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree, condition_tree_plan: Vec::new() });
+                let cv_len = read_u32(&mut rp_r) as usize;
+                let carries_value: Vec<(NodeId, NodeId)> = (0..cv_len)
+                    .map(|_| (NodeId(read_u32(&mut rp_r)), NodeId(read_u32(&mut rp_r))))
+                    .collect();
+                let cc_len = read_u32(&mut rp_r) as usize;
+                let carries_cell: Vec<(NodeId, NodeId)> = (0..cc_len)
+                    .map(|_| (NodeId(read_u32(&mut rp_r)), NodeId(read_u32(&mut rp_r))))
+                    .collect();
+                sg.reset_plan = Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree, condition_tree_plan: Vec::new(), carries_value, carries_cell, fused_carries: Vec::new() });
             }
         }
         (subgraphs, sg_uv_offsets)
@@ -1428,8 +1460,6 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
     let call_targets: Vec<Option<SubGraphId>> = scatter_a_u32(SectionKind::CallTargets)
         .into_iter().map(|o| o.map(SubGraphId)).collect();
     let await_event_sources: Vec<Option<NodeId>> = scatter_a_u32(SectionKind::AwaitEventSources)
-        .into_iter().map(|o| o.map(NodeId)).collect();
-    let writeback_targets: Vec<Option<NodeId>> = scatter_a_u32(SectionKind::WritebackTargets)
         .into_iter().map(|o| o.map(NodeId)).collect();
     let global_load_slots: Vec<Option<u32>> = scatter_a_u32(SectionKind::GlobalLoadSlots);
     let global_store_slots: Vec<Option<u32>> = scatter_a_u32(SectionKind::GlobalStoreSlots);
@@ -1572,6 +1602,7 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         sg_initial_seed: Vec::new(),
         downstream_counts: Vec::new(),
         linear_plans: Vec::new(),
+        converter_scope: false,
         nodes: Vec::new(),
         inputs_pool: InputsPool::new(),
         subgraphs,
@@ -1595,7 +1626,6 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         embed_infos,
         resources,
         select_infos: Vec::new(),
-        writeback_targets,
         tail_call_flags: Vec::new(),
         safe_op_flags: Vec::new(),
         hoisted_node: vec![false; n],

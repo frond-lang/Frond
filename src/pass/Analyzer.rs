@@ -4553,13 +4553,9 @@ fn find_invariants(
         loop_deps.insert(n);
     }
 
-    // Modified set: writeback targets of side-effecting nodes within body_sg
-    let mut modified: FxHashSet<NodeId> = FxHashSet::default();
-    for idx in (body_start.0 as usize)..(body_end.0 as usize) {
-        if let Some(Some(wt)) = graph.writeback_targets.get(idx) {
-            modified.insert(*wt);
-        }
-    }
+    // Modified set within body_sg (WriteBack machinery deleted B/C 2026-08-22 —
+    // cell stores go through the engine-level Cell, not node metadata).
+    let modified: FxHashSet<NodeId> = FxHashSet::default();
 
     // Pre-compute all loop sub-graph ranges (loop_kind != None) to determine whether a node is at function level.
     // The hoist target is the function-level sub-graph; only nodes whose inputs are all at function level

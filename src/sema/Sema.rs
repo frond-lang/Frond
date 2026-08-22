@@ -1601,15 +1601,15 @@ define_builtin_types! {
             sig("is_ok", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), None),
         ],
         "Channel" : ["T"] = [
-            sig("send", vec![TypeRepr::ThisType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(284))),
+            sig("send", vec![TypeRepr::ThisType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(282))),
             sig("recv", vec![TypeRepr::ThisType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::ChannelAwait)),
-            sig("close", vec![TypeRepr::ThisType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
+            sig("close", vec![TypeRepr::ThisType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(283))),
         ],
         "Atomic" : ["T"] = [
-            sig("swap", vec![TypeRepr::ThisType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::BinOp(317))),
-            sig("compare_exchange", vec![TypeRepr::ThisType, TypeRepr::Named("T".into()), TypeRepr::Named("T".into())], Some(TypeRepr::Named("bool".into())), Some(IntrinsicKind::TriOp(318))),
-            sig("load", vec![TypeRepr::ThisType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::UnOp(315))),
-            sig("store", vec![TypeRepr::ThisType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(316))),
+            sig("swap", vec![TypeRepr::ThisType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::BinOp(314))),
+            sig("compare_exchange", vec![TypeRepr::ThisType, TypeRepr::Named("T".into()), TypeRepr::Named("T".into())], Some(TypeRepr::Named("bool".into())), Some(IntrinsicKind::TriOp(315))),
+            sig("load", vec![TypeRepr::ThisType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::UnOp(312))),
+            sig("store", vec![TypeRepr::ThisType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(313))),
         ],
         "Async" : ["T"] = [
             sig("status", vec![TypeRepr::ThisType], Some(TypeRepr::Named("str".into())), None),
@@ -1617,12 +1617,12 @@ define_builtin_types! {
             sig("cancel", vec![TypeRepr::ThisType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(42))),
         ],
         "Sender" : ["T"] = [
-            sig("send", vec![TypeRepr::ThisType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(284))),
-            sig("close", vec![TypeRepr::ThisType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
+            sig("send", vec![TypeRepr::ThisType, TypeRepr::Named("T".into())], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::BinOp(282))),
+            sig("close", vec![TypeRepr::ThisType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(283))),
         ],
         "Receiver" : ["T"] = [
             sig("recv", vec![TypeRepr::ThisType], Some(TypeRepr::Named("T".into())), Some(IntrinsicKind::ChannelAwait)),
-            sig("close", vec![TypeRepr::ThisType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(285))),
+            sig("close", vec![TypeRepr::ThisType], Some(TypeRepr::Named("void".into())), Some(IntrinsicKind::UnOp(283))),
         ],
         "Lazy" : ["T"] = [],
         // Lib/ForeignFn methods dispatch structurally (name-based, like reflect):
@@ -1633,12 +1633,12 @@ define_builtin_types! {
         "Lib" : [] = [],
         "array" : ["T"] = [
             sig("len", vec![TypeRepr::ThisType], Some(TypeRepr::Named("usize".into())), Some(IntrinsicKind::UnOp(35))),
-            sig("is_empty", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), Some(IntrinsicKind::UnOp(343))),
+            sig("is_empty", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), Some(IntrinsicKind::UnOp(340))),
         ],
         "str" : [] = [
             sig("len", vec![TypeRepr::ThisType], Some(TypeRepr::Named("usize".into())), Some(IntrinsicKind::UnOp(35))),
-            sig("is_empty", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), Some(IntrinsicKind::UnOp(343))),
-            sig("bytes", vec![TypeRepr::ThisType], Some(TypeRepr::Array(Box::new(TypeRepr::Named("u8".into())), None)), Some(IntrinsicKind::UnOp(287))),
+            sig("is_empty", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), Some(IntrinsicKind::UnOp(340))),
+            sig("bytes", vec![TypeRepr::ThisType], Some(TypeRepr::Array(Box::new(TypeRepr::Named("u8".into())), None)), Some(IntrinsicKind::UnOp(285))),
         ],
         "nullable" : ["T"] = [
             sig("is_null", vec![TypeRepr::ThisType], Some(TypeRepr::Named("bool".into())), Some(IntrinsicKind::UnOp(34))),

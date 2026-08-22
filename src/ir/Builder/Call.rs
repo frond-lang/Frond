@@ -252,7 +252,28 @@ impl<'a> IrBuilder<'a> {
         // arg_count metadata records the actual argument count (excluding closure value and effect), used for chained partial-application detection
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
             if !self.func_subgraphs.contains_key(*name) {
-                if let Some(closure_node) = self.lookup_var(name) {
+                // Cell-backed binding: the callable routes through the cell —
+                // the FORWARDED value node when the Builder knows it (zero
+                // cost), else a CF_DEREF_READ load. `lookup_var` alone would
+                // hand back the CELL node itself (its value is a Ref(Arc<Cell>),
+                // not callable).
+                let cell_backed = self.lookup_cell_binding(name).and_then(|c| {
+                    self.cell_forwarded_value(c).or_else(|| {
+                        let (count, off) = match self.current_effect {
+                            Some(eff) => (2, self.graph.inputs_pool.push(&[c, eff])),
+                            None => (1, self.graph.inputs_pool.push(&[c])),
+                        };
+                        let load = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: count,
+                            inputs_offset: off,
+                            compute_fn: CF_DEREF_READ,
+                        });
+                        self.track_cell_store(c, load);
+                        Some(load)
+                    })
+                });
+                if let Some(closure_node) = cell_backed.or_else(|| self.lookup_var(name)) {
                     let mut inputs = Vec::with_capacity(args.len() + 2);
                     inputs.push(closure_node);
                     for &arg in args {
@@ -372,72 +393,75 @@ impl<'a> IrBuilder<'a> {
 
         // Tail-recursion-to-iteration interception: currently compiling in a TailRecToLoop body and callee is self_name,
         // and in tail position (to avoid recursive calls in arguments being mistakenly intercepted),
-        // generate WriteBack(param, actual) instead of Call(self).
+        // store the actuals through the parameter-register Cells instead of Call(self).
         // body_sg is a LoopBody; after it completes, reset_loop_iteration automatically jumps back to while_sg to re-evaluate cond.
         if self.in_tail_position && self.tail_rec_ctx.is_some() {
-            // Tail-recursion interception: generate WriteBack(param, actual) instead of Call(self)
+            // Tail-recursion interception: cell stores instead of Call(self)
         }
         if self.in_tail_position {
             if let Some(ctx) = &self.tail_rec_ctx.clone() {
                 if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
                     if *name == ctx.self_name {
-                    // Compile all actual-argument expressions (evaluate first, then WriteBack, to avoid races between parameters)
+                    // Compile all actual-argument expressions (evaluate first, then store, to avoid races between parameters)
                     let arg_nodes: Vec<NodeId> = args
                         .iter()
                         .map(|&a| self.compile_subexpr(a))
                         .collect();
-                    // Perform a WriteBack for each parameter (writing back to the function-level param nodes).
-                    // Barrier mechanism: the first WriteBack depends on all arg_nodes;
-                    // subsequent WriteBacks chain-depend on the previous WriteBack.
-                    // This ensures all actual-argument expressions finish evaluating before any WriteBack executes,
-                    // preventing a+b from reading the already-WriteBack-updated value of a.
-                    //
-                    // Only the last WriteBack uses CF_TAILREC_WRITEBACK (sets Continue);
-                    // non-last WriteBacks use CF_WRITEBACK (do not set Continue).
-                    // Reason: the Continue signal causes the frame to exit immediately and skip notify_downstream;
-                    // if every WriteBack set Continue, subsequent chained WriteBacks would never become ready to execute.
-                    let wb_count = arg_nodes.len().min(ctx.param_nodes.len());
-                    let mut last_wb: Option<NodeId> = None;
+                    // B2: store each actual through the parameter-register Cell
+                    // (CF_DEREF_WRITE). Barrier mechanism mirrors the old
+                    // WriteBack chain: the first store depends on all arg_nodes
+                    // (all actuals finish evaluating before any store executes —
+                    // `self(a, a+1)` must not read an already-updated cell);
+                    // subsequent stores chain-depend on the previous store.
+                    // Inputs past [cell, value] are ordering-only deps (the
+                    // compute fn reads inputs[0..2]) — same convention as the
+                    // assignment path's trailing effect input.
+                    let mut last_store: Option<NodeId> = None;
                     for (i, &arg_node) in arg_nodes.iter().enumerate() {
-                        if i < ctx.param_nodes.len() {
-                            let mut wb_inputs = vec![arg_node];
+                        if i < ctx.param_cells.len() {
+                            let mut store_inputs = vec![ctx.param_cells[i], arg_node];
                             if i == 0 {
-                                // First WB: a barrier depending on all other arg_nodes
+                                // First store: a barrier depending on all other arg_nodes
                                 for &other in &arg_nodes[1..] {
-                                    wb_inputs.push(other);
+                                    store_inputs.push(other);
                                 }
-                            } else if let Some(prev_wb) = last_wb {
-                                // Subsequent WBs: depend on the previous WB (chain ordering)
-                                wb_inputs.push(prev_wb);
+                            } else if let Some(prev_store) = last_store {
+                                // Subsequent stores: depend on the previous store (chain ordering)
+                                store_inputs.push(prev_store);
                             }
-                            let is_last = i + 1 == wb_count;
-                            let compute_fn = if is_last {
-                                CF_TAILREC_WRITEBACK
-                            } else {
-                                CF_WRITEBACK
-                            };
-                            let wb_off = self.graph.inputs_pool.push(&wb_inputs);
-                            let wb_node = self.graph.add_node(Node {
-                                kind: NodeKind::Call,
-                                input_count: wb_inputs.len() as u8,
-                                inputs_offset: wb_off,
-                                compute_fn,
+                            let store_off = self.graph.inputs_pool.push(&store_inputs);
+                            let store_node = self.graph.add_node(Node {
+                                kind: NodeKind::BinOp,
+                                input_count: store_inputs.len() as u8,
+                                inputs_offset: store_off,
+                                compute_fn: CF_DEREF_WRITE,
                             });
-                            self.graph.set_writeback_target(wb_node, ctx.param_nodes[i]);
-                            self.current_effect = Some(wb_node);
-                            last_wb = Some(wb_node);
+                            self.track_cell_store(ctx.param_cells[i], arg_node);
+                            self.current_effect = Some(store_node);
+                            last_store = Some(store_node);
                         }
                     }
-                    // Return the last WriteBack node (after body_sg completes, reset_loop_iteration automatically jumps back)
-                    return last_wb.unwrap_or_else(|| {
-                        let off = self.graph.inputs_pool.push(&[]);
-                        self.graph.add_node(Node {
-                            kind: NodeKind::Const,
-                            input_count: 0,
-                            inputs_offset: off,
-                            compute_fn: CF_NOOP,
-                        })
-                    });
+                    // Continue barrier (terminates the body-sg frame; the loop
+                    // re-evaluates the condition against the updated cells).
+                    let barrier_dep = match last_store {
+                        Some(s) => s,
+                        None => match self.current_effect {
+                            Some(eff) => eff,
+                            None => {
+                                let off = self.graph.inputs_pool.push(&[]);
+                                self.graph.add_node(Node {
+                                    kind: NodeKind::Const,
+                                    input_count: 0,
+                                    inputs_offset: off,
+                                    compute_fn: CF_NOOP,
+                                })
+                            }
+                        },
+                    };
+                    let barrier = self.make_continue_barrier(barrier_dep);
+                    self.current_effect = Some(barrier);
+                    // Return the barrier node (after body_sg completes, reset_loop_iteration automatically jumps back)
+                    return barrier;
                     }
                 }
             }
@@ -450,8 +474,25 @@ impl<'a> IrBuilder<'a> {
             if let Some(ctx) = &ctx_clone {
                 if let crate::ast::Ast::Expr::Ident(callee_name) = &callee_expr.node {
                     if *callee_name == ctx.self_name {
-                        // 1. Check call_result_map: if the current call is already in the map, return the mapped node
+                        // 1. Check call_result_map: if the current call is already in the map,
+                        //    return the mapped node. The RESULT_CELL_MARKER case synthesizes a
+                        //    CF_DEREF_READ of the result Cell HERE (in the consuming state sg):
+                        //    it executes after the producing state's store (states run
+                        //    sequentially), reading the current Cell value.
                         if let Some(&mapped) = ctx.call_result_map.get(&call_expr_id) {
+                            if mapped == RESULT_CELL_MARKER {
+                                let (lc, lo) = match self.current_effect {
+                                    Some(eff) => (2, self.graph.inputs_pool.push(&[ctx.result_cell, eff])),
+                                    None => (1, self.graph.inputs_pool.push(&[ctx.result_cell])),
+                                };
+                                let load = self.graph.add_node(Node {
+                                    kind: NodeKind::UnOp,
+                                    input_count: lc,
+                                    inputs_offset: lo,
+                                    compute_fn: CF_DEREF_READ,
+                                });
+                                return load;
+                            }
                             return mapped;
                         }
                         // 2. If already truncated, return a void constant (no Call node generated)
@@ -474,19 +515,29 @@ impl<'a> IrBuilder<'a> {
                         let max_saved = ctx.max_saved;
                         let current_state = ctx.current_state as usize;
                         let stack_node = ctx.stack_node;
-                        let sp_node = ctx.sp_node;
-                        let result_node = ctx.result_node;
+                        let sp_cell = ctx.sp_cell;
+
+                        // B3: read the current sp through its Cell. The pop store
+                        // (body sg, iteration start) has completed before this
+                        // state sg runs, so the Cell holds the post-pop value.
+                        let sp_load_off = self.graph.inputs_pool.push(&[sp_cell]);
+                        let sp_load = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: 1,
+                            inputs_offset: sp_load_off,
+                            compute_fn: CF_DEREF_READ,
+                        });
 
                         // Compute stack indices: base_cont = sp * stride, base_task = (sp + 1) * stride
-                        // sp has already been decremented by pop (sp_node = original_sp - 1)
+                        // sp has already been decremented by pop (sp = original_sp - 1)
                         // cont writes to the slot freed by pop (overwriting the consumed frame); task writes to the next slot
                         // sp_new = sp + 2; on pop, sp-1 reads task first (LIFO), then cont
                         let one_const = self.make_i32_const(1);
-                        let sp_plus_1 = self.make_binop(sp_node, one_const, CF_ADD_I32);
+                        let sp_plus_1 = self.make_binop(sp_load, one_const, CF_ADD_I32);
                         let two_const = self.make_i32_const(2);
-                        let sp_plus_2 = self.make_binop(sp_node, two_const, CF_ADD_I32);
+                        let sp_plus_2 = self.make_binop(sp_load, two_const, CF_ADD_I32);
                         let stride_val = self.make_i32_const(stride as i32);
-                        let base_cont = self.make_binop(sp_node, stride_val, CF_MUL_I32);
+                        let base_cont = self.make_binop(sp_load, stride_val, CF_MUL_I32);
                         let base_task = self.make_binop(sp_plus_1, stride_val, CF_MUL_I32);
 
                         // Push continuation frame (write to the slot freed by pop)
@@ -507,8 +558,11 @@ impl<'a> IrBuilder<'a> {
                             self.make_array_store(stack_node, state_idx_cont, state_after);
                         self.current_effect = Some(self.chain_effects(self.current_effect, state_store_cont));
                         // stack[base_cont + P + 1..P + 1 + num_saved] = saved values
-                        // For state S: slot j = saved_nodes[j] (j < S-1), result_node (j == S-1), 0 (j >= S)
+                        // For state S: slot j = saved_nodes[j] (j < S-1), result-load (j == S-1), 0 (j >= S)
+                        // The result-load reads the result Cell HERE (this state sg):
+                        // the value was stored by the previous state's completion.
                         let zero_saved = self.make_i32_const(0);
+                        let mut result_load: Option<NodeId> = None;
                         for j in 0..max_saved {
                             let offset = self.make_i32_const((param_count + 1 + j) as i32);
                             let idx = self.make_binop(base_cont, offset, CF_ADD_I32);
@@ -516,8 +570,25 @@ impl<'a> IrBuilder<'a> {
                                 if j + 1 < current_state {
                                     ctx.saved_nodes[j]
                                 } else {
-                                    // j == current_state - 1
-                                    result_node
+                                    // j == current_state - 1: the most recent call's result
+                                    let load = match result_load {
+                                        Some(l) => l,
+                                        None => {
+                                            let (lc, lo) = match self.current_effect {
+                                                Some(eff) => (2, self.graph.inputs_pool.push(&[ctx.result_cell, eff])),
+                                                None => (1, self.graph.inputs_pool.push(&[ctx.result_cell])),
+                                            };
+                                            let l = self.graph.add_node(Node {
+                                                kind: NodeKind::UnOp,
+                                                input_count: lc,
+                                                inputs_offset: lo,
+                                                compute_fn: CF_DEREF_READ,
+                                            });
+                                            result_load = Some(l);
+                                            l
+                                        }
+                                    };
+                                    load
                                 }
                             } else {
                                 zero_saved
@@ -548,13 +619,19 @@ impl<'a> IrBuilder<'a> {
                             self.current_effect = Some(self.chain_effects(self.current_effect, store));
                         }
 
-                        // WriteBack sp = sp + 2 (chained into effect to ensure it runs after all stores)
+                        // sp = sp + 2 through the Cell (chained into effect to ensure it runs after all stores)
                         let sp_new = self.chain_effects(self.current_effect, sp_plus_2);
-                        let sp_wb = self.compile_writeback_node(sp_new, sp_node);
-                        self.current_effect = Some(sp_wb);
+                        let sp_store_off = self.graph.inputs_pool.push(&[sp_cell, sp_new]);
+                        let sp_store = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: 2,
+                            inputs_offset: sp_store_off,
+                            compute_fn: CF_DEREF_WRITE,
+                        });
+                        self.current_effect = Some(sp_store);
 
                         // Create the barrier node (Continue signal; blocks subsequent expression execution)
-                        let barrier = self.make_continue_barrier(sp_wb);
+                        let barrier = self.make_continue_barrier(sp_store);
                         self.current_effect = Some(barrier);
 
                         // Set the truncated flag
@@ -656,6 +733,54 @@ impl<'a> IrBuilder<'a> {
             let arg_node = self.compile_subexpr(arg);
             arg_nodes.push(arg_node);
             self.bind_var(param.name, arg_node);
+        }
+        // Inline-body param slotting (mirrors ③ in compile_function_body):
+        // an ASSIGNED param's cell stores keep the loop/branch machinery out
+        // of the caller's inline copy. Without this, an inlined loop assigning
+        // the param compiles WriteBacks against the raw arg node.
+        // Branch contexts (if arm, &&-RHS — current_branch_sg set) create the
+        // cells too, but chain them onto a FRESH in-branch effect root:
+        // chaining onto the incoming (parent) effect would wire a
+        // branch-internal SEQ to a non-dominating outer node (⑤ V2 stall),
+        // while skipping the chain entirely lets an internal gate launch
+        // before the alloc executes — its completion can't reach the nested
+        // branch frame's pending table and stores are silently dropped (⑥).
+        // The reset is sound: parent effects completed before the branch frame
+        // launched, so in-branch ordering is the only constraint.
+        if self.fn_all_vars_slot {
+            let in_branch = self.current_branch_sg.is_some();
+            let mut assigned = rustc_hash::FxHashSet::default();
+            collect_assigned_names_deep(&self.current_module().arena, body, &mut assigned);
+            for param in params {
+                if assigned.contains(param.name) {
+                    if let Some(arg_node) = self.lookup_var(param.name) {
+                        let off = self.graph.inputs_pool.push(&[arg_node]);
+                        let cell_node = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: 1,
+                            inputs_offset: off,
+                            compute_fn: CF_CELL_ALLOC,
+                        });
+                        self.bind_cell(param.name, cell_node);
+                        self.track_cell_decl(param.name, cell_node, arg_node);
+                        if in_branch {
+                            // Root the branch-local effect chain at the alloc:
+                            // no SEQ onto the incoming parent effect (⑤ V2
+                            // stall class), yet every subsequent in-branch
+                            // effect — including internal gate effect chains —
+                            // depends on the alloc, so nested-sg stores can
+                            // never outrun it (⑥ silent-drop class). Parent
+                            // effects completed before this branch frame
+                            // launched; in-branch ordering is the only
+                            // constraint.
+                            self.current_effect = Some(cell_node);
+                        } else {
+                            self.current_effect =
+                                Some(self.chain_effects(self.current_effect, cell_node));
+                        }
+                    }
+                }
+            }
         }
         // W4c: bodies with early `return` / `?` cannot be compiled straight into
         // the caller (the Return signal is function-scoped and would terminate

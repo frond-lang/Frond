@@ -26,6 +26,10 @@ pub(super) fn env_flag(name: &str) -> bool {
     const KNOWN_FLAGS: &[&str] = &[
         "FROND_DEBUG_STALL",
         "FROND_NO_REUSECHAIN",
+        "FROND_NO_DELTA_RESET",
+        "FROND_NO_SAMEFRAME",
+        "FROND_SAMEFRAME",
+        "FROND_DEBUG_SF",
         "FROND_DEBUG_FORIN",
         "FROND_DEBUG_CALL",
         "FROND_DEBUG_IFELSE",
@@ -283,18 +287,72 @@ fn compute_linear_plan(graph: &DataFlowGraph, s: usize) -> Option<Vec<NodeId>> {
     let nested: &[(u32, u32)] = graph.sg_nested_ranges(s);
     let is_nested = |gid: u32| -> bool { nested.iter().any(|&(a, b)| gid >= a && gid < b) };
 
+    // Gate-in-plan is allowed only where launching is statically known to be
+    // same-frame-safe: plain / LoopBody sgs whose every own Gate's BOTH branch
+    // targets pass the E7 eligibility (minus the runtime arg bits). A gate
+    // that would bail every iteration (loop-dispatch gates, converter state
+    // machines, capture/suspending/closure arms) rejects the plan — the sg
+    // keeps the pure dataflow driver (pre-E9 behavior, no regression).
+    let sg_kind = graph.subgraphs[s].loop_kind;
+    let sg_conv = graph.subgraphs[s].converter_generated;
+    let fn_id = graph.subgraphs[s].function_id;
+    let gates_ok = !sg_conv
+        && matches!(
+            sg_kind,
+            crate::ir::Ir::LoopKind::None | crate::ir::Ir::LoopKind::LoopBody
+        );
+    let gate_static_ok = |gate_idx: usize| -> bool {
+        let Some(gb) = graph.gate_branches_at(gate_idx) else {
+            return false;
+        };
+        if gb.capture {
+            return false;
+        }
+        for (_, bsg, _) in &gb.branches {
+            let t = &graph.subgraphs[bsg.0 as usize];
+            if t.converter_generated
+                || t.has_suspend
+                || !t.event_source_decls.is_empty()
+                || t.loop_kind != crate::ir::Ir::LoopKind::None
+                || t.function_id != fn_id
+                || bsg.0 == t.function_id
+            {
+                return false;
+            }
+            // Control-signal-free own nodes (mirrors the runtime eligibility
+            // scan in Schedule.rs — keep the two in sync).
+            let nested_t: &[(u32, u32)] = graph.sg_nested_ranges(bsg.0 as usize);
+            let (cs, ce) = t.node_range;
+            for g in cs.0..ce.0 {
+                if nested_t.iter().any(|&(a, b)| g >= a && g < b) {
+                    continue;
+                }
+                if crate::ir::Ir::is_control_flow_compute_fn(
+                    graph.node(g as usize).compute_fn,
+                ) {
+                    return false;
+                }
+            }
+        }
+        true
+    };
     let mut own = vec![false; n];
     for i in 0..n {
         let node = graph.node(start + i);
         if node.kind == NodeKind::EventSource {
             return None;
         }
-        // Only fully-linear subgraphs get a plan: a launch node mid-sg would force a
-        // bail + readiness rebuild every run, which costs more than pure dataflow
-        // driving (measured: match_dispatch regressed ~13% with prefix-linear plans).
-        // The bail machinery in run_linear remains as a safety net.
+        // Segmented-linear (E9): Gate nodes stay IN the plan at their topo
+        // position — run_linear launches the taken branch same-frame (E7) and
+        // drains the injected subtree before continuing, so no bail/rebuild is
+        // needed for them. Other launch kinds (Call/Await/EventSource) still
+        // reject the plan: their protocols need the dataflow driver. (The
+        // pre-E7 measurement — mid-sg launches regressing match_dispatch ~13%
+        // — was about child-frame launches + readiness rebuilds, both gone.)
         if is_launch_kind(node.kind) {
-            return None;
+            if node.kind != NodeKind::Gate || !gates_ok || !gate_static_ok(start + i) {
+                return None;
+            }
         }
         if is_nested((start + i) as u32) {
             continue;

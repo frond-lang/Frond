@@ -1646,8 +1646,8 @@ pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
             x.type_name == y.type_name && x.inner.equals(&y.inner, arena)
         }
         (HeapObj::Cell(x), HeapObj::Cell(y)) => {
-            let xb = x.inner.lock().clone();
-            let yb = y.inner.lock().clone();
+            let xb = x.get();
+            let yb = y.get();
             value_equals_with_arena(&xb, &yb, arena)
         }
         (HeapObj::Range(x), HeapObj::Range(y)) => {
@@ -1970,7 +1970,7 @@ fn deep_clone_heap(
             inner: deep_clone_handle(n.inner, arena, cache),
         }),
         HeapObj::Cell(c) => {
-            let inner = c.inner.lock().clone();
+            let inner = c.get();
             HeapObj::Cell(Cell::new(deep_clone_value(&inner, arena, cache)))
         }
         // Place refs deep-clone as independent copies (same philosophy as

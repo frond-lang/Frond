@@ -35,12 +35,18 @@ impl<'a> IrBuilder<'a> {
                 Some(eff) => (2, self.graph.inputs_pool.push(&[cell_node, eff])),
                 None => (1, self.graph.inputs_pool.push(&[cell_node])),
             };
-            return self.graph.add_node(Node {
+            let load_node = self.graph.add_node(Node {
                 kind: NodeKind::UnOp,
                 input_count,
                 inputs_offset,
                 compute_fn: CF_DEREF_READ,
             });
+            // Remember the load as the cell's current value: subsequent reads
+            // in the SAME body execution reuse it (the load node re-executes
+            // every iteration / dominates later same-frame code, so the
+            // forwarded value is the live one).
+            self.track_cell_store(cell_node, load_node);
+            return load_node;
         }
         match self.lookup_var(name) {
             Some(node_id) => {
@@ -161,27 +167,10 @@ impl<'a> IrBuilder<'a> {
                     self.current_effect = Some(self.chain_effects(self.current_effect, set_node));
                     return self.compile_void_const();
                 }
-                let captured_source = self.captured_scopes.iter().rev()
-                    .find_map(|scope| scope.iter()
-                        .find(|(n, _)| n.as_str() == *name)
-                        .map(|(_, node)| *node));
-                if let Some(source) = captured_source {
-                    let wb_node = self.compile_writeback_node(val_node, source);
-                    self.bind_var(name, val_node);
-                    self.current_effect = Some(wb_node);
-                } else if let Some(outer_node) = self.lookup_var(name) {
-                    if !self.is_in_current_subgraph(outer_node) {
-                        let wb_node = self.compile_writeback_node(val_node, outer_node);
-                        self.bind_var(name, val_node);
-                        self.current_effect = Some(wb_node);
-                    } else if let Some(&captured_node) = self.captured_vars.get(*name) {
-                        let wb_node = self.compile_writeback_node(val_node, captured_node);
-                        self.bind_var(name, val_node);
-                        self.current_effect = Some(wb_node);
-                    } else {
-                        self.bind_var(name, val_node);
-                    }
-                } else if let Some(slot) = self.lookup_global_var(name) {
+                // B/C deletion: the WriteBack ladder is gone (all assigned
+                // names are cell-backed; the cell path above handles them).
+                // Remaining: globals store, plain rebind.
+                if let Some(slot) = self.lookup_global_var(name) {
                     let store_node = self.compile_global_store(val_node, slot);
                     self.current_effect = Some(store_node);
                 } else {

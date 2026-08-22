@@ -37,7 +37,13 @@ pub const SOLIDIFY_MAGIC: [u8; 4] = *b"FNDO";
 /// v2: Nodes packed 4B, sparse per-node tables, dropped HoistedOwners/
 /// HoistedNode/Downstreams, DynFfiInfos serialized.
 /// Older files are rejected (rebuild from source to regenerate).
-pub const SOLIDIFY_SCHEMA_VERSION: u16 = 4;
+// v6 (2026-08-22, B/C renumber): compute_fn ids compacted — retired ids
+// 46 (FFI_CALL) / 49 (WRITEBACK) / 310 (TAILREC_WRITEBACK) deleted and the
+// whole id space shifted down (table len 353→350). v5 already dropped the
+// WritebackTargets section with the WriteBack machinery.
+// v7 (2026-08-22, E7): SubGraph flags bit2 = converter_generated (strategy-
+// converter internals excluded from same-frame branch execution).
+pub const SOLIDIFY_SCHEMA_VERSION: u16 = 7;
 /// Header flag bit0: node inputs_offset omitted from packed Nodes records
 /// (inputs pool contiguous in node-id order; offsets derived at load).
 pub const FLAG_NODE_INPUT_OFFSETS_ELIDED: u16 = 0b0000_0001;
@@ -179,7 +185,7 @@ pub enum SectionKind {
     FieldAccessInfos = 11,
     VtableCallMethods = 12,
     AwaitEventSources = 13,
-    WritebackTargets = 14,
+    WritebackTargets = 14, // RETIRED (B/C 2026-08-22): no longer serialized; id kept reserved.
     HoistedOwners = 15,
     GlobalLoadSlots = 16,
     GlobalStoreSlots = 17,

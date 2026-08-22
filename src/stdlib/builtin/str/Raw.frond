@@ -113,7 +113,7 @@ fun __str_array_join(arr: str[], sep: str): str {
     if arr.len() == 0 {
         return ""
     }
-    val lens: usize[] = []
+    var lens: usize[] = []
     var total = 0 as usize
     var i = 0 as usize
     while i < arr.len() {

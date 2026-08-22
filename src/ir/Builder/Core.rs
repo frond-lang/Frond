@@ -124,6 +124,10 @@ pub struct IrBuilder<'a> {
     /// them, so forwarding would read stale compile-time values. Reads of
     /// these cells always emit CF_DEREF_READ loads.
     pub no_forward_cells: rustc_hash::FxHashSet<NodeId>,
+    /// Entry-call argument nodes for the while sg most recently registered
+    /// (the loop-carried cell params initial values). Consumed by the Stmt
+    /// While branch when emitting the launch call.
+    pub while_entry_args: Vec<NodeId>,
     /// Function subgraphs that contain a function-level defer (Bug #49). Historically this
     /// was `!defer_table.is_empty()`; now that defers register dynamically at runtime
     /// (CF_BLOCK_DEFER_REGISTER + frame.defer_stack), the table is always empty, so this
@@ -159,7 +163,6 @@ pub struct IrBuilder<'a> {
     /// WriteBacks keep current across iterations), not through the mid-chain node of a
     /// previous assignment — otherwise the condition re-evaluates against a stale
     /// snapshot every iteration and the loop never terminates.
-    pub var_home: rustc_hash::FxHashMap<String, (NodeId, bool)>,
     /// Bug #66: Whether the current `compile_block` call is the function body's top-level block.
     /// Set to `true` at `compile_function_body` entry; reset to `false` by the first `compile_block`
     /// call (the function body itself). Nested blocks see `false`, so only they extract
@@ -290,29 +293,36 @@ pub(super) fn reflect_method_intrinsic(method: &str) -> Option<(crate::sema::Sem
     // BinOp: receiver + one index arg
     let bin = |id: u32| Some((IntrinsicKind::BinOp(id), 1));
     match method {
-        "kind" => un(328),              // CF_REFLECT_KIND_STR (kind() returns str)
-        "type_name" => un(327),         // CF_REFLECT_TYPE_NAME
-        "size" => un(330),              // CF_REFLECT_LAYOUT_SIZE (aggregate)
-        "alignment" => un(331),         // CF_REFLECT_LAYOUT_ALIGN
-        "field_count" => un(332),       // CF_REFLECT_FIELD_COUNT
-        "repr" => un(290),               // CF_REFLECT_FORMAT (renamed from format 2026-08-17)
-        "constructor" => un(336),       // CF_REFLECT_ADT_CTOR
-        "clone" => un(351),             // CF_REFLECT_CLONE (deep copy, data domain)
-        "field_name" => bin(333),       // CF_REFLECT_FIELD_NAME
+        "kind" => un(325),              // CF_REFLECT_KIND_STR (kind() returns str)
+        "type_name" => un(324),         // CF_REFLECT_TYPE_NAME
+        "size" => un(327),              // CF_REFLECT_LAYOUT_SIZE (aggregate)
+        "alignment" => un(328),         // CF_REFLECT_LAYOUT_ALIGN
+        "field_count" => un(329),       // CF_REFLECT_FIELD_COUNT
+        "repr" => un(288),               // CF_REFLECT_FORMAT (renamed from format 2026-08-17)
+        "constructor" => un(333),       // CF_REFLECT_ADT_CTOR
+        "clone" => un(348),             // CF_REFLECT_CLONE (deep copy, data domain)
+        "field_name" => bin(330),       // CF_REFLECT_FIELD_NAME
         // field_value removed: its return type cannot be expressed without an "any"
-        // type in Frond's type system. CF_REFLECT_FIELD_VALUE (334) remains implemented
+        // type in Frond's type system. CF_REFLECT_FIELD_VALUE (331) remains implemented
         // in Compute.rs for potential future use (e.g. a typed field_value<T>(i): T).
         _ => None,
     }
 }
 
 /// Tail-recursion-to-iteration context: used by `compile_call` when intercepting self-calls.
-/// `self_name` is the current function name; `param_nodes` is the parameter node list.
+/// `self_name` is the current function name; `param_cells` are the parameter register Cells
+/// (B2): tail-call actuals are stored through CF_DEREF_WRITE and the re-evaluated condition
+/// loads the current values — replacing the old WriteBack param-register machinery.
 #[derive(Clone)]
 pub(crate) struct TailRecCtx {
     pub(super) self_name: String,
-    pub(super) param_nodes: Vec<NodeId>,
+    pub(super) param_cells: Vec<NodeId>,
 }
+
+/// call_result_map marker: the mapped call's result lives in the nontail-rec
+/// converter's result Cell — the consumer synthesizes a CF_DEREF_READ in its
+/// own state subgraph (never a valid NodeId).
+pub(crate) const RESULT_CELL_MARKER: NodeId = NodeId(u32::MAX);
 
 /// Non-tail-recursion-to-iteration context: intercepts self-calls as `push + continue` while
 /// compiling `body_sg`.
@@ -325,13 +335,14 @@ pub(crate) struct NonTailRecCtx {
     pub param_nodes: Vec<NodeId>,
     /// Work-stack array node (a local variable within the function subgraph).
     pub stack_node: NodeId,
-    /// Stack-pointer node (`sp`; a local variable within the function subgraph).
-    pub sp_node: NodeId,
-    /// Result variable node (`result`; a local variable within the function subgraph).
-    pub result_node: NodeId,
+    /// Stack-pointer Cell (B3): sp lives across iterations as engine state.
+    pub sp_cell: NodeId,
+    /// Result Cell (B3): the deepest completed state's result.
+    pub result_cell: NodeId,
     /// Call-site ExprId -> node mapping.
     /// When compiling a continuation, encountering an ExprId in this map returns the
-    /// corresponding node (`result` or a `saved` node).
+    /// corresponding node (a `saved` node, or [`RESULT_CELL_MARKER`] for the
+    /// result Cell).
     pub call_result_map: rustc_hash::FxHashMap<crate::ast::Ast::ExprId, NodeId>,
     /// Truncation flag: set to `true` after intercepting the first self-call; subsequent
     /// self-calls generate a void constant.
@@ -381,13 +392,13 @@ impl<'a> IrBuilder<'a> {
             fn_all_vars_slot: false,
             cell_values: rustc_hash::FxHashMap::default(),
             no_forward_cells: rustc_hash::FxHashSet::default(),
+            while_entry_args: Vec::new(),
             function_defer_sgs: rustc_hash::FxHashSet::default(),
             current_function_id: 0,
             current_sg_start: 0,
             current_effect: None,
             in_tail_position: false,
             fn_returns_throw: false,
-            var_home: rustc_hash::FxHashMap::default(),
             in_function_top_block: false,
             param_scope_depth: 0,
             in_loop_body: false,
@@ -539,89 +550,14 @@ impl<'a> IrBuilder<'a> {
     }
 
     /// Bind a variable name to a NodeId (in the current scope).
-
-    /// Bug #100 residual: a (re)declaration creates a FRESH home slot. bind_var keeps
-    /// the first home per name (loop-body WriteBack rebinds must not move it), so a
-    /// sequential redeclaration of the same name in one function (`var si` in an early
-    /// section, then `var si` again later) must reset the home explicitly — otherwise
-    /// the second declaration's initial value never reaches the home slot and later
-    /// loops reading through home start from the first declaration's stale final value.
     pub(super) fn declare_var(&mut self, name: &str, node_id: NodeId) {
         self.bind_var(name, node_id);
-        let fn_level = self.loop_stack.is_empty();
-        self.var_home.insert(name.to_string(), (node_id, fn_level));
-    }
-
-    /// Bug #100: rebind every loop-body-modified variable to its canonical HOME node
-    /// before compiling a while-loop condition. The condition re-evaluates every
-    /// iteration; WriteBacks update the home slot in the loop frame (via the frame
-    /// chain), so reading the home gives the current value. Reading the mid-chain node
-    /// of a pre-loop assignment instead freezes the condition at loop entry.
-    pub(super) fn rebind_modified_vars_to_home(&mut self, body: crate::ast::Ast::ExprId) {
-        let mut names = rustc_hash::FxHashSet::default();
-        let m = self.current_module();
-        collect_assigned_names(&m.arena, body, &mut names);
-        for name in names {
-            if let Some(&(home, fn_level)) = self.var_home.get(name.as_str()) {
-                if fn_level {
-                    // Rebind in the scope WHERE the name is bound (not the innermost
-                    // scope): a rebind performed inside an if-branch scope would be
-                    // discarded when the branch scope pops, leaving post-branch code
-                    // reading the stale pre-loop chain binding.
-                    for scope in self.scope_stack.iter_mut().rev() {
-                        if scope.contains_key(name.as_str()) {
-                            scope.insert(name.clone(), home);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Companion to `rebind_modified_vars_to_home`: BEFORE a loop is registered, any
-    /// pre-loop assignment to a loop-modified variable lives on the scope's value
-    /// chain (a fresh def node), while the loop's condition/post-loop reads go through
-    /// the variable's HOME slot — which still holds the declaration-time value. That
-    /// made `i = i - 1; while i > 1 {...}` evaluate the condition against the stale
-    /// declaration value. Sync each such variable's current def into its home slot with
-    /// a WriteBack chained onto the current effect, so loop entry sees the up-to-date
-    /// value exactly like an in-body WriteBack would.
-    pub(super) fn sync_modified_vars_to_home(&mut self, body: crate::ast::Ast::ExprId) {
-        let mut names = rustc_hash::FxHashSet::default();
-        let m = self.current_module();
-        collect_assigned_names(&m.arena, body, &mut names);
-        for name in names {
-            if let Some(&(home, fn_level)) = self.var_home.get(name.as_str()) {
-                if !fn_level {
-                    continue;
-                }
-                let cur = match self.lookup_var(name.as_str()) {
-                    Some(n) => n,
-                    None => continue,
-                };
-                if cur == home {
-                    continue; // no pre-loop assignment; home already current
-                }
-                let wb = self.compile_writeback_node(cur, home);
-                let eff = self.chain_effects(self.current_effect, wb);
-                self.current_effect = Some(eff);
-            }
-        }
     }
 
     pub(super) fn bind_var(&mut self, name: &str, node_id: NodeId) {
         if let Some(scope) = self.scope_stack.last_mut() {
             scope.insert(name.to_string(), node_id);
         }
-        // Bug #100: record the canonical home slot (first binding). Later re-bindings
-        // (loop-body WriteBacks) update the current binding but keep the home stable.
-        // The bool marks function-level declarations (bound outside any loop body):
-        // only those get rebound in loop conditions — a variable declared INSIDE an
-        // enclosing loop body is fresh each iteration and its binding chain is already
-        // correct (rebinding it broke nested-loop shapes like bubble sort).
-        let fn_level = self.loop_stack.is_empty();
-        self.var_home.entry(name.to_string()).or_insert((node_id, fn_level));
     }
 
     /// Look up the NodeId bound to a variable (searching from inner to outer scope).
@@ -632,20 +568,6 @@ impl<'a> IrBuilder<'a> {
             }
         }
         // Global variables: return None; the caller handles them via is_global_var + global_var_slots.
-        None
-    }
-
-    /// Look up the outermost binding of a variable (the original declaration in the
-    /// function-level scope). Used by `Assignment` to determine the correct WriteBack
-    /// target: when a variable is assigned in a nested same_function subgraph (e.g.
-    /// if branch inside a while body), WriteBack must target the outermost binding
-    /// (the root-frame declaration), not an intermediate node in a branch subgraph.
-    pub(super) fn lookup_root_frame_var(&self, name: &str) -> Option<NodeId> {
-        for scope in self.scope_stack.iter() {
-            if let Some(&node_id) = scope.get(name) {
-                return Some(node_id);
-            }
-        }
         None
     }
 
@@ -717,16 +639,29 @@ impl<'a> IrBuilder<'a> {
     /// the function being compiled (the owner tag blocks cross-function
     /// leakage through the shared scope chain).
     pub(super) fn lookup_cell_binding(&self, name: &str) -> Option<NodeId> {
-        if !self.captured_scopes.is_empty() {
-            return None;
-        }
+        // NOTE: no captured_scopes guard — the binding-identity check below
+        // already routes correctly inside lambda bodies: a cell-captured name
+        // resolves to the lambda's UPVALUE node (registered in cell_bound by
+        // compile_lambda), while a plain outer name resolves to its upvalue
+        // and fails the identity check against the outer cell entry.
         let owner = self.current_function_id;
-        self.cell_bound
+        let cell_node = self
+            .cell_bound
             .iter()
             .rev()
             .find_map(|scope| scope.get(name))
             .filter(|(_, o)| *o == owner)
-            .map(|(node, _)| *node)
+            .map(|(node, _)| *node)?;
+        // Binding-identity guard: the name's scope_stack resolution must BE
+        // the cell node. A plain rebind of the same name (inline-expansion
+        // params binding formals via bind_var, pattern variables, for-vars)
+        // shadows the cell WITHOUT touching cell_bound — routing by name
+        // alone would read the wrong storage (observed: inlined callee param
+        // colliding with a cell-backed caller param of the same name).
+        if self.lookup_var(name) != Some(cell_node) {
+            return None;
+        }
+        Some(cell_node)
     }
 
     /// Register a cell-backed binding in the current scope and rebind the
@@ -740,33 +675,38 @@ impl<'a> IrBuilder<'a> {
     }
 
     /// Decl-site cell-backing eligibility (place model):
-    /// - `var` decls in all-vars functions (C1-③④): every scalar binding not
-    ///   captured by a lambda / nested fn, not declared inside a lambda body.
-    /// - `val` decls and `var` decls in non-all-vars functions: only when
-    ///   address-taken (C1-① shape).
+    /// - `var` decls in all-vars functions (C1-③④): EVERY binding (any value
+    ///   type — scalars AND containers/records; `arr[i] = x` reads the cell
+    ///   for the current Arc and mutates in place, unchanged), not captured
+    ///   by a lambda / nested fn, not declared inside a lambda body.
+    /// - `val` decls: only when address-taken (C1-① shape).
     pub(super) fn decl_cell_backing_eligible(
         &self,
         name: &str,
-        value_expr: crate::ast::Ast::ExprId,
+        _value_expr: crate::ast::Ast::ExprId,
         is_var: bool,
     ) -> bool {
-        if self.captured_scopes.is_empty() {
-            let scalar = self.expr_type_is_scalar(value_expr);
-            if scalar && !self.fn_lambda_captured.contains(name) {
-                return if is_var {
-                    self.fn_all_vars_slot || self.fn_address_taken.contains(name)
-                } else {
-                    self.fn_address_taken.contains(name)
-                };
-            }
+        // ⑤ Lambda-body LOCAL vars are slot-backed too (④ removed the
+        // captured_scopes routing block — the binding-identity guard routes
+        // correctly inside lambda bodies). Nested-lambda captures ALSO stay
+        // slot-backed: ④'s cell-capture chain propagates the shared cell
+        // through upvalue levels (the outer lambda cell-captures, the inner
+        // registers against the outer's upvalue).
+        if is_var {
+            self.fn_all_vars_slot || self.fn_address_taken.contains(name)
+        } else {
+            self.fn_address_taken.contains(name)
         }
-        false
     }
 
     /// Record the value a cell-backed binding holds right after its cell
     /// allocation, and mark address-taken cells non-forwardable.
     pub(super) fn track_cell_decl(&mut self, name: &str, cell_node: NodeId, value_node: NodeId) {
-        if self.fn_address_taken.contains(name) {
+        // Cell-captured by a lambda: like address-taken, the cell escapes —
+        // calls through the closure can mutate it invisibly to the compiler,
+        // so reads must always LOAD (a forwarded read would pin the
+        // compile-time value).
+        if self.fn_address_taken.contains(name) || self.fn_lambda_captured.contains(name) {
             self.no_forward_cells.insert(cell_node);
         } else {
             self.cell_values.insert(cell_node, value_node);
@@ -810,6 +750,15 @@ impl<'a> IrBuilder<'a> {
         self.cell_values = saved;
     }
 
+    /// Subgraph-body barrier exit (branch- AND loop-like): clear EVERYTHING —
+    /// neither pre-body values (the body may have overwritten the cell) nor
+    /// the body's own stores (their nodes live inside the subgraph range the
+    /// parent frame never executes — forwarding them leaves reads pending
+    /// forever) may survive. Reads after the body emit real loads.
+    pub(super) fn cell_barrier_exit(&mut self) {
+        self.cell_values.clear();
+    }
+
     /// True when `recv.field` is the `Type.Ctor` qualified-constructor form —
     /// constructors are rvalues, not places (defense in depth behind the sema
     /// place check).
@@ -826,35 +775,6 @@ impl<'a> IrBuilder<'a> {
         false
     }
 
-    /// Bug #49: check whether the current function subgraph contains a function-level defer.
-    /// Used to decide whether a local variable reassignment needs a WriteBack to the original
-    /// node (so defer bodies read the latest value, Reference-mode semantics).
-    pub(super) fn current_function_has_defer(&self) -> bool {
-        if let Some(sg_id) = self.current_function_sg {
-            return self.function_defer_sgs.contains(&sg_id);
-        }
-        false
-    }
-
-    /// Compile a WriteBack node: assigns an outer variable, writing it back to the function's
-    /// root frame via `root_frame_ptr`.
-    /// Returns the NodeId of the WriteBack node.
-    pub(super) fn compile_writeback_node(&mut self, val_node: NodeId, target_outer: NodeId) -> NodeId {
-        let wb_off = self.graph.inputs_pool.push(&[val_node]);
-        let wb_node = self.graph.add_node(Node {
-            kind: NodeKind::BinOp,
-            input_count: 1,
-            inputs_offset: wb_off,
-            compute_fn: CF_WRITEBACK, // compute_writeback
-        });
-        self.graph.set_writeback_target(wb_node, target_outer);
-        wb_node
-    }
-
-    /// Map a `CompoundAssignOp` to the `ComputeFnId` of the corresponding binary operation.
-    ///
-    /// Looks up `arith_base` by concrete type: arithmetic operations use offsets 0-4;
-    /// bitwise operations use offsets 5-9 (integers only).
     pub(super) fn compound_assign_op_to_compute_fn(
         &mut self,
         op: crate::ast::Ast::CompoundAssignOp,
@@ -894,6 +814,7 @@ impl<'a> IrBuilder<'a> {
     ) -> SubGraphId {
         let id = SubGraphId(self.graph.subgraphs.len() as u32);
         let sg = SubGraph {
+            converter_generated: false,
             id,
             node_range: (NodeId(0), NodeId(0)),
             param_count,
@@ -1167,9 +1088,12 @@ impl<'a> IrBuilder<'a> {
                     compute_fn: CF_REF_OF,
                 });
                 // LAZY cell backing: the first `&x` of a binding that did not
-                // get decl-site backing (a param the entry loop skipped —
-                // non-annotated or non-scalar-checked, or a local the
-                // pre-pass skipped in a strategy-transformed function).
+                // get decl-site backing (a scalar PARAM — param slotting is
+                // off — or a local the pre-pass skipped in a
+                // strategy-transformed function). SCALARS ONLY: compute_ref_of
+                // SHARES heap-object Arcs (`&rec` object semantics), so a
+                // lazy "cell" for a container binding would be the Arc itself
+                // and name stores through it would silently no-op.
                 // Registers the cell so later name reads/writes route through
                 // it; the name is NOT value-tracked (forwarding is disabled:
                 // `val r = &x` binds a COPY of the cell node, so deref stores
@@ -1182,7 +1106,6 @@ impl<'a> IrBuilder<'a> {
                         let eligible = self.lookup_var(name)
                             .map(|b| self.is_in_current_subgraph(b))
                             .unwrap_or(false)
-                            && !self.fn_lambda_captured.contains(*name)
                             && self.expr_type_is_scalar(*inner);
                         if eligible {
                             self.bind_cell(name, ref_node);
@@ -2234,7 +2157,7 @@ impl<'a> IrBuilder<'a> {
 /// non-modified variable to its home is a no-op when home == current binding).
 /// Recurses through Block/If/Match/While/Loop/For and expression blocks; skips lambda
 /// bodies (their assignments are scoped to the nested function).
-fn collect_assigned_names(
+pub(super) fn collect_assigned_names(
     arena: &crate::ast::Ast::AstArena<'_>,
     expr: crate::ast::Ast::ExprId,
     out: &mut rustc_hash::FxHashSet<String>,
@@ -2264,6 +2187,72 @@ fn collect_assigned_names(
         }
         // Skip nested functions/lambdas: their assignments bind their own scopes.
         Expr::Lambda { .. } => {}
+        _ => {}
+    }
+}
+
+/// Deep variant for the param-slotting pass (③): recurses into loop/branch
+/// BODIES (the shallow variant deliberately does not — nested loops' own
+/// registrations rebind at their own level, and recursing would collect outer
+/// loop variables for inner conditions). Lambdas are still skipped: their
+/// assignments bind their own scopes.
+pub(super) fn collect_assigned_names_deep(
+    arena: &crate::ast::Ast::AstArena<'_>,
+    expr: crate::ast::Ast::ExprId,
+    out: &mut rustc_hash::FxHashSet<String>,
+) {
+    use crate::ast::Ast::Expr;
+    match &arena.expr(expr).node {
+        Expr::Block { stmts, trailing } => {
+            for &st in stmts {
+                collect_assigned_names_deep_stmt(arena, st, out);
+            }
+            if let Some(t) = trailing {
+                collect_assigned_names_deep(arena, *t, out);
+            }
+        }
+        Expr::If { cond, then_branch, else_branch } => {
+            collect_assigned_names_deep(arena, *cond, out);
+            collect_assigned_names_deep(arena, *then_branch, out);
+            if let Some(e) = else_branch {
+                collect_assigned_names_deep(arena, *e, out);
+            }
+        }
+        Expr::Match { scrutinee, arms } => {
+            collect_assigned_names_deep(arena, *scrutinee, out);
+            for arm in arms {
+                collect_assigned_names_deep(arena, arm.body, out);
+            }
+        }
+        Expr::Lambda { .. } => {}
+        _ => {}
+    }
+}
+
+fn collect_assigned_names_deep_stmt(
+    arena: &crate::ast::Ast::AstArena<'_>,
+    stmt: crate::ast::Ast::StmtId,
+    out: &mut rustc_hash::FxHashSet<String>,
+) {
+    use crate::ast::Ast::Stmt;
+    match &arena.stmt(stmt).node {
+        Stmt::Assignment { target, .. } | Stmt::CompoundAssignment { target, .. } => {
+            if let crate::ast::Ast::Expr::Ident(name) = &arena.expr(*target).node {
+                out.insert(name.to_string());
+            }
+        }
+        Stmt::Expression { expr } => collect_assigned_names_deep(arena, *expr, out),
+        Stmt::While { condition, body } => {
+            collect_assigned_names_deep(arena, *condition, out);
+            collect_assigned_names_deep(arena, *body, out);
+        }
+        Stmt::Loop { body } => collect_assigned_names_deep(arena, *body, out),
+        Stmt::For { iterable, body, .. } => {
+            collect_assigned_names_deep(arena, *iterable, out);
+            collect_assigned_names_deep(arena, *body, out);
+        }
+        Stmt::Return { value: Some(v) } => collect_assigned_names_deep(arena, *v, out),
+        Stmt::Throw { expr } => collect_assigned_names_deep(arena, *expr, out),
         _ => {}
     }
 }

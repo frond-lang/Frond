@@ -118,8 +118,6 @@ impl DataFlowGraph {
     #[inline]
     pub fn await_event_source(&self, idx: usize) -> Option<NodeId> { self.await_event_sources[idx] }
     #[inline]
-    pub fn writeback_target(&self, idx: usize) -> Option<NodeId> { self.writeback_targets[idx] }
-    #[inline]
     pub fn global_load_slot(&self, idx: usize) -> Option<u32> { self.global_load_slots[idx] }
     #[inline]
     pub fn global_store_slot(&self, idx: usize) -> Option<u32> { self.global_store_slots[idx] }
