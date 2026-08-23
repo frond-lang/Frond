@@ -430,6 +430,44 @@ fn infer_type_args<'a>(
         }
     }
 
+    // Pass 1b: match `.array` type annotations (e.g. `a: T[]`) — bind the bare
+    // type-param element to the argument's concrete element type. This is the
+    // most common generic shape (`iter<T>`, `Mem.*`, `Sort.*`); without it the
+    // parameter stayed a placeholder Adt("T") and every instance compiled a
+    // soft-typed body (i32 survived via numeric soft comparison; str/f64
+    // silently misbehaved). A str argument binds the u8 byte element, mirroring
+    // the sema unification gate (str ↔ T[], byte semantics).
+    for (i, arg) in arguments.iter().enumerate().take(param_count) {
+        let param_type = match fd.params[i].type_annotation {
+            Some(t) => t,
+            None => continue,
+        };
+        let elem = match &fd_ast.ty(param_type).node {
+            TypeNode::Array { element_type, .. } => *element_type,
+            _ => continue,
+        };
+        let pname = match &fd_ast.ty(elem).node {
+            TypeNode::Named { name } => *name,
+            _ => continue,
+        };
+        if !is_type_param(pname) || name_to_handle.contains_key(pname) {
+            continue;
+        }
+        let arg_key = module_expr_key(module_name, arg.0 as u64);
+        if let Some(info) = sema_result.get_expr(arg_key) {
+            let r = arena.resolve(info.ty);
+            match arena.get(r) {
+                crate::types::Type::Array(_) => {
+                    name_to_handle.insert(pname, arena.array_parts(r).0);
+                }
+                crate::types::Type::Str => {
+                    name_to_handle.insert(pname, arena.make(crate::types::Type::U8));
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Pass 2: match `.function` type annotations (e.g. `f: (A, T) -> A`)
     // against lambda arguments.
     for (i, arg) in arguments.iter().enumerate().take(param_count) {
@@ -834,9 +872,29 @@ fn process_method_call<'a>(
     };
     let fd_ast = tables.arena(owner, method).unwrap_or(ast);
 
+    // Method-sugar form (`recv.method(args)` desugars to `method(recv, args)`):
+    // when the receiver is a VALUE (not a module-namespace recv flagged by
+    // sema in `module_func_recv_exprs`), it occupies the function's FIRST
+    // parameter. Without feeding it to type-arg inference, a `T[]` first
+    // parameter can never bind T when there are no further arguments
+    // (`arr.sort()`), and partial binds (`lower_bound`'s `v: T`) produce a
+    // wrong instance whose body compares soft-typed values — correct for i32
+    // by accident, silently wrong for f64/str.
+    let recv_is_namespace = sema_result
+        .module_func_recv_exprs
+        .contains(&crate::sema::Sema::module_expr_key(module_name, recv.0 as u64));
+    let sugar_args: Vec<ExprId> = if recv_is_namespace {
+        arguments.to_vec()
+    } else {
+        let mut v = Vec::with_capacity(arguments.len() + 1);
+        v.push(recv);
+        v.extend_from_slice(arguments);
+        v
+    };
+
     let type_args = infer_type_args(
         method,
-        arguments,
+        &sugar_args,
         type_args_hint,
         &type_params,
         fd_decl,

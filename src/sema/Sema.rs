@@ -2333,7 +2333,16 @@ pub(crate) fn ast_type_decl_to_type_def<'a>(
             (TypeDefKind::Record, vec![ctor], None, None)
         }
         AstTypeDef::Alias { target } => {
-            let target_ty = concretize_type(arena, *target, &[], ast, sema_result);
+            // Generic aliases: bind each type param to a name-keyed
+            // placeholder Adt so the stored target keeps them recoverable —
+            // use sites substitute real arguments by name
+            // (`substitute_named_adts`). Non-generic aliases pass no
+            // placeholders and are unaffected.
+            let placeholder_args: Vec<TypeHandle> = type_params
+                .iter()
+                .map(|tp| arena.make_adt(tp.clone(), Box::new([])))
+                .collect();
+            let target_ty = concretize_type(arena, *target, &placeholder_args, ast, sema_result);
             let target_name = type_name_from_node(Some(*target), ast);
             (
                 TypeDefKind::Alias,

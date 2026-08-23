@@ -62,6 +62,7 @@ const EXTERN_FROND_FILES: &[&str] = &[
     "src/stdlib/builtin/os/Raw.frond",
     "src/stdlib/builtin/rand/Raw.frond",
     "src/stdlib/builtin/mem/Raw.frond",
+    "src/stdlib/builtin/sort/Raw.frond",
 ];
 
 fn main() {

@@ -127,6 +127,8 @@ pub(super) const GOLDEN_RATIO_64: u64 = 0x9E3779B97F4A7C15;
 /// Unified engine: field types are determined by `S`, while the business logic is written once.
 pub struct Engine<S: LockStrategy> {
     pub graph: Arc<DataFlowGraph>,
+    /// Hang-watchdog progress counter (Multi debug; cheap atomic bump per frame).
+    pub hang_progress: std::sync::atomic::AtomicU64,
     pub frames: S::Mutex<HashMap<FrameId, Box<crate::ir::Ir::Frame>>>,
     pub next_frame_id: S::Mutex<FrameId>,
     pub arena: S::Mutex<ValueArena>,
@@ -138,7 +140,12 @@ pub struct Engine<S: LockStrategy> {
     /// Fallback for event-delivery races: when an event arrives while a frame is being processed by
     /// process_frame (and is therefore absent from the HashMap), the event is stashed here and
     /// consumed once process_frame inserts the frame (symmetric to pending_completions).
-    pub pending_events: S::Mutex<HashMap<FrameId, (crate::ir::Ir::RuntimeEvent, Value)>>,
+    /// Multi-slot per frame: several events can arrive while the frame is out of
+    /// the map (being processed) — a single-slot map silently OVERWROTE the
+    /// earlier event, and when the survivor was stale the frame's real wait was
+    /// lost forever (the fourth await-loop hang root).
+    pub pending_events:
+        S::Mutex<HashMap<FrameId, Vec<(crate::ir::Ir::RuntimeEvent, Value)>>>,
     /// Defer-frame tracking: the set of all currently-active defer frames (distinguishes defer
     /// frames from ordinary child frames in `process_frame`'s Completed/Failed branches).
     pub defer_frames: S::Mutex<HashSet<FrameId>>,
@@ -425,15 +432,69 @@ impl EngineRef {
     /// suspend/wake behavior, so multiple workers advancing frames concurrently is more efficient.
     pub fn new(graph: DataFlowGraph) -> Self {
         let mut graph = graph;
+        // .fndo hot-path parity: loaded (mmap-backed) graphs unpack the
+        // packed Nodes section PER node() call; on interpreter hot loops
+        // that indirection cost 2-3x (loop_sum: ~290ms source vs ~670ms
+        // artifact). Artifacts are kilobytes — materialize the nodes Vec
+        // once, up front, so both paths hit the same Vec slice in node().
+        if graph.mem.is_some() && graph.nodes.is_empty() {
+            let n = graph.node_count();
+            let mut nodes = Vec::with_capacity(n);
+            for i in 0..n {
+                nodes.push(graph.node(i));
+            }
+            graph.nodes = nodes;
+        }
+        // Same treatment for the Inputs pool: inputs() does a mmap
+        // section lookup + transmute per call; one bulk copy into the
+        // pool removes the remaining per-node indirection.
+        if graph.mem.is_some() && graph.inputs_pool.data.is_empty() {
+            let total = graph
+                .nodes
+                .iter()
+                .map(|n| n.inputs_offset as usize + n.input_count as usize)
+                .max()
+                .unwrap_or(0);
+            let mut data = vec![NodeId(0); total];
+            for nd in graph.nodes.iter() {
+                let s = nd.inputs_offset as usize;
+                let src = graph.inputs(nd.inputs_offset, nd.input_count);
+                data[s..s + nd.input_count as usize].copy_from_slice(src);
+            }
+            graph.inputs_pool.data = data;
+        }
+        // Category B boolean tables: same story — bulk-fill the Vecs so
+        // the accessors stop reading the mmap bitmaps per call.
+        if graph.mem.is_some() {
+            let n = graph.nodes.len();
+            if graph.tail_call_flags.is_empty() {
+                let v: Vec<bool> = (0..n).map(|i| graph.tail_call_flag(i)).collect();
+                graph.tail_call_flags = v;
+            }
+            if graph.safe_op_flags.is_empty() {
+                let v: Vec<bool> = (0..n).map(|i| graph.safe_op_flag(i)).collect();
+                graph.safe_op_flags = v;
+            }
+            if graph.slice_inclusive.is_empty() {
+                let v: Vec<bool> = (0..n).map(|i| graph.slice_inclusive(i)).collect();
+                graph.slice_inclusive = v;
+            }
+        }
         materialize_const_cache(&mut graph);
         precompute_sg_templates(&mut graph);
         materialize_downstream_counts(&mut graph);
         materialize_linear_plans(&mut graph);
         let has_async = Self::entry_reaches_suspend(&graph);
         if has_async {
-            let workers = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
+            let workers = std::env::var("FROND_WORKERS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&w| w >= 1)
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1)
+                });
             Self::Multi(Arc::new(Engine::<Multi>::new_multi(graph, workers)))
         } else {
             Self::Single(Engine::<Single>::new_single(graph))
@@ -491,6 +552,9 @@ impl EngineRef {
             Self::Multi(e) => Engine::<Multi>::run_multi(e),
         };
         exec_cov_dump(&graph);
+        // Teardown cycle sweep: releases any cyclic garbage still registered
+        // (roots empty — nothing runs after this).
+        let _ = crate::value::Registry::collect_cycles(&[]);
         result
     }
 }

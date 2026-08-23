@@ -1,0 +1,202 @@
+// Sort.frond — array sorting + sorted-array search (part of builtin/sort)
+//
+// Public surface is the METHOD form: `arr.sort()`, `arr.sort_by(cmp)`,
+// `arr.is_sorted()`, `arr.lower_bound(v)`, `arr.upper_bound(v)` — recv.method
+// sugar over these free functions, same as `arr.iter()`.
+//
+// Semantics: in-place, UNSTABLE, ascending. `sort`/`is_sorted`/`lower_bound`/
+// `upper_bound` require ordered elements (scalars, str) exactly like
+// Mem.compare. `sort_by` takes a three-way comparator (negative when the
+// first argument sorts before the second, 0 when equal, positive when after)
+// and works for any element type. Float NaN ordering is unspecified.
+//
+// Scalar element arrays take the C heapsort fast path (Raw.frond, marshaled
+// through the SoA column contract); str[] and every other type use the
+// pure-Frond heapsort below.
+
+// Sift `a[root..end)` down within a max-heap (ordered via < / >).
+@internal
+fun __sort_sift_lt<T>(a: T[], root: usize, end: usize): void {
+    var r = root
+    var going = true
+    while going {
+        var child = 2 * r + 1
+        if child >= end {
+            going = false
+        } else {
+            if child + 1 < end && a[child + 1] > a[child] {
+                child = child + 1
+            }
+            if a[child] > a[r] {
+                val t = a[r]
+                a[r] = a[child]
+                a[child] = t
+                r = child
+            } else {
+                going = false
+            }
+        }
+    }
+}
+
+// In-place heapsort for ordered elements (pure-Frond path).
+@internal
+fun __sort_heap_lt<T>(a: T[]): void {
+    val n = a.len()
+    if n < 2 { return }
+    var s = n / 2
+    while s > 0 {
+        s = s - 1
+        __sort_sift_lt(a, s, n)
+    }
+    var e = n - 1
+    while e > 0 {
+        val t = a[0]
+        a[0] = a[e]
+        a[e] = t
+        __sort_sift_lt(a, 0, e)
+        e = e - 1
+    }
+}
+
+// Sift within a max-heap ordered by a three-way comparator.
+@internal
+fun __sort_sift_by<T>(a: T[], cmp: (T, T) -> i32, root: usize, end: usize): void {
+    var r = root
+    var going = true
+    while going {
+        var child = 2 * r + 1
+        if child >= end {
+            going = false
+        } else {
+            if child + 1 < end && cmp(a[child + 1], a[child]) > 0 {
+                child = child + 1
+            }
+            if cmp(a[child], a[r]) > 0 {
+                val t = a[r]
+                a[r] = a[child]
+                a[child] = t
+                r = child
+            } else {
+                going = false
+            }
+        }
+    }
+}
+
+// In-place heapsort by comparator (pure Frond — the comparator is a Frond
+// closure and cannot cross the FFI boundary).
+@internal
+fun __sort_heap_by<T>(a: T[], cmp: (T, T) -> i32): void {
+    val n = a.len()
+    if n < 2 { return }
+    var s = n / 2
+    while s > 0 {
+        s = s - 1
+        __sort_sift_by(a, cmp, s, n)
+    }
+    var e = n - 1
+    while e > 0 {
+        val t = a[0]
+        a[0] = a[e]
+        a[e] = t
+        __sort_sift_by(a, cmp, 0, e)
+        e = e - 1
+    }
+}
+
+// Sorts the array in place (ascending, unstable). Scalar element types take
+// the C heapsort fast path; every other ordered element type (str, ...) uses
+// the pure-Frond heapsort.
+pub fun sort<T>(a: T[]): void {
+    val n = a.type_name()
+    if n == "i8[]" {
+        __sort_i8(a as i8[])
+    } else if n == "i16[]" {
+        __sort_i16(a as i16[])
+    } else if n == "i32[]" {
+        __sort_i32(a as i32[])
+    } else if n == "i64[]" {
+        __sort_i64(a as i64[])
+    } else if n == "u16[]" {
+        __sort_u16(a as u16[])
+    } else if n == "u32[]" {
+        __sort_u32(a as u32[])
+    } else if n == "u64[]" {
+        __sort_u64(a as u64[])
+    } else if n == "isize[]" {
+        __sort_isize(a as isize[])
+    } else if n == "usize[]" {
+        __sort_usize(a as usize[])
+    } else if n == "f32[]" {
+        __sort_f32(a as f32[])
+    } else if n == "f64[]" {
+        __sort_f64(a as f64[])
+    } else if n == "bool[]" {
+        __sort_bool(a as bool[])
+    } else if n == "char[]" {
+        __sort_char(a as char[])
+    } else if n == "i128[]" {
+        __sort_i128(a as i128[])
+    } else if n == "u128[]" {
+        __sort_u128(a as u128[])
+    } else if n == "f16[]" {
+        __sort_f16(a as f16[])
+    } else if n == "f128[]" {
+        __sort_f128(a as f128[])
+    } else {
+        __sort_heap_lt(a)
+    }
+}
+
+// Sorts the array in place by a three-way comparator (negative = first sorts
+// before second, 0 = equal, positive = after). Works for any element type.
+pub fun sort_by<T>(a: T[], cmp: (T, T) -> i32): void {
+    __sort_heap_by(a, cmp)
+}
+
+// Whether the array is in nondecreasing order.
+pub fun is_sorted<T>(a: T[]): bool {
+    var i = 1 as usize
+    while i < a.len() {
+        if a[i] < a[i - 1] {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+// First index at which v could be inserted without breaking order: the count
+// of elements strictly less than v (classic lower_bound / bisect_left).
+// Requires a sorted array.
+pub fun lower_bound<T>(a: T[], v: T): usize {
+    var lo = 0 as usize
+    var hi = a.len()
+    while lo < hi {
+        val mid = (lo + hi) / 2
+        if a[mid] < v {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}
+
+// First index at which v could be inserted after equal runs: the count of
+// elements less than OR equal to v (classic upper_bound / bisect_right).
+// Requires a sorted array.
+pub fun upper_bound<T>(a: T[], v: T): usize {
+    var lo = 0 as usize
+    var hi = a.len()
+    while lo < hi {
+        val mid = (lo + hi) / 2
+        if a[mid] <= v {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}

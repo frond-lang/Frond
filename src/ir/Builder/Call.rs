@@ -1459,7 +1459,20 @@ impl<'a> IrBuilder<'a> {
             // When the method name matches a top-level free function, recv is passed as the first argument.
             // Single-point resolution: builtin/user free functions resolve bare; std free
             // functions (no bare slot) resolve only through the earlier qualified paths.
-            if let Some(Ok(target_sg)) = self.resolve_func("path4_free_fn", method, None, None) {
+            // Generic callees bind the sema-chosen monomorphization via
+            // call_instantiations (same lookup as Path 0): without it the call
+            // lands on the UNSPECIALIZED body, whose soft-typed comparisons
+            // work for i32 by accident and silently misorder f64/str elements.
+            let call_inst_key = crate::sema::Sema::module_expr_key(
+                self.expr_key_module(),
+                call_expr_id.0 as u64,
+            );
+            let inst_mangled = self
+                .sema
+                .call_instantiations
+                .get(&call_inst_key)
+                .map(|&id| format!("{}#{}", method, id));
+            if let Some(Ok(target_sg)) = self.resolve_func("path4_free_fn", method, inst_mangled.as_deref(), None) {
                 self.graph.set_call_target(call_node, target_sg);
                 return call_node;
             }

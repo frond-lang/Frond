@@ -343,6 +343,15 @@ impl<S: LockStrategy> Engine<S> {
         loop_fid: FrameId,
         body_frame: &mut Frame,
     ) {
+        // Both frames re-enter the loop protocol with a clean slate: scrub any
+        // stale waiter registrations so a leftover entry from the finished
+        // iteration can never disturb a later one.
+        {
+            let body_fid = body_frame.id;
+            self.event_waiters
+                .lock()
+                .retain(|(_, wf)| *wf != loop_fid && *wf != body_fid);
+        }
         let loop_sg_id = loop_frame.subgraph_id;
         // Borrow the plan from the graph instead of cloning: reset_plan stays immutable for the
         // whole run, and both this borrow and reset_condition_tree(&self) are shared borrows.

@@ -71,6 +71,10 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     // mem module (u8[] buffer primitives over libc mem*)
     ("builtin/mem/pack.frond", include_str!("../stdlib/builtin/mem/pack.frond")),
     ("builtin/mem/Raw.frond", include_str!("../stdlib/builtin/mem/Raw.frond")),
+    // sort module (array sort/sort_by + sorted-array search, method form)
+    ("builtin/sort/pack.frond", include_str!("../stdlib/builtin/sort/pack.frond")),
+    ("builtin/sort/Raw.frond", include_str!("../stdlib/builtin/sort/Raw.frond")),
+    ("builtin/sort/Sort.frond", include_str!("../stdlib/builtin/sort/Sort.frond")),
 ];
 
 /// Standard library module file manifest (requires `import std.xxx` to load).

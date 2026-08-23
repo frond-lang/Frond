@@ -140,6 +140,24 @@ struct AsyncJoinEntry {
     result: Option<Value>,
 }
 impl AsyncJoinRuntime {
+    /// Cycle-collector roots: resolved child results waiting to be joined
+    /// (held outside any frame's value table).
+    /// Hang-watchdog dump: "id(ready)" per pending join entry.
+    pub fn debug_dump(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|(k, v)| format!("{:?}(ready={})", k, v.result.is_some()))
+            .collect()
+    }
+
+    pub fn collect_results(&self, out: &mut Vec<Value>) {
+        for e in self.entries.values() {
+            if let Some(v) = &e.result {
+                out.push(v.clone());
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             entries: std::collections::HashMap::new(),
@@ -333,6 +351,10 @@ impl<S: LockStrategy> Engine<S> {
     ) -> (RuntimeEvent, Option<Value>, crate::ir::Ir::NodeId) {
         use crate::ir::Ir::EventSourceKind;
         let await_node = pending.await_node_local;
+        let dbg = super::env_flag("FROND_DEBUG_AWAIT");
+        if dbg {
+            eprintln!("[AWAIT] fid={:?} kind={:?} enter", fid, pending.event_kind);
+        }
         let (event, val) = match pending.event_kind {
             EventSourceKind::AsyncJoin => AsyncJoinSource.resolve(self, pending),
             EventSourceKind::Channel => ChannelSource.resolve(self, pending),
@@ -346,6 +368,53 @@ impl<S: LockStrategy> Engine<S> {
         // not nest with a source lock, avoiding lock-ordering conflicts.
         if val.is_none() {
             self.event_waiters.lock().push((event, fid));
+            // Post-registration re-poll (Multi await-loop hang root): the
+            // awaited child may complete BETWEEN resolve()'s first poll and
+            // this registration — on_event_arrived then finds no waiter and
+            // keeps the result 'for a consuming read' that nothing performs;
+            // the frame suspends forever. Re-poll under the same rules; on a
+            // raced-in result, deregister the just-pushed waiter and return
+            // ready (no suspension). Sound against concurrent fires: if
+            // on_event_arrived consumed the waiter meanwhile, the entry is
+            // gone and this re-poll answers None.
+            let raced = match pending.event_kind {
+                EventSourceKind::AsyncJoin => match pending.event_obj {
+                    crate::value::Value::Scalar(_, crate::value::ValueTag::I32) => {
+                        let id = crate::ir::Ir::AsyncHandleId(
+                            pending.event_obj.as_i32() as u32,
+                        );
+                        self.async_join_runtime.lock().try_get_result(id)
+                    }
+                    _ => None,
+                },
+                EventSourceKind::Channel => {
+                    let ch = pending
+                        .event_obj
+                        .heap_obj()
+                        .and_then(|h| h.channel());
+                    ch.and_then(|c| {
+                        c.recv().or_else(|| {
+                            if c.is_closed() {
+                                Some(crate::value::Value::Null)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                }
+                // Timers fire via this engine's own poll loop; no completion
+                // can race into the poll→register window.
+                EventSourceKind::Timer | EventSourceKind::SubgraphComplete => None,
+            };
+            if dbg {
+                eprintln!("[AWAIT] fid={:?} repoll raced={}", fid, raced.is_some());
+            }
+            if let Some(v) = raced {
+                self.event_waiters
+                    .lock()
+                    .retain(|(e, f)| !(*e == event && *f == fid));
+                return (event, Some(v), await_node);
+            }
         }
         (event, val, await_node)
     }
@@ -359,7 +428,9 @@ impl<S: LockStrategy> Engine<S> {
     pub(super) fn apply_event_to_frame(&self, frame: &mut Frame, value: Value) -> bool {
         let await_node = match frame.suspend_state {
             SuspendState::WaitingEvent(node) => node,
-            _ => return false,
+            other => {
+                return false;
+            }
         };
         let node_offset = frame.node_offset;
         let await_graph_id = NodeId(await_node.0 + node_offset);
@@ -414,29 +485,62 @@ impl<S: LockStrategy> Engine<S> {
             event_waiters.retain(|(_, fid)| !waiter_set.contains(fid));
             waiters
         };
-        let woken = waiters.len();
+        let mut delivered = 0usize;
+        if super::env_flag("FROND_DEBUG_AWAIT") {
+            eprintln!("[EVT] event={:?} waiters={:?}", event, waiters);
+        }
 
         for fid in waiters {
-            // Take out the frame (keep it boxed to preserve address stability).
+            // Check-then-take under one frames-lock critical section: ONLY a frame
+            // that is genuinely suspended WaitingEvent — on THIS event, or in the
+            // select form (WaitingEvent with suspend_event=None, registered for
+            // several events at once) — is taken out. Anything else (cached loop
+            // body mid-relaunch, already woken by another path, stale
+            // registration) stays in the map untouched. The old take-first/
+            // apply-later flow transiently removed such frames and reinserted
+            // them WITHOUT a queue push — stranding Ready-but-unqueued frames
+            // forever (the third Multi await-loop hang) — and its remove/
+            // reinsert window raced the loop-body relaunch's frames.remove(bfid)
+            // into creating a duplicate body and orphaning the original.
             let mut frame_box = {
                 let mut frames = self.frames.lock();
-                match frames.remove(&fid) {
-                    Some(b) => b,
+                let waiting_on_this = match frames.get(&fid) {
+                    Some(f) => {
+                        matches!(f.suspend_state, SuspendState::WaitingEvent(_))
+                            && (f.suspend_event == Some(event) || f.suspend_event.is_none())
+                    }
                     None => {
-                        // The frame is being processed by process_frame (not in the HashMap).
-                        // Stash the event; process_frame will consume it after reinserting the
-                        // frame (race fallback).
-                        // The waiter has already been removed from event_waiters above, so no
+                        // The frame is being processed by process_frame (not in the
+                        // HashMap). Stash the event; process_frame will consume it
+                        // after reinserting the frame (race fallback). The waiter
+                        // has already been removed from event_waiters above, so no
                         // duplicate cleanup is needed.
-                        self.pending_events.lock().insert(fid, (event, value.clone()));
+                        self.pending_events
+                            .lock()
+                            .entry(fid)
+                            .or_default()
+                            .push((event, value.clone()));
+                        delivered += 1;
                         continue;
                     }
+                };
+                if waiting_on_this {
+                    frames.remove(&fid)
+                } else {
+                    None
                 }
+            };
+            let Some(mut frame_box) = frame_box else {
+                // Not waiting on this event anymore: leave the frame exactly as it
+                // is — no remove, no reinsert, no stranding.
+                continue;
             };
             let frame: &mut Frame = &mut *frame_box;
 
             if !self.apply_event_to_frame(frame, value.clone()) {
-                // Not an event-waiting frame (already woken by another event): put it back + skip.
+                // Defensive only: the check above guarantees the frame was
+                // WaitingEvent on this event, and nothing can change it while it
+                // is out of the map. Reinsert as-is if this ever fires.
                 self.frames.lock().insert(fid, frame_box);
                 continue;
             }
@@ -444,8 +548,16 @@ impl<S: LockStrategy> Engine<S> {
             // Put the frame back + enqueue (same Box, address unchanged).
             self.frames.lock().insert(fid, frame_box);
             queue.push(fid);
+            delivered += 1;
         }
-        woken
+        // Delivered (injected or stashed for the frame's next suspension), NOT
+        // merely waiter-removed: the async-completion callers use this to drop
+        // the join entry holding the result. A skipped delivery (frame not
+        // waiting on this event at check time) must KEEP the entry so a frame
+        // that suspends on this event afterwards still finds the result via
+        // try_get_result — counting removed waiters here deleted the result and
+        // left the re-registered waiter dead forever (an await-loop hang root).
+        delivered
     }
 
     /// Cancels a frame: Suspended -> Cancelling + enqueue.

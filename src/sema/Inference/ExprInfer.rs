@@ -91,10 +91,40 @@ impl<'a> InferContext<'a> {
             Expr::Binary { .. } => self.infer_binary_expr(expr, ast, env),
 
             // ── Unary operations ──
-            Expr::Unary { operand, .. } => {
-                let _ = self.infer_expr(*operand, ast, env, None);
-                // ! / ~ / - all return the operand's type.
-                self.infer_expr(*operand, ast, env, None)
+            Expr::Unary { op, operand } => {
+                let opnd_ty = self.infer_expr(*operand, ast, env, None);
+                // `!` is LOGICAL not — a bool-only operator. The runtime
+                // compute reads the operand via as_bool(), which answers
+                // false for every non-bool value, so `!count` silently
+                // evaluated to `true`. Gate it at sema (soft TypeVar/Unknown
+                // operands stay lenient for generic code). `~` and `-` keep
+                // the operand's type.
+                if matches!(op, crate::ast::Ast::UnaryOp::Not) {
+                    let r = self.arena.resolve(opnd_ty);
+                    let non_bool = match self.arena.get(r) {
+                        crate::types::Type::Bool
+                        | crate::types::Type::TypeVar(_)
+                        | crate::types::Type::Unknown => false,
+                        _ => true,
+                    };
+                    if non_bool {
+                        let sp = ast.expr(*operand).span;
+                        let ty_desc = self
+                            .arena
+                            .type_name_concrete(r)
+                            .unwrap_or_else(|| "value".to_string());
+                        self.add_error_at(
+                            &format!(
+                                "'!' is logical not and requires a bool operand (found '{}'); use '~' for bitwise not",
+                                ty_desc
+                            ),
+                            sp.line,
+                            sp.column,
+                        );
+                    }
+                    return self.arena.make(crate::types::Type::Bool);
+                }
+                opnd_ty
             }
 
             // ── Type cast `expr as T` ──
@@ -345,7 +375,14 @@ impl<'a> InferContext<'a> {
                 for &e in elements.iter().skip(1) {
                     let elem_ty = self.infer_expr(e, ast, env, expected_elem);
                     if let Err(e_err) = self.try_widen_unify(first_ty, elem_ty) {
-                        self.add_error(&format!("array element type mismatch: {}", e_err));
+                        // Span-bearing diagnostic: the spanless form printed
+                        // "0:0" and gave no clue which element mismatched.
+                        let sp = ast.expr(e).span;
+                        self.add_error_at(
+                            &format!("array element type mismatch: {}", e_err),
+                            sp.line,
+                            sp.column,
+                        );
                     }
                     elem_tys.push(elem_ty);
                 }

@@ -714,6 +714,14 @@ impl<S: LockStrategy> Engine<S> {
                 );
             }
             if let Some(caller_frame) = caller_frame_opt {
+                // The caller is fully woken Ready by this direct write-back: any
+                // waiter entry still registered for it is stale (its event will
+                // never be meaningful again). Scrub, or a leftover registration
+                // later fires on a frame that is mid-relaunch/cached and — even
+                // with check-then-take — burns a spurious event delivery.
+                self.event_waiters
+                    .lock()
+                    .retain(|(_, wf)| *wf != caller_fid);
                 self.frames.lock().insert(caller_fid, caller_frame);
                 queue.push(caller_fid);
             }

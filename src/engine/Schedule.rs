@@ -1520,12 +1520,33 @@ impl<S: LockStrategy> Engine<S> {
                     return;
                 }
                 let event = frame.suspend_event;
-                // Check pending_completions (the race where a child frame completes before the
-                // parent frame is re-inserted). Use a Vec to support concurrent completion of
-                // multiple child frames for the same caller (avoiding overwrites).
-                let completions: Vec<_> =
-                    self.pending_completions.lock().remove(&fid).unwrap_or_default();
+                // Insert the frame FIRST, then drain the stashed completions/events.
+                // Both rendezvous paths (complete_and_wake_caller / on_event_arrived)
+                // stash ONLY when the frame is absent from the map; a pre-insert check
+                // races against a stash landing between the (empty) check and the
+                // insert — the stash is then never consumed and the frame sleeps
+                // forever (the second Multi await-loop hang window; the events side
+                // was already fixed this way, the completions side was not).
+                self.frames.lock().insert(fid, frame_box);
+                // Both stash guards are scoped to their block expressions: released
+                // before the take-back below re-acquires frames (nesting either stash
+                // lock -> frames deadlocks against the stash writers' frames -> stash
+                // paths). The take-back uses a plain `let` — an if-let scrutinee guard
+                // would live through the whole body and self-deadlock the
+                // non-reentrant parking_lot mutex when the body re-acquires frames.
+                let completions: Vec<_> = {
+                    let mut pc = self.pending_completions.lock();
+                    pc.remove(&fid).unwrap_or_default()
+                };
+                let stashed_events: Vec<_> = {
+                    let mut pe = self.pending_events.lock();
+                    pe.remove(&fid).unwrap_or_default()
+                };
                 if !completions.is_empty() {
+                    // Pending completion(s) present: take the frame back, consume the
+                    // completion events directly, reinsert Ready, re-queue.
+                    let fb_opt = self.frames.lock().remove(&fid);
+                    if let Some(mut frame) = fb_opt {
                     // Pending completion(s) present: consume the completion events directly.
                     if let Some(e) = event {
                         self.event_waiters
@@ -1547,7 +1568,7 @@ impl<S: LockStrategy> Engine<S> {
                             self.graph.downstream_count(call_graph_id.0 as usize);
                         frame.set_value(call_node, return_value, consumer_count);
                         if !frame.branch_relays.is_empty() {
-                            relay_branch_value(frame, &self.graph, call_node);
+                            relay_branch_value(&mut frame, &self.graph, call_node);
                         }
                         // Gate branch subgraph control-signal propagation (consistent with the
                         // normal path in complete_and_wake_caller).
@@ -1570,41 +1591,116 @@ impl<S: LockStrategy> Engine<S> {
                             frame.control_signal = child_signal;
                         }
                         notify_downstream(
-                            frame,
+                            &mut frame,
                             &self.graph,
                             call_node,
                             call_graph_id,
                             caller_offset,
                         );
                     }
-                    frame.state = FrameState::Ready;
-                    frame.suspend_state = SuspendState::NotSuspended;
-                    frame.suspend_event = None;
-                    // Put back the same Box (address unchanged).
-                    self.frames.lock().insert(fid, frame_box);
-                    queue.push(fid);
-                } else {
-                    // Check pending_events (race fallback for when an event arrives while the frame
-                    // is absent from the HashMap).
-                    let pending_evt = self.pending_events.lock().remove(&fid);
-                    if let Some((_evt, evt_val)) = pending_evt {
-                        // Pending event present: inject the event value + wake.
-                        // The waiter has already been removed in on_event_arrived, so no duplicate
-                        // cleanup is needed.
-                        if self.apply_event_to_frame(frame, evt_val) {
-                            self.frames.lock().insert(fid, frame_box);
+                        frame.state = FrameState::Ready;
+                        frame.suspend_state = SuspendState::NotSuspended;
+                        frame.suspend_event = None;
+                        // Put back the same Box (address unchanged).
+                        self.frames.lock().insert(fid, frame);
+                        queue.push(fid);
+                    } else {
+                        // Frame concurrently taken (direct wake / cached-body
+                        // relaunch): its processing drives it — RE-STASH the
+                        // completions so a later suspension still finds them.
+                        // Consuming them here without delivery would lose the
+                        // wake forever (the join entry / waiter are already gone).
+                        let mut pc = self.pending_completions.lock();
+                        pc.entry(fid).or_default().extend(completions);
+                    }
+                } else if !stashed_events.is_empty() {
+                    // Events arrived while the frame was absent (multi-slot: the
+                    // frame may hold several; a single-slot map used to overwrite
+                    // the earlier one — when the survivor was stale the frame's
+                    // real wait was lost forever). Apply the FIRST entry matching
+                    // the frame's current wait — WaitingEvent on exactly that
+                    // event, or select-style suspend_event=None (any readiness
+                    // wins). The rest are stale by definition and dropped.
+                    let fb_opt = self.frames.lock().remove(&fid);
+                    if let Some(mut fb) = fb_opt {
+                        let select_form = matches!(fb.suspend_state, SuspendState::WaitingEvent(_))
+                            && fb.suspend_event.is_none();
+                        let mut applied = false;
+                        if matches!(fb.suspend_state, SuspendState::WaitingEvent(_)) {
+                            for (evt, evt_val) in stashed_events {
+                                if fb.suspend_event == Some(evt) || select_form {
+                                    if self.apply_event_to_frame(&mut fb, evt_val) {
+                                        applied = true;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        if applied {
+                            self.frames.lock().insert(fid, fb);
                             queue.push(fid);
                         } else {
-                            // Frame is not WaitingEvent (state inconsistency): put it back, do not
-                            // enqueue.
-                            self.frames.lock().insert(fid, frame_box);
+                            self.frames.lock().insert(fid, fb);
                         }
                     } else {
-                        self.frames.lock().insert(fid, frame_box);
+                        // Frame concurrently taken: RE-STASH the events for its
+                        // next suspension (see the completions arm above).
+                        let mut pe = self.pending_events.lock();
+                        pe.entry(fid).or_default().extend(stashed_events);
                     }
                 }
             }
             FrameState::Completed => {
+                // Cycle-collection pressure valve: at frame completion (a
+                // quiescent point) collect cyclic garbage when the registry
+                // grows past the threshold. Roots = every live frame's value
+                // table (globals live in the root frame's slots).
+                // Single-threaded engines only: in Multi mode other workers
+                // mutate the object graph concurrently and the stop-the-world
+                // assumption breaks (mid-run collection would race). Multi-mode
+                // cycles are reclaimed by the teardown sweep instead.
+                if self.wakeup.is_none()
+                    && crate::value::Registry::registered_count() > 1 << 16 {
+                    let mut roots: Vec<crate::value::Value> = Vec::new();
+                    let frames = self.frames.lock();
+                    for f in frames.values() {
+                        roots.extend(f.value_table.values.iter().cloned());
+                    }
+                    drop(frames);
+                    // Engine-side Value holders outside the frame map:
+                    // pooled frames, pending completions/events, the final
+                    // result, resolved-but-unjoined async results, and the
+                    // arena's handle-backed slots (opaque to the edge walk,
+                    // so rooted conservatively here).
+                    for f in self.frame_pool.lock().iter() {
+                        roots.extend(f.value_table.values.iter().cloned());
+                    }
+                    for v in self.pending_completions.lock().values() {
+                        for (_, val, _) in v.iter() {
+                            roots.push(val.clone());
+                        }
+                    }
+                    for v in self.pending_events.lock().values() {
+                        for (_, val) in v {
+                            roots.push(val.clone());
+                        }
+                    }
+                    if let Some(v) = self.result.lock().as_ref() {
+                        roots.push(v.clone());
+                    }
+                    self.async_join_runtime.lock().collect_results(&mut roots);
+                    {
+                        let arena = self.arena.lock();
+                        let mut arcs: Vec<std::sync::Arc<crate::value::HeapObj>> = Vec::new();
+                        arena.collect_ref_arcs(&mut arcs);
+                        drop(arena);
+                        for a in arcs {
+                            roots.push(crate::value::Value::from_ref(a));
+                        }
+                    }
+                    crate::value::Registry::collect_cycles(&roots);
+                }
+
                 // Bug #77: check if this is a defer frame completing. Defer frames are
                 // registered in `defer_frames` by init_defer_frame; their completion must
                 // decrement the parent's defer-waiter count and, when all defer frames are
@@ -1653,6 +1749,10 @@ impl<S: LockStrategy> Engine<S> {
                                     self.async_join_runtime
                                         .lock()
                                         .set_result(async_id, return_value.clone());
+                                    if super::env_flag("FROND_DEBUG_AWAIT") {
+                                        eprintln!("[CHILD-DONE] child={:?} async_id={:?}", fid, async_id);
+                                    }
+
                                     let woken = self.on_event_arrived(
                                         RuntimeEvent::AsyncJoin(async_id),
                                         return_value,
