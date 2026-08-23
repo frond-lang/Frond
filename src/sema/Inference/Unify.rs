@@ -121,6 +121,72 @@ impl<'a> InferContext<'a> {
         }
     }
 
+    /// Inheritance substitution check for concrete Adt pairs: returns
+    /// `Some(None)` when `arg` may substitute for `param` (param is on the
+    /// arg's first-base chain), `Some(Some(msg))` with a dedicated message
+    /// when the base IS in the chain but not first (view offsets unsupported),
+    /// and `None` when unrelated (fall through to the generic mismatch).
+    fn inheritance_substitutable(
+        &self,
+        param: TypeHandle,
+        arg: TypeHandle,
+    ) -> Option<Option<String>> {
+        let rp = self.arena.resolve(param);
+        let ra = self.arena.resolve(arg);
+        let (pname, _) = match self.arena.get(rp) {
+            crate::types::Ty::Type::Adt(_) => self.arena.adt_parts(rp),
+            _ => return None,
+        };
+        let (aname, _) = match self.arena.get(ra) {
+            crate::types::Ty::Type::Adt(_) => self.arena.adt_parts(ra),
+            _ => return None,
+        };
+        if pname == aname {
+            return None; // same type: not this path's concern
+        }
+        // Walk the arg's base chain: first-base links are layout-compatible;
+        // non-first links are not yet substitutable.
+        let mut ok = false;
+        let mut late = false;
+        let mut current: Option<Box<str>> = Some(aname.into());
+        let mut hops = 0usize;
+        while let Some(cn) = current {
+            if hops > 64 {
+                break;
+            }
+            let def = self.sema_result.get_type_def(cn.as_ref())?;
+            let mut next: Option<Box<str>> = None;
+            for (i, b) in def.bases.iter().enumerate() {
+                if b.as_ref() == pname {
+                    if i == 0 && !late {
+                        ok = true;
+                    } else {
+                        late = true;
+                        ok = false;
+                    }
+                }
+                if i == 0 {
+                    next = Some(b.clone());
+                }
+            }
+            if ok || late {
+                break;
+            }
+            current = next;
+            hops += 1;
+        }
+        let _ = late;
+        // Non-first bases: allowed — method calls dispatch per-child (the
+        // inherited bodies compile against the child layout), so passing
+        // through methods is layout-correct. Direct FIELD access through a
+        // non-first-base-typed receiver remains first-base-only (fields are
+        // name-keyed at runtime anyway).
+        if ok || late {
+            return Some(None);
+        }
+        None
+    }
+
     /// Call-site argument check with the hard-concrete rule: when BOTH the
     /// parameter and the argument are fully concrete (no TypeVar anywhere) and
     /// cannot unify, no solver iteration can ever reconcile them — report the
@@ -159,6 +225,63 @@ impl<'a> InferContext<'a> {
             // path fail is it a real mismatch (stdlib passes str into str?
             // parameters, and str? unwraps into str receivers).
             let widened = self.try_widen_unify(param, arg).is_ok();
+            // Inheritance substitution: a CHILD value may flow into a
+            // base-typed parameter when the base is on the child's
+            // FIRST-base chain (prefix layout compatibility — later bases
+            // need view offsets, not yet supported).
+            if !widened {
+                if let Some(msg) = self.inheritance_substitutable(param, arg) {
+                    if let Some(m) = msg {
+                        self.add_error_at(&m, line, column);
+                    }
+                    return;
+                }
+            }
+            // Trait-param substitution (incl. trait inheritance): a concrete
+            // type with a witness for the trait — or a CHILD trait of it —
+            // flows into a trait-typed parameter (runtime dispatches via the
+            // vtable fallback table).
+            if !widened {
+                let rp = self.arena.resolve(param);
+                let ra = self.arena.resolve(arg);
+                // Trait-typed parameter — as Type::Trait or (the common
+                // annotation lowering) an Adt placeholder naming a trait.
+                let tname: Option<&str> = match self.arena.get(rp) {
+                    crate::types::Ty::Type::Trait(_) => {
+                        Some(self.arena.trait_parts(rp).0)
+                    }
+                    crate::types::Ty::Type::Adt(_) => {
+                        let (n, _) = self.arena.adt_parts(rp);
+                        if self.sema_result.get_trait_def(n).is_some() {
+                            Some(n)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(tname) = tname {
+                    if let crate::types::Ty::Type::Adt(_) = self.arena.get(ra) {
+                        let (aname, _) = self.arena.adt_parts(ra);
+                        // The InferContext's OWN table carries this module's
+                        // fresh witnesses (sema_result's mirror is only synced
+                        // post-inference, step 10).
+                        let has_witness = self
+                            .witness_table
+                            .entries()
+                            .any(|e| e.trait_name.as_ref() == tname && {
+                                self.sema_result
+                                    .type_id_to_name
+                                    .get(&e.type_id)
+                                    .map(|n| n.as_ref() == aname)
+                                    .unwrap_or(false)
+                            });
+                        if has_witness {
+                            return;
+                        }
+                    }
+                }
+            }
             if !widened {
                 let p_str = format!("{}", self.arena.display(self.arena.resolve(param)));
                 let a_str = format!("{}", self.arena.display(self.arena.resolve(arg)));

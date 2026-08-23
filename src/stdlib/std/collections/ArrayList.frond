@@ -1,0 +1,31 @@
+// ArrayList.frond — the array-backed list under its explicit name
+// (part of std.collections)
+//
+// A pure child of List<T> (the Map/Set family pattern, mirroring
+// HashMap(Map<K, V>)): zero own fields, zero overrides — it exists as the
+// named entry point for the array-backed storage (amortized O(1) push,
+// O(1) get/set) and the anchor the family can diverge from later. Every
+// behavioral contract (aliasing semantics, snapshot, capacity tail) is
+// List's; see List.frond.
+//
+//   val xs = ArrayList.empty()
+//   xs.push(1)
+//   val ys = ArrayList.from([1, 2, 3])
+
+type ArrayList<T>(List<T>) = ArrayList() {
+
+    // Storage is the base's (buf, count) — nothing to add. push/pop/get/
+    // set/len/as_array/capacity are all inherited verbatim.
+}
+
+// Factory family (the List.empty / List.from convention).
+pub fun empty<T>(): ArrayList<T> {
+    var buf: T[] = []
+    ArrayList(buf, 0)
+}
+
+// Snapshot an array into a list (slice copy, independent of the input).
+pub fun from<T>(arr: T[]): ArrayList<T> {
+    var buf: T[] = arr[0..arr.len()]
+    ArrayList(buf, arr.len())
+}

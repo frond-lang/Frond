@@ -215,9 +215,9 @@ fn reflect_type_name(v: &Value) -> String {
         Value::Ref(r) => match &**r {
             crate::value::HeapObj::Str(_) => TYPE_NAME_STR.to_string(),
             crate::value::HeapObj::Array(arr) => array_type_name(arr),
-            crate::value::HeapObj::Record(rec) => rec.type_name.clone(),
-            crate::value::HeapObj::Adt(a) => a.type_name.clone(),
-            crate::value::HeapObj::Newtype(n) => n.type_name.clone(),
+            crate::value::HeapObj::Record(rec) => crate::sema::Sema::display_type_name(&rec.type_name),
+            crate::value::HeapObj::Adt(a) => crate::sema::Sema::display_type_name(&a.type_name),
+            crate::value::HeapObj::Newtype(n) => crate::sema::Sema::display_type_name(&n.type_name),
             crate::value::HeapObj::LazyVal(_) => "Lazy".to_string(),
             crate::value::HeapObj::ErrorVal(_) => "Error".to_string(),
             crate::value::HeapObj::ThrowVal(_) => "Throw".to_string(),
@@ -2048,11 +2048,23 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId, ctx: &EvalCon
         // disambiguate same-named constructors across different types.
         Some(crate::value::HeapObj::Adt(a)) => {
             a.constructor == ctor_name
-                && type_name.map_or(true, |tn| a.type_name == tn)
+                && type_name.map_or(true, |tn| {
+                    a.type_name == tn || type_inherits(graph, &a.type_name, tn)
+                })
         }
-        Some(crate::value::HeapObj::Record(r)) => r.type_name == ctor_name,
+        // Record/Newtype patterns key on the TYPE name (ctor name == type
+        // name for these kinds). Canonical identity: prefer the pattern's
+        // type-name metadata (module-qualified); the ctor-name slot is the
+        // legacy bare fallback.
+        Some(crate::value::HeapObj::Record(r)) => match type_name {
+            Some(tn) => r.type_name == tn,
+            None => r.type_name == ctor_name,
+        },
         // Newtype: constructor name == type name; match `NewtypeValue.type_name`.
-        Some(crate::value::HeapObj::Newtype(n)) => n.type_name == ctor_name,
+        Some(crate::value::HeapObj::Newtype(n)) => match type_name {
+            Some(tn) => n.type_name == tn,
+            None => n.type_name == ctor_name,
+        },
         Some(crate::value::HeapObj::ThrowVal(tv)) => match &tv.payload {
             crate::value::ThrowPayload::Ok(_) => ctor_name == CTOR_OK,
             crate::value::ThrowPayload::Err(payload) => {
@@ -2069,8 +2081,14 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId, ctx: &EvalCon
                             a.constructor == ctor_name
                                 && type_name.map_or(true, |tn| a.type_name == tn)
                         }
-                        Some(crate::value::HeapObj::Newtype(n)) => n.type_name == ctor_name,
-                        Some(crate::value::HeapObj::Record(r)) => r.type_name == ctor_name,
+                        Some(crate::value::HeapObj::Newtype(n)) => match type_name {
+                            Some(tn) => n.type_name == tn,
+                            None => n.type_name == ctor_name,
+                        },
+                        Some(crate::value::HeapObj::Record(r)) => match type_name {
+                            Some(tn) => r.type_name == tn,
+                            None => r.type_name == ctor_name,
+                        },
                         _ => false,
                     }
                 }
@@ -3968,6 +3986,31 @@ pub fn compute_break(_frame: &mut Frame, _node: NodeId, _ctx: &EvalContext) -> N
 /// Replaces the old `control_signal_nodes[SignalKind::Continue]` table lookup.
 pub fn compute_continue(_frame: &mut Frame, _node: NodeId, _ctx: &EvalContext) -> NodeResult {
     NodeResult::Continue
+}
+
+/// Whether `child` (transitively) inherits `ancestor` per the graph's
+/// inheritance links (sema TypeDefInfo.bases, embedded at build time).
+fn type_inherits(graph: &crate::ir::Ir::DataFlowGraph, child: &str, ancestor: &str) -> bool {
+    if child == ancestor {
+        return true;
+    }
+    let mut frontier: Vec<&str> = vec![child];
+    let mut hops = 0;
+    while let Some(c) = frontier.pop() {
+        hops += 1;
+        if hops > 64 {
+            return false;
+        }
+        for (cn, bn) in &graph.inheritance_links {
+            if cn.as_ref() == c {
+                if bn.as_ref() == ancestor {
+                    return true;
+                }
+                frontier.push(bn.as_ref());
+            }
+        }
+    }
+    false
 }
 
 /// compute_fn (idx 311): match fallback — panics when no match arm matches.

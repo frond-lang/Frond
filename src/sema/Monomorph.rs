@@ -1403,8 +1403,14 @@ fn resolve_instance_body_types<'a>(
     // types into `local_expr_types`.
     let local_expr_types: FxHashMap<u64, ExprInfo>;
     {
+        // Sync the free-function resolvers' module context (resolve_type_key
+        // reads sema_result.current_module_name): signature/body name
+        // resolution must happen in the GENERIC FUNCTION'S module, not the
+        // last-checked one (a local shadow would hijack std names otherwise).
+        let saved_sema_module = sema_result.current_module_name.clone();
         let mut infer_ctx = InferContext::new(arena, sema_result);
         infer_ctx.current_module_name = module_name.to_string();
+        infer_ctx.sema_result.current_module_name = module_name.to_string();
 
         // Push type bindings (place rigid vars first; `enter_instantiation_mode`
         // will replace them with the concrete type_args).
@@ -1423,11 +1429,22 @@ fn resolve_instance_body_types<'a>(
         );
 
         // Create the environment and register the function parameters.
-        // Child of the (shared, get-or-created) root — never the root
-        // itself: the root is global now, and defining the instance's
-        // parameters into it would leak them into every other lookup.
-        let root = infer_ctx.sema_result.env.root();
-        let fn_env = infer_ctx.sema_result.env.child(root);
+        // Child of the DECLARING MODULE's env (module-scoped: bare names in
+        // the generic body must resolve the module's own symbols first — a
+        // root-anchored child would resolve contested bare names to the
+        // first root registrant, e.g. one of the nine container `empty`s),
+        // falling back to the shared root when the module env is unknown.
+        // Never the root itself: the root is global now, and defining the
+        // instance's parameters into it would leak them into every other
+        // lookup.
+        let parent_env = {
+            let logical = crate::sema::Sema::module_logical_path(module_name);
+            logical
+                .as_deref()
+                .and_then(|lp| infer_ctx.sema_result.module_envs.get(lp).copied())
+                .unwrap_or_else(|| infer_ctx.sema_result.env.root())
+        };
+        let fn_env = infer_ctx.sema_result.env.child(parent_env);
         for param in fd.params {
             let h = if let Some(ta) = param.type_annotation {
                 infer_ctx.type_from_ast(ta, ast)
@@ -1460,7 +1477,9 @@ fn resolve_instance_body_types<'a>(
         }
 
         infer_ctx.pop_type_bindings();
-    } // infer_ctx dropped, releasing &mut arena and &mut sema_result
+        drop(infer_ctx);
+        sema_result.current_module_name = saved_sema_module;
+    }
 
     // Merge `local_expr_types` into `instance.expr_types` +
     // `sema_result.expr_types`.
@@ -1532,12 +1551,19 @@ pub fn validate_trait_method_bindings<'a>(
         else {
             continue;
         };
-        // Implemented trait names, deduped in declaration order.
+        // Implemented trait names, deduped in declaration order — plus the
+        // transitive PARENT closure (trait inheritance): a parent's default
+        // participates in conflict detection exactly like a listed trait's.
         let mut traits: Vec<Box<str>> = Vec::new();
         for it in implemented_traits.iter() {
             let t: Box<str> = it.trait_name.into();
             if !traits.iter().any(|x| x.as_ref() == t.as_ref()) {
                 traits.push(t);
+            }
+            for pt in sema_result.trait_parent_closure(it.trait_name) {
+                if !traits.iter().any(|x| x.as_ref() == pt.as_ref()) {
+                    traits.push(pt);
+                }
             }
         }
         // Union of method names across the implemented traits (owned, to release
@@ -1662,7 +1688,21 @@ pub fn validate_trait_method_bindings<'a>(
                     ));
                 }
             } else if providers.len() > 1 {
-                // R3: ambiguous inherited default.
+                // R3: ambiguous inherited default — UNLESS one provider is a
+                // descendant of all others (trait inheritance: the child
+                // trait's own declaration shadows its parents').
+                let shadowed = providers.iter().any(|c| {
+                    providers.iter().all(|o| {
+                        o == c
+                            || sema_result
+                                .trait_parent_closure(c)
+                                .iter()
+                                .any(|a| a.as_ref() == o.as_str())
+                    })
+                });
+                if shadowed {
+                    continue;
+                }
                 findings.push(Finding(
                     format!(
                         "ambiguous trait default '{}': type '{}' inherits conflicting defaults from [{}]; resolve with an explicit override or a delegate ('fun {}(...): ... = {}.{}')",
@@ -1704,13 +1744,149 @@ pub fn validate_trait_method_bindings<'a>(
 /// wins dispatch); the exception is `super`: when sema recorded the
 /// (type, trait, method) triple in `super_targets`, the default subgraph must
 /// exist even though the type overrides it.
+/// Trait-declaration-site validation (trait inheritance):
+/// 1. A trait whose parents provide CONFLICTING defaults for a name it does
+///    not re-declare is rejected at the declaration ("resolve it in the
+///    child trait"); re-declaring ABSTRACT while parents conflict is also
+///    rejected (an abstract re-declaration cannot shadow a default).
+/// 2. Abstract requirements: every type implementing a trait (directly or
+///    through a child) must implement its abstract methods or inherit a
+///    default for them from somewhere in the closure.
+pub fn validate_trait_inheritance<'a>(
+    module: &'a Module<'a>,
+    sema_result: &mut SemaResult,
+) {
+    // ── 1. Declaration-site parent-default conflicts ──
+    for decl in &module.declarations {
+        let crate::ast::Ast::Decl::TraitDecl { name, parents, .. } = &decl.node
+        else {
+            continue;
+        };
+        if parents.is_empty() {
+            continue;
+        }
+        // Parents' defaults grouped by method name.
+        use std::collections::BTreeMap;
+        let mut defaults: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for p in parents {
+            for (_origin, m) in sema_result.trait_effective_methods(p.trait_name) {
+                if m.has_body {
+                    defaults.entry(m.name.to_string()).or_default().push(p.trait_name.to_string());
+                }
+            }
+        }
+        let own_names: Vec<String> = sema_result
+            .get_trait_def(name)
+            .map(|td| td.methods.iter().map(|m| m.name.to_string()).collect())
+            .unwrap_or_default();
+        for (m_name, providers) in defaults {
+            if providers.len() <= 1 {
+                continue;
+            }
+            let providers_dedup: Vec<String> = {
+                let mut v = providers.clone();
+                v.sort();
+                v.dedup();
+                v
+            };
+            if providers_dedup.len() <= 1 {
+                continue;
+            }
+            if own_names.iter().any(|n| n == &m_name) {
+                let has_body = sema_result
+                    .get_trait_def(name)
+                    .and_then(|td| td.methods.iter().find(|m| m.name.as_ref() == m_name))
+                    .map(|m| m.has_body)
+                    .unwrap_or(false);
+                if !has_body {
+                    sema_result.add_error(crate::sema::Sema::SemaError::new_with_path(
+                        &format!(
+                            "trait '{}' re-declares '{}' abstract while parents [{}] provide conflicting defaults; give '{}' a default body in '{}'",
+                            name, m_name, providers_dedup.join(", "), m_name, name
+                        ), module.name, decl.span.line, decl.span.column));
+                }
+                continue;
+            }
+            sema_result.add_error(crate::sema::Sema::SemaError::new_with_path(
+                &format!(
+                    "trait '{}' inherits conflicting defaults for '{}' from [{}]; declare its own '{}' (with a body) in the trait to resolve",
+                    name, m_name, providers_dedup.join(", "), m_name
+                ), module.name, decl.span.line, decl.span.column));
+        }
+    }
+
+    // ── 2. Abstract-requirement enforcement for implementing types ──
+    for decl in &module.declarations {
+        let crate::ast::Ast::Decl::TypeDecl { name, implemented_traits, methods, .. } = &decl.node
+        else {
+            continue;
+        };
+        if implemented_traits.is_empty() {
+            continue;
+        }
+        // The full closure (direct + parents).
+        let mut closure: Vec<String> = Vec::new();
+        for it in implemented_traits.iter() {
+            if !closure.iter().any(|x| x == it.trait_name) {
+                closure.push(it.trait_name.to_string());
+            }
+            for pt in sema_result.trait_parent_closure(it.trait_name) {
+                if !closure.iter().any(|x| x == pt.as_ref()) {
+                    closure.push(pt.to_string());
+                }
+            }
+        }
+        let own: Vec<String> = methods.iter().map(|m| m.name.to_string()).collect();
+        for t in &closure {
+            // Owned snapshot of this trait's abstract method names (borrow
+            // hygiene: the default-scan below re-borrows sema_result).
+            let abstracts: Vec<String> = sema_result
+                .get_trait_def(t)
+                .map(|td| {
+                    td.methods
+                        .iter()
+                        .filter(|m| !m.has_body)
+                        .map(|m| m.name.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for m_name in abstracts {
+                if own.iter().any(|n| n == &m_name) {
+                    continue;
+                }
+                // A default elsewhere in the closure satisfies the requirement.
+                let defaulted = closure.iter().any(|ct| {
+                    sema_result
+                        .get_trait_def(ct)
+                        .map(|ctd| {
+                            ctd.methods
+                                .iter()
+                                .any(|cm| cm.name.as_ref() == m_name && cm.has_body)
+                        })
+                        .unwrap_or(false)
+                });
+                if !defaulted {
+                    sema_result.add_error(crate::sema::Sema::SemaError::new_with_path(
+                        &format!(
+                            "type '{}' does not implement trait method '{}.{}' (required directly or through trait inheritance)",
+                            name, t, m_name
+                        ), module.name, decl.span.line, decl.span.column));
+                }
+            }
+        }
+    }
+}
+
 pub fn collect_trait_default_instances<'a>(
     module: &'a Module<'a>,
     sema_result: &mut SemaResult,
 ) {
     for decl in &module.declarations {
         if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &decl.node {
-            let trait_idx = match sema_result.trait_def_index.get(*name).copied() {
+            // Module-scoped canonical key — matches registration and the
+            // witness entries' trait names.
+            let canonical: Box<str> = sema_result.resolve_trait_key(name).into();
+            let trait_idx = match sema_result.trait_def_index.get(canonical.as_ref()).copied() {
                 Some(idx) => idx,
                 None => continue,
             };
@@ -1719,7 +1895,7 @@ pub fn collect_trait_default_instances<'a>(
             let impl_entries: Vec<(u16, String)> = sema_result
                 .witness_table
                 .entries()
-                .filter(|e| e.trait_name.as_ref() == *name)
+                .filter(|e| e.trait_name.as_ref() == canonical.as_ref())
                 .filter_map(|e| {
                     // type_id → type_name (O(1) reverse-lookup via
                     // type_id_to_name index, replacing the former O(n) linear
@@ -1728,6 +1904,62 @@ pub fn collect_trait_default_instances<'a>(
                         .map(|name| (e.type_id, name.to_string()))
                 })
                 .collect();
+
+            // Trait-inheritance super support: when a type witnesses THIS
+            // trait and the trait (or the type) overrides a PARENT's default,
+            // the parent default must ALSO specialize for that type — the
+            // child's body may `super.m()` into it (compile-side target).
+            for pt in sema_result.trait_parent_closure(name) {
+                // Owned snapshot of the parent's (idx, name, has_body) triples
+                // (borrow hygiene: the instance push below re-borrows).
+                let parent_methods: Vec<(usize, String, bool)> = sema_result
+                    .get_trait_def(pt.as_ref())
+                    .map(|ptd| {
+                        ptd.methods
+                            .iter()
+                            .enumerate()
+                            .map(|(i, m)| (i, m.name.to_string(), m.has_body))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let parent_idx = match sema_result.trait_def_index.get(pt.as_ref()) {
+                    Some(&i) => i,
+                    None => continue,
+                };
+                for (pm_idx, pm_name_owned, pm_has_body) in parent_methods {
+                    if !pm_has_body {
+                        continue;
+                    }
+                    let pm_name: &str = pm_name_owned.as_str();
+                    let child_overrides = methods
+                        .iter()
+                        .any(|m| &*m.name == pm_name && m.body.is_some());
+                    for (type_id, type_name) in &impl_entries {
+                        let type_overrides = sema_result
+                            .get_type_def(type_name.as_str())
+                            .map(|td| td.methods.iter().any(|m| &*m.name == pm_name))
+                            .unwrap_or(false);
+                        if !child_overrides && !type_overrides {
+                            continue; // parent default dispatches directly; normal collection covers it
+                        }
+                        let already = sema_result.trait_default_instances.iter().any(|i| {
+                            i.type_id == *type_id
+                                && i.trait_idx == parent_idx
+                                && i.method_idx as usize == pm_idx
+                        });
+                        if already {
+                            continue;
+                        }
+                        sema_result.trait_default_instances.push(TraitDefaultInstance {
+                            type_id: *type_id,
+                            type_name: type_name.as_str().into(),
+                            trait_idx: parent_idx,
+                            trait_name: pt.clone(),
+                            method_idx: pm_idx as u16,
+                        });
+                    }
+                }
+            }
 
             for (method_idx, method) in methods.iter().enumerate() {
                 if method.body.is_none() {
@@ -1744,7 +1976,7 @@ pub fn collect_trait_default_instances<'a>(
                         .collect();
                     match sema_result.resolve_method_binding(&traits, type_name, method_name) {
                         crate::sema::Sema::MethodBinding::Bound { trait_name, overridden }
-                            if trait_name.as_ref() == *name =>
+                            if trait_name.as_ref() == canonical.as_ref() =>
                         {
                             if overridden
                                 && !sema_result.super_targets.contains(&(
@@ -1761,7 +1993,7 @@ pub fn collect_trait_default_instances<'a>(
                                 type_id: *type_id,
                                 type_name: type_name.as_str().into(),
                                 trait_idx,
-                                trait_name: (*name).into(),
+                                trait_name: canonical.clone().into(),
                                 method_idx: method_idx as u16,
                             });
                         }
@@ -1791,6 +2023,7 @@ pub fn run_monomorphization<'a>(
     sema_result: &mut SemaResult,
     arena: &mut TypeArena,
 ) {
+    validate_trait_inheritance(module, sema_result);
     collect_monomorph_instances(module, all_modules, sema_result, arena);
     collect_trait_default_instances(module, sema_result);
 }

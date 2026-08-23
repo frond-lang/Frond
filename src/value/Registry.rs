@@ -44,10 +44,13 @@ pub fn registered_count() -> usize {
 }
 
 /// Visits every Value edge of a heap object (the Arc-object graph). Arena
-/// handle fields (Adt fields, Newtype inner, Closure bound_args) are
-/// deliberately opaque: their backing arena slots are roots in their own
-/// right, so treating them as non-edges cannot strand a live object — it can
-/// only keep a dead one until its arena resets (bounded, frame-scoped).
+/// handle fields (Newtype inner, Closure bound_args) are deliberately
+/// opaque: their backing arena slots are roots in their own right, so
+/// treating them as non-edges cannot strand a live object — it can only keep
+/// a dead one until its arena resets (bounded, frame-scoped). Adt/Record
+/// fields are inline Values and MUST be walked: an Adt reached through a
+/// root whose fields stay unmarked gets its live children swept (observed:
+/// 5万-entry IntMap judged dead at the pressure valve → UAF at teardown).
 pub fn for_each_child(obj: &HeapObj, f: &mut dyn FnMut(&Value)) {
     use crate::value::HeapObj;
     match obj {
@@ -59,6 +62,11 @@ pub fn for_each_child(obj: &HeapObj, f: &mut dyn FnMut(&Value)) {
         HeapObj::Record(r) => {
             for e in &r.fields {
                 f(e);
+            }
+        }
+        HeapObj::Adt(a) => {
+            for fld in &a.fields {
+                f(&fld.value);
             }
         }
         HeapObj::Cell(c) => {
@@ -141,35 +149,63 @@ pub fn collect_cycles(roots: &[Value]) -> usize {
     }
     // Sweep: dead = registered but unmarked.
     let dead: Vec<usize> = reg.difference(&marked).copied().collect();
+    let trace = std::env::var("FROND_TRACE_CYCLES").is_ok();
+    if trace {
+        eprintln!(
+            "[cycles] roots={} registered={} marked={} dead={}",
+            roots.len(),
+            reg.len(),
+            marked.len(),
+            dead.len()
+        );
+    }
     for p in &dead {
         reg.remove(p);
     }
     drop(reg);
-    // Snapshot each dead source's outgoing edges BEFORE any release.
-    let mut edge_list: Vec<Vec<usize>> = Vec::with_capacity(dead.len());
+    // Phase 1: CLONE every dead-source outgoing edge (a real Arc::clone,
+    // +1 each). This cushion guarantees no child's count can reach zero
+    // while the sources below are still releasing their own edges. (The
+    // previous from_raw scheme was unsound: from_raw ADOPTS an existing
+    // count instead of adding one, so the held "clones" and the sources'
+    // own fields double-owned every edge — dropping both sides released
+    // each count twice and detonated on any real cycle once Adt fields
+    // became visible to the walk.)
+    let mut held: Vec<Arc<HeapObj>> = Vec::new();
     for p in &dead {
-        // SAFETY: alive via its own cycle edges until phase 2 below.
+        // SAFETY: alive — still referenced by its own/other edges, plus the
+        // registry snapshot happened before any release.
         let obj = unsafe { &*(*p as *const HeapObj) };
-        let mut kids: Vec<usize> = Vec::new();
         for_each_child(obj, &mut |v: &Value| {
             if let Value::Ref(a) = v {
-                kids.push(Arc::as_ptr(a) as usize);
+                held.push(a.clone());
             }
         });
-        edge_list.push(kids);
     }
-    // Phase 1: retake EVERY dead-source edge clone and hold it (each from_raw
-    // +1s the child count), so no object can hit zero mid-iteration — a later
-    // edge list may still carry the raw ptr of an earlier-released child.
-    let mut held: Vec<Arc<HeapObj>> = Vec::new();
-    for kids in &edge_list {
-        for q in kids {
-            // SAFETY: recreates the child Arc clone the dead source holds.
-            held.push(unsafe { Arc::from_raw(*q as *const HeapObj) });
-        }
+    if trace {
+        eprintln!("[cycles] cushion built, edges={}", held.len());
     }
-    // Phase 2: release all at once — cycle members fall to zero through
-    // normal Rust drops; HeapObj::drop deregisters (no-op miss: removed above).
+    // Phase 2: release each dead source's OWN outgoing edges by replacing
+    // the object in place with a benign value — dropping the old value runs
+    // its normal Drop, releasing exactly the field/array Arcs it owns.
+    // HeapObj::drop's deregister is a no-op miss (entries removed above).
+    for p in &dead {
+        // SAFETY: stop-the-world quiescent point; the object is garbage and
+        // the cushion keeps every child of it alive through this pass.
+        let old = unsafe {
+            std::ptr::replace(
+                *p as *mut HeapObj,
+                HeapObj::Range(crate::value::Range::new(0, 0, false)),
+            )
+        };
+        drop(old);
+    }
+    // Phase 3: drop the cushion — net effect is one release per dead-source
+    // edge; cycle members fall to zero through normal Rust drops (the final
+    // Arc drop re-runs HeapObj::drop on the benign replacement).
     drop(held);
+    if trace {
+        eprintln!("[cycles] release done");
+    }
     dead.len()
 }

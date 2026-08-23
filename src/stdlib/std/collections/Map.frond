@@ -1,0 +1,154 @@
+// Map.frond — generic hash map base (part of std.collections)
+//
+// The shared separate-chaining implementation: bucket arrays hold small entry
+// arrays, grow ×2 at load factor 2, rebuild buckets on remove. Children
+// (HashMap<K, V>, IntMap<V> via Map<i64, V>) inherit everything and only
+// override `hash_of` — the template-method seam: every lookup/set routes
+// through it, so a child that mixes integers directly (IntMap) skips the
+// per-op string formatting of the generic default.
+//
+// Keys hash with Hash.key (std.core.hash: FNV-1a over the `"{k}"`
+// representation, every value formats) and compare with `==` (engine-level
+// deep equality). NaN keys never match (NaN != NaN; wrap them if needed).
+// Records, ADTs, arrays, bool, str, scalars are all valid keys.
+//
+//   val m = HashMap.empty()          // generic hashing
+//   val im = IntMap.empty()          // i64 fast path (hash_of override)
+
+import std.core.hash
+
+pub type MapEntry<K, V> = MapEntry(pub key: K, pub value: V)
+
+type Map<K, V> = Map(buckets: MapEntry<K, V>[][], count: usize) {
+
+    pub fun len(): usize { count }
+
+    pub fun is_empty(): bool { count == 0 }
+
+    pub fun has(key: K): bool {
+        val row = buckets[(hash_of(key) & ((buckets.len() - 1) as u64)) as usize]
+        var i = 0 as usize
+        while i < row.len() {
+            if row[i].key == key { return true }
+            i = i + 1
+        }
+        false
+    }
+
+    pub fun get(key: K): V? {
+        val row = buckets[(hash_of(key) & ((buckets.len() - 1) as u64)) as usize]
+        var i = 0 as usize
+        while i < row.len() {
+            if row[i].key == key { return row[i].value }
+            i = i + 1
+        }
+        null
+    }
+
+    pub fun &set(key: K, value: V): void {
+        val slot = (hash_of(key) & ((buckets.len() - 1) as u64)) as usize
+        val row = buckets[slot]
+        var i = 0 as usize
+        while i < row.len() {
+            if row[i].key == key {
+                buckets[slot][i] = MapEntry(key, value)
+                return
+            }
+            i = i + 1
+        }
+        buckets[slot] = row ++ [MapEntry(key, value)]
+        count = count + 1
+        grow_if_needed()
+    }
+
+    pub fun &remove(key: K): bool {
+        val slot = (hash_of(key) & ((buckets.len() - 1) as u64)) as usize
+        val row = buckets[slot]
+        var kept: MapEntry<K, V>[] = []
+        var found = false
+        var i = 0 as usize
+        while i < row.len() {
+            if row[i].key == key {
+                found = true
+            } else {
+                kept = kept ++ [row[i]]
+            }
+            i = i + 1
+        }
+        if found {
+            buckets[slot] = kept
+            count = count - 1
+        }
+        found
+    }
+
+    pub fun keys(): K[] {
+        val out = List.empty()
+        var b = 0 as usize
+        while b < buckets.len() {
+            var i = 0 as usize
+            while i < buckets[b].len() {
+                out.push(buckets[b][i].key)
+                i = i + 1
+            }
+            b = b + 1
+        }
+        out.as_array()
+    }
+
+    pub fun values(): V[] {
+        val out = List.empty()
+        var b = 0 as usize
+        while b < buckets.len() {
+            var i = 0 as usize
+            while i < buckets[b].len() {
+                out.push(buckets[b][i].value)
+                i = i + 1
+            }
+            b = b + 1
+        }
+        out.as_array()
+    }
+
+    // Lazy bucket walker (builtin HashIterator): O(n) iteration with zero
+    // allocation — no snapshot. Mutation semantics: see HashIterator docs.
+    pub fun entries(): HashIterator<MapEntry<K, V>> {
+        hash_iter(buckets)
+    }
+
+    pub fun &clear(): void {
+        val empty: MapEntry<K, V>[] = []
+        buckets = [empty, ..buckets.len()]
+        count = 0
+    }
+
+    // The template-method seam: children override this to specialize key
+    // hashing (IntMap mixes i64 directly — no per-op string formatting).
+    fun hash_of(key: K): u64 { Hash.key(key) }
+
+    // Double the bucket array and re-distribute every entry: scatter straight
+    // from the old buckets into the fresh ones (no all-entries intermediate —
+    // that used to be an O(n²) concat accumulation).
+    fun &grow_if_needed(): void {
+        if count <= buckets.len() * 2 { return }
+        val old = buckets
+        val empty: MapEntry<K, V>[] = []
+        buckets = [empty, ..old.len() * 2]
+        var b = 0 as usize
+        while b < old.len() {
+            var i = 0 as usize
+            while i < old[b].len() {
+                val e = old[b][i]
+                val slot = (hash_of(e.key) & ((buckets.len() - 1) as u64)) as usize
+                buckets[slot] = buckets[slot] ++ [e]
+                i = i + 1
+            }
+            b = b + 1
+        }
+    }
+}
+
+pub fun empty<K, V>(): Map<K, V> {
+    val empty: MapEntry<K, V>[] = []
+    Map([empty, ..16], 0)
+}

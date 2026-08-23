@@ -74,6 +74,8 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     // sort module (array sort/sort_by + sorted-array search, method form)
     ("builtin/sort/pack.frond", include_str!("../stdlib/builtin/sort/pack.frond")),
     ("builtin/sort/Raw.frond", include_str!("../stdlib/builtin/sort/Raw.frond")),
+    ("builtin/encoding/pack.frond", include_str!("../stdlib/builtin/encoding/pack.frond")),
+    ("builtin/encoding/Raw.frond", include_str!("../stdlib/builtin/encoding/Raw.frond")),
     ("builtin/sort/Sort.frond", include_str!("../stdlib/builtin/sort/Sort.frond")),
 ];
 
@@ -154,21 +156,25 @@ pub const STD_FILES: &[StdlibFile] = &[
     // rand module (PRNG wrappers over builtin/rand)
     ("std/rand/pack.frond", include_str!("../stdlib/std/rand/pack.frond")),
     ("std/rand/Rand.frond", include_str!("../stdlib/std/rand/Rand.frond")),
-    // codec module (pure Frond hex/base64 byte-text codecs)
-    ("std/codec/pack.frond", include_str!("../stdlib/std/codec/pack.frond")),
-    ("std/codec/Hex.frond", include_str!("../stdlib/std/codec/Hex.frond")),
-    ("std/codec/Base64.frond", include_str!("../stdlib/std/codec/Base64.frond")),
     // json module (pure Frond; layered: value ADT / parser / serializer)
     ("std/json/pack.frond", include_str!("../stdlib/std/json/pack.frond")),
     ("std/json/Json.frond", include_str!("../stdlib/std/json/Json.frond")),
     ("std/json/Parse.frond", include_str!("../stdlib/std/json/Parse.frond")),
     ("std/json/Format.frond", include_str!("../stdlib/std/json/Format.frond")),
-    // collections module (pure Frond hash containers: str/i64 keyed maps & sets)
+    // collections module (pure Frond containers: List + str/i64 keyed maps & sets)
     ("std/collections/pack.frond", include_str!("../stdlib/std/collections/pack.frond")),
+    ("std/collections/List.frond", include_str!("../stdlib/std/collections/List.frond")),
+    ("std/collections/ArrayList.frond", include_str!("../stdlib/std/collections/ArrayList.frond")),
+    ("std/collections/LinkedList.frond", include_str!("../stdlib/std/collections/LinkedList.frond")),
+    ("std/collections/Map.frond", include_str!("../stdlib/std/collections/Map.frond")),
+    ("std/collections/Set.frond", include_str!("../stdlib/std/collections/Set.frond")),
     ("std/collections/HashMap.frond", include_str!("../stdlib/std/collections/HashMap.frond")),
     ("std/collections/IntMap.frond", include_str!("../stdlib/std/collections/IntMap.frond")),
     ("std/collections/HashSet.frond", include_str!("../stdlib/std/collections/HashSet.frond")),
     ("std/collections/IntSet.frond", include_str!("../stdlib/std/collections/IntSet.frond")),
+    ("std/encoding/pack.frond", include_str!("../stdlib/std/encoding/pack.frond")),
+    ("std/encoding/Hex.frond", include_str!("../stdlib/std/encoding/Hex.frond")),
+    ("std/encoding/Base64.frond", include_str!("../stdlib/std/encoding/Base64.frond")),
 ];
 
 /// Looks up a stdlib file by path.

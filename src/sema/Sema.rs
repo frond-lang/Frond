@@ -394,6 +394,11 @@ pub struct TypeDefInfo {
     /// declaration order). An empty slice means the type has no methods (alias,
     /// or a record/adt without methods).
     pub methods: Box<[MethodSigInfo]>,
+    /// Concrete base type names, declaration order (inheritance). Field layout
+    /// = each base's fields (in order, generic args applied) then own fields;
+    /// method lookup = own → bases in order → trait defaults. Empty for
+    /// non-child types.
+    pub bases: Box<[Box<str>]>,
 }
 
 /// Trait definition info (replaces the signature portion of IRBuilder's
@@ -401,6 +406,8 @@ pub struct TypeDefInfo {
 #[derive(Debug, Clone)]
 pub struct TraitDefInfo {
     pub name: Box<str>,
+    /// Parent trait names (declaration order). `trait Pet(Animal)`.
+    pub parents: Box<[Box<str>]>,
     pub methods: Box<[TraitMethodSig]>,
 }
 
@@ -554,6 +561,29 @@ pub struct TraitDefaultInstance {
     pub method_idx: u16,
 }
 
+/// An inherited-method expansion instance (inheritance). The child's method
+/// table gains an entry at `method_idx` whose BODY is the base type's method
+/// (located in `base_module`'s AST by `base_method_idx`); the IR stage
+/// compiles it with the CHILD as receiver type — per-child compilation is
+/// what makes `this`-dispatch late-bound (same mechanism as
+/// `TraitDefaultInstance`).
+#[derive(Debug, Clone)]
+pub struct InheritedMethodInstance {
+    /// `type_id` of the child type.
+    pub type_id: u16,
+    /// Name of the child type.
+    pub type_name: Box<str>,
+    /// The method's index within the child's merged method table
+    /// (own methods first in AST order, then inherited ones in base order).
+    pub method_idx: u16,
+    /// Module path of the base's declaring module (AST lookup hint).
+    pub base_module: Box<str>,
+    /// Name of the base type owning the method body.
+    pub base_type_name: Box<str>,
+    /// Index of the method within the base type's method table.
+    pub base_method_idx: u16,
+}
+
 /// Coroutine metadata (the product of the async-function state-machine
 /// transformation).
 ///
@@ -699,11 +729,35 @@ pub struct SemaResult {
     pub type_defs: FxHashMap<u16, TypeDefInfo>,
     /// u16 index allocator for `type_defs` (never recycles).
     pub next_type_def_id: u16,
-    /// Type name → index into `type_defs`.
+    /// Type name → index into `type_defs`. Keys are CANONICAL type names:
+    /// user-module types are module-qualified (`src.Main.List`), std/builtin
+    /// types keep their bare name (one std tree, unique by construction).
     pub type_def_index: FxHashMap<String, u16>,
     /// Dynamic type_id → type name (reverse index for O(1) lookup).
     /// Updated in tandem with `type_defs` (put_type_def / purge_module).
     pub type_id_to_name: FxHashMap<u16, Box<str>>,
+    /// The module currently being populated/checked — the module context
+    /// `resolve_type_key` resolves bare names against. Maintained by
+    /// populate_module and check_module_with_env.
+    pub current_module_name: String,
+    /// Import bookkeeping for module-scoped type resolution: module name →
+    /// logical paths of the user modules it imports (std imports are
+    /// excluded — the bare-key fallback covers them). Filled by
+    /// process_import_decls.
+    pub module_imports: FxHashMap<String, Vec<String>>,
+    /// Logical paths of all user (non-std/builtin) modules in the compile,
+    /// used to map import spellings to module paths.
+    pub user_module_paths: Vec<String>,
+    /// Bare type names of the module currently being POPULATED (declared but
+    /// possibly not yet registered — forward references). Lets
+    /// `resolve_type_key_in` resolve a field/alias/base referencing a type
+    /// declared later in the same module to its canonical key before the
+    /// registration lands.
+    pub pending_own_types: std::collections::HashSet<String>,
+    /// Bare trait names of the module currently being populated — the trait
+    /// twin of `pending_own_types` (forward-referenced parent traits, impl
+    /// bounds ahead of the trait's declaration).
+    pub pending_own_traits: std::collections::HashSet<String>,
     /// Trait definition table.
     pub trait_defs: FxHashMap<u16, TraitDefInfo>,
     /// u16 index allocator for `trait_defs` (never recycles).
@@ -752,6 +806,9 @@ pub struct SemaResult {
     /// Trait-default-method monomorphization instance table (collected during
     /// the later Sema phase by the Monomorph module).
     pub trait_default_instances: Vec<TraitDefaultInstance>,
+    /// Inherited-method expansion instances (inheritance), consumed by the IR
+    /// stage to compile base method bodies with the child as receiver.
+    pub inherited_method_instances: Vec<InheritedMethodInstance>,
     /// Dynamic ops registry (ops for user types, replaces TypeDescriptorPool).
     pub dynamic_ops: DynamicOpsRegistry,
     /// Call-site → instance mapping.
@@ -811,6 +868,11 @@ pub struct SemaResult {
     /// consumed by the IR builder to bypass the type's own override (Path 2)
     /// and the vtable (Path 1), targeting the trait-default subgraph directly.
     pub super_dispatches: FxHashMap<u64, (u16, u16)>,
+    /// `super.m()` resolved to a CONCRETE BASE type's method (inheritance):
+    /// expr_key → (base type name, method name). Consumed by the IR builder
+    /// ahead of the trait-default path — target is the base's own method
+    /// subgraph (one level up), receiver is the enclosing `this`.
+    pub super_base_dispatches: FxHashMap<u64, (Box<str>, Box<str>)>,
     /// `(type_name, trait_name, method_name)` triples for which a `super` call
     /// was resolved. Drives trait-default instance generation: an overriding
     /// type normally gets no specialized default subgraph, but one must exist
@@ -869,6 +931,11 @@ impl SemaResult {
             next_type_def_id: 0,
             type_def_index: FxHashMap::default(),
             type_id_to_name: FxHashMap::default(),
+            current_module_name: String::new(),
+            module_imports: FxHashMap::default(),
+            user_module_paths: Vec::new(),
+            pending_own_types: std::collections::HashSet::new(),
+            pending_own_traits: std::collections::HashSet::new(),
             trait_defs: FxHashMap::default(),
             next_trait_def_id: 0,
             trait_def_index: FxHashMap::default(),
@@ -884,6 +951,7 @@ impl SemaResult {
             monomorph_instances: Vec::new(),
             monomorph_index: FxHashMap::default(),
             trait_default_instances: Vec::new(),
+            inherited_method_instances: Vec::new(),
             dynamic_ops: DynamicOpsRegistry::new(),
             call_instantiations: FxHashMap::default(),
             field_accesses: FxHashMap::default(),
@@ -897,6 +965,7 @@ impl SemaResult {
             pattern_ctor_types: FxHashMap::default(),
             captures: FxHashMap::default(),
             super_dispatches: FxHashMap::default(),
+            super_base_dispatches: FxHashMap::default(),
             super_targets: FxHashSet::default(),
             module_ownership: ModuleOwnership::default(),
         }
@@ -976,8 +1045,39 @@ impl SemaResult {
     /// (multi-map), and disambiguation is deferred to type-context resolution
     /// or qualified-name syntax (`Type.Ctor`).
     pub fn put_type_def(&mut self, def: TypeDefInfo, module_name: &str) -> bool {
-        // Type-name conflict: reject (same-named types cannot be redefined).
-        if self.type_def_index.contains_key(def.name.as_ref()) {
+        // The type namespace is module-scoped: `def.name` arrives CANONICAL
+        // (user types module-qualified `src.Main.List` by
+        // `ast_type_decl_to_type_def`; std/builtin/synthetic keep the bare
+        // name), so a local `type List` alongside std.collections.List no
+        // longer conflicts — the two coexist and every downstream consumer
+        // (runtime equality, match, dispatch, reflect) compares the
+        // qualified names. Remaining conflicts: a canonical key held by
+        // ANOTHER module (possible only for bare std keys — two std modules
+        // declaring the same bare type) or a same-module re-registration
+        // (the populate pipeline runs twice per module — idempotent no-op).
+        if let Some(&existing_idx) = self.type_def_index.get(def.name.as_ref()) {
+            let existing_module = self
+                .module_ownership
+                .type_def_indices
+                .iter()
+                .find_map(|(m, ids)| {
+                    if ids.contains(&existing_idx) {
+                        Some(m.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or("");
+            // Same-module re-registration: silent no-op.
+            if existing_module == module_name {
+                return false;
+            }
+            self.add_error(SemaError::new_with_path(
+                &format!("duplicate type definition: '{}'", def.name),
+                module_name,
+                1,
+                1,
+            ));
             return false;
         }
         // u16 index overflow check (aligned with register in TypeDesc.rs).
@@ -1080,20 +1180,214 @@ impl SemaResult {
 
     /// Look up a type definition by name (concrete array names map to the
     /// synthetic builtin "array" def — see `canonical_type_name`).
+    ///
+    /// Module-scoped resolution for every caller: a CANONICAL (dotted) name
+    /// passes through exactly; a BARE name resolves own-module-first (a
+    /// local `type List` shadows the std type), then imports, then the
+    /// std/builtin bare key, then a unique global user type. The exact-hit
+    /// fast path is deliberately NOT taken for bare names — std occupying
+    /// the bare key must not shadow the current module's own type.
     pub fn get_type_def(&self, name: &str) -> Option<&TypeDefInfo> {
-        let idx = *self.type_def_index.get(Self::canonical_type_name(name))?;
+        let key = Self::canonical_type_name(name);
+        let resolved = self.resolve_type_key(key);
+        let idx = *self.type_def_index.get(&resolved)?;
         self.type_defs.get(&idx)
     }
 
-    /// Look up a constructor definition by constructor name.
+    /// Module-scoped bare-name → canonical type key resolution.
+    ///
+    /// Resolution order (the module-scoped type system's single choke point):
+    /// a dotted input is treated as already canonical (exact pass-through);
+    /// a bare name resolves as
+    ///   1. the CURRENT module's own types (`src.Main.List` — local types
+    ///      shadow std names);
+    ///   2. user modules the current module imports;
+    ///   3. the std/builtin bare key (one std tree occupies bare names);
+    ///   4. a globally unique user type with this bare name (dep-module
+    ///      references written bare, the legacy flat-table visibility);
+    ///   5. bare fallback (unknown/builtin scalars — error recovery paths).
+    pub fn resolve_type_key_in(&self, module_name: &str, bare: &str) -> String {
+        // A dotted input is already a canonical (module-qualified) name:
+        // exact hit or pass through unchanged (std keys are bare, so a dotted
+        // miss is an unknown/forward reference — bare-key behavior).
+        if bare.contains('.') {
+            return bare.to_string();
+        }
+        // 1. Own module — local `type List` shadows the std type. The
+        //    pending set covers forward references during populate (declared
+        //    but not yet registered).
+        let own = canonical_type_key(module_name, bare);
+        if self.type_def_index.contains_key(&own)
+            || (own != bare && self.pending_own_types.contains(bare))
+        {
+            return own;
+        }
+        // 2. Imported user modules (declaration order).
+        if let Some(imports) = self.module_imports.get(module_name) {
+            for path in imports {
+                let key = format!("{}.{}", path, bare);
+                if self.type_def_index.contains_key(&key) {
+                    return key;
+                }
+            }
+        }
+        // 3. std/builtin bare key — one std tree occupies bare names.
+        if self.type_def_index.contains_key(bare) {
+            return bare.to_string();
+        }
+        // 4. A globally unique user type with this bare name (dep-module
+        //    references written bare — the legacy flat-table visibility).
+        //    Contested names fall through to the bare fallback.
+        let mut unique: Option<&String> = None;
+        for key in self.type_def_index.keys() {
+            if key.contains('.') && key.rsplit('.').next() == Some(bare) {
+                if unique.is_some() {
+                    unique = None;
+                    break;
+                }
+                unique = Some(key);
+            }
+        }
+        if let Some(key) = unique {
+            return key.clone();
+        }
+        // 5. Unknown/builtin-scalar bare fallback (error recovery paths).
+        bare.to_string()
+    }
+
+    /// `resolve_type_key_in` against the module currently being
+    /// populated/checked (`current_module_name`).
+    pub fn resolve_type_key(&self, bare: &str) -> String {
+        self.resolve_type_key_in(&self.current_module_name, bare)
+    }
+
+    /// Module-scoped bare-name → canonical TRAIT key resolution (the trait
+    /// twin of `resolve_type_key_in`; own-pending covers forward-referenced
+    /// parents and impl bounds).
+    pub fn resolve_trait_key_in(&self, module_name: &str, bare: &str) -> String {
+        if bare.contains('.') {
+            return bare.to_string();
+        }
+        let own = canonical_type_key(module_name, bare);
+        if self.trait_def_index.contains_key(&own)
+            || (own != bare && self.pending_own_traits.contains(bare))
+        {
+            return own;
+        }
+        if let Some(imports) = self.module_imports.get(module_name) {
+            for path in imports {
+                let key = format!("{}.{}", path, bare);
+                if self.trait_def_index.contains_key(&key) {
+                    return key;
+                }
+            }
+        }
+        if self.trait_def_index.contains_key(bare) {
+            return bare.to_string();
+        }
+        let mut unique: Option<&String> = None;
+        for key in self.trait_def_index.keys() {
+            if key.contains('.') && key.rsplit('.').next() == Some(bare) {
+                if unique.is_some() {
+                    unique = None;
+                    break;
+                }
+                unique = Some(key);
+            }
+        }
+        if let Some(key) = unique {
+            return key.clone();
+        }
+        bare.to_string()
+    }
+
+    pub fn resolve_trait_key(&self, bare: &str) -> String {
+        self.resolve_trait_key_in(&self.current_module_name, bare)
+    }
+
+    /// Transitive parent-trait closure of `trait_name` (excluding itself),
+    /// declaration-order BFS with dedup; cycle- and missing-safe.
+    pub fn trait_parent_closure(&self, trait_name: &str) -> Vec<Box<str>> {
+        let mut out: Vec<Box<str>> = Vec::new();
+        let mut queue: std::collections::VecDeque<Box<str>> = std::collections::VecDeque::new();
+        if let Some(td) = self.get_trait_def(trait_name) {
+            for p in td.parents.iter() {
+                queue.push_back(p.clone());
+            }
+        }
+        let mut hops = 0;
+        while let Some(t) = queue.pop_front() {
+            hops += 1;
+            if hops > 128 {
+                break;
+            }
+            if out.iter().any(|x| x.as_ref() == t.as_ref()) {
+                continue;
+            }
+            if let Some(td) = self.get_trait_def(t.as_ref()) {
+                out.push(t.clone());
+                for p in td.parents.iter() {
+                    queue.push_back(p.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// The effective method surface of a trait: own methods plus every
+    /// transitive parent's (child's own entries shadow same-named parents').
+    pub fn trait_effective_methods(&self, trait_name: &str) -> Vec<(Box<str>, &TraitMethodSig)> {
+        // (origin trait, sig) pairs; own first so shadowing picks the child's.
+        let mut out: Vec<(Box<str>, &TraitMethodSig)> = Vec::new();
+        if let Some(td) = self.get_trait_def(trait_name) {
+            for m in td.methods.iter() {
+                out.push((trait_name.into(), m));
+            }
+        }
+        for p in self.trait_parent_closure(trait_name) {
+            if let Some(td) = self.get_trait_def(p.as_ref()) {
+                for m in td.methods.iter() {
+                    if !out.iter().any(|(_, om)| om.name == m.name) {
+                        out.push((p.clone(), m));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Look up a constructor definition by constructor name.    /// Look up a constructor definition by constructor name.
     /// Returns the first match when multiple types share the same constructor
     /// name; use `get_ctor_defs` for disambiguation.
     pub fn get_ctor_def(&self, name: &str) -> Option<&CtorDefInfo> {
-        let packed_idx = self.ctor_def_index.get(name)?.first()?;
-        let type_idx = (*packed_idx >> 16) as u16;
-        let ctor_idx = (*packed_idx & 0xFFFF) as u16;
-        let def = self.type_defs.get(&type_idx)?;
-        def.constructors.get(ctor_idx as usize)
+        // Canonical (dotted) type names arrive here for record types whose
+        // constructor shares the type's name — the ctor map is keyed by the
+        // bare ctor name, so retry with the stripped tail and pick the entry
+        // whose OWNING type matches the canonical name.
+        if let Some(list) = self.ctor_def_index.get(name) {
+            if let Some(&packed_idx) = list.first() {
+                let type_idx = (packed_idx >> 16) as u16;
+                let ctor_idx = (packed_idx & 0xFFFF) as u16;
+                return self
+                    .type_defs
+                    .get(&type_idx)
+                    .and_then(|def| def.constructors.get(ctor_idx as usize));
+            }
+        }
+        if !name.contains('.') {
+            return None;
+        }
+        let bare = name.rsplit('.').next()?;
+        for &packed_idx in self.ctor_def_index.get(bare)? {
+            let type_idx = (packed_idx >> 16) as u16;
+            let ctor_idx = (packed_idx & 0xFFFF) as u16;
+            if let Some(def) = self.type_defs.get(&type_idx) {
+                if def.name.as_ref() == name {
+                    return def.constructors.get(ctor_idx as usize);
+                }
+            }
+        }
+        None
     }
 
     /// Look up all constructor definitions matching a constructor name.
@@ -1136,7 +1430,35 @@ impl SemaResult {
     }
 
     // ── Trait definitions ──
-    define_table_registry!(put_trait_def, get_trait_def, trait_defs, trait_def_index, TraitDefInfo, next_trait_def_id);
+    // Trait registry: hand-written (not the shared macro) — the GET is
+    // module-scoped, mirroring the type namespace (user-module traits are
+    // canonical `src.Main.Eq`; std/builtin keep bare names).
+    /// Insert a trait def; returns `false` on a duplicate canonical name
+    /// (same-module re-population lands here and is a silent no-op, exactly
+    /// like the macro version).
+    pub fn put_trait_def(&mut self, def: TraitDefInfo) -> bool {
+        if self.trait_def_index.contains_key(def.name.as_ref()) {
+            return false;
+        }
+        assert!(
+            self.next_trait_def_id < u16::MAX,
+            "trait_defs index overflow: too many entries",
+        );
+        let idx = self.next_trait_def_id;
+        self.next_trait_def_id += 1;
+        self.trait_def_index.insert(def.name.to_string(), idx);
+        self.trait_defs.insert(idx, def);
+        true
+    }
+
+    /// Module-scoped trait lookup: a CANONICAL (dotted) name passes through;
+    /// a bare name resolves own-module-first, then imports, then the
+    /// std/builtin bare key, then a unique global user trait.
+    pub fn get_trait_def(&self, name: &str) -> Option<&TraitDefInfo> {
+        let resolved = self.resolve_trait_key(name);
+        let idx = *self.trait_def_index.get(&resolved)?;
+        self.trait_defs.get(&idx)
+    }
 
     // ── Function signatures ──
     // Module-qualified registry ("module\x00name") — hand-written, not the
@@ -1257,8 +1579,20 @@ impl SemaResult {
     /// `method_subgraphs`. Returning `None` means the type has no such method
     /// (it may be a trait default method; consult the witness_table).
     pub fn lookup_method_idx(&self, type_name: &str, method_name: &str) -> Option<u16> {
-        let &type_idx = self.type_def_index.get(Self::canonical_type_name(type_name))?;
-        let type_def = &self.type_defs[&type_idx];
+        // Module-scoped: bare AST names resolve to their canonical key
+        // (exact canonical keys hit directly).
+        let key = Self::canonical_type_name(type_name);
+        let key = match self.type_def_index.get(key) {
+            Some(&idx) => idx,
+            None => {
+                let resolved = self.resolve_type_key(key);
+                if resolved == key {
+                    return None;
+                }
+                *self.type_def_index.get(&resolved)?
+            }
+        };
+        let type_def = &self.type_defs[&key];
         type_def
             .methods
             .iter()
@@ -1331,6 +1665,28 @@ impl SemaResult {
             }
         }
         let overridden = declared.map(|m| m.has_body).unwrap_or(false);
+        // Trait-inheritance shadowing: when one provider is a descendant of
+        // every other (its parent closure contains them all), the child
+        // trait's declaration shadows the parents' — `trait C(A, B)` can
+        // resolve A/B's conflict by declaring its own default `m`.
+        if providers.len() > 1 {
+            let mut winner: Option<usize> = None;
+            for (i, c) in providers.iter().enumerate() {
+                if providers.iter().all(|o| {
+                    o.as_ref() == c.as_ref()
+                        || self.trait_parent_closure(c.as_ref())
+                            .iter()
+                            .any(|a| a.as_ref() == o.as_ref())
+                }) {
+                    winner = Some(i);
+                    break;
+                }
+            }
+            if let Some(i) = winner {
+                let t = providers.remove(i);
+                return MethodBinding::Bound { trait_name: t, overridden };
+            }
+        }
         match providers.len() {
             0 => MethodBinding::Unbound,
             1 => MethodBinding::Bound { trait_name: providers.remove(0), overridden },
@@ -1579,6 +1935,7 @@ macro_rules! define_builtin_types {
                     target_type_name: None,
                     target_type: None,
                     methods: methods.into_boxed_slice(),
+                    bases: Box::new([]),
                 };
                 sema_result.put_type_def(def, "");
             }
@@ -1730,53 +2087,58 @@ fn resolve_named_type_resolved(
     sema_result: &mut SemaResult,
     visiting: &mut FxHashSet<String>,
 ) -> TypeHandle {
-    // 1. Prefer type_args bindings (generic type parameters).
+    // 1. Prefer type_args bindings (generic type parameters — bare names).
     for &ta in type_args {
         if type_handle_name_matches(arena, ta, name) {
             return ta;
         }
     }
-    // 2. Built-in scalar/str/null/void.
+    // 2. Built-in scalar/str/null/void (bare names).
     if let Some(ty) = Type::from_type_name(name) {
         return arena.make(ty);
     }
+    // Module-scoped canonicalization: a bare AST name resolves against the
+    // module being populated/checked (own → imports → std → unique user);
+    // everything downstream (type_defs lookup, Adt identity, alias-chain
+    // traversal) uses the canonical key.
+    let canonical = sema_result.resolve_type_key(name);
     // Cyclic-alias detection: `name` already in `visiting` means a cycle;
     // stop recursing.
-    if visiting.contains(name) {
-        return arena.make_adt(name.into(), Box::new([]));
+    if visiting.contains(canonical.as_str()) {
+        return arena.make_adt(canonical.into(), Box::new([]));
     }
     // Recursion-depth limit: `visiting.len()` is the current depth; stop
     // recursing past the limit to prevent stack overflow.
     if visiting.len() >= MAX_TYPE_RECURSION_DEPTH {
-        return arena.make_adt(name.into(), Box::new([]));
+        return arena.make_adt(canonical.into(), Box::new([]));
     }
-    visiting.insert(name.to_string());
+    visiting.insert(canonical.clone());
     // 3. Consult type_defs to resolve the alias/newtype chain.
     //    Extract the needed info (owned) to release the immutable borrow,
     //    allowing subsequent `&mut` calls.
     let (target_ty, target_name): (Option<TypeHandle>, Option<String>) =
-        match sema_result.get_type_def(name) {
+        match sema_result.get_type_def(&canonical) {
             Some(td) => (
                 td.target_type,
-                td.target_type_name.as_deref().map(String::from),
+                td.target_type_name.as_deref().map(|n| sema_result.resolve_type_key(n)),
             ),
             None => (None, None),
         };
     if let Some(inner_ty) = target_ty {
         // alias/newtype has a target TypeHandle: return it directly.
-        visiting.remove(name);
+        visiting.remove(canonical.as_str());
         return inner_ty;
     }
     if let Some(ttn) = target_name {
         // target_type_name is known: recursively resolve to the final concrete
         // type.
         let result = resolve_named_type_resolved(arena, &ttn, type_args, sema_result, visiting);
-        visiting.remove(name);
+        visiting.remove(canonical.as_str());
         return result;
     }
     // 4. Other user-defined types → create a named Adt.
-    visiting.remove(name);
-    arena.make_adt(name.into(), Box::new([]))
+    visiting.remove(canonical.as_str());
+    arena.make_adt(canonical.into(), Box::new([]))
 }
 
 /// Resolve a `TypeNode` into a `TypeHandle` (resolved version, with alias/newtype
@@ -2029,8 +2391,8 @@ pub fn populate_sema_result_from_ast<'a>(
                 false
             }
         }
-        Decl::TypeDecl { name, type_params, def, methods, .. } => {
-            ast_type_decl_to_type_def(arena, sema_result, name, type_params, def, ast, decl.span, module_name);
+        Decl::TypeDecl { name, type_params, base_types, def, methods, .. } => {
+            ast_type_decl_to_type_def(arena, sema_result, name, type_params, base_types, def, ast, decl.span, module_name);
             // Register methods inside the type block into
             // TypeDefInfo.methods (indexed by method_idx).
             for method in methods.iter() {
@@ -2038,9 +2400,12 @@ pub fn populate_sema_result_from_ast<'a>(
             }
             true
         }
-        Decl::TraitDecl { name, methods, .. } => {
-            if ast_trait_decl_to_trait_def(arena, sema_result, name, methods, ast) {
-                sema_result.record_trait_def_owner(name, module_name);
+        Decl::TraitDecl { name, parents, methods, .. } => {
+            if ast_trait_decl_to_trait_def(arena, sema_result, name, parents, methods, ast, module_name) {
+                sema_result.record_trait_def_owner(
+                    &sema_result.resolve_trait_key_in(module_name, name),
+                    module_name,
+                );
                 true
             } else {
                 false
@@ -2059,14 +2424,421 @@ pub fn populate_module<'a>(
     arena: &mut TypeArena,
     sema_result: &mut SemaResult,
     module: &'a crate::ast::Ast::Module<'a>,
+    all_modules: &[&'a crate::ast::Ast::Module<'a>],
 ) -> bool {
-    let mut ok = true;
+    // Module context for name canonicalization during populate (ctor fields,
+    // alias targets, bases) — forward references within the module resolve
+    // through the pending own-type set. NESTED types (declared inside
+    // function bodies) are included: they register during check, and their
+    // canonical keys must be predictable from the start.
+    sema_result.current_module_name = module.name.to_string();
+    sema_result.pending_own_types = collect_module_type_names(module);
+    sema_result.pending_own_traits = collect_module_trait_names(module);
+    // Import bookkeeping EARLY: populate-time canonicalization (bases, alias
+    // targets, ctor fields) resolves against the module's imports, which the
+    // check-time process_import_decls pass would otherwise record too late.
     for decl in &module.declarations {
+        if let crate::ast::Ast::Decl::ImportDecl { module_path, .. } = &decl.node {
+            if !module_path.is_empty() {
+                record_module_import(sema_result, module.name, &module_path.join("."));
+            }
+        }
+    }
+    let mut ok = true;
+    // Same-module duplicate type declarations are a hard error. put_type_def
+    // treats same-module re-registration as an idempotent no-op (the populate
+    // pipeline runs twice per module), so genuine duplicates must be caught
+    // here, at the declaration level.
+    let mut declared_traits: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut declared_types: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for decl in &module.declarations {
+        if let crate::ast::Ast::Decl::TraitDecl { name, .. } = &decl.node {
+            if !declared_traits.insert(name) {
+                sema_result.add_error(SemaError::new_with_path(
+                    &format!(
+                        "duplicate trait definition: '{}'",
+                        canonical_type_key(module.name, name)
+                    ),
+                    module.name,
+                    decl.span.line,
+                    decl.span.column,
+                ));
+                ok = false;
+                continue; // skip only the duplicate declaration
+            }
+        }
+        if let crate::ast::Ast::Decl::TypeDecl { name, .. } = &decl.node {
+            if !declared_types.insert(name) {
+                sema_result.add_error(SemaError::new_with_path(
+                    &format!(
+                        "duplicate type definition: '{}'",
+                        canonical_type_key(module.name, name)
+                    ),
+                    module.name,
+                    decl.span.line,
+                    decl.span.column,
+                ));
+                ok = false;
+                continue;
+            }
+        }
         if !populate_sema_result_from_ast(arena, sema_result, decl, &module.arena, module.name) {
             ok = false;
         }
     }
+    expand_inherited_methods(module, all_modules, arena, sema_result);
     ok
+}
+
+/// Every trait name declared anywhere in the module — the trait twin of
+/// `collect_module_type_names` (feeds `pending_own_traits`).
+pub fn collect_module_trait_names(
+    module: &crate::ast::Ast::Module<'_>,
+) -> std::collections::HashSet<String> {
+    struct TraitDeclNames<'m> {
+        names: std::collections::HashSet<String>,
+        arena: &'m crate::ast::Ast::AstArena<'m>,
+    }
+    impl<'a, 'm> crate::ast::Ast::AstVisitor<'a> for TraitDeclNames<'m> {
+        fn visit_decl(&mut self, decl: &'a crate::ast::Ast::Spanned<crate::ast::Ast::Decl<'a>>) {
+            if let crate::ast::Ast::Decl::TraitDecl { name, .. } = &decl.node {
+                self.names.insert(name.to_string());
+            }
+        }
+        fn visit_stmt(&mut self, stmt: crate::ast::Ast::StmtId) {
+            if let crate::ast::Ast::Stmt::LocalDecl { decl } = &self.arena.stmt(stmt).node {
+                if let crate::ast::Ast::Decl::TraitDecl { name, .. } = decl.as_ref() {
+                    self.names.insert(name.to_string());
+                }
+            }
+        }
+    }
+    let mut v = TraitDeclNames {
+        names: std::collections::HashSet::new(),
+        arena: &module.arena,
+    };
+    crate::ast::Ast::walk_module(&mut v, &module.arena, module);
+    v.names
+}
+
+/// Record one import declaration into `module_imports`: the import spelling
+/// is mapped to the logical paths of the user modules it names (exact or
+/// tail-segment match — `import Counter` → `src.Counter`). std/builtin
+/// imports are skipped (std types live on the bare-key fallback). Called from
+/// BOTH populate_module (early — bases/alias targets resolve against imports
+/// during populate, before check-time processing) and process_import_decls
+/// (idempotent).
+pub fn record_module_import(
+    sema_result: &mut SemaResult,
+    module_name: &str,
+    full_path: &str,
+) {
+    if full_path.starts_with("std.") || full_path.starts_with("builtin.") {
+        return;
+    }
+    let matches: Vec<String> = sema_result
+        .user_module_paths
+        .iter()
+        .filter(|lp| lp.as_str() == full_path || lp.ends_with(&format!(".{}", full_path)))
+        .cloned()
+        .collect();
+    let entry = sema_result
+        .module_imports
+        .entry(module_name.to_string())
+        .or_default();
+    for m in matches {
+        if !entry.contains(&m) {
+            entry.push(m);
+        }
+    }
+}
+
+/// Every type name declared anywhere in the module — top-level `TypeDecl`s
+/// plus nested ones inside function/method bodies (`Stmt::LocalDecl`).
+/// Feeds `pending_own_types` so module-scoped canonical resolution can
+/// resolve forward references to not-yet-registered same-module types
+/// (e.g. `type L4 = L4(v: L3)` ahead of L3's declaration).
+pub fn collect_module_type_names(
+    module: &crate::ast::Ast::Module<'_>,
+) -> std::collections::HashSet<String> {
+    struct TypeDeclNames<'m> {
+        names: std::collections::HashSet<String>,
+        arena: &'m crate::ast::Ast::AstArena<'m>,
+    }
+    impl<'a, 'm> crate::ast::Ast::AstVisitor<'a> for TypeDeclNames<'m> {
+        fn visit_decl(&mut self, decl: &'a crate::ast::Ast::Spanned<crate::ast::Ast::Decl<'a>>) {
+            if let crate::ast::Ast::Decl::TypeDecl { name, .. } = &decl.node {
+                self.names.insert(name.to_string());
+            }
+        }
+        // The shared walker's LocalDecl arm does not invoke visit_decl for
+        // nested declarations (it only recurses into method bodies), so
+        // nested TypeDecls are intercepted here, at the statement level.
+        fn visit_stmt(&mut self, stmt: crate::ast::Ast::StmtId) {
+            if let crate::ast::Ast::Stmt::LocalDecl { decl } = &self.arena.stmt(stmt).node {
+                if let crate::ast::Ast::Decl::TypeDecl { name, .. } = decl.as_ref() {
+                    self.names.insert(name.to_string());
+                }
+            }
+        }
+    }
+    let mut v = TypeDeclNames {
+        names: std::collections::HashSet::new(),
+        arena: &module.arena,
+    };
+    crate::ast::Ast::walk_module(&mut v, &module.arena, module);
+    v.names
+}
+
+/// Inheritance method expansion: append the bases' methods to each child's
+/// method table AFTER the child's own methods (own methods shadow/override by
+/// name), recording an `InheritedMethodInstance` per appended entry for the
+/// IR stage. v1: base TypeDecls are located in the SAME module as the child
+/// (stdlib cross-module bases land with the Map-family reorganization, which
+/// will widen this lookup by `base_module`).
+/// Base-bound substitution pairs at the REPR level: base type-param names →
+/// the bound argument's TypeRepr (read in the child module's arena).
+fn inheritance_bound_repr_pairs<'a>(
+    b: &crate::ast::Ast::TraitBound<'a>,
+    base_params: &[Box<str>],
+    child_arena: &AstArena<'a>,
+) -> Vec<(Box<str>, TypeRepr)> {
+    b.type_args
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &arg)| {
+            let tp = base_params.get(i)?;
+            let repr = type_node_to_repr(&child_arena.ty(arg).node, child_arena);
+            Some((tp.clone(), repr))
+        })
+        .collect()
+}
+
+/// TypeRepr-tree substitution by name (the sig-level twin of
+/// `substitute_named_adts_free`).
+fn substitute_type_repr(ty: TypeRepr, pairs: &[(Box<str>, TypeRepr)]) -> TypeRepr {
+    if pairs.is_empty() {
+        return ty;
+    }
+    match ty {
+        TypeRepr::Named(n) => {
+            if let Some((_, r)) = pairs.iter().find(|(pn, _)| *pn == n) {
+                r.clone()
+            } else {
+                TypeRepr::Named(n)
+            }
+        }
+        TypeRepr::ThisType => TypeRepr::ThisType,
+        TypeRepr::Generic(g, args) => TypeRepr::Generic(
+            g,
+            args.iter().map(|a| substitute_type_repr(a.clone(), pairs)).collect(),
+        ),
+        TypeRepr::Nullable(i) => TypeRepr::Nullable(Box::new(substitute_type_repr(*i, pairs))),
+        TypeRepr::Ref(i) => TypeRepr::Ref(Box::new(substitute_type_repr(*i, pairs))),
+        TypeRepr::RawPtr(i) => TypeRepr::RawPtr(Box::new(substitute_type_repr(*i, pairs))),
+        TypeRepr::Function(ps, r) => TypeRepr::Function(
+            ps.iter().map(|a| substitute_type_repr(a.clone(), pairs)).collect(),
+            Box::new(substitute_type_repr(*r, pairs)),
+        ),
+        TypeRepr::Array(e, sz) => TypeRepr::Array(Box::new(substitute_type_repr(*e, pairs)), sz),
+    }
+}
+
+fn expand_inherited_methods<'a>(
+    module: &'a crate::ast::Ast::Module<'a>,
+    all_modules: &[&'a crate::ast::Ast::Module<'a>],
+    arena: &mut TypeArena,
+    sema_result: &mut SemaResult,
+) {
+    for decl in &module.declarations {
+        let crate::ast::Ast::Decl::TypeDecl { name, base_types, .. } = &decl.node
+        else {
+            continue;
+        };
+        if base_types.is_empty() {
+            continue;
+        }
+        // Idempotence: populate runs twice per module (pipeline + the
+        // check-phase re-populate); a second expansion would append the
+        // inherited methods AGAIN — duplicated method-table entries and
+        // InheritedMethodInstances compile the body twice into overlapping
+        // subgraph ranges (observed: while-loops in inherited methods hang).
+        if sema_result
+            .inherited_method_instances
+            .iter()
+            .any(|i| i.type_name.as_ref() == sema_result.resolve_type_key(name))
+        {
+            continue;
+        }
+        let canonical_name: Box<str> = sema_result.resolve_type_key(name).into();
+        let Some(&child_idx) = sema_result.type_def_index.get(canonical_name.as_ref()) else {
+            continue;
+        };
+        let child_type_id = crate::types::dynamic_type_id(child_idx);
+        // Name → source already available on the child. `None` = the child's
+        // OWN method (shadowing = the override, always wins silently);
+        // `Some(base)` = inherited from that base — a SECOND base offering the
+        // same name is an ambiguity error (must override to disambiguate).
+        let own_method_count: usize = module
+            .declarations
+            .iter()
+            .find_map(|d| match &d.node {
+                crate::ast::Ast::Decl::TypeDecl { name: n, methods, .. } if *n == *name => {
+                    Some(methods.iter().filter(|m| m.body.is_some()).count())
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
+        let mut present: Vec<(Box<str>, Option<Box<str>>)> = sema_result
+            .get_type_def(canonical_name.as_ref())
+            .map(|d| {
+                d.methods
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        (
+                            m.name.clone(),
+                            if i < own_method_count { None } else { Some(Box::from("__pending__")) },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for b in base_types {
+            // Locate the base's method AST: same module first, then any
+            // module (cross-module bases, e.g. std collections children).
+            let base_lookup = |mods: &[&'a crate::ast::Ast::Module<'a>]| -> Option<(&'a [crate::ast::Ast::MethodDecl<'a>], &'a crate::ast::Ast::Module<'a>)> {
+                mods.iter().find_map(|m| {
+                    m.declarations.iter().find_map(|d| match &d.node {
+                        crate::ast::Ast::Decl::TypeDecl { name: bn, methods, .. }
+                            if *bn == b.trait_name =>
+                        {
+                            Some((methods.as_slice(), *m))
+                        }
+                        _ => None,
+                    })
+                })
+            };
+            let Some((base_methods, base_mod)) = base_lookup(&[module])
+                .or_else(|| base_lookup(all_modules))
+            else {
+                continue;
+            };
+            let base_ast_method_count = base_methods.len();
+            let bname: Box<str> = sema_result.resolve_type_key(b.trait_name).into();
+            // Iterate the base's METHOD TABLE (own AST methods first — table
+            // index == AST index for the own part — then its inherited
+            // entries), so chains (base-of-base methods) come along.
+            let base_table_len = sema_result
+                .get_type_def(bname.as_ref())
+                .map(|d| d.methods.len())
+                .unwrap_or(0);
+            for table_idx in 0..base_table_len {
+                let m_name: Box<str> = sema_result
+                    .get_type_def(bname.as_ref())
+                    .and_then(|d| d.methods.get(table_idx).map(|m| m.name.clone()))
+                    .unwrap_or_default();
+                if m_name.is_empty() {
+                    continue;
+                }
+                // Body source: own AST method (table_idx < AST count and it
+                // has a body), or the ORIGINAL declaring type via the base's
+                // own instance record (inheritance chains).
+                let mut src: Option<(Box<str>, Box<str>, u16)> = None;
+                if table_idx < base_ast_method_count {
+                    if base_methods[table_idx].body.is_some() {
+                        src = Some((base_mod.name.into(), bname.clone(), table_idx as u16));
+                    }
+                } else if let Some(inst) = sema_result
+                    .inherited_method_instances
+                    .iter()
+                    .find(|i| i.type_name.as_ref() == bname.as_ref() && i.method_idx as usize == table_idx)
+                {
+                    src = Some((inst.base_module.clone(), inst.base_type_name.clone(), inst.base_method_idx));
+                }
+                let Some((src_module, src_type, src_idx)) = src else {
+                    continue; // abstract/body-less or unresolvable — nothing to inherit
+                };
+                if let Some((_, psrc)) = present.iter().find(|(n, _)| n.as_ref() == m_name.as_ref()) {
+                    if let Some(prev) = psrc {
+                        if prev.as_ref() != "__pending__" && prev.as_ref() != bname.as_ref() {
+                            sema_result.add_error(SemaError::new_with_path(
+                                &format!(
+                                    "ambiguous inherited method '{}': offered by bases '{}' and '{}' — override it in '{}' to disambiguate",
+                                    m_name, prev, bname, name
+                                ), module.name, decl.span.line, decl.span.column));
+                        }
+                    }
+                    continue; // own override (silent) / same base (dedup) / reported ambiguity
+                }
+                present.push((m_name.clone(), Some(bname.clone())));
+                // Locate the declaring type's AST method for the sig + the
+                // body (the ORIGINAL type, which may be the base's base in
+                // another module). `src_type` is a canonical key — match the
+                // AST declaration by bare name (tail segment).
+                let find_decl = |mods: &[&'a crate::ast::Ast::Module<'a>]| -> Option<(&'a crate::ast::Ast::MethodDecl<'a>, &'a crate::ast::Ast::Module<'a>)> {
+                    mods.iter().find_map(|m| {
+                        m.declarations.iter().find_map(|d| match &d.node {
+                            crate::ast::Ast::Decl::TypeDecl { name: bn, methods, .. }
+                                if src_type.as_ref().rsplit('.').next() == Some(bn.as_ref()) =>
+                            {
+                                methods.get(src_idx as usize).map(|bm| (bm, *m))
+                            }
+                            _ => None,
+                        })
+                    })
+                };
+                let Some((bm, decl_mod)) = find_decl(&[module])
+                    .or_else(|| find_decl(all_modules))
+                else {
+                    continue;
+                };
+                // Append the MethodSigInfo (built from the declaring type's
+                // AST, under the child's name — param/return placeholders ride
+                // by name like the base's own registration).
+                ast_method_to_func_sig(arena, sema_result, name, bm, &decl_mod.arena);
+                let method_idx = sema_result
+                    .get_type_def(*name)
+                    .map(|d| d.methods.len() as u16 - 1)
+                    .unwrap_or(0);
+                // Pinned-arg substitution on the appended sig's REPRs: a
+                // child bound like IntMap<V>(Map<i64, V>) must see the base's
+                // K-param references as i64 (the child has no K of its own).
+                {
+                    let base_sig_params: Vec<Box<str>> = sema_result
+                        .get_type_def(bname.as_ref())
+                        .map(|d| d.type_params.to_vec())
+                        .unwrap_or_default();
+                    let pairs = inheritance_bound_repr_pairs(b, &base_sig_params, &module.arena);
+                    if !pairs.is_empty() {
+                        if let Some(&child_idx2) = sema_result.type_def_index.get(canonical_name.as_ref()) {
+                            if let Some(d) = sema_result.type_defs.get_mut(&child_idx2) {
+                                if let Some(sig) = d.methods.last_mut() {
+                                    let pt: Vec<TypeRepr> = sig
+                                        .param_type_reprs
+                                        .to_vec()
+                                        .into_iter()
+                                        .map(|t| substitute_type_repr(t, &pairs))
+                                        .collect();
+                                    sig.param_type_reprs = pt.into_boxed_slice();
+                                    sig.return_type_repr =
+                                        sig.return_type_repr.take().map(|t| substitute_type_repr(t, &pairs));
+                                }
+                            }
+                        }
+                    }
+                }
+                sema_result.inherited_method_instances.push(InheritedMethodInstance {
+                    type_id: child_type_id,
+                    type_name: canonical_name.clone().into(),
+                    method_idx,
+                    base_module: decl_mod.name.into(),
+                    base_type_name: src_type,
+                    base_method_idx: src_idx,
+                });
+            }
+        }
+    }
 }
 
 // ── Private conversion functions ──
@@ -2085,6 +2857,93 @@ pub fn module_logical_path(name: &str) -> Option<String> {
         return None;
     }
     Some(path.replace('/', "."))
+}
+
+/// Canonical registration key for a type declared in `module_name`.
+///
+/// Module-scoped type identity: user-module types are registered under a
+/// module-qualified name (`src.Main.List` — logical path + bare name), so
+/// same-named types in different modules coexist in `type_def_index` and,
+/// downstream, in the runtime `type_name` strings that equality, match,
+/// dispatch and reflect all compare. std/builtin modules (and synthetic
+/// registrations with an empty module) keep the bare name — one std tree,
+/// unique by construction, and every existing runtime string, test and
+/// .fndo artifact for std types stays unchanged.
+pub fn canonical_type_key(module_name: &str, bare: &str) -> String {
+    let is_std = module_name.is_empty()
+        || module_name.starts_with("std/")
+        || module_name.starts_with("builtin/");
+    if is_std {
+        return bare.to_string();
+    }
+    match module_logical_path(module_name) {
+        Some(mp) => {
+            // Normalize the prefix to the package-relative form: the entry
+            // module's loader key may be an absolute OS path
+            // (`F:/…/pkg/src/Main.frond`); the type identity anchors at the
+            // last `src` path segment → `src.Main`.
+            let prefix = match mp.rfind(".src.") {
+                Some(pos) => mp[pos + 1..].to_string(),
+                None => mp,
+            };
+            format!("{}.{}", prefix, bare)
+        }
+        None => bare.to_string(),
+    }
+}
+
+/// Strip the module prefix from a canonical type name for DISPLAY purposes
+/// (`src.Main.Pair<src.Main.Point, i32>` → `Pair<Point, i32>`). Names without
+/// a module-qualified head (std/builtin bare names, builtin composites like
+/// `u8[]`) pass through unchanged. Generic arguments are stripped
+/// recursively; the head prefix is the last '.' outside any `<...>` group.
+pub fn display_type_name(name: &str) -> String {
+    // Split into head (before the first '<') and the arg list.
+    let (head, args) = match name.find('<') {
+        Some(open) => (&name[..open], &name[open..]),
+        None => (name, ""),
+    };
+    let bare_head = match head.rfind('.') {
+        Some(p) => &head[p + 1..],
+        None => head,
+    };
+    if args.is_empty() {
+        return bare_head.to_string();
+    }
+    let mut out = String::with_capacity(name.len());
+    out.push_str(bare_head);
+    strip_args_display(args, &mut out);
+    out
+}
+
+/// `args` starts at the '<' of an argument list; appends the display-stripped
+/// arguments (recursively) to `out`, preserving the `<a, b>` shape.
+fn strip_args_display(args: &str, out: &mut String) {
+    let inner = &args[1..args.len().saturating_sub(1)];
+    out.push('<');
+    let mut depth: usize = 0;
+    let mut seg_start = 0;
+    let mut first = true;
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                if !first {
+                    out.push_str(", ");
+                }
+                out.push_str(&display_type_name(inner[seg_start..i].trim()));
+                first = false;
+                seg_start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if !first {
+        out.push_str(", ");
+    }
+    out.push_str(&display_type_name(inner[seg_start..].trim()));
+    out.push('>');
 }
 
 /// Compute a module-aware expression key: combines a hash of the module name with
@@ -2171,7 +3030,12 @@ fn build_method_sig_info<'a>(
         return_type_repr,
         intrinsic: None,
         has_body: method.body.is_some(),
-        delegate_trait: method.delegate.as_ref().map(|d| d.trait_name.into()),
+        // Canonical trait key (module-scoped) — consumers index the trait
+        // tables and trait-default subgraphs by the registered name.
+        delegate_trait: method
+            .delegate
+            .as_ref()
+            .map(|d| sema_result.resolve_trait_key(d.trait_name).into_boxed_str()),
         // Trait implementations travel with the trait: override and delegate
         // methods are public even without an explicit `pub`, mirroring the
         // "trait methods are public with the trait" rule.
@@ -2206,7 +3070,9 @@ fn ast_method_to_func_sig<'a>(
     ast: &AstArena<'a>,
 ) -> bool {
     let sig = build_method_sig_info(arena, sema_result, method, ast);
-    if let Some(&type_idx) = sema_result.type_def_index.get(type_name) {
+    // Module-scoped: the AST type name resolves to its canonical key.
+    let canonical = sema_result.resolve_type_key(type_name);
+    if let Some(&type_idx) = sema_result.type_def_index.get(canonical.as_str()) {
         if let Some(type_def) = sema_result.type_defs.get_mut(&type_idx) {
             let mut methods_vec: Vec<MethodSigInfo> = type_def.methods.to_vec();
             methods_vec.push(sig);
@@ -2275,10 +3141,44 @@ pub(crate) fn ast_trait_decl_to_trait_def<'a>(
     arena: &mut TypeArena,
     sema_result: &mut SemaResult,
     name: &'a str,
+    parents: &[crate::ast::Ast::TraitBound<'a>],
     methods: &[crate::ast::Ast::MethodDecl<'a>],
     ast: &AstArena<'a>,
+    def_module: &str,
 ) -> bool {
-    let name: Box<str> = name.into();
+    // Canonical registration name (module-qualified for user modules).
+    let name: Box<str> = canonical_type_key(def_module, name).into();
+    // Parent validation: must be known traits; a parent naming THIS trait
+    // (directly or via a cycle of already-registered links) is rejected.
+    let mut parent_names: Vec<Box<str>> = Vec::new();
+    for p in parents {
+        let pn: Box<str> = sema_result.resolve_trait_key_in(def_module, p.trait_name).into();
+        if pn.as_ref() == name.as_ref() {
+            sema_result.add_error(SemaError::new(
+                &format!("trait '{name}' cannot inherit from itself"),
+                0, 1,
+            ));
+            continue;
+        }
+        if parent_names.iter().any(|x| x.as_ref() == pn.as_ref()) {
+            continue; // duplicate parent — dedup silently
+        }
+        if sema_result.get_trait_def(pn.as_ref()).is_none() {
+            sema_result.add_error(SemaError::new(
+                &format!("trait '{name}' parent '{pn}' is not a known trait (parents must be declared before the child)"),
+                0, 1,
+            ));
+            continue;
+        }
+        if sema_result.trait_parent_closure(pn.as_ref()).iter().any(|a| a.as_ref() == name.as_ref()) {
+            sema_result.add_error(SemaError::new(
+                &format!("cyclic trait inheritance: '{pn}' already inherits from '{name}'"),
+                0, 1,
+            ));
+            continue;
+        }
+        parent_names.push(pn);
+    }
 
     let methods: Vec<TraitMethodSig> = methods
         .iter()
@@ -2299,6 +3199,7 @@ pub(crate) fn ast_trait_decl_to_trait_def<'a>(
 
     let trait_def = TraitDefInfo {
         name,
+        parents: parent_names.into_boxed_slice(),
         methods: methods.into_boxed_slice(),
     };
 
@@ -2312,24 +3213,172 @@ pub(crate) fn ast_type_decl_to_type_def<'a>(
     sema_result: &mut SemaResult,
     name: &'a str,
     type_params: &[crate::ast::Ast::TypeParam<'a>],
+    base_types: &[crate::ast::Ast::TraitBound<'a>],
     def: &AstTypeDef<'a>,
     ast: &AstArena<'a>,
     def_span: Span,
     def_module: &str,
 ) -> bool {
-    let name: Box<str> = name.into();
+    // Canonical registration name: user-module types are module-qualified
+    // (`src.Main.List`) so same-named types coexist across modules; std and
+    // builtin types keep the bare name (see `canonical_type_key`).
+    let name: Box<str> = canonical_type_key(def_module, name).into();
     let type_params: Box<[Box<str>]> = type_params.iter().map(|tp| tp.name.into()).collect();
+
+    // ── Inheritance: validate bases + merge their fields ahead of the own
+    // fields in the Record branch. A base must be a record or single-ctor
+    // ADT (the `type X = X(f: T, ...)` shape the stdlib containers use —
+    // those register as Adt kind) declared earlier (std loads before user
+    // modules; same-module bases must be declared before the child). Diamond
+    // (a shared transitive ancestor) and duplicate field names across
+    // bases+own are hard errors — field access is by name and has no
+    // qualification syntax. Idempotence: a type already registered (this
+    // decl re-processed by a later pass) skips the merge entirely.
+    let mut base_names: Vec<Box<str>> = Vec::new();
+    // (field name, substituted type, is_pub, repr) collected from bases.
+    let mut base_fields: Vec<(Box<str>, TypeHandle, bool, TypeRepr)> = Vec::new();
+    // Full substituted ctor sets per base (multi-ctor ADT inheritance).
+    let mut base_ctor_sets: Vec<Vec<CtorDefInfo>> = Vec::new();
+    let already_registered = sema_result.type_def_index.contains_key(name.as_ref());
+    for b in base_types.iter().take(if already_registered { 0 } else { usize::MAX }) {
+        // Base names resolve module-scoped (own module → std → unique user),
+        // so an inherited base with a std-colliding name still binds to the
+        // local type when the child declares it locally.
+        let bname: Box<str> = sema_result.resolve_type_key_in(def_module, b.trait_name).into();
+        // Snapshot the base's data (owned) so validation and substitution
+        // below can freely re-borrow sema_result.
+        let base_snapshot = sema_result.get_type_def(bname.as_ref()).map(|d| {
+            (
+                d.kind,
+                d.constructors.len(),
+                d.type_params.to_vec(),
+                d.bases.to_vec(),
+                d.constructors.to_vec(),
+            )
+        });
+        let (base_kind, base_ctor_count, base_params, _base_own_bases, base_all_ctors) = match base_snapshot {
+            Some(x) => x,
+            None => {
+                sema_result.add_error(SemaError::new_with_path(
+                    &format!("inheritance base '{bname}' is not a known type (bases must be declared before the child)"), def_module, def_span.line, def_span.column));
+                continue;
+            }
+        };
+        let base_is_admissible =
+            matches!(base_kind, TypeDefKind::Record)
+                || matches!(base_kind, TypeDefKind::Adt);
+        if !base_is_admissible {
+            sema_result.add_error(SemaError::new_with_path(
+                &format!("inheritance base '{bname}' must be a record or ADT (newtype/alias bases are rejected)"), def_module, def_span.line, def_span.column));
+            continue;
+        }
+        // Diamond check: the new base's ancestor chain must not contain an
+        // already-accepted base, and vice versa.
+        let mut chain: Vec<String> = Vec::new();
+        collect_ancestor_names(sema_result, bname.as_ref(), &mut chain);
+        let mut earlier_chain: Vec<String> = Vec::new();
+        for other in &base_names {
+            collect_ancestor_names(sema_result, other.as_ref(), &mut earlier_chain);
+        }
+        for other in &base_names {
+            if chain.iter().any(|a| a == other.as_ref()) {
+                sema_result.add_error(SemaError::new_with_path(
+                    &format!("diamond inheritance forbidden: base '{other}' is a transitive ancestor of base '{bname}'"), def_module, def_span.line, def_span.column));
+            }
+        }
+        if earlier_chain.iter().any(|a| a == bname.as_ref()) {
+            sema_result.add_error(SemaError::new_with_path(
+                &format!("diamond inheritance forbidden: base '{bname}' is a transitive ancestor of an earlier base"), def_module, def_span.line, def_span.column));
+        }
+        base_names.push(bname.clone());
+        // Substitution: base's declared type params → the bound's arg handles
+        // (name-keyed placeholder Adts, the alias convention).
+        let arg_handles: Vec<TypeHandle> = b
+            .type_args
+            .iter()
+            .map(|&arg| concretize_type(arena, arg, &[], ast, sema_result))
+            .collect();
+        let mut pairs: Vec<(Box<str>, TypeHandle)> = Vec::new();
+        let mut repr_pairs: Vec<(Box<str>, TypeRepr)> = Vec::new();
+        for (i, tp) in base_params.iter().enumerate() {
+            if let Some(&h) = arg_handles.get(i) {
+                pairs.push((tp.clone(), h));
+                if let Some(&arg_node) = b.type_args.get(i) {
+                    repr_pairs.push((
+                        tp.clone(),
+                        type_node_to_repr(&ast.ty(arg_node).node, ast),
+                    ));
+                }
+            }
+        }
+        // Substitute the base's FULL ctor set (multi-ctor ADT bases use it
+        // for ctor-set inheritance; single-ctor bases only feed base_fields).
+        let mut sub_ctors: Vec<CtorDefInfo> = Vec::with_capacity(base_all_ctors.len());
+        for bc in &base_all_ctors {
+            let mut c = bc.clone();
+            c.type_name = name.as_ref().into();
+            let ft: Vec<TypeHandle> = c
+                .field_types
+                .to_vec()
+                .into_iter()
+                .map(|t| substitute_named_adts_free(arena, t, &pairs))
+                .collect();
+            c.field_types = ft.into_boxed_slice();
+            let fr: Vec<TypeRepr> = c
+                .field_type_reprs
+                .to_vec()
+                .into_iter()
+                .map(|r| substitute_type_repr(r, &repr_pairs))
+                .collect();
+            c.field_type_reprs = fr.into_boxed_slice();
+            sub_ctors.push(c);
+        }
+        base_ctor_sets.push(sub_ctors);
+        let base_ctor = &base_all_ctors[0];
+        for i in 0..base_ctor.field_names.len() {
+            let fname = base_ctor.field_names[i].clone().unwrap_or_else(|| "_".into());
+            base_fields.push((
+                fname,
+                substitute_named_adts_free(arena, base_ctor.field_types[i], &pairs),
+                base_ctor.field_is_pub[i],
+                substitute_type_repr(base_ctor.field_type_reprs[i].clone(), &repr_pairs),
+            ));
+        }
+    }
 
     let (kind, constructors, target_type_name, target_type) = match def {
         AstTypeDef::Adt { constructors: ctor_defs } => {
-            let ctors: Vec<CtorDefInfo> = ctor_defs
+            if !base_names.is_empty() && ctor_defs.len() > 1 {
+                sema_result.add_error(SemaError::new_with_path(
+                    "inheritance on a multi-constructor ADT is not supported (ADT children may not add constructors)", def_module, def_span.line, def_span.column));
+            }
+            let mut ctors: Vec<CtorDefInfo> = ctor_defs
                 .iter()
                 .map(|c| constructor_def_to_ctor_info(arena, c, name.as_ref(), ast, sema_result, def_span, def_module))
                 .collect();
+            let multi_ctor_base = base_ctor_sets.iter().any(|cs| cs.len() > 1);
+            if multi_ctor_base {
+                // ADT child of a multi-ctor base: inherit the ctor set
+                // VERBATIM (children may not add constructors — an open sum
+                // would break match exhaustiveness). Requires the zero-field
+                // child form `= X()`.
+                if ctors.len() != 1 || !ctors[0].field_names.is_empty() || ctor_defs[0].fields.len() != 0 {
+                    sema_result.add_error(SemaError::new_with_path(
+                        "a multi-constructor ADT base requires the zero-field child form '= Child() { ... }' (no own fields, no added constructors)", def_module, def_span.line, def_span.column));
+                }
+                ctors = base_ctor_sets.concat();
+            } else if ctors.len() == 1 && !base_fields.is_empty() {
+                // Single-ctor ADT children (= X(...) / = X()) merge base fields
+                // exactly like records — this is the stdlib container shape.
+                merge_base_fields_into_ctor(&mut ctors[0], base_fields, sema_result, def_span, def_module);
+            }
             (TypeDefKind::Adt, ctors, None, None)
         }
         AstTypeDef::Record { fields } => {
-            let ctor = record_fields_to_ctor_info(arena, fields, name.as_ref(), ast, sema_result, def_span, def_module);
+            let mut ctor = record_fields_to_ctor_info(arena, fields, name.as_ref(), ast, sema_result, def_span, def_module);
+            if !base_fields.is_empty() {
+                merge_base_fields_into_ctor(&mut ctor, base_fields, sema_result, def_span, def_module);
+            }
             (TypeDefKind::Record, vec![ctor], None, None)
         }
         AstTypeDef::Alias { target } => {
@@ -2343,7 +3392,8 @@ pub(crate) fn ast_type_decl_to_type_def<'a>(
                 .map(|tp| arena.make_adt(tp.clone(), Box::new([])))
                 .collect();
             let target_ty = concretize_type(arena, *target, &placeholder_args, ast, sema_result);
-            let target_name = type_name_from_node(Some(*target), ast);
+            let target_name = type_name_from_node(Some(*target), ast)
+                .map(|n| sema_result.resolve_type_key_in(def_module, n));
             (
                 TypeDefKind::Alias,
                 Vec::new(),
@@ -2353,7 +3403,8 @@ pub(crate) fn ast_type_decl_to_type_def<'a>(
         }
         AstTypeDef::Newtype { name: nt_name, inner } => {
             let target_ty = concretize_type(arena, *inner, &[], ast, sema_result);
-            let target_name = type_name_from_node(Some(*inner), ast);
+            let target_name = type_name_from_node(Some(*inner), ast)
+                .map(|n| sema_result.resolve_type_key_in(def_module, n));
             let target_repr = type_node_to_repr(&ast.ty(*inner).node, ast);
             let ctor = CtorDefInfo {
                 name: (*nt_name).into(),
@@ -2386,12 +3437,223 @@ pub(crate) fn ast_type_decl_to_type_def<'a>(
         target_type_name,
         target_type,
         methods: Box::new([]),
+        bases: base_names.into_boxed_slice(),
     };
 
     sema_result.put_type_def(type_def, def_module)
 }
 
 // ── Helper functions ──
+
+/// Prepend the (already substituted) base fields ahead of the child ctor's
+/// own fields, rejecting duplicate names across bases+own.
+fn merge_base_fields_into_ctor(
+    ctor: &mut CtorDefInfo,
+    base_fields: Vec<(Box<str>, TypeHandle, bool, TypeRepr)>,
+    sema_result: &mut SemaResult,
+    def_span: Span,
+    def_module: &str,
+) {
+    let mut seen: std::collections::HashSet<Box<str>> = std::collections::HashSet::new();
+    for (fname, _, _, _) in &base_fields {
+        if !seen.insert(fname.clone()) {
+            sema_result.add_error(SemaError::new_with_path(
+                &format!("inherited field name collision: '{fname}' appears in more than one base"),
+                def_module,
+                def_span.line,
+                def_span.column,
+            ));
+        }
+    }
+    for n in ctor.field_names.iter().flatten() {
+        if !seen.insert(n.clone()) {
+            sema_result.add_error(SemaError::new_with_path(
+                &format!("field '{n}' collides with an inherited base field"),
+                def_module,
+                def_span.line,
+                def_span.column,
+            ));
+        }
+    }
+    let mut names: Vec<Option<Box<str>>> = Vec::with_capacity(base_fields.len() + ctor.field_names.len());
+    let mut types: Vec<TypeHandle> = Vec::with_capacity(base_fields.len() + ctor.field_types.len());
+    let mut pubs: Vec<bool> = Vec::with_capacity(base_fields.len() + ctor.field_is_pub.len());
+    let mut reprs: Vec<TypeRepr> = Vec::with_capacity(base_fields.len() + ctor.field_type_reprs.len());
+    for (fname, fty, fpub, frepr) in base_fields {
+        // Keep ONE copy per name (collisions were already reported above;
+        // duplicating them here would trip the ctor duplicate-field check).
+        if names.iter().flatten().any(|n| n.as_ref() == fname.as_ref()) {
+            continue;
+        }
+        names.push(Some(fname));
+        types.push(fty);
+        pubs.push(fpub);
+        reprs.push(frepr);
+    }
+    names.extend(ctor.field_names.iter().cloned());
+    types.extend(ctor.field_types.iter().copied());
+    pubs.extend(ctor.field_is_pub.iter().copied());
+    reprs.extend(ctor.field_type_reprs.iter().cloned());
+    ctor.field_names = names.into_boxed_slice();
+    ctor.field_types = types.into_boxed_slice();
+    ctor.field_is_pub = pubs.into_boxed_slice();
+    ctor.field_type_reprs = reprs.into_boxed_slice();
+}
+
+/// Recursively collect the transitive base-type names of `type_name`
+/// (direct + indirect; the type itself excluded). Cycle-safe via the
+/// seen-dedup on `out`.
+fn collect_ancestor_names(sema_result: &SemaResult, type_name: &str, out: &mut Vec<String>) {
+    let Some(def) = sema_result.get_type_def(type_name) else { return };
+    for b in def.bases.iter() {
+        if out.iter().any(|x| x == b.as_ref()) {
+            continue;
+        }
+        out.push(b.as_ref().to_string());
+        collect_ancestor_names(sema_result, b.as_ref(), out);
+    }
+}
+
+/// Name-keyed structural substitution over a TypeHandle — registration-phase
+/// twin of `InferContext::substitute_named_adts` (arm-for-arm), keyed on
+/// placeholder `Adt(name)` nodes so a base's generic fields unfold against
+/// the inheritance bound's arguments (`type IntMap(Map<i64, V>)`).
+pub(crate) fn substitute_named_adts_free(
+    arena: &mut TypeArena,
+    ty: TypeHandle,
+    pairs: &[(Box<str>, TypeHandle)],
+) -> TypeHandle {
+    if pairs.is_empty() {
+        return ty;
+    }
+    substitute_named_adts_free_inner(arena, ty, pairs)
+}
+
+fn substitute_named_adts_free_inner(
+    arena: &mut TypeArena,
+    ty: TypeHandle,
+    pairs: &[(Box<str>, TypeHandle)],
+) -> TypeHandle {
+    use crate::types::Type;
+    let resolved = arena.resolve(ty);
+    match arena.get(resolved) {
+        Type::Adt(_) => {
+            let (name, type_args) = arena.adt_parts(resolved);
+            if let Some((_, h)) = pairs.iter().find(|(n, _)| n.as_ref() == name) {
+                return *h;
+            }
+            let name: Box<str> = name.into();
+            let type_args: Vec<TypeHandle> = type_args.to_vec();
+            let new_args: Vec<TypeHandle> = type_args
+                .iter()
+                .map(|&a| substitute_named_adts_free_inner(arena, a, pairs))
+                .collect();
+            arena.make_adt(name, new_args.into_boxed_slice())
+        }
+        Type::Fn(_) => {
+            let (params, return_type) = arena.fn_parts(resolved);
+            let params: Vec<TypeHandle> = params.to_vec();
+            let new_params: Vec<TypeHandle> = params
+                .iter()
+                .map(|&p| substitute_named_adts_free_inner(arena, p, pairs))
+                .collect();
+            let new_ret = substitute_named_adts_free_inner(arena, return_type, pairs);
+            arena.make_fn(new_params.into_boxed_slice(), new_ret)
+        }
+        Type::Record(_) => {
+            let fields = arena.record_fields(resolved).to_vec();
+            let name = arena.record_name(resolved).map(|s| s.into());
+            let new_fields: Vec<crate::types::FieldType> = fields
+                .iter()
+                .map(|f| crate::types::FieldType {
+                    name: f.name.clone(),
+                    ty: substitute_named_adts_free_inner(arena, f.ty, pairs),
+                })
+                .collect();
+            arena.make_record(new_fields.into_boxed_slice(), name)
+        }
+        Type::Nullable(_) => {
+            let inner = arena.nullable_inner(resolved);
+            let new_inner = substitute_named_adts_free_inner(arena, inner, pairs);
+            arena.make_nullable(new_inner)
+        }
+        Type::Generic(_) => {
+            let (name, args) = arena.generic_parts(resolved);
+            let name: Box<str> = name.into();
+            let args: Vec<TypeHandle> = args.to_vec();
+            let new_args: Vec<TypeHandle> = args
+                .iter()
+                .map(|&a| substitute_named_adts_free_inner(arena, a, pairs))
+                .collect();
+            arena.make_generic(name, new_args.into_boxed_slice())
+        }
+        Type::Array(_) => {
+            let (element_type, size) = arena.array_parts(resolved);
+            let new_elem = substitute_named_adts_free_inner(arena, element_type, pairs);
+            arena.make_array(new_elem, size)
+        }
+        Type::Throw(_) => {
+            let (value_type, error_type) = arena.throw_parts(resolved);
+            let new_v = substitute_named_adts_free_inner(arena, value_type, pairs);
+            let new_e = substitute_named_adts_free_inner(arena, error_type, pairs);
+            arena.make_throw(new_v, new_e)
+        }
+        Type::Trait(_) => {
+            let (name, type_args) = arena.trait_parts(resolved);
+            let name: Box<str> = name.into();
+            let type_args: Vec<TypeHandle> = type_args.to_vec();
+            let new_args: Vec<TypeHandle> = type_args
+                .iter()
+                .map(|&a| substitute_named_adts_free_inner(arena, a, pairs))
+                .collect();
+            arena.make_trait(name, new_args.into_boxed_slice())
+        }
+        Type::Ref(_) => {
+            let (inner, is_raw) = arena.ref_parts(resolved);
+            let new_inner = substitute_named_adts_free_inner(arena, inner, pairs);
+            arena.make_ref(new_inner, is_raw)
+        }
+        Type::Channel(_) => {
+            let elem = arena.channel_elem(resolved);
+            let new_elem = substitute_named_adts_free_inner(arena, elem, pairs);
+            arena.make_channel(new_elem)
+        }
+        Type::Async(_) => {
+            let value = arena.async_value(resolved);
+            let new_value = substitute_named_adts_free_inner(arena, value, pairs);
+            arena.make_async(new_value)
+        }
+        Type::Lazy(_) => {
+            let value = arena.lazy_value(resolved);
+            let new_value = substitute_named_adts_free_inner(arena, value, pairs);
+            arena.make_lazy(new_value)
+        }
+        Type::Atomic(_) => {
+            let elem = arena.atomic_elem(resolved);
+            let new_elem = substitute_named_adts_free_inner(arena, elem, pairs);
+            arena.make_atomic(new_elem)
+        }
+        Type::Sender(_) => {
+            let elem = arena.sender_elem(resolved);
+            let new_elem = substitute_named_adts_free_inner(arena, elem, pairs);
+            arena.make_sender(new_elem)
+        }
+        Type::Receiver(_) => {
+            let elem = arena.receiver_elem(resolved);
+            let new_elem = substitute_named_adts_free_inner(arena, elem, pairs);
+            arena.make_receiver(new_elem)
+        }
+        Type::ForeignFn(_) => {
+            let ret = arena.foreign_fn_ret(resolved);
+            let new_ret = substitute_named_adts_free_inner(arena, ret, pairs);
+            arena.make_foreign_fn(new_ret)
+        }
+        // Scalars, Never, Unknown, Void, Null, TraitObject, ModuleRef have no
+        // sub-nodes → as-is.
+        _ => resolved,
+    }
+}
+
 
 /// Resolve a parameter type: returns (TypeHandle, is_ref, type_name, type_repr).
 fn resolve_param_type<'a>(

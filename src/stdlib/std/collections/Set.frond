@@ -1,0 +1,131 @@
+// Set.frond — generic hash set base (part of std.collections)
+//
+// The shared separate-chaining set implementation (mirrors Map's table
+// shape): bucket arrays hold small element arrays, grow ×2 at load factor 2,
+// rebuild buckets on remove. Children (HashSet<K>, IntSet via Set<i64>)
+// inherit everything and only override `hash_of` — the same template-method
+// seam as Map. add() reports whether the element was newly inserted.
+
+import std.core.hash
+import std.core.mem
+
+// Row append: scalar element rows (IntSet's i64 rows, any scalar K) grow
+// through the C path — fill + Mem.copy (memcpy), the same seam as List.push;
+// every other element type uses engine concat.
+fun row_append<K>(row: K[], key: K): K[] {
+    if row.len() == 0 {
+        [key]
+    } else if Mem.is_scalar_array(row) {
+        val nb = [row[0], ..row.len() + 1]
+        Mem.copy(nb, 0, row, 0, row.len())
+        nb[row.len()] = key
+        nb
+    } else {
+        row ++ [key]
+    }
+}
+
+type Set<K> = Set(buckets: K[][], count: usize) {
+
+    pub fun len(): usize { count }
+
+    pub fun is_empty(): bool { count == 0 }
+
+    pub fun has(key: K): bool {
+        val row = buckets[(hash_of(key) & ((buckets.len() - 1) as u64)) as usize]
+        var i = 0 as usize
+        while i < row.len() {
+            if row[i] == key { return true }
+            i = i + 1
+        }
+        false
+    }
+
+    // Returns true when the key was newly inserted, false when it was present.
+    pub fun &add(key: K): bool {
+        val slot = (hash_of(key) & ((buckets.len() - 1) as u64)) as usize
+        val row = buckets[slot]
+        var i = 0 as usize
+        while i < row.len() {
+            if row[i] == key { return false }
+            i = i + 1
+        }
+        buckets[slot] = row_append(row, key)
+        count = count + 1
+        grow_if_needed()
+        true
+    }
+
+    pub fun &remove(key: K): bool {
+        val slot = (hash_of(key) & ((buckets.len() - 1) as u64)) as usize
+        val row = buckets[slot]
+        var kept: K[] = []
+        var found = false
+        var i = 0 as usize
+        while i < row.len() {
+            if row[i] == key {
+                found = true
+            } else {
+                kept = kept ++ [row[i]]
+            }
+            i = i + 1
+        }
+        if found {
+            buckets[slot] = kept
+            count = count - 1
+        }
+        found
+    }
+
+    pub fun items(): K[] {
+        val out = List.empty()
+        var b = 0 as usize
+        while b < buckets.len() {
+            var i = 0 as usize
+            while i < buckets[b].len() {
+                out.push(buckets[b][i])
+                i = i + 1
+            }
+            b = b + 1
+        }
+        out.as_array()
+    }
+
+    pub fun entries(): HashIterator<K> {
+        hash_iter(buckets)
+    }
+
+    pub fun &clear(): void {
+        val empty: K[] = []
+        buckets = [empty, ..buckets.len()]
+        count = 0
+    }
+
+    // The template-method seam (see Map.hash_of).
+    fun hash_of(key: K): u64 { Hash.key(key) }
+
+    // Scatter rebuild (see Map.grow_if_needed): straight old → fresh
+    // redistribution, no all-entries intermediate.
+    fun &grow_if_needed(): void {
+        if count <= buckets.len() * 2 { return }
+        val old = buckets
+        val empty: K[] = []
+        buckets = [empty, ..old.len() * 2]
+        var b = 0 as usize
+        while b < old.len() {
+            var i = 0 as usize
+            while i < old[b].len() {
+                val key = old[b][i]
+                val slot = (hash_of(key) & ((buckets.len() - 1) as u64)) as usize
+                buckets[slot] = row_append(buckets[slot], key)
+                i = i + 1
+            }
+            b = b + 1
+        }
+    }
+}
+
+pub fun empty<K>(): Set<K> {
+    val empty: K[] = []
+    Set([empty, ..16], 0)
+}

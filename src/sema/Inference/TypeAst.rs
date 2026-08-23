@@ -43,21 +43,27 @@ impl<'a> InferContext<'a> {
         if name == crate::types::NAME_LIB {
             return self.arena.make(Type::Lib);
         }
-        // 4. trait definition → Trait type.
-        if self.sema_result.get_trait_def(name).is_some() {
-            return self.arena.make_trait(name.into(), Box::new([]));
+        // 4. trait definition → Trait type (module-scoped canonical key:
+        // own-module traits shadow std bare names).
+        if let Some(td) = self.sema_result.get_trait_def(name) {
+            let canonical = self.sema_result.resolve_trait_key(name);
+            let _ = td;
+            return self.arena.make_trait(canonical.into(), Box::new([]));
         }
+        // Module-scoped canonical key: own module shadows std, imports follow,
+        // std bare keys then unique user fallbacks (resolve_type_key).
+        let canonical = self.sema_result.resolve_type_key(name);
         // Alias cycle detection.
-        if visiting.contains(name) {
-            return self.arena.make_adt(name.into(), Box::new([]));
+        if visiting.contains(canonical.as_str()) {
+            return self.arena.make_adt(canonical.into(), Box::new([]));
         }
-        visiting.insert(name.to_string());
+        visiting.insert(canonical.to_string());
         // 5. Alias unfolding: type Name = T → resolve T.
         // Prefer the already-resolved target_type (TypeHandle), which covers non-named targets like functions/Records/Arrays;
         // fall back to target_type_name (a named target, e.g. type A = B).
         let alias_info = self
             .sema_result
-            .get_type_def(name)
+            .get_type_def(&canonical)
             .filter(|td| td.kind == TypeDefKind::Alias)
             .map(|td| (td.target_type, td.target_type_name.as_deref().map(String::from), td.type_params.len()));
         if let Some((alias_target_ty, alias_target_name, param_count)) = alias_info {
@@ -69,22 +75,23 @@ impl<'a> InferContext<'a> {
                     "generic type alias '{}' requires type arguments (e.g. '{}<arg>)",
                     name, name
                 ));
-                visiting.remove(name);
+                visiting.remove(canonical.as_str());
                 return self.arena.make(Type::Unknown);
             }
             if let Some(inner_ty) = alias_target_ty {
-                visiting.remove(name);
+                visiting.remove(canonical.as_str());
                 return inner_ty;
             }
             if let Some(target_name) = alias_target_name {
                 let result = self.resolve_name_to_type(&target_name, type_param_map, visiting);
-                visiting.remove(name);
+                visiting.remove(canonical.as_str());
                 return result;
             }
         }
-        visiting.remove(name);
-        // 6. User-defined type → Adt.
-        self.arena.make_adt(name.into(), Box::new([]))
+        visiting.remove(canonical.as_str());
+        // 6. User-defined type → Adt (canonical, module-qualified for user
+        // modules — the runtime identity).
+        self.arena.make_adt(canonical.into(), Box::new([]))
     }
 
     /// Resolves an AST TypeNode to a TypeHandle (full version, with a type-parameter map).
@@ -146,16 +153,20 @@ impl<'a> InferContext<'a> {
                 if is_builtin_generic_type(name) {
                     return self.make_builtin_generic((*name).into(), args_box);
                 }
-                // trait definition → Trait type.
+                // trait definition → Trait type (module-scoped canonical).
                 if self.sema_result.get_trait_def(name).is_some() {
-                    return self.arena.make_trait((*name).into(), args_box);
+                    let canonical = self.sema_result.resolve_trait_key(name);
+                    return self.arena.make_trait(canonical.into(), args_box);
                 }
+                // Module-scoped canonical key for the user-type lookups below
+                // (own module shadows std bare names).
+                let canonical = self.sema_result.resolve_type_key(name);
                 // Generic TYPE ALIAS application (`CmpFn<i32>`): unfold to the
                 // alias target with the params substituted by the applied
                 // arguments. Previously this became an opaque Adt that never
                 // unfolded — a lambda could not be passed where `CmpFn<i32>`
                 // was expected, and the stored target had its params erased.
-                if let Some(td) = self.sema_result.get_type_def(name) {
+                if let Some(td) = self.sema_result.get_type_def(&canonical) {
                     if td.kind == TypeDefKind::Alias {
                         if let Some(target) = td.target_type {
                             if td.type_params.len() == args_box.len() {
@@ -185,11 +196,11 @@ impl<'a> InferContext<'a> {
                 // User-defined generic ADT.
                 let has_type_params = self
                     .sema_result
-                    .get_type_def(name)
+                    .get_type_def(&canonical)
                     .map(|d| !d.type_params.is_empty())
                     .unwrap_or(false);
                 if has_type_params {
-                    return self.arena.make_adt((*name).into(), args_box);
+                    return self.arena.make_adt(canonical.into(), args_box);
                 }
                 // Fallback: construct a Generic (may be undefined or a forward reference; reported on later use).
                 self.arena.make_generic((*name).into(), args_box)

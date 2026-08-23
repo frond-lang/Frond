@@ -840,7 +840,8 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         let m = self.builtin_modules[mod_i];
 
         // Obtain the pre-registered sg_id from method_subgraphs (created in build() step 0a)
-        let type_id = match self.sema.type_def_index.get(type_name) {
+        let canonical_type = self.sema.resolve_type_key_in(m.name, type_name);
+        let type_id = match self.sema.type_def_index.get(&canonical_type) {
             Some(&idx) => crate::types::dynamic_type_id(idx),
             None => return,
         };
@@ -937,7 +938,9 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         };
 
         // Obtain the pre-registered sg_id from method_subgraphs (created in build() step 0a)
-        let type_id = match self.sema.type_def_index.get(type_name) {
+        // User-module methods: the AST name resolves to the canonical key.
+        let canonical_type = self.sema.resolve_type_key_in(self.module.name, type_name);
+        let type_id = match self.sema.type_def_index.get(&canonical_type) {
             Some(&idx) => crate::types::dynamic_type_id(idx),
             None => return,
         };
@@ -1014,13 +1017,16 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
             .find_map(|m| {
                 m.declarations.iter().find_map(|d| {
                     if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
-                        if *name == trait_name {
+                        // trait_name is a canonical key — bare tail match.
+                        if trait_name.rsplit('.').next() == Some(name.as_ref()) {
                             if let Some(method) = methods.get(method_idx) {
                                 if method.body.is_some() {
                                     return Some((
+                                        method.name.to_string(),
                                         method.body.unwrap(),
                                         method.is_async,
                                         method.params.clone(),
+                                        method.return_type,
                                         m,
                                     ));
                                 }
@@ -1031,7 +1037,7 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
                 })
             });
 
-        let (body_expr, is_async, params, decl_module) = match found {
+        let (method_name, body_expr, is_async, params, return_type, decl_module) = match found {
             Some(x) => x,
             None => return,
         };
@@ -1083,11 +1089,152 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
             self.bind_var(param.name, param_node);
         }
 
-        let return_node = self.compile_expr(body_expr);
+        // MUST go through compile_function_body (not raw compile_expr): it
+        // performs the place-model function entry setup (fn_all_vars_slot,
+        // place-name collection, fresh cell_values) — without it every `var`
+        // in a default body lowers through the deleted non-cell path and
+        // forwards to a frozen constant (while-loops spin forever on a
+        // constant-true condition; same fix as compile_inherited_method).
+        let is_void_fn = match return_type {
+            None => true,
+            Some(tr) => {
+                matches!(decl_module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
+            }
+        };
+        let fn_returns_throw = Self::type_ref_returns_throw(&decl_module.arena, return_type);
+        let return_node = self.compile_function_body(
+            &method_name,
+            None,
+            body_expr,
+            &params,
+            is_void_fn,
+            is_async,
+            fn_returns_throw,
+        );
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_function_sg = None;
         self.current_trait_default_idx = None;
+        self.current_method_type = prev_method_type;
+        self.compiling_builtin = prev_builtin;
+
+        let node_end = self.graph.nodes.len() as u32;
+        let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
+        sg.node_range = (NodeId(node_start), NodeId(node_end));
+        sg.entry_node = NodeId(node_start);
+        sg.return_node = return_node;
+        sg.has_suspend = is_async;
+        sg.function_id = sg_id.0;
+    }
+
+    /// Compile an INHERITED method instance (inheritance): the child's method
+    /// table entry whose BODY is the base type's method. The body is compiled
+    /// with the CHILD as receiver type (`current_method_type`), so bare field
+    /// names resolve against the merged field list and bare method calls
+    /// dispatch to the child's table — per-child compilation is what makes
+    /// `this`-dispatch late-bound (the TraitDefaultInstance mechanism, lifted
+    /// to concrete bases).
+    pub(super) fn compile_inherited_method(&mut self, inst_idx: usize) {
+        let inst = match self.sema.inherited_method_instances.get(inst_idx) {
+            Some(i) => i.clone(),
+            None => return,
+        };
+        // Locate the base's method AST (builtin modules + user module).
+        let found = self
+            .builtin_modules
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.module))
+            .find_map(|m| {
+                m.declarations.iter().find_map(|d| {
+                    if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &d.node {
+                        // base_type_name is a canonical key — bare tail match.
+                        if inst.base_type_name.as_ref().rsplit('.').next() == Some(name.as_ref()) {
+                            if let Some(method) = methods.get(inst.base_method_idx as usize) {
+                                if method.body.is_some() {
+                                    return Some((
+                                        method.name.to_string(),
+                                        method.body.unwrap(),
+                                        method.is_async,
+                                        method.params.clone(),
+                                        method.return_type,
+                                        m,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    None
+                })
+            });
+        let (method_name, body_expr, is_async, params, return_type, decl_module) = match found {
+            Some(x) => x,
+            None => return,
+        };
+        let sg_id = match self.method_subgraphs.get(&(inst.type_id, inst.method_idx)) {
+            Some(&sg) => sg,
+            None => return,
+        };
+
+        let node_start = self.graph.nodes.len() as u32;
+
+        // Switch the AST arena context to the base's declaring module while
+        // compiling the body.
+        let prev_builtin = self.compiling_builtin;
+        self.compiling_builtin = if std::ptr::eq(decl_module, self.module) {
+            None
+        } else {
+            Some(decl_module)
+        };
+
+        self.current_function_sg = Some(sg_id);
+        self.current_function_id = sg_id.0;
+        let prev_effect = self.current_effect;
+        self.current_effect = None;
+        let prev_sg_start = self.current_sg_start;
+        self.current_sg_start = node_start;
+        let prev_method_type = self.current_method_type.take();
+        self.current_method_type = Some((inst.type_name.clone(), inst.type_id));
+        self.enter_scope();
+
+        for param in &params {
+            let inputs_offset = self.graph.inputs_pool.push(&[]);
+            let param_node = self.graph.add_node(Node {
+                kind: NodeKind::Const,
+                input_count: 0,
+                inputs_offset,
+                compute_fn: CF_NOOP,
+            });
+            self.bind_var(param.name, param_node);
+        }
+
+        // MUST go through compile_function_body (not raw compile_expr): it
+        // performs the place-model function entry setup (fn_all_vars_slot,
+        // place-name collection, fresh cell_values) — without it every `var`
+        // in an inherited body lowers through the deleted non-cell path and
+        // forwards to a frozen constant (observed: while-loops in inherited
+        // methods spin forever on a constant-true condition). Same latent gap
+        // exists for trait-default bodies containing `var`.
+        let is_void_fn = match return_type {
+            None => true,
+            Some(tr) => {
+                matches!(decl_module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
+            }
+        };
+        let fn_returns_throw = Self::type_ref_returns_throw(&decl_module.arena, return_type);
+        let return_node = self.compile_function_body(
+            &method_name,
+            Some(inst.type_name.as_ref()),
+            body_expr,
+            &params,
+            is_void_fn,
+            is_async,
+            fn_returns_throw,
+        );
+        self.exit_scope();
+        self.current_effect = prev_effect;
+        self.current_sg_start = prev_sg_start;
+        self.current_function_sg = None;
         self.current_method_type = prev_method_type;
         self.compiling_builtin = prev_builtin;
 
@@ -1105,7 +1252,7 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
     /// `(method_name, params_count, is_async)`.
     ///
     /// This is used by the IR build to pre-register and compile local type methods
-    /// (step 0a-local / step 2b-local), complementing `compile_user_method` which only
+    /// (step 0a-local / 2b-local), complementing `compile_user_method` which only
     /// searches `self.module.declarations`.
     pub(super) fn find_type_method(
         &self,

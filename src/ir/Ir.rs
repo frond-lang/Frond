@@ -2865,6 +2865,12 @@ pub struct DataFlowGraph {
     /// When a vtable call receives a concrete record (not a TraitVal), the runtime looks up
     /// the method subgraph by the value's type_name here, enabling static dispatch on the
     /// concrete type without boxing into a TraitVal.
+    /// (child type name, base type name) pairs from sema TypeDefInfo.bases —
+    /// runtime match arm disambiguation accepts an inherited type's values
+    /// (an ADT child's ctor set is the base's, verbatim).
+    pub inheritance_links: Vec<(Box<str>, Box<str>)>,
+    /// (method_idx, type_name) -> SubGraphId: runtime dispatch for concrete
+    /// receivers (inheritance base-typed call sites + trait fallback).
     pub vtable_fallback_dispatch: rustc_hash::FxHashMap<(u16, Box<str>), SubGraphId>,
     /// String pool: ConstValue::Str { offset, len } references this pool.
     /// Maintained by IrBuilder as intern during build; filled from the .fndo StringPool section during load.
@@ -2963,6 +2969,7 @@ impl Clone for DataFlowGraph {
             memo_infos: self.memo_infos.clone(),
             memo_tables: self.memo_tables.clone(),
             vtable_fallback_dispatch: self.vtable_fallback_dispatch.clone(),
+            inheritance_links: self.inheritance_links.clone(),
             sg_debug_names: self.sg_debug_names.clone(),
             string_pool: self.string_pool.clone(),
             mem: None,
@@ -3039,6 +3046,7 @@ impl DataFlowGraph {
             memo_infos: Vec::new(),
             memo_tables: Arc::new(Vec::new()),
             vtable_fallback_dispatch: rustc_hash::FxHashMap::default(),
+            inheritance_links: Vec::new(),
             sg_debug_names: Vec::new(),
             string_pool: Arc::from(Vec::new()),
             mem: None,

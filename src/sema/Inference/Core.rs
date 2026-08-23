@@ -427,7 +427,7 @@ impl<'a> InferContext<'a> {
         all_modules: &[&'m Module<'m>],
     ) -> bool {
         // 1. Populate the definition tables (if not already populated).
-        populate_module(self.arena, self.sema_result, module);
+        populate_module(self.arena, self.sema_result, module, all_modules);
 
         // 1b. Check for cyclic type aliases (Bug #80).
         self.check_alias_cycles();
@@ -449,6 +449,9 @@ impl<'a> InferContext<'a> {
         let types_baseline = self.arena.len();
         self.current_module_logical_path = module_logical_path(module.name);
         self.current_module_name = module.name.to_string();
+        // Sync the SemaResult-side module context used by the free-function
+        // name resolvers (resolve_type_key / resolve_named_type_resolved).
+        self.sema_result.current_module_name = module.name.to_string();
 
         // 3. Process import declarations: register module reference aliases + import aliases.
         self.process_import_decls(module, root_env);
@@ -588,6 +591,29 @@ impl<'a> InferContext<'a> {
             }
         }
 
+        // 9z. ExprInfo type_name backfill: fixpoint stores snapshot the type
+        // BEFORE the solver finalizes; entries whose stored type_name is None
+        // but whose ty handle NOW resolves to a concrete named type get the
+        // name backfilled (method-sugar dispatch reads the name — without
+        // this, zero-arg ctor receivers degrade to `_` and lose dispatch).
+        {
+            let keys: Vec<u64> = self
+                .sema_result
+                .expr_types
+                .iter()
+                .filter(|(_, info)| info.type_name.is_none())
+                .map(|(k, _)| *k)
+                .collect();
+            for k in keys {
+                let ty = self.sema_result.expr_types[&k].ty;
+                if let Some(name) = self.arena.type_name_concrete(self.arena.resolve(ty)) {
+                    if let Some(info) = self.sema_result.expr_types.get_mut(&k) {
+                        info.type_name = Some(name.into_boxed_str());
+                    }
+                }
+            }
+        }
+
         // 10. Mirror witness_table into sema_result (so the IR layer can access trait method
         // dispatch info).
         // witness_table accumulates across modules; sync the latest state after each check.
@@ -598,6 +624,7 @@ impl<'a> InferContext<'a> {
         // defaults, delegate targets), then collect trait default-method
         // monomorphization instances (depends on the mirrored witness_table).
         crate::sema::Monomorph::validate_trait_method_bindings(module, self.sema_result);
+        crate::sema::Monomorph::validate_trait_inheritance(module, self.sema_result);
         crate::sema::Monomorph::collect_trait_default_instances(module, self.sema_result);
 
         // 11. Report global residual TypeVar diagnostics.

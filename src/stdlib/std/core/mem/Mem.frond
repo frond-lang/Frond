@@ -209,6 +209,15 @@ pub fun equal<T>(a: T[], b: T[]): bool {
     }
 }
 
+// Whether the array's element type has the Mem C fast path (the scalar
+// element names fill/copy cover). Generic containers consult this at runtime
+// to route growth through fill + copy (a C memcpy) instead of engine concat —
+// the List.push / Set row-append seam.
+pub fun is_scalar_array<T>(arr: T[]): bool {
+    val n = arr.type_name()
+    n == "u8[]" || n == "i8[]" || n == "i16[]" || n == "i32[]" || n == "i64[]" || n == "u16[]" || n == "u32[]" || n == "u64[]" || n == "isize[]" || n == "usize[]" || n == "f32[]" || n == "f64[]" || n == "bool[]" || n == "char[]" || n == "i128[]" || n == "u128[]" || n == "f16[]" || n == "f128[]"
+}
+
 // Deep copy: arrays (incl. nested) and records recurse into fresh structure;
 // immutable leaves and runtime identities (closures/channels/FFI handles)
 // share. The only user-level deep-copy path — plain assignment, element

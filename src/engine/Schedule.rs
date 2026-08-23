@@ -1662,6 +1662,13 @@ impl<S: LockStrategy> Engine<S> {
                 if self.wakeup.is_none()
                     && crate::value::Registry::registered_count() > 1 << 16 {
                     let mut roots: Vec<crate::value::Value> = Vec::new();
+                    // The completing frame itself was already TAKEN out of the
+                    // frames map at the top of process_frame and is only held
+                    // in the local frame_box — root its value table here too,
+                    // or everything referenced solely by this frame (e.g. two
+                    // 5万-entry maps in main) reads as garbage and gets its
+                    // edges released → use-after-free at teardown.
+                    roots.extend(frame.value_table.values.iter().cloned());
                     let frames = self.frames.lock();
                     for f in frames.values() {
                         roots.extend(f.value_table.values.iter().cloned());

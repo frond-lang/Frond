@@ -1,0 +1,13 @@
+// std/encoding package declaration
+//
+// Byte-text encodings (the Go encoding/ line: hex, base64): encode/decode
+// between u8[] and str. decode returns T? (null on malformed input) — same
+// convention as the parse family in std.core.types, not Throw: bad input is
+// expected data, not a host failure. Round-trip guarantee:
+// decode(encode(data)) == data.
+//
+// The inner loops are the C kernels in builtin/encoding/Raw.frond (visible
+// by default as builtin); this facade only sizes the buffers and applies
+// the strict-validation contract.
+pub pack Hex
+pub pack Base64

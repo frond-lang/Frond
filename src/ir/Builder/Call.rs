@@ -862,6 +862,12 @@ impl<'a> IrBuilder<'a> {
     /// Look up a type declaration's field info (by type name).
     ///
     /// Uniformly searches layer by layer through type_scope_stack (top-level + nested types share the same lookup path).
+    pub(super) fn alloc_base_dispatch_idx(&mut self) -> u16 {
+        let idx = self.next_base_dispatch_idx;
+        self.next_base_dispatch_idx = self.next_base_dispatch_idx.wrapping_add(1).max(0x8000);
+        idx
+    }
+
     pub(super) fn lookup_type_field_names(&self, type_name: &str) -> Option<TypeFieldInfo> {
         self.lookup_type_fields(type_name)
     }
@@ -881,7 +887,9 @@ impl<'a> IrBuilder<'a> {
         type_name: &str,
         ctor_name: &str,
     ) -> Option<(String, String, Vec<Option<String>>, RecordLitKind, bool)> {
-        let &type_idx = self.sema.type_def_index.get(type_name)?;
+        // Module-scoped: the AST type segment resolves to its canonical key.
+        let canonical = self.sema.resolve_type_key_in(self.current_module().name, type_name);
+        let &type_idx = self.sema.type_def_index.get(&canonical)?;
         let type_def = &self.sema.type_defs[&type_idx];
         let ctor = type_def
             .constructors
@@ -1044,7 +1052,31 @@ impl<'a> IrBuilder<'a> {
     /// - intrinsic methods (await/len/send/recv/close/bytes/cancel etc.) are flagged via
     ///   MethodSigInfo.intrinsic and lowered directly to a compute_fn node
     /// - type/trait methods are compiled into Call nodes, looking up method_subgraphs via (type_id, method_idx)
-    pub(super) fn compile_method_call(
+    /// Whether walking `name`'s FIRST-base links (the layout-prefix chain)
+/// reaches `ancestor` (exclusive of `name` itself).
+fn first_base_chain_reaches(
+    sema: &crate::sema::Sema::SemaResult,
+    name: &str,
+    ancestor: &str,
+) -> bool {
+    let mut current: Option<Box<str>> = Some(name.into());
+    let mut hops = 0usize;
+    while let Some(cn) = current {
+        if hops > 64 {
+            return false;
+        }
+        let Some(def) = sema.get_type_def(cn.as_ref()) else { return false };
+        let Some(first) = def.bases.first() else { return false };
+        if first.as_ref() == ancestor {
+            return true;
+        }
+        current = Some(first.clone());
+        hops += 1;
+    }
+    false
+}
+
+pub(super) fn compile_method_call(
         &mut self,
         call_expr_id: crate::ast::Ast::ExprId,
         recv: crate::ast::Ast::ExprId,
@@ -1384,6 +1416,12 @@ impl<'a> IrBuilder<'a> {
                 compute_fn: CF_CALL_LAUNCH,
             });
 
+            if std::env::var("FROND_TRACE_CTOR").is_ok() {
+                let k = crate::sema::Sema::module_expr_key(self.expr_key_module(), recv.0 as u64);
+                let tn = self.sema.expr_types.get(&k).map(|i| i.type_name.clone());
+                let tid = self.expr_type_id(recv);
+                eprintln!("[dispatch-recv] method={} type_name={:?} type_id={:?} recv_expr={} cur_mod={}", method, tn, tid, recv.0, self.current_module().name);
+            }
             // Dispatch priority (semantic priority, not fallback):
             //   1. trait object dynamic dispatch (recv type is a trait -> vtable runtime dispatch)
             //   2. type's own method / trait method override: (type_id, method_idx) lookup into method_subgraphs
@@ -1415,14 +1453,57 @@ impl<'a> IrBuilder<'a> {
             // Path 2: type's own method / trait method override
             // When recv_node_override is set (implicit-this call), the callee ExprId does not carry
             // the receiver's type info; use current_method_type (set by the enclosing method compile).
-            let recv_type: Option<(&str, u16)> = if recv_node_override.is_some() {
-                self.current_method_type.as_ref().map(|(n, id)| (n.as_ref(), *id))
+            // Owned so the immutable self borrow ends before the dynamic-
+            // dispatch registration below (which takes &mut self).
+            let recv_type: Option<(String, u16)> = if recv_node_override.is_some() {
+                self.current_method_type.as_ref().map(|(n, id)| (n.to_string(), *id))
             } else {
-                self.expr_type_name(recv).zip(self.expr_type_id(recv))
+                self.expr_type_name(recv).map(|n| n.to_string()).zip(self.expr_type_id(recv))
             };
             if let Some((type_name, type_id)) = recv_type {
-                if let Some(method_idx) = self.sema.lookup_method_idx(type_name, method) {
+                if let Some(method_idx) = self.sema.lookup_method_idx(type_name.as_str(), method) {
                     if let Some(&target_sg) = self.method_subgraphs.get(&(type_id, method_idx)) {
+                        // Inheritance dynamic dispatch: when any type's
+                        // FIRST-base chain reaches this receiver type, a child
+                        // value may flow in here. Inherited methods are
+                        // compiled per child (late binding), so the correct
+                        // subgraph depends on the value's ACTUAL type — emit a
+                        // vtable-style dispatch keyed by (site_idx, type_name)
+                        // covering the base and every chain descendant.
+                        let has_descendants = self.sema.type_defs.values().any(|d| {
+                            !d.bases.is_empty()
+                                && Self::first_base_chain_reaches(self.sema, d.name.as_ref(), type_name.as_str())
+                        });
+                        if has_descendants {
+                            let site_idx = self.alloc_base_dispatch_idx();
+                            self.graph.set_vtable_call(call_node, site_idx);
+                            self.graph
+                                .vtable_fallback_dispatch
+                                .insert((site_idx, type_name.clone().into()), target_sg);
+                            let descendants: Vec<(Box<str>, u16, u16)> = self
+                                .sema
+                                .type_defs
+                                .iter()
+                                .filter(|(_, d)| {
+                                    !d.bases.is_empty()
+                                        && Self::first_base_chain_reaches(self.sema, d.name.as_ref(), type_name.as_str())
+                                })
+                                .filter_map(|(&idx, d)| {
+                                    let did = crate::types::dynamic_type_id(idx);
+                                    self.sema
+                                        .lookup_method_idx(d.name.as_ref(), method)
+                                        .map(|mi| (d.name.clone(), did, mi))
+                                })
+                                .collect();
+                            for (dname, did, mi) in descendants {
+                                if let Some(&dsg) = self.method_subgraphs.get(&(did, mi)) {
+                                    self.graph
+                                        .vtable_fallback_dispatch
+                                        .insert((site_idx, dname.into()), dsg);
+                                }
+                            }
+                            return call_node;
+                        }
                         self.graph.set_call_target(call_node, target_sg);
                         return call_node;
                     }
@@ -1436,6 +1517,13 @@ impl<'a> IrBuilder<'a> {
                 self.expr_type_id(recv)
             };
             if let Some(type_id) = path3_type_id {
+                // Collect every implementing trait that provides a specialized
+                // default for this method, then select deterministically: a
+                // trait that is a DESCENDANT of all other providers wins
+                // (trait inheritance — the child's declaration shadows its
+                // parents'); plain multi-trait conflicts never reach here
+                // (sema's R3 rejects them at check time).
+                let mut candidates: Vec<(Box<str>, SubGraphId)> = Vec::new();
                 for trait_def in self.sema.trait_defs.values() {
                     if !self.type_implements_trait(type_id, &trait_def.name) {
                         continue;
@@ -1447,11 +1535,33 @@ impl<'a> IrBuilder<'a> {
                     {
                         if let Some(&trait_idx) = self.sema.trait_def_index.get(trait_def.name.as_ref()) {
                             if let Some(&target_sg) = self.trait_default_subgraphs.get(&(type_id, trait_idx, method_idx as u16)) {
-                                self.graph.set_call_target(call_node, target_sg);
-                                return call_node;
+                                candidates.push((trait_def.name.clone(), target_sg));
                             }
                         }
                     }
+                }
+                let chosen: Option<SubGraphId> = if candidates.len() == 1 {
+                    candidates.first().map(|(_, sg)| *sg)
+                } else if candidates.len() > 1 {
+                    candidates
+                        .iter()
+                        .find(|(c, _)| {
+                            candidates.iter().all(|(o, _)| {
+                                o.as_ref() == c.as_ref()
+                                    || self
+                                        .sema
+                                        .trait_parent_closure(c.as_ref())
+                                        .iter()
+                                        .any(|a| a.as_ref() == o.as_ref())
+                            })
+                        })
+                        .map(|(_, sg)| *sg)
+                } else {
+                    None
+                };
+                if let Some(target_sg) = chosen {
+                    self.graph.set_call_target(call_node, target_sg);
+                    return call_node;
                 }
             }
 
@@ -1516,6 +1626,58 @@ impl<'a> IrBuilder<'a> {
             self.expr_key_module(),
             call_expr_id.0 as u64,
         );
+        // Base-type super (inheritance): a sema-recorded base dispatch wins
+        // over the trait-default layer — target is the BASE's own method
+        // subgraph, receiver is the enclosing `this` (child values are
+        // layout-prefix compatible with the base's field ids).
+        if let Some((base_name, base_method)) = self.sema.super_base_dispatches.get(&key) {
+            let base_tid = self
+                .sema
+                .type_def_index
+                .get(base_name.as_ref())
+                .map(|&idx| crate::types::dynamic_type_id(idx));
+            let base_mi = self.sema.lookup_method_idx(base_name.as_ref(), base_method.as_ref());
+            if let (Some(tid), Some(mi)) = (base_tid, base_mi) {
+                if let Some(&sg) = self.method_subgraphs.get(&(tid, mi)) {
+                    let recv_node = match self.lookup_var("this") {
+                        Some(n) => n,
+                        None => {
+                            self.errors.push(
+                                "super call: receiver 'this' not in scope (base super is only                                  supported in the direct body of a type method)"
+                                    .into(),
+                            );
+                            let off = self.graph.inputs_pool.push(&[]);
+                            return self.graph.add_node(Node {
+                                kind: NodeKind::Const,
+                                input_count: 0,
+                                inputs_offset: off,
+                                compute_fn: CF_NOOP,
+                            });
+                        }
+                    };
+                    let mut inputs = vec![recv_node];
+                    for &a in args {
+                        inputs.push(self.compile_subexpr(a));
+                    }
+                    if let Some(eff) = self.current_effect {
+                        inputs.push(eff);
+                    }
+                    let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                    let call_node = self.graph.add_node(Node {
+                        kind: NodeKind::Call,
+                        input_count: inputs.len() as u8,
+                        inputs_offset,
+                        compute_fn: CF_CALL_LAUNCH,
+                    });
+                    self.graph.set_call_target(call_node, sg);
+                    return call_node;
+                }
+            }
+            self.errors.push(format!(
+                "super call '{}.{}' could not resolve a base method subgraph",
+                base_name, base_method
+            ));
+        }
         let dispatch = self.sema.super_dispatches.get(&key).copied();
         let type_id = self.current_method_type.as_ref().map(|(_, id)| *id);
         let target_sg = dispatch
@@ -1740,34 +1902,74 @@ impl<'a> IrBuilder<'a> {
         // (vtable_idx, type_name). This handles both explicit trait declarations (`: Trait`) and
         // structural trait implementations (methods present without explicit declaration).
         //
-        // First try the witness table (explicit declarations); if empty, fall back to scanning
-        // all types with a matching method name.
+        // First try the witness table (explicit declarations); a type whose
+        // witness method_slots MISS the name (the method is a TRAIT DEFAULT —
+        // slots only carry the type's own methods) resolves to the
+        // specialized trait-default subgraph; the structural scan remains
+        // the last resort for undeclared implementations.
+        let trait_idx_and_mpos: Option<(u16, u16)> = self
+            .sema
+            .trait_def_index
+            .get(trait_name)
+            .copied()
+            .zip(
+                self.sema
+                    .get_trait_def(trait_name)
+                    .and_then(|td| {
+                        td.methods
+                            .iter()
+                            .position(|m| m.name.as_ref() == method_name)
+                            .map(|p| p as u16)
+                    }),
+            );
         let mut entries: Vec<(u16, u16)> = Vec::new();
+        let mut resolved_any = false;
         for entry in self.sema.witness_table.entries() {
             if entry.trait_name.as_ref() != trait_name {
                 continue;
             }
             if let Some(type_method_idx) = self.sema.witness_table.resolve_method(trait_name, entry.type_id, method_name) {
                 entries.push((entry.type_id, type_method_idx));
-            }
-        }
-        // Structural fallback: if witness table has no entries for this trait, scan all types
-        // that have a method with the matching name. This supports `type Dog { fun name(): str }`
-        // being passed as `Animal` without an explicit `: Animal` declaration.
-        if entries.is_empty() {
-            for (&type_idx, type_def) in &self.sema.type_defs {
-                for (m_idx, m) in type_def.methods.iter().enumerate() {
-                    if m.name.as_ref() == method_name {
-                        entries.push((crate::types::dynamic_type_id(type_idx), m_idx as u16));
-                        break;
+                resolved_any = true;
+            } else if let Some((trait_idx, trait_mpos)) = trait_idx_and_mpos {
+                // Trait-default method: the specialized subgraph compiled for
+                // this (type, trait, method) triple.
+                if let Some(&sg) = self
+                    .trait_default_subgraphs
+                    .get(&(entry.type_id, trait_idx, trait_mpos))
+                {
+                    if let Some(name) = self.type_name_from_id(entry.type_id) {
+                        self.graph
+                            .vtable_fallback_dispatch
+                            .insert((vtable_idx, name.into_boxed_str()), sg);
+                        resolved_any = true;
                     }
                 }
             }
         }
-        for (type_id, type_method_idx) in entries {
-            if let Some(&sg) = self.method_subgraphs.get(&(type_id, type_method_idx)) {
-                if let Some(name) = self.type_name_from_id(type_id) {
-                    self.graph.vtable_fallback_dispatch.insert((vtable_idx, name.into_boxed_str()), sg);
+        if resolved_any {
+            for (type_id, type_method_idx) in entries {
+                if let Some(&sg) = self.method_subgraphs.get(&(type_id, type_method_idx)) {
+                    if let Some(name) = self.type_name_from_id(type_id) {
+                        self.graph.vtable_fallback_dispatch.insert((vtable_idx, name.into_boxed_str()), sg);
+                    }
+                }
+            }
+            return;
+        }
+        // Structural fallback: if witness table has no entries for this trait, scan all types
+        // that have a method with the matching name. This supports `type Dog { fun name(): str }`
+        // being passed as `Animal` without an explicit `: Animal` declaration.
+        for (&type_idx, type_def) in &self.sema.type_defs {
+            for (m_idx, m) in type_def.methods.iter().enumerate() {
+                if m.name.as_ref() == method_name {
+                    let tid = crate::types::dynamic_type_id(type_idx);
+                    if let Some(&sg) = self.method_subgraphs.get(&(tid, m_idx as u16)) {
+                        if let Some(name) = self.type_name_from_id(tid) {
+                            self.graph.vtable_fallback_dispatch.insert((vtable_idx, name.into_boxed_str()), sg);
+                        }
+                    }
+                    break;
                 }
             }
         }
@@ -1830,11 +2032,22 @@ impl<'a> IrBuilder<'a> {
             .as_deref()
             .unwrap_or_else(|| self.type_arena.get(info.ty).name());
         // Concrete array names ("u8[]") address the synthetic builtin "array"
-        // type def.
-        self.sema
-            .type_def_index
-            .get(crate::sema::Sema::SemaResult::canonical_type_name(type_name))
-            .map(|&idx| crate::types::dynamic_type_id(idx))
+        // type def. Bare legacy names resolve module-scoped.
+        let key = crate::sema::Sema::SemaResult::canonical_type_name(type_name);
+        let type_idx = match self.sema.type_def_index.get(key) {
+            Some(&idx) => idx,
+            None => {
+                let resolved = self.sema.resolve_type_key(key);
+                if resolved == key {
+                    return None;
+                }
+                match self.sema.type_def_index.get(&resolved) {
+                    Some(&idx) => idx,
+                    None => return None,
+                }
+            }
+        };
+        Some(crate::types::dynamic_type_id(type_idx))
     }
 
 }

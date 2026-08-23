@@ -690,6 +690,11 @@ pub enum Decl<'a> {
         visibility: Visibility,
         name: &'a str,
         type_params: Vec<TypeParam<'a>>,
+        /// Concrete base types: `type Child(Base1, Base2)` — inheritance
+        /// (fields prefix-merged in declaration order, methods inherited
+        /// linearly). Distinct from `implemented_traits` (the `: (...)`
+        /// clause); the TraitBound shape is reused for its name+type_args.
+        base_types: Vec<TraitBound<'a>>,
         implemented_traits: Vec<TraitBound<'a>>,
         def: TypeDef<'a>,
         methods: Vec<MethodDecl<'a>>,
@@ -813,6 +818,7 @@ pub fn walk_decl<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, decl
         }
         Decl::TypeDecl {
             type_params,
+            base_types,
             implemented_traits,
             def,
             methods,
@@ -820,6 +826,9 @@ pub fn walk_decl<'a, V: AstVisitor<'a>>(v: &mut V, arena: &'a AstArena<'a>, decl
         } => {
             for tp in type_params {
                 walk_type_param(v, arena, tp);
+            }
+            for b in base_types {
+                walk_trait_bound(v, arena, b);
             }
             for b in implemented_traits {
                 walk_trait_bound(v, arena, b);
@@ -1500,6 +1509,7 @@ impl<'a> AstVisitor<'a> for Printer<'a> {
                 visibility,
                 name,
                 type_params,
+                base_types,
                 implemented_traits,
                 def,
                 methods,
@@ -1508,6 +1518,15 @@ impl<'a> AstVisitor<'a> for Printer<'a> {
                 self.indent();
                 self.print_visibility(*visibility);
                 self.print_type_params(type_params);
+                if !base_types.is_empty() {
+                    self.write_line("(base_types");
+                    self.indent();
+                    for b in base_types {
+                        self.write_line(&format!("\"{}\"", b.trait_name));
+                    }
+                    self.dedent();
+                    self.write_line(")");
+                }
                 self.print_bounds(implemented_traits);
                 self.visit_type_def(def);
                 self.print_methods(methods);

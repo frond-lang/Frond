@@ -70,6 +70,9 @@ pub struct IrBuilder<'a> {
     /// `TraitDefaultInstance.type_name` in sema and obtain the concrete type of `self`
     /// (consuming sema output; the IR does not hold semantic information).
     pub current_trait_default_idx: Option<usize>,
+    /// Allocation counter for inheritance base-dispatch site indices (vtable
+    /// keys). Starts at 0x8000 to stay clear of trait method indices.
+    pub next_base_dispatch_idx: u16,
     /// The subgraph id of the function currently being compiled (used for `defer` registration).
     pub current_function_sg: Option<SubGraphId>,
     /// W3C region context: the INNERMOST branch/loop-body subgraph currently
@@ -138,6 +141,13 @@ pub struct IrBuilder<'a> {
     /// Type-field scope stack: constructor/type name -> field name list
     /// (managed in parallel with `scope_stack`).
     pub type_scope_stack: Vec<rustc_hash::FxHashMap<String, TypeFieldInfo>>,
+    /// Per-module type-field scopes (module-scoped type resolution): module
+    /// name -> (bare type/ctor name -> TypeFieldInfo with CANONICAL
+    /// type_name). Own-module bindings shadow the base layer (`type_scope_stack[0]`),
+    /// so a local `type List` wins inside its module without clobbering the
+    /// std binding other modules compile against. Only user modules carry
+    /// entries — std/builtin keep the historical flat base layer.
+    pub module_type_scopes: rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<String, TypeFieldInfo>>,
     /// `function_id` of the function currently being compiled (used for subgraph tagging and
     /// `root_frame_ptr` inheritance decisions).
     pub current_function_id: u32,
@@ -380,6 +390,7 @@ impl<'a> IrBuilder<'a> {
             method_subgraphs: rustc_hash::FxHashMap::default(),
             trait_default_subgraphs: rustc_hash::FxHashMap::default(),
             current_trait_default_idx: None,
+            next_base_dispatch_idx: 0x8000,
             current_function_sg: None,
             current_branch_sg: None,
             loop_stack: Vec::new(),
@@ -412,6 +423,7 @@ impl<'a> IrBuilder<'a> {
             global_var_slots: rustc_hash::FxHashMap::default(),
             top_level_var_decls: Vec::new(),
             type_scope_stack: Vec::new(),
+            module_type_scopes: rustc_hash::FxHashMap::default(),
             memo_table_count: 0,
             string_pool: Vec::new(),
             string_map: rustc_hash::FxHashMap::default(),
@@ -538,15 +550,47 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    /// Look up type field info by walking the scope stack from inner to outer (constructor name
-    /// or type name).
+    /// Register type field info into the BASE layer (index 0) without
+    /// displacing an existing binding — std modules bind first, so user
+    /// types only fill free bare keys (std keeps priority for cross-module
+    /// bare references). Canonical keys are unique and always land.
+    pub(super) fn bind_type_fields_base_first_wins(&mut self, name: &str, info: TypeFieldInfo) {
+        if self.type_scope_stack.is_empty() {
+            return;
+        }
+        self.type_scope_stack[0].entry(name.to_string()).or_insert(info);
+    }
+
+    /// Bind a user-module type/ctor binding into that module's dedicated
+    /// scope (shadow layer above the base).
+    pub(super) fn bind_module_type_fields(&mut self, module_name: &str, name: &str, info: TypeFieldInfo) {
+        self.module_type_scopes
+            .entry(module_name.to_string())
+            .or_default()
+            .insert(name.to_string(), info);
+    }
+
+    /// Look up type field info by walking the scope stack from inner to outer
+    /// (constructor name or type name). The per-module scope of the module
+    /// currently being compiled sits between the local (nested-type) layers
+    /// and the base layer — own-module types shadow the flat base.
     pub(super) fn lookup_type_fields(&self, name: &str) -> Option<TypeFieldInfo> {
-        for scope in self.type_scope_stack.iter().rev() {
+        // Local layers above the base (index 0), innermost first.
+        if self.type_scope_stack.len() > 1 {
+            for scope in self.type_scope_stack[1..].iter().rev() {
+                if let Some(info) = scope.get(name) {
+                    return Some(info.clone());
+                }
+            }
+        }
+        // The current module's own scope.
+        if let Some(scope) = self.module_type_scopes.get(self.current_module().name) {
             if let Some(info) = scope.get(name) {
                 return Some(info.clone());
             }
         }
-        None
+        // Base layer.
+        self.type_scope_stack.first()?.get(name).cloned()
     }
 
     /// Bind a variable name to a NodeId (in the current scope).
@@ -1669,7 +1713,8 @@ impl<'a> IrBuilder<'a> {
         for m in &all_modules {
             for d in &m.declarations {
                 if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &d.node {
-                    let type_id = self.sema.type_def_index.get(*name).map(|&idx| crate::types::dynamic_type_id(idx));
+                    let canonical = self.sema.resolve_type_key_in(m.name, name);
+                    let type_id = self.sema.type_def_index.get(&canonical).map(|&idx| crate::types::dynamic_type_id(idx));
                     if let Some(tid) = type_id {
                         for (method_idx, method) in methods.iter().enumerate() {
                             if method.body.is_some() {
@@ -1697,7 +1742,8 @@ impl<'a> IrBuilder<'a> {
                 // Look up the TypeDecl (top-level or local) to get method info.
                 let method_info = self.find_type_method(type_name, *method_idx);
                 if let Some((method_name, params_count, is_async)) = method_info {
-                    let type_id = match self.sema.type_def_index.get(type_name.as_str()) {
+                    let canonical = self.sema.resolve_type_key(type_name.as_str());
+                    let type_id = match self.sema.type_def_index.get(&canonical) {
                         Some(&idx) => crate::types::dynamic_type_id(idx),
                         None => continue,
                     };
@@ -1710,6 +1756,17 @@ impl<'a> IrBuilder<'a> {
                     self.method_subgraphs.insert((type_id, *method_idx as u16), sg_id);
                     self.func_subgraphs.insert(mangled, sg_id);
                 }
+            }
+        }
+
+        // 0a-inh-links. Record (child, base) pairs for runtime match
+        // disambiguation (an ADT child inherits the base's ctor set verbatim,
+        // so a value of the child type must match arms compiled for the base).
+        for d in self.sema.type_defs.values() {
+            for b in d.bases.iter() {
+                self.graph
+                    .inheritance_links
+                    .push((d.name.clone(), b.clone()));
             }
         }
 
@@ -1730,7 +1787,8 @@ impl<'a> IrBuilder<'a> {
                 .find_map(|m| {
                     m.declarations.iter().find_map(|d| {
                         if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
-                            if *name == inst.trait_name.as_ref() {
+                            // trait_name is a canonical key — bare tail match.
+                            if inst.trait_name.as_ref().rsplit('.').next() == Some(name.as_ref()) {
                                 if let Some(method) = methods.get(inst.method_idx as usize) {
                                     return Some((
                                         method.name.to_string(),
@@ -1751,6 +1809,50 @@ impl<'a> IrBuilder<'a> {
             let sg_id = self.register_subgraph_placeholder(&mangled, params_count, is_async);
             self.trait_default_subgraphs
                 .insert((inst.type_id, inst.trait_idx, inst.method_idx), sg_id);
+        }
+
+        // 0a-inh. Pre-register inherited-method subgraphs (inheritance):
+        //   (child_type_id, child_method_idx) -> SubGraphId, mangled
+        //   "Child.method" — consumed by compile_inherited_method (step 2d),
+        //   which compiles the BASE's method body with the child as receiver.
+        for inst in &self.sema.inherited_method_instances {
+            let method_info = self
+                .builtin_modules
+                .iter()
+                .copied()
+                .chain(std::iter::once(self.module))
+                .find_map(|m| {
+                    m.declarations.iter().find_map(|d| {
+                        if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &d.node {
+                            // base_type_name is a canonical key — match the
+                            // AST declaration by bare (tail-segment) name.
+                            if inst.base_type_name.as_ref().rsplit('.').next() == Some(name.as_ref()) {
+                                if let Some(method) = methods.get(inst.base_method_idx as usize) {
+                                    return Some((
+                                        method.name.to_string(),
+                                        method.params.len() as u8,
+                                        method.is_async,
+                                    ));
+                                }
+                            }
+                        }
+                        None
+                    })
+                });
+            let (method_name, params_count, is_async) = match method_info {
+                Some(info) => info,
+                None => continue,
+            };
+            // The child's own methods (registered above by the top-level
+            // scan) take precedence for the same (type_id, idx) key — they
+            // never collide by construction (inherited idx = own len + k).
+            if self.method_subgraphs.contains_key(&(inst.type_id, inst.method_idx)) {
+                continue;
+            }
+            let mangled = format!("{}.{}", inst.type_name, method_name);
+            let sg_id = self.register_subgraph_placeholder(&mangled, params_count, is_async);
+            self.method_subgraphs.insert((inst.type_id, inst.method_idx), sg_id);
+            self.func_subgraphs.insert(mangled, sg_id);
         }
 
         // 0b. Register selective import aliases in func_subgraphs:
@@ -1871,43 +1973,112 @@ impl<'a> IrBuilder<'a> {
         // 0c. Register all modules' top-level types into the base scope (unified with nested types via type_scope_stack lookup)
         //     ADT registers both the type name and each constructor name (constructor name maps to type name, for type_name reflection)
         //     Newtype registers the constructor name (== type name); kind=Newtype drives compute_record_construct to build a NewtypeValue
+        //
+        //     Module-scoped: the recorded `type_name` is the CANONICAL key
+        //     (user modules module-qualified) — it flows into
+        //     RecordLitInfo and the runtime AdtValue identity. std/builtin
+        //     modules bind straight into the base layer (bare names, std
+        //     first). USER modules bind into their per-module scope (own
+        //     shadow layer) plus a first-wins base entry for cross-module
+        //     bare references — std keeps priority — and an unconditional
+        //     canonical base entry (unique per module).
         self.type_scope_stack.push(rustc_hash::FxHashMap::default());
         for m in &all_modules {
+            let is_user_module = !(m.name.starts_with("std/") || m.name.starts_with("builtin/"));
             for d in &m.declarations {
-                if let crate::ast::Ast::Decl::TypeDecl { name, def, .. } = &d.node {
+                if let crate::ast::Ast::Decl::TypeDecl { name, def, base_types, .. } = &d.node {
+                    let canonical: String = self.sema.resolve_type_key_in(m.name, name);
+                    // One bind closure: module scope + base-layer policy.
+                    let mut bind = |b: &mut Self, key: &str, info: TypeFieldInfo| {
+                        if is_user_module {
+                            b.bind_module_type_fields(m.name, key, info.clone());
+                            b.bind_type_fields_base_first_wins(key, info.clone());
+                            if key != canonical {
+                                b.bind_type_fields_base_first_wins(&canonical, info);
+                            }
+                        } else {
+                            b.bind_type_fields(key, info);
+                        }
+                    };
+                    // Inheritance: children bind the MERGED field list (base
+                    // fields + own) from sema — the AST ctor only shows own
+                    // fields, and a positional (unnamed) construct breaks
+                    // name-based field reads inside inherited/override methods.
+                    let merged_names: Option<Vec<String>> = if base_types.is_empty() {
+                        None
+                    } else {
+                        self.sema.type_def_index.get(&canonical).and_then(|&idx| {
+                            let def = &self.sema.type_defs[&idx];
+                            if def.bases.is_empty() { return None; }
+                            def.constructors.first().map(|c| {
+                                c.field_names.iter()
+                                    .map(|n| n.as_deref().unwrap_or("_").to_string())
+                                    .collect()
+                            })
+                        })
+                    };
                     match def {
                         crate::ast::Ast::TypeDef::Record { fields } => {
-                            let field_names: Vec<String> = fields.iter().map(|f| f.name.to_string()).collect();
-                            self.bind_type_fields(name, TypeFieldInfo {
+                            let field_names: Vec<String> = merged_names.unwrap_or_else(|| {
+                                fields.iter().map(|f| f.name.to_string()).collect()
+                            });
+                            bind(&mut self, name, TypeFieldInfo {
                                 field_names,
-                                type_name: name.to_string(),
+                                type_name: canonical.clone(),
                                 kind: RecordLitKind::Record,
                             });
                         }
                         crate::ast::Ast::TypeDef::Adt { constructors } => {
                             // Register the type name (nullary path used for type-name lookup; field_names is empty only when there are no field constructors)
-                            self.bind_type_fields(name, TypeFieldInfo {
+                            bind(&mut self, name, TypeFieldInfo {
                                 field_names: Vec::new(),
-                                type_name: name.to_string(),
+                                type_name: canonical.clone(),
                                 kind: RecordLitKind::Adt,
                             });
+                            // Multi-ctor ADT children: the ctor set lives in
+                            // sema (inherited verbatim) — bind EACH inherited
+                            // ctor name to the child so expected-type-guided
+                            // construction builds child values.
+                            if merged_names.is_some() {
+                                if let Some(&idx) = self.sema.type_def_index.get(&canonical) {
+                                    let def = &self.sema.type_defs[&idx];
+                                    if !def.bases.is_empty() && def.constructors.len() > 1 {
+                                        for c in def.constructors.iter() {
+                                            let field_names: Vec<String> = c
+                                                .field_names
+                                                .iter()
+                                                .map(|n| n.as_deref().unwrap_or("_").to_string())
+                                                .collect();
+                                            bind(&mut self, c.name.as_ref(), TypeFieldInfo {
+                                                field_names,
+                                                type_name: canonical.clone(),
+                                                kind: RecordLitKind::Adt,
+                                            });
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
                             // Register each constructor name (mapped to the type name)
                             for ctor in constructors {
-                                let field_names: Vec<String> = ctor.fields.iter()
-                                    .map(|f| f.name.unwrap_or("_").to_string())
-                                    .collect();
-                                self.bind_type_fields(ctor.name, TypeFieldInfo {
+                                let field_names: Vec<String> = match &merged_names {
+                                    Some(names) if constructors.len() == 1 => names.clone(),
+                                    _ => ctor.fields.iter()
+                                        .map(|f| f.name.unwrap_or("_").to_string())
+                                        .collect(),
+                                };
+                                bind(&mut self, ctor.name, TypeFieldInfo {
                                     field_names,
-                                    type_name: name.to_string(),
+                                    type_name: canonical.clone(),
                                     kind: RecordLitKind::Adt,
                                 });
                             }
                         }
                         crate::ast::Ast::TypeDef::Newtype { name: nt_name, .. } => {
                             // Newtype: constructor name == type name, kind=Newtype
-                            self.bind_type_fields(nt_name, TypeFieldInfo {
+                            bind(&mut self, nt_name, TypeFieldInfo {
                                 field_names: Vec::new(),
-                                type_name: nt_name.to_string(),
+                                type_name: canonical.clone(),
                                 kind: RecordLitKind::Newtype,
                             });
                         }
@@ -2039,6 +2210,13 @@ impl<'a> IrBuilder<'a> {
                 inst.type_name.as_ref(),
                 inst_idx,
             );
+        }
+
+        // 2d. Compile inherited-method instances (inheritance): base method
+        //     bodies compiled with the child as receiver. Entries in
+        //     method_subgraphs were pre-registered in step 0a-inh.
+        for inst_idx in 0..self.sema.inherited_method_instances.len() {
+            self.compile_inherited_method(inst_idx);
         }
 
         // 3. Compile user module functions (declaring module = the entry module)

@@ -1,131 +1,16 @@
 // IntSet.frond — i64 hash set (part of std.collections)
 //
-// Same table shape as HashSet; keys hash through Hash.mix_i64 (std.core.hash
-// fmix64 mixer) so dense and negative key patterns spread evenly.
+// The i64 fast-path child of Set<i64>: the ONLY override is `hash_of`
+// (Hash.mix_i64 direct integer mixing — no per-op string formatting).
+// Everything else is inherited.
 
 import std.core.hash
 
-type IntSet = IntSet(buckets: i64[][], count: usize) {
-
-    pub fun len(): usize { count }
-
-    pub fun is_empty(): bool { count == 0 }
-
-    pub fun has(key: i64): bool {
-        val row = buckets[(Hash.mix_i64(key) & ((buckets.len() - 1) as u64)) as usize]
-        var i = 0 as usize
-        while i < row.len() {
-            if row[i] == key { return true }
-            i = i + 1
-        }
-        false
-    }
-
-    // Returns true when the key was newly inserted, false when it was present.
-    pub fun &add(key: i64): bool {
-        val slot = (Hash.mix_i64(key) & ((buckets.len() - 1) as u64)) as usize
-        val row = buckets[slot]
-        var i = 0 as usize
-        while i < row.len() {
-            if row[i] == key { return false }
-            i = i + 1
-        }
-        buckets[slot] = row ++ [key]
-        count = count + 1
-        grow_if_needed()
-        true
-    }
-
-    pub fun &remove(key: i64): bool {
-        val slot = (Hash.mix_i64(key) & ((buckets.len() - 1) as u64)) as usize
-        val row = buckets[slot]
-        var kept: i64[] = []
-        var found = false
-        var i = 0 as usize
-        while i < row.len() {
-            if row[i] == key {
-                found = true
-            } else {
-                kept = kept ++ [row[i]]
-            }
-            i = i + 1
-        }
-        if found {
-            buckets[slot] = kept
-            count = count - 1
-        }
-        found
-    }
-
-    pub fun items(): i64[] {
-        var out: i64[] = []
-        var b = 0 as usize
-        while b < buckets.len() {
-            var i = 0 as usize
-            while i < buckets[b].len() {
-                out = out ++ [buckets[b][i]]
-                i = i + 1
-            }
-            b = b + 1
-        }
-        out
-    }
-
-    pub fun entries(): HashIterator<i64> {
-        hash_iter(buckets)
-    }
-
-    pub fun &clear(): void {
-        var fresh: i64[][] = []
-        var i = 0 as usize
-        while i < buckets.len() {
-            var empty: i64[] = []
-            fresh = fresh ++ [empty]
-            i = i + 1
-        }
-        buckets = fresh
-        count = 0
-    }
-
-    fun &grow_if_needed(): void {
-        if count <= buckets.len() * 2 { return }
-        var all: i64[] = []
-        var b = 0 as usize
-        while b < buckets.len() {
-            var i = 0 as usize
-            while i < buckets[b].len() {
-                all = all ++ [buckets[b][i]]
-                i = i + 1
-            }
-            b = b + 1
-        }
-        var fresh: i64[][] = []
-        var j = 0 as usize
-        while j < buckets.len() * 2 {
-            var empty: i64[] = []
-            fresh = fresh ++ [empty]
-            j = j + 1
-        }
-        buckets = fresh
-        var k = 0 as usize
-        while k < all.len() {
-            val key = all[k]
-            val slot = (Hash.mix_i64(key) & ((buckets.len() - 1) as u64)) as usize
-            buckets[slot] = buckets[slot] ++ [key]
-            k = k + 1
-        }
-    }
+type IntSet(Set<i64>) = IntSet() {
+    fun hash_of(key: i64): u64 { Hash.mix_i64(key) }
 }
 
-
-
-pub fun new(): IntSet {
-    var fresh: i64[][] = []
-    var i = 0 as usize
-    while i < 16 {
-        var empty: i64[] = []
-        fresh = fresh ++ [empty]
-        i = i + 1
-    }
-    IntSet(fresh, 0)
+pub fun empty(): IntSet {
+    val empty: i64[] = []
+    IntSet([empty, ..16], 0)
 }

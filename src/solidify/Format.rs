@@ -260,6 +260,32 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
         sections.push((SectionKind::Resources, body));
     }
 
+    // Inheritance links (v8): self-contained string-pair section.
+    {
+        let mut body: Vec<u8> = Vec::new();
+        write_u32(&mut body, graph.inheritance_links.len() as u32);
+        for (child, base) in &graph.inheritance_links {
+            write_u32(&mut body, child.len() as u32);
+            body.extend_from_slice(child.as_bytes());
+            write_u32(&mut body, base.len() as u32);
+            body.extend_from_slice(base.as_bytes());
+        }
+        sections.push((SectionKind::InheritanceLinks, body));
+    }
+
+    // Vtable fallback dispatch (v8).
+    {
+        let mut body: Vec<u8> = Vec::new();
+        write_u32(&mut body, graph.vtable_fallback_dispatch.len() as u32);
+        for ((idx, name), sg) in &graph.vtable_fallback_dispatch {
+            write_u16(&mut body, *idx);
+            write_u32(&mut body, name.len() as u32);
+            body.extend_from_slice(name.as_bytes());
+            write_u32(&mut body, sg.0);
+        }
+        sections.push((SectionKind::VtableFallback, body));
+    }
+
     // ---- per-Node boolean tables (category B; dense bitmaps stay) ----
     ser_bool_table!(sections, n, graph, tail_call_flags, TailCallFlags);
     ser_bool_table!(sections, n, graph, safe_op_flags, SafeOpFlags);
@@ -725,6 +751,53 @@ fn parse_resources_section(mem: &GraphMemory) -> Vec<(Arc<str>, Arc<[u8]>)> {
         let data: Arc<[u8]> = Arc::from(r[p..p + dl].to_vec());
         p += dl;
         out.push((Arc::from(name), data));
+    }
+    out
+}
+
+/// Parses the v8 InheritanceLinks section (self-contained
+/// `[count u32]{ child_len, child, base_len, base }` string pairs).
+fn parse_inheritance_links_section(mem: &GraphMemory) -> Vec<(Box<str>, Box<str>)> {
+    if !mem.has_section(SectionKind::InheritanceLinks) {
+        return Vec::new();
+    }
+    let r = mem.section(SectionKind::InheritanceLinks);
+    let count = u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut p = 4usize;
+    for _ in 0..count {
+        let cl = u32::from_le_bytes([r[p], r[p + 1], r[p + 2], r[p + 3]]) as usize;
+        p += 4;
+        let child = String::from_utf8_lossy(&r[p..p + cl]).into_owned();
+        p += cl;
+        let bl = u32::from_le_bytes([r[p], r[p + 1], r[p + 2], r[p + 3]]) as usize;
+        p += 4;
+        let base = String::from_utf8_lossy(&r[p..p + bl]).into_owned();
+        p += bl;
+        out.push((child.into(), base.into()));
+    }
+    out
+}
+
+/// Parses the v8 VtableFallback section: (idx, type_name) -> SubGraphId.
+fn parse_vtable_fallback_section(mem: &GraphMemory) -> rustc_hash::FxHashMap<(u16, Box<str>), crate::ir::Ir::SubGraphId> {
+    let mut out = rustc_hash::FxHashMap::default();
+    if !mem.has_section(SectionKind::VtableFallback) {
+        return out;
+    }
+    let r = mem.section(SectionKind::VtableFallback);
+    let count = u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as usize;
+    let mut p = 4usize;
+    for _ in 0..count {
+        let idx = u16::from_le_bytes([r[p], r[p + 1]]);
+        p += 2;
+        let nl = u32::from_le_bytes([r[p], r[p + 1], r[p + 2], r[p + 3]]) as usize;
+        p += 4;
+        let name = String::from_utf8_lossy(&r[p..p + nl]).into_owned();
+        p += nl;
+        let sg = u32::from_le_bytes([r[p], r[p + 1], r[p + 2], r[p + 3]]);
+        p += 4;
+        out.insert((idx, name.into()), crate::ir::Ir::SubGraphId(sg));
     }
     out
 }
@@ -1241,7 +1314,8 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         cast_target_types,
         memo_infos,
         memo_tables,
-        vtable_fallback_dispatch: rustc_hash::FxHashMap::default(),
+        vtable_fallback_dispatch: parse_vtable_fallback_section(&mem),
+        inheritance_links: parse_inheritance_links_section(&mem),
         sg_debug_names: Vec::new(),
         string_pool,
         mem: None,
@@ -1645,7 +1719,8 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         cast_target_types,
         memo_infos,
         memo_tables,
-        vtable_fallback_dispatch: rustc_hash::FxHashMap::default(),
+        vtable_fallback_dispatch: parse_vtable_fallback_section(&mem),
+        inheritance_links: parse_inheritance_links_section(&mem),
         sg_debug_names: Vec::new(),
         string_pool,
         mem: Some(mem),

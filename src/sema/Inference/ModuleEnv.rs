@@ -203,6 +203,16 @@ impl<'a> InferContext<'a> {
                     continue;
                 }
                 let full_path = module_path.join(".");
+                // Import bookkeeping for module-scoped TYPE resolution: map
+                // the import spelling to the logical paths of the user
+                // modules it names (exact or tail-segment match — `import
+                // Counter` → `src.Counter`). std imports are skipped: std
+                // types live on the bare-key fallback.
+                crate::sema::Sema::record_module_import(
+                    &mut self.sema_result,
+                    module.name,
+                    &full_path,
+                );
                 // Ensure the imported module's hierarchy env exists (including intermediate path
                 // prefixes and first-segment ModuleRef registration).
                 let module_env = self.ensure_module_env(&full_path, env);
@@ -275,6 +285,15 @@ impl<'a> InferContext<'a> {
                                 if let Some(sym_ty) =
                                     self.sema_result.env.lookup_local(origin_env, &name)
                                 {
+                                    if std::env::var("FROND_TRACE_CTOR").is_ok()
+                                        && (name == "HashMap" || name == "Map" || name == "empty")
+                                    {
+                                        eprintln!(
+                                            "[import-reexport] import={} origin={} name={} -> {:?}",
+                                            full_path, origin, name,
+                                            self.arena.get(self.arena.resolve(sym_ty))
+                                        );
+                                    }
                                     self.sema_result.env.define(env, &name, sym_ty);
                                 }
                             }
@@ -369,23 +388,48 @@ impl<'a> InferContext<'a> {
         for decl in module.declarations.iter() {
             if let Decl::TypeDecl { name, implemented_traits, methods, .. } = &decl.node {
                 // Look up type_id (using type_def_index + FIRST_DYNAMIC_TYPE_ID offset).
+                // The AST name resolves to its module-scoped canonical key.
+                let canonical = self.sema_result.resolve_type_key(name);
                 let type_id = self
                     .sema_result
                     .type_def_index
-                    .get(*name)
+                    .get(canonical.as_str())
                     .map(|&idx| dynamic_type_id(idx));
 
                 if let Some(tid) = type_id {
-                    // Register a witness entry for each implemented trait.
+                    // Register a witness entry for each implemented trait
+                    // (module-scoped canonical trait key).
                     for impl_trait in implemented_traits.iter() {
-                        let trait_name = impl_trait.trait_name.to_string();
+                        let trait_name = self.sema_result.resolve_trait_key(impl_trait.trait_name);
+                        // Unknown trait names must fail here — a silent miss
+                        // registers no witness and every method call on the
+                        // trait's surface would fail cryptically at dispatch.
+                        if self.sema_result.get_trait_def(&trait_name).is_none() {
+                            let sp = decl.span;
+                            self.add_error_at(
+                                &format!(
+                                    "type '{}' implements unknown trait '{}' (declared before use? traits must exist)",
+                                    *name, trait_name
+                                ),
+                                sp.line,
+                                sp.column,
+                            );
+                            continue;
+                        }
                         // Collect method slots: method_name → method_idx (position in TypeDefInfo.methods).
                         let method_slots: Vec<(String, u16)> = methods
                             .iter()
                             .enumerate()
                             .map(|(i, m)| (m.name.to_string(), i as u16))
                             .collect();
-                        impls.push((trait_name, name.to_string(), method_slots));
+                        impls.push((trait_name.clone(), name.to_string(), method_slots.clone()));
+                        // Witness transitivity (trait inheritance): implementing
+                        // a child trait is also a witness for every transitive
+                        // PARENT trait — parent defaults specialize for this
+                        // type and parent-typed params accept it.
+                        for pt in self.sema_result.trait_parent_closure(&trait_name) {
+                            impls.push((pt.to_string(), name.to_string(), method_slots.clone()));
+                        }
                         let _ = tid; // tid is used in the loop below.
                     }
                 }
@@ -394,11 +438,13 @@ impl<'a> InferContext<'a> {
 
         // Register into the witness table.
         for (trait_name, type_name, method_slots_vec) in impls {
-            // Re-query type_id (the previous borrow has been released).
+            // Re-query type_id (the previous borrow has been released);
+            // module-scoped canonical key.
+            let canonical = self.sema_result.resolve_type_key(&type_name);
             let type_id = self
                 .sema_result
                 .type_def_index
-                .get(type_name.as_str())
+                .get(canonical.as_str())
                 .map(|&idx| dynamic_type_id(idx));
             if let Some(tid) = type_id {
                 let mut slots = FxHashMap::default();
@@ -406,7 +452,7 @@ impl<'a> InferContext<'a> {
                     slots.insert(method_name.into_boxed_str(), method_idx);
                 }
                 self.witness_table
-                    .register(&trait_name, tid, &type_name, slots);
+                    .register(&trait_name, tid, &canonical, slots);
                 // Record module ownership for incremental purge (witness key).
                 let mod_name = self.current_module_name.clone();
                 self.sema_result.module_ownership.witness_keys
@@ -563,24 +609,117 @@ impl<'a> InferContext<'a> {
                         self.pop_type_bindings();
                     }
                 }
-                Decl::TypeDecl { name, type_params, def, .. } => {
-                    // Predeclare the type constructor.
+                Decl::TypeDecl { name, type_params, base_types, def, .. } => {
+                    // Predeclare the type constructor. The self type uses the
+                    // module-scoped CANONICAL name (user modules are
+                    // module-qualified) so Adt identity matches registration.
+                    // Generic types bind their type params here (mirroring
+                    // check_decl): ctor field types then resolve `T` to the
+                    // rigid param instead of a junk named Adt, and the return
+                    // carries the parameterized shape — the predeclare binding
+                    // is now signature-identical to check_decl's, so the
+                    // first-wins define order is benign.
+                    let canonical: Box<str> = self.sema_result.resolve_type_key(name).into();
+                    if !type_params.is_empty() {
+                        self.push_type_bindings(
+                            &type_params.iter().map(|tp| {
+                                (tp.name, tp.kind.as_ref().map(|k| SemKind::from_ast(k)))
+                            }).collect::<Vec<_>>(),
+                        );
+                    }
                     let self_ty = if type_params.is_empty() {
-                        self.arena.make_adt((*name).into(), Box::new([]))
+                        self.arena.make_adt(canonical.clone(), Box::new([]))
                     } else {
-                        // Generic type: predeclare with a rigid var.
-                        self.arena.fresh_rigid_var()
+                        let type_args: Vec<TypeHandle> = type_params.iter()
+                            .map(|tp| self.lookup_type_binding(tp.name)
+                                .unwrap_or_else(|| self.arena.fresh_rigid_var()))
+                            .collect();
+                        self.arena.make_adt(canonical.clone(), type_args.into_boxed_slice())
                     };
-                    // Constructors are registered into root_env (not module_env):
-                    // constructors are companion symbols of the type, at the same naming level,
-                    // and must use redefine to overwrite the ModuleRef alias previously registered
-                    // by register_module_aliases, so `DateTime(...)` resolves to the constructor
-                    // rather than the ModuleRef.
+                    // Inheritance: the child's registered CtorDefInfo carries
+                    // the MERGED field list (base fields + own) while the AST
+                    // ctor shows only the own fields (`= Child()` has none) —
+                    // build the ctor fn type from sema's merged view so the
+                    // env binding is callable with the full signature.
+                    let merged_ctor_reprs: Option<Vec<TypeRepr>> = if base_types.is_empty() {
+                        None
+                    } else if std::env::var("FROND_TRACE_CTOR").is_ok() {
+                        eprintln!("[predeclare-merge] type {} bases={:?}", name, base_types.iter().map(|b| b.trait_name).collect::<Vec<_>>());
+                        self.sema_result
+                            .get_type_def(*name)
+                            .and_then(|d| d.constructors.first())
+                            .map(|c| c.field_type_reprs.to_vec())
+                    } else {
+                        self.sema_result
+                            .get_type_def(*name)
+                            .and_then(|d| d.constructors.first())
+                            .map(|c| c.field_type_reprs.to_vec())
+                    };
+                    // Constructors: std/builtin modules keep the historical
+                    // root_env `redefine` (they own the bare-name layer and
+                    // must override module aliases like `DateTime`). USER
+                    // modules bind into their own module_env — env-chain
+                    // lookup then shadows the root/std binding, so a local
+                    // `type List` with constructor `List` wins inside the
+                    // module without clobbering the std ctor for everyone —
+                    // plus a first-wins root_env define for the legacy
+                    // cross-module bare-call compatibility.
+                    let is_stdlib_mod = module
+                        .name
+                        .starts_with("std/")
+                        || module.name.starts_with("builtin/");
                     match def {
                         crate::ast::Ast::TypeDef::Adt { constructors } => {
                             for ctor in constructors.iter() {
-                                let ctor_fn_ty = self.build_ctor_fn_type(ctor, name, &module.arena);
-                                self.sema_result.env.redefine(root_env, ctor.name, ctor_fn_ty);
+                                let ctor_fn_ty = match &merged_ctor_reprs {
+                                    Some(reprs) => {
+                                        // Merged view: (inherited + own fields) -> Child.
+                                        // Return is always a plain Adt (matches
+                                        // build_ctor_fn_type — a rigid-var self_ty here
+                                        // defeats Path 0b's ctor-receiver module-fn
+                                        // fallback for generic children).
+                                        let child_adt = self.arena.make_adt(canonical.clone(), Box::new([]));
+                                        let param_types: Vec<TypeHandle> = reprs
+                                            .iter()
+                                            .map(|r| self.type_repr_to_handle(r))
+                                            .collect();
+                                        if param_types.is_empty() {
+                                            child_adt
+                                        } else {
+                                            self.arena.make_fn(param_types.into_boxed_slice(), child_adt)
+                                        }
+                                    }
+                                    None => {
+                                        // Mirror check_decl's binding: params
+                                        // from the AST (type params bound
+                                        // above), return = self_ty (the
+                                        // parameterized shape for generics);
+                                        // nullary ctors bind as the value.
+                                        let param_types: Vec<TypeHandle> = ctor
+                                            .fields
+                                            .iter()
+                                            .map(|f| self.type_from_ast(f.ty, &module.arena))
+                                            .collect();
+                                        if param_types.is_empty() {
+                                            self_ty
+                                        } else {
+                                            self.arena.make_fn(
+                                                param_types.into_boxed_slice(),
+                                                self_ty,
+                                            )
+                                        }
+                                    }
+                                };
+                                if is_stdlib_mod {
+                                    self.sema_result.env.redefine(root_env, ctor.name, ctor_fn_ty);
+                                } else {
+                                    self.sema_result.env.define(module_env, ctor.name, ctor_fn_ty);
+                                    self.sema_result.env.define(root_env, ctor.name, ctor_fn_ty);
+                                }
+                                if std::env::var("FROND_TRACE_CTOR").is_ok() {
+                                    let back = self.sema_result.env.lookup(root_env, ctor.name);
+                                    eprintln!("[predeclare-bind] {} -> {:?}", ctor.name, back.map(|t| self.arena.get(self.arena.resolve(t))));
+                                }
                                 // Record constructor short name → module env (Zig @This semantics),
                                 // so `TypeName.free_func(args)` can fall back to lookup a
                                 // in-module free function.
@@ -594,13 +733,21 @@ impl<'a> InferContext<'a> {
                                 vec![inner_ty].into_boxed_slice(),
                                 self_ty,
                             );
-                            self.sema_result.env.redefine(root_env, ctor_name, ctor_fn_ty);
+                            if is_stdlib_mod {
+                                self.sema_result.env.redefine(root_env, ctor_name, ctor_fn_ty);
+                            } else {
+                                self.sema_result.env.define(module_env, ctor_name, ctor_fn_ty);
+                                self.sema_result.env.define(root_env, ctor_name, ctor_fn_ty);
+                            }
                             // Record constructor short name → module env (Zig @This semantics),
                             // so `TypeName.free_func(args)` can fall back to lookup a
                             // in-module free function.
                             self.ctor_module_envs.insert(ctor_name.to_string(), module_env);
                         }
                         _ => {}
+                    }
+                    if !type_params.is_empty() {
+                        self.pop_type_bindings();
                     }
                     let _ = self_ty;
                 }
@@ -900,10 +1047,10 @@ impl<'a> InferContext<'a> {
                     let _ = self.infer_expr(*expr, ast, env, None);
                 }
             }
-            Decl::TypeDecl { name, type_params, def, implemented_traits, methods, .. } => {
+            Decl::TypeDecl { name, type_params, base_types, def, implemented_traits, methods, .. } => {
                 // Register the nested type definition into sema_result (so constructor calls are
                 // recognized during type checking).
-                ast_type_decl_to_type_def(self.arena, self.sema_result, *name, type_params, def, ast, decl_span, &self.current_module_name);
+                ast_type_decl_to_type_def(self.arena, self.sema_result, *name, type_params, base_types, def, ast, decl_span, &self.current_module_name);
                 // Register methods into TypeDefInfo.methods (indexed by method_idx).
                 // This mirrors what `populate_module` does for top-level TypeDecls. Without this,
                 // `lookup_method_idx` cannot find local-type methods and IR dispatch returns void.
@@ -920,9 +1067,11 @@ impl<'a> InferContext<'a> {
                         }).collect::<Vec<_>>(),
                     );
                 }
-                // Build the ADT type handle.
+                // Build the ADT type handle (canonical name — module-qualified
+                // for user modules, matching registration).
+                let canonical: Box<str> = self.sema_result.resolve_type_key(name).into();
                 let self_ty = if type_params.is_empty() {
-                    self.arena.make_adt((*name).into(), Box::new([]))
+                    self.arena.make_adt(canonical.clone(), Box::new([]))
                 } else {
                     // Generic type: build Adt { name, type_args: [rigid_T, ...] }.
                     // Use the rigid var from type_binding_stack as type_args, to avoid producing
@@ -931,7 +1080,7 @@ impl<'a> InferContext<'a> {
                         .map(|tp| self.lookup_type_binding(tp.name)
                             .unwrap_or_else(|| self.arena.fresh_type_var()))
                         .collect();
-                    self.arena.make_adt((*name).into(), type_args.into_boxed_slice())
+                    self.arena.make_adt(canonical.clone(), type_args.into_boxed_slice())
                 };
                 // Register constructor function types into the current env (so Call expressions
                 // can find the constructors).
@@ -947,18 +1096,47 @@ impl<'a> InferContext<'a> {
                         self.sema_result.env.define(env, *name, fn_ty);
                     }
                     crate::ast::Ast::TypeDef::Adt { constructors } => {
+                        // Inheritance: children with bases bind the ctor fn type
+                        // from sema's MERGED ctor (base fields + own) — the AST
+                        // ctor only shows own fields (`= Child()` has none), so
+                        // the AST-derived binding would shadow predeclare's
+                        // merged Fn with a bare Adt value type.
+                        let merged_reprs: Option<Vec<TypeRepr>> = if base_types.is_empty() {
+                            None
+                        } else {
+                            self.sema_result
+                                .get_type_def(*name)
+                                .and_then(|d| d.constructors.first())
+                                .map(|c| c.field_type_reprs.to_vec())
+                        };
                         for ctor in constructors {
-                            let param_types: Vec<TypeHandle> = ctor.fields.iter().map(|f| {
-                                self.type_from_ast(f.ty, ast)
-                            }).collect();
-                            let fn_ty = if param_types.is_empty() {
-                                // Zero-argument variants are values, not functions.
-                                self_ty
-                            } else {
-                                self.arena.make_fn(
-                                    param_types.into_boxed_slice(),
-                                    self_ty,
-                                )
+                            let fn_ty = match &merged_reprs {
+                                Some(reprs) => {
+                                    let child_adt = self.arena.make_adt(canonical.clone(), Box::new([]));
+                                    let param_types: Vec<TypeHandle> = reprs
+                                        .iter()
+                                        .map(|r| self.type_repr_to_handle(r))
+                                        .collect();
+                                    if param_types.is_empty() {
+                                        child_adt
+                                    } else {
+                                        self.arena.make_fn(param_types.into_boxed_slice(), child_adt)
+                                    }
+                                }
+                                None => {
+                                    let param_types: Vec<TypeHandle> = ctor.fields.iter().map(|f| {
+                                        self.type_from_ast(f.ty, ast)
+                                    }).collect();
+                                    if param_types.is_empty() {
+                                        // Zero-argument variants are values, not functions.
+                                        self_ty
+                                    } else {
+                                        self.arena.make_fn(
+                                            param_types.into_boxed_slice(),
+                                            self_ty,
+                                        )
+                                    }
+                                }
                             };
                             self.sema_result.env.define(env, ctor.name, fn_ty);
                         }
@@ -970,9 +1148,22 @@ impl<'a> InferContext<'a> {
                 // Expose the implemented trait names to method-body inference:
                 // `super.method(...)` resolves against the trait-default layer of
                 // these traits (see infer_super_method_call).
-                self.current_type_decl_traits = Some(
-                    implemented_traits.iter().map(|t| t.trait_name.into()).collect(),
-                );
+                self.current_type_decl_traits = Some({
+                    // Canonical keys — matches registration and the witness
+                    // table (module-scoped resolution).
+                    let mut ts: Vec<Box<str>> = implemented_traits
+                        .iter()
+                        .map(|t| self.sema_result.resolve_trait_key(t.trait_name).into_boxed_str())
+                        .collect();
+                    for t in ts.clone() {
+                        for pt in self.sema_result.trait_parent_closure(t.as_ref()) {
+                            if !ts.iter().any(|x| x.as_ref() == pt.as_ref()) {
+                                ts.push(pt);
+                            }
+                        }
+                    }
+                    ts
+                });
                 // First register all methods as functions into env (supports bare-name method
                 // call syntax `method(recv, args)`), then check method bodies (avoids
                 // forward-reference issues).
@@ -1073,10 +1264,10 @@ impl<'a> InferContext<'a> {
                     self.pop_type_bindings();
                 }
             }
-            Decl::TraitDecl { name, type_params, methods, .. } => {
+            Decl::TraitDecl { name, type_params, parents, methods, .. } => {
                 // Register the nested trait definition into sema_result (so trait type
                 // annotations are recognized).
-                ast_trait_decl_to_trait_def(self.arena, self.sema_result, name, methods, ast);
+                ast_trait_decl_to_trait_def(self.arena, self.sema_result, name, parents, methods, ast, &self.current_module_name);
                 // Type parameter bindings (including kind registration): so references to
                 // generic parameters inside the trait block can be resolved from
                 // type_binding_stack.
@@ -1088,7 +1279,11 @@ impl<'a> InferContext<'a> {
                     );
                 }
                 let self_var = self.push_this_type_var();
-                self.current_trait_name = Some((*name).to_string().into_boxed_str());
+                // Canonical trait key — matches registration (user-module
+                // traits are module-qualified).
+                self.current_trait_name = Some(
+                    self.sema_result.resolve_trait_key(name).into_boxed_str(),
+                );
                 for method in methods.iter() {
                     if let Some(body) = method.body {
                         let method_env = self.sema_result.env.child(env);

@@ -47,14 +47,42 @@ impl<'a> InferContext<'a> {
             None
         };
 
+        // No-downgrade merge: fixpoint iterations re-store ExprInfos; a
+        // later pass must not replace a CONCRETE type_name with None (solver
+        // rollbacks stored unresolved vars over previously-concrete calls —
+        // observed: zero-arg ctor receivers losing their dispatch type).
+        let new_name_is_none = type_name.is_none();
+        let keep_prev = new_name_is_none
+            && self
+                .sema_result
+                .expr_types
+                .get(&key)
+                .and_then(|prev| prev.type_name.as_ref())
+                .is_some();
         let info = ExprInfo {
-            ty: resolved,
+            ty: if keep_prev { self.sema_result.expr_types[&key].ty } else { resolved },
             const_val: None,
             expr_id: expr.0 as u64,
-            type_name: type_name.map(|s| s.into_boxed_str()),
-            is_trait_object,
-            is_ref_type: is_ref,
-            is_raw_ref,
+            type_name: if keep_prev {
+                self.sema_result.expr_types[&key].type_name.clone()
+            } else {
+                type_name.map(|s| s.into_boxed_str())
+            },
+            is_trait_object: if keep_prev {
+                self.sema_result.expr_types[&key].is_trait_object
+            } else {
+                is_trait_object
+            },
+            is_ref_type: if keep_prev {
+                self.sema_result.expr_types[&key].is_ref_type
+            } else {
+                is_ref
+            },
+            is_raw_ref: if keep_prev {
+                self.sema_result.expr_types[&key].is_raw_ref
+            } else {
+                is_raw_ref
+            },
             implicit_this,
         };
 

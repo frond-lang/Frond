@@ -780,13 +780,16 @@ impl<'a> IrBuilder<'a> {
                         Some(construct_node)
                     }
                     crate::ast::Ast::Decl::TypeDecl { name, def, .. } => {
-                        // Register nested type fields into the current scope (unified with top-level types via type_scope_stack lookup)
+                        // Register nested type fields into the current scope (unified with top-level types via type_scope_stack lookup).
+                        // Canonical type name (module-qualified for user modules) —
+                        // matches registration and the runtime identity.
+                        let canonical: String = self.sema.resolve_type_key(name);
                         match def {
                             crate::ast::Ast::TypeDef::Record { fields } => {
                                 let field_names: Vec<String> = fields.iter().map(|f| f.name.to_string()).collect();
                                 self.bind_type_fields(name, TypeFieldInfo {
                                     field_names,
-                                    type_name: name.to_string(),
+                                    type_name: canonical.clone(),
                                     kind: RecordLitKind::Record,
                                 });
                             }
@@ -794,7 +797,7 @@ impl<'a> IrBuilder<'a> {
                                 // Register the type name + each constructor name (mapped to the type name)
                                 self.bind_type_fields(name, TypeFieldInfo {
                                     field_names: Vec::new(),
-                                    type_name: name.to_string(),
+                                    type_name: canonical.clone(),
                                     kind: RecordLitKind::Adt,
                                 });
                                 for ctor in constructors {
@@ -803,7 +806,7 @@ impl<'a> IrBuilder<'a> {
                                         .collect();
                                     self.bind_type_fields(ctor.name, TypeFieldInfo {
                                         field_names,
-                                        type_name: name.to_string(),
+                                        type_name: canonical.clone(),
                                         kind: RecordLitKind::Adt,
                                     });
                                 }
@@ -811,7 +814,7 @@ impl<'a> IrBuilder<'a> {
                             crate::ast::Ast::TypeDef::Newtype { name: nt_name, .. } => {
                                 self.bind_type_fields(nt_name, TypeFieldInfo {
                                     field_names: Vec::new(),
-                                    type_name: nt_name.to_string(),
+                                    type_name: canonical.clone(),
                                     kind: RecordLitKind::Newtype,
                                 });
                             }

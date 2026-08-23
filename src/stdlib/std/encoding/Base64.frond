@@ -1,0 +1,27 @@
+// Base64.frond — base64 encoding (part of std.encoding)
+//
+// Standard alphabet (RFC 4648 §4: A-Z a-z 0-9 + /) with mandatory '='
+// padding on encode. decode is strict: null on wrong length (mod 4),
+// invalid characters, '=' anywhere but the tail, or more than two pad
+// characters. Round-trip guarantee: decode(encode(data)) == data.
+//
+// The inner loops are the C kernel __b64_encode/__b64_decode
+// (builtin/encoding/Raw.frond); this facade sizes the output (the decode
+// buffer is the 3-per-group worst case, sliced down to the returned count)
+// and maps the kernel's -1 to null.
+
+pub fun encode(data: u8[]): str {
+    var out_len = (data.len() / 3) * 4
+    if data.len() % 3 != 0 { out_len = out_len + 4 }
+    var out: u8[] = [0, ..out_len]
+    __b64_encode(out, data)
+    out as str
+}
+
+pub fun decode(s: str): u8[]? {
+    if s.len() % 4 != 0 { return null }
+    var out: u8[] = [0, ..(s.len() / 4) * 3]
+    val n = __b64_decode(out, s)
+    if n < 0 { return null }
+    out[0..n as usize]
+}

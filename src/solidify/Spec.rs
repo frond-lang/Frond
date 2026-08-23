@@ -229,6 +229,14 @@ pub enum SectionKind {
     /// Lib interop (v4): Lib.embed build-time resources, self-contained layout
     /// `[count u32]{ name_len u32, name bytes, data_len u32, data bytes }`.
     Resources = 64,
+    /// Inheritance links (v8): `[count u32]{ child_len u32, child bytes,
+    /// base_len u32, base bytes }` — sema TypeDefInfo.bases pairs for runtime
+    /// match-arm disambiguation (ADT children inherit the base's ctor set).
+    InheritanceLinks = 65,
+    /// Vtable fallback dispatch (v8): `[count]{ idx u16, name_len u32, name,
+    /// sg u32 }` — closes the artifact-mode gap where dynamic dispatch
+    /// (trait-typed params + inheritance base-typed receivers) lost its table.
+    VtableFallback = 66,
     // Inline C FFI (compiled by frond build → cc → object extraction)
     CMachineCode = 70,
     CSymbols = 71,
@@ -382,6 +390,11 @@ impl GraphMemory {
 
     /// Returns the header.
     pub fn header(&self) -> &SolidifyHeader { &self.header }
+
+    /// Whether a section of this kind is present.
+    pub fn has_section(&self, kind: SectionKind) -> bool {
+        self.sections.contains_key(&(kind as u8))
+    }
 
     /// Returns the byte slice of the specified section.
     pub fn section(&self, kind: SectionKind) -> &[u8] {
