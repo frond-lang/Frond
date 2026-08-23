@@ -454,7 +454,9 @@ impl<'a> InferContext<'a> {
         type_name: &str,
         ctor_name: &str,
     ) -> Option<(Box<str>, Box<[TypeRepr]>)> {
-        let &type_idx = self.sema_result.type_def_index.get(type_name)?;
+        // Module-scoped: the AST type segment resolves to its canonical key.
+        let canonical = self.sema_result.resolve_type_key(type_name);
+        let &type_idx = self.sema_result.type_def_index.get(&canonical)?;
         let type_def = &self.sema_result.type_defs[&type_idx];
         let ctor = type_def
             .constructors
@@ -495,7 +497,10 @@ impl<'a> InferContext<'a> {
                     if !is_throw && has_ok_arm {
                         // Check whether the scrutinee implements the Err trait (via the witness table).
                         let implements_err = self.arena.type_name(resolved_scrutinee)
-                            .and_then(|tn| self.sema_result.type_def_index.get(tn).copied())
+                            .and_then(|tn| {
+                                let canonical = self.sema_result.resolve_type_key(tn);
+                                self.sema_result.type_def_index.get(&canonical).copied()
+                            })
                             .map(|idx| self.witness_table.implements("Err", dynamic_type_id(idx)))
                             .unwrap_or(false);
                         let widened = if implements_err {
@@ -519,7 +524,7 @@ impl<'a> InferContext<'a> {
 
                 let mut arm_tys: Vec<TypeHandle> = Vec::new();
                 for arm in arms.iter() {
-                    let child_env = self.env.child(env);
+                    let child_env = self.sema_result.env.child(env);
 
                     // sema v2: enter the match-arm scope and apply ConstructorMatch narrowing.
                     self.flow_ctx.push_scope();
@@ -623,7 +628,7 @@ impl<'a> InferContext<'a> {
                         );
                     }
                 } else {
-                    self.env.define(env, name, expected_ty);
+                    self.sema_result.env.define(env, name, expected_ty);
                 }
             }
             Pattern::Constructor { name, patterns } => {

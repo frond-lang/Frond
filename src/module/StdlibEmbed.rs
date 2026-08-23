@@ -42,6 +42,7 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     ("builtin/error/OsError.frond", include_str!("../stdlib/builtin/error/OsError.frond")),
     ("builtin/error/FfiError.frond", include_str!("../stdlib/builtin/error/FfiError.frond")),
     ("builtin/error/JsonError.frond", include_str!("../stdlib/builtin/error/JsonError.frond")),
+    ("builtin/error/FmtError.frond", include_str!("../stdlib/builtin/error/FmtError.frond")),
     // reflect module (runtime reflection, Raw.frond primitives + Reflect.frond wrapper)
     ("builtin/reflect/pack.frond", include_str!("../stdlib/builtin/reflect/pack.frond")),
     ("builtin/reflect/Raw.frond", include_str!("../stdlib/builtin/reflect/Raw.frond")),
@@ -67,6 +68,15 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     // rand module (PRNG step primitive)
     ("builtin/rand/pack.frond", include_str!("../stdlib/builtin/rand/pack.frond")),
     ("builtin/rand/Raw.frond", include_str!("../stdlib/builtin/rand/Raw.frond")),
+    // mem module (u8[] buffer primitives over libc mem*)
+    ("builtin/mem/pack.frond", include_str!("../stdlib/builtin/mem/pack.frond")),
+    ("builtin/mem/Raw.frond", include_str!("../stdlib/builtin/mem/Raw.frond")),
+    // sort module (array sort/sort_by + sorted-array search, method form)
+    ("builtin/sort/pack.frond", include_str!("../stdlib/builtin/sort/pack.frond")),
+    ("builtin/sort/Raw.frond", include_str!("../stdlib/builtin/sort/Raw.frond")),
+    ("builtin/encoding/pack.frond", include_str!("../stdlib/builtin/encoding/pack.frond")),
+    ("builtin/encoding/Raw.frond", include_str!("../stdlib/builtin/encoding/Raw.frond")),
+    ("builtin/sort/Sort.frond", include_str!("../stdlib/builtin/sort/Sort.frond")),
 ];
 
 /// Standard library module file manifest (requires `import std.xxx` to load).
@@ -131,24 +141,40 @@ pub const STD_FILES: &[StdlibFile] = &[
     ("std/core/types/U128.frond", include_str!("../stdlib/std/core/types/U128.frond")),
     ("std/core/types/Usize.frond", include_str!("../stdlib/std/core/types/Usize.frond")),
     ("std/core/types/Isize.frond", include_str!("../stdlib/std/core/types/Isize.frond")),
+    // fmt sub-library of std/core: number formatting (radix 2..36, padding)
+    ("std/core/fmt/pack.frond", include_str!("../stdlib/std/core/fmt/pack.frond")),
+    ("std/core/fmt/Fmt.frond", include_str!("../stdlib/std/core/fmt/Fmt.frond")),
+    // hash sub-library of std/core: algorithm collection (FNV/CRC32/Adler32/xxHash64)
+    ("std/core/hash/pack.frond", include_str!("../stdlib/std/core/hash/pack.frond")),
+    ("std/core/hash/Hash.frond", include_str!("../stdlib/std/core/hash/Hash.frond")),
+    ("std/core/hash/Crc32.frond", include_str!("../stdlib/std/core/hash/Crc32.frond")),
+    ("std/core/hash/Adler32.frond", include_str!("../stdlib/std/core/hash/Adler32.frond")),
+    ("std/core/hash/Xxh64.frond", include_str!("../stdlib/std/core/hash/Xxh64.frond")),
+    // mem sub-library of std/core: generic T[] container primitives
+    ("std/core/mem/pack.frond", include_str!("../stdlib/std/core/mem/pack.frond")),
+    ("std/core/mem/Mem.frond", include_str!("../stdlib/std/core/mem/Mem.frond")),
     // rand module (PRNG wrappers over builtin/rand)
     ("std/rand/pack.frond", include_str!("../stdlib/std/rand/pack.frond")),
     ("std/rand/Rand.frond", include_str!("../stdlib/std/rand/Rand.frond")),
-    // codec module (pure Frond hex/base64 byte-text codecs)
-    ("std/codec/pack.frond", include_str!("../stdlib/std/codec/pack.frond")),
-    ("std/codec/Hex.frond", include_str!("../stdlib/std/codec/Hex.frond")),
-    ("std/codec/Base64.frond", include_str!("../stdlib/std/codec/Base64.frond")),
     // json module (pure Frond; layered: value ADT / parser / serializer)
     ("std/json/pack.frond", include_str!("../stdlib/std/json/pack.frond")),
     ("std/json/Json.frond", include_str!("../stdlib/std/json/Json.frond")),
     ("std/json/Parse.frond", include_str!("../stdlib/std/json/Parse.frond")),
     ("std/json/Format.frond", include_str!("../stdlib/std/json/Format.frond")),
-    // collections module (pure Frond hash containers: str/i64 keyed maps & sets)
+    // collections module (pure Frond containers: List + str/i64 keyed maps & sets)
     ("std/collections/pack.frond", include_str!("../stdlib/std/collections/pack.frond")),
+    ("std/collections/List.frond", include_str!("../stdlib/std/collections/List.frond")),
+    ("std/collections/ArrayList.frond", include_str!("../stdlib/std/collections/ArrayList.frond")),
+    ("std/collections/LinkedList.frond", include_str!("../stdlib/std/collections/LinkedList.frond")),
+    ("std/collections/Map.frond", include_str!("../stdlib/std/collections/Map.frond")),
+    ("std/collections/Set.frond", include_str!("../stdlib/std/collections/Set.frond")),
     ("std/collections/HashMap.frond", include_str!("../stdlib/std/collections/HashMap.frond")),
     ("std/collections/IntMap.frond", include_str!("../stdlib/std/collections/IntMap.frond")),
     ("std/collections/HashSet.frond", include_str!("../stdlib/std/collections/HashSet.frond")),
     ("std/collections/IntSet.frond", include_str!("../stdlib/std/collections/IntSet.frond")),
+    ("std/encoding/pack.frond", include_str!("../stdlib/std/encoding/pack.frond")),
+    ("std/encoding/Hex.frond", include_str!("../stdlib/std/encoding/Hex.frond")),
+    ("std/encoding/Base64.frond", include_str!("../stdlib/std/encoding/Base64.frond")),
 ];
 
 /// Looks up a stdlib file by path.

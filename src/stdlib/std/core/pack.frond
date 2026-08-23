@@ -6,4 +6,11 @@
 // (`import std.core.types`).
 //
 //   types/  — value-type namespaces: Str, I8..I128, U8..U128, F16..F128, Bool
+//   fmt/    — number formatting: integer radix 2..36, hex/oct/bin, padding
+//   hash/   — hash algorithm collection: FNV-1a, CRC-32, Adler-32, xxHash64
+//             (+ the collections key scheme and fmix64 mixer in Hash)
+//   mem/    — T[] container primitives: fill/copy/swap/reverse/repeat/equal
 pub pack types
+pub pack fmt
+pub pack hash
+pub pack mem

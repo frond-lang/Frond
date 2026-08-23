@@ -1,0 +1,10 @@
+// std/core/mem package declaration
+//
+// Generic T[] container primitives, one pack:
+//
+//   Mem — fill/copy/swap/reverse/repeat/equal over any T[], with a u8[]
+//         libc fast path; clone (deep copy) joins once the reflect intrinsic
+//         exposing the engine's deep_clone lands.
+//
+// One import (`import std.core.mem`) exposes every entry (Mem.fill, ...).
+pub pack Mem

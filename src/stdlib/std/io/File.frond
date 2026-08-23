@@ -158,7 +158,7 @@ pub type File = File(fd: i64, pub path: Path, mode: OpenMode, is_closed: bool) {
             val chunk = buf[written..len]
             val n = write(chunk, chunk.len()).await()?
             if n == 0 {
-                throw IOError(BrokenPipe, "write_all: write returned 0", 32, path)
+                throw IOError(BrokenPipe, "write_all: write returned 0", 32, path.to_str())
             }
             written = written + n
         }
@@ -171,7 +171,7 @@ pub type File = File(fd: i64, pub path: Path, mode: OpenMode, is_closed: bool) {
             throw IOError(InvalidInput, "source file closed", 0, path.to_str())
         }
         if dst.is_closed {
-            throw IOError(InvalidInput, "destination file closed", 0, dst.path)
+            throw IOError(InvalidInput, "destination file closed", 0, dst.path.to_str())
         }
         var copied: usize = 0
         loop {

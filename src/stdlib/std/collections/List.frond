@@ -1,0 +1,105 @@
+// List.frond — growable list FAMILY BASE (part of std.collections)
+//
+// The dynamic counterpart to the fixed-length T[]: arrays never grow (the
+// 2026-08-22 ruling — dynamic building was `concat`, which is O(n) per
+// append and O(n²) per loop); List is the amortized O(1) append structure.
+// The concrete storage here is the array-backed implementation; the named
+// variants live beside it as children (the Map/Set family pattern):
+//
+//   ArrayList<T>(List<T>)  — the array-backed list under its explicit name
+//                            (pure inheritance, zero own fields)
+//   LinkedList<T>(List<T>) — head/tail doubly-linked nodes overriding the
+//                            storage methods (O(1) push/pop at both ends,
+//                            O(n) get/set; adds push_front)
+//
+// Shape: a record over one capacity buffer `buf` plus a live `count`.
+// In-capacity push writes `buf[count]` in place; crossing capacity doubles
+// the buffer (min 4) — scalar element types (see Mem.is_scalar_array) grow
+// through `[v, ..cap]` fill + `Mem.copy` (C memcpy); every other element
+// type (str, records, nested arrays) grows through engine-native concat +
+// fill. No filler value is ever required: growth only happens when the
+// buffer is non-empty, so `buf[0]` seeds the tail.
+//
+// Semantics: List is a plain record — `val b = a` ALIASES (shallow share,
+// same rule as arrays/maps); mutations are visible through every alias.
+// `as_array()` returns an independent snapshot (a slice copy), safe against
+// later pushes. Values beyond `count` in the capacity tail are unspecified
+// (stale or filler); only [0..count) is meaningful. `get` bounds-checks to
+// T?; `set(i, v)` requires i < len() — the engine's index trap fires beyond
+// capacity. `pop` leaves the vacated slot stale (the value stays referenced
+// until overwritten).
+//
+//   val xs = List.empty()           // array-backed (this base)
+//   val als = ArrayList.empty()     // same storage, explicit name
+//   val lls = LinkedList.empty()    // linked storage
+//   xs.push(1)
+//   xs.push(2)
+//   val snapshot = xs.as_array()    // [1, 2], independent of xs
+//   val ys = List.from([1, 2, 3])   // snapshot an array into a list
+
+import std.core.mem
+
+// (type stays non-pub, same house rule as the four hash containers: the
+// MODULE name carries `List.empty()`; the type itself is only reached through
+// inference. A pub type would shadow the module name and break the call.)
+type List<T> = List(buf: T[], count: usize) {
+
+    pub fun len(): usize { count }
+
+    pub fun is_empty(): bool { count == 0 }
+
+    // Allocated capacity (buf length); len() <= capacity() always.
+    pub fun capacity(): usize { buf.len() }
+
+    pub fun get(i: usize): T? {
+        if i < count { buf[i] } else { null }
+    }
+
+    // Requires i < len(). An i in [len(), capacity()) writes a dead slot;
+    // beyond capacity() the engine's index trap aborts.
+    pub fun &set(i: usize, value: T): void {
+        buf[i] = value
+    }
+
+    pub fun &push(value: T): void {
+        if count == buf.len() {
+            if buf.len() == 0 {
+                buf = [value, ..4]
+            } else if Mem.is_scalar_array(buf) {
+                val nb = [buf[0], ..buf.len() * 2]
+                Mem.copy(nb, 0, buf, 0, count)
+                buf = nb
+            } else {
+                buf = buf ++ [buf[0], ..buf.len()]
+            }
+        }
+        buf[count] = value
+        count = count + 1
+    }
+
+    pub fun &pop(): T? {
+        if count == 0 { return null }
+        val v = buf[count - 1]
+        count = count - 1
+        v
+    }
+
+    // Independent snapshot of [0..count) — a slice copy, immune to later
+    // mutation of the list.
+    pub fun as_array(): T[] {
+        buf[0..count]
+    }
+}
+
+// Factory family (std-wide convention, the Path.from / Instant.now line):
+// empty() is the bare default, from(arr) snapshots an array into a list.
+pub fun empty<T>(): List<T> {
+    var buf: T[] = []
+    List(buf, 0)
+}
+
+// Snapshot an array into a list: the slice copy makes the list's buffer
+// independent of the input array (same contract as as_array).
+pub fun from<T>(arr: T[]): List<T> {
+    List(arr[0..arr.len()], arr.len())
+}

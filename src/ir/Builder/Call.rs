@@ -252,7 +252,28 @@ impl<'a> IrBuilder<'a> {
         // arg_count metadata records the actual argument count (excluding closure value and effect), used for chained partial-application detection
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
             if !self.func_subgraphs.contains_key(*name) {
-                if let Some(closure_node) = self.lookup_var(name) {
+                // Cell-backed binding: the callable routes through the cell —
+                // the FORWARDED value node when the Builder knows it (zero
+                // cost), else a CF_DEREF_READ load. `lookup_var` alone would
+                // hand back the CELL node itself (its value is a Ref(Arc<Cell>),
+                // not callable).
+                let cell_backed = self.lookup_cell_binding(name).and_then(|c| {
+                    self.cell_forwarded_value(c).or_else(|| {
+                        let (count, off) = match self.current_effect {
+                            Some(eff) => (2, self.graph.inputs_pool.push(&[c, eff])),
+                            None => (1, self.graph.inputs_pool.push(&[c])),
+                        };
+                        let load = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: count,
+                            inputs_offset: off,
+                            compute_fn: CF_DEREF_READ,
+                        });
+                        self.track_cell_store(c, load);
+                        Some(load)
+                    })
+                });
+                if let Some(closure_node) = cell_backed.or_else(|| self.lookup_var(name)) {
                     let mut inputs = Vec::with_capacity(args.len() + 2);
                     inputs.push(closure_node);
                     for &arg in args {
@@ -372,72 +393,75 @@ impl<'a> IrBuilder<'a> {
 
         // Tail-recursion-to-iteration interception: currently compiling in a TailRecToLoop body and callee is self_name,
         // and in tail position (to avoid recursive calls in arguments being mistakenly intercepted),
-        // generate WriteBack(param, actual) instead of Call(self).
+        // store the actuals through the parameter-register Cells instead of Call(self).
         // body_sg is a LoopBody; after it completes, reset_loop_iteration automatically jumps back to while_sg to re-evaluate cond.
         if self.in_tail_position && self.tail_rec_ctx.is_some() {
-            // Tail-recursion interception: generate WriteBack(param, actual) instead of Call(self)
+            // Tail-recursion interception: cell stores instead of Call(self)
         }
         if self.in_tail_position {
             if let Some(ctx) = &self.tail_rec_ctx.clone() {
                 if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
                     if *name == ctx.self_name {
-                    // Compile all actual-argument expressions (evaluate first, then WriteBack, to avoid races between parameters)
+                    // Compile all actual-argument expressions (evaluate first, then store, to avoid races between parameters)
                     let arg_nodes: Vec<NodeId> = args
                         .iter()
                         .map(|&a| self.compile_subexpr(a))
                         .collect();
-                    // Perform a WriteBack for each parameter (writing back to the function-level param nodes).
-                    // Barrier mechanism: the first WriteBack depends on all arg_nodes;
-                    // subsequent WriteBacks chain-depend on the previous WriteBack.
-                    // This ensures all actual-argument expressions finish evaluating before any WriteBack executes,
-                    // preventing a+b from reading the already-WriteBack-updated value of a.
-                    //
-                    // Only the last WriteBack uses CF_TAILREC_WRITEBACK (sets Continue);
-                    // non-last WriteBacks use CF_WRITEBACK (do not set Continue).
-                    // Reason: the Continue signal causes the frame to exit immediately and skip notify_downstream;
-                    // if every WriteBack set Continue, subsequent chained WriteBacks would never become ready to execute.
-                    let wb_count = arg_nodes.len().min(ctx.param_nodes.len());
-                    let mut last_wb: Option<NodeId> = None;
+                    // B2: store each actual through the parameter-register Cell
+                    // (CF_DEREF_WRITE). Barrier mechanism mirrors the old
+                    // WriteBack chain: the first store depends on all arg_nodes
+                    // (all actuals finish evaluating before any store executes —
+                    // `self(a, a+1)` must not read an already-updated cell);
+                    // subsequent stores chain-depend on the previous store.
+                    // Inputs past [cell, value] are ordering-only deps (the
+                    // compute fn reads inputs[0..2]) — same convention as the
+                    // assignment path's trailing effect input.
+                    let mut last_store: Option<NodeId> = None;
                     for (i, &arg_node) in arg_nodes.iter().enumerate() {
-                        if i < ctx.param_nodes.len() {
-                            let mut wb_inputs = vec![arg_node];
+                        if i < ctx.param_cells.len() {
+                            let mut store_inputs = vec![ctx.param_cells[i], arg_node];
                             if i == 0 {
-                                // First WB: a barrier depending on all other arg_nodes
+                                // First store: a barrier depending on all other arg_nodes
                                 for &other in &arg_nodes[1..] {
-                                    wb_inputs.push(other);
+                                    store_inputs.push(other);
                                 }
-                            } else if let Some(prev_wb) = last_wb {
-                                // Subsequent WBs: depend on the previous WB (chain ordering)
-                                wb_inputs.push(prev_wb);
+                            } else if let Some(prev_store) = last_store {
+                                // Subsequent stores: depend on the previous store (chain ordering)
+                                store_inputs.push(prev_store);
                             }
-                            let is_last = i + 1 == wb_count;
-                            let compute_fn = if is_last {
-                                CF_TAILREC_WRITEBACK
-                            } else {
-                                CF_WRITEBACK
-                            };
-                            let wb_off = self.graph.inputs_pool.push(&wb_inputs);
-                            let wb_node = self.graph.add_node(Node {
-                                kind: NodeKind::Call,
-                                input_count: wb_inputs.len() as u8,
-                                inputs_offset: wb_off,
-                                compute_fn,
+                            let store_off = self.graph.inputs_pool.push(&store_inputs);
+                            let store_node = self.graph.add_node(Node {
+                                kind: NodeKind::BinOp,
+                                input_count: store_inputs.len() as u8,
+                                inputs_offset: store_off,
+                                compute_fn: CF_DEREF_WRITE,
                             });
-                            self.graph.set_writeback_target(wb_node, ctx.param_nodes[i]);
-                            self.current_effect = Some(wb_node);
-                            last_wb = Some(wb_node);
+                            self.track_cell_store(ctx.param_cells[i], arg_node);
+                            self.current_effect = Some(store_node);
+                            last_store = Some(store_node);
                         }
                     }
-                    // Return the last WriteBack node (after body_sg completes, reset_loop_iteration automatically jumps back)
-                    return last_wb.unwrap_or_else(|| {
-                        let off = self.graph.inputs_pool.push(&[]);
-                        self.graph.add_node(Node {
-                            kind: NodeKind::Const,
-                            input_count: 0,
-                            inputs_offset: off,
-                            compute_fn: CF_NOOP,
-                        })
-                    });
+                    // Continue barrier (terminates the body-sg frame; the loop
+                    // re-evaluates the condition against the updated cells).
+                    let barrier_dep = match last_store {
+                        Some(s) => s,
+                        None => match self.current_effect {
+                            Some(eff) => eff,
+                            None => {
+                                let off = self.graph.inputs_pool.push(&[]);
+                                self.graph.add_node(Node {
+                                    kind: NodeKind::Const,
+                                    input_count: 0,
+                                    inputs_offset: off,
+                                    compute_fn: CF_NOOP,
+                                })
+                            }
+                        },
+                    };
+                    let barrier = self.make_continue_barrier(barrier_dep);
+                    self.current_effect = Some(barrier);
+                    // Return the barrier node (after body_sg completes, reset_loop_iteration automatically jumps back)
+                    return barrier;
                     }
                 }
             }
@@ -450,8 +474,25 @@ impl<'a> IrBuilder<'a> {
             if let Some(ctx) = &ctx_clone {
                 if let crate::ast::Ast::Expr::Ident(callee_name) = &callee_expr.node {
                     if *callee_name == ctx.self_name {
-                        // 1. Check call_result_map: if the current call is already in the map, return the mapped node
+                        // 1. Check call_result_map: if the current call is already in the map,
+                        //    return the mapped node. The RESULT_CELL_MARKER case synthesizes a
+                        //    CF_DEREF_READ of the result Cell HERE (in the consuming state sg):
+                        //    it executes after the producing state's store (states run
+                        //    sequentially), reading the current Cell value.
                         if let Some(&mapped) = ctx.call_result_map.get(&call_expr_id) {
+                            if mapped == RESULT_CELL_MARKER {
+                                let (lc, lo) = match self.current_effect {
+                                    Some(eff) => (2, self.graph.inputs_pool.push(&[ctx.result_cell, eff])),
+                                    None => (1, self.graph.inputs_pool.push(&[ctx.result_cell])),
+                                };
+                                let load = self.graph.add_node(Node {
+                                    kind: NodeKind::UnOp,
+                                    input_count: lc,
+                                    inputs_offset: lo,
+                                    compute_fn: CF_DEREF_READ,
+                                });
+                                return load;
+                            }
                             return mapped;
                         }
                         // 2. If already truncated, return a void constant (no Call node generated)
@@ -474,19 +515,29 @@ impl<'a> IrBuilder<'a> {
                         let max_saved = ctx.max_saved;
                         let current_state = ctx.current_state as usize;
                         let stack_node = ctx.stack_node;
-                        let sp_node = ctx.sp_node;
-                        let result_node = ctx.result_node;
+                        let sp_cell = ctx.sp_cell;
+
+                        // B3: read the current sp through its Cell. The pop store
+                        // (body sg, iteration start) has completed before this
+                        // state sg runs, so the Cell holds the post-pop value.
+                        let sp_load_off = self.graph.inputs_pool.push(&[sp_cell]);
+                        let sp_load = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: 1,
+                            inputs_offset: sp_load_off,
+                            compute_fn: CF_DEREF_READ,
+                        });
 
                         // Compute stack indices: base_cont = sp * stride, base_task = (sp + 1) * stride
-                        // sp has already been decremented by pop (sp_node = original_sp - 1)
+                        // sp has already been decremented by pop (sp = original_sp - 1)
                         // cont writes to the slot freed by pop (overwriting the consumed frame); task writes to the next slot
                         // sp_new = sp + 2; on pop, sp-1 reads task first (LIFO), then cont
                         let one_const = self.make_i32_const(1);
-                        let sp_plus_1 = self.make_binop(sp_node, one_const, CF_ADD_I32);
+                        let sp_plus_1 = self.make_binop(sp_load, one_const, CF_ADD_I32);
                         let two_const = self.make_i32_const(2);
-                        let sp_plus_2 = self.make_binop(sp_node, two_const, CF_ADD_I32);
+                        let sp_plus_2 = self.make_binop(sp_load, two_const, CF_ADD_I32);
                         let stride_val = self.make_i32_const(stride as i32);
-                        let base_cont = self.make_binop(sp_node, stride_val, CF_MUL_I32);
+                        let base_cont = self.make_binop(sp_load, stride_val, CF_MUL_I32);
                         let base_task = self.make_binop(sp_plus_1, stride_val, CF_MUL_I32);
 
                         // Push continuation frame (write to the slot freed by pop)
@@ -507,8 +558,11 @@ impl<'a> IrBuilder<'a> {
                             self.make_array_store(stack_node, state_idx_cont, state_after);
                         self.current_effect = Some(self.chain_effects(self.current_effect, state_store_cont));
                         // stack[base_cont + P + 1..P + 1 + num_saved] = saved values
-                        // For state S: slot j = saved_nodes[j] (j < S-1), result_node (j == S-1), 0 (j >= S)
+                        // For state S: slot j = saved_nodes[j] (j < S-1), result-load (j == S-1), 0 (j >= S)
+                        // The result-load reads the result Cell HERE (this state sg):
+                        // the value was stored by the previous state's completion.
                         let zero_saved = self.make_i32_const(0);
+                        let mut result_load: Option<NodeId> = None;
                         for j in 0..max_saved {
                             let offset = self.make_i32_const((param_count + 1 + j) as i32);
                             let idx = self.make_binop(base_cont, offset, CF_ADD_I32);
@@ -516,8 +570,25 @@ impl<'a> IrBuilder<'a> {
                                 if j + 1 < current_state {
                                     ctx.saved_nodes[j]
                                 } else {
-                                    // j == current_state - 1
-                                    result_node
+                                    // j == current_state - 1: the most recent call's result
+                                    let load = match result_load {
+                                        Some(l) => l,
+                                        None => {
+                                            let (lc, lo) = match self.current_effect {
+                                                Some(eff) => (2, self.graph.inputs_pool.push(&[ctx.result_cell, eff])),
+                                                None => (1, self.graph.inputs_pool.push(&[ctx.result_cell])),
+                                            };
+                                            let l = self.graph.add_node(Node {
+                                                kind: NodeKind::UnOp,
+                                                input_count: lc,
+                                                inputs_offset: lo,
+                                                compute_fn: CF_DEREF_READ,
+                                            });
+                                            result_load = Some(l);
+                                            l
+                                        }
+                                    };
+                                    load
                                 }
                             } else {
                                 zero_saved
@@ -548,13 +619,19 @@ impl<'a> IrBuilder<'a> {
                             self.current_effect = Some(self.chain_effects(self.current_effect, store));
                         }
 
-                        // WriteBack sp = sp + 2 (chained into effect to ensure it runs after all stores)
+                        // sp = sp + 2 through the Cell (chained into effect to ensure it runs after all stores)
                         let sp_new = self.chain_effects(self.current_effect, sp_plus_2);
-                        let sp_wb = self.compile_writeback_node(sp_new, sp_node);
-                        self.current_effect = Some(sp_wb);
+                        let sp_store_off = self.graph.inputs_pool.push(&[sp_cell, sp_new]);
+                        let sp_store = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: 2,
+                            inputs_offset: sp_store_off,
+                            compute_fn: CF_DEREF_WRITE,
+                        });
+                        self.current_effect = Some(sp_store);
 
                         // Create the barrier node (Continue signal; blocks subsequent expression execution)
-                        let barrier = self.make_continue_barrier(sp_wb);
+                        let barrier = self.make_continue_barrier(sp_store);
                         self.current_effect = Some(barrier);
 
                         // Set the truncated flag
@@ -651,9 +728,59 @@ impl<'a> IrBuilder<'a> {
     ) -> NodeId {
         self.enter_scope();
         // Compile actuals and bind to formal names (actual nodes are compiled in the current scope context)
+        let mut arg_nodes = Vec::with_capacity(params.len());
         for (param, &arg) in params.iter().zip(args.iter()) {
             let arg_node = self.compile_subexpr(arg);
+            arg_nodes.push(arg_node);
             self.bind_var(param.name, arg_node);
+        }
+        // Inline-body param slotting (mirrors ③ in compile_function_body):
+        // an ASSIGNED param's cell stores keep the loop/branch machinery out
+        // of the caller's inline copy. Without this, an inlined loop assigning
+        // the param compiles WriteBacks against the raw arg node.
+        // Branch contexts (if arm, &&-RHS — current_branch_sg set) create the
+        // cells too, but chain them onto a FRESH in-branch effect root:
+        // chaining onto the incoming (parent) effect would wire a
+        // branch-internal SEQ to a non-dominating outer node (⑤ V2 stall),
+        // while skipping the chain entirely lets an internal gate launch
+        // before the alloc executes — its completion can't reach the nested
+        // branch frame's pending table and stores are silently dropped (⑥).
+        // The reset is sound: parent effects completed before the branch frame
+        // launched, so in-branch ordering is the only constraint.
+        if self.fn_all_vars_slot {
+            let in_branch = self.current_branch_sg.is_some();
+            let mut assigned = rustc_hash::FxHashSet::default();
+            collect_assigned_names_deep(&self.current_module().arena, body, &mut assigned);
+            for param in params {
+                if assigned.contains(param.name) {
+                    if let Some(arg_node) = self.lookup_var(param.name) {
+                        let off = self.graph.inputs_pool.push(&[arg_node]);
+                        let cell_node = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: 1,
+                            inputs_offset: off,
+                            compute_fn: CF_CELL_ALLOC,
+                        });
+                        self.bind_cell(param.name, cell_node);
+                        self.track_cell_decl(param.name, cell_node, arg_node);
+                        if in_branch {
+                            // Root the branch-local effect chain at the alloc:
+                            // no SEQ onto the incoming parent effect (⑤ V2
+                            // stall class), yet every subsequent in-branch
+                            // effect — including internal gate effect chains —
+                            // depends on the alloc, so nested-sg stores can
+                            // never outrun it (⑥ silent-drop class). Parent
+                            // effects completed before this branch frame
+                            // launched; in-branch ordering is the only
+                            // constraint.
+                            self.current_effect = Some(cell_node);
+                        } else {
+                            self.current_effect =
+                                Some(self.chain_effects(self.current_effect, cell_node));
+                        }
+                    }
+                }
+            }
         }
         // W4c: bodies with early `return` / `?` cannot be compiled straight into
         // the caller (the Return signal is function-scoped and would terminate
@@ -668,6 +795,15 @@ impl<'a> IrBuilder<'a> {
                 || crate::pass::Analyzer::has_propagate(body, arena)
         };
         if early_exit {
+            // The wrap Gate's branch reads outer nodes (the actuals) via the
+            // FRAME SNAPSHOT, not through SSA edges — so the actuals must be
+            // COMPUTED before the Gate fires. `compile_subexpr` does not feed
+            // current_effect, so chain the arg nodes in explicitly; otherwise
+            // the Gate can launch the branch while an arg (e.g. a `&x` RefOf)
+            // is still uncomputed and the branch body reads null.
+            for arg_node in arg_nodes {
+                self.current_effect = Some(self.chain_effects(self.current_effect, arg_node));
+            }
             let body_node = self.compile_inline_wrap(body);
             self.exit_scope();
             return body_node;
@@ -726,6 +862,12 @@ impl<'a> IrBuilder<'a> {
     /// Look up a type declaration's field info (by type name).
     ///
     /// Uniformly searches layer by layer through type_scope_stack (top-level + nested types share the same lookup path).
+    pub(super) fn alloc_base_dispatch_idx(&mut self) -> u16 {
+        let idx = self.next_base_dispatch_idx;
+        self.next_base_dispatch_idx = self.next_base_dispatch_idx.wrapping_add(1).max(0x8000);
+        idx
+    }
+
     pub(super) fn lookup_type_field_names(&self, type_name: &str) -> Option<TypeFieldInfo> {
         self.lookup_type_fields(type_name)
     }
@@ -745,7 +887,9 @@ impl<'a> IrBuilder<'a> {
         type_name: &str,
         ctor_name: &str,
     ) -> Option<(String, String, Vec<Option<String>>, RecordLitKind, bool)> {
-        let &type_idx = self.sema.type_def_index.get(type_name)?;
+        // Module-scoped: the AST type segment resolves to its canonical key.
+        let canonical = self.sema.resolve_type_key_in(self.current_module().name, type_name);
+        let &type_idx = self.sema.type_def_index.get(&canonical)?;
         let type_def = &self.sema.type_defs[&type_idx];
         let ctor = type_def
             .constructors
@@ -908,7 +1052,31 @@ impl<'a> IrBuilder<'a> {
     /// - intrinsic methods (await/len/send/recv/close/bytes/cancel etc.) are flagged via
     ///   MethodSigInfo.intrinsic and lowered directly to a compute_fn node
     /// - type/trait methods are compiled into Call nodes, looking up method_subgraphs via (type_id, method_idx)
-    pub(super) fn compile_method_call(
+    /// Whether walking `name`'s FIRST-base links (the layout-prefix chain)
+/// reaches `ancestor` (exclusive of `name` itself).
+fn first_base_chain_reaches(
+    sema: &crate::sema::Sema::SemaResult,
+    name: &str,
+    ancestor: &str,
+) -> bool {
+    let mut current: Option<Box<str>> = Some(name.into());
+    let mut hops = 0usize;
+    while let Some(cn) = current {
+        if hops > 64 {
+            return false;
+        }
+        let Some(def) = sema.get_type_def(cn.as_ref()) else { return false };
+        let Some(first) = def.bases.first() else { return false };
+        if first.as_ref() == ancestor {
+            return true;
+        }
+        current = Some(first.clone());
+        hops += 1;
+    }
+    false
+}
+
+pub(super) fn compile_method_call(
         &mut self,
         call_expr_id: crate::ast::Ast::ExprId,
         recv: crate::ast::Ast::ExprId,
@@ -1248,6 +1416,12 @@ impl<'a> IrBuilder<'a> {
                 compute_fn: CF_CALL_LAUNCH,
             });
 
+            if std::env::var("FROND_TRACE_CTOR").is_ok() {
+                let k = crate::sema::Sema::module_expr_key(self.expr_key_module(), recv.0 as u64);
+                let tn = self.sema.expr_types.get(&k).map(|i| i.type_name.clone());
+                let tid = self.expr_type_id(recv);
+                eprintln!("[dispatch-recv] method={} type_name={:?} type_id={:?} recv_expr={} cur_mod={}", method, tn, tid, recv.0, self.current_module().name);
+            }
             // Dispatch priority (semantic priority, not fallback):
             //   1. trait object dynamic dispatch (recv type is a trait -> vtable runtime dispatch)
             //   2. type's own method / trait method override: (type_id, method_idx) lookup into method_subgraphs
@@ -1279,14 +1453,57 @@ impl<'a> IrBuilder<'a> {
             // Path 2: type's own method / trait method override
             // When recv_node_override is set (implicit-this call), the callee ExprId does not carry
             // the receiver's type info; use current_method_type (set by the enclosing method compile).
-            let recv_type: Option<(&str, u16)> = if recv_node_override.is_some() {
-                self.current_method_type.as_ref().map(|(n, id)| (n.as_ref(), *id))
+            // Owned so the immutable self borrow ends before the dynamic-
+            // dispatch registration below (which takes &mut self).
+            let recv_type: Option<(String, u16)> = if recv_node_override.is_some() {
+                self.current_method_type.as_ref().map(|(n, id)| (n.to_string(), *id))
             } else {
-                self.expr_type_name(recv).zip(self.expr_type_id(recv))
+                self.expr_type_name(recv).map(|n| n.to_string()).zip(self.expr_type_id(recv))
             };
             if let Some((type_name, type_id)) = recv_type {
-                if let Some(method_idx) = self.sema.lookup_method_idx(type_name, method) {
+                if let Some(method_idx) = self.sema.lookup_method_idx(type_name.as_str(), method) {
                     if let Some(&target_sg) = self.method_subgraphs.get(&(type_id, method_idx)) {
+                        // Inheritance dynamic dispatch: when any type's
+                        // FIRST-base chain reaches this receiver type, a child
+                        // value may flow in here. Inherited methods are
+                        // compiled per child (late binding), so the correct
+                        // subgraph depends on the value's ACTUAL type — emit a
+                        // vtable-style dispatch keyed by (site_idx, type_name)
+                        // covering the base and every chain descendant.
+                        let has_descendants = self.sema.type_defs.values().any(|d| {
+                            !d.bases.is_empty()
+                                && Self::first_base_chain_reaches(self.sema, d.name.as_ref(), type_name.as_str())
+                        });
+                        if has_descendants {
+                            let site_idx = self.alloc_base_dispatch_idx();
+                            self.graph.set_vtable_call(call_node, site_idx);
+                            self.graph
+                                .vtable_fallback_dispatch
+                                .insert((site_idx, type_name.clone().into()), target_sg);
+                            let descendants: Vec<(Box<str>, u16, u16)> = self
+                                .sema
+                                .type_defs
+                                .iter()
+                                .filter(|(_, d)| {
+                                    !d.bases.is_empty()
+                                        && Self::first_base_chain_reaches(self.sema, d.name.as_ref(), type_name.as_str())
+                                })
+                                .filter_map(|(&idx, d)| {
+                                    let did = crate::types::dynamic_type_id(idx);
+                                    self.sema
+                                        .lookup_method_idx(d.name.as_ref(), method)
+                                        .map(|mi| (d.name.clone(), did, mi))
+                                })
+                                .collect();
+                            for (dname, did, mi) in descendants {
+                                if let Some(&dsg) = self.method_subgraphs.get(&(did, mi)) {
+                                    self.graph
+                                        .vtable_fallback_dispatch
+                                        .insert((site_idx, dname.into()), dsg);
+                                }
+                            }
+                            return call_node;
+                        }
                         self.graph.set_call_target(call_node, target_sg);
                         return call_node;
                     }
@@ -1300,6 +1517,13 @@ impl<'a> IrBuilder<'a> {
                 self.expr_type_id(recv)
             };
             if let Some(type_id) = path3_type_id {
+                // Collect every implementing trait that provides a specialized
+                // default for this method, then select deterministically: a
+                // trait that is a DESCENDANT of all other providers wins
+                // (trait inheritance — the child's declaration shadows its
+                // parents'); plain multi-trait conflicts never reach here
+                // (sema's R3 rejects them at check time).
+                let mut candidates: Vec<(Box<str>, SubGraphId)> = Vec::new();
                 for trait_def in self.sema.trait_defs.values() {
                     if !self.type_implements_trait(type_id, &trait_def.name) {
                         continue;
@@ -1311,11 +1535,33 @@ impl<'a> IrBuilder<'a> {
                     {
                         if let Some(&trait_idx) = self.sema.trait_def_index.get(trait_def.name.as_ref()) {
                             if let Some(&target_sg) = self.trait_default_subgraphs.get(&(type_id, trait_idx, method_idx as u16)) {
-                                self.graph.set_call_target(call_node, target_sg);
-                                return call_node;
+                                candidates.push((trait_def.name.clone(), target_sg));
                             }
                         }
                     }
+                }
+                let chosen: Option<SubGraphId> = if candidates.len() == 1 {
+                    candidates.first().map(|(_, sg)| *sg)
+                } else if candidates.len() > 1 {
+                    candidates
+                        .iter()
+                        .find(|(c, _)| {
+                            candidates.iter().all(|(o, _)| {
+                                o.as_ref() == c.as_ref()
+                                    || self
+                                        .sema
+                                        .trait_parent_closure(c.as_ref())
+                                        .iter()
+                                        .any(|a| a.as_ref() == o.as_ref())
+                            })
+                        })
+                        .map(|(_, sg)| *sg)
+                } else {
+                    None
+                };
+                if let Some(target_sg) = chosen {
+                    self.graph.set_call_target(call_node, target_sg);
+                    return call_node;
                 }
             }
 
@@ -1323,7 +1569,20 @@ impl<'a> IrBuilder<'a> {
             // When the method name matches a top-level free function, recv is passed as the first argument.
             // Single-point resolution: builtin/user free functions resolve bare; std free
             // functions (no bare slot) resolve only through the earlier qualified paths.
-            if let Some(Ok(target_sg)) = self.resolve_func("path4_free_fn", method, None, None) {
+            // Generic callees bind the sema-chosen monomorphization via
+            // call_instantiations (same lookup as Path 0): without it the call
+            // lands on the UNSPECIALIZED body, whose soft-typed comparisons
+            // work for i32 by accident and silently misorder f64/str elements.
+            let call_inst_key = crate::sema::Sema::module_expr_key(
+                self.expr_key_module(),
+                call_expr_id.0 as u64,
+            );
+            let inst_mangled = self
+                .sema
+                .call_instantiations
+                .get(&call_inst_key)
+                .map(|&id| format!("{}#{}", method, id));
+            if let Some(Ok(target_sg)) = self.resolve_func("path4_free_fn", method, inst_mangled.as_deref(), None) {
                 self.graph.set_call_target(call_node, target_sg);
                 return call_node;
             }
@@ -1367,6 +1626,58 @@ impl<'a> IrBuilder<'a> {
             self.expr_key_module(),
             call_expr_id.0 as u64,
         );
+        // Base-type super (inheritance): a sema-recorded base dispatch wins
+        // over the trait-default layer — target is the BASE's own method
+        // subgraph, receiver is the enclosing `this` (child values are
+        // layout-prefix compatible with the base's field ids).
+        if let Some((base_name, base_method)) = self.sema.super_base_dispatches.get(&key) {
+            let base_tid = self
+                .sema
+                .type_def_index
+                .get(base_name.as_ref())
+                .map(|&idx| crate::types::dynamic_type_id(idx));
+            let base_mi = self.sema.lookup_method_idx(base_name.as_ref(), base_method.as_ref());
+            if let (Some(tid), Some(mi)) = (base_tid, base_mi) {
+                if let Some(&sg) = self.method_subgraphs.get(&(tid, mi)) {
+                    let recv_node = match self.lookup_var("this") {
+                        Some(n) => n,
+                        None => {
+                            self.errors.push(
+                                "super call: receiver 'this' not in scope (base super is only                                  supported in the direct body of a type method)"
+                                    .into(),
+                            );
+                            let off = self.graph.inputs_pool.push(&[]);
+                            return self.graph.add_node(Node {
+                                kind: NodeKind::Const,
+                                input_count: 0,
+                                inputs_offset: off,
+                                compute_fn: CF_NOOP,
+                            });
+                        }
+                    };
+                    let mut inputs = vec![recv_node];
+                    for &a in args {
+                        inputs.push(self.compile_subexpr(a));
+                    }
+                    if let Some(eff) = self.current_effect {
+                        inputs.push(eff);
+                    }
+                    let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                    let call_node = self.graph.add_node(Node {
+                        kind: NodeKind::Call,
+                        input_count: inputs.len() as u8,
+                        inputs_offset,
+                        compute_fn: CF_CALL_LAUNCH,
+                    });
+                    self.graph.set_call_target(call_node, sg);
+                    return call_node;
+                }
+            }
+            self.errors.push(format!(
+                "super call '{}.{}' could not resolve a base method subgraph",
+                base_name, base_method
+            ));
+        }
         let dispatch = self.sema.super_dispatches.get(&key).copied();
         let type_id = self.current_method_type.as_ref().map(|(_, id)| *id);
         let target_sg = dispatch
@@ -1591,34 +1902,74 @@ impl<'a> IrBuilder<'a> {
         // (vtable_idx, type_name). This handles both explicit trait declarations (`: Trait`) and
         // structural trait implementations (methods present without explicit declaration).
         //
-        // First try the witness table (explicit declarations); if empty, fall back to scanning
-        // all types with a matching method name.
+        // First try the witness table (explicit declarations); a type whose
+        // witness method_slots MISS the name (the method is a TRAIT DEFAULT —
+        // slots only carry the type's own methods) resolves to the
+        // specialized trait-default subgraph; the structural scan remains
+        // the last resort for undeclared implementations.
+        let trait_idx_and_mpos: Option<(u16, u16)> = self
+            .sema
+            .trait_def_index
+            .get(trait_name)
+            .copied()
+            .zip(
+                self.sema
+                    .get_trait_def(trait_name)
+                    .and_then(|td| {
+                        td.methods
+                            .iter()
+                            .position(|m| m.name.as_ref() == method_name)
+                            .map(|p| p as u16)
+                    }),
+            );
         let mut entries: Vec<(u16, u16)> = Vec::new();
+        let mut resolved_any = false;
         for entry in self.sema.witness_table.entries() {
             if entry.trait_name.as_ref() != trait_name {
                 continue;
             }
             if let Some(type_method_idx) = self.sema.witness_table.resolve_method(trait_name, entry.type_id, method_name) {
                 entries.push((entry.type_id, type_method_idx));
-            }
-        }
-        // Structural fallback: if witness table has no entries for this trait, scan all types
-        // that have a method with the matching name. This supports `type Dog { fun name(): str }`
-        // being passed as `Animal` without an explicit `: Animal` declaration.
-        if entries.is_empty() {
-            for (&type_idx, type_def) in &self.sema.type_defs {
-                for (m_idx, m) in type_def.methods.iter().enumerate() {
-                    if m.name.as_ref() == method_name {
-                        entries.push((crate::types::dynamic_type_id(type_idx), m_idx as u16));
-                        break;
+                resolved_any = true;
+            } else if let Some((trait_idx, trait_mpos)) = trait_idx_and_mpos {
+                // Trait-default method: the specialized subgraph compiled for
+                // this (type, trait, method) triple.
+                if let Some(&sg) = self
+                    .trait_default_subgraphs
+                    .get(&(entry.type_id, trait_idx, trait_mpos))
+                {
+                    if let Some(name) = self.type_name_from_id(entry.type_id) {
+                        self.graph
+                            .vtable_fallback_dispatch
+                            .insert((vtable_idx, name.into_boxed_str()), sg);
+                        resolved_any = true;
                     }
                 }
             }
         }
-        for (type_id, type_method_idx) in entries {
-            if let Some(&sg) = self.method_subgraphs.get(&(type_id, type_method_idx)) {
-                if let Some(name) = self.type_name_from_id(type_id) {
-                    self.graph.vtable_fallback_dispatch.insert((vtable_idx, name.into_boxed_str()), sg);
+        if resolved_any {
+            for (type_id, type_method_idx) in entries {
+                if let Some(&sg) = self.method_subgraphs.get(&(type_id, type_method_idx)) {
+                    if let Some(name) = self.type_name_from_id(type_id) {
+                        self.graph.vtable_fallback_dispatch.insert((vtable_idx, name.into_boxed_str()), sg);
+                    }
+                }
+            }
+            return;
+        }
+        // Structural fallback: if witness table has no entries for this trait, scan all types
+        // that have a method with the matching name. This supports `type Dog { fun name(): str }`
+        // being passed as `Animal` without an explicit `: Animal` declaration.
+        for (&type_idx, type_def) in &self.sema.type_defs {
+            for (m_idx, m) in type_def.methods.iter().enumerate() {
+                if m.name.as_ref() == method_name {
+                    let tid = crate::types::dynamic_type_id(type_idx);
+                    if let Some(&sg) = self.method_subgraphs.get(&(tid, m_idx as u16)) {
+                        if let Some(name) = self.type_name_from_id(tid) {
+                            self.graph.vtable_fallback_dispatch.insert((vtable_idx, name.into_boxed_str()), sg);
+                        }
+                    }
+                    break;
                 }
             }
         }
@@ -1680,10 +2031,23 @@ impl<'a> IrBuilder<'a> {
             .type_name
             .as_deref()
             .unwrap_or_else(|| self.type_arena.get(info.ty).name());
-        self.sema
-            .type_def_index
-            .get(type_name)
-            .map(|&idx| crate::types::dynamic_type_id(idx))
+        // Concrete array names ("u8[]") address the synthetic builtin "array"
+        // type def. Bare legacy names resolve module-scoped.
+        let key = crate::sema::Sema::SemaResult::canonical_type_name(type_name);
+        let type_idx = match self.sema.type_def_index.get(key) {
+            Some(&idx) => idx,
+            None => {
+                let resolved = self.sema.resolve_type_key(key);
+                if resolved == key {
+                    return None;
+                }
+                match self.sema.type_def_index.get(&resolved) {
+                    Some(&idx) => idx,
+                    None => return None,
+                }
+            }
+        };
+        Some(crate::types::dynamic_type_id(type_idx))
     }
 
 }

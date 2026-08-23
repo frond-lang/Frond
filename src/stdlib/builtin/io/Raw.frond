@@ -30,7 +30,11 @@ fun __file_open_raw(path: str, flags: i32, mode: i32): i64 #{
         if (flags & 4) posix_flags |= _O_CREAT;
         if (flags & 8) posix_flags |= _O_TRUNC;
         if (flags & 16) posix_flags |= _O_APPEND;
-        return _open(path_data, posix_flags | _O_BINARY, mode);
+        wchar_t* wpath = frond_utf8_to_utf16(path_data, path_len);
+        if (!wpath) return -1;
+        int fd = _wopen(wpath, posix_flags | _O_BINARY, mode);
+        free(wpath);
+        return fd;
     #else
         int posix_flags = 0;
         if ((flags & 3) == 3) {
@@ -101,7 +105,11 @@ fun __file_seek_raw(fd: i64, offset: i64, whence: i32): i64 #{
 @extern("C")
 fun __file_remove_raw(path: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
-        return _unlink(path_data);
+        wchar_t* wpath = frond_utf8_to_utf16(path_data, path_len);
+        if (!wpath) return -1;
+        int rc = _wunlink(wpath);
+        free(wpath);
+        return rc;
     #else
         return unlink(path_data);
     #endif
@@ -111,7 +119,16 @@ fun __file_remove_raw(path: str): i32 #{
 @internal
 @extern("C")
 fun __file_rename_raw(old: str, new: str): i32 #{
-    return rename(old_data, new_data);
+    #if defined(_WIN32) || defined(_WIN64)
+        wchar_t* wold = frond_utf8_to_utf16(old_data, old_len);
+        wchar_t* wnew = frond_utf8_to_utf16(new_data, new_len);
+        if (!wold || !wnew) { free(wold); free(wnew); return -1; }
+        int rc = _wrename(wold, wnew);
+        free(wold); free(wnew);
+        return rc;
+    #else
+        return rename(old_data, new_data);
+    #endif
 }#
 
 @c_include("unistd.h")
@@ -180,17 +197,33 @@ fun __stdin_readln_into(buf: u8[]): i64 #{
 @extern("C")
 fun __dir_create_raw(path: str, recursive: bool): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
+        // Walk in UTF-8 (separators are ASCII, never part of a multi-byte
+        // UTF-8 sequence, so truncation stays on character boundaries), then
+        // bridge each level to _wmkdir.
         if (recursive) {
             char buf[4096];
             size_t len = path_len < sizeof(buf)-1 ? path_len : sizeof(buf)-1;
             memcpy(buf, path_data, len);
             buf[len] = 0;
             for (char* p = buf+1; *p; p++) {
-                if (*p == '/' || *p == '\\') { *p = 0; _mkdir(buf); *p = '/'; }
+                if (*p == '/' || *p == '\\') {
+                    *p = 0;
+                    wchar_t* wseg = frond_utf8_to_utf16(buf, strlen(buf));
+                    if (wseg) { _wmkdir(wseg); free(wseg); }
+                    *p = '/';
+                }
             }
-            return _mkdir(buf);
+            wchar_t* wfull = frond_utf8_to_utf16(buf, strlen(buf));
+            if (!wfull) return -1;
+            int rc = _wmkdir(wfull);
+            free(wfull);
+            return rc;
         }
-        return _mkdir(path_data);
+        wchar_t* wpath = frond_utf8_to_utf16(path_data, path_len);
+        if (!wpath) return -1;
+        int rc = _wmkdir(wpath);
+        free(wpath);
+        return rc;
     #else
         if (recursive) {
             char buf[4096];
@@ -212,7 +245,11 @@ fun __dir_create_raw(path: str, recursive: bool): i32 #{
 fun __dir_remove_raw(path: str, recursive: bool): i32 #{
     (void)recursive;
     #if defined(_WIN32) || defined(_WIN64)
-        return _rmdir(path_data);
+        wchar_t* wpath = frond_utf8_to_utf16(path_data, path_len);
+        if (!wpath) return -1;
+        int rc = _wrmdir(wpath);
+        free(wpath);
+        return rc;
     #else
         return rmdir(path_data);
     #endif
@@ -225,7 +262,11 @@ fun __dir_remove_raw(path: str, recursive: bool): i32 #{
 @extern("C")
 fun __file_chmod_raw(path: str, mode: i32): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
-        return _chmod(path_data, mode);
+        wchar_t* wpath = frond_utf8_to_utf16(path_data, path_len);
+        if (!wpath) return -1;
+        int rc = _wchmod(wpath, mode);
+        free(wpath);
+        return rc;
     #else
         return chmod(path_data, mode);
     #endif
@@ -247,7 +288,11 @@ fun __file_chmod_raw(path: str, mode: i32): i32 #{
 fun __file_stat_into(path: str, buf: u8[]): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         struct _stat64 st;
-        if (_stat64(path_data, &st) < 0) return -1;
+        wchar_t* wpath = frond_utf8_to_utf16(path_data, path_len);
+        if (!wpath) return -1;
+        int src = _wstat64(wpath, &st);
+        free(wpath);
+        if (src < 0) return -1;
         uint64_t size = (uint64_t)st.st_size;
         int64_t mtime = (int64_t)st.st_mtime * 1000000000LL;
         int64_t ctime = (int64_t)st.st_ctime * 1000000000LL;
@@ -347,25 +392,30 @@ fun __file_fstat_into(fd: i64, buf: u8[]): i32 #{
 @extern("C")
 fun __dir_list_into(path: str, names_buf: u8[], name_offsets: u8[], kinds_buf: u8[], max_count: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
-        WIN32_FIND_DATAA fd;
-        char pattern[4096];
-        size_t plen = path_len < sizeof(pattern) - 3 ? path_len : sizeof(pattern) - 3;
-        memcpy(pattern, path_data, plen);
-        pattern[plen] = '\\';
-        pattern[plen + 1] = '*';
-        pattern[plen + 2] = 0;
-        HANDLE h = FindFirstFileA(pattern, &fd);
+        WIN32_FIND_DATAW fd;
+        wchar_t pattern[4096];
+        wchar_t* wpath = frond_utf8_to_utf16(path_data, path_len);
+        if (!wpath) return -1;
+        size_t wl = wcslen(wpath);
+        if (wl >= sizeof(pattern) / sizeof(pattern[0]) - 3) { free(wpath); return -2; }
+        memcpy(pattern, wpath, sizeof(wchar_t) * wl);
+        free(wpath);
+        pattern[wl] = L'\\';
+        pattern[wl + 1] = L'*';
+        pattern[wl + 2] = 0;
+        HANDLE h = FindFirstFileW(pattern, &fd);
         if (h == INVALID_HANDLE_VALUE) return -1;
         size_t count = 0;
         size_t names_pos = 0;
         do {
-            if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
             if (count >= max_count) { FindClose(h); return -3; }
-            size_t nlen = strlen(fd.cFileName);
-            if (names_pos + nlen > names_buf_len) { FindClose(h); return -2; }
+            int64_t nlen = frond_utf16_to_utf8_into(fd.cFileName,
+                (char*)(names_buf_data + names_pos), names_buf_len - names_pos);
+            if (nlen == -1) { FindClose(h); return -2; }  // names buffer too small
+            if (nlen < 0) { FindClose(h); return -2; }    // conversion failure
             if ((count + 1) * 4 > name_offsets_len) { FindClose(h); return -2; }
             if (count >= kinds_buf_len) { FindClose(h); return -2; }
-            memcpy(names_buf_data + names_pos, fd.cFileName, nlen);
             uint32_t off = (uint32_t)names_pos;
             memcpy(name_offsets_data + count * 4, &off, 4);
             uint8_t kind = 0;
@@ -374,9 +424,9 @@ fun __dir_list_into(path: str, names_buf: u8[], name_offsets: u8[], kinds_buf: u
             else if (attr & FILE_ATTRIBUTE_REPARSE_POINT) kind = 2;
             else kind = 0;
             kinds_buf_data[count] = kind;
-            names_pos += nlen;
+            names_pos += (size_t)nlen;
             count++;
-        } while (FindNextFileA(h, &fd));
+        } while (FindNextFileW(h, &fd));
         FindClose(h);
         return (int64_t)count;
     #else
@@ -423,14 +473,17 @@ fun __dir_list_into(path: str, names_buf: u8[], name_offsets: u8[], kinds_buf: u
 @extern("C")
 fun __file_exists_raw(path: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
-        DWORD attr = GetFileAttributesA(path_data);
+        wchar_t* wpath = frond_utf8_to_utf16(path_data, path_len);
+        if (!wpath) return 0;
+        DWORD attr = GetFileAttributesW(wpath);
+        free(wpath);
         return attr != INVALID_FILE_ATTRIBUTES ? 1 : 0;
     #else
         return access(path_data, F_OK) == 0 ? 1 : 0;
     #endif
 }#
 
-// Copy a file (overwrites dst). Windows: CopyFileA; POSIX: read/write loop.
+// Copy a file (overwrites dst). Windows: CopyFileW; POSIX: read/write loop.
 @c_include("windows.h")
 @c_include("fcntl.h")
 @c_include("unistd.h")
@@ -438,7 +491,12 @@ fun __file_exists_raw(path: str): i32 #{
 @extern("C")
 fun __file_copy_raw(src: str, dst: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
-        return CopyFileA(src_data, dst_data, FALSE) ? 0 : -1;
+        wchar_t* wsrc = frond_utf8_to_utf16(src_data, src_len);
+        wchar_t* wdst = frond_utf8_to_utf16(dst_data, dst_len);
+        if (!wsrc || !wdst) { free(wsrc); free(wdst); return -1; }
+        BOOL ok = CopyFileW(wsrc, wdst, FALSE);
+        free(wsrc); free(wdst);
+        return ok ? 0 : -1;
     #else
         int in = open(src_data, O_RDONLY);
         if (in < 0) return -1;
@@ -475,12 +533,17 @@ fun __file_copy_raw(src: str, dst: str): i32 #{
 @extern("C")
 fun __fs_realpath_into(path: str, buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
-        char* r = _fullpath((char*)buf_data, path_data, (size_t)buf_len);
+        wchar_t* wpath = frond_utf8_to_utf16(path_data, path_len);
+        if (!wpath) return -1;
+        wchar_t* r = _wfullpath(NULL, wpath, 0);
+        free(wpath);
         if (!r) return -1;
-        if (GetFileAttributesA(r) == INVALID_FILE_ATTRIBUTES) return -1;
-        size_t n = strlen(r);
-        if (n >= (size_t)buf_len) return -2;
-        return (int64_t)n;
+        if (GetFileAttributesW(r) == INVALID_FILE_ATTRIBUTES) { free(r); return -1; }
+        int64_t n = frond_utf16_to_utf8_into(r, (char*)buf_data, buf_len);
+        free(r);
+        if (n == -1) return -2;
+        if (n < 0) return -1;
+        return n;
     #else
         if ((size_t)buf_len < PATH_MAX) return -2;
         if (!realpath(path_data, (char*)buf_data)) return -1;

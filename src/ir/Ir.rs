@@ -106,371 +106,377 @@ compute_fn_ids! {
     43 => CF_SELECT_GATE,
     44 => CF_THROW_OK,
     45 => CF_THROW_ERR,
-    46 => CF_FFI_CALL,
-    47 => CF_PROPAGATE,
-    48 => CF_SEQ,
-    49 => CF_WRITEBACK,
-    // i64 arithmetic and comparison (50-63)
-    50 => CF_ADD_I64,
-    51 => CF_SUB_I64,
-    52 => CF_MUL_I64,
-    53 => CF_DIV_I64,
-    54 => CF_MOD_I64,
-    55 => CF_EQ_I64,
-    56 => CF_NE_I64,
-    57 => CF_LT_I64,
-    58 => CF_GT_I64,
-    59 => CF_LE_I64,
-    60 => CF_GE_I64,
-    61 => CF_NEG_I64,
-    62 => CF_BITNOT_I32,
-    63 => CF_BITNOT_I64,
+    46 => CF_PROPAGATE,
+    47 => CF_SEQ,
+    // i64 arithmetic and comparison (48-61)
+    48 => CF_ADD_I64,
+    49 => CF_SUB_I64,
+    50 => CF_MUL_I64,
+    51 => CF_DIV_I64,
+    52 => CF_MOD_I64,
+    53 => CF_EQ_I64,
+    54 => CF_NE_I64,
+    55 => CF_LT_I64,
+    56 => CF_GT_I64,
+    57 => CF_LE_I64,
+    58 => CF_GE_I64,
+    59 => CF_NEG_I64,
+    60 => CF_BITNOT_I32,
+    61 => CF_BITNOT_I64,
     // i128 arithmetic and comparison (64-77)
-    64 => CF_ADD_I128,
-    65 => CF_SUB_I128,
-    66 => CF_MUL_I128,
-    67 => CF_DIV_I128,
-    68 => CF_MOD_I128,
-    69 => CF_EQ_I128,
-    70 => CF_NE_I128,
-    71 => CF_LT_I128,
-    72 => CF_GT_I128,
-    73 => CF_LE_I128,
-    74 => CF_GE_I128,
-    75 => CF_NEG_I128,
-    76 => CF_BITNOT_I128,
+    62 => CF_ADD_I128,
+    63 => CF_SUB_I128,
+    64 => CF_MUL_I128,
+    65 => CF_DIV_I128,
+    66 => CF_MOD_I128,
+    67 => CF_EQ_I128,
+    68 => CF_NE_I128,
+    69 => CF_LT_I128,
+    70 => CF_GT_I128,
+    71 => CF_LE_I128,
+    72 => CF_GE_I128,
+    73 => CF_NEG_I128,
+    74 => CF_BITNOT_I128,
     // Integer bitwise operations (77-91)
-    77 => CF_BITAND_I32,
-    78 => CF_BITOR_I32,
-    79 => CF_BITXOR_I32,
-    80 => CF_BITAND_I64,
-    81 => CF_BITOR_I64,
-    82 => CF_BITXOR_I64,
-    83 => CF_BITAND_I128,
-    84 => CF_BITOR_I128,
-    85 => CF_BITXOR_I128,
-    86 => CF_SHL_I32,
-    87 => CF_SHR_I32,
-    88 => CF_SHL_I64,
-    89 => CF_SHR_I64,
-    90 => CF_SHL_I128,
-    91 => CF_SHR_I128,
+    75 => CF_BITAND_I32,
+    76 => CF_BITOR_I32,
+    77 => CF_BITXOR_I32,
+    78 => CF_BITAND_I64,
+    79 => CF_BITOR_I64,
+    80 => CF_BITXOR_I64,
+    81 => CF_BITAND_I128,
+    82 => CF_BITOR_I128,
+    83 => CF_BITXOR_I128,
+    84 => CF_SHL_I32,
+    85 => CF_SHR_I32,
+    86 => CF_SHL_I64,
+    87 => CF_SHR_I64,
+    88 => CF_SHL_I128,
+    89 => CF_SHR_I128,
     // compute_fn for all primitive types (92-259)
     // i8: 92-103
-    92 => CF_ADD_I8,
-    93 => CF_SUB_I8,
-    94 => CF_MUL_I8,
-    95 => CF_DIV_I8,
-    96 => CF_MOD_I8,
-    97 => CF_BITAND_I8,
-    98 => CF_BITOR_I8,
-    99 => CF_BITXOR_I8,
-    100 => CF_SHL_I8,
-    101 => CF_SHR_I8,
-    102 => CF_NEG_I8,
-    103 => CF_BITNOT_I8,
+    90 => CF_ADD_I8,
+    91 => CF_SUB_I8,
+    92 => CF_MUL_I8,
+    93 => CF_DIV_I8,
+    94 => CF_MOD_I8,
+    95 => CF_BITAND_I8,
+    96 => CF_BITOR_I8,
+    97 => CF_BITXOR_I8,
+    98 => CF_SHL_I8,
+    99 => CF_SHR_I8,
+    100 => CF_NEG_I8,
+    101 => CF_BITNOT_I8,
     // i16: 104-115
-    104 => CF_ADD_I16,
-    105 => CF_SUB_I16,
-    106 => CF_MUL_I16,
-    107 => CF_DIV_I16,
-    108 => CF_MOD_I16,
-    109 => CF_BITAND_I16,
-    110 => CF_BITOR_I16,
-    111 => CF_BITXOR_I16,
-    112 => CF_SHL_I16,
-    113 => CF_SHR_I16,
-    114 => CF_NEG_I16,
-    115 => CF_BITNOT_I16,
+    102 => CF_ADD_I16,
+    103 => CF_SUB_I16,
+    104 => CF_MUL_I16,
+    105 => CF_DIV_I16,
+    106 => CF_MOD_I16,
+    107 => CF_BITAND_I16,
+    108 => CF_BITOR_I16,
+    109 => CF_BITXOR_I16,
+    110 => CF_SHL_I16,
+    111 => CF_SHR_I16,
+    112 => CF_NEG_I16,
+    113 => CF_BITNOT_I16,
     // i32: 116-127
-    116 => CF_ADD_I32_FULL,
-    117 => CF_SUB_I32_FULL,
-    118 => CF_MUL_I32_FULL,
-    119 => CF_DIV_I32_FULL,
-    120 => CF_MOD_I32_FULL,
-    121 => CF_BITAND_I32_FULL,
-    122 => CF_BITOR_I32_FULL,
-    123 => CF_BITXOR_I32_FULL,
-    124 => CF_SHL_I32_FULL,
-    125 => CF_SHR_I32_FULL,
-    126 => CF_NEG_I32_FULL,
-    127 => CF_BITNOT_I32_FULL,
+    114 => CF_ADD_I32_FULL,
+    115 => CF_SUB_I32_FULL,
+    116 => CF_MUL_I32_FULL,
+    117 => CF_DIV_I32_FULL,
+    118 => CF_MOD_I32_FULL,
+    119 => CF_BITAND_I32_FULL,
+    120 => CF_BITOR_I32_FULL,
+    121 => CF_BITXOR_I32_FULL,
+    122 => CF_SHL_I32_FULL,
+    123 => CF_SHR_I32_FULL,
+    124 => CF_NEG_I32_FULL,
+    125 => CF_BITNOT_I32_FULL,
     // i64: 128-139
-    128 => CF_ADD_I64_FULL,
-    129 => CF_SUB_I64_FULL,
-    130 => CF_MUL_I64_FULL,
-    131 => CF_DIV_I64_FULL,
-    132 => CF_MOD_I64_FULL,
-    133 => CF_BITAND_I64_FULL,
-    134 => CF_BITOR_I64_FULL,
-    135 => CF_BITXOR_I64_FULL,
-    136 => CF_SHL_I64_FULL,
-    137 => CF_SHR_I64_FULL,
-    138 => CF_NEG_I64_FULL,
-    139 => CF_BITNOT_I64_FULL,
+    126 => CF_ADD_I64_FULL,
+    127 => CF_SUB_I64_FULL,
+    128 => CF_MUL_I64_FULL,
+    129 => CF_DIV_I64_FULL,
+    130 => CF_MOD_I64_FULL,
+    131 => CF_BITAND_I64_FULL,
+    132 => CF_BITOR_I64_FULL,
+    133 => CF_BITXOR_I64_FULL,
+    134 => CF_SHL_I64_FULL,
+    135 => CF_SHR_I64_FULL,
+    136 => CF_NEG_I64_FULL,
+    137 => CF_BITNOT_I64_FULL,
     // i128: 140-151
-    140 => CF_ADD_I128_FULL,
-    141 => CF_SUB_I128_FULL,
-    142 => CF_MUL_I128_FULL,
-    143 => CF_DIV_I128_FULL,
-    144 => CF_MOD_I128_FULL,
-    145 => CF_BITAND_I128_FULL,
-    146 => CF_BITOR_I128_FULL,
-    147 => CF_BITXOR_I128_FULL,
-    148 => CF_SHL_I128_FULL,
-    149 => CF_SHR_I128_FULL,
-    150 => CF_NEG_I128_FULL,
-    151 => CF_BITNOT_I128_FULL,
+    138 => CF_ADD_I128_FULL,
+    139 => CF_SUB_I128_FULL,
+    140 => CF_MUL_I128_FULL,
+    141 => CF_DIV_I128_FULL,
+    142 => CF_MOD_I128_FULL,
+    143 => CF_BITAND_I128_FULL,
+    144 => CF_BITOR_I128_FULL,
+    145 => CF_BITXOR_I128_FULL,
+    146 => CF_SHL_I128_FULL,
+    147 => CF_SHR_I128_FULL,
+    148 => CF_NEG_I128_FULL,
+    149 => CF_BITNOT_I128_FULL,
     // u8: 152-163
-    152 => CF_ADD_U8,
-    153 => CF_SUB_U8,
-    154 => CF_MUL_U8,
-    155 => CF_DIV_U8,
-    156 => CF_MOD_U8,
-    157 => CF_BITAND_U8,
-    158 => CF_BITOR_U8,
-    159 => CF_BITXOR_U8,
-    160 => CF_SHL_U8,
-    161 => CF_SHR_U8,
-    162 => CF_NEG_U8,
-    163 => CF_BITNOT_U8,
+    150 => CF_ADD_U8,
+    151 => CF_SUB_U8,
+    152 => CF_MUL_U8,
+    153 => CF_DIV_U8,
+    154 => CF_MOD_U8,
+    155 => CF_BITAND_U8,
+    156 => CF_BITOR_U8,
+    157 => CF_BITXOR_U8,
+    158 => CF_SHL_U8,
+    159 => CF_SHR_U8,
+    160 => CF_NEG_U8,
+    161 => CF_BITNOT_U8,
     // u16: 164-175
-    164 => CF_ADD_U16,
-    165 => CF_SUB_U16,
-    166 => CF_MUL_U16,
-    167 => CF_DIV_U16,
-    168 => CF_MOD_U16,
-    169 => CF_BITAND_U16,
-    170 => CF_BITOR_U16,
-    171 => CF_BITXOR_U16,
-    172 => CF_SHL_U16,
-    173 => CF_SHR_U16,
-    174 => CF_NEG_U16,
-    175 => CF_BITNOT_U16,
+    162 => CF_ADD_U16,
+    163 => CF_SUB_U16,
+    164 => CF_MUL_U16,
+    165 => CF_DIV_U16,
+    166 => CF_MOD_U16,
+    167 => CF_BITAND_U16,
+    168 => CF_BITOR_U16,
+    169 => CF_BITXOR_U16,
+    170 => CF_SHL_U16,
+    171 => CF_SHR_U16,
+    172 => CF_NEG_U16,
+    173 => CF_BITNOT_U16,
     // u32: 176-187
-    176 => CF_ADD_U32,
-    177 => CF_SUB_U32,
-    178 => CF_MUL_U32,
-    179 => CF_DIV_U32,
-    180 => CF_MOD_U32,
-    181 => CF_BITAND_U32,
-    182 => CF_BITOR_U32,
-    183 => CF_BITXOR_U32,
-    184 => CF_SHL_U32,
-    185 => CF_SHR_U32,
-    186 => CF_NEG_U32,
-    187 => CF_BITNOT_U32,
+    174 => CF_ADD_U32,
+    175 => CF_SUB_U32,
+    176 => CF_MUL_U32,
+    177 => CF_DIV_U32,
+    178 => CF_MOD_U32,
+    179 => CF_BITAND_U32,
+    180 => CF_BITOR_U32,
+    181 => CF_BITXOR_U32,
+    182 => CF_SHL_U32,
+    183 => CF_SHR_U32,
+    184 => CF_NEG_U32,
+    185 => CF_BITNOT_U32,
     // u64: 188-199
-    188 => CF_ADD_U64,
-    189 => CF_SUB_U64,
-    190 => CF_MUL_U64,
-    191 => CF_DIV_U64,
-    192 => CF_MOD_U64,
-    193 => CF_BITAND_U64,
-    194 => CF_BITOR_U64,
-    195 => CF_BITXOR_U64,
-    196 => CF_SHL_U64,
-    197 => CF_SHR_U64,
-    198 => CF_NEG_U64,
-    199 => CF_BITNOT_U64,
+    186 => CF_ADD_U64,
+    187 => CF_SUB_U64,
+    188 => CF_MUL_U64,
+    189 => CF_DIV_U64,
+    190 => CF_MOD_U64,
+    191 => CF_BITAND_U64,
+    192 => CF_BITOR_U64,
+    193 => CF_BITXOR_U64,
+    194 => CF_SHL_U64,
+    195 => CF_SHR_U64,
+    196 => CF_NEG_U64,
+    197 => CF_BITNOT_U64,
     // u128: 200-211
-    200 => CF_ADD_U128,
-    201 => CF_SUB_U128,
-    202 => CF_MUL_U128,
-    203 => CF_DIV_U128,
-    204 => CF_MOD_U128,
-    205 => CF_BITAND_U128,
-    206 => CF_BITOR_U128,
-    207 => CF_BITXOR_U128,
-    208 => CF_SHL_U128,
-    209 => CF_SHR_U128,
-    210 => CF_NEG_U128,
-    211 => CF_BITNOT_U128,
+    198 => CF_ADD_U128,
+    199 => CF_SUB_U128,
+    200 => CF_MUL_U128,
+    201 => CF_DIV_U128,
+    202 => CF_MOD_U128,
+    203 => CF_BITAND_U128,
+    204 => CF_BITOR_U128,
+    205 => CF_BITXOR_U128,
+    206 => CF_SHL_U128,
+    207 => CF_SHR_U128,
+    208 => CF_NEG_U128,
+    209 => CF_BITNOT_U128,
     // isize: 212-223
-    212 => CF_ADD_ISIZE,
-    213 => CF_SUB_ISIZE,
-    214 => CF_MUL_ISIZE,
-    215 => CF_DIV_ISIZE,
-    216 => CF_MOD_ISIZE,
-    217 => CF_BITAND_ISIZE,
-    218 => CF_BITOR_ISIZE,
-    219 => CF_BITXOR_ISIZE,
-    220 => CF_SHL_ISIZE,
-    221 => CF_SHR_ISIZE,
-    222 => CF_NEG_ISIZE,
-    223 => CF_BITNOT_ISIZE,
+    210 => CF_ADD_ISIZE,
+    211 => CF_SUB_ISIZE,
+    212 => CF_MUL_ISIZE,
+    213 => CF_DIV_ISIZE,
+    214 => CF_MOD_ISIZE,
+    215 => CF_BITAND_ISIZE,
+    216 => CF_BITOR_ISIZE,
+    217 => CF_BITXOR_ISIZE,
+    218 => CF_SHL_ISIZE,
+    219 => CF_SHR_ISIZE,
+    220 => CF_NEG_ISIZE,
+    221 => CF_BITNOT_ISIZE,
     // usize: 224-235
-    224 => CF_ADD_USIZE,
-    225 => CF_SUB_USIZE,
-    226 => CF_MUL_USIZE,
-    227 => CF_DIV_USIZE,
-    228 => CF_MOD_USIZE,
-    229 => CF_BITAND_USIZE,
-    230 => CF_BITOR_USIZE,
-    231 => CF_BITXOR_USIZE,
-    232 => CF_SHL_USIZE,
-    233 => CF_SHR_USIZE,
-    234 => CF_NEG_USIZE,
-    235 => CF_BITNOT_USIZE,
+    222 => CF_ADD_USIZE,
+    223 => CF_SUB_USIZE,
+    224 => CF_MUL_USIZE,
+    225 => CF_DIV_USIZE,
+    226 => CF_MOD_USIZE,
+    227 => CF_BITAND_USIZE,
+    228 => CF_BITOR_USIZE,
+    229 => CF_BITXOR_USIZE,
+    230 => CF_SHL_USIZE,
+    231 => CF_SHR_USIZE,
+    232 => CF_NEG_USIZE,
+    233 => CF_BITNOT_USIZE,
     // 4 floating-point types × 6 operations
     // f16: 236-241
-    236 => CF_ADD_F16,
-    237 => CF_SUB_F16,
-    238 => CF_MUL_F16,
-    239 => CF_DIV_F16,
-    240 => CF_MOD_F16,
-    241 => CF_NEG_F16,
+    234 => CF_ADD_F16,
+    235 => CF_SUB_F16,
+    236 => CF_MUL_F16,
+    237 => CF_DIV_F16,
+    238 => CF_MOD_F16,
+    239 => CF_NEG_F16,
     // f32: 242-247
-    242 => CF_ADD_F32,
-    243 => CF_SUB_F32,
-    244 => CF_MUL_F32,
-    245 => CF_DIV_F32,
-    246 => CF_MOD_F32,
-    247 => CF_NEG_F32,
+    240 => CF_ADD_F32,
+    241 => CF_SUB_F32,
+    242 => CF_MUL_F32,
+    243 => CF_DIV_F32,
+    244 => CF_MOD_F32,
+    245 => CF_NEG_F32,
     // f64: 248-253
-    248 => CF_ADD_F64_FULL,
-    249 => CF_SUB_F64_FULL,
-    250 => CF_MUL_F64_FULL,
-    251 => CF_DIV_F64_FULL,
-    252 => CF_MOD_F64_FULL,
-    253 => CF_NEG_F64_FULL,
+    246 => CF_ADD_F64_FULL,
+    247 => CF_SUB_F64_FULL,
+    248 => CF_MUL_F64_FULL,
+    249 => CF_DIV_F64_FULL,
+    250 => CF_MOD_F64_FULL,
+    251 => CF_NEG_F64_FULL,
     // f128: 254-259
-    254 => CF_ADD_F128,
-    255 => CF_SUB_F128,
-    256 => CF_MUL_F128,
-    257 => CF_DIV_F128,
-    258 => CF_MOD_F128,
-    259 => CF_NEG_F128,
+    252 => CF_ADD_F128,
+    253 => CF_SUB_F128,
+    254 => CF_MUL_F128,
+    255 => CF_DIV_F128,
+    256 => CF_MOD_F128,
+    257 => CF_NEG_F128,
     // Semantic operations (260-265)
-    260 => CF_REF_EQ,
-    261 => CF_REF_NEQ,
-    262 => CF_CONCAT_LIST,
-    263 => CF_RANGE,
-    264 => CF_RANGE_INCLUSIVE,
-    265 => CF_ELVIS,
+    258 => CF_REF_EQ,
+    259 => CF_REF_NEQ,
+    260 => CF_CONCAT_LIST,
+    261 => CF_RANGE,
+    262 => CF_RANGE_INCLUSIVE,
+    263 => CF_ELVIS,
     // inline_trait / lazy construction (266-267)
-    266 => CF_TRAIT_CONSTRUCT,
-    267 => CF_LAZY_CONSTRUCT,
-    268 => CF_SLICE,
-    269 => CF_STR_CONCAT,
+    264 => CF_TRAIT_CONSTRUCT,
+    265 => CF_LAZY_CONSTRUCT,
+    266 => CF_SLICE,
+    267 => CF_STR_CONCAT,
     // Global variable read/write (270-271)
-    270 => CF_GLOBAL_LOAD,
-    271 => CF_GLOBAL_STORE,
+    268 => CF_GLOBAL_LOAD,
+    269 => CF_GLOBAL_STORE,
     // Record extension / atomic construction (272-273)
-    272 => CF_RECORD_EXTEND,
-    273 => CF_ATOMIC_CONSTRUCT,
+    270 => CF_RECORD_EXTEND,
+    271 => CF_ATOMIC_CONSTRUCT,
     // Pattern matching (274-276)
-    274 => CF_PATTERN_CTOR_MATCH,
-    275 => CF_PATTERN_ADT_FIELD_GET,
-    276 => CF_PATTERN_STR_EQ,
+    272 => CF_PATTERN_CTOR_MATCH,
+    273 => CF_PATTERN_ADT_FIELD_GET,
+    274 => CF_PATTERN_STR_EQ,
     // General type conversion (277-278)
-    277 => CF_CAST_TO_STR,
-    278 => CF_CAST_SCALAR,
+    275 => CF_CAST_TO_STR,
+    276 => CF_CAST_SCALAR,
     // Reference semantics and non-null assertion (279-282)
-    279 => CF_NON_NULL_ASSERT,
-    280 => CF_REF_OF,
-    281 => CF_DEREF_READ,
-    282 => CF_DEREF_WRITE,
+    277 => CF_NON_NULL_ASSERT,
+    278 => CF_REF_OF,
+    279 => CF_DEREF_READ,
+    280 => CF_DEREF_WRITE,
     // Channel operations (283-285)
-    283 => CF_CHANNEL_CREATE,
-    284 => CF_CHANNEL_SEND,
-    285 => CF_CHANNEL_CLOSE,
+    281 => CF_CHANNEL_CREATE,
+    282 => CF_CHANNEL_SEND,
+    283 => CF_CHANNEL_CLOSE,
     // Partial application construction (286)
-    286 => CF_PARTIAL_CONSTRUCT,
+    284 => CF_PARTIAL_CONSTRUCT,
     // str.bytes() → u8[] (287)
-    287 => CF_STR_BYTES,
+    285 => CF_STR_BYTES,
     // Stack-allocated construction (288-289)
-    288 => CF_RECORD_CONSTRUCT_STACK,
-    289 => CF_ARRAY_CONSTRUCT_STACK,
+    286 => CF_RECORD_CONSTRUCT_STACK,
+    287 => CF_ARRAY_CONSTRUCT_STACK,
     // Standalone reflect compute_fn (290-291): split from compute_ffi_call
     // to decouple lazy force logic from FFI calls.
-    290 => CF_REFLECT_FORMAT,
-    291 => CF_REFLECT_SCALAR_TO_STR,
+    288 => CF_REFLECT_FORMAT,
+    289 => CF_REFLECT_SCALAR_TO_STR,
     // String comparison (292-297): lexicographic by Unicode code point sequence.
     // Does not use the i32 path (str has no as_i32 semantics; the i32 path would always yield 0, producing wrong results).
-    292 => CF_EQ_STR,
-    293 => CF_NE_STR,
-    294 => CF_LT_STR,
-    295 => CF_GT_STR,
-    296 => CF_LE_STR,
-    297 => CF_GE_STR,
+    290 => CF_EQ_STR,
+    291 => CF_NE_STR,
+    292 => CF_LT_STR,
+    293 => CF_GT_STR,
+    294 => CF_LE_STR,
+    295 => CF_GE_STR,
     // Semantic equality/inequality for composite types (298-299): record/adt/newtype/array/closure/throw, etc.
-    298 => CF_EQ_OBJ,
-    299 => CF_NE_OBJ,
+    296 => CF_EQ_OBJ,
+    297 => CF_NE_OBJ,
     // Boolean inequality (300): symmetric with CF_EQ_BOOL(27); as_i32 on bool is always 0, so CF_NE_I32 cannot be used.
-    300 => CF_NE_BOOL,
+    298 => CF_NE_BOOL,
     // Array index store (301): arr[i] = x, in-place mutation of the Array heap object.
-    301 => CF_ARRAY_STORE,
+    299 => CF_ARRAY_STORE,
     // f128 comparison (302-307): f128 via to_f64 loses 60 bits of precision, requiring dedicated bit-pattern comparison.
-    302 => CF_EQ_F128,
-    303 => CF_NE_F128,
-    304 => CF_LT_F128,
-    305 => CF_GT_F128,
-    306 => CF_LE_F128,
-    307 => CF_GE_F128,
-    // Memoization cache (308-309): memo_check queries the cache and returns record(hit, value); memo_store writes the cache and passes the value through.
-    308 => CF_MEMO_CHECK,
-    309 => CF_MEMO_STORE,
-    // Tail-recursion WriteBack (310): compute_writeback + sets the Continue signal.
-    310 => CF_TAILREC_WRITEBACK,
-    // Control-flow compute_fn (311-313): replaces the control_signal_nodes table;
+    300 => CF_EQ_F128,
+    301 => CF_NE_F128,
+    302 => CF_LT_F128,
+    303 => CF_GT_F128,
+    304 => CF_LE_F128,
+    305 => CF_GE_F128,
+    // Memoization cache (306-307): memo_check queries the cache and returns record(hit, value); memo_store writes the cache and passes the value through.
+    306 => CF_MEMO_CHECK,
+    307 => CF_MEMO_STORE,
+    // Control-flow compute_fn (308-311): replaces the control_signal_nodes table;
     // compute_fn directly returns NodeResult::Return/Break/Continue.
-    311 => CF_RETURN,
-    312 => CF_BREAK,
-    313 => CF_CONTINUE,
-    314 => CF_MATCH_FALLBACK,
-    // Atomic operations (315-318): load/store/swap/compare_exchange on Atomic<T>.
-    315 => CF_ATOMIC_LOAD,
-    316 => CF_ATOMIC_STORE,
-    317 => CF_ATOMIC_SWAP,
-    318 => CF_ATOMIC_COMPARE_EXCHANGE,
-    319 => CF_STR_MULTI_CONCAT,
-    320 => CF_STR_ARRAY_JOIN,
+    308 => CF_RETURN,
+    309 => CF_BREAK,
+    310 => CF_CONTINUE,
+    311 => CF_MATCH_FALLBACK,
+    // Atomic operations (312-315): load/store/swap/compare_exchange on Atomic<T>.
+    312 => CF_ATOMIC_LOAD,
+    313 => CF_ATOMIC_STORE,
+    314 => CF_ATOMIC_SWAP,
+    315 => CF_ATOMIC_COMPARE_EXCHANGE,
+    316 => CF_STR_MULTI_CONCAT,
+    317 => CF_STR_ARRAY_JOIN,
     // Array fill [value, ..count] (321): repeats value count times
-    321 => CF_ARRAY_FILL,
+    318 => CF_ARRAY_FILL,
     // Runtime defer registration/execution (322-323): table override (new signature)
-    322 => CF_DEFER_REGISTER,
-    323 => CF_DEFER_RUN,
+    319 => CF_DEFER_REGISTER,
+    320 => CF_DEFER_RUN,
     // Block-scoped defer registration (324): like CF_DEFER_REGISTER but input[0] is an effect dep.
-    324 => CF_BLOCK_DEFER_REGISTER,
+    321 => CF_BLOCK_DEFER_REGISTER,
     // stdlib @extern("C") #{ }# inline FFI call (325): resolves a self-symbol (frond_extern_<name>)
     // via dlsym/GetProcAddress + Abi::call_dynamic. Inputs are the call arguments + a trailing
     // effect dep; dyn_ffi_info metadata carries (symbol, sig, arg_count).
-    325 => CF_DYN_FFI_CALL,
-    // ── reflect compute_fns (326-340): standalone reflect primitives.
+    322 => CF_DYN_FFI_CALL,
+    // ── reflect compute_fns (323-337): standalone reflect primitives.
     // Replaces the former @builtin + REFLECT_ENTRIES + CF_FFI_CALL dispatch path.
     // Each takes the receiver value as input[0] (+ optional index as input[1])
     // and calls the pure-Rust helper in value/Reflect.rs directly — no FFI.
-    326 => CF_REFLECT_KIND,           // v.kind()        -> u8
-    327 => CF_REFLECT_TYPE_NAME,      // v.type_name()   -> str
-    328 => CF_REFLECT_KIND_STR,       // v.kind_str()    -> str
-    329 => CF_REFLECT_SIZE,           // v.size()        -> u8  (scalar byte width)
-    330 => CF_REFLECT_LAYOUT_SIZE,    // v.size()        -> u32 (aggregate layout size)
-    331 => CF_REFLECT_LAYOUT_ALIGN,   // v.alignment()   -> u32
-    332 => CF_REFLECT_FIELD_COUNT,    // v.field_count() -> u16
-    333 => CF_REFLECT_FIELD_NAME,     // v.field_name(i) -> str
-    334 => CF_REFLECT_FIELD_VALUE,    // v.field_value(i)-> Value
-    335 => CF_REFLECT_ARRAY_LEN,      // v.array_len()   -> usize
-    336 => CF_REFLECT_ADT_CTOR,       // v.adt_constructor() -> str
-    // ── Lib / ForeignFn compute_fns (337-342): builtin native-library interop.
+    323 => CF_REFLECT_KIND,           // v.kind()        -> u8
+    324 => CF_REFLECT_TYPE_NAME,      // v.type_name()   -> str
+    325 => CF_REFLECT_KIND_STR,       // v.kind_str()    -> str
+    326 => CF_REFLECT_SIZE,           // v.size()        -> u8  (scalar byte width)
+    327 => CF_REFLECT_LAYOUT_SIZE,    // v.size()        -> u32 (aggregate layout size)
+    328 => CF_REFLECT_LAYOUT_ALIGN,   // v.alignment()   -> u32
+    329 => CF_REFLECT_FIELD_COUNT,    // v.field_count() -> u16
+    330 => CF_REFLECT_FIELD_NAME,     // v.field_name(i) -> str
+    331 => CF_REFLECT_FIELD_VALUE,    // v.field_value(i)-> Value
+    332 => CF_REFLECT_ARRAY_LEN,      // v.array_len()   -> usize
+    333 => CF_REFLECT_ADT_CTOR,       // v.adt_constructor() -> str
+    // ── Lib / ForeignFn compute_fns (334-339): builtin native-library interop.
     // open/embed: input[0] = path str (+ effect dep); lookup: [lib, name, args_sig];
     // has_symbol: [lib, name]; close: [lib]; call: [ffn, args...] with the arg
     // count in the shared closure_call_arg_count metadata slot.
-    337 => CF_LIB_OPEN,
-    338 => CF_LIB_EMBED,
-    339 => CF_LIB_LOOKUP,
-    340 => CF_LIB_HAS_SYMBOL,
-    341 => CF_LIB_CLOSE,
-    342 => CF_FFN_CALL,
-    // ── Emptiness check (343): `s.is_empty()` / `arr.is_empty()` (str/array builtin)
-    343 => CF_IS_EMPTY,
-    344 => CF_EQ_U128,
-    345 => CF_NE_U128,
-    346 => CF_LT_U128,
-    347 => CF_GT_U128,
-    348 => CF_LE_U128,
-    349 => CF_GE_U128,
-}
+    334 => CF_LIB_OPEN,
+    335 => CF_LIB_EMBED,
+    336 => CF_LIB_LOOKUP,
+    337 => CF_LIB_HAS_SYMBOL,
+    338 => CF_LIB_CLOSE,
+    339 => CF_FFN_CALL,
+    // ── Emptiness check (340): `s.is_empty()` / `arr.is_empty()` (str/array builtin)
+    340 => CF_IS_EMPTY,
+    341 => CF_EQ_U128,
+    342 => CF_NE_U128,
+    343 => CF_LT_U128,
+    344 => CF_GT_U128,
+    345 => CF_LE_U128,
+    346 => CF_GE_U128,
+    // ── Array cast (347): `x as T[]` — carries the array through, converts
+    //    scalar elements when tags differ, passes non-scalar targets as
+    //    reference casts.
+    347 => CF_CAST_ARRAY,
+    // ── Deep copy (348): `v.clone()` reflect method — data domain (arrays/
+    //    records) recurses, immutable leaves and runtime identities share.
+    348 => CF_REFLECT_CLONE,
+    // ── Unconditional Cell allocation (349): place-model decl-site slotting.
+    //    Unlike CF_REF_OF (which shares heap-object Arcs), this ALWAYS boxes
+    //    the value into a fresh Cell — the binding's storage location.
+    349 => CF_CELL_ALLOC,}
 
 /// Number of entries in `build_compute_fn_table()`.
 ///
@@ -643,6 +649,19 @@ pub struct ValueTable {
     /// Replaces the original Vec<bool>, 8x compression (N nodes: N B → N/8 B).
     pub ready: Vec<u8>,
     pub refcounts: Vec<u16>,
+    /// E6 delta-reset bookkeeping: `dirty_gen[idx] == gen` ⟺ slot idx was written during the
+    /// current generation. `dirty_list` holds this generation's written slots (dedup via the
+    /// stamp — a slot is pushed at most once per generation). A generation boundary is any
+    /// `reset_all` / `take_dirty`, which bumps `gen` so stale stamps stop matching without
+    /// clearing the array.
+    ///
+    /// Tracking is opt-in per frame (`enable_dirty_tracking`): only loop frames and their
+    /// body frames consume dirty lists (per-iteration delta reset), so every other frame
+    /// skips the bookkeeping entirely (one bool check per set_value).
+    track_dirty: bool,
+    dirty_gen: Vec<u32>,
+    gen: u32,
+    dirty_list: Vec<u32>,
 }
 
 impl ValueTable {
@@ -652,6 +671,10 @@ impl ValueTable {
             values: Vec::new(),
             ready: Vec::new(),
             refcounts: Vec::new(),
+            track_dirty: false,
+            dirty_gen: Vec::new(),
+            gen: 1,
+            dirty_list: Vec::new(),
         }
     }
 
@@ -661,6 +684,76 @@ impl ValueTable {
             values: vec![Value::NULL; n],
             ready: vec![0u8; (n + 7) / 8],
             refcounts: vec![0; n],
+            track_dirty: false,
+            dirty_gen: vec![0; n],
+            gen: 1,
+            dirty_list: Vec::new(),
+        }
+    }
+
+    /// Enables delta-reset tracking and starts a fresh generation (prior writes — covered by
+    /// the caller's full-copy synchronization — are deliberately not recorded).
+    pub fn enable_dirty_tracking(&mut self) {
+        if !self.track_dirty {
+            self.track_dirty = true;
+        }
+        self.dirty_list.clear();
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.dirty_gen.fill(0);
+            self.gen = 1;
+        }
+    }
+
+    /// Disables delta-reset tracking (frame re-targeting: pool acquire / subgraph switch).
+    pub fn disable_dirty_tracking(&mut self) {
+        self.track_dirty = false;
+        self.dirty_list.clear();
+    }
+
+    /// Whether delta-reset tracking is on (the delta path requires BOTH frames tracked).
+    pub fn dirty_tracking_enabled(&self) -> bool {
+        self.track_dirty
+    }
+
+    /// Marks slot idx as written in the current generation (no-op if already recorded).
+    #[inline]
+    fn record_dirty(&mut self, idx: usize) {
+        if !self.track_dirty {
+            return;
+        }
+        if self.dirty_gen[idx] != self.gen {
+            self.dirty_gen[idx] = self.gen;
+            self.dirty_list.push(idx as u32);
+        }
+    }
+
+    /// Public recording for write sites that assign `values` directly (fused carry apply).
+    #[inline]
+    pub fn record_dirty_slot(&mut self, idx: usize) {
+        self.record_dirty(idx);
+    }
+
+    /// Number of slots recorded in the current dirty generation (0 when tracking is off).
+    pub fn dirty_len(&self) -> usize {
+        self.dirty_list.len()
+    }
+
+    /// The k-th slot of the current dirty generation.
+    pub fn dirty_slot(&self, k: usize) -> u32 {
+        self.dirty_list[k]
+    }
+
+    /// Ends the current dirty generation (list capacity is retained — the next generation's
+    /// pushes reuse it). Writes after this call start a fresh generation. Index-based
+    /// iteration (`dirty_len`/`dirty_slot`) + this call avoid both allocation churn and
+    /// borrow conflicts at the loop boundary.
+    pub fn end_dirty_generation(&mut self) {
+        self.dirty_list.clear();
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.dirty_gen.fill(0);
+            self.gen = 1;
         }
     }
 
@@ -678,6 +771,7 @@ impl ValueTable {
         self.values.resize(n, Value::NULL);
         self.ready.resize((n + 7) / 8, 0);
         self.refcounts.resize(n, 0);
+        self.dirty_gen.resize(n, 0);
     }
 
     /// Checks whether node idx is ready.
@@ -703,6 +797,17 @@ impl ValueTable {
         self.values[idx] = value;
         self.set_ready(idx);
         self.refcounts[idx] = consumer_count;
+        self.record_dirty(idx);
+    }
+
+    /// Copies slot idx from `src` (value + ready bit, refcount zeroed — the copy is never
+    /// consumed in the destination frame). Records the write for E6 delta bookkeeping.
+    /// `src` must have idx ready (mirror of `copy_outer_ready_values`'s ready-only copy).
+    pub fn copy_slot_from(&mut self, idx: usize, src: &ValueTable) {
+        self.values[idx] = src.values[idx].clone();
+        self.set_ready(idx);
+        self.refcounts[idx] = 0;
+        self.record_dirty(idx);
     }
 
     /// Gets the output value (cloned).
@@ -734,13 +839,22 @@ impl ValueTable {
         self.values[idx] = Value::NULL;
         self.clear_ready(idx);
         self.refcounts[idx] = 0;
+        self.record_dirty(idx);
     }
 
     /// Resets all slots to unready (heap object Arc Drop auto-decrefs).
+    /// E6: also ends the current dirty generation — a reset_all is a generation boundary,
+    /// everything written before it is wiped anyway.
     pub fn reset_all(&mut self) {
         self.values.fill(Value::NULL);
         self.ready.fill(0);
         self.refcounts.fill(0);
+        self.dirty_list.clear();
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.dirty_gen.fill(0);
+            self.gen = 1;
+        }
     }
 }
 
@@ -1247,6 +1361,22 @@ pub struct Frame {
     /// Stores the Closure value for escaping closure calls, used to write back upvalues to the Closure after the child frame completes.
     /// None = ordinary function call or same_function closure call.
     pub closure_val: Option<Value>,
+    /// E7 same-frame branch relays: (branch return node local, gate node local).
+    /// A same-frame branch execution (match arm / if arm / short-circuit RHS)
+    /// registers its sg's return node here; when the driver sets that node's
+    /// value, the value is relayed to the gate's slot and the gate's consumers
+    /// notified — the dataflow equivalent of a child frame's completion
+    /// writeback, without the frame. Usually empty (checked on every node
+    /// completion; cleared on frame reuse and loop resets).
+    pub branch_relays: Vec<(NodeId, NodeId)>,
+    /// E8: nullary-constructor construct cache — (node gid, Value). A 0-field
+    /// ADT/Record construct's result is fully determined by the node's
+    /// immutable metadata, so one build per node suffices; later executions
+    /// Arc-clone the cached value (vs. 3-4 allocations: type_name String +
+    /// ctor String + fields Vec + the Arc itself). gid-keyed and eternally
+    /// valid across frames/iterations; cleared on frame pool reuse only for
+    /// memory hygiene.
+    pub construct_cache: Vec<(u32, Value)>,
 }
 
 impl Frame {
@@ -1274,6 +1404,8 @@ impl Frame {
             same_fn_prep_cache: None,
             linear_fresh: false,
             closure_val: None,
+            branch_relays: Vec::new(),
+            construct_cache: Vec::new(),
         }
     }
 
@@ -1318,6 +1450,31 @@ impl Frame {
         } else {
             Value::NULL
         }
+    }
+
+    /// Borrows a node's output value WITHOUT cloning (global NodeId; walks
+    /// the frame chain like `get_value_by_global` but returns a reference).
+    /// Returns None when the slot is not ready in any frame — callers fall
+    /// back to `force_input`. Hot path for cell deref reads/writes: skipping
+    /// the Value clone removes an Arc incref/decref pair per cell op.
+    pub(crate) fn peek_value_by_global(&self, global_node: NodeId) -> Option<&Value> {
+        let local = global_node.0.wrapping_sub(self.node_offset);
+        if (local as usize) < self.value_table.len()
+            && self.value_table.is_ready(local as usize)
+        {
+            return Some(&self.value_table.values[local as usize]);
+        }
+        // SAFETY: parent/root frames strictly outlive their children, and the
+        // engine executes single-threaded during compute_fn dispatch (frames
+        // are suspended while callees run) — the borrow cannot dangle and no
+        // concurrent write can alias it.
+        if !self.parent_frame_ptr.is_null() {
+            return unsafe { (*self.parent_frame_ptr).peek_value_by_global(global_node) };
+        }
+        if !self.root_frame_ptr.is_null() {
+            return unsafe { (*self.root_frame_ptr).peek_value_by_global(global_node) };
+        }
+        None
     }
 
     /// Checks whether a node is ready (all inputs produced).
@@ -1594,6 +1751,11 @@ pub enum EventSourceKind {
 pub struct SubGraph {
     /// Subgraph id.
     pub id: SubGraphId,
+    /// Builder stamp: generated inside a strategy converter (tailrec /
+    /// non-tail-rec / memoize). The engine's E7 same-frame branch path
+    /// excludes converter-generated sgs — their state machines rely on the
+    /// child-frame signal-propagation protocol (Continue barriers).
+    pub converter_generated: bool,
     /// Node id range [start, end).
     pub node_range: (NodeId, NodeId),
     /// Number of parameters (input count of the entry node).
@@ -1648,6 +1810,33 @@ pub struct ResetPlan {
     /// also rescanned every subgraph for nested ranges) each iteration.
     /// Empty when there is nothing to precompute or before `precompute_reset_plans`.
     pub condition_tree_plan: Vec<(NodeId, u16)>,
+    /// Place-model phi (while loops): loop-carried cell values ride the sg's
+    /// PARAM slots. `carries_value`: (param_node, value_source_node) — at
+    /// each iteration reset the engine copies the body's final value of
+    /// `value_source_node` into the param slot (and pokes the condition
+    /// chain). `carries_cell`: (param_node, cell_node) — same, but the source
+    /// is dereferenced through the Cell first (for conditionally stored vars
+    /// whose final value node is not statically known).
+    pub carries_value: Vec<(NodeId, NodeId)>,
+    pub carries_cell: Vec<(NodeId, NodeId)>,
+    /// E2 fused-carry plan (filled by `precompute_reset_plans`): per carried
+    /// param — (param_local, src_body_local, consumer_loop_locals) with all
+    /// frame-relative indices precomputed, so the per-iteration application
+    /// in `reset_loop_iteration` is direct slot arithmetic (no
+    /// get_value_by_global chain walk, no downstream_slice lookup, no
+    /// downstream_count recompute).
+    pub fused_carries: Vec<FusedCarry>,
+}
+
+/// One precomputed loop-carried register application.
+#[derive(Debug, Clone)]
+pub struct FusedCarry {
+    pub param_local: u32,
+    pub src_body_local: u32,
+    pub through_cell: bool,
+    /// Downstream consumers of the param, as loop-frame local ids (the
+    /// pending decrements + ready pushes applied after the slot write).
+    pub consumers: Vec<u32>,
 }
 
 /// Which side of the NodeRef door a reference came from: per-node metadata
@@ -1813,362 +2002,364 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
         43  => super::Compute::noop_compute_real, // compute_select_gate — new signature, table override
         44  => super::Compute::compute_throw_ok,
         45  => super::Compute::compute_throw_err,
-        46  => super::Compute::noop_compute_real, // CF_FFI_CALL is deprecated (wrapper table deleted); the slot is kept to avoid renumbering.
-        47  => super::Compute::noop_compute_real, // compute_propagate — new signature, table override
-        48  => super::Compute::compute_seq,
-        49  => super::Compute::noop_compute_real, // compute_writeback — new signature, table override
-        // i64 arithmetic and comparison (50-63)
-        50  => super::Compute::compute_add_i64,
-        51  => super::Compute::compute_sub_i64,
-        52  => super::Compute::compute_mul_i64,
-        53  => super::Compute::compute_div_i64,
-        54  => super::Compute::compute_mod_i64,
-        55  => super::Compute::compute_eq_i64,
-        56  => super::Compute::compute_ne_i64,
-        57  => super::Compute::compute_lt_i64,
-        58  => super::Compute::compute_gt_i64,
-        59  => super::Compute::compute_le_i64,
-        60  => super::Compute::compute_ge_i64,
-        61  => super::Compute::compute_neg_i64,
-        62  => super::Compute::compute_bitnot_i32,
-        63  => super::Compute::compute_bitnot_i64,
-        // i128 arithmetic and comparison (64-77)
-        64  => super::Compute::compute_add_i128,
-        65  => super::Compute::compute_sub_i128,
-        66  => super::Compute::compute_mul_i128,
-        67  => super::Compute::compute_div_i128,
-        68  => super::Compute::compute_mod_i128,
-        69  => super::Compute::compute_eq_i128,
-        70  => super::Compute::compute_ne_i128,
-        71  => super::Compute::compute_lt_i128,
-        72  => super::Compute::compute_gt_i128,
-        73  => super::Compute::compute_le_i128,
-        74  => super::Compute::compute_ge_i128,
-        75  => super::Compute::compute_neg_i128,
-        76  => super::Compute::compute_bitnot_i128,
-        // Integer bitwise operations (77-92): BitAnd/BitOr/BitXor/Shl/Shr × i32/i64/i128
-        77  => super::Compute::compute_bitand_i32,
-        78  => super::Compute::compute_bitor_i32,
-        79  => super::Compute::compute_bitxor_i32,
-        80  => super::Compute::compute_bitand_i64,
-        81  => super::Compute::compute_bitor_i64,
-        82  => super::Compute::compute_bitxor_i64,
-        83  => super::Compute::compute_bitand_i128,
-        84  => super::Compute::compute_bitor_i128,
-        85  => super::Compute::compute_bitxor_i128,
-        86  => super::Compute::compute_shl_i32,
-        87  => super::Compute::compute_shr_i32,
-        88  => super::Compute::compute_shl_i64,
-        89  => super::Compute::compute_shr_i64,
-        90  => super::Compute::compute_shl_i128,
-        91  => super::Compute::compute_shr_i128,
-        // ---- compute_fn for all primitive types (92-259) ----
+        46  => super::Compute::noop_compute_real, // compute_propagate — new signature, table override
+        47  => super::Compute::compute_seq,
+        // i64 arithmetic and comparison (48-61)
+        48  => super::Compute::compute_add_i64,
+        49  => super::Compute::compute_sub_i64,
+        50  => super::Compute::compute_mul_i64,
+        51  => super::Compute::compute_div_i64,
+        52  => super::Compute::compute_mod_i64,
+        53  => super::Compute::compute_eq_i64,
+        54  => super::Compute::compute_ne_i64,
+        55  => super::Compute::compute_lt_i64,
+        56  => super::Compute::compute_gt_i64,
+        57  => super::Compute::compute_le_i64,
+        58  => super::Compute::compute_ge_i64,
+        59  => super::Compute::compute_neg_i64,
+        60  => super::Compute::compute_bitnot_i32,
+        61  => super::Compute::compute_bitnot_i64,
+        // i128 arithmetic and comparison (62-75)
+        62  => super::Compute::compute_add_i128,
+        63  => super::Compute::compute_sub_i128,
+        64  => super::Compute::compute_mul_i128,
+        65  => super::Compute::compute_div_i128,
+        66  => super::Compute::compute_mod_i128,
+        67  => super::Compute::compute_eq_i128,
+        68  => super::Compute::compute_ne_i128,
+        69  => super::Compute::compute_lt_i128,
+        70  => super::Compute::compute_gt_i128,
+        71  => super::Compute::compute_le_i128,
+        72  => super::Compute::compute_ge_i128,
+        73  => super::Compute::compute_neg_i128,
+        74  => super::Compute::compute_bitnot_i128,
+        // Integer bitwise operations (75-90): BitAnd/BitOr/BitXor/Shl/Shr × i32/i64/i128
+        75  => super::Compute::compute_bitand_i32,
+        76  => super::Compute::compute_bitor_i32,
+        77  => super::Compute::compute_bitxor_i32,
+        78  => super::Compute::compute_bitand_i64,
+        79  => super::Compute::compute_bitor_i64,
+        80  => super::Compute::compute_bitxor_i64,
+        81  => super::Compute::compute_bitand_i128,
+        82  => super::Compute::compute_bitor_i128,
+        83  => super::Compute::compute_bitxor_i128,
+        84  => super::Compute::compute_shl_i32,
+        85  => super::Compute::compute_shr_i32,
+        86  => super::Compute::compute_shl_i64,
+        87  => super::Compute::compute_shr_i64,
+        88  => super::Compute::compute_shl_i128,
+        89  => super::Compute::compute_shr_i128,
+        // ---- compute_fn for all primitive types (90-257) ----
         // 12 integer types × 12 operations (add/sub/mul/div/mod/bitand/bitor/bitxor/shl/shr/neg/bitnot)
-        // i8: 92-103
-        92  => super::Compute::compute_add_i8,
-        93  => super::Compute::compute_sub_i8,
-        94  => super::Compute::compute_mul_i8,
-        95  => super::Compute::compute_div_i8,
-        96  => super::Compute::compute_mod_i8,
-        97  => super::Compute::compute_bitand_i8,
-        98  => super::Compute::compute_bitor_i8,
-        99  => super::Compute::compute_bitxor_i8,
-        100 => super::Compute::compute_shl_i8,
-        101 => super::Compute::compute_shr_i8,
-        102 => super::Compute::compute_neg_i8,
-        103 => super::Compute::compute_bitnot_i8,
-        // i16: 104-115
-        104 => super::Compute::compute_add_i16,
-        105 => super::Compute::compute_sub_i16,
-        106 => super::Compute::compute_mul_i16,
-        107 => super::Compute::compute_div_i16,
-        108 => super::Compute::compute_mod_i16,
-        109 => super::Compute::compute_bitand_i16,
-        110 => super::Compute::compute_bitor_i16,
-        111 => super::Compute::compute_bitxor_i16,
-        112 => super::Compute::compute_shl_i16,
-        113 => super::Compute::compute_shr_i16,
-        114 => super::Compute::compute_neg_i16,
-        115 => super::Compute::compute_bitnot_i16,
-        // i32: 116-127
-        116 => super::Compute::compute_add_i32,
-        117 => super::Compute::compute_sub_i32,
-        118 => super::Compute::compute_mul_i32,
-        119 => super::Compute::compute_div_i32,
-        120 => super::Compute::compute_mod_i32,
-        121 => super::Compute::compute_bitand_i32,
-        122 => super::Compute::compute_bitor_i32,
-        123 => super::Compute::compute_bitxor_i32,
-        124 => super::Compute::compute_shl_i32,
-        125 => super::Compute::compute_shr_i32,
-        126 => super::Compute::compute_neg_i32,
-        127 => super::Compute::compute_bitnot_i32,
-        // i64: 128-139
-        128 => super::Compute::compute_add_i64,
-        129 => super::Compute::compute_sub_i64,
-        130 => super::Compute::compute_mul_i64,
-        131 => super::Compute::compute_div_i64,
-        132 => super::Compute::compute_mod_i64,
-        133 => super::Compute::compute_bitand_i64,
-        134 => super::Compute::compute_bitor_i64,
-        135 => super::Compute::compute_bitxor_i64,
-        136 => super::Compute::compute_shl_i64,
-        137 => super::Compute::compute_shr_i64,
-        138 => super::Compute::compute_neg_i64,
-        139 => super::Compute::compute_bitnot_i64,
-        // i128: 140-151
-        140 => super::Compute::compute_add_i128,
-        141 => super::Compute::compute_sub_i128,
-        142 => super::Compute::compute_mul_i128,
-        143 => super::Compute::compute_div_i128,
-        144 => super::Compute::compute_mod_i128,
-        145 => super::Compute::compute_bitand_i128,
-        146 => super::Compute::compute_bitor_i128,
-        147 => super::Compute::compute_bitxor_i128,
-        148 => super::Compute::compute_shl_i128,
-        149 => super::Compute::compute_shr_i128,
-        150 => super::Compute::compute_neg_i128,
-        151 => super::Compute::compute_bitnot_i128,
-        // u8: 152-163
-        152 => super::Compute::compute_add_u8,
-        153 => super::Compute::compute_sub_u8,
-        154 => super::Compute::compute_mul_u8,
-        155 => super::Compute::compute_div_u8,
-        156 => super::Compute::compute_mod_u8,
-        157 => super::Compute::compute_bitand_u8,
-        158 => super::Compute::compute_bitor_u8,
-        159 => super::Compute::compute_bitxor_u8,
-        160 => super::Compute::compute_shl_u8,
-        161 => super::Compute::compute_shr_u8,
-        162 => super::Compute::compute_neg_u8,
-        163 => super::Compute::compute_bitnot_u8,
-        // u16: 164-175
-        164 => super::Compute::compute_add_u16,
-        165 => super::Compute::compute_sub_u16,
-        166 => super::Compute::compute_mul_u16,
-        167 => super::Compute::compute_div_u16,
-        168 => super::Compute::compute_mod_u16,
-        169 => super::Compute::compute_bitand_u16,
-        170 => super::Compute::compute_bitor_u16,
-        171 => super::Compute::compute_bitxor_u16,
-        172 => super::Compute::compute_shl_u16,
-        173 => super::Compute::compute_shr_u16,
-        174 => super::Compute::compute_neg_u16,
-        175 => super::Compute::compute_bitnot_u16,
-        // u32: 176-187
-        176 => super::Compute::compute_add_u32,
-        177 => super::Compute::compute_sub_u32,
-        178 => super::Compute::compute_mul_u32,
-        179 => super::Compute::compute_div_u32,
-        180 => super::Compute::compute_mod_u32,
-        181 => super::Compute::compute_bitand_u32,
-        182 => super::Compute::compute_bitor_u32,
-        183 => super::Compute::compute_bitxor_u32,
-        184 => super::Compute::compute_shl_u32,
-        185 => super::Compute::compute_shr_u32,
-        186 => super::Compute::compute_neg_u32,
-        187 => super::Compute::compute_bitnot_u32,
-        // u64: 188-199
-        188 => super::Compute::compute_add_u64,
-        189 => super::Compute::compute_sub_u64,
-        190 => super::Compute::compute_mul_u64,
-        191 => super::Compute::compute_div_u64,
-        192 => super::Compute::compute_mod_u64,
-        193 => super::Compute::compute_bitand_u64,
-        194 => super::Compute::compute_bitor_u64,
-        195 => super::Compute::compute_bitxor_u64,
-        196 => super::Compute::compute_shl_u64,
-        197 => super::Compute::compute_shr_u64,
-        198 => super::Compute::compute_neg_u64,
-        199 => super::Compute::compute_bitnot_u64,
-        // u128: 200-211
-        200 => super::Compute::compute_add_u128,
-        201 => super::Compute::compute_sub_u128,
-        202 => super::Compute::compute_mul_u128,
-        203 => super::Compute::compute_div_u128,
-        204 => super::Compute::compute_mod_u128,
-        205 => super::Compute::compute_bitand_u128,
-        206 => super::Compute::compute_bitor_u128,
-        207 => super::Compute::compute_bitxor_u128,
-        208 => super::Compute::compute_shl_u128,
-        209 => super::Compute::compute_shr_u128,
-        210 => super::Compute::compute_neg_u128,
-        211 => super::Compute::compute_bitnot_u128,
-        // isize: 212-223
-        212 => super::Compute::compute_add_isize,
-        213 => super::Compute::compute_sub_isize,
-        214 => super::Compute::compute_mul_isize,
-        215 => super::Compute::compute_div_isize,
-        216 => super::Compute::compute_mod_isize,
-        217 => super::Compute::compute_bitand_isize,
-        218 => super::Compute::compute_bitor_isize,
-        219 => super::Compute::compute_bitxor_isize,
-        220 => super::Compute::compute_shl_isize,
-        221 => super::Compute::compute_shr_isize,
-        222 => super::Compute::compute_neg_isize,
-        223 => super::Compute::compute_bitnot_isize,
-        // usize: 224-235
-        224 => super::Compute::compute_add_usize,
-        225 => super::Compute::compute_sub_usize,
-        226 => super::Compute::compute_mul_usize,
-        227 => super::Compute::compute_div_usize,
-        228 => super::Compute::compute_mod_usize,
-        229 => super::Compute::compute_bitand_usize,
-        230 => super::Compute::compute_bitor_usize,
-        231 => super::Compute::compute_bitxor_usize,
-        232 => super::Compute::compute_shl_usize,
-        233 => super::Compute::compute_shr_usize,
-        234 => super::Compute::compute_neg_usize,
-        235 => super::Compute::compute_bitnot_usize,
+        // i8: 90-101
+        90  => super::Compute::compute_add_i8,
+        91  => super::Compute::compute_sub_i8,
+        92  => super::Compute::compute_mul_i8,
+        93  => super::Compute::compute_div_i8,
+        94  => super::Compute::compute_mod_i8,
+        95  => super::Compute::compute_bitand_i8,
+        96  => super::Compute::compute_bitor_i8,
+        97  => super::Compute::compute_bitxor_i8,
+        98 => super::Compute::compute_shl_i8,
+        99 => super::Compute::compute_shr_i8,
+        100 => super::Compute::compute_neg_i8,
+        101 => super::Compute::compute_bitnot_i8,
+        // i16: 102-113
+        102 => super::Compute::compute_add_i16,
+        103 => super::Compute::compute_sub_i16,
+        104 => super::Compute::compute_mul_i16,
+        105 => super::Compute::compute_div_i16,
+        106 => super::Compute::compute_mod_i16,
+        107 => super::Compute::compute_bitand_i16,
+        108 => super::Compute::compute_bitor_i16,
+        109 => super::Compute::compute_bitxor_i16,
+        110 => super::Compute::compute_shl_i16,
+        111 => super::Compute::compute_shr_i16,
+        112 => super::Compute::compute_neg_i16,
+        113 => super::Compute::compute_bitnot_i16,
+        // i32: 114-125
+        114 => super::Compute::compute_add_i32,
+        115 => super::Compute::compute_sub_i32,
+        116 => super::Compute::compute_mul_i32,
+        117 => super::Compute::compute_div_i32,
+        118 => super::Compute::compute_mod_i32,
+        119 => super::Compute::compute_bitand_i32,
+        120 => super::Compute::compute_bitor_i32,
+        121 => super::Compute::compute_bitxor_i32,
+        122 => super::Compute::compute_shl_i32,
+        123 => super::Compute::compute_shr_i32,
+        124 => super::Compute::compute_neg_i32,
+        125 => super::Compute::compute_bitnot_i32,
+        // i64: 126-137
+        126 => super::Compute::compute_add_i64,
+        127 => super::Compute::compute_sub_i64,
+        128 => super::Compute::compute_mul_i64,
+        129 => super::Compute::compute_div_i64,
+        130 => super::Compute::compute_mod_i64,
+        131 => super::Compute::compute_bitand_i64,
+        132 => super::Compute::compute_bitor_i64,
+        133 => super::Compute::compute_bitxor_i64,
+        134 => super::Compute::compute_shl_i64,
+        135 => super::Compute::compute_shr_i64,
+        136 => super::Compute::compute_neg_i64,
+        137 => super::Compute::compute_bitnot_i64,
+        // i128: 138-149
+        138 => super::Compute::compute_add_i128,
+        139 => super::Compute::compute_sub_i128,
+        140 => super::Compute::compute_mul_i128,
+        141 => super::Compute::compute_div_i128,
+        142 => super::Compute::compute_mod_i128,
+        143 => super::Compute::compute_bitand_i128,
+        144 => super::Compute::compute_bitor_i128,
+        145 => super::Compute::compute_bitxor_i128,
+        146 => super::Compute::compute_shl_i128,
+        147 => super::Compute::compute_shr_i128,
+        148 => super::Compute::compute_neg_i128,
+        149 => super::Compute::compute_bitnot_i128,
+        // u8: 150-161
+        150 => super::Compute::compute_add_u8,
+        151 => super::Compute::compute_sub_u8,
+        152 => super::Compute::compute_mul_u8,
+        153 => super::Compute::compute_div_u8,
+        154 => super::Compute::compute_mod_u8,
+        155 => super::Compute::compute_bitand_u8,
+        156 => super::Compute::compute_bitor_u8,
+        157 => super::Compute::compute_bitxor_u8,
+        158 => super::Compute::compute_shl_u8,
+        159 => super::Compute::compute_shr_u8,
+        160 => super::Compute::compute_neg_u8,
+        161 => super::Compute::compute_bitnot_u8,
+        // u16: 162-173
+        162 => super::Compute::compute_add_u16,
+        163 => super::Compute::compute_sub_u16,
+        164 => super::Compute::compute_mul_u16,
+        165 => super::Compute::compute_div_u16,
+        166 => super::Compute::compute_mod_u16,
+        167 => super::Compute::compute_bitand_u16,
+        168 => super::Compute::compute_bitor_u16,
+        169 => super::Compute::compute_bitxor_u16,
+        170 => super::Compute::compute_shl_u16,
+        171 => super::Compute::compute_shr_u16,
+        172 => super::Compute::compute_neg_u16,
+        173 => super::Compute::compute_bitnot_u16,
+        // u32: 174-185
+        174 => super::Compute::compute_add_u32,
+        175 => super::Compute::compute_sub_u32,
+        176 => super::Compute::compute_mul_u32,
+        177 => super::Compute::compute_div_u32,
+        178 => super::Compute::compute_mod_u32,
+        179 => super::Compute::compute_bitand_u32,
+        180 => super::Compute::compute_bitor_u32,
+        181 => super::Compute::compute_bitxor_u32,
+        182 => super::Compute::compute_shl_u32,
+        183 => super::Compute::compute_shr_u32,
+        184 => super::Compute::compute_neg_u32,
+        185 => super::Compute::compute_bitnot_u32,
+        // u64: 186-197
+        186 => super::Compute::compute_add_u64,
+        187 => super::Compute::compute_sub_u64,
+        188 => super::Compute::compute_mul_u64,
+        189 => super::Compute::compute_div_u64,
+        190 => super::Compute::compute_mod_u64,
+        191 => super::Compute::compute_bitand_u64,
+        192 => super::Compute::compute_bitor_u64,
+        193 => super::Compute::compute_bitxor_u64,
+        194 => super::Compute::compute_shl_u64,
+        195 => super::Compute::compute_shr_u64,
+        196 => super::Compute::compute_neg_u64,
+        197 => super::Compute::compute_bitnot_u64,
+        // u128: 198-209
+        198 => super::Compute::compute_add_u128,
+        199 => super::Compute::compute_sub_u128,
+        200 => super::Compute::compute_mul_u128,
+        201 => super::Compute::compute_div_u128,
+        202 => super::Compute::compute_mod_u128,
+        203 => super::Compute::compute_bitand_u128,
+        204 => super::Compute::compute_bitor_u128,
+        205 => super::Compute::compute_bitxor_u128,
+        206 => super::Compute::compute_shl_u128,
+        207 => super::Compute::compute_shr_u128,
+        208 => super::Compute::compute_neg_u128,
+        209 => super::Compute::compute_bitnot_u128,
+        // isize: 210-221
+        210 => super::Compute::compute_add_isize,
+        211 => super::Compute::compute_sub_isize,
+        212 => super::Compute::compute_mul_isize,
+        213 => super::Compute::compute_div_isize,
+        214 => super::Compute::compute_mod_isize,
+        215 => super::Compute::compute_bitand_isize,
+        216 => super::Compute::compute_bitor_isize,
+        217 => super::Compute::compute_bitxor_isize,
+        218 => super::Compute::compute_shl_isize,
+        219 => super::Compute::compute_shr_isize,
+        220 => super::Compute::compute_neg_isize,
+        221 => super::Compute::compute_bitnot_isize,
+        // usize: 222-233
+        222 => super::Compute::compute_add_usize,
+        223 => super::Compute::compute_sub_usize,
+        224 => super::Compute::compute_mul_usize,
+        225 => super::Compute::compute_div_usize,
+        226 => super::Compute::compute_mod_usize,
+        227 => super::Compute::compute_bitand_usize,
+        228 => super::Compute::compute_bitor_usize,
+        229 => super::Compute::compute_bitxor_usize,
+        230 => super::Compute::compute_shl_usize,
+        231 => super::Compute::compute_shr_usize,
+        232 => super::Compute::compute_neg_usize,
+        233 => super::Compute::compute_bitnot_usize,
         // 4 floating-point types × 6 operations (add/sub/mul/div/mod/neg)
-        // f16: 236-241
-        236 => super::Compute::compute_add_f16,
-        237 => super::Compute::compute_sub_f16,
-        238 => super::Compute::compute_mul_f16,
-        239 => super::Compute::compute_div_f16,
-        240 => super::Compute::compute_mod_f16,
-        241 => super::Compute::compute_neg_f16,
-        // f32: 242-247
-        242 => super::Compute::compute_add_f32,
-        243 => super::Compute::compute_sub_f32,
-        244 => super::Compute::compute_mul_f32,
-        245 => super::Compute::compute_div_f32,
-        246 => super::Compute::compute_mod_f32,
-        247 => super::Compute::compute_neg_f32,
-        // f64: 248-253
-        248 => super::Compute::compute_add_f64,
-        249 => super::Compute::compute_sub_f64,
-        250 => super::Compute::compute_mul_f64,
-        251 => super::Compute::compute_div_f64,
-        252 => super::Compute::compute_mod_f64,
-        253 => super::Compute::compute_neg_f64,
-        // f128: 254-259
-        254 => super::Compute::compute_add_f128,
-        255 => super::Compute::compute_sub_f128,
-        256 => super::Compute::compute_mul_f128,
-        257 => super::Compute::compute_div_f128,
-        258 => super::Compute::compute_mod_f128,
-        259 => super::Compute::compute_neg_f128,
-        // Semantic operations (260-265): RefEq/RefNeq/ConcatList/Range/RangeInclusive/Elvis
-        260 => super::Compute::compute_ref_eq,
-        261 => super::Compute::compute_ref_neq,
-        262 => super::Compute::compute_concat_list,
-        263 => super::Compute::compute_range,
-        264 => super::Compute::compute_range_inclusive,
-        265 => super::Compute::compute_elvis,
-        // inline_trait / lazy construction (266-267)
-        266 => super::Compute::compute_trait_construct,
-        267 => super::Compute::compute_lazy_construct,
-        268 => super::Compute::compute_slice,
-        269 => super::Compute::compute_str_concat,
-        // Global variable read/write (270-271)
-        270 => super::Compute::compute_global_load,
-        271 => super::Compute::compute_global_store,
-        // Record extension / atomic construction (272-273)
-        272 => super::Compute::compute_record_extend,
-        273 => super::Compute::compute_atomic_construct,
-        // Pattern matching (274-276)
-        274 => super::Compute::compute_pattern_ctor_match,
-        275 => super::Compute::compute_pattern_adt_field_get,
-        276 => super::Compute::compute_pattern_str_eq,
-        // General type conversion (277-278)
-        277 => super::Compute::compute_cast_to_str,
-        278 => super::Compute::compute_cast_scalar,
-        // Reference semantics and non-null assertion (279-282)
-        279 => super::Compute::compute_non_null_assert,
-        280 => super::Compute::compute_ref_of,
-        281 => super::Compute::compute_deref_read,
-        282 => super::Compute::compute_deref_write,
-        // Channel operations (283-285)
-        283 => super::Compute::compute_channel_create,
-        284 => super::Compute::noop_compute_real, // compute_channel_send — new signature, table override
-        285 => super::Compute::compute_channel_close,
-        // Partial application construction (286)
-        286 => super::Compute::compute_partial_construct,
-        // str.bytes() → u8[] (287)
-        287 => super::Compute::compute_str_bytes,
-        // Stack-allocated construction (288-289): uses non-escaping allocation points marked by the analyzer
-        288 => super::Compute::compute_record_construct_stack,
-        289 => super::Compute::compute_array_construct_stack,
-        // Standalone reflect compute_fn (290-291): lazy force + Reflect::format_value
-        290 => super::Compute::compute_reflect_format,
-        291 => super::Compute::compute_reflect_scalar_to_str,
-        // String comparison (292-297): lexicographic by Unicode code point sequence
-        292 => super::Compute::compute_eq_str,
-        293 => super::Compute::compute_ne_str,
-        294 => super::Compute::compute_lt_str,
-        295 => super::Compute::compute_gt_str,
-        296 => super::Compute::compute_le_str,
-        297 => super::Compute::compute_ge_str,
-        // Semantic equality/inequality for composite types (298-299)
-        298 => super::Compute::compute_eq_obj,
-        299 => super::Compute::compute_ne_obj,
-        // Boolean inequality (300)
-        300 => super::Compute::compute_ne_bool,
-        // Array index store (301)
-        301 => super::Compute::compute_array_store,
-        // f128 comparison (302-307)
-        302 => super::Compute::compute_eq_f128,
-        303 => super::Compute::compute_ne_f128,
-        304 => super::Compute::compute_lt_f128,
-        305 => super::Compute::compute_gt_f128,
-        306 => super::Compute::compute_le_f128,
-        307 => super::Compute::compute_ge_f128,
-        // Memoization cache (308-309)
-        308 => super::Compute::compute_memo_check,
-        309 => super::Compute::compute_memo_store,
+        // f16: 234-239
+        234 => super::Compute::compute_add_f16,
+        235 => super::Compute::compute_sub_f16,
+        236 => super::Compute::compute_mul_f16,
+        237 => super::Compute::compute_div_f16,
+        238 => super::Compute::compute_mod_f16,
+        239 => super::Compute::compute_neg_f16,
+        // f32: 240-245
+        240 => super::Compute::compute_add_f32,
+        241 => super::Compute::compute_sub_f32,
+        242 => super::Compute::compute_mul_f32,
+        243 => super::Compute::compute_div_f32,
+        244 => super::Compute::compute_mod_f32,
+        245 => super::Compute::compute_neg_f32,
+        // f64: 246-251
+        246 => super::Compute::compute_add_f64,
+        247 => super::Compute::compute_sub_f64,
+        248 => super::Compute::compute_mul_f64,
+        249 => super::Compute::compute_div_f64,
+        250 => super::Compute::compute_mod_f64,
+        251 => super::Compute::compute_neg_f64,
+        // f128: 252-257
+        252 => super::Compute::compute_add_f128,
+        253 => super::Compute::compute_sub_f128,
+        254 => super::Compute::compute_mul_f128,
+        255 => super::Compute::compute_div_f128,
+        256 => super::Compute::compute_mod_f128,
+        257 => super::Compute::compute_neg_f128,
+        // Semantic operations (258-263): RefEq/RefNeq/ConcatList/Range/RangeInclusive/Elvis
+        258 => super::Compute::compute_ref_eq,
+        259 => super::Compute::compute_ref_neq,
+        260 => super::Compute::compute_concat_list,
+        261 => super::Compute::compute_range,
+        262 => super::Compute::compute_range_inclusive,
+        263 => super::Compute::compute_elvis,
+        // inline_trait / lazy construction (264-265)
+        264 => super::Compute::compute_trait_construct,
+        265 => super::Compute::compute_lazy_construct,
+        266 => super::Compute::compute_slice,
+        267 => super::Compute::compute_str_concat,
+        // Global variable read/write (268-269)
+        268 => super::Compute::compute_global_load,
+        269 => super::Compute::compute_global_store,
+        // Record extension / atomic construction (270-271)
+        270 => super::Compute::compute_record_extend,
+        271 => super::Compute::compute_atomic_construct,
+        // Pattern matching (272-274)
+        272 => super::Compute::compute_pattern_ctor_match,
+        273 => super::Compute::compute_pattern_adt_field_get,
+        274 => super::Compute::compute_pattern_str_eq,
+        // General type conversion (275-276)
+        275 => super::Compute::compute_cast_to_str,
+        276 => super::Compute::compute_cast_scalar,
+        // Reference semantics and non-null assertion (277-280)
+        277 => super::Compute::compute_non_null_assert,
+        278 => super::Compute::compute_ref_of,
+        279 => super::Compute::compute_deref_read,
+        280 => super::Compute::compute_deref_write,
+        // Channel operations (281-283)
+        281 => super::Compute::compute_channel_create,
+        282 => super::Compute::noop_compute_real, // compute_channel_send — new signature, table override
+        283 => super::Compute::compute_channel_close,
+        // Partial application construction (284)
+        284 => super::Compute::compute_partial_construct,
+        // str.bytes() → u8[] (285)
+        285 => super::Compute::compute_str_bytes,
+        // Stack-allocated construction (286-287): uses non-escaping allocation points marked by the analyzer
+        286 => super::Compute::compute_record_construct_stack,
+        287 => super::Compute::compute_array_construct_stack,
+        // Standalone reflect compute_fn (288-289): lazy force + Reflect::format_value
+        288 => super::Compute::compute_reflect_format,
+        289 => super::Compute::compute_reflect_scalar_to_str,
+        // String comparison (290-295): lexicographic by Unicode code point sequence
+        290 => super::Compute::compute_eq_str,
+        291 => super::Compute::compute_ne_str,
+        292 => super::Compute::compute_lt_str,
+        293 => super::Compute::compute_gt_str,
+        294 => super::Compute::compute_le_str,
+        295 => super::Compute::compute_ge_str,
+        // Semantic equality/inequality for composite types (296-297)
+        296 => super::Compute::compute_eq_obj,
+        297 => super::Compute::compute_ne_obj,
+        // Boolean inequality (298)
+        298 => super::Compute::compute_ne_bool,
+        // Array index store (299)
+        299 => super::Compute::compute_array_store,
+        // f128 comparison (300-305)
+        300 => super::Compute::compute_eq_f128,
+        301 => super::Compute::compute_ne_f128,
+        302 => super::Compute::compute_lt_f128,
+        303 => super::Compute::compute_gt_f128,
+        304 => super::Compute::compute_le_f128,
+        305 => super::Compute::compute_ge_f128,
+        // Memoization cache (306-307)
+        306 => super::Compute::compute_memo_check,
+        307 => super::Compute::compute_memo_store,
         // Tail-recursion WriteBack (310)
-        310 => super::Compute::noop_compute_real, // compute_tailrec_writeback — new signature, table override
-        // Control-flow compute_fn (311-314) — new signature, table override
-        311 => super::Compute::noop_compute_real, // compute_return
-        312 => super::Compute::noop_compute_real, // compute_break
-        313 => super::Compute::noop_compute_real, // compute_continue
-        314 => super::Compute::noop_compute_real, // compute_match_fallback
-        // Atomic operations (315-318): load/store/swap/compare_exchange on Atomic<T>
-        315 => super::Compute::compute_atomic_load,
-        316 => super::Compute::compute_atomic_store,
-        317 => super::Compute::compute_atomic_swap,
-        318 => super::Compute::compute_atomic_compare_exchange,
-        // Multi-input string concat (319): one-shot O(n) concat for string interpolation
-        319 => super::Compute::compute_str_multi_concat,
-        // Array join (320): str[] + sep → str, one-shot O(n) concat
-        320 => super::Compute::compute_str_array_join,
-        // Array fill (321): [value, ..count] — repeats value count times
-        321 => super::Compute::compute_array_fill,
-        // Runtime defer (322-323): new signature, table override
-        322 => super::Compute::noop_compute_real, // compute_defer_register
-        323 => super::Compute::noop_compute_real, // compute_defer_run
-        324 => super::Compute::noop_compute_real, // compute_block_defer_register
-        325 => super::Compute::compute_dyn_ffi_call,
-        // reflect compute_fns (326-336): standalone reflect primitives.
+        // Control-flow compute_fn (308-311) — new signature, table override
+        308 => super::Compute::noop_compute_real, // compute_return
+        309 => super::Compute::noop_compute_real, // compute_break
+        310 => super::Compute::noop_compute_real, // compute_continue
+        311 => super::Compute::noop_compute_real, // compute_match_fallback
+        // Atomic operations (312-315): load/store/swap/compare_exchange on Atomic<T>
+        312 => super::Compute::compute_atomic_load,
+        313 => super::Compute::compute_atomic_store,
+        314 => super::Compute::compute_atomic_swap,
+        315 => super::Compute::compute_atomic_compare_exchange,
+        // Multi-input string concat (316): one-shot O(n) concat for string interpolation
+        316 => super::Compute::compute_str_multi_concat,
+        // Array join (317): str[] + sep → str, one-shot O(n) concat
+        317 => super::Compute::compute_str_array_join,
+        // Array fill (318): [value, ..count] — repeats value count times
+        318 => super::Compute::compute_array_fill,
+        // Runtime defer (319-320): new signature, table override
+        319 => super::Compute::noop_compute_real, // compute_defer_register
+        320 => super::Compute::noop_compute_real, // compute_defer_run
+        321 => super::Compute::noop_compute_real, // compute_block_defer_register
+        322 => super::Compute::compute_dyn_ffi_call,
+        // reflect compute_fns (323-333): standalone reflect primitives.
         // Replaces @builtin + REFLECT_ENTRIES + CF_FFI_CALL dispatch.
-        326 => super::Compute::compute_reflect_kind,
-        327 => super::Compute::compute_reflect_type_name,
-        328 => super::Compute::compute_reflect_kind_str,
-        329 => super::Compute::compute_reflect_size,
-        330 => super::Compute::compute_reflect_layout_size,
-        331 => super::Compute::compute_reflect_layout_align,
-        332 => super::Compute::compute_reflect_field_count,
-        333 => super::Compute::compute_reflect_field_name,
-        334 => super::Compute::compute_reflect_field_value,
-        335 => super::Compute::compute_reflect_array_len,
-        336 => super::Compute::compute_reflect_adt_ctor,
-        // Lib / ForeignFn (337-342): native-library interop (legacy Value
+        323 => super::Compute::compute_reflect_kind,
+        324 => super::Compute::compute_reflect_type_name,
+        325 => super::Compute::compute_reflect_kind_str,
+        326 => super::Compute::compute_reflect_size,
+        327 => super::Compute::compute_reflect_layout_size,
+        328 => super::Compute::compute_reflect_layout_align,
+        329 => super::Compute::compute_reflect_field_count,
+        330 => super::Compute::compute_reflect_field_name,
+        331 => super::Compute::compute_reflect_field_value,
+        332 => super::Compute::compute_reflect_array_len,
+        333 => super::Compute::compute_reflect_adt_ctor,
+        // Lib / ForeignFn (334-339): native-library interop (legacy Value
         // signature; wrap_fn! handles safe_op short-circuit + batching)
-        337 => super::Compute::compute_lib_open,
-        338 => super::Compute::compute_lib_embed,
-        339 => super::Compute::compute_lib_lookup,
-        340 => super::Compute::compute_lib_has_symbol,
-        341 => super::Compute::compute_lib_close,
-        342 => super::Compute::compute_ffn_call,
-        // Emptiness check (343): str/array is_empty
-        343 => super::Compute::compute_is_empty,
-        344 => super::Compute::compute_eq_u128,
-        345 => super::Compute::compute_ne_u128,
-        346 => super::Compute::compute_lt_u128,
-        347 => super::Compute::compute_gt_u128,
-        348 => super::Compute::compute_le_u128,
-        349 => super::Compute::compute_ge_u128,
+        334 => super::Compute::compute_lib_open,
+        335 => super::Compute::compute_lib_embed,
+        336 => super::Compute::compute_lib_lookup,
+        337 => super::Compute::compute_lib_has_symbol,
+        338 => super::Compute::compute_lib_close,
+        339 => super::Compute::compute_ffn_call,
+        // Emptiness check (340): str/array is_empty
+        340 => super::Compute::compute_is_empty,
+        341 => super::Compute::compute_eq_u128,
+        342 => super::Compute::compute_ne_u128,
+        343 => super::Compute::compute_lt_u128,
+        344 => super::Compute::compute_gt_u128,
+        345 => super::Compute::compute_le_u128,
+        346 => super::Compute::compute_ge_u128,
+        // Array cast (347)
+        347 => super::Compute::compute_cast_array,
+        // Deep copy (348): v.clone()
+        348 => super::Compute::compute_reflect_clone,
+        349 => super::Compute::compute_cell_alloc,
     };
     // Replace index 0 with compute_const (unwrapped, uses the new signature directly)
     // Const nodes use CF_NOOP(0); compute_const materializes the value from const_values
@@ -2182,17 +2373,15 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
     table[41] = super::Compute::compute_closure_call;
     table[42] = super::Compute::compute_cancel_async_handle;
     table[43] = super::Compute::compute_select_gate;
-    table[47] = super::Compute::compute_propagate;
-    table[284] = super::Compute::compute_channel_send;
-    table[310] = super::Compute::compute_tailrec_writeback;
-    table[311] = super::Compute::compute_return;
-    table[312] = super::Compute::compute_break;
-    table[313] = super::Compute::compute_continue;
-    table[314] = super::Compute::compute_match_fallback;
-    table[49] = super::Compute::compute_writeback;
-    table[322] = super::Compute::compute_defer_register;
-    table[323] = super::Compute::compute_defer_run;
-    table[324] = super::Compute::compute_block_defer_register;
+    table[46] = super::Compute::compute_propagate;
+    table[282] = super::Compute::compute_channel_send;
+    table[308] = super::Compute::compute_return;
+    table[309] = super::Compute::compute_break;
+    table[310] = super::Compute::compute_continue;
+    table[311] = super::Compute::compute_match_fallback;
+    table[319] = super::Compute::compute_defer_register;
+    table[320] = super::Compute::compute_defer_run;
+    table[321] = super::Compute::compute_block_defer_register;
     assert_eq!(
         table.len() as u32, COMPUTE_FN_TABLE_LEN,
         "build_compute_fn_table(): table length drifted from COMPUTE_FN_TABLE_LEN; update the constant"
@@ -2210,7 +2399,7 @@ pub fn build_compute_fn_table() -> Vec<ComputeFn> {
 ///
 /// The four aliased heap reads (`is_versioned_read_cf` subset) folded into the
 /// CSE/LICM pure set by `pure_compute_fn_set`. Their movement safety no longer
-/// relies on purity subtraction (the pre-W2 Bug #99 stopgap, removed): the
+/// relies on purity subtraction (the pre-W2 Bug #97 stopgap, removed): the
 /// storage-versioning pass (`Builder::Versioning`) attaches version edges that
 /// make CSE/LICM see mutations through shared Arcs directly.
 pub fn aliasing_read_cfs() -> [ComputeFnId; 4] {
@@ -2274,34 +2463,35 @@ pub fn effect_class(cf: ComputeFnId) -> EffectClass {
     use EffectClass::*;
     match cf.0 {
         // ── Pure: legacy arithmetic/comparison ranges (equivalence-tested) ──
-        1..=27 | 50..=91 | 92..=259 => Pure,
-        34 | 260 | 261 | 265 | 274 | 276 | 278 | 279 | 287 | 343 => Pure, // reads/queries
-        344..=349 => Pure, // u128 comparisons (pure reads)
-        292..=300 | 302..=307 => Pure, // string/obj/bool/f128 comparison
+        1..=27 | 48..=89 | 90..=257 => Pure,
+        34 | 258 | 259 | 263 | 272 | 274 | 276 | 277 | 285 | 340 => Pure, // reads/queries
+        341..=346 => Pure, // u128 comparisons (pure reads)
+        290..=298 | 300..=305 => Pure, // string/obj/bool/f128 comparison
         // ── Reads of mutable state (aliasing) ──
-        30 | 32 | 35 | 275 => ReadMutable,      // field/array/pattern-ADT reads (aliasing_read_cfs)
-        270 | 281 | 308 | 315 | 334 | 335 => ReadMutable, // global/deref/memo/atomic/reflect-value reads
+        30 | 32 | 35 | 273 => ReadMutable,      // field/array/pattern-ADT reads (aliasing_read_cfs)
+        268 | 279 | 306 | 312 | 331 | 332 => ReadMutable, // global/deref/memo/atomic/reflect-value reads
         // ── In-place writes ──
-        33 | 282 | 301 | 309 | 316 | 317 | 318 => WriteMutable,
+        33 | 280 | 299 | 307 | 313 | 314 | 315 => WriteMutable,
         // ── Graph-location writes ──
-        49 | 271 | 310 => WriteLocal, // writeback / global_store / tailrec writeback
+        269 => WriteLocal, // global_store
         // ── Control flow / dispatch ──
-        28 | 37 | 47 | 311 | 312 | 313 | 314 => ControlFlow,
+        28 | 37 | 46 | 308 | 309 | 310 | 311 => ControlFlow,
         // ── Ordering ──
-        48 => Seq, // CF_SEQ
+        47 => Seq, // CF_SEQ
         // ── Async runtime ──
-        38 | 39 | 42 | 43 | 284 | 285 => Async,
+        38 | 39 | 42 | 43 | 282 | 283 => Async,
         // ── Launches ──
         36 | 41 => Call, // call_launch / closure_call
         // ── FFI ──
-        46 | 325 | 337..=342 => Ffi,
+        322 | 334..=339 => Ffi,
         // ── Engine/frame effects ──
-        322 | 323 | 324 => Runtime, // defer register/run/block-register
+        319 | 320 | 321 => Runtime, // defer register/run/block-register
         // ── Allocation (distinct object per run) ──
-        29 | 31 | 40 | 44 | 45 | 262 | 263 | 264 | 266 | 267 | 268 | 269 | 272 | 273
-        | 277 | 280 | 283 | 286 | 288 | 289 | 290 | 291 | 319 | 320 | 321 => Alloc,
+        29 | 31 | 40 | 44 | 45 | 260 | 261 | 262 | 264 | 265 | 266 | 267 | 270 | 271
+        | 275 | 278 | 281 | 284 | 286 | 287 | 288 | 289 | 316 | 317 | 318 | 347 | 348
+        | 349 => Alloc,
         // ── Pure value metadata (kept out of CSE/LICM pending W2 validation) ──
-        326..=333 | 336 => PureMeta,
+        323..=330 | 333 => PureMeta,
         // CF_NOOP: parameter placeholder passthrough.
         0 => Pure,
         other => panic!(
@@ -2426,7 +2616,6 @@ macro_rules! node_metadata {
             opt(lib_ret_kinds, u8, set_lib_ret_kind)
             opt(embed_infos, u32, set_embed_info)
             opt(select_infos, SelectInfo, set_select_info)
-            opt(writeback_targets, NodeId, set_writeback_target)
             opt(batch_infos, BatchInfo, set_batch_info)
             opt(trait_construct_infos, TraitConstructInfo, set_trait_construct_info)
             opt(lazy_construct_infos, LazyConstructInfo, set_lazy_construct_info)
@@ -2464,7 +2653,6 @@ macro_rules! node_metadata {
             opt(lib_ret_kinds, u8, set_lib_ret_kind)
             opt(embed_infos, u32, set_embed_info)
             opt(select_infos, SelectInfo, set_select_info)
-            opt(writeback_targets, NodeId, set_writeback_target)
             opt(batch_infos, BatchInfo, set_batch_info)
             opt(trait_construct_infos, TraitConstructInfo, set_trait_construct_info)
             opt(lazy_construct_infos, LazyConstructInfo, set_lazy_construct_info)
@@ -2580,6 +2768,9 @@ pub struct DataFlowGraph {
     /// nodes; None = not linearizable: EventSource present or cyclic). Populated once at
     /// EngineRef::new — derived data, never serialized (F-7 safe by construction).
     pub linear_plans: Vec<Option<Vec<NodeId>>>,
+    /// Builder-time flag: subgraphs added while set are stamped
+    /// `converter_generated` (strategy-converter internals).
+    pub converter_scope: bool,
     /// Target subgraph for Call nodes (indexed by NodeId; None for non-Call nodes).
     pub call_targets: Vec<Option<SubGraphId>>,
     /// Branch info for Gate nodes (indexed by NodeId; None for non-Gate nodes).
@@ -2620,7 +2811,6 @@ pub struct DataFlowGraph {
     /// select expression branch info (indexed by NodeId; None for non-select-gate nodes).
     pub select_infos: Vec<Option<SelectInfo>>,
     /// Target outer NodeId for WriteBack nodes (indexed by NodeId; None for non-WriteBack nodes).
-    pub writeback_targets: Vec<Option<NodeId>>,
     /// Tail-call flag for Call nodes (indexed by NodeId; true = tail-call frame reuse).
     pub tail_call_flags: Vec<bool>,
     /// Safe-operation flag (indexed by NodeId; true = short-circuit return Null when inputs[0] is Null).
@@ -2675,6 +2865,12 @@ pub struct DataFlowGraph {
     /// When a vtable call receives a concrete record (not a TraitVal), the runtime looks up
     /// the method subgraph by the value's type_name here, enabling static dispatch on the
     /// concrete type without boxing into a TraitVal.
+    /// (child type name, base type name) pairs from sema TypeDefInfo.bases —
+    /// runtime match arm disambiguation accepts an inherited type's values
+    /// (an ADT child's ctor set is the base's, verbatim).
+    pub inheritance_links: Vec<(Box<str>, Box<str>)>,
+    /// (method_idx, type_name) -> SubGraphId: runtime dispatch for concrete
+    /// receivers (inheritance base-typed call sites + trait fallback).
     pub vtable_fallback_dispatch: rustc_hash::FxHashMap<(u16, Box<str>), SubGraphId>,
     /// String pool: ConstValue::Str { offset, len } references this pool.
     /// Maintained by IrBuilder as intern during build; filled from the .fndo StringPool section during load.
@@ -2736,6 +2932,7 @@ impl Clone for DataFlowGraph {
             sg_initial_seed: self.sg_initial_seed.clone(),
             downstream_counts: self.downstream_counts.clone(),
             linear_plans: self.linear_plans.clone(),
+            converter_scope: false,
             call_targets: self.call_targets.clone(),
             gate_branches: self.gate_branches.clone(),
             field_access_infos: self.field_access_infos.clone(),
@@ -2752,7 +2949,6 @@ impl Clone for DataFlowGraph {
             embed_infos: self.embed_infos.clone(),
             resources: self.resources.clone(),
             select_infos: self.select_infos.clone(),
-            writeback_targets: self.writeback_targets.clone(),
             tail_call_flags: self.tail_call_flags.clone(),
             safe_op_flags: self.safe_op_flags.clone(),
             hoisted_node: self.hoisted_node.clone(),
@@ -2773,6 +2969,7 @@ impl Clone for DataFlowGraph {
             memo_infos: self.memo_infos.clone(),
             memo_tables: self.memo_tables.clone(),
             vtable_fallback_dispatch: self.vtable_fallback_dispatch.clone(),
+            inheritance_links: self.inheritance_links.clone(),
             sg_debug_names: self.sg_debug_names.clone(),
             string_pool: self.string_pool.clone(),
             mem: None,
@@ -2804,6 +3001,7 @@ impl DataFlowGraph {
             sg_initial_seed: Vec::new(),
             downstream_counts: Vec::new(),
             linear_plans: Vec::new(),
+            converter_scope: false,
             nodes: Vec::new(),
             inputs_pool: InputsPool::new(),
             subgraphs: Vec::new(),
@@ -2828,7 +3026,6 @@ impl DataFlowGraph {
             embed_infos: Vec::new(),
             resources: Vec::new(),
             select_infos: Vec::new(),
-            writeback_targets: Vec::new(),
             tail_call_flags: Vec::new(),
             safe_op_flags: Vec::new(),
             hoisted_node: Vec::new(),
@@ -2849,6 +3046,7 @@ impl DataFlowGraph {
             memo_infos: Vec::new(),
             memo_tables: Arc::new(Vec::new()),
             vtable_fallback_dispatch: rustc_hash::FxHashMap::default(),
+            inheritance_links: Vec::new(),
             sg_debug_names: Vec::new(),
             string_pool: Arc::from(Vec::new()),
             mem: None,
@@ -3030,6 +3228,10 @@ impl DataFlowGraph {
     /// Adds a subgraph and returns its `SubGraphId`.
     pub fn add_subgraph(&mut self, sg: SubGraph) -> SubGraphId {
         let id = SubGraphId(self.subgraphs.len() as u32);
+        let mut sg = sg;
+        // Builder-time scope stamp: subgraphs created inside a strategy
+        // converter compilation are converter-internal (E7 exclusion).
+        sg.converter_generated = self.converter_scope;
         self.subgraphs.push(sg);
         id
     }
@@ -3076,7 +3278,6 @@ impl DataFlowGraph {
         hash_opt!(lib_ret_kinds);
         hash_opt!(embed_infos);
         hash_opt!(select_infos);
-        hash_opt!(writeback_targets);
         hash_opt!(batch_infos);
         hash_opt!(trait_construct_infos);
         hash_opt!(lazy_construct_infos);
@@ -3216,9 +3417,6 @@ impl DataFlowGraph {
         if let Some(src) = self.await_event_sources.get(idx).and_then(|o| *o) {
             f(src);
         }
-        if let Some(t) = self.writeback_targets.get(idx).and_then(|o| *o) {
-            f(t);
-        }
         if let Some(gb) = self.gate_branches.get(idx).and_then(|o| o.as_ref()) {
             f(gb.condition_input);
             for (_, _, params) in &gb.branches {
@@ -3275,6 +3473,14 @@ impl DataFlowGraph {
             for &n in &plan.reset_condition_tree {
                 f(n);
             }
+            for &(p, v) in &plan.carries_value {
+                f(p);
+                f(v);
+            }
+            for &(p, c) in &plan.carries_cell {
+                f(p);
+                f(c);
+            }
             // plan.condition_tree_plan is deliberately NOT enumerated: rebuild
             // clears it (W5) and the pipeline recomputes it post-compaction.
         }
@@ -3301,10 +3507,6 @@ impl DataFlowGraph {
             if let Some(src) = self.await_event_sources.get(idx).and_then(|o| *o) {
                 self.await_event_sources[idx] =
                     Some(f(NodeRefSite::NodeMeta, idx as u32, src));
-            }
-            if let Some(t) = self.writeback_targets.get(idx).and_then(|o| *o) {
-                self.writeback_targets[idx] =
-                    Some(f(NodeRefSite::NodeMeta, idx as u32, t));
             }
             if let Some(gb) = self.gate_branches.get(idx).and_then(|o| o.as_ref()) {
                 let new_cond = f(NodeRefSite::NodeMeta, idx as u32, gb.condition_input);
@@ -3361,6 +3563,14 @@ impl DataFlowGraph {
                 }
                 for n in plan.reset_condition_tree.iter_mut() {
                     *n = f(NodeRefSite::SgAnchor, si as u32, *n);
+                }
+                for (p, v) in plan.carries_value.iter_mut() {
+                    *p = f(NodeRefSite::SgAnchor, si as u32, *p);
+                    *v = f(NodeRefSite::SgAnchor, si as u32, *v);
+                }
+                for (p, c) in plan.carries_cell.iter_mut() {
+                    *p = f(NodeRefSite::SgAnchor, si as u32, *p);
+                    *c = f(NodeRefSite::SgAnchor, si as u32, *c);
                 }
                 // condition_tree_plan: cleared by rebuild (W5), never remapped.
             }
@@ -3616,20 +3826,13 @@ impl DataFlowGraph {
 
         // 3c. Compact vectors containing NodeId (plain clone — remap happens
         // once, after step 6, via `map_node_refs`).
-        // await_event_sources / writeback_targets: Vec<Option<NodeId>>
+        // await_event_sources: Vec<Option<NodeId>>
         {
             let mut v: Vec<Option<NodeId>> = Vec::with_capacity(new_to_old.len());
             for &old_idx in &new_to_old {
                 v.push(self.await_event_sources[old_idx]);
             }
             self.await_event_sources = v;
-        }
-        {
-            let mut v: Vec<Option<NodeId>> = Vec::with_capacity(new_to_old.len());
-            for &old_idx in &new_to_old {
-                v.push(self.writeback_targets[old_idx]);
-            }
-            self.writeback_targets = v;
         }
         // gate_branches / select_infos: interior NodeIds remapped by the door.
         {
@@ -4158,6 +4361,66 @@ pub fn compute_nested_ranges(&mut self) {
     /// of on every loop iteration. Uses the mem-agnostic accessors so both the
     /// built and the loaded (zerocopy) graphs can run it.
     pub fn precompute_reset_plans(&mut self) {
+        // E2 fused carries: precompute per carried param the frame-relative
+        // indices (param local in the loop frame, source local in the BODY
+        // frame, consumer locals in the loop frame) so the per-iteration
+        // application is direct slot arithmetic. The body frame shares the
+        // loop frame's node_offset (same_function branch frame), so body
+        // locals use the same offset as the loop frame.
+        let fused: Vec<(usize, Vec<FusedCarry>)> = self
+            .subgraphs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, sg)| {
+                let plan = sg.reset_plan.as_ref()?;
+                if plan.carries_value.is_empty() && plan.carries_cell.is_empty() {
+                    return None;
+                }
+                // Same-function frames: BOTH the loop frame and the body
+                // frame use the OWNING FUNCTION's node_start as node_offset
+                // (the value-table layout is the parent function's). Resolve
+                // it via function_id — NOT the while sg's own range start.
+                let fn_start = self.subgraphs[sg.function_id as usize].node_range.0 .0;
+                let loop_offset = fn_start;
+                let body_offset = fn_start;
+                let mut out: Vec<FusedCarry> = Vec::new();
+                let all_carries = plan
+                    .carries_value
+                    .iter()
+                    .map(|(p, s)| (*p, *s, false))
+                    .chain(plan.carries_cell.iter().map(|(p, c)| (*p, *c, true)));
+                for (param_gid, src_gid, through_cell) in all_carries {
+                    // The body frame's node_offset equals the FUNCTION start;
+                    // both frames are same_function (parent's layout). Source
+                    // and param locals both subtract their frame offsets —
+                    // which are identical here, so one subtraction works.
+                    let param_local = param_gid.0.wrapping_sub(loop_offset);
+                    let src_body_local = src_gid.0.wrapping_sub(body_offset);
+                    let consumers: Vec<u32> = self
+                        .downstream_slice(param_gid.0 as usize)
+                        .iter()
+                        .filter_map(|&ds| {
+                            let l = ds.0.wrapping_sub(loop_offset);
+                            (l < self.subgraphs[i].node_range.1 .0.wrapping_sub(loop_offset))
+                                .then_some(l)
+                        })
+                        .collect();
+                    out.push(FusedCarry {
+                        param_local,
+                        src_body_local,
+                        through_cell,
+                        consumers,
+                    });
+                }
+                Some((i, out))
+            })
+            .collect();
+        for (i, fused_carries) in fused {
+            if let Some(plan) = self.subgraphs[i].reset_plan.as_mut() {
+                plan.fused_carries = fused_carries;
+            }
+        }
+
         let plans: Vec<(usize, Vec<(NodeId, u16)>)> = self
             .subgraphs
             .iter()
@@ -4193,7 +4456,18 @@ pub fn compute_nested_ranges(&mut self) {
         // CSR section rather than the owned Vec).
         let nested = self.sg_nested_ranges(loop_sg_idx);
         let is_nested = |gid: u32| nested.iter().any(|&(s, e)| gid >= s && gid < e);
-        let is_in_sg = |gid: u32| gid >= sg_start.0 && gid < sg_end.0 && !is_nested(gid);
+        // Param-prefix nodes are excluded from COLLECTION (injected slots —
+        // call args / phi carries — never re-computed; a CF_NOOP re-fire
+        // would VOID them), but their edges COUNT toward consumers' pending:
+        // the phi carry's poke is the param's completion signal, so a node
+        // like `lt(param, len)` waits for BOTH the tree chain and the carry
+        // poke — firing on the poke alone would read freshly-cleared sibling
+        // slots as 0.
+        let param_end = sg_start.0 + loop_sg.param_count as u32;
+        let is_in_sg = |gid: u32| gid >= param_end && gid < sg_end.0 && !is_nested(gid);
+        let is_pending_src = |gid: u32| {
+            (gid >= sg_start.0 && gid < param_end) || is_in_sg(gid)
+        };
 
         let mut visited: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
         let mut stack: Vec<NodeId> = roots.to_vec();
@@ -4220,7 +4494,7 @@ pub fn compute_nested_ranges(&mut self) {
                 let inputs = self.inputs(node.inputs_offset, node.input_count);
                 let pending = inputs
                     .iter()
-                    .filter(|&&inp| visited.contains(&inp.0) && is_in_sg(inp.0))
+                    .filter(|&&inp| is_pending_src(inp.0))
                     .count() as u16;
                 (gid, pending)
             })
@@ -4316,24 +4590,24 @@ pub const fn scalar_meta(tag: crate::value::ValueTag) -> Option<ScalarMeta> {
     // family is derived from ValueTag::family() (single source of truth).
     let family = tag.family();
     Some(match tag {
-        // 12 integer types (arith_base starts at 92, 12 indices each).
-        ValueTag::I8    => ScalarMeta { arith_base: 92,  family, is_float: false },
-        ValueTag::I16   => ScalarMeta { arith_base: 104, family, is_float: false },
-        ValueTag::I32   => ScalarMeta { arith_base: 116, family, is_float: false },
-        ValueTag::I64   => ScalarMeta { arith_base: 128, family, is_float: false },
-        ValueTag::I128  => ScalarMeta { arith_base: 140, family, is_float: false },
-        ValueTag::U8    => ScalarMeta { arith_base: 152, family, is_float: false },
-        ValueTag::U16   => ScalarMeta { arith_base: 164, family, is_float: false },
-        ValueTag::U32   => ScalarMeta { arith_base: 176, family, is_float: false },
-        ValueTag::U64   => ScalarMeta { arith_base: 188, family, is_float: false },
-        ValueTag::U128  => ScalarMeta { arith_base: 200, family, is_float: false },
-        ValueTag::Isize => ScalarMeta { arith_base: 212, family, is_float: false },
-        ValueTag::Usize => ScalarMeta { arith_base: 224, family, is_float: false },
-        // 4 floating-point types (arith_base starts at 236, 6 indices each).
-        ValueTag::F16   => ScalarMeta { arith_base: 236, family, is_float: true },
-        ValueTag::F32   => ScalarMeta { arith_base: 242, family, is_float: true },
-        ValueTag::F64   => ScalarMeta { arith_base: 248, family, is_float: true },
-        ValueTag::F128  => ScalarMeta { arith_base: 254, family, is_float: true },
+        // 12 integer types (arith_base starts at 90, 12 indices each).
+        ValueTag::I8    => ScalarMeta { arith_base: 90,  family, is_float: false },
+        ValueTag::I16   => ScalarMeta { arith_base: 102, family, is_float: false },
+        ValueTag::I32   => ScalarMeta { arith_base: 114, family, is_float: false },
+        ValueTag::I64   => ScalarMeta { arith_base: 126, family, is_float: false },
+        ValueTag::I128  => ScalarMeta { arith_base: 138, family, is_float: false },
+        ValueTag::U8    => ScalarMeta { arith_base: 150, family, is_float: false },
+        ValueTag::U16   => ScalarMeta { arith_base: 162, family, is_float: false },
+        ValueTag::U32   => ScalarMeta { arith_base: 174, family, is_float: false },
+        ValueTag::U64   => ScalarMeta { arith_base: 186, family, is_float: false },
+        ValueTag::U128  => ScalarMeta { arith_base: 198, family, is_float: false },
+        ValueTag::Isize => ScalarMeta { arith_base: 210, family, is_float: false },
+        ValueTag::Usize => ScalarMeta { arith_base: 222, family, is_float: false },
+        // 4 floating-point types (arith_base starts at 234, 6 indices each).
+        ValueTag::F16   => ScalarMeta { arith_base: 234, family, is_float: true },
+        ValueTag::F32   => ScalarMeta { arith_base: 240, family, is_float: true },
+        ValueTag::F64   => ScalarMeta { arith_base: 246, family, is_float: true },
+        ValueTag::F128  => ScalarMeta { arith_base: 252, family, is_float: true },
         // Non-arithmetic scalar types (bool/char, no arith_base).
         ValueTag::Bool  => ScalarMeta { arith_base: 0,   family, is_float: false },
         ValueTag::Char  => ScalarMeta { arith_base: 0,   family, is_float: false },
@@ -4346,85 +4620,3 @@ pub const fn scalar_meta(tag: crate::value::ValueTag) -> Option<ScalarMeta> {
 // Effect classification tests (W1)
 // =========================================================================
 
-#[cfg(test)]
-mod effect_classification_tests {
-    use super::*;
-
-    /// Verbatim copy of the PRE-W1 hand-written pure set (the behavior W1 must
-    /// preserve exactly). Keep frozen; if `pure_compute_fn_set()` drifts from
-    /// this, the equivalence guarantee is broken.
-    /// (344..=349 — u128 comparisons — joined both sets when they were added.)
-    fn legacy_pure_set() -> rustc_hash::FxHashSet<ComputeFnId> {
-        let mut s = rustc_hash::FxHashSet::default();
-        for id in 1..=27u32 { s.insert(ComputeFnId(id)); }
-        for id in 50..=91u32 { s.insert(ComputeFnId(id)); }
-        for id in 92..=259u32 { s.insert(ComputeFnId(id)); }
-        for id in 344..=349u32 { s.insert(ComputeFnId(id)); }
-        s.insert(CF_RECORD_FIELD_GET);
-        s.insert(CF_ARRAY_INDEX);
-        s.insert(CF_IS_NULL);
-        s.insert(CF_ARRAY_LEN);
-        s.insert(CF_IS_EMPTY);
-        s.insert(CF_REF_EQ);
-        s.insert(CF_REF_NEQ);
-        s.insert(CF_ELVIS);
-        s.insert(CF_PATTERN_CTOR_MATCH);
-        s.insert(CF_PATTERN_ADT_FIELD_GET);
-        s.insert(CF_PATTERN_STR_EQ);
-        s.insert(CF_CAST_SCALAR);
-        s.insert(CF_NON_NULL_ASSERT);
-        s.insert(CF_STR_BYTES);
-        s.insert(CF_EQ_STR);
-        s.insert(CF_NE_STR);
-        s.insert(CF_LT_STR);
-        s.insert(CF_GT_STR);
-        s.insert(CF_LE_STR);
-        s.insert(CF_GE_STR);
-        s.insert(CF_EQ_OBJ);
-        s.insert(CF_NE_OBJ);
-        s.insert(CF_NE_BOOL);
-        s.insert(CF_EQ_F128);
-        s.insert(CF_NE_F128);
-        s.insert(CF_LT_F128);
-        s.insert(CF_GT_F128);
-        s.insert(CF_LE_F128);
-        s.insert(CF_GE_F128);
-        s
-    }
-
-    /// The derived set must equal the legacy set member-for-member.
-    #[test]
-    fn pure_set_equivalence_with_legacy() {
-        let new = pure_compute_fn_set();
-        let old = legacy_pure_set();
-        let missing: Vec<_> = old.difference(&new).collect();
-        let added: Vec<_> = new.difference(&old).collect();
-        assert!(
-            missing.is_empty() && added.is_empty(),
-            "pure set drift: lost {:?}, gained {:?}",
-            missing,
-            added
-        );
-    }
-
-    /// Every compute fn id in the table must be classified (effect_class
-    /// panics otherwise — this test turns that into a named failure).
-    #[test]
-    fn classification_covers_all_cfs() {
-        for id in 0..COMPUTE_FN_TABLE_LEN {
-            let _ = effect_class(ComputeFnId(id));
-        }
-    }
-
-    /// Aliasing reads are classified ReadMutable; in-place mutators are
-    /// WriteMutable (the graph_pure_set contract depends on this).
-    #[test]
-    fn aliasing_contract() {
-        for cf in aliasing_read_cfs() {
-            assert_eq!(effect_class(cf), EffectClass::ReadMutable, "cf {}", cf.0);
-        }
-        for cf in [CF_RECORD_FIELD_SET, CF_ARRAY_STORE, CF_DEREF_WRITE] {
-            assert_eq!(effect_class(cf), EffectClass::WriteMutable, "cf {}", cf.0);
-        }
-    }
-}

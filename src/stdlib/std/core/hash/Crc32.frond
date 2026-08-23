@@ -1,0 +1,56 @@
+// Crc32.frond — CRC-32 checksum (part of std.core.hash)
+//
+// CRC-32/ISO-HDLC — the zlib/zip/png polynomial (reflected 0xEDB88320).
+// Bitwise implementation: no 256-entry table, 8 shift rounds per byte;
+// correct byte-for-byte against zlib.crc32. Not cryptographic.
+
+val POLY: u32 = 0xEDB88320
+val MASK: u32 = 0xFFFFFFFF
+
+// Fold one byte into the reflected CRC register (8 polynomial steps).
+@internal
+fun step_byte(crc: u32, b: u8): u32 {
+    var c = crc ^ (b as u32)
+    var i = 0 as u8
+    while i < 8 {
+        if (c & 1) != 0 {
+            c = (c >> 1) ^ POLY
+        } else {
+            c = c >> 1
+        }
+        i = i + 1
+    }
+    c
+}
+
+// CRC-32 via the generic entry: str and u8[] digest directly
+// ("" = 0, "123456789" = 0xCBF43926); anything else sums as 0. (Named crc32, not sum: the engine's monomorph cache
+// keys generic instantiations by bare name, so same-named generics across
+// packs would collide.)
+pub fun crc32<T>(data: T): u32 {
+    match data.type_name() {
+        "str" => {
+            val s = data as str
+            crc32_bytes(s.bytes())
+        },
+        "u8[]" => crc32_bytes(data as u8[]),
+        // Empty (and non-uniform) arrays: no bytes to digest — same answer
+        // as crc32_bytes(empty), consistent with the str/u8[] arms.
+        "array" => {
+            val none: u8[] = []
+            crc32_bytes(none)
+        },
+        _ => 0
+    }
+}
+
+// CRC-32 of raw bytes — the algorithm's native input domain.
+pub fun crc32_bytes(data: u8[]): u32 {
+    var crc: u32 = MASK
+    var i: usize = 0
+    while i < data.len() {
+        crc = step_byte(crc, data[i])
+        i = i + 1
+    }
+    crc ^ MASK
+}

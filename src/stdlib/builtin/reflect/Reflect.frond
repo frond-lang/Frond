@@ -41,3 +41,9 @@ trait Value {
     fun repr(): str
     fun constructor(): str
 }
+
+// `clone()` is also a reflect auto-impl method (CF_REFLECT_CLONE; returns the
+// receiver's own type, not expressible as a trait signature above — the same
+// reason field_value was removed). Deep copy of the data domain: arrays
+// (incl. nested/SoA) and records recurse; immutable leaves and runtime
+// identities share. Exposed to user code as std.core.mem `Mem.clone`.

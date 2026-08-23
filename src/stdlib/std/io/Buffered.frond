@@ -128,7 +128,7 @@ pub type BufWriter = BufWriter(inner: File, buf: u8[], pos: usize) {
                 val n = inner.write(chunk, chunk.len()).await()?
                 if n == 0 {
                     // Wrote 0 bytes but still has unwritten data — avoid infinite loop, treat as BrokenPipe
-                    throw IOError(BrokenPipe, "flush: write returned 0", 32, inner.path)
+                    throw IOError(BrokenPipe, "flush: write returned 0", 32, inner.path.to_str())
                 }
                 written = written + n
             }

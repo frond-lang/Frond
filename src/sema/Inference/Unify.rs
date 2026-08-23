@@ -121,6 +121,184 @@ impl<'a> InferContext<'a> {
         }
     }
 
+    /// Inheritance substitution check for concrete Adt pairs: returns
+    /// `Some(None)` when `arg` may substitute for `param` (param is on the
+    /// arg's first-base chain), `Some(Some(msg))` with a dedicated message
+    /// when the base IS in the chain but not first (view offsets unsupported),
+    /// and `None` when unrelated (fall through to the generic mismatch).
+    fn inheritance_substitutable(
+        &self,
+        param: TypeHandle,
+        arg: TypeHandle,
+    ) -> Option<Option<String>> {
+        let rp = self.arena.resolve(param);
+        let ra = self.arena.resolve(arg);
+        let (pname, _) = match self.arena.get(rp) {
+            crate::types::Ty::Type::Adt(_) => self.arena.adt_parts(rp),
+            _ => return None,
+        };
+        let (aname, _) = match self.arena.get(ra) {
+            crate::types::Ty::Type::Adt(_) => self.arena.adt_parts(ra),
+            _ => return None,
+        };
+        if pname == aname {
+            return None; // same type: not this path's concern
+        }
+        // Walk the arg's base chain: first-base links are layout-compatible;
+        // non-first links are not yet substitutable.
+        let mut ok = false;
+        let mut late = false;
+        let mut current: Option<Box<str>> = Some(aname.into());
+        let mut hops = 0usize;
+        while let Some(cn) = current {
+            if hops > 64 {
+                break;
+            }
+            let def = self.sema_result.get_type_def(cn.as_ref())?;
+            let mut next: Option<Box<str>> = None;
+            for (i, b) in def.bases.iter().enumerate() {
+                if b.as_ref() == pname {
+                    if i == 0 && !late {
+                        ok = true;
+                    } else {
+                        late = true;
+                        ok = false;
+                    }
+                }
+                if i == 0 {
+                    next = Some(b.clone());
+                }
+            }
+            if ok || late {
+                break;
+            }
+            current = next;
+            hops += 1;
+        }
+        let _ = late;
+        // Non-first bases: allowed — method calls dispatch per-child (the
+        // inherited bodies compile against the child layout), so passing
+        // through methods is layout-correct. Direct FIELD access through a
+        // non-first-base-typed receiver remains first-base-only (fields are
+        // name-keyed at runtime anyway).
+        if ok || late {
+            return Some(None);
+        }
+        None
+    }
+
+    /// Call-site argument check with the hard-concrete rule: when BOTH the
+    /// parameter and the argument are fully concrete (no TypeVar anywhere) and
+    /// cannot unify, no solver iteration can ever reconcile them — report the
+    /// mismatch immediately. This closes the silent str-through-Path hole
+    /// (`File.open("x", ..)` compiled and shifted every argument one ABI slot
+    /// at runtime). TypeVars/literals keep the lenient constraint path (the
+    /// soft-unify wall stdlib relies on stays intact).
+    pub fn unify_call_arg(&mut self, param: TypeHandle, arg: TypeHandle, line: u32, column: u32) {
+        let (concrete_pair, hard_fail) = {
+            let InferContext { arena, .. } = self;
+            let rp = arena.resolve(param);
+            let ra = arena.resolve(arg);
+            use super::CallInfer::type_contains_typevar;
+            let concrete_pair = !type_contains_typevar(arena, rp)
+                && !type_contains_typevar(arena, ra);
+            let hard_fail = arena.unify(rp, ra).is_err();
+            (concrete_pair, hard_fail)
+        };
+        // Numeric pairs are exempt: implicit width widening (i64 -> i128 etc.)
+        // is an established lenient path the stdlib leans on; this sentinel is
+        // for STRUCTURAL mismatches (str into Path, Path into str?, ...).
+        let both_numeric = self.arena.get(self.arena.resolve(param)).is_numeric()
+            && self.arena.get(self.arena.resolve(arg)).is_numeric();
+        // The builtin `Error` interface accepts ANY error type (throw-family
+        // covariance): exempt it from the structural check.
+        let param_is_error_iface = matches!(
+            self.arena.get(self.arena.resolve(param)),
+            crate::types::Ty::Type::Adt(_)
+        ) && {
+            let (name, _) = self.arena.adt_parts(self.arena.resolve(param));
+            name == "Error"
+        };
+        if concrete_pair && !both_numeric && !param_is_error_iface && hard_fail {
+            // Nullable/throw structural promotion (T -> T?) is legitimate for
+            // concrete pairs; only when BOTH the plain unify and the widening
+            // path fail is it a real mismatch (stdlib passes str into str?
+            // parameters, and str? unwraps into str receivers).
+            let widened = self.try_widen_unify(param, arg).is_ok();
+            // Inheritance substitution: a CHILD value may flow into a
+            // base-typed parameter when the base is on the child's
+            // FIRST-base chain (prefix layout compatibility — later bases
+            // need view offsets, not yet supported).
+            if !widened {
+                if let Some(msg) = self.inheritance_substitutable(param, arg) {
+                    if let Some(m) = msg {
+                        self.add_error_at(&m, line, column);
+                    }
+                    return;
+                }
+            }
+            // Trait-param substitution (incl. trait inheritance): a concrete
+            // type with a witness for the trait — or a CHILD trait of it —
+            // flows into a trait-typed parameter (runtime dispatches via the
+            // vtable fallback table).
+            if !widened {
+                let rp = self.arena.resolve(param);
+                let ra = self.arena.resolve(arg);
+                // Trait-typed parameter — as Type::Trait or (the common
+                // annotation lowering) an Adt placeholder naming a trait.
+                let tname: Option<&str> = match self.arena.get(rp) {
+                    crate::types::Ty::Type::Trait(_) => {
+                        Some(self.arena.trait_parts(rp).0)
+                    }
+                    crate::types::Ty::Type::Adt(_) => {
+                        let (n, _) = self.arena.adt_parts(rp);
+                        if self.sema_result.get_trait_def(n).is_some() {
+                            Some(n)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(tname) = tname {
+                    if let crate::types::Ty::Type::Adt(_) = self.arena.get(ra) {
+                        let (aname, _) = self.arena.adt_parts(ra);
+                        // The InferContext's OWN table carries this module's
+                        // fresh witnesses (sema_result's mirror is only synced
+                        // post-inference, step 10).
+                        let has_witness = self
+                            .witness_table
+                            .entries()
+                            .any(|e| e.trait_name.as_ref() == tname && {
+                                self.sema_result
+                                    .type_id_to_name
+                                    .get(&e.type_id)
+                                    .map(|n| n.as_ref() == aname)
+                                    .unwrap_or(false)
+                            });
+                        if has_witness {
+                            return;
+                        }
+                    }
+                }
+            }
+            if !widened {
+                let p_str = format!("{}", self.arena.display(self.arena.resolve(param)));
+                let a_str = format!("{}", self.arena.display(self.arena.resolve(arg)));
+                self.add_error_at(
+                    &format!(
+                        "argument type mismatch: cannot pass '{}' where '{}' is expected",
+                        a_str, p_str
+                    ),
+                    line,
+                    column,
+                );
+                return;
+            }
+        }
+        self.unify_or_constrain(param, arg);
+    }
+
     /// Attempts a widening unification of two types and returns the unified type.
     /// First tries a strict unify; on failure, if both are numeric, picks one per the widening rules;
     /// otherwise handles structural compatibility for nullable/throw vs. ordinary types, void, etc.

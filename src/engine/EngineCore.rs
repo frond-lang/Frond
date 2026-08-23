@@ -26,6 +26,10 @@ pub(super) fn env_flag(name: &str) -> bool {
     const KNOWN_FLAGS: &[&str] = &[
         "FROND_DEBUG_STALL",
         "FROND_NO_REUSECHAIN",
+        "FROND_NO_DELTA_RESET",
+        "FROND_NO_SAMEFRAME",
+        "FROND_SAMEFRAME",
+        "FROND_DEBUG_SF",
         "FROND_DEBUG_FORIN",
         "FROND_DEBUG_CALL",
         "FROND_DEBUG_IFELSE",
@@ -123,6 +127,8 @@ pub(super) const GOLDEN_RATIO_64: u64 = 0x9E3779B97F4A7C15;
 /// Unified engine: field types are determined by `S`, while the business logic is written once.
 pub struct Engine<S: LockStrategy> {
     pub graph: Arc<DataFlowGraph>,
+    /// Hang-watchdog progress counter (Multi debug; cheap atomic bump per frame).
+    pub hang_progress: std::sync::atomic::AtomicU64,
     pub frames: S::Mutex<HashMap<FrameId, Box<crate::ir::Ir::Frame>>>,
     pub next_frame_id: S::Mutex<FrameId>,
     pub arena: S::Mutex<ValueArena>,
@@ -134,7 +140,12 @@ pub struct Engine<S: LockStrategy> {
     /// Fallback for event-delivery races: when an event arrives while a frame is being processed by
     /// process_frame (and is therefore absent from the HashMap), the event is stashed here and
     /// consumed once process_frame inserts the frame (symmetric to pending_completions).
-    pub pending_events: S::Mutex<HashMap<FrameId, (crate::ir::Ir::RuntimeEvent, Value)>>,
+    /// Multi-slot per frame: several events can arrive while the frame is out of
+    /// the map (being processed) — a single-slot map silently OVERWROTE the
+    /// earlier event, and when the survivor was stale the frame's real wait was
+    /// lost forever (the fourth await-loop hang root).
+    pub pending_events:
+        S::Mutex<HashMap<FrameId, Vec<(crate::ir::Ir::RuntimeEvent, Value)>>>,
     /// Defer-frame tracking: the set of all currently-active defer frames (distinguishes defer
     /// frames from ordinary child frames in `process_frame`'s Completed/Failed branches).
     pub defer_frames: S::Mutex<HashSet<FrameId>>,
@@ -142,6 +153,13 @@ pub struct Engine<S: LockStrategy> {
     /// number of defer frames still pending. When the count reaches zero the frame is resumed.
     pub defer_waiters: S::Mutex<HashMap<FrameId, u32>>,
     pub result: S::Mutex<Option<Value>>,
+    /// Poison state for the multi-threaded engine: the panic message captured
+    /// when a worker dies. Once set, every worker exits its park loop, the
+    /// scope joins, and `run_multi` panics with this ORIGINAL message (instead
+    /// of hanging forever waiting for a result that can never be produced —
+    /// async programs keep `event_waiters` non-empty, so the normal
+    /// all-workers-idle exit never triggers after a worker is gone).
+    pub panic_payload: S::Mutex<Option<String>>,
     /// Frame pool: reclaims completed `Box<Frame>` for reuse, eliminating frequent Vec
     /// allocation/deallocation.
     pub frame_pool: S::Mutex<Vec<Box<crate::ir::Ir::Frame>>>,
@@ -276,18 +294,72 @@ fn compute_linear_plan(graph: &DataFlowGraph, s: usize) -> Option<Vec<NodeId>> {
     let nested: &[(u32, u32)] = graph.sg_nested_ranges(s);
     let is_nested = |gid: u32| -> bool { nested.iter().any(|&(a, b)| gid >= a && gid < b) };
 
+    // Gate-in-plan is allowed only where launching is statically known to be
+    // same-frame-safe: plain / LoopBody sgs whose every own Gate's BOTH branch
+    // targets pass the E7 eligibility (minus the runtime arg bits). A gate
+    // that would bail every iteration (loop-dispatch gates, converter state
+    // machines, capture/suspending/closure arms) rejects the plan — the sg
+    // keeps the pure dataflow driver (pre-E9 behavior, no regression).
+    let sg_kind = graph.subgraphs[s].loop_kind;
+    let sg_conv = graph.subgraphs[s].converter_generated;
+    let fn_id = graph.subgraphs[s].function_id;
+    let gates_ok = !sg_conv
+        && matches!(
+            sg_kind,
+            crate::ir::Ir::LoopKind::None | crate::ir::Ir::LoopKind::LoopBody
+        );
+    let gate_static_ok = |gate_idx: usize| -> bool {
+        let Some(gb) = graph.gate_branches_at(gate_idx) else {
+            return false;
+        };
+        if gb.capture {
+            return false;
+        }
+        for (_, bsg, _) in &gb.branches {
+            let t = &graph.subgraphs[bsg.0 as usize];
+            if t.converter_generated
+                || t.has_suspend
+                || !t.event_source_decls.is_empty()
+                || t.loop_kind != crate::ir::Ir::LoopKind::None
+                || t.function_id != fn_id
+                || bsg.0 == t.function_id
+            {
+                return false;
+            }
+            // Control-signal-free own nodes (mirrors the runtime eligibility
+            // scan in Schedule.rs — keep the two in sync).
+            let nested_t: &[(u32, u32)] = graph.sg_nested_ranges(bsg.0 as usize);
+            let (cs, ce) = t.node_range;
+            for g in cs.0..ce.0 {
+                if nested_t.iter().any(|&(a, b)| g >= a && g < b) {
+                    continue;
+                }
+                if crate::ir::Ir::is_control_flow_compute_fn(
+                    graph.node(g as usize).compute_fn,
+                ) {
+                    return false;
+                }
+            }
+        }
+        true
+    };
     let mut own = vec![false; n];
     for i in 0..n {
         let node = graph.node(start + i);
         if node.kind == NodeKind::EventSource {
             return None;
         }
-        // Only fully-linear subgraphs get a plan: a launch node mid-sg would force a
-        // bail + readiness rebuild every run, which costs more than pure dataflow
-        // driving (measured: match_dispatch regressed ~13% with prefix-linear plans).
-        // The bail machinery in run_linear remains as a safety net.
+        // Segmented-linear (E9): Gate nodes stay IN the plan at their topo
+        // position — run_linear launches the taken branch same-frame (E7) and
+        // drains the injected subtree before continuing, so no bail/rebuild is
+        // needed for them. Other launch kinds (Call/Await/EventSource) still
+        // reject the plan: their protocols need the dataflow driver. (The
+        // pre-E7 measurement — mid-sg launches regressing match_dispatch ~13%
+        // — was about child-frame launches + readiness rebuilds, both gone.)
         if is_launch_kind(node.kind) {
-            return None;
+            if node.kind != NodeKind::Gate || !gates_ok || !gate_static_ok(start + i) {
+                return None;
+            }
         }
         if is_nested((start + i) as u32) {
             continue;
@@ -360,15 +432,69 @@ impl EngineRef {
     /// suspend/wake behavior, so multiple workers advancing frames concurrently is more efficient.
     pub fn new(graph: DataFlowGraph) -> Self {
         let mut graph = graph;
+        // .fndo hot-path parity: loaded (mmap-backed) graphs unpack the
+        // packed Nodes section PER node() call; on interpreter hot loops
+        // that indirection cost 2-3x (loop_sum: ~290ms source vs ~670ms
+        // artifact). Artifacts are kilobytes — materialize the nodes Vec
+        // once, up front, so both paths hit the same Vec slice in node().
+        if graph.mem.is_some() && graph.nodes.is_empty() {
+            let n = graph.node_count();
+            let mut nodes = Vec::with_capacity(n);
+            for i in 0..n {
+                nodes.push(graph.node(i));
+            }
+            graph.nodes = nodes;
+        }
+        // Same treatment for the Inputs pool: inputs() does a mmap
+        // section lookup + transmute per call; one bulk copy into the
+        // pool removes the remaining per-node indirection.
+        if graph.mem.is_some() && graph.inputs_pool.data.is_empty() {
+            let total = graph
+                .nodes
+                .iter()
+                .map(|n| n.inputs_offset as usize + n.input_count as usize)
+                .max()
+                .unwrap_or(0);
+            let mut data = vec![NodeId(0); total];
+            for nd in graph.nodes.iter() {
+                let s = nd.inputs_offset as usize;
+                let src = graph.inputs(nd.inputs_offset, nd.input_count);
+                data[s..s + nd.input_count as usize].copy_from_slice(src);
+            }
+            graph.inputs_pool.data = data;
+        }
+        // Category B boolean tables: same story — bulk-fill the Vecs so
+        // the accessors stop reading the mmap bitmaps per call.
+        if graph.mem.is_some() {
+            let n = graph.nodes.len();
+            if graph.tail_call_flags.is_empty() {
+                let v: Vec<bool> = (0..n).map(|i| graph.tail_call_flag(i)).collect();
+                graph.tail_call_flags = v;
+            }
+            if graph.safe_op_flags.is_empty() {
+                let v: Vec<bool> = (0..n).map(|i| graph.safe_op_flag(i)).collect();
+                graph.safe_op_flags = v;
+            }
+            if graph.slice_inclusive.is_empty() {
+                let v: Vec<bool> = (0..n).map(|i| graph.slice_inclusive(i)).collect();
+                graph.slice_inclusive = v;
+            }
+        }
         materialize_const_cache(&mut graph);
         precompute_sg_templates(&mut graph);
         materialize_downstream_counts(&mut graph);
         materialize_linear_plans(&mut graph);
         let has_async = Self::entry_reaches_suspend(&graph);
         if has_async {
-            let workers = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
+            let workers = std::env::var("FROND_WORKERS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&w| w >= 1)
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1)
+                });
             Self::Multi(Arc::new(Engine::<Multi>::new_multi(graph, workers)))
         } else {
             Self::Single(Engine::<Single>::new_single(graph))
@@ -426,6 +552,9 @@ impl EngineRef {
             Self::Multi(e) => Engine::<Multi>::run_multi(e),
         };
         exec_cov_dump(&graph);
+        // Teardown cycle sweep: releases any cyclic garbage still registered
+        // (roots empty — nothing runs after this).
+        let _ = crate::value::Registry::collect_cycles(&[]);
         result
     }
 }

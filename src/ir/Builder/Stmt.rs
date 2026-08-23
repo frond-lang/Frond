@@ -196,6 +196,25 @@ impl<'a> IrBuilder<'a> {
                     inputs_offset: copy_off,
                     compute_fn: CF_SEQ,
                 });
+                // Cell backing (place model): scalar bindings lower to a Cell
+                // at the DECL SITE — order-independent (`&x` before or after
+                // any read/write), and `&x` is zero-cost (the cell exists).
+                // All-vars functions cell-back every scalar `var` (C1-③④);
+                // elsewhere only address-taken bindings (C1-①). Captured
+                // bindings stay plain (the capture machinery snapshots the
+                // binding node).
+                if self.decl_cell_backing_eligible(name, *value, false) {
+                    let off = self.graph.inputs_pool.push(&[copy_node]);
+                    let cell_node = self.graph.add_node(Node {
+                        kind: NodeKind::UnOp,
+                        input_count: 1,
+                        inputs_offset: off,
+                        compute_fn: CF_CELL_ALLOC,
+                    });
+                    self.bind_cell(name, cell_node);
+                    self.track_cell_decl(name, cell_node, copy_node);
+                    return Some(cell_node);
+                }
                 self.declare_var(name, copy_node);
                 Some(copy_node)
             }
@@ -225,6 +244,20 @@ impl<'a> IrBuilder<'a> {
                 } else {
                     value_node
                 };
+                // Cell backing (see ValDecl above); all-vars functions back
+                // every scalar `var`.
+                if self.decl_cell_backing_eligible(name, *value, true) {
+                    let off = self.graph.inputs_pool.push(&[home]);
+                    let cell_node = self.graph.add_node(Node {
+                        kind: NodeKind::UnOp,
+                        input_count: 1,
+                        inputs_offset: off,
+                        compute_fn: CF_CELL_ALLOC,
+                    });
+                    self.bind_cell(name, cell_node);
+                    self.track_cell_decl(name, cell_node, home);
+                    return Some(cell_node);
+                }
                 self.declare_var(name, home);
                 Some(home)
             }
@@ -251,7 +284,57 @@ impl<'a> IrBuilder<'a> {
                     });
                     return Some(store_node);
                 }
+                // `*ref = value` → CF_DEREF_WRITE through the shared Cell.
+                // MUST return the node: falling through to None silently
+                // dropped the store (this branch was missing entirely — the
+                // Assign.rs copy serves a different, unreachable path — so
+                // `*r = v` never emitted a node and never executed).
+                // `current_effect` rides as a direct trailing input (scheduler
+                // ordering only): consecutive deref writes must not fire out
+                // of order (the value-side chain does not order the write
+                // itself).
+                if let crate::ast::Ast::Expr::Deref(ref_inner) = target_expr {
+                    let ref_node = self.compile_subexpr(*ref_inner);
+                    let (input_count, inputs_offset) = match self.current_effect {
+                        Some(eff) => (3, self.graph.inputs_pool.push(&[ref_node, val_node, eff])),
+                        None => (2, self.graph.inputs_pool.push(&[ref_node, val_node])),
+                    };
+                    let write_node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count,
+                        inputs_offset,
+                        compute_fn: CF_DEREF_WRITE,
+                    });
+                    return Some(write_node);
+                }
                 if let crate::ast::Ast::Expr::Ident(name) = target_expr {
+                    // Cell-backed binding (place model): `x = v` writes
+                    // through the shared Cell (same node shape as `*r = v`)
+                    // and does NOT rebind the name: reads route through the
+                    // cell, and a rebind would fork the two stores (plain
+                    // node vs cell). `current_effect` is a direct trailing
+                    // input (scheduler ordering only): without it,
+                    // consecutive cell writes could fire out of order and
+                    // the LAST-scheduled write would win.
+                    if let Some(cell_node) = self.lookup_cell_binding(name) {
+                        let (input_count, inputs_offset) = match self.current_effect {
+                            Some(eff) => (
+                                3,
+                                self.graph.inputs_pool.push(&[cell_node, val_node, eff]),
+                            ),
+                            None => (2, self.graph.inputs_pool.push(&[cell_node, val_node])),
+                        };
+                        let write_node = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count,
+                            inputs_offset,
+                            compute_fn: CF_DEREF_WRITE,
+                        });
+                        // Forwarding memory: this store is now the cell's
+                        // known current value.
+                        self.track_cell_store(cell_node, val_node);
+                        return Some(write_node);
+                    }
                     // Implicit-this field assignment: `field = value` inside a method body
                     // resolves to `this.field = value`.
                     if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) = self.expr_implicit_this(*target).cloned() {
@@ -268,62 +351,18 @@ impl<'a> IrBuilder<'a> {
                         self.graph.set_field_set_name(set_node, field.to_string());
                         return Some(set_node);
                     }
-                    // Check whether this is a lambda-captured variable: captured_scopes records, per lambda
-                    // layer, the captured variable names and their corresponding outer node. Assigning a
-                    // captured variable requires a WriteBack to the outer node so the change is visible
-                    // to the outer layer (by-reference capture semantics).
-                    let captured_source = self.captured_scopes.iter().rev()
-                        .find_map(|scope| scope.iter()
-                            .find(|(n, _)| n.as_str() == *name)
-                            .map(|(_, node)| *node));
-                    if let Some(source) = captured_source {
-                        let wb_node = self.compile_writeback_node(val_node, source);
-                        self.bind_var(name, val_node);
-                        return Some(wb_node);
-                    } else if let Some(outer_node) = self.lookup_var(name) {
-                        if !self.is_in_current_subgraph(outer_node) {
-                            // Outer variable -> WriteBack. Use the root-frame declaration as
-                            // WriteBack target, not the intermediate node returned by lookup_var
-                            // (which may be in a same_function branch subgraph like a while body).
-                            // This ensures WriteBack writes to the correct root-frame slot.
-                            let wb_target = self.lookup_root_frame_var(name).unwrap_or(outer_node);
-                            let wb_node = self.compile_writeback_node(val_node, wb_target);
-                            self.bind_var(name, val_node);
-                            return Some(wb_node);
-                        } else if let Some(&captured_node) = self.captured_vars.get(*name) {
-                            // Local variable captured by an inner lambda -> WriteBack
-                            let wb_node = self.compile_writeback_node(val_node, captured_node);
-                            self.bind_var(name, val_node);
-                            return Some(wb_node);
-                        } else if self.current_function_has_defer() {
-                            // Bug #49: when a function contains defer, reassigning a local variable requires a
-                            // WriteBack to the original node, so the defer body (which references the original
-                            // node) reads the latest value rather than the compile-time snapshot.
-                            let wb_node = self.compile_writeback_node(val_node, outer_node);
-                            self.bind_var(name, val_node);
-                            return Some(wb_node);
-                        } else {
-                            // Same_function branch subgraph (e.g. loop body): a prior assignment
-                            // already bind_var'd the variable into the current subgraph, so
-                            // lookup_var returns a local node. Use lookup_root_frame_var to find
-                            // the outermost binding (root-frame declaration) for WriteBack, so
-                            // the new value propagates back to the root frame.
-                            if let Some(original_outer) = self.lookup_root_frame_var(name) {
-                                if !self.is_in_current_subgraph(original_outer) {
-                                    let wb_node = self.compile_writeback_node(val_node, original_outer);
-                                    self.bind_var(name, val_node);
-                                    return Some(wb_node);
-                                }
-                            }
-                            self.bind_var(name, val_node);
-                        }
-                    } else if let Some(slot) = self.lookup_global_var(name) {
+                    // B/C deletion (2026-08-22): the WriteBack ladder is gone —
+                    // every assigned name is cell-backed (all-vars: locals,
+                    // assigned params, captured vars via ④'s shared-cell
+                    // upvalues; converters via B2/B3 register cells), so the
+                    // cell path above already handled the assignable shapes.
+                    // What remains: global stores and plain local rebinds.
+                    if let Some(slot) = self.lookup_global_var(name) {
                         // Global variable -> global_store, returning an effect node to ensure scheduled execution
                         let store_node = self.compile_global_store(val_node, slot);
                         return Some(store_node);
-                    } else {
-                        self.bind_var(name, val_node);
                     }
+                    self.bind_var(name, val_node);
                 }
                 None
             }
@@ -342,9 +381,97 @@ impl<'a> IrBuilder<'a> {
             }
             crate::ast::Ast::Stmt::CompoundAssignment { target, op, value } => {
                 let target_expr = &self.current_module().arena.expr(*target).node;
+                // `*ref op= value` → deref-read, op, deref-write through the
+                // shared Cell (statement-level branch; previously missing, the
+                // compound store was silently dropped).
+                if let crate::ast::Ast::Expr::Deref(ref_inner) = target_expr {
+                    let raw_val = self.compile_subexpr(*value);
+                    let val_node = self.chain_effects(self.current_effect, raw_val);
+                    let ref_node = self.compile_subexpr(*ref_inner);
+                    // Read carries the effect as a direct trailing input —
+                    // without it the read can fire before prior writes and
+                    // compound from a stale cell value.
+                    let (r_count, r_off) = match self.current_effect {
+                        Some(eff) => (2, self.graph.inputs_pool.push(&[ref_node, eff])),
+                        None => (1, self.graph.inputs_pool.push(&[ref_node])),
+                    };
+                    let read_node = self.graph.add_node(Node {
+                        kind: NodeKind::UnOp,
+                        input_count: r_count,
+                        inputs_offset: r_off,
+                        compute_fn: CF_DEREF_READ,
+                    });
+                    let bin_compute = self.compound_assign_op_to_compute_fn(*op, *target);
+                    let bin_off = self.graph.inputs_pool.push(&[read_node, val_node]);
+                    let result_node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: 2,
+                        inputs_offset: bin_off,
+                        compute_fn: bin_compute,
+                    });
+                    // Effect rides as a direct trailing input (scheduler
+                    // ordering only) — consecutive deref writes must not fire
+                    // out of order.
+                    let (w_count, w_off) = match self.current_effect {
+                        Some(eff) => (3, self.graph.inputs_pool.push(&[ref_node, result_node, eff])),
+                        None => (2, self.graph.inputs_pool.push(&[ref_node, result_node])),
+                    };
+                    let write_node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count: w_count,
+                        inputs_offset: w_off,
+                        compute_fn: CF_DEREF_WRITE,
+                    });
+                    return Some(write_node);
+                }
                 if let crate::ast::Ast::Expr::Ident(name) = target_expr {
                     let val_node = self.compile_subexpr(*value);
                     let bin_compute = self.compound_assign_op_to_compute_fn(*op, *target);
+                    // Cell-backed binding: `x op= v` — read-modify-write
+                    // through the shared Cell; no name rebind (reads route
+                    // through the cell).
+                    if let Some(cell_node) = self.lookup_cell_binding(name) {
+                        // Read carries the effect as a direct trailing input
+                        // too: without it the read can fire before prior
+                        // cell/deref writes and compound from a stale value.
+                        let (r_count, r_off) = match self.current_effect {
+                            Some(eff) => (2, self.graph.inputs_pool.push(&[cell_node, eff])),
+                            None => (1, self.graph.inputs_pool.push(&[cell_node])),
+                        };
+                        let read_node = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: r_count,
+                            inputs_offset: r_off,
+                            compute_fn: CF_DEREF_READ,
+                        });
+                        let bin_off = self.graph.inputs_pool.push(&[read_node, val_node]);
+                        let raw_result = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: 2,
+                            inputs_offset: bin_off,
+                            compute_fn: bin_compute,
+                        });
+                        let result_node = self.chain_effects(self.current_effect, raw_result);
+                        // Write carries the effect as a direct trailing input
+                        // (scheduler ordering only) — see the Assignment
+                        // cell branch for why the SEQ wrapper is not enough
+                        // for the write itself.
+                        let (w_count, w_off) = match self.current_effect {
+                            Some(eff) => (
+                                3,
+                                self.graph.inputs_pool.push(&[cell_node, result_node, eff]),
+                            ),
+                            None => (2, self.graph.inputs_pool.push(&[cell_node, result_node])),
+                        };
+                        let write_node = self.graph.add_node(Node {
+                            kind: NodeKind::BinOp,
+                            input_count: w_count,
+                            inputs_offset: w_off,
+                            compute_fn: CF_DEREF_WRITE,
+                        });
+                        self.track_cell_store(cell_node, result_node);
+                        return Some(write_node);
+                    }
                     // Implicit-this field compound assignment: `field op= value` inside a
                     // method body resolves to `this.field op= value`.
                     if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) = self.expr_implicit_this(*target).cloned() {
@@ -380,11 +507,9 @@ impl<'a> IrBuilder<'a> {
                         self.graph.set_field_set_name(set_node, field.to_string());
                         return Some(set_node);
                     }
-                    // Check whether this is a lambda-captured variable
-                    let captured_source = self.captured_scopes.iter().rev()
-                        .find_map(|scope| scope.iter()
-                            .find(|(n, _)| n.as_str() == *name)
-                            .map(|(_, node)| *node));
+                    // B/C deletion: the WriteBack ladder is gone (all assigned
+                    // names are cell-backed; the cell store path higher up
+                    // handles them). Remaining: globals store, plain rebind.
                     // Read current value: local var > global var > placeholder
                     let cur_node = if let Some(n) = self.lookup_var(name) {
                         n
@@ -402,11 +527,7 @@ impl<'a> IrBuilder<'a> {
                     });
                     // Link current_effect: prevents a compound assignment after continue from running early
                     let result_node = self.chain_effects(self.current_effect, raw_result);
-                    if captured_source.is_some() {
-                        self.compile_writeback_node(result_node, captured_source.unwrap());
-                        self.bind_var(name, result_node);
-                        None
-                    } else if self.lookup_global_var(name).is_some() && self.lookup_var(name).is_none() {
+                    if self.lookup_global_var(name).is_some() && self.lookup_var(name).is_none() {
                         // Global variable -> global_store. Return the store node so it is chained
                         // into the block's effect chain (last_effect), otherwise the store would be
                         // orphaned and dropped (the global has no local binding to keep it alive).
@@ -414,15 +535,6 @@ impl<'a> IrBuilder<'a> {
                         let store_node = self.compile_global_store(result_node, slot);
                         self.current_effect = Some(store_node);
                         Some(store_node)
-                    } else if !self.is_in_current_subgraph(cur_node) {
-                        // Outer variable -> WriteBack + bind a local reference
-                        self.compile_writeback_node(result_node, cur_node);
-                        self.bind_var(name, result_node);
-                        None
-                    } else if let Some(&captured_node) = self.captured_vars.get(*name) {
-                        self.compile_writeback_node(result_node, captured_node);
-                        self.bind_var(name, result_node);
-                        None
                     } else {
                         self.bind_var(name, result_node);
                         None
@@ -509,25 +621,28 @@ impl<'a> IrBuilder<'a> {
                 Some(n)
             }
             crate::ast::Ast::Stmt::While { condition, body } => {
-                // Sync pre-loop assignments of loop-modified vars into their home slots
-                // BEFORE registration (the home slot is what the rebind'd condition and
-                // post-loop reads see; without this sync a pre-loop `i = i - 1` was
-                // invisible to the loop).
-                self.sync_modified_vars_to_home(*body);
                 let while_sg = self.register_while_subgraph(*condition, *body);
-                let call_node = self.compile_recursive_call(while_sg);
-                // Bug #100 (residual): statements AFTER the loop must read loop-assigned
-                // variables through their home slot (kept current by WriteBacks), not
-                // through the loop-body chain node whose enclosing-frame slot is a stale
-                // snapshot (e.g. `if exp != 0` after the exponent loop always saw 0).
-                self.rebind_modified_vars_to_home(*body);
+                // Launch call with the loop-carried params' initial values
+                // (args FIRST — compute_call_launch takes inputs[..param_count]
+                // — then the effect dependency).
+                let entry_args = std::mem::take(&mut self.while_entry_args);
+                let mut call_inputs = entry_args;
+                if let Some(eff) = self.current_effect {
+                    call_inputs.push(eff);
+                }
+                let inputs_off = self.graph.inputs_pool.push(&call_inputs);
+                let call_node = self.graph.add_node(Node {
+                    kind: NodeKind::Call,
+                    input_count: call_inputs.len() as u8,
+                    inputs_offset: inputs_off,
+                    compute_fn: CF_CALL_LAUNCH,
+                });
+                self.graph.set_call_target(call_node, while_sg);
                 Some(call_node)
             }
             crate::ast::Ast::Stmt::Loop { body } => {
-                self.sync_modified_vars_to_home(*body);
                 let loop_sg = self.register_loop_subgraph(*body);
                 let call_node = self.compile_recursive_call(loop_sg);
-                self.rebind_modified_vars_to_home(*body);
                 Some(call_node)
             }
             crate::ast::Ast::Stmt::For {
@@ -548,7 +663,6 @@ impl<'a> IrBuilder<'a> {
                 );
                 // Start the loop: Call(for_sg, [iterable_node])
                 let call_node = self.make_call(for_sg, &[iterable_node]);
-                self.rebind_modified_vars_to_home(*body);
                 Some(call_node)
             }
             crate::ast::Ast::Stmt::Defer { expr } => {
@@ -557,7 +671,12 @@ impl<'a> IrBuilder<'a> {
                     // The defer body subgraph + captured values are pushed onto
                     // the loop frame's defer_stack at runtime; CF_DEFER_RUN (in void_sg) drains
                     // it in LIFO order at loop exit.
+                    // Defer barrier: the body runs at exit time — its reads
+                    // must LOAD (no forwarding of compile-time values) and its
+                    // stores must not leak into subsequent forwarding.
+                    let defer_barrier = self.cell_barrier_enter();
                     let (body_sg, _captured_inputs) = self.compile_branch_subgraph(*expr);
+                    self.cell_barrier_exit_defer(defer_barrier);
                     // Unified capture model: snapshot the loop variable (if any)
                     // and any Snapshot-mode captures, so each defer body reads
                     // per-iteration values rather than final values.
@@ -622,7 +741,11 @@ impl<'a> IrBuilder<'a> {
                     // hazard); defer bodies read outer variables live via the
                     // frame chain at drain time (Bug #47).
                     let eff_input = self.current_effect;
+                    // Defer barrier (same as the loop-defer site): reads load,
+                    // stores don't leak into subsequent forwarding.
+                    let defer_barrier = self.cell_barrier_enter();
                     let (body_sg, _branch_captures) = self.compile_branch_subgraph(*expr);
+                    self.cell_barrier_exit_defer(defer_barrier);
                     // Bug #49 flag: mark the function sg so later local reassignments
                     // emit WriteBacks (defer bodies read the LATEST value).
                     if let Some(fn_sg) = self.current_function_sg {
@@ -657,13 +780,16 @@ impl<'a> IrBuilder<'a> {
                         Some(construct_node)
                     }
                     crate::ast::Ast::Decl::TypeDecl { name, def, .. } => {
-                        // Register nested type fields into the current scope (unified with top-level types via type_scope_stack lookup)
+                        // Register nested type fields into the current scope (unified with top-level types via type_scope_stack lookup).
+                        // Canonical type name (module-qualified for user modules) —
+                        // matches registration and the runtime identity.
+                        let canonical: String = self.sema.resolve_type_key(name);
                         match def {
                             crate::ast::Ast::TypeDef::Record { fields } => {
                                 let field_names: Vec<String> = fields.iter().map(|f| f.name.to_string()).collect();
                                 self.bind_type_fields(name, TypeFieldInfo {
                                     field_names,
-                                    type_name: name.to_string(),
+                                    type_name: canonical.clone(),
                                     kind: RecordLitKind::Record,
                                 });
                             }
@@ -671,7 +797,7 @@ impl<'a> IrBuilder<'a> {
                                 // Register the type name + each constructor name (mapped to the type name)
                                 self.bind_type_fields(name, TypeFieldInfo {
                                     field_names: Vec::new(),
-                                    type_name: name.to_string(),
+                                    type_name: canonical.clone(),
                                     kind: RecordLitKind::Adt,
                                 });
                                 for ctor in constructors {
@@ -680,7 +806,7 @@ impl<'a> IrBuilder<'a> {
                                         .collect();
                                     self.bind_type_fields(ctor.name, TypeFieldInfo {
                                         field_names,
-                                        type_name: name.to_string(),
+                                        type_name: canonical.clone(),
                                         kind: RecordLitKind::Adt,
                                     });
                                 }
@@ -688,7 +814,7 @@ impl<'a> IrBuilder<'a> {
                             crate::ast::Ast::TypeDef::Newtype { name: nt_name, .. } => {
                                 self.bind_type_fields(nt_name, TypeFieldInfo {
                                     field_names: Vec::new(),
-                                    type_name: nt_name.to_string(),
+                                    type_name: canonical.clone(),
                                     kind: RecordLitKind::Newtype,
                                 });
                             }

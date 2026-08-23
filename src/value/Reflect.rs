@@ -65,7 +65,7 @@ pub fn format_value(v: &Value, depth: u32) -> String {
             // Heap object: match on HeapObj
             match &**r {
                 HeapObj::Record(rec) => {
-                    let mut out = format!("{}(", rec.type_name);
+                    let mut out = format!("{}(", crate::sema::Sema::display_type_name(&rec.type_name));
                     for (i, f) in rec.fields.iter().enumerate() {
                         if i > 0 { out.push_str(", "); }
                         if let Some(name) = rec.field_names.get(i).and_then(|n| n.as_ref()) {
@@ -97,13 +97,17 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                 HeapObj::Newtype(n) => {
                     // Newtype.inner is still a ValueHandle: convert to Value then recurse
                     let inner_val = super::Arena::ValueArena::with_global(|arena| arena.get_value(n.inner));
-                    format!("{}({})", n.type_name, format_value(&inner_val, depth + 1))
+                    format!("{}({})", crate::sema::Sema::display_type_name(&n.type_name), format_value(&inner_val, depth + 1))
                 }
                 HeapObj::Array(a) => {
                     let mut out = String::from("[");
-                    for (i, e) in a.elements.iter().enumerate() {
+                    // SoA-first: elements can be an empty shell (single-source
+                    // clones keep data only in the contiguous storage).
+                    let n = a.len();
+                    for i in 0..n {
                         if i > 0 { out.push_str(", "); }
-                        out.push_str(&format_value(e, depth + 1));
+                        let e = a.get(i).unwrap_or(crate::value::Value::VOID);
+                        out.push_str(&format_value(&e, depth + 1));
                     }
                     out.push(']');
                     out

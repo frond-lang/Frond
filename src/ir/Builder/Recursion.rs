@@ -27,10 +27,33 @@ impl<'a> IrBuilder<'a> {
             .filter_map(|p| self.lookup_var(p.name))
             .collect();
 
+        // 1b. B2 parameter-register cells: each param gets a Cell initialized
+        // with the incoming argument. The names re-bind to the cells, so body
+        // reads / condition reads route through CF_DEREF_READ (live per
+        // iteration) and tail-call stores write CF_DEREF_WRITE — the old
+        // WriteBack param registers are gone. The allocs chain into the
+        // effect stream ahead of the while Call (same ordering contract as
+        // the ③ assigned-param cells).
+        let mut param_cells: Vec<NodeId> = Vec::with_capacity(param_nodes.len());
+        for (param, &pn) in params.iter().zip(param_nodes.iter()) {
+            let off = self.graph.inputs_pool.push(&[pn]);
+            let cell_node = self.graph.add_node(Node {
+                kind: NodeKind::UnOp,
+                input_count: 1,
+                inputs_offset: off,
+                compute_fn: CF_CELL_ALLOC,
+            });
+            self.bind_cell(param.name, cell_node);
+            self.track_cell_decl(param.name, cell_node, pn);
+            self.current_effect = Some(self.chain_effects(self.current_effect, cell_node));
+            param_cells.push(cell_node);
+        }
+
         // 2. Placeholder-register while_sg.
         let node_start = self.graph.nodes.len() as u32;
         let while_sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
+            converter_generated: false,
             id: while_sg_id,
             node_range: (NodeId(node_start), NodeId(node_start)),
             param_count: 0,
@@ -51,13 +74,17 @@ impl<'a> IrBuilder<'a> {
         });
 
         // 3. Build the loop condition `cond_node` (within while_sg's node_range).
+        // Forwarding barrier first (loop-like): the condition re-evaluates every
+        // iteration — reads of the param cells must be real loads, not forwards
+        // of the initial argument nodes (stale from iteration 2 on).
+        self.cell_barrier_enter();
         let cond_node = self.build_tail_rec_cond(&info.base_cases, &info.rec_branches);
 
-        // 4. Set `tail_rec_ctx` (`compile_call` intercepts self-calls as `WriteBack +
-        //    Call(while_sg)`).
+        // 4. Set `tail_rec_ctx` (`compile_call` intercepts self-calls as
+        //    cell stores + Continue barrier).
         self.tail_rec_ctx = Some(TailRecCtx {
             self_name: name.to_string(),
-            param_nodes,
+            param_cells,
         });
 
         // 5. Compile body_sg: compiles the original function body (LoopBody; after completion
@@ -76,7 +103,7 @@ impl<'a> IrBuilder<'a> {
         let prev_tail = self.in_tail_position;
         self.current_effect = None;
         self.in_tail_position = true;
-        let body_sg = self.compile_loop_body_subgraph(body_expr, while_sg_id);
+        let body_sg = self.compile_loop_body_subgraph(body_expr, while_sg_id, true);
         self.in_tail_position = prev_tail;
         self.current_effect = prev_effect;
 
@@ -331,7 +358,12 @@ impl<'a> IrBuilder<'a> {
             .filter_map(|p| self.lookup_var(p.name))
             .collect();
 
-        // 2. Create local variables: stack_node (empty array), sp_node (0), result_node (void)
+        // 2. Create local variables: stack_node (empty array), sp_cell (Cell=i1),
+        //    result_cell (Cell=void). B3: the converter's registers are Cells —
+        //    sp/result live across iterations as engine state (the old
+        //    WriteBack home-slot registers are gone). The allocs chain into the
+        //    effect stream ahead of the while Call (same ordering contract as
+        //    the ③ assigned-param cells).
         let stack_off = self.graph.inputs_pool.push(&[]);
         let stack_node = self.graph.add_node(Node {
             kind: NodeKind::BinOp,
@@ -339,13 +371,29 @@ impl<'a> IrBuilder<'a> {
             inputs_offset: stack_off,
             compute_fn: CF_ARRAY_CONSTRUCT,
         });
-        let sp_node = self.make_i32_const(0);
-        let result_node = self.compile_void_const();
+        let one_init = self.make_i32_const(1);
+        let sp_cell_off = self.graph.inputs_pool.push(&[one_init]);
+        let sp_cell = self.graph.add_node(Node {
+            kind: NodeKind::UnOp,
+            input_count: 1,
+            inputs_offset: sp_cell_off,
+            compute_fn: CF_CELL_ALLOC,
+        });
+        let void_init = self.compile_void_const();
+        let result_cell_off = self.graph.inputs_pool.push(&[void_init]);
+        let result_cell = self.graph.add_node(Node {
+            kind: NodeKind::UnOp,
+            input_count: 1,
+            inputs_offset: result_cell_off,
+            compute_fn: CF_CELL_ALLOC,
+        });
 
-        // 3. Push the initial frame: stack[0..P] = params, stack[P] = 0 (INIT), stack[P+1..] = 0; sp = 1
+        // 3. Push the initial frame: stack[0..P] = params, stack[P] = 0 (INIT), stack[P+1..] = 0
         // All array_stores must be chained into the effect chain to ensure Call(while_sg) executes after the stack is filled.
         let zero_init = self.make_i32_const(0);
         let mut init_effect: Option<NodeId> = None;
+        init_effect = Some(self.chain_effects(init_effect, sp_cell));
+        init_effect = Some(self.chain_effects(init_effect, result_cell));
         for i in 0..param_count {
             let idx = self.make_i32_const(i as i32);
             let store = self.make_array_store(stack_node, idx, param_nodes[i]);
@@ -359,14 +407,13 @@ impl<'a> IrBuilder<'a> {
             let store = self.make_array_store(stack_node, idx, zero_init);
             init_effect = Some(self.chain_effects(init_effect, store));
         }
-        let one_init = self.make_i32_const(1);
-        let sp_init_wb = self.compile_writeback_node(one_init, sp_node);
-        self.current_effect = Some(self.chain_effects(init_effect, sp_init_wb));
+        self.current_effect = init_effect;
 
         // 4. Placeholder-register while_sg
         let while_node_start = self.graph.nodes.len() as u32;
         let while_sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
+            converter_generated: false,
             id: while_sg_id,
             node_range: (NodeId(while_node_start), NodeId(while_node_start)),
             param_count: 0,
@@ -386,11 +433,20 @@ impl<'a> IrBuilder<'a> {
             reset_plan: None,
         });
 
-        // 5. cond_node: sp > 0 (within while_sg node_range)
+        // 5. cond_node: sp > 0 (within while_sg node_range). sp is read through
+        // its Cell: the load is an input of the comparison, so it sits in the
+        // condition tree and re-fires every iteration with the current value.
         let zero_cond = self.make_i32_const(0);
-        let cond_node = self.make_binop(sp_node, zero_cond, CF_GT_I32);
+        let sp_cond_load_off = self.graph.inputs_pool.push(&[sp_cell]);
+        let sp_cond_load = self.graph.add_node(Node {
+            kind: NodeKind::UnOp,
+            input_count: 1,
+            inputs_offset: sp_cond_load_off,
+            compute_fn: CF_DEREF_READ,
+        });
+        let cond_node = self.make_binop(sp_cond_load, zero_cond, CF_GT_I32);
 
-        // Save the init effect chain (including sp=1 WriteBack); body_sg compilation will reset current_effect
+        // Save the init effect chain (cell allocs + stack init); body_sg compilation will reset current_effect
         let init_effect_chain = self.current_effect;
 
         // 6. Compile body_sg (LoopBody: pop + read frame + state dispatch)
@@ -401,8 +457,8 @@ impl<'a> IrBuilder<'a> {
             &call_sites,
             while_sg_id,
             stack_node,
-            sp_node,
-            result_node,
+            sp_cell,
+            result_cell,
             param_count,
             max_saved,
             stride,
@@ -411,18 +467,21 @@ impl<'a> IrBuilder<'a> {
         // Restore the init effect chain so Call(while_sg) depends on the init code (including sp=1 WriteBack)
         self.current_effect = init_effect_chain;
 
-        // 7. Compile result_sg (false branch, returns result_node)
+        // 7. Compile result_sg (false branch): load the final result through the
+        // result Cell (the load node lives in result_sg; the cell was last
+        // written by the deepest completed state).
         let result_sg = {
             let rs_start = self.graph.nodes.len() as u32;
-            let off = self.graph.inputs_pool.push(&[result_node]);
+            let off = self.graph.inputs_pool.push(&[result_cell]);
             let passthrough = self.graph.add_node(Node {
-                kind: NodeKind::BinOp,
+                kind: NodeKind::UnOp,
                 input_count: 1,
                 inputs_offset: off,
-                compute_fn: CF_SEQ,
+                compute_fn: CF_DEREF_READ,
             });
             let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
             self.graph.add_subgraph(SubGraph {
+                converter_generated: false,
                 id: sg_id,
                 node_range: (NodeId(rs_start), NodeId(rs_start + 1)),
                 param_count: 0,
@@ -476,7 +535,10 @@ impl<'a> IrBuilder<'a> {
             reset_to_zero: vec![],
             reset_to_one: vec![],
             reset_condition_tree: vec![cond_node],
+            fused_carries: Vec::new(),
             condition_tree_plan: Vec::new(),
+            carries_value: Vec::new(),
+            carries_cell: Vec::new(),
         });
 
         // 10. Create the Call node to launch while_sg
@@ -500,8 +562,8 @@ impl<'a> IrBuilder<'a> {
         call_sites: &[crate::ast::Ast::ExprId],
         while_sg_id: SubGraphId,
         stack_node: NodeId,
-        sp_node: NodeId,
-        result_node: NodeId,
+        sp_cell: NodeId,
+        result_cell: NodeId,
         param_count: usize,
         max_saved: usize,
         stride: u32,
@@ -523,6 +585,7 @@ impl<'a> IrBuilder<'a> {
         // register their EventSourceDecls directly into it.
         let body_sg = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
+            converter_generated: false,
             id: body_sg,
             node_range: (NodeId(body_node_start), NodeId(body_node_start)),
             param_count: 0,
@@ -544,11 +607,27 @@ impl<'a> IrBuilder<'a> {
         let prev_branch_sg_outer = self.current_branch_sg;
         self.current_branch_sg = Some(body_sg);
 
-        // 1. Pop: sp = sp - 1 (WriteBack to sp_node)
+        // 1. Pop: sp = sp - 1 through the Cell. The load is ordered after the
+        // body's entry effect (trailing dep — compute reads inputs[0]); the
+        // store re-binds the Cell so the condition's next re-evaluation and
+        // the next iteration's pop read the decremented value.
+        let sp_pop_load_off = self.graph.inputs_pool.push(&[sp_cell]);
+        let sp_pop_load = self.graph.add_node(Node {
+            kind: NodeKind::UnOp,
+            input_count: 1,
+            inputs_offset: sp_pop_load_off,
+            compute_fn: CF_DEREF_READ,
+        });
         let one_pop = self.make_i32_const(1);
-        let sp_minus_1 = self.make_binop(sp_node, one_pop, CF_SUB_I32);
-        let pop_wb = self.compile_writeback_node(sp_minus_1, sp_node);
-        self.current_effect = Some(pop_wb);
+        let sp_minus_1 = self.make_binop(sp_pop_load, one_pop, CF_SUB_I32);
+        let pop_store_off = self.graph.inputs_pool.push(&[sp_cell, sp_minus_1]);
+        let pop_store = self.graph.add_node(Node {
+            kind: NodeKind::BinOp,
+            input_count: 2,
+            inputs_offset: pop_store_off,
+            compute_fn: CF_DEREF_WRITE,
+        });
+        self.current_effect = Some(pop_store);
 
         // 2. Read the stack frame: frame_base = sp_minus_1 * stride
         let stride_node = self.make_i32_const(stride as i32);
@@ -595,15 +674,18 @@ impl<'a> IrBuilder<'a> {
         for state_idx in 0..num_states {
             // Build call_result_map:
             // state 0: empty (all calls are fresh)
-            // state N: call_sites[0..N-2] -> saved[0..N-2], call_sites[N-1] -> result_node
+            // state N: call_sites[0..N-2] -> saved[0..N-2],
+            //          call_sites[N-1] -> RESULT_CELL_MARKER (the most recent
+            //          call's result lives in the result Cell; the consumer
+            //          synthesizes a CF_DEREF_READ in its own state sg)
             let mut call_result_map: rustc_hash::FxHashMap<crate::ast::Ast::ExprId, NodeId> =
                 rustc_hash::FxHashMap::default();
             for i in 0..state_idx {
                 if i + 1 < state_idx {
                     call_result_map.insert(call_sites[i], saved_nodes[i]);
                 } else {
-                    // i == state_idx - 1: the most recently completed call result is in result_node
-                    call_result_map.insert(call_sites[i], result_node);
+                    // i == state_idx - 1: the most recently completed call result is in the result Cell
+                    call_result_map.insert(call_sites[i], RESULT_CELL_MARKER);
                 }
             }
 
@@ -612,8 +694,8 @@ impl<'a> IrBuilder<'a> {
                 self_name: self_name.to_string(),
                 param_nodes: param_cur.clone(),
                 stack_node,
-                sp_node,
-                result_node,
+                sp_cell,
+                result_cell,
                 call_result_map,
                 truncated: false,
                 stride,
@@ -632,6 +714,7 @@ impl<'a> IrBuilder<'a> {
             // register their EventSourceDecls directly into it.
             let state_sg = SubGraphId(self.graph.subgraphs.len() as u32);
             self.graph.add_subgraph(SubGraph {
+                converter_generated: false,
                 id: state_sg,
                 node_range: (NodeId(sg_node_start), NodeId(sg_node_start)),
                 param_count: 0,
@@ -649,7 +732,7 @@ impl<'a> IrBuilder<'a> {
                 upvalue_outer_nodes: Vec::new(),
                 nested_ranges: Vec::new(),
                 reset_plan: None,
-            });
+                    });
             let prev_branch_sg = self.current_branch_sg;
             self.current_branch_sg = Some(state_sg);
 
@@ -674,11 +757,17 @@ impl<'a> IrBuilder<'a> {
             self.exit_scope();
             self.current_sg_start = prev_sg_start_inner;
 
-            // Always WriteBack the body result to result_node.
-            // Recursion path: the barrier's Continue signal terminates state_sg before the WriteBack executes,
-            //   so the WriteBack does not run.
-            // Base case path: the body completes normally, and the WriteBack writes the result to result_node.
-            let return_node = self.compile_writeback_node(body_node, result_node);
+            // Always store the body result through the result Cell.
+            // Recursion path: the barrier's Continue signal terminates state_sg before the store executes,
+            //   so the store does not run.
+            // Base case path: the body completes normally, and the store writes the result to the Cell.
+            let return_store_off = self.graph.inputs_pool.push(&[result_cell, body_node]);
+            let return_node = self.graph.add_node(Node {
+                kind: NodeKind::BinOp,
+                input_count: 2,
+                inputs_offset: return_store_off,
+                compute_fn: CF_DEREF_WRITE,
+            });
 
             let sg_node_end = self.graph.nodes.len() as u32;
             self.current_branch_sg = prev_branch_sg;
@@ -737,6 +826,7 @@ impl<'a> IrBuilder<'a> {
                 let wrap_end = self.graph.nodes.len() as u32;
                 let wrap_sg = SubGraphId(self.graph.subgraphs.len() as u32);
                 self.graph.add_subgraph(SubGraph {
+                    converter_generated: false,
                     id: wrap_sg,
                     node_range: (NodeId(wrap_start), NodeId(wrap_end)),
                     param_count: 0,
@@ -788,6 +878,7 @@ impl<'a> IrBuilder<'a> {
         let node_start = self.graph.nodes.len() as u32;
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
+            converter_generated: false,
             id: sg_id,
             node_range: (NodeId(node_start), NodeId(node_start)),
             param_count: 0,
@@ -814,7 +905,7 @@ impl<'a> IrBuilder<'a> {
         let prev_effect = self.current_effect;
         self.current_effect = None;
         // body subgraph (not tail-recursive)
-        let body_sg = self.compile_loop_body_subgraph(body, sg_id);
+        let body_sg = self.compile_loop_body_subgraph(body, sg_id, true);
         // void subgraph (unreachable branch; used on break exit): includes CF_DEFER_RUN for defer-in-loop.
         let void_sg = self.compile_defer_run_subgraph();
         self.current_effect = prev_effect;
@@ -850,7 +941,10 @@ impl<'a> IrBuilder<'a> {
             reset_to_zero: vec![],
             reset_to_one: vec![],
             reset_condition_tree: vec![cond_node],
+            fused_carries: Vec::new(),
             condition_tree_plan: Vec::new(),
+            carries_value: Vec::new(),
+            carries_cell: Vec::new(),
         });
         sg_id
     }
@@ -863,10 +957,21 @@ impl<'a> IrBuilder<'a> {
         &mut self,
         body: crate::ast::Ast::ExprId,
         loop_sg: SubGraphId,
+        clear_cell_values: bool,
     ) -> SubGraphId {
         let node_start = self.graph.nodes.len() as u32;
         let prev_sg_start = self.current_sg_start;
         self.current_sg_start = node_start;
+        // Place-model forwarding barrier (loop-like): pre-loop values are
+        // stale from iteration 2 on, and post-loop reads must load. `while`
+        // bodies pass clear=false — the barrier ran before the CONDITION
+        // compile (register_while_subgraph), and the condition's cell LOADS
+        // are recorded in the forwarding memory: body reads of the same cells
+        // forward to them (same iteration, condition dominates the body) —
+        // saving one load per cell per iteration.
+        if clear_cell_values {
+            self.cell_barrier_enter();
+        }
         // Push the loop context (continue jump target; While/Loop have no iterator parameter)
         self.loop_stack.push(LoopContext {
             sg: loop_sg,
@@ -888,6 +993,7 @@ impl<'a> IrBuilder<'a> {
         // fix — replaces the post-hoc drain from the function sg).
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
+            converter_generated: false,
             id: sg_id,
             node_range: (NodeId(node_start), NodeId(node_start)),
             param_count: 0,
@@ -917,6 +1023,13 @@ impl<'a> IrBuilder<'a> {
         self.exit_scope();
         self.current_sg_start = prev_sg_start;
         self.current_branch_sg = prev_branch_sg;
+        // While bodies (clear=false) did not enter a barrier here — the
+        // body's final cell_values (the phi carry sources) must SURVIVE for
+        // register_while_subgraph to read; its own barrier_exit after the
+        // void_sg compile performs the final clear.
+        if clear_cell_values {
+            self.cell_barrier_exit();
+        }
         let node_end = self.graph.nodes.len() as u32;
         {
             let sgm = &mut self.graph.subgraphs[sg_id.0 as usize];

@@ -465,11 +465,10 @@ pub fn classify_side_effect(
         // -- Function call: consult PurityTable (includes sema is_async/is_throwing checks) --
         Expr::Call { callee, args, .. } => {
             let callee_purity = if let Expr::Ident(name) = &arena.expr(*callee).node {
-                // sema FuncSigInfo lookup: async/throwing functions are always impure
-                if let Some(sig) = sema.get_func_sig(*name) {
-                    if sig.is_async || sig.is_throwing {
-                        return SideEffect::Impure;
-                    }
+                // sema FuncSigInfo lookup: async/throwing functions are always impure.
+                // All-owners check: same-named functions across modules each count.
+                if sema.func_sigs_named(*name).iter().any(|sig| sig.is_async || sig.is_throwing) {
+                    return SideEffect::Impure;
                 }
                 func_name_to_id.get(*name).and_then(|fid| purity.lookup(*fid))
             } else {
@@ -1404,11 +1403,12 @@ pub fn analyze_purity(module: &Module, arena: &AstArena, cg: &CallGraph, sema: &
         .collect();
     for (caller, name, body, is_async) in func_metas {
         // sema FuncSigInfo lookup: async/throwing functions are always impure
+        // (module-qualified: `name` is this module's own function).
         if is_async {
             direct_impure.insert(caller);
             continue;
         }
-        if let Some(sig) = sema.get_func_sig(name) {
+        if let Some(sig) = sema.get_func_sig_in(module.name, name) {
             if sig.is_async || sig.is_throwing {
                 direct_impure.insert(caller);
                 continue;
@@ -1464,11 +1464,10 @@ fn is_direct_impure(body: ExprId, arena: &AstArena, self_name: &str, module_name
                     if is_impure_builtin(name) {
                         return true;
                     }
-                    // sema FuncSigInfo lookup: async/throwing functions (including stdlib external functions) are always impure
-                    if let Some(sig) = sema.get_func_sig(name) {
-                        if sig.is_async || sig.is_throwing {
-                            return true;
-                        }
+                    // sema FuncSigInfo lookup: async/throwing functions (including stdlib external functions) are always impure.
+                    // All-owners check: same-named functions across modules each count.
+                    if sema.func_sigs_named(name).iter().any(|sig| sig.is_async || sig.is_throwing) {
+                        return true;
                     }
                 } else {
                     return true;
@@ -3969,14 +3968,13 @@ pub fn inline_pass(
         if cg.recursive.contains(&func) {
             continue;
         }
-        // async/throwing functions are not inlined
+        // async/throwing functions are not inlined.
         if is_async {
             continue;
         }
-        if let Some(sig) = sema.get_func_sig(name) {
-            if sig.is_async || sig.is_throwing {
-                continue;
-            }
+        // All-owners check: same-named functions across modules each count.
+        if sema.func_sigs_named(name).iter().any(|sig| sig.is_async || sig.is_throwing) {
+            continue;
         }
         // Entry functions (Entry/ExternC/ExternAttr) are not inlined
         if let Some(reason) = cg.entry_reasons.get(&func) {
@@ -4555,13 +4553,9 @@ fn find_invariants(
         loop_deps.insert(n);
     }
 
-    // Modified set: writeback targets of side-effecting nodes within body_sg
-    let mut modified: FxHashSet<NodeId> = FxHashSet::default();
-    for idx in (body_start.0 as usize)..(body_end.0 as usize) {
-        if let Some(Some(wt)) = graph.writeback_targets.get(idx) {
-            modified.insert(*wt);
-        }
-    }
+    // Modified set within body_sg (WriteBack machinery deleted B/C 2026-08-22 —
+    // cell stores go through the engine-level Cell, not node metadata).
+    let modified: FxHashSet<NodeId> = FxHashSet::default();
 
     // Pre-compute all loop sub-graph ranges (loop_kind != None) to determine whether a node is at function level.
     // The hoist target is the function-level sub-graph; only nodes whose inputs are all at function level

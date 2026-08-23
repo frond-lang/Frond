@@ -87,11 +87,11 @@ impl<'a> InferContext<'a> {
 
         // Define the binding. Use redefine to allow same-mutability shadowing
         // (define returns false without updating when the name already exists).
-        if self.env.define(env, name, bind_ty) {
+        if self.sema_result.env.define(env, name, bind_ty) {
             // New binding — already inserted.
         } else {
             // Name already exists — shadowing. Use redefine to update the binding.
-            self.env.redefine(env, name, bind_ty);
+            self.sema_result.env.redefine(env, name, bind_ty);
         }
         // Return the value's inferred type so callers (e.g. Block divergence
         // analysis) can detect `val/var x = <never>` as a diverging statement.
@@ -127,6 +127,11 @@ impl<'a> InferContext<'a> {
                 }
             }
             Stmt::Assignment { target, value } => {
+                // `*ref = value` is a real deref write (CF_DEREF_WRITE through
+                // the shared Cell); name reads of the referenced binding are
+                // statically rebound through the same Cell (Builder
+                // `active_ref_bindings`), so the write is observed in source
+                // order.
                 let target_ty = self.infer_expr(*target, ast, env, None);
                 let val_ty = self.infer_expr(*value, ast, env, Some(target_ty));
                 if self.arena.unify(target_ty, val_ty).is_err() {
@@ -150,6 +155,8 @@ impl<'a> InferContext<'a> {
                 None
             }
             Stmt::CompoundAssignment { target, value, .. } => {
+                // `*ref op= value` lowers read-op-write through the shared
+                // Cell (see Stmt::Assignment above).
                 let target_ty = self.infer_expr(*target, ast, env, None);
                 let value_ty = self.infer_expr(*value, ast, env, None);
                 // Bug #95: compound assignment must enforce the same strict numeric
@@ -267,7 +274,7 @@ impl<'a> InferContext<'a> {
             Stmt::For { name, iterable, body } => {
                 let span = ast.stmt(stmt).span;
                 let iterable_ty = self.infer_expr(*iterable, ast, env, None);
-                let child_env = self.env.child(env);
+                let child_env = self.sema_result.env.child(env);
                 // Structurally extract the element type from the iterator type and build a
                 // constraint rather than using an isolated fresh_type_var.
                 // Covers: Array<T>, ArrayIter<T>, RangeIterator, Str→char, Map<K,V>→Entry<K,V>, etc.
@@ -288,8 +295,13 @@ impl<'a> InferContext<'a> {
                     };
                     if is_non_iterator {
                         let type_name = match ct {
-                            Type::Array(_) => "array",
-                            _ => ct.name(),
+                            // Element-concrete name ("i32[]") reads better in
+                            // the diagnostic than the bare "array".
+                            Type::Array(_) => self
+                                .arena
+                                .type_name_concrete(resolved)
+                                .unwrap_or_else(|| "array".to_string()),
+                            _ => ct.name().to_string(),
                         };
                         self.add_error_at(
                             &format!(
@@ -329,7 +341,7 @@ impl<'a> InferContext<'a> {
                         fv
                     })
                 };
-                self.env.define(child_env, name, item_ty);
+                self.sema_result.env.define(child_env, name, item_ty);
                 let _ = self.infer_expr(*body, ast, child_env, None);
                 None
             }

@@ -1,0 +1,121 @@
+// Fmt.frond — number formatting (part of std.core.fmt)
+//
+// What "{x}" interpolation can't do: every integer type in any radix 2..36
+// (lowercase digits, "-" prefix), hex/oct/bin/dec conveniences, and width
+// padding. Floats keep using "{x}" (json formats its own NaN/Inf as null).
+//
+// radix mechanics: digits are extracted on u128, which covers every integer
+// width; signed values keep the sign and format the magnitude — negation
+// halves first so I128.MIN never overflows on its way to u128.
+
+// Digit byte for a nibble-and-up value 0..35 (lowercase 0-9a-z).
+@internal
+fun digit_byte(d: u8): u8 {
+    if d < 10 { (48 + (d as i32)) as u8 } else { (87 + (d as i32)) as u8 }
+}
+
+// Magnitude digits (no sign). u128 base-2 worst case is 128 digits, so a
+// fixed 128-byte buffer is written back-to-front and sliced; every input
+// emits at least one digit (v = 0 → "0").
+@internal
+fun mag_digits(v: u128, base: u8): str {
+    var buf: u8[] = [0, ..128]
+    var i: usize = 128
+    var x = v
+    var stop = false
+    while !stop {
+        i = i - 1
+        buf[i] = digit_byte((x % (base as u128)) as u8)
+        x = x / (base as u128)
+        if x == (0 as u128) { stop = true }
+    }
+    (buf[i..128]) as str
+}
+
+// Magnitude of a negative i128 as u128. Plain 0 - x overflows at I128.MIN,
+// so halve first (always representable) and reassemble doubled.
+@internal
+fun neg_mag(x: i128): u128 {
+    val half = (0 - (x / 2)) as u128
+    if x % 2 == 0 { half * 2 } else { half * 2 + 1 }
+}
+
+// Signed i128 in any radix 2..36: sign prefix, then magnitude digits.
+@internal
+fun radix_i128(x: i128, base: u8): str {
+    if x >= 0 { mag_digits(x as u128, base) } else { "-" + mag_digits(neg_mag(x), base) }
+}
+
+// Integer → digits in radix 2..36 (lowercase, "-" prefixes negatives).
+// Throws FmtError: InvalidBase when base is outside 2..36, NotAnInteger
+// when T is not an integer type (floats/bool/str/... have no radix form).
+// These used to return "" silently — a bad argument punched a hole in the
+// output instead of raising.
+pub fun radix<T>(x: T, base: u8): Throw<str, FmtError> {
+    if base < 2 || base > 36 {
+        throw FmtError(InvalidBase, "base {base} out of range 2..36", "{x}")
+    }
+    match x.type_name() {
+        "u8" => Ok(mag_digits(x as u128, base)),
+        "u16" => Ok(mag_digits(x as u128, base)),
+        "u32" => Ok(mag_digits(x as u128, base)),
+        "u64" => Ok(mag_digits(x as u128, base)),
+        "u128" => Ok(mag_digits(x as u128, base)),
+        "usize" => Ok(mag_digits(x as u128, base)),
+        "i8" => Ok(radix_i128(x as i128, base)),
+        "i16" => Ok(radix_i128(x as i128, base)),
+        "i32" => Ok(radix_i128(x as i128, base)),
+        "i64" => Ok(radix_i128(x as i128, base)),
+        "i128" => Ok(radix_i128(x as i128, base)),
+        "isize" => Ok(radix_i128(x as i128, base)),
+        _ => {
+            val t = x.type_name()
+            throw FmtError(NotAnInteger, "radix formats integer types, got {t}", "{x}")
+        }
+    }
+}
+
+// Common radix conveniences (base is always valid here, so the only
+// FmtError they can raise is NotAnInteger; it propagates to the caller).
+pub fun dec<T>(x: T): Throw<str, FmtError> { radix(x, 10) }
+pub fun hex<T>(x: T): Throw<str, FmtError> { radix(x, 16) }
+pub fun oct<T>(x: T): Throw<str, FmtError> { radix(x, 8) }
+pub fun bin<T>(x: T): Throw<str, FmtError> { radix(x, 2) }
+
+// Pad s on the left with `fill` up to `width` bytes; no-op when already
+// long enough. Compose for zero-padded hex: unwrap Fmt.hex first —
+// `pad_left(s, 4, 48)` with s from `match Fmt.hex(255) { Ok(s) => s, ... }`,
+// or `Fmt.hex(255)?` inside a throwing function.
+pub fun pad_left(s: str, width: usize, fill: u8): str {
+    val b = s.bytes()
+    if b.len() >= width { return s }
+    var out: u8[] = [0, ..width]
+    var i: usize = 0
+    while i < width - b.len() {
+        out[i] = fill
+        i = i + 1
+    }
+    while i < width {
+        out[i] = b[i - (width - b.len())]
+        i = i + 1
+    }
+    out as str
+}
+
+// Pad s on the right with `fill` up to `width` bytes; no-op when already
+// long enough.
+pub fun pad_right(s: str, width: usize, fill: u8): str {
+    val b = s.bytes()
+    if b.len() >= width { return s }
+    var out: u8[] = [0, ..width]
+    var i: usize = 0
+    while i < b.len() {
+        out[i] = b[i]
+        i = i + 1
+    }
+    while i < width {
+        out[i] = fill
+        i = i + 1
+    }
+    out as str
+}

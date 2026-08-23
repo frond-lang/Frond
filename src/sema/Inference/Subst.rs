@@ -181,6 +181,139 @@ impl<'a> InferContext<'a> {
         }
     }
 
+    /// Name-keyed structural substitution: replaces `Adt(name)` nodes whose
+    /// name matches a pair with the given argument. Mirrors `substitute_type`
+    /// arm-for-arm but keys on placeholder Adt NAMES instead of TypeVar idxs —
+    /// this is how generic type aliases (`type CmpFn<T> = (T, T) -> i32`)
+    /// unfold at use sites: the alias target stores `Adt("T")` placeholders
+    /// (registration binds params by name) and `CmpFn<i32>` substitutes them.
+    pub(super) fn substitute_named_adts(
+        &mut self,
+        ty: TypeHandle,
+        pairs: &[(Box<str>, TypeHandle)],
+    ) -> TypeHandle {
+        if pairs.is_empty() {
+            return ty;
+        }
+        let resolved = self.arena.resolve(ty);
+        match self.arena.get(resolved) {
+            Type::Adt(_) => {
+                let (name, type_args) = self.arena.adt_parts(resolved);
+                if let Some(pair) = pairs.iter().find(|(n, _)| n.as_ref() == name) {
+                    return pair.1;
+                }
+                let name: Box<str> = name.into();
+                let type_args: Vec<TypeHandle> = type_args.to_vec();
+                let new_args: Vec<TypeHandle> = type_args
+                    .iter()
+                    .map(|&a| self.substitute_named_adts(a, pairs))
+                    .collect();
+                self.arena.make_adt(name, new_args.into_boxed_slice())
+            }
+            Type::Fn(_) => {
+                let (params, return_type) = self.arena.fn_parts(resolved);
+                let params: Vec<TypeHandle> = params.to_vec();
+                let new_params: Vec<TypeHandle> = params
+                    .iter()
+                    .map(|&p| self.substitute_named_adts(p, pairs))
+                    .collect();
+                let new_ret = self.substitute_named_adts(return_type, pairs);
+                self.arena.make_fn(new_params.into_boxed_slice(), new_ret)
+            }
+            Type::Record(_) => {
+                let fields = self.arena.record_fields(resolved).to_vec();
+                let name = self.arena.record_name(resolved).map(|s| s.into());
+                let new_fields: Vec<crate::types::FieldType> = fields
+                    .iter()
+                    .map(|f| crate::types::FieldType {
+                        name: f.name.clone(),
+                        ty: self.substitute_named_adts(f.ty, pairs),
+                    })
+                    .collect();
+                self.arena.make_record(new_fields.into_boxed_slice(), name)
+            }
+            Type::Nullable(_) => {
+                let inner = self.arena.nullable_inner(resolved);
+                let new_inner = self.substitute_named_adts(inner, pairs);
+                self.arena.make_nullable(new_inner)
+            }
+            Type::Generic(_) => {
+                let (name, args) = self.arena.generic_parts(resolved);
+                let name: Box<str> = name.into();
+                let args: Vec<TypeHandle> = args.to_vec();
+                let new_args: Vec<TypeHandle> = args
+                    .iter()
+                    .map(|&a| self.substitute_named_adts(a, pairs))
+                    .collect();
+                self.arena.make_generic(name, new_args.into_boxed_slice())
+            }
+            Type::Array(_) => {
+                let (element_type, size) = self.arena.array_parts(resolved);
+                let new_elem = self.substitute_named_adts(element_type, pairs);
+                self.arena.make_array(new_elem, size)
+            }
+            Type::Throw(_) => {
+                let (value_type, error_type) = self.arena.throw_parts(resolved);
+                let new_v = self.substitute_named_adts(value_type, pairs);
+                let new_e = self.substitute_named_adts(error_type, pairs);
+                self.arena.make_throw(new_v, new_e)
+            }
+            Type::Trait(_) => {
+                let (name, type_args) = self.arena.trait_parts(resolved);
+                let name: Box<str> = name.into();
+                let type_args: Vec<TypeHandle> = type_args.to_vec();
+                let new_args: Vec<TypeHandle> = type_args
+                    .iter()
+                    .map(|&a| self.substitute_named_adts(a, pairs))
+                    .collect();
+                self.arena.make_trait(name, new_args.into_boxed_slice())
+            }
+            Type::Ref(_) => {
+                let (inner, is_raw) = self.arena.ref_parts(resolved);
+                let new_inner = self.substitute_named_adts(inner, pairs);
+                self.arena.make_ref(new_inner, is_raw)
+            }
+            Type::Channel(_) => {
+                let elem = self.arena.channel_elem(resolved);
+                let new_elem = self.substitute_named_adts(elem, pairs);
+                self.arena.make_channel(new_elem)
+            }
+            Type::Async(_) => {
+                let value = self.arena.async_value(resolved);
+                let new_value = self.substitute_named_adts(value, pairs);
+                self.arena.make_async(new_value)
+            }
+            Type::Lazy(_) => {
+                let value = self.arena.lazy_value(resolved);
+                let new_value = self.substitute_named_adts(value, pairs);
+                self.arena.make_lazy(new_value)
+            }
+            Type::Atomic(_) => {
+                let elem = self.arena.atomic_elem(resolved);
+                let new_elem = self.substitute_named_adts(elem, pairs);
+                self.arena.make_atomic(new_elem)
+            }
+            Type::Sender(_) => {
+                let elem = self.arena.sender_elem(resolved);
+                let new_elem = self.substitute_named_adts(elem, pairs);
+                self.arena.make_sender(new_elem)
+            }
+            Type::Receiver(_) => {
+                let elem = self.arena.receiver_elem(resolved);
+                let new_elem = self.substitute_named_adts(elem, pairs);
+                self.arena.make_receiver(new_elem)
+            }
+            Type::ForeignFn(_) => {
+                let ret = self.arena.foreign_fn_ret(resolved);
+                let new_ret = self.substitute_named_adts(ret, pairs);
+                self.arena.make_foreign_fn(new_ret)
+            }
+            // Scalars / Never / Unknown / Void / Null / TraitObject / ModuleRef /
+            // Timer have no sub-nodes → returned as-is.
+            _ => resolved,
+        }
+    }
+
     // ── Literal promotion ──
     // v2 convergence: literal_promotion has been replaced by peer_type_binary,
     // literal promotion rules are inlined into peer_type_binary, eliminating the dual-track scheme.

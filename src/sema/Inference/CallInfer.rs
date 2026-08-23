@@ -154,7 +154,8 @@ impl<'a> InferContext<'a> {
                                     let n = params.len().min(args.len() + 1);
                                     for i in 1..n {
                                         let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
-                                        self.unify_or_constrain(params[i], arg_ty);
+                                        let sp = ast.expr(args[i - 1]).span;
+                                        self.unify_call_arg(params[i], arg_ty, sp.line, sp.column);
                                     }
                                     // Store callee's ExprInfo so that pending_implicit_this
                                     // (flushed in infer_expr) can attach the implicit_this marker.
@@ -169,7 +170,13 @@ impl<'a> InferContext<'a> {
                                 }
                             }
                         }
-                        self.infer_expr(*callee, ast, env, None)
+                        let t = self.infer_expr(*callee, ast, env, None);
+                        if std::env::var("FROND_TRACE_CTOR").is_ok() {
+                            if let Expr::Ident(n) = &ast.expr(*callee).node {
+                                eprintln!("[ctor-infer] callee {} -> {:?}", n, self.arena.get(self.arena.resolve(t)));
+                            }
+                        }
+                        t
                     }
                 } else {
                     self.infer_expr(*callee, ast, env, None)
@@ -183,7 +190,7 @@ impl<'a> InferContext<'a> {
                     if let Type::ModuleRef(_) = self.arena.get(resolved_callee) {
                         let (path, module_env) = self.arena.module_ref_parts(resolved_callee);
                         if let Some(func_name) = path.rsplit('.').next() {
-                            if let Some(fn_ty) = self.env.lookup_local(module_env, func_name) {
+                            if let Some(fn_ty) = self.sema_result.env.lookup_local(module_env, func_name) {
                                 let inst_fn = self.instantiate_fn_type(fn_ty);
                                 if let Type::Fn(_) = self.arena.get(inst_fn) {
                                     let (params, return_type) = self.arena.fn_parts(inst_fn);
@@ -230,7 +237,7 @@ impl<'a> InferContext<'a> {
                     let (path, module_env) = self.arena.module_ref_parts(resolved_callee);
                     // The trailing segment is the function name (e.g. "std.reflect.Reflect.format" → "format").
                     if let Some(func_name) = path.rsplit('.').next() {
-                        if let Some(fn_ty) = self.env.lookup_local(module_env, func_name) {
+                        if let Some(fn_ty) = self.sema_result.env.lookup_local(module_env, func_name) {
                             // Instantiate the polymorphic function type to avoid type-constraint clashes across calls.
                             let inst_fn = self.instantiate_fn_type(fn_ty);
                             if let Type::Fn(_) = self.arena.get(inst_fn) {
@@ -259,8 +266,10 @@ impl<'a> InferContext<'a> {
                     if params.len() == args.len() {
                         for (&param_ty, &arg) in params.iter().zip(args.iter()) {
                             let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
-                            // On unify failure, register a constraint (rather than discarding) so the fixpoint iteration can solve the argument type.
-                            self.unify_or_constrain(param_ty, arg_ty);
+                            // Hard-concrete mismatch fails now; TypeVars keep the
+                            // constraint path (see unify_call_arg).
+                            let sp = ast.expr(arg).span;
+                            self.unify_call_arg(param_ty, arg_ty, sp.line, sp.column);
                         }
                     }
                     // Always return the declared return type, to avoid cascading type loss from argument mismatches.
@@ -312,7 +321,7 @@ impl<'a> InferContext<'a> {
                 // BEFORE receiver inference. A local binding named `Lib` shadows it.
                 if let Expr::Ident("Lib") = &ast.expr(*recv).node {
                     let shadowed = self
-                        .env
+                        .sema_result.env
                         .lookup_with_pred(env, "Lib", |_| true)
                         .is_some();
                     if !shadowed && (*method == "open" || *method == "embed") {
@@ -398,6 +407,15 @@ impl<'a> InferContext<'a> {
                 }
 
                 let recv_ty = self.infer_expr(*recv, ast, env, None);
+                if std::env::var("FROND_TRACE_CTOR").is_ok() && *method == "empty" {
+                    if let crate::ast::Ast::Expr::Ident(rn) = &ast.expr(*recv).node {
+                        eprintln!(
+                            "[method-sugar] recv {} -> {:?}",
+                            rn,
+                            self.arena.get(self.arena.resolve(recv_ty))
+                        );
+                    }
+                }
 
                 // Path 0a: ModuleRef recv → module-path function call.
                 // When recv is a ModuleRef (e.g. std.net.UdpSocket), method is a top-level function in that module;
@@ -405,7 +423,7 @@ impl<'a> InferContext<'a> {
                 let recv_resolved_0a = self.arena.resolve(recv_ty);
                 if let Type::ModuleRef(_) = self.arena.get(recv_resolved_0a) {
                     let (mod_path, module_env) = self.arena.module_ref_parts(recv_resolved_0a);
-                    let found = self.env.lookup_local(module_env, method);
+                    let found = self.sema_result.env.lookup_local(module_env, method);
                     // Directory-module semantics: when lookup_local misses in the current module env,
                     // search sibling modules in the same directory (e.g. Math.sqrt where sqrt lives in Power.frond,
                     // with Math and Power both under the std.math directory).
@@ -420,7 +438,8 @@ impl<'a> InferContext<'a> {
                             let n = params.len().min(args.len());
                             for i in 0..n {
                                 let arg_ty = self.infer_expr(args[i], ast, env, Some(params[i]));
-                                self.unify_or_constrain(params[i], arg_ty);
+                                let sp = ast.expr(args[i]).span;
+                                self.unify_call_arg(params[i], arg_ty, sp.line, sp.column);
                             }
                             // Mark recv as a module-function-call receiver so IR compilation does not pass recv.
                             // (Consistent with path 0b: ModuleRef recv has Module.fun(args) semantics.)
@@ -444,8 +463,20 @@ impl<'a> InferContext<'a> {
                     let ret_resolved = self.arena.resolve(ret_ty);
                     if let Type::Adt(_) = self.arena.get(ret_resolved) {
                         let (type_name, _) = self.arena.adt_parts(ret_resolved);
-                        if let Some(&mod_env) = self.ctor_module_envs.get(type_name) {
-                            if let Some(fn_ty) = self.env.lookup_local(mod_env, method) {
+                        // ctor_module_envs is keyed by the BARE ctor name —
+                        // a canonical (module-qualified) type name matches by
+                        // tail segment.
+                        let mod_env = self
+                            .ctor_module_envs
+                            .get(type_name)
+                            .or_else(|| {
+                                type_name
+                                    .rsplit('.')
+                                    .next()
+                                    .and_then(|bare| self.ctor_module_envs.get(bare))
+                            });
+                        if let Some(&mod_env) = mod_env {
+                            if let Some(fn_ty) = self.sema_result.env.lookup_local(mod_env, method) {
                                 // Guard: `TypeName.method(args)` must not dispatch to a TYPE
                                 // method. Type methods carry an implicit `this` at param slot 0
                                 // while this call site passes no receiver, so the IR would land
@@ -460,7 +491,7 @@ impl<'a> InferContext<'a> {
                                     self.add_error_at(
                                         &format!(
                                             "method '{}.{}' cannot be called through the type name; call it on an instance (x.{}(..)) or via the bare form {}(instance, ..), or move the factory to module level",
-                                            type_name, method, method, method
+                                            display_type_name(type_name), method, method, method
                                         ),
                                         span.line,
                                         span.column,
@@ -474,7 +505,8 @@ impl<'a> InferContext<'a> {
                                     let n = params.len().min(args.len());
                                     for i in 0..n {
                                         let arg_ty = self.infer_expr(args[i], ast, env, Some(params[i]));
-                                        self.unify_or_constrain(params[i], arg_ty);
+                                        let sp = ast.expr(args[i]).span;
+                                        self.unify_call_arg(params[i], arg_ty, sp.line, sp.column);
                                     }
                                     // Mark recv as a module-function-call receiver so IR compilation does not pass recv.
                                     let recv_key = module_expr_key(
@@ -539,7 +571,8 @@ impl<'a> InferContext<'a> {
                         let n = params.len().min(args.len() + 1);
                         for i in 1..n {
                             let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
-                            self.unify_or_constrain(params[i], arg_ty);
+                            let sp = ast.expr(args[i - 1]).span;
+                            self.unify_call_arg(params[i], arg_ty, sp.line, sp.column);
                         }
                         return return_type;
                     }
@@ -548,7 +581,7 @@ impl<'a> InferContext<'a> {
                 // Path 0 (fallback): look up a binding named after the method as an Fn type in env (free function with a self parameter).
                 // Use lookup_with_pred to skip same-named non-function bindings (e.g. a local variable shadowing a free function).
                 // In Frond `recv.method(args)` is sugar for `method(recv, args)`.
-                if let Some(fn_ty) = self.env.lookup_with_pred(env, method, |ty| {
+                if let Some(fn_ty) = self.sema_result.env.lookup_with_pred(env, method, |ty| {
                     let r = self.arena.resolve(ty);
                     matches!(self.arena.get(r), Type::Fn(_))
                 }) {
@@ -601,7 +634,8 @@ impl<'a> InferContext<'a> {
                             let n = params.len().min(args.len() + 1);
                             for i in 1..n {
                                 let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
-                                self.unify_or_constrain(params[i], arg_ty);
+                                let sp = ast.expr(args[i - 1]).span;
+                                self.unify_call_arg(params[i], arg_ty, sp.line, sp.column);
                             }
                             return return_type;
                         }
@@ -621,7 +655,7 @@ impl<'a> InferContext<'a> {
                 // This is the Sema-side recognition that pairs with Builder::lookup_intrinsic +
                 // reflect_method_intrinsic — the method call type-checks here, and lowers to a
                 // CF_REFLECT_* compute_fn at IR build time.
-                if let Some(ret_ty) = self.reflect_method_return_type(*method, args.len()) {
+                if let Some(ret_ty) = self.reflect_method_return_type(*method, args.len(), recv_ty) {
                     // Infer args (for type-checking side effects) but discard their constraints.
                     for &a in args.iter() {
                         let _ = self.infer_expr(a, ast, env, None);
@@ -744,9 +778,10 @@ impl<'a> InferContext<'a> {
                 if is_builtin_generic_type(name) {
                     return self.make_builtin_generic(name.clone(), args_box);
                 }
-                // trait definition → Trait type.
+                // trait definition → Trait type (module-scoped canonical).
                 if self.sema_result.get_trait_def(name).is_some() {
-                    return self.arena.make_trait(name.clone(), args_box);
+                    let canonical = self.sema_result.resolve_trait_key(name);
+                    return self.arena.make_trait(canonical.into(), args_box);
                 }
                 // User-defined generic ADT.
                 let has_type_params = self
@@ -808,15 +843,203 @@ impl<'a> InferContext<'a> {
         use crate::sema::Sema::MethodBinding;
         let span = ast.expr(expr).span;
 
-        // Inside a trait default method, `super` would mean the parent trait's
-        // default — trait parents are not implemented yet.
-        if self.current_trait_name.is_some() {
-            self.add_error_at(
-                "super is not allowed inside a trait default method (trait parents are not implemented yet)",
-                span.line,
-                span.column,
-            );
-            return self.arena.fresh_type_var();
+        // ── Base-type super (inheritance): when the enclosing type has
+        // concrete bases and the method lives on one of them, super.m targets
+        // the BASE's implementation, one level up — checked ahead of the
+        // trait-default layer (the dispatch chain is own → base → trait).
+        {
+            let type_name2: Box<str> = self
+                .current_this_type()
+                .and_then(|t| {
+                    let r = self.arena.resolve(t);
+                    match self.arena.get(r) {
+                        Type::Adt(_) => {
+                            let (n, _) = self.arena.adt_parts(r);
+                            Some(n.into())
+                        }
+                        _ => None,
+                    }
+                })
+                .unwrap_or_default();
+            if !type_name2.is_empty() {
+                let bases: Vec<Box<str>> = self
+                    .sema_result
+                    .get_type_def(type_name2.as_ref())
+                    .map(|d| d.bases.to_vec())
+                    .unwrap_or_default();
+                let mut hits: Vec<(&Box<str>, u16)> = Vec::new();
+                for b in &bases {
+                    if let Some(mi) = self.sema_result.lookup_method_idx(b.as_ref(), method) {
+                        hits.push((b, mi));
+                    }
+                }
+                if hits.len() > 1 {
+                    self.add_error_at(
+                        &format!(
+                            "ambiguous super: method '{}' exists on multiple bases [{}]; disambiguate by overriding and calling the base explicitly",
+                            method,
+                            hits.iter().map(|(b, _)| b.as_ref()).collect::<Vec<_>>().join(", ")
+                        ),
+                        span.line,
+                        span.column,
+                    );
+                    return self.arena.fresh_type_var();
+                }
+                if let Some((b, mi)) = hits.first().map(|(bn, m)| ((*bn).clone(), *m)) {
+                    // Owned snapshot of the base method's sig (borrow hygiene:
+                    // the arg inference below re-borrows self).
+                    let sig_owned: Option<crate::sema::Sema::MethodSigInfo> = self
+                        .sema_result
+                        .get_type_def(b.as_ref())
+                        .and_then(|d| d.methods.get(mi as usize).cloned());
+                    if let Some(sig) = sig_owned {
+                        // Type-check args against the base method's signature
+                        // (reprs → handles; `this` occupies param slot 0).
+                        let inst_fn = {
+                            let pt: Vec<TypeHandle> = sig
+                                .param_type_reprs
+                                .iter()
+                                .map(|r| self.type_repr_to_handle(r))
+                                .collect();
+                            let rt = sig
+                                .return_type_repr
+                                .as_ref()
+                                .map(|r| self.type_repr_to_handle(r))
+                                .unwrap_or_else(|| self.arena.make(Type::Unknown));
+                            self.arena.make_fn(pt.into_boxed_slice(), rt)
+                        };
+                        if let Type::Fn(_) = self.arena.get(inst_fn) {
+                            let (params, return_type) = self.arena.fn_parts(inst_fn);
+                            let params: Vec<TypeHandle> = params.to_vec();
+                            let n = params.len().min(args.len() + 1);
+                            for i in 1..n {
+                                let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(params[i]));
+                                let sp = ast.expr(args[i - 1]).span;
+                                self.unify_call_arg(params[i], arg_ty, sp.line, sp.column);
+                            }
+                            let key = module_expr_key(&self.current_module_name, expr.0 as u64);
+                            self.sema_result
+                                .super_base_dispatches
+                                .insert(key, (b.clone(), method.into()));
+                            return return_type;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Inside a child trait's default method, `super.m()` targets the
+        // PARENT trait's default (trait inheritance). Resolution mirrors the
+        // type-side super: unique parent provider (or a descendant parent
+        // shadowing others), recorded via the existing super_dispatches /
+        // super_targets machinery so the parent default specializes for each
+        // implementing type.
+        if let Some(trait_name) = self.current_trait_name.clone() {
+            let parents = self.sema_result.trait_parent_closure(trait_name.as_ref());
+            let mut providers: Vec<Box<str>> = parents
+                .iter()
+                .filter(|p| {
+                    self.sema_result
+                        .get_trait_def(p.as_ref())
+                        .map(|td| {
+                            td.methods.iter().any(|m| m.name.as_ref() == method && m.has_body)
+                        })
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            // Descendant shadowing among parents (a nearer parent re-declared m).
+            if providers.len() > 1 {
+                let mut winner: Option<usize> = None;
+                for (i, c) in providers.iter().enumerate() {
+                    if providers.iter().all(|o| {
+                        o.as_ref() == c.as_ref()
+                            || self
+                                .sema_result
+                                .trait_parent_closure(c.as_ref())
+                                .iter()
+                                .any(|a| a.as_ref() == o.as_ref())
+                    }) {
+                        winner = Some(i);
+                        break;
+                    }
+                }
+                if let Some(i) = winner {
+                    providers.remove(i);
+                    providers.truncate(1);
+                }
+            }
+            match providers.len() {
+                0 => {
+                    self.add_error_at(
+                        &format!(
+                            "super: no parent trait of '{}' provides a default '{}'",
+                            crate::sema::Sema::display_type_name(trait_name.as_ref()),
+                            method
+                        ),
+                        span.line,
+                        span.column,
+                    );
+                    return self.arena.fresh_type_var();
+                }
+                1 => {
+                    let parent = providers.remove(0);
+                    let sig = self.sema_result.get_trait_def(parent.as_ref()).and_then(|td| {
+                        td.methods
+                            .iter()
+                            .enumerate()
+                            .find(|(_, m)| m.name.as_ref() == method)
+                            .map(|(i, m)| (i as u16, m.param_count, m.return_type, m.has_body))
+                    });
+                    let Some((method_idx, param_count, return_type, has_body)) = sig else {
+                        self.add_error_at(
+                            &format!(
+                                "super: parent trait '{}' method '{method}' could not be resolved",
+                                crate::sema::Sema::display_type_name(parent.as_ref())
+                            ),
+                            span.line,
+                            span.column,
+                        );
+                        return self.arena.fresh_type_var();
+                    };
+                    let _ = param_count;
+                    if !has_body {
+                        self.add_error_at(
+                            &format!("super: parent trait '{parent}' method '{method}' has no default body"),
+                            span.line,
+                            span.column,
+                        );
+                        return self.arena.fresh_type_var();
+                    }
+                    let trait_idx = self
+                        .sema_result
+                        .trait_def_index
+                        .get(parent.as_ref())
+                        .copied();
+                    let Some(trait_idx) = trait_idx else {
+                        self.add_error_at(
+                            &format!("super: parent trait '{parent}' index missing"),
+                            span.line,
+                            span.column,
+                        );
+                        return self.arena.fresh_type_var();
+                    };
+                    let key = module_expr_key(&self.current_module_name, expr.0 as u64);
+                    self.sema_result.super_dispatches.insert(key, (trait_idx, method_idx));
+                    return return_type;
+                }
+                _ => {
+                    let list = providers.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(", ");
+                    self.add_error_at(
+                        &format!(
+                            "ambiguous super: parents of '{trait_name}' [{list}] all provide a default '{method}'"
+                        ),
+                        span.line,
+                        span.column,
+                    );
+                    return self.arena.fresh_type_var();
+                }
+            }
         }
         let traits: Vec<Box<str>> = match self.current_type_decl_traits.clone() {
             Some(t) => t,
@@ -934,7 +1157,8 @@ impl<'a> InferContext<'a> {
             let n = param_types.len().min(args.len() + 1);
             for i in 1..n {
                 let arg_ty = self.infer_expr(args[i - 1], ast, env, Some(param_types[i]));
-                self.unify_or_constrain(param_types[i], arg_ty);
+                let sp = ast.expr(args[i - 1]).span;
+                self.unify_call_arg(param_types[i], arg_ty, sp.line, sp.column);
             }
             if let Some(exp) = expected {
                 self.unify_or_constrain(ret_ty, exp);
@@ -982,6 +1206,44 @@ impl<'a> InferContext<'a> {
             }
             _ => {}
         }
+
+        // Module-scoped name resolution for the SIGNATURE below: a method's
+        // TypeRepr names resolve in the DECLARING type's module, not the
+        // caller's — otherwise a local `type List` shadowing std.collections.List
+        // would hijack the std signature's own `List<T>` references.
+        // A BARE receiver name on a type handle is a std-context creation
+        // (user-module handles are always canonical/dotted): resolve it with
+        // the exact std-first key, not the caller's shadow scope.
+        let saved_module_ctx = self.sema_result.current_module_name.clone();
+        let sig_module: Option<Box<str>> = self
+            .arena
+            .type_name(resolved)
+            .and_then(|tn| {
+                let def = if tn.contains('.') {
+                    self.sema_result.get_type_def(tn)
+                } else {
+                    self.sema_result
+                        .type_def_index
+                        .get(tn)
+                        .and_then(|&i| self.sema_result.type_defs.get(&i))
+                };
+                def.and_then(|d| d.constructors.first().map(|c| c.def_module.clone()))
+            });
+        if let Some(m) = sig_module {
+            self.sema_result.current_module_name = m.to_string();
+        }
+        let result = self.lookup_method_type_impl(resolved, method, line, column);
+        self.sema_result.current_module_name = saved_module_ctx;
+        result
+    }
+
+    fn lookup_method_type_impl(
+        &mut self,
+        resolved: TypeHandle,
+        method: &str,
+        line: u32,
+        column: u32,
+    ) -> Option<TypeHandle> {
 
         // Privacy gate: type methods are module-scoped unless `pub`. Report and
         // still resolve the signature — returning None sends the caller into a
@@ -1083,14 +1345,26 @@ impl<'a> InferContext<'a> {
                 // method table. This enables bare `method()` calls inside trait default bodies.
                 if self.arena.type_vars[idx as usize].is_rigid {
                     if let Some(ref trait_name) = self.current_trait_name {
-                        if let Some(td) = self.sema_result.get_trait_def(trait_name) {
-                            if let Some(sig) = td.methods.iter().find(|m| m.name.as_ref() == method) {
-                                let params: Vec<TypeHandle> = (0..sig.param_count)
-                                    .map(|i| if i == 0 { resolved } else { self.arena.fresh_type_var() })
-                                    .collect();
-                                let return_type = sig.return_type;
-                                return Some(self.arena.make_fn(params.into_boxed_slice(), return_type));
-                            }
+                        // Trait inheritance: the effective surface includes the
+                        // transitive parents' methods (bare parent-default
+                        // calls inside a child trait's default body).
+                        let sig = self
+                            .sema_result
+                            .get_trait_def(trait_name)
+                            .and_then(|td| td.methods.iter().find(|m| m.name.as_ref() == method))
+                            .or_else(|| {
+                                self.sema_result
+                                    .trait_effective_methods(trait_name)
+                                    .into_iter()
+                                    .find(|(_, m)| m.name.as_ref() == method)
+                                    .map(|(_, m)| m)
+                            });
+                        if let Some(sig) = sig {
+                            let params: Vec<TypeHandle> = (0..sig.param_count)
+                                .map(|i| if i == 0 { resolved } else { self.arena.fresh_type_var() })
+                                .collect();
+                            let return_type = sig.return_type;
+                            return Some(self.arena.make_fn(params.into_boxed_slice(), return_type));
                         }
                     }
                 }
@@ -1266,7 +1540,7 @@ impl<'a> InferContext<'a> {
         // On miss, report an error; no string concatenation or prefix check is needed.
         if let Type::ModuleRef(_) = self.arena.get(resolved) {
             let (path, module_env) = self.arena.module_ref_parts(resolved);
-            if let Some(sym_ty) = self.env.lookup_local(module_env, field) {
+            if let Some(sym_ty) = self.sema_result.env.lookup_local(module_env, field) {
                 return sym_ty;
             }
             self.add_error_at(
@@ -1373,7 +1647,7 @@ impl<'a> InferContext<'a> {
 /// anywhere in the type — top-level OR nested (e.g. `T[]`'s element). Such
 /// types stay on the lenient constraint path; only fully-concrete types can
 /// hard-reject a Path 0 free-function candidate.
-fn type_contains_typevar(arena: &crate::types::Arena::TypeArena, h: TypeHandle) -> bool {
+pub(super) fn type_contains_typevar(arena: &crate::types::Arena::TypeArena, h: TypeHandle) -> bool {
     let resolved = arena.resolve(h);
     if matches!(arena.get(resolved), Type::TypeVar(_) | Type::Unknown) {
         return true;

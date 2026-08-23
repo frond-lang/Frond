@@ -1,0 +1,23 @@
+// Hex.frond — hexadecimal encoding (part of std.encoding)
+//
+// encode: two lowercase digits per byte ("ff00").
+// decode: accepts upper and lower case, null on odd length or non-hex bytes.
+// Round-trip guarantee: decode(encode(data)) == data.
+//
+// The inner loops are the C kernel __hex_encode/__hex_decode
+// (builtin/encoding/Raw.frond); this facade sizes the output and maps the
+// kernel's -1 to null. decode passes the str straight to the kernel (the
+// FFI marshals it as a zero-copy view) -- no bytes() materialization.
+
+pub fun encode(data: u8[]): str {
+    var out: u8[] = [0, ..data.len() * 2]
+    __hex_encode(out, data)
+    out as str
+}
+
+pub fun decode(s: str): u8[]? {
+    if s.len() % 2 != 0 { return null }
+    var out: u8[] = [0, ..s.len() / 2]
+    if __hex_decode(out, s) < 0 { return null }
+    out
+}

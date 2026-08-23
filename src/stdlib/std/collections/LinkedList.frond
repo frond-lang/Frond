@@ -1,0 +1,142 @@
+// LinkedList.frond — doubly-linked list (part of std.collections)
+//
+// The linked-storage child of List<T>: head/tail node pointers override the
+// array-backed storage methods, keeping List's surface and ordering
+// semantics (push appends at the END, pop removes from the END). The base's
+// `count` is the live length (maintained by the overrides); the base's
+// `buf` stays empty forever — capacity() therefore reports 0 (no allocated
+// slots; the structure is unbounded).
+//
+// Cost profile vs ArrayList: push/pop/push_front are all O(1) (no growth,
+// no memcpy); get/set/as_array are O(n) walks. get/set bounds-check to a
+// no-op beyond len() (ArrayList's set instead writes dead slots / traps
+// beyond capacity — that part of the base contract does not carry over).
+//
+//   val lls = LinkedList.empty()
+//   lls.push(1)          // [1]
+//   lls.push(2)          // [1, 2]
+//   lls.push_front(0)    // [0, 1, 2]
+//   val ys = LinkedList.from([1, 2, 3])
+
+// Family-private node record. Self-references are NULLABLE (that is what
+// terminates the chain); records alias, so relinking writes node fields in
+// place through the shared references.
+type LNode<T> = LNode(v: T, prev: LNode<T>?, next: LNode<T>?)
+
+type LinkedList<T>(List<T>) = LinkedList(head: LNode<T>?, tail: LNode<T>?) {
+
+    // len / is_empty / capacity are inherited: len/is_empty read `count`
+    // (maintained below), capacity reads the forever-empty `buf` (0).
+
+    pub fun &push(value: T): void {
+        val node: LNode<T>? = LNode(value, tail, null)
+        match tail {
+            null => { head = node }
+            t => { t.next = node }
+        }
+        tail = node
+        count = count + 1
+    }
+
+    // The linked-list extra: O(1) prepend (no array shift exists to pay).
+    pub fun &push_front(value: T): void {
+        val node: LNode<T>? = LNode(value, null, head)
+        match head {
+            null => { tail = node }
+            h => { h.prev = node }
+        }
+        head = node
+        count = count + 1
+    }
+
+    pub fun &pop(): T? {
+        match tail {
+            null => { null }
+            t => {
+                val v = t.v
+                tail = t.prev
+                match tail {
+                    null => { head = null }
+                    p => { p.next = null }
+                }
+                count = count - 1
+                v
+            }
+        }
+    }
+
+    pub fun get(i: usize): T? {
+        if i >= count { return null }
+        var n = head
+        var k = 0 as usize
+        while k < i {
+            match n {
+                null => { return null }
+                cur => { n = cur.next }
+            }
+            k = k + 1
+        }
+        match n {
+            null => { null }
+            cur => { cur.v }
+        }
+    }
+
+    // Bounds-checked no-op beyond len() (see header).
+    pub fun &set(i: usize, value: T): void {
+        if i >= count { return }
+        var n = head
+        var k = 0 as usize
+        while k < i {
+            match n {
+                null => { return }
+                cur => { n = cur.next }
+            }
+            k = k + 1
+        }
+        match n {
+            null => {}
+            cur => { cur.v = value }
+        }
+    }
+
+    pub fun as_array(): T[] {
+        if count == 0 { return [] }
+        match head {
+            null => { [] }
+            h => {
+                var out = [h.v, ..count]
+                var n = h.next
+                var i = 1 as usize
+                while i < count {
+                    match n {
+                        null => {}
+                        cur => {
+                            out[i] = cur.v
+                            n = cur.next
+                        }
+                    }
+                    i = i + 1
+                }
+                out
+            }
+        }
+    }
+}
+
+// Factory family (the List.empty / List.from convention).
+pub fun empty<T>(): LinkedList<T> {
+    var buf: T[] = []
+    LinkedList(buf, 0, null, null)
+}
+
+// Snapshot an array into a linked list (elementwise push — O(n) appends).
+pub fun from<T>(arr: T[]): LinkedList<T> {
+    val out = empty<T>()
+    var i = 0 as usize
+    while i < arr.len() {
+        out.push(arr[i])
+        i = i + 1
+    }
+    out
+}

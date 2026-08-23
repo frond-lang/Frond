@@ -50,6 +50,7 @@ impl<'a> IrBuilder<'a> {
             let node_start = self.graph.nodes.len() as u32;
             let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
             self.graph.add_subgraph(SubGraph {
+                converter_generated: false,
                 id: sg_id,
                 node_range: (NodeId(node_start), NodeId(node_start)),
                 param_count: 0,
@@ -167,6 +168,7 @@ impl<'a> IrBuilder<'a> {
             self.lookup_captures(key_id).to_vec()
         };
         let mut captured: Vec<(String, NodeId)> = Vec::new();
+        let mut pending_cell_captures: Vec<(String, NodeId)> = Vec::new();
 
         // Self-reference detection: a named function that references itself in its body becomes an
         // upvalue placeholder.
@@ -248,7 +250,25 @@ impl<'a> IrBuilder<'a> {
                 inputs_offset,
                 compute_fn: CF_NOOP,
             });
+            // Cell-capture registration (place model 4): when the outer
+            // binding is cell-backed, the upvalue carries the SHARED cell Arc
+            // (construct wraps it once, call unwraps that layer). Routing the
+            // body's reads/writes through deref ops on it gives by-ref
+            // capture semantics via the shared cell — no WriteBack machinery.
+            // Without this, reads would leak the Arc as a plain value.
+            // NOTE: the eligibility check MUST run before bind_var — once the
+            // name rebinds to the upvalue, the binding-identity guard
+            // correctly reports it no longer points at the outer cell.
+            let is_cell_capture = self.lookup_cell_binding(name).is_some();
             self.bind_var(name, upvalue_node);
+            if is_cell_capture {
+                // Registration is DEFERRED to just before the body compile:
+                // the owner tag must match the id the BODY compiles under
+                // (escaping lambdas switch function_id below), or the body's
+                // lookups filter their own registration out and fall back to
+                // the WriteBack path.
+                pending_cell_captures.push((name.clone(), upvalue_node));
+            }
         }
 
         // 4. Compile the body to obtain the return node.
@@ -302,6 +322,17 @@ impl<'a> IrBuilder<'a> {
             self.current_function_id = sg_id.0;
         }
         self.captured_scopes.push(captured.clone());
+        // Deferred cell-capture registration: AFTER the escape function_id
+        // switch, so the owner tag matches the body's compile-time id.
+        if !pending_cell_captures.is_empty() {
+            let owner = self.current_function_id;
+            for (name, upvalue_node) in &pending_cell_captures {
+                if let Some(scope) = self.cell_bound.last_mut() {
+                    scope.insert(name.clone(), (*upvalue_node, owner));
+                }
+            }
+            pending_cell_captures.clear();
+        }
 
         // Unified entry: memoize/tail_rec/non_tail_rec apply equally to closures
         // (the lambda is not in the call_graph, so `lookup_memo_strategy` returns None -> the
@@ -461,7 +492,18 @@ impl<'a> IrBuilder<'a> {
                     inputs_offset,
                     compute_fn: CF_NOOP,
                 });
+                // Cell-capture registration (see compile_lambda): the check
+                // MUST precede bind_var (binding-identity guard).
+                let is_cell_capture = self.lookup_cell_binding(name).is_some();
                 self.bind_var(name, upvalue_node);
+                if is_cell_capture {
+                    if let Some(scope) = self.cell_bound.last_mut() {
+                        scope.insert(
+                            name.clone(),
+                            (upvalue_node, self.current_function_id),
+                        );
+                    }
+                }
             }
 
             // 4. Compile the method body.
@@ -537,6 +579,7 @@ impl<'a> IrBuilder<'a> {
         let mut ident_names: Vec<String> = Vec::new();
         self.collect_free_idents_expr(operand, &mut ident_names);
         let mut captured: Vec<(String, NodeId)> = Vec::new();
+        let mut pending_cell_captures: Vec<(String, NodeId)> = Vec::new();
         for name in &ident_names {
             if let Some(node) = self.lookup_var(name) {
                 if !captured.iter().any(|(n, _)| n == name) {
@@ -561,10 +604,39 @@ impl<'a> IrBuilder<'a> {
                 inputs_offset,
                 compute_fn: CF_NOOP,
             });
+            // Cell-capture registration (place model 4): when the outer
+            // binding is cell-backed, the upvalue carries the SHARED cell Arc
+            // (construct wraps it once, call unwraps that layer). Routing the
+            // body's reads/writes through deref ops on it gives by-ref
+            // capture semantics via the shared cell — no WriteBack machinery.
+            // Without this, reads would leak the Arc as a plain value.
+            // NOTE: the eligibility check MUST run before bind_var — once the
+            // name rebinds to the upvalue, the binding-identity guard
+            // correctly reports it no longer points at the outer cell.
+            let is_cell_capture = self.lookup_cell_binding(name).is_some();
             self.bind_var(name, upvalue_node);
+            if is_cell_capture {
+                // Registration is DEFERRED to just before the body compile:
+                // the owner tag must match the id the BODY compiles under
+                // (escaping lambdas switch function_id below), or the body's
+                // lookups filter their own registration out and fall back to
+                // the WriteBack path.
+                pending_cell_captures.push((name.clone(), upvalue_node));
+            }
         }
 
-        // 4. Compile the operand to obtain the return node.
+        // 4. Register deferred cell captures (no escape id switch in lazy
+        //    thunks — registering here keeps the pattern uniform), then
+        //    compile the operand.
+        if !pending_cell_captures.is_empty() {
+            let owner = self.current_function_id;
+            for (name, upvalue_node) in &pending_cell_captures {
+                if let Some(scope) = self.cell_bound.last_mut() {
+                    scope.insert(name.clone(), (*upvalue_node, owner));
+                }
+            }
+            pending_cell_captures.clear();
+        }
         let return_node = self.compile_expr(operand);
         self.exit_scope();
 

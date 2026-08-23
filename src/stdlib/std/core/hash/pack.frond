@@ -1,0 +1,17 @@
+// std/core/hash package declaration
+//
+// Hash algorithm collection (one pack per algorithm, the codec Hex/Base64
+// pattern). All deterministic, portable pure Frond, none cryptographic:
+//
+//   Hash    — FNV-1a 64 primitives + the collections generic-key scheme
+//             and the fmix64 integer mixer
+//   Crc32   — CRC-32/ISO-HDLC (zlib/zip/png compatible)
+//   Adler32 — zlib's Adler-32
+//   Xxh64   — xxHash64, the fast non-crypto digest
+//
+// One import (`import std.core.hash`) exposes every algorithm pack and
+// every entry (Crc32.crc32, Xxh64.xxh64, ...).
+pub pack Hash
+pub pack Crc32
+pub pack Adler32
+pub pack Xxh64

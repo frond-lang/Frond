@@ -114,6 +114,7 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
             debug_assert!(loop_kind <= 0b1111);
             let mut flags: u8 = sg.has_suspend as u8;
             flags |= (sg.reset_plan.is_some() as u8) << 1;
+            flags |= (sg.converter_generated as u8) << 2;
             flags |= loop_kind << 4;
 
             write_u32(&mut sg_buf, sg.node_range.0.0);
@@ -171,6 +172,16 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
                 for nid in &rp.reset_to_one { write_u32(&mut reset_plan_buf, nid.0); }
                 write_u32(&mut reset_plan_buf, rp.reset_condition_tree.len() as u32);
                 for nid in &rp.reset_condition_tree { write_u32(&mut reset_plan_buf, nid.0); }
+                write_u32(&mut reset_plan_buf, rp.carries_value.len() as u32);
+                for (p, v) in &rp.carries_value {
+                    write_u32(&mut reset_plan_buf, p.0);
+                    write_u32(&mut reset_plan_buf, v.0);
+                }
+                write_u32(&mut reset_plan_buf, rp.carries_cell.len() as u32);
+                for (p, c) in &rp.carries_cell {
+                    write_u32(&mut reset_plan_buf, p.0);
+                    write_u32(&mut reset_plan_buf, c.0);
+                }
             }
         }
 
@@ -228,7 +239,6 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
     ser_sparse_opt!(sections, graph, field_access_infos, FieldAccessInfos, |b, v| write_u16(b, *v));
     ser_sparse_opt!(sections, graph, vtable_call_methods, VtableCallMethods, |b, v| write_u16(b, *v));
     ser_sparse_opt!(sections, graph, await_event_sources, AwaitEventSources, |b, v| write_u32(b, v.0));
-    ser_sparse_opt!(sections, graph, writeback_targets, WritebackTargets, |b, v| write_u32(b, v.0));
     ser_sparse_opt!(sections, graph, global_load_slots, GlobalLoadSlots, |b, v| write_u32(b, *v));
     ser_sparse_opt!(sections, graph, global_store_slots, GlobalStoreSlots, |b, v| write_u32(b, *v));
     ser_sparse_opt!(sections, graph, pattern_field_indices, PatternFieldIndices, |b, v| write_u16(b, *v));
@@ -248,6 +258,32 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
             body.extend_from_slice(data);
         }
         sections.push((SectionKind::Resources, body));
+    }
+
+    // Inheritance links (v8): self-contained string-pair section.
+    {
+        let mut body: Vec<u8> = Vec::new();
+        write_u32(&mut body, graph.inheritance_links.len() as u32);
+        for (child, base) in &graph.inheritance_links {
+            write_u32(&mut body, child.len() as u32);
+            body.extend_from_slice(child.as_bytes());
+            write_u32(&mut body, base.len() as u32);
+            body.extend_from_slice(base.as_bytes());
+        }
+        sections.push((SectionKind::InheritanceLinks, body));
+    }
+
+    // Vtable fallback dispatch (v8).
+    {
+        let mut body: Vec<u8> = Vec::new();
+        write_u32(&mut body, graph.vtable_fallback_dispatch.len() as u32);
+        for ((idx, name), sg) in &graph.vtable_fallback_dispatch {
+            write_u16(&mut body, *idx);
+            write_u32(&mut body, name.len() as u32);
+            body.extend_from_slice(name.as_bytes());
+            write_u32(&mut body, sg.0);
+        }
+        sections.push((SectionKind::VtableFallback, body));
     }
 
     // ---- per-Node boolean tables (category B; dense bitmaps stay) ----
@@ -719,6 +755,53 @@ fn parse_resources_section(mem: &GraphMemory) -> Vec<(Arc<str>, Arc<[u8]>)> {
     out
 }
 
+/// Parses the v8 InheritanceLinks section (self-contained
+/// `[count u32]{ child_len, child, base_len, base }` string pairs).
+fn parse_inheritance_links_section(mem: &GraphMemory) -> Vec<(Box<str>, Box<str>)> {
+    if !mem.has_section(SectionKind::InheritanceLinks) {
+        return Vec::new();
+    }
+    let r = mem.section(SectionKind::InheritanceLinks);
+    let count = u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut p = 4usize;
+    for _ in 0..count {
+        let cl = u32::from_le_bytes([r[p], r[p + 1], r[p + 2], r[p + 3]]) as usize;
+        p += 4;
+        let child = String::from_utf8_lossy(&r[p..p + cl]).into_owned();
+        p += cl;
+        let bl = u32::from_le_bytes([r[p], r[p + 1], r[p + 2], r[p + 3]]) as usize;
+        p += 4;
+        let base = String::from_utf8_lossy(&r[p..p + bl]).into_owned();
+        p += bl;
+        out.push((child.into(), base.into()));
+    }
+    out
+}
+
+/// Parses the v8 VtableFallback section: (idx, type_name) -> SubGraphId.
+fn parse_vtable_fallback_section(mem: &GraphMemory) -> rustc_hash::FxHashMap<(u16, Box<str>), crate::ir::Ir::SubGraphId> {
+    let mut out = rustc_hash::FxHashMap::default();
+    if !mem.has_section(SectionKind::VtableFallback) {
+        return out;
+    }
+    let r = mem.section(SectionKind::VtableFallback);
+    let count = u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as usize;
+    let mut p = 4usize;
+    for _ in 0..count {
+        let idx = u16::from_le_bytes([r[p], r[p + 1]]);
+        p += 2;
+        let nl = u32::from_le_bytes([r[p], r[p + 1], r[p + 2], r[p + 3]]) as usize;
+        p += 4;
+        let name = String::from_utf8_lossy(&r[p..p + nl]).into_owned();
+        p += nl;
+        let sg = u32::from_le_bytes([r[p], r[p + 1], r[p + 2], r[p + 3]]);
+        p += 4;
+        out.insert((idx, name.into()), crate::ir::Ir::SubGraphId(sg));
+    }
+    out
+}
+
 /// Rebuilds an owned `DataFlowGraph` from a `GraphMemory` (shared parsing logic).
 fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     let n = mem.header().node_count as usize;
@@ -787,6 +870,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
             let has_suspend = flags & 1 != 0;
             let has_rp = flags & 0b10 != 0;
             let loop_kind = u8_to_loop_kind(flags >> 4);
+            let converter_generated = flags & 0b100 != 0;
             let upvalue_count = read_u8(&mut sr_r);
             let loop_parent_sg = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(SubGraphId(v)) } };
             let cond_node = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(NodeId(v)) } };
@@ -835,13 +919,14 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
             }
 
             subgraphs.push(SubGraph {
+                converter_generated,
                 id: SubGraphId(i as u32),
                 node_range, param_count, entry_node, return_node, has_suspend,
                 event_source_decls, defer_table, loop_kind, loop_parent_sg, cond_node,
                 function_id, iter_next_node, upvalue_count, upvalue_outer_nodes,
                 nested_ranges: Vec::new(), // derived post-assembly (v3)
                 reset_plan: None,           // filled below once slice ends are known
-            });
+                    });
 
             // Reset plans parse in the pass below (a plan's slice ends where
             // the next sg's slice starts); park a marker on the struct now.
@@ -849,6 +934,8 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
                 subgraphs[i].reset_plan = Some(ResetPlan {
                     reset_to_zero: Vec::new(), reset_to_one: Vec::new(),
                     reset_condition_tree: Vec::new(), condition_tree_plan: Vec::new(),
+                        carries_value: Vec::new(), carries_cell: Vec::new(),
+                    fused_carries: Vec::new(),
                 });
             }
         }
@@ -865,7 +952,15 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
                 let reset_to_one: Vec<NodeId> = (0..ro_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
                 let rc_len = read_u32(&mut rp_r) as usize;
                 let reset_condition_tree: Vec<NodeId> = (0..rc_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
-                sg.reset_plan = Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree, condition_tree_plan: Vec::new() });
+                let cv_len = read_u32(&mut rp_r) as usize;
+                let carries_value: Vec<(NodeId, NodeId)> = (0..cv_len)
+                    .map(|_| (NodeId(read_u32(&mut rp_r)), NodeId(read_u32(&mut rp_r))))
+                    .collect();
+                let cc_len = read_u32(&mut rp_r) as usize;
+                let carries_cell: Vec<(NodeId, NodeId)> = (0..cc_len)
+                    .map(|_| (NodeId(read_u32(&mut rp_r)), NodeId(read_u32(&mut rp_r))))
+                    .collect();
+                sg.reset_plan = Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree, condition_tree_plan: Vec::new(), carries_value, carries_cell, fused_carries: Vec::new() });
             }
         }
         subgraphs
@@ -910,8 +1005,6 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     let call_targets: Vec<Option<SubGraphId>> = scatter_a_u32(SectionKind::CallTargets)
         .into_iter().map(|o| o.map(SubGraphId)).collect();
     let await_event_sources: Vec<Option<NodeId>> = scatter_a_u32(SectionKind::AwaitEventSources)
-        .into_iter().map(|o| o.map(NodeId)).collect();
-    let writeback_targets: Vec<Option<NodeId>> = scatter_a_u32(SectionKind::WritebackTargets)
         .into_iter().map(|o| o.map(NodeId)).collect();
     let global_load_slots: Vec<Option<u32>> = scatter_a_u32(SectionKind::GlobalLoadSlots);
     let global_store_slots: Vec<Option<u32>> = scatter_a_u32(SectionKind::GlobalStoreSlots);
@@ -1178,6 +1271,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         sg_initial_seed: Vec::new(),
         downstream_counts: Vec::new(),
         linear_plans: Vec::new(),
+        converter_scope: false,
         nodes,
         inputs_pool,
         subgraphs,
@@ -1201,7 +1295,6 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         embed_infos,
         resources,
         select_infos,
-        writeback_targets,
         tail_call_flags,
         safe_op_flags,
         hoisted_node,
@@ -1221,7 +1314,8 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         cast_target_types,
         memo_infos,
         memo_tables,
-        vtable_fallback_dispatch: rustc_hash::FxHashMap::default(),
+        vtable_fallback_dispatch: parse_vtable_fallback_section(&mem),
+        inheritance_links: parse_inheritance_links_section(&mem),
         sg_debug_names: Vec::new(),
         string_pool,
         mem: None,
@@ -1287,6 +1381,7 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
             let has_suspend = flags & 1 != 0;
             let has_rp = flags & 0b10 != 0;
             let loop_kind = u8_to_loop_kind(flags >> 4);
+            let converter_generated = flags & 0b100 != 0;
             let upvalue_count = read_u8(&mut sr_r);
             let loop_parent_sg = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(SubGraphId(v)) } };
             let cond_node = { let v = read_u32(&mut sr_r); if v == u32::MAX { None } else { Some(NodeId(v)) } };
@@ -1331,18 +1426,21 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
             }
 
             subgraphs.push(SubGraph {
+                converter_generated,
                 id: SubGraphId(i as u32),
                 node_range, param_count, entry_node, return_node, has_suspend,
                 event_source_decls, defer_table, loop_kind, loop_parent_sg, cond_node,
                 function_id, iter_next_node, upvalue_count, upvalue_outer_nodes,
                 nested_ranges: Vec::new(), // derived post-assembly (v3)
                 reset_plan: None,
-            });
+                    });
 
             if has_rp {
                 subgraphs[i].reset_plan = Some(ResetPlan {
                     reset_to_zero: Vec::new(), reset_to_one: Vec::new(),
                     reset_condition_tree: Vec::new(), condition_tree_plan: Vec::new(),
+                        carries_value: Vec::new(), carries_cell: Vec::new(),
+                    fused_carries: Vec::new(),
                 });
             }
         }
@@ -1358,7 +1456,15 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
                 let reset_to_one: Vec<NodeId> = (0..ro_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
                 let rc_len = read_u32(&mut rp_r) as usize;
                 let reset_condition_tree: Vec<NodeId> = (0..rc_len).map(|_| NodeId(read_u32(&mut rp_r))).collect();
-                sg.reset_plan = Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree, condition_tree_plan: Vec::new() });
+                let cv_len = read_u32(&mut rp_r) as usize;
+                let carries_value: Vec<(NodeId, NodeId)> = (0..cv_len)
+                    .map(|_| (NodeId(read_u32(&mut rp_r)), NodeId(read_u32(&mut rp_r))))
+                    .collect();
+                let cc_len = read_u32(&mut rp_r) as usize;
+                let carries_cell: Vec<(NodeId, NodeId)> = (0..cc_len)
+                    .map(|_| (NodeId(read_u32(&mut rp_r)), NodeId(read_u32(&mut rp_r))))
+                    .collect();
+                sg.reset_plan = Some(ResetPlan { reset_to_zero, reset_to_one, reset_condition_tree, condition_tree_plan: Vec::new(), carries_value, carries_cell, fused_carries: Vec::new() });
             }
         }
         (subgraphs, sg_uv_offsets)
@@ -1428,8 +1534,6 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
     let call_targets: Vec<Option<SubGraphId>> = scatter_a_u32(SectionKind::CallTargets)
         .into_iter().map(|o| o.map(SubGraphId)).collect();
     let await_event_sources: Vec<Option<NodeId>> = scatter_a_u32(SectionKind::AwaitEventSources)
-        .into_iter().map(|o| o.map(NodeId)).collect();
-    let writeback_targets: Vec<Option<NodeId>> = scatter_a_u32(SectionKind::WritebackTargets)
         .into_iter().map(|o| o.map(NodeId)).collect();
     let global_load_slots: Vec<Option<u32>> = scatter_a_u32(SectionKind::GlobalLoadSlots);
     let global_store_slots: Vec<Option<u32>> = scatter_a_u32(SectionKind::GlobalStoreSlots);
@@ -1572,6 +1676,7 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         sg_initial_seed: Vec::new(),
         downstream_counts: Vec::new(),
         linear_plans: Vec::new(),
+        converter_scope: false,
         nodes: Vec::new(),
         inputs_pool: InputsPool::new(),
         subgraphs,
@@ -1595,7 +1700,6 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         embed_infos,
         resources,
         select_infos: Vec::new(),
-        writeback_targets,
         tail_call_flags: Vec::new(),
         safe_op_flags: Vec::new(),
         hoisted_node: vec![false; n],
@@ -1615,7 +1719,8 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         cast_target_types,
         memo_infos,
         memo_tables,
-        vtable_fallback_dispatch: rustc_hash::FxHashMap::default(),
+        vtable_fallback_dispatch: parse_vtable_fallback_section(&mem),
+        inheritance_links: parse_inheritance_links_section(&mem),
         sg_debug_names: Vec::new(),
         string_pool,
         mem: Some(mem),
@@ -1718,273 +1823,3 @@ pub fn inspect_solidify(data: &[u8]) -> io::Result<SolidifyInfo> {
 
 // ==================== Roundtrip tests (v2) ====================
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ir::Ir::*;
-
-    /// Builds a small synthetic graph exercising every serialized surface:
-    /// two function subgraphs (entry + callee), a cross-function Call node,
-    /// a Gate with branches, Const values (incl. Str), closure/partial/lazy
-    /// metadata, FFI call names, boolean flags, writeback/global slots and a
-    /// defer entry.
-    fn build_sample_graph() -> DataFlowGraph {
-        let mut g = DataFlowGraph::new();
-
-        // Callee function sg: [param, add, return] — nodes 0..3
-        let callee_sg = g.add_subgraph(SubGraph {
-            id: SubGraphId(0),
-            node_range: (NodeId(0), NodeId(3)),
-            param_count: 2,
-            entry_node: NodeId(0),
-            return_node: NodeId(2),
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: Vec::new(),
-            loop_kind: LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 0,
-            iter_next_node: None,
-            upvalue_count: 0,
-            upvalue_outer_nodes: Vec::new(),
-            nested_ranges: Vec::new(),
-            reset_plan: None,
-        });
-
-        // callee nodes: param placeholders + an add
-        let off = g.inputs_pool.push(&[]);
-        g.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: off, compute_fn: CF_NOOP });
-        let off = g.inputs_pool.push(&[]);
-        g.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: off, compute_fn: CF_NOOP });
-        let off = g.inputs_pool.push(&[NodeId(0), NodeId(1)]);
-        g.add_node(Node { kind: NodeKind::BinOp, input_count: 2, inputs_offset: off, compute_fn: ComputeFnId(1) });
-        g.const_values[2] = Some(ConstValue::I32(7));
-
-        // Entry function sg: [const "hi", const 42, const true, gate, call]
-        let entry_start = g.nodes.len() as u32;
-        g.add_subgraph(SubGraph {
-            id: SubGraphId(1),
-            node_range: (NodeId(entry_start), NodeId(entry_start + 5)),
-            param_count: 0,
-            entry_node: NodeId(entry_start),
-            return_node: NodeId(entry_start + 4),
-            has_suspend: false,
-            event_source_decls: Vec::new(),
-            defer_table: vec![DeferEntry {
-                trigger_node: NodeId(entry_start + 4),
-                body_subgraph: SubGraphId(0),
-                captured_inputs: vec![NodeId(entry_start)],
-                registered: false,
-            }],
-            loop_kind: LoopKind::None,
-            loop_parent_sg: None,
-            cond_node: None,
-            function_id: 1,
-            iter_next_node: None,
-            upvalue_count: 0,
-            upvalue_outer_nodes: Vec::new(),
-            nested_ranges: Vec::new(),
-            reset_plan: Some(ResetPlan {
-                reset_to_zero: vec![NodeId(entry_start)],
-                reset_to_one: vec![],
-                reset_condition_tree: vec![],
-                condition_tree_plan: Vec::new(),
-            }),
-        });
-
-        // string pool for the Str const
-        let pool: Arc<[u8]> = Arc::from(b"hello world".to_vec());
-        g.string_pool = pool;
-
-        // const "hello" (Str), const 42 (I64), const true (Bool)
-        let e0 = entry_start as usize;
-        let off = g.inputs_pool.push(&[]);
-        g.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: off, compute_fn: CF_NOOP });
-        g.const_values[e0] = Some(ConstValue::Str { offset: 0, len: 11 });
-        let off = g.inputs_pool.push(&[]);
-        g.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: off, compute_fn: CF_NOOP });
-        g.const_values[e0 + 1] = Some(ConstValue::I64(42));
-        let off = g.inputs_pool.push(&[]);
-        g.add_node(Node { kind: NodeKind::Const, input_count: 0, inputs_offset: off, compute_fn: CF_NOOP });
-        g.const_values[e0 + 2] = Some(ConstValue::Bool(true));
-
-        // Gate node (branch target = callee sg)
-        let off = g.inputs_pool.push(&[NodeId((e0 + 2) as u32)]);
-        let gate = g.add_node(Node { kind: NodeKind::Gate, input_count: 1, inputs_offset: off, compute_fn: ComputeFnId(47) });
-        g.set_gate_branches(gate, GateBranches {
-            condition_input: NodeId((e0 + 2) as u32),
-            branches: vec![(true, SubGraphId(0), vec![NodeId(e0 as u32), NodeId((e0 + 1) as u32)])],
-            capture: true,
-        });
-
-        // Call node → callee
-        let off = g.inputs_pool.push(&[NodeId((e0 + 1) as u32), gate]);
-        let call = g.add_node(Node { kind: NodeKind::Call, input_count: 2, inputs_offset: off, compute_fn: ComputeFnId(36) });
-        g.set_call_target(call, SubGraphId(0));
-        g.set_tail_call(call);
-
-        // Metadata coverage (gate + call nodes as hosts)
-        g.set_writeback_target(gate, NodeId((e0 + 1) as u32));
-        g.set_global_load_slot(gate, 3);
-        g.set_global_store_slot(call, 4);
-        g.set_ffi_call_name(call, "frond_extern_test".to_string());
-        g.set_cast_target_type(gate, "i32".to_string());
-        g.set_closure_info(gate, ClosureInfo { subgraph_id: callee_sg, arity: 2, self_upvalue_idx: -1 });
-        g.set_partial_info(gate, PartialInfo { subgraph_id: callee_sg, bound_count: 1 });
-        g.set_lazy_construct_info(gate, LazyConstructInfo { thunk_sg: callee_sg });
-        g.set_memo_info(gate, MemoInfo { table_index: 1, param_count: 2 });
-        g.set_field_access_info(gate, 9);
-        g.set_vtable_call(gate, 2);
-        g.set_await_event_source(gate, NodeId(e0 as u32));
-        g.set_closure_call_arg_count(call, 2);
-        g.set_pattern_ctor_name(call, "Some".to_string());
-        g.set_pattern_type_name(call, "Option".to_string());
-        g.set_pattern_field_index(call, 1);
-        g.set_safe_op(gate);
-        g.set_slice_inclusive(call, true);
-        g.set_dyn_ffi_info(call, DynFfiInfo {
-            symbol: "frond_extern_test".to_string(),
-            sig: crate::ffi::Abi::AbiSig::new(
-                vec![crate::ffi::Abi::AbiType::Int { bits: 64, signed: false }],
-                crate::ffi::Abi::AbiType::Void,
-            ),
-            arg_count: 1,
-        });
-        g.set_record_lit_info(gate, RecordLitInfo {
-            type_name: "P".to_string(),
-            field_names: vec![Some("x".to_string()), None],
-            constructor: "P".to_string(),
-            kind: RecordLitKind::Record,
-        });
-        g.set_select_info(gate, SelectInfo {
-            branches: vec![SelectBranch { subgraph_id: SubGraphId(0), event_kind: EventSourceKind::SubgraphComplete, event_source_node: NodeId(e0 as u32) }],
-        });
-        g.set_trait_construct_info(gate, TraitConstructInfo {
-            trait_name: "T".to_string(),
-            method_names: vec!["m".to_string()],
-            methods: vec![TraitMethodEntry { subgraph_id: SubGraphId(0), arity: 1, upvalue_count: 0 }],
-        });
-        g.set_record_extend_info(gate, RecordExtendInfo { update_names: vec!["y".to_string()] });
-        g.set_batch_info(gate, BatchInfo { tag: crate::value::ValueTag::I32, op: BatchOp::Bin(crate::value::BinOp::Add) });
-
-        g.set_entry_subgraph(SubGraphId(1));
-        g.compute_downstreams();
-        g
-    }
-
-    /// Field-by-field semantic comparison through the mem-agnostic accessors —
-    /// the exact surfaces the engine reads.
-    fn assert_graphs_equal(a: &DataFlowGraph, b: &DataFlowGraph) {
-        assert_eq!(a.node_count(), b.node_count());
-        let n = a.node_count();
-        for i in 0..n {
-            let na = a.node(i);
-            let nb = b.node(i);
-            assert_eq!(format!("{:?}", na.kind), format!("{:?}", nb.kind), "node {i} kind");
-            assert_eq!(na.input_count, nb.input_count, "node {i} input_count");
-            assert_eq!(na.compute_fn.0, nb.compute_fn.0, "node {i} compute_fn");
-            let ia = a.inputs(na.inputs_offset, na.input_count);
-            let ib = b.inputs(nb.inputs_offset, nb.input_count);
-            assert_eq!(ia, ib, "node {i} inputs");
-            // Str consts are re-interned per pool: compare resolved bytes, not offsets.
-            let (ca, cb) = (a.const_value(i), b.const_value(i));
-            match (&ca, &cb) {
-                (Some(ConstValue::Str { offset: o1, len: l1 }), Some(ConstValue::Str { offset: o2, len: l2 })) => {
-                    assert_eq!(l1, l2, "node {i} str len");
-                    let s1 = &a.string_pool_slice()[*o1 as usize..(*o1 + *l1) as usize];
-                    let s2 = &b.string_pool_slice()[*o2 as usize..(*o2 + *l2) as usize];
-                    assert_eq!(s1, s2, "node {i} str bytes");
-                }
-                _ => assert_eq!(format!("{:?}", ca), format!("{:?}", cb), "node {i} const_value"),
-            }
-            assert_eq!(a.call_target(i), b.call_target(i), "node {i} call_target");
-            assert_eq!(a.field_access_info(i), b.field_access_info(i));
-            assert_eq!(a.vtable_call_method(i), b.vtable_call_method(i));
-            assert_eq!(a.await_event_source(i), b.await_event_source(i));
-            assert_eq!(a.writeback_target(i), b.writeback_target(i));
-            assert_eq!(a.global_load_slot(i), b.global_load_slot(i));
-            assert_eq!(a.global_store_slot(i), b.global_store_slot(i));
-            assert_eq!(a.pattern_field_index(i), b.pattern_field_index(i));
-            assert_eq!(a.closure_call_arg_count(i), b.closure_call_arg_count(i));
-            assert_eq!(a.tail_call_flag(i), b.tail_call_flag(i));
-            assert_eq!(a.safe_op_flag(i), b.safe_op_flag(i));
-            assert_eq!(a.slice_inclusive(i), b.slice_inclusive(i));
-            assert_eq!(a.ffi_call_name(i), b.ffi_call_name(i));
-            assert_eq!(a.field_set_name(i), b.field_set_name(i));
-            assert_eq!(a.pattern_ctor_name(i), b.pattern_ctor_name(i));
-            assert_eq!(a.pattern_type_name(i), b.pattern_type_name(i));
-            assert_eq!(a.cast_target_type(i), b.cast_target_type(i));
-            assert_eq!(format!("{:?}", a.closure_info(i)), format!("{:?}", b.closure_info(i)));
-            assert_eq!(format!("{:?}", a.partial_info(i)), format!("{:?}", b.partial_info(i)));
-            assert_eq!(format!("{:?}", a.lazy_construct_info(i)), format!("{:?}", b.lazy_construct_info(i)));
-            assert_eq!(format!("{:?}", a.memo_info(i)), format!("{:?}", b.memo_info(i)));
-            assert_eq!(format!("{:?}", a.dyn_ffi_info(i)), format!("{:?}", b.dyn_ffi_info(i)));
-            assert_eq!(format!("{:?}", a.batch_info(i)), format!("{:?}", b.batch_info(i)));
-            assert_eq!(format!("{:?}", a.record_lit_info_at(i)), format!("{:?}", b.record_lit_info_at(i)));
-            assert_eq!(format!("{:?}", a.select_info_at(i)), format!("{:?}", b.select_info_at(i)));
-            assert_eq!(format!("{:?}", a.trait_construct_info_at(i)), format!("{:?}", b.trait_construct_info_at(i)));
-            assert_eq!(format!("{:?}", a.record_extend_info_at(i)), format!("{:?}", b.record_extend_info_at(i)));
-            let gba = format!("{:?}", a.gate_branches_at(i));
-            let gbb = format!("{:?}", b.gate_branches_at(i));
-            assert_eq!(gba, gbb, "node {i} gate_branches");
-            assert_eq!(a.downstream_slice(i), b.downstream_slice(i), "node {i} downstreams");
-        }
-        assert_eq!(a.subgraphs.len(), b.subgraphs.len());
-        for (sa, sb) in a.subgraphs.iter().zip(b.subgraphs.iter()) {
-            assert_eq!(sa.id, sb.id);
-            assert_eq!(sa.node_range, sb.node_range);
-            assert_eq!(sa.param_count, sb.param_count);
-            assert_eq!(sa.entry_node, sb.entry_node);
-            assert_eq!(sa.return_node, sb.return_node);
-            assert_eq!(sa.has_suspend, sb.has_suspend);
-            assert_eq!(format!("{:?}", sa.loop_kind), format!("{:?}", sb.loop_kind));
-            assert_eq!(sa.loop_parent_sg, sb.loop_parent_sg);
-            assert_eq!(sa.cond_node, sb.cond_node);
-            assert_eq!(sa.function_id, sb.function_id);
-            assert_eq!(sa.iter_next_node, sb.iter_next_node);
-            assert_eq!(sa.upvalue_count, sb.upvalue_count);
-            assert_eq!(sa.defer_table.len(), sb.defer_table.len());
-            for (da, db) in sa.defer_table.iter().zip(sb.defer_table.iter()) {
-                assert_eq!(da.trigger_node, db.trigger_node);
-                assert_eq!(da.body_subgraph, db.body_subgraph);
-                assert_eq!(da.captured_inputs, db.captured_inputs);
-            }
-            assert_eq!(
-                sa.reset_plan.as_ref().map(|p| &p.reset_to_zero),
-                sb.reset_plan.as_ref().map(|p| &p.reset_to_zero),
-            );
-            assert_eq!(sa.nested_ranges, sb.nested_ranges, "sg {} nested_ranges", sa.id.0);
-            assert_eq!(sa.reset_plan.as_ref().map(|p| &p.reset_condition_tree), sb.reset_plan.as_ref().map(|p| &p.reset_condition_tree));
-        }
-        assert_eq!(a.entry_subgraph, b.entry_subgraph);
-    }
-
-    #[test]
-    fn v2_roundtrip_eager_and_zerocopy() {
-        let g = build_sample_graph();
-        let bytes = serialize_solidify(&g);
-        assert!(bytes.len() < 2048, "sample artifact unexpectedly large: {}", bytes.len());
-
-        // Eager (owned) path.
-        let eager = load_solidify_from_bytes(&bytes).expect("eager load");
-        assert_graphs_equal(&g, &eager);
-
-        // Zerocopy (mmap-style) path.
-        let zc = load_zerocopy_from_bytes(bytes.clone()).expect("zerocopy load");
-        assert_graphs_equal(&g, &zc);
-
-        // The two load paths must agree with each other too.
-        assert_graphs_equal(&eager, &zc);
-    }
-
-    #[test]
-    fn v2_rejects_corruption() {
-        let g = build_sample_graph();
-        let mut bytes = serialize_solidify(&g);
-        // Corrupt one body byte -> CRC mismatch.
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xFF;
-        assert!(load_solidify_from_bytes(&bytes).is_err());
-    }
-}

@@ -1,0 +1,5 @@
+// builtin mem package declaration
+//
+// Exposes the u8[] buffer primitives to std/core/mem (the C fast path of
+// the generic container facade).
+pub pack Raw

@@ -10,6 +10,44 @@ impl<'a> IrBuilder<'a> {
         expr_id: crate::ast::Ast::ExprId,
         name: &str,
     ) -> NodeId {
+        // Cell-backed binding (place model): name reads route through the
+        // shared Cell (CF_DEREF_READ on the cell node), so `*r = v` and
+        // `x = v` writes are observed in source order.
+        // COMPILE-TIME FORWARDING (C1-③, the mem2reg equivalent): when the
+        // Builder knows the cell's current value (last store, non-escaped),
+        // the read reuses that node directly — a zero-cost SSA edge, exactly
+        // the pre-place-model lowering for straight-line code. Barriers
+        // (loop bodies, branch exits, defer bodies) drop the memory and fall
+        // back to real loads.
+        // `current_effect` is appended as a DIRECT input on the load path
+        // (scheduler-ordering only — the compute fn reads inputs[0]): a
+        // CF_SEQ wrapper would not stop the read from firing before a prior
+        // cell/deref write (the SEQ merely waits for both, it does not order
+        // input computation). Same pattern as `compile_global_load`.
+        if let Some(cell_node) = self.lookup_cell_binding(name) {
+            if let Some(value_node) = self.cell_forwarded_value(cell_node) {
+                return match self.current_effect {
+                    Some(eff) => self.chain_effects(Some(eff), value_node),
+                    None => value_node,
+                };
+            }
+            let (input_count, inputs_offset) = match self.current_effect {
+                Some(eff) => (2, self.graph.inputs_pool.push(&[cell_node, eff])),
+                None => (1, self.graph.inputs_pool.push(&[cell_node])),
+            };
+            let load_node = self.graph.add_node(Node {
+                kind: NodeKind::UnOp,
+                input_count,
+                inputs_offset,
+                compute_fn: CF_DEREF_READ,
+            });
+            // Remember the load as the cell's current value: subsequent reads
+            // in the SAME body execution reuse it (the load node re-executes
+            // every iteration / dominates later same-frame code, so the
+            // forwarded value is the live one).
+            self.track_cell_store(cell_node, load_node);
+            return load_node;
+        }
         match self.lookup_var(name) {
             Some(node_id) => {
                 // When `current_effect` exists, create a CF_SEQ dependency node to ensure the
@@ -89,6 +127,25 @@ impl<'a> IrBuilder<'a> {
         let target_expr = &self.current_module().arena.expr(target).node;
         match target_expr {
             crate::ast::Ast::Expr::Ident(name) => {
+                // Cell-backed binding (mirror of Stmt::Assignment): `x = v`
+                // writes through the shared Cell; no rebind (reads route
+                // through the cell). Effect rides as a direct trailing input
+                // (scheduler ordering only).
+                if let Some(cell_node) = self.lookup_cell_binding(name) {
+                    let (input_count, inputs_offset) = match self.current_effect {
+                        Some(eff) => (3, self.graph.inputs_pool.push(&[cell_node, val_node, eff])),
+                        None => (2, self.graph.inputs_pool.push(&[cell_node, val_node])),
+                    };
+                    let write_node = self.graph.add_node(Node {
+                        kind: NodeKind::BinOp,
+                        input_count,
+                        inputs_offset,
+                        compute_fn: CF_DEREF_WRITE,
+                    });
+                    self.track_cell_store(cell_node, val_node);
+                    self.current_effect = Some(write_node);
+                    return self.compile_void_const();
+                }
                 // Implicit-this field assignment: `field = value` inside a method body
                 // resolves to `this.field = value`. Without this, the bare name would
                 // create a local binding instead of mutating the instance field.
@@ -110,27 +167,10 @@ impl<'a> IrBuilder<'a> {
                     self.current_effect = Some(self.chain_effects(self.current_effect, set_node));
                     return self.compile_void_const();
                 }
-                let captured_source = self.captured_scopes.iter().rev()
-                    .find_map(|scope| scope.iter()
-                        .find(|(n, _)| n.as_str() == *name)
-                        .map(|(_, node)| *node));
-                if let Some(source) = captured_source {
-                    let wb_node = self.compile_writeback_node(val_node, source);
-                    self.bind_var(name, val_node);
-                    self.current_effect = Some(wb_node);
-                } else if let Some(outer_node) = self.lookup_var(name) {
-                    if !self.is_in_current_subgraph(outer_node) {
-                        let wb_node = self.compile_writeback_node(val_node, outer_node);
-                        self.bind_var(name, val_node);
-                        self.current_effect = Some(wb_node);
-                    } else if let Some(&captured_node) = self.captured_vars.get(*name) {
-                        let wb_node = self.compile_writeback_node(val_node, captured_node);
-                        self.bind_var(name, val_node);
-                        self.current_effect = Some(wb_node);
-                    } else {
-                        self.bind_var(name, val_node);
-                    }
-                } else if let Some(slot) = self.lookup_global_var(name) {
+                // B/C deletion: the WriteBack ladder is gone (all assigned
+                // names are cell-backed; the cell path above handles them).
+                // Remaining: globals store, plain rebind.
+                if let Some(slot) = self.lookup_global_var(name) {
                     let store_node = self.compile_global_store(val_node, slot);
                     self.current_effect = Some(store_node);
                 } else {

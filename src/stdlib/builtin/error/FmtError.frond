@@ -1,0 +1,27 @@
+// FmtError: error type returned when a formatting operation fails
+//
+// Usage:
+//   - Fmt.radix/dec/hex/oct/bin return Throw<_, FmtError> when the base is
+//     outside 2..36 or the input is not an integer type (these used to
+//     return "" silently — a bad argument produced a hole in the output
+//     instead of an error)
+//   - Field semantics (aligned with the error family):
+//       kind   : error category (exhaustive ADT)
+//       message: human readable description
+//       value  : string representation of the input that triggered the error
+//
+// As a builtin error_newtype, it automatically gets the Error trait's
+// message() default implementation (reads the message field).
+// type_name() override returns "fmt error" for easy identification in logs.
+type FmtError: Err = FmtError(
+    pub kind: FmtErrorKind,
+    pub message: str,
+    pub value: str,
+) {
+    override fun type_name(): str { "fmt error" }
+}
+
+// Formatting error categories (exhaustive ADT)
+type FmtErrorKind =
+    | InvalidBase   // radix base outside 2..36
+    | NotAnInteger  // input is not an integer type (radix formats integers only)

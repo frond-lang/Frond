@@ -95,24 +95,49 @@ pub fn run_sema_pipeline_or_exit(
     let mut ctx = InferContext::new(&mut type_arena, &mut sema_result);
 
     ctx.reset_state();
-    let root_env = ctx.env.root();
+    let root_env = ctx.sema_result.env.root();
     ctx.register_builtins(root_env);
+
+    // Bug #103 layering: std declarations live on a dedicated layer whose
+    // parent is root_env. Std modules attach to the std layer (their
+    // cross-module bare calls keep working); USER modules attach to root_env
+    // directly, so un-imported std bare names / method-sugar fallbacks /
+    // short-name qualifiers no longer resolve — the import statement is the
+    // only channel that re-exports std symbols into user scope.
+    let std_env = ctx.sema_result.env.child(root_env);
+    // Expose the std layer to the import re-export (process_import_decls
+    // filters std_binding_origins against it).
+    ctx.sema_result
+        .module_envs
+        .insert("std.layer".to_string(), std_env);
 
     let module_logical_paths: Vec<String> = loader
         .loaded_keys()
         .iter()
         .filter_map(|k| k.strip_suffix(".frond").map(|s| s.replace('/', ".")))
         .collect();
-    ctx.register_module_aliases(root_env, &module_logical_paths);
+    ctx.register_module_aliases(root_env, std_env, &module_logical_paths);
+    // User-module logical paths (non-std/builtin) — the target set the
+    // module-scoped type resolver maps import spellings against.
+    ctx.sema_result.user_module_paths = module_logical_paths
+        .iter()
+        .filter(|p| !(p.as_str() == "std" || p.starts_with("std.") || p.starts_with("builtin.")))
+        .cloned()
+        .collect();
 
-    // predeclare: register all module functions and type constructors into root_env first,
+    // predeclare: register all module functions and type constructors first,
     // to resolve cross-module forward references. check_module_with_env will predeclare again internally (idempotent).
     for (_, m) in loader.builtin_modules() {
         ctx.predeclare_declarations(m, root_env);
     }
     for key in std_keys {
         if let Some(m) = loader.get_module_by_key(key) {
-            ctx.predeclare_declarations(m, root_env);
+            // Origin manifest: strip ".frond" and '/'→'.' for the logical path.
+            let logical = key
+                .strip_suffix(".frond")
+                .map(|s| s.replace('/', "."))
+                .unwrap_or_default();
+            ctx.predeclare_declarations_with_origin(m, std_env, Some(&logical));
         }
     }
     for k in dep_keys {
@@ -124,25 +149,9 @@ pub fn run_sema_pipeline_or_exit(
     let mut prev_err_len = 0usize;
     let mut prev_warn_len = 0usize;
 
-    // populate: fill in the definition tables (type method signatures, etc.) for all modules before checking,
-    // to resolve cross-module method lookup failures caused by module check ordering.
-    // check_module_with_env will call it again internally (idempotent; put_type_def rejects duplicates).
-    for (_, m) in loader.builtin_modules() {
-        populate_module(ctx.arena, ctx.sema_result, m);
-    }
-    for key in std_keys {
-        if let Some(m) = loader.get_module_by_key(key) {
-            populate_module(ctx.arena, ctx.sema_result, m);
-        }
-    }
-    for k in dep_keys {
-        if let Some(m) = loader.get_module_by_key(k) {
-            populate_module(ctx.arena, ctx.sema_result, m);
-        }
-    }
-    populate_module(ctx.arena, ctx.sema_result, entry_module);
-
-    // Build the all_modules list: used for cross-module monomorphization (generic calls need access to the callee module's arena).
+    // Build the all_modules list FIRST: used for cross-module
+    // monomorphization (generic calls need access to the callee module's
+    // arena) and for cross-module inheritance-base AST lookup in populate.
     let mut all_modules: Vec<&Module> = Vec::new();
     for (_, m) in loader.builtin_modules() {
         all_modules.push(m);
@@ -159,11 +168,30 @@ pub fn run_sema_pipeline_or_exit(
     }
     all_modules.push(entry_module);
 
+    // populate: fill in the definition tables (type method signatures, etc.) for all modules before checking,
+    // to resolve cross-module method lookup failures caused by module check ordering.
+    // check_module_with_env will call it again internally (idempotent; put_type_def rejects duplicates).
+    for (_, m) in loader.builtin_modules() {
+        populate_module(ctx.arena, ctx.sema_result, m, &all_modules);
+    }
+    for key in std_keys {
+        if let Some(m) = loader.get_module_by_key(key) {
+            populate_module(ctx.arena, ctx.sema_result, m, &all_modules);
+        }
+    }
+    for k in dep_keys {
+        if let Some(m) = loader.get_module_by_key(k) {
+            populate_module(ctx.arena, ctx.sema_result, m, &all_modules);
+        }
+    }
+    populate_module(ctx.arena, ctx.sema_result, entry_module, &all_modules);
+
     // check: builtin → std → dep → entry
     for (path, m) in loader.builtin_modules() {
         ctx.check_module_with_env(m, root_env, &all_modules);
         for err in &ctx.sema_result.errors[prev_err_len..] {
-            eprintln!("{}:{}:{}: {}", path, err.line, err.column, err.message);
+            let ep = err.file_path.as_deref().map(|s| s as &str).unwrap_or(path);
+            eprintln!("{}:{}:{}: {}", ep, err.line, err.column, err.message);
         }
         for warn in &ctx.sema_result.warnings[prev_warn_len..] {
             let wp = warn.file_path.as_deref().map(|s| s as &str).unwrap_or(path);
@@ -174,7 +202,7 @@ pub fn run_sema_pipeline_or_exit(
     }
     for key in std_keys {
         if let Some(m) = loader.get_module_by_key(key) {
-            ctx.check_module_with_env(m, root_env, &all_modules);
+            ctx.check_module_with_env(m, std_env, &all_modules);
             for err in &ctx.sema_result.errors[prev_err_len..] {
                 eprintln!("{}:{}:{}: {}", key, err.line, err.column, err.message);
             }
@@ -326,7 +354,7 @@ pub fn run_sema_pipeline_lsp(
     let mut ctx = InferContext::new(&mut type_arena, &mut sema_result);
 
     ctx.reset_state();
-    let root_env = ctx.env.root();
+    let root_env = ctx.sema_result.env.root();
     ctx.register_builtins(root_env);
 
     let module_logical_paths: Vec<String> = loader
@@ -334,7 +362,7 @@ pub fn run_sema_pipeline_lsp(
         .iter()
         .filter_map(|k| k.strip_suffix(".frond").map(|s| s.replace('/', ".")))
         .collect();
-    ctx.register_module_aliases(root_env, &module_logical_paths);
+    ctx.register_module_aliases(root_env, root_env, &module_logical_paths);
 
     for (_, m) in loader.builtin_modules() {
         ctx.predeclare_declarations(m, root_env);
@@ -350,20 +378,24 @@ pub fn run_sema_pipeline_lsp(
         }
     }
 
+    let mut lsp_all_modules: Vec<&Module> = Vec::new();
     for (_, m) in loader.builtin_modules() {
-        populate_module(ctx.arena, ctx.sema_result, m);
+        lsp_all_modules.push(m);
     }
     for key in std_keys {
         if let Some(m) = loader.get_module_by_key(key) {
-            populate_module(ctx.arena, ctx.sema_result, m);
+            lsp_all_modules.push(m);
         }
     }
     for k in dep_keys {
         if let Some(m) = loader.get_module_by_key(k) {
-            populate_module(ctx.arena, ctx.sema_result, m);
+            lsp_all_modules.push(m);
         }
     }
-    populate_module(ctx.arena, ctx.sema_result, entry_module);
+    for m in &lsp_all_modules {
+        populate_module(ctx.arena, ctx.sema_result, m, &lsp_all_modules);
+    }
+    populate_module(ctx.arena, ctx.sema_result, entry_module, &lsp_all_modules);
 
     let mut all_modules: Vec<&Module> = Vec::new();
     for (_, m) in loader.builtin_modules() {
@@ -530,7 +562,7 @@ pub fn run_sema_incremental(
     // 3. Construct InferContext from existing state (preserves clean modules' sema products)
     let mut ctx = InferContext::from_existing(prev_type_arena, prev_sema_result);
     ctx.reset_state();
-    let root_env = ctx.env.root();
+    let root_env = ctx.sema_result.env.root();
     ctx.register_builtins(root_env);
 
     // Register module aliases for all loaded modules
@@ -539,10 +571,12 @@ pub fn run_sema_incremental(
         .iter()
         .filter_map(|k| k.strip_suffix(".frond").map(|s| s.replace('/', ".")))
         .collect();
-    ctx.register_module_aliases(root_env, &module_logical_paths);
+    ctx.register_module_aliases(root_env, root_env, &module_logical_paths);
 
     // 4. Predeclare ALL modules into root_env (builtins first for name priority).
-    // from_existing creates a fresh env, so all symbol bindings must be restored.
+    // The env arena is shared (SemaResult.env) and module envs are reused via
+    // the shared module_envs table, so re-predeclaring redefines bindings in
+    // place — no fresh-env restore needed.
     for (_, m) in loader.builtin_modules() {
         ctx.predeclare_declarations(m, root_env);
     }
@@ -556,15 +590,19 @@ pub fn run_sema_incremental(
     }
 
     // 5. Populate ALL modules (idempotent for clean modules — type_defs already preserved).
+    let mut incr_all_modules: Vec<&Module> = Vec::new();
     for (_, m) in loader.builtin_modules() {
-        populate_module(ctx.arena, ctx.sema_result, m);
+        incr_all_modules.push(m);
     }
     for key in &all_keys {
         if !is_builtin_module(key) {
             if let Some(m) = loader.get_module_by_key(key) {
-                populate_module(ctx.arena, ctx.sema_result, m);
+                incr_all_modules.push(m);
             }
         }
+    }
+    for m in &incr_all_modules {
+        populate_module(ctx.arena, ctx.sema_result, m, &incr_all_modules);
     }
 
     // 6. Build all_modules list (ALL loaded modules, for cross-module monomorphization).

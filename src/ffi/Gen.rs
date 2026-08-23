@@ -87,7 +87,8 @@ pub const TYPE_MAP: &[(&str, TypeMapping)] = &[
     ("u32",   TypeMapping { rust_wrapper: Some("u32"), c_param_kind: CParamKind::Single("uint32_t") }),
     ("u64",   TypeMapping { rust_wrapper: Some("u64"), c_param_kind: CParamKind::Single("uint64_t") }),
     ("u128",  TypeMapping { rust_wrapper: Some("u128"), c_param_kind: CParamKind::LoHi }),
-    ("isize", TypeMapping { rust_wrapper: Some("isize"), c_param_kind: CParamKind::Single("ssize_t") }),
+    // isize → int64_t (NOT ssize_t — MSVC has no ssize_t; same width/layout).
+    ("isize", TypeMapping { rust_wrapper: Some("isize"), c_param_kind: CParamKind::Single("int64_t") }),
     ("usize", TypeMapping { rust_wrapper: Some("usize"), c_param_kind: CParamKind::Single("size_t") }),
     // Scalar floating-point
     ("f32",   TypeMapping { rust_wrapper: Some("f32"),   c_param_kind: CParamKind::Single("float") }),
@@ -101,6 +102,31 @@ pub const TYPE_MAP: &[(&str, TypeMapping)] = &[
     ("str",   TypeMapping { rust_wrapper: Some("&str"),  c_param_kind: CParamKind::DataLen { c_data_type: "const char*" } }),
     ("void",  TypeMapping { rust_wrapper: Some("()"),    c_param_kind: CParamKind::Single("void") }),
     ("u8[]",  TypeMapping { rust_wrapper: Some("&[u8]"), c_param_kind: CParamKind::DataLen { c_data_type: "uint8_t*" } }),
+    // Scalar arrays (mem scalar-intrinsic fast paths). `{p}_data` is a typed
+    // pointer and `{p}_len` is the ELEMENT count (Marshal serializes the SoA
+    // column / element vector to native bytes and pushes the element count).
+    // isize maps to int64_t (not ssize_t — MSVC has no ssize_t); same layout.
+    ("i8[]",   TypeMapping { rust_wrapper: Some("&[i8]"),   c_param_kind: CParamKind::DataLen { c_data_type: "int8_t*" } }),
+    ("i16[]",  TypeMapping { rust_wrapper: Some("&[i16]"),  c_param_kind: CParamKind::DataLen { c_data_type: "int16_t*" } }),
+    ("i32[]",  TypeMapping { rust_wrapper: Some("&[i32]"),  c_param_kind: CParamKind::DataLen { c_data_type: "int32_t*" } }),
+    ("i64[]",  TypeMapping { rust_wrapper: Some("&[i64]"),  c_param_kind: CParamKind::DataLen { c_data_type: "int64_t*" } }),
+    ("u16[]",  TypeMapping { rust_wrapper: Some("&[u16]"),  c_param_kind: CParamKind::DataLen { c_data_type: "uint16_t*" } }),
+    ("u32[]",  TypeMapping { rust_wrapper: Some("&[u32]"),  c_param_kind: CParamKind::DataLen { c_data_type: "uint32_t*" } }),
+    ("u64[]",  TypeMapping { rust_wrapper: Some("&[u64]"),  c_param_kind: CParamKind::DataLen { c_data_type: "uint64_t*" } }),
+    ("isize[]", TypeMapping { rust_wrapper: Some("&[isize]"), c_param_kind: CParamKind::DataLen { c_data_type: "int64_t*" } }),
+    ("usize[]", TypeMapping { rust_wrapper: Some("&[usize]"), c_param_kind: CParamKind::DataLen { c_data_type: "size_t*" } }),
+    ("f32[]",  TypeMapping { rust_wrapper: Some("&[f32]"),   c_param_kind: CParamKind::DataLen { c_data_type: "float*" } }),
+    ("f64[]",  TypeMapping { rust_wrapper: Some("&[f64]"),   c_param_kind: CParamKind::DataLen { c_data_type: "double*" } }),
+    ("bool[]", TypeMapping { rust_wrapper: Some("&[bool]"),  c_param_kind: CParamKind::DataLen { c_data_type: "uint8_t*" } }),
+    ("char[]", TypeMapping { rust_wrapper: Some("&[char]"),  c_param_kind: CParamKind::DataLen { c_data_type: "uint32_t*" } }),
+    // 128-bit elements: no portable C 128-bit type (MSVC has no usable
+    // __int128), so the C side views the native 16-byte blocks as uint64
+    // pairs. Fill VALUES never cross as scalars — they travel inside a
+    // single-element pattern ARRAY (see __mem_fill_i128 etc.).
+    ("i128[]",  TypeMapping { rust_wrapper: Some("&[i128]"),  c_param_kind: CParamKind::DataLen { c_data_type: "uint64_t*" } }),
+    ("u128[]",  TypeMapping { rust_wrapper: Some("&[u128]"),  c_param_kind: CParamKind::DataLen { c_data_type: "uint64_t*" } }),
+    ("f128[]",  TypeMapping { rust_wrapper: Some("&[f128]"),  c_param_kind: CParamKind::DataLen { c_data_type: "uint64_t*" } }),
+    ("f16[]",   TypeMapping { rust_wrapper: Some("&[f16]"),   c_param_kind: CParamKind::DataLen { c_data_type: "uint16_t*" } }),
     // Pointer types
     ("*u8",   TypeMapping { rust_wrapper: Some("*mut u8"),  c_param_kind: CParamKind::Single("uint8_t*") }),
     ("*i8",   TypeMapping { rust_wrapper: Some("*mut i8"),  c_param_kind: CParamKind::Single("int8_t*") }),
@@ -297,6 +323,44 @@ pub fn generate_c_source(funcs: &[ExternCFunc]) -> Result<String, String> {
         out.push_str("#endif\n");
     }
     out.push('\n');
+
+    // Shared encoding helpers: Frond `str` is UTF-8 at the language level;
+    // Windows wide-char APIs are bridged here so ANSI code pages (GBK etc.)
+    // can never leak into str values. Self-contained (own includes) so any
+    // module's generated file compiles whether or not it uses Windows headers.
+    // POSIX is byte-transparent (UTF-8 by convention) and compiles none of it.
+    out.push_str(concat!(
+        "#if defined(_WIN32) || defined(_WIN64)\n",
+        "#include <windows.h>\n",
+        "#include <stdlib.h>\n",
+        "// UTF-8 (length-delimited, no NUL required) -> UTF-16. Returns a\n",
+        "// malloc'd NUL-terminated string, or NULL on conversion/allocation\n",
+        "// failure (invalid UTF-8 included — strict, no silent replacement).\n",
+        "static wchar_t* frond_utf8_to_utf16(const char* s, size_t n) {\n",
+        "    if (!s) return NULL;\n",
+        "    int need = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, (int)n, NULL, 0);\n",
+        "    if (need <= 0) return NULL;\n",
+        "    wchar_t* w = (wchar_t*)malloc(sizeof(wchar_t) * (size_t)(need + 1));\n",
+        "    if (!w) return NULL;\n",
+        "    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, (int)n, w, need) != need) {\n",
+        "        free(w); return NULL;\n",
+        "    }\n",
+        "    w[need] = 0;\n",
+        "    return w;\n",
+        "}\n",
+        "// UTF-16 (NUL-terminated) -> UTF-8 bytes into out[0..cap), no NUL.\n",
+        "// Returns the byte count; -1 = out too small; -2 = conversion failure.\n",
+        "static int64_t frond_utf16_to_utf8_into(const wchar_t* w, char* out, size_t cap) {\n",
+        "    int need = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, w, -1, NULL, 0, NULL, NULL);\n",
+        "    if (need <= 0) return -2;\n",
+        "    size_t bytes = (size_t)need - 1;\n",
+        "    if (bytes > cap) return -1;\n",
+        "    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, w, -1, out, need, NULL, NULL) != need) return -2;\n",
+        "    return (int64_t)bytes;\n",
+        "}\n",
+        "#endif\n",
+        "\n",
+    ));
 
     for func in funcs {
         let params_str = if func.c_params.is_empty() {

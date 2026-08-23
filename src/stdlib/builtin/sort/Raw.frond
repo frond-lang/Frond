@@ -1,0 +1,586 @@
+// builtin/sort/Raw.frond — per-type in-place heapsort C primitives (builtin)
+//
+// The C fast path of the array sort facade (builtin/sort/Sort.frond): scalar
+// element arrays route here by type_name(); every other element type (str[],
+// records, mixed) uses the pure-Frond heapsort in Sort.frond. Marshaling
+// reuses the scalar-array contract (SoA column → native bytes, {p}_len =
+// ELEMENT count, mutations written back into the array) — the same machinery
+// as builtin/mem. Self-contained heapsorts (no qsort): a comparator function
+// pointer cannot cross the FFI boundary, and typed comparisons inline anyway.
+
+@c_include("stdint.h")
+@c_include("stddef.h")
+
+// In-place heapsort over the i8[] buffer (ascending). Unstable; NaN
+// ordering (floats) is unspecified — an inconsistent comparator just yields
+// some permutation, never UB (no library qsort involved).
+@internal
+@extern("C")
+fun __sort_i8(buf: i8[]): void #{
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            int8_t t = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        int8_t t = buf_data[0]; buf_data[0] = buf_data[e]; buf_data[e] = t;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            int8_t t2 = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t2;
+            root = child;
+        }
+    }
+}#
+// In-place heapsort over the i16[] buffer (ascending). Unstable; NaN
+// ordering (floats) is unspecified — an inconsistent comparator just yields
+// some permutation, never UB (no library qsort involved).
+@internal
+@extern("C")
+fun __sort_i16(buf: i16[]): void #{
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            int16_t t = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        int16_t t = buf_data[0]; buf_data[0] = buf_data[e]; buf_data[e] = t;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            int16_t t2 = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t2;
+            root = child;
+        }
+    }
+}#
+// In-place heapsort over the i32[] buffer (ascending). Unstable; NaN
+// ordering (floats) is unspecified — an inconsistent comparator just yields
+// some permutation, never UB (no library qsort involved).
+@internal
+@extern("C")
+fun __sort_i32(buf: i32[]): void #{
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            int32_t t = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        int32_t t = buf_data[0]; buf_data[0] = buf_data[e]; buf_data[e] = t;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            int32_t t2 = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t2;
+            root = child;
+        }
+    }
+}#
+// In-place heapsort over the i64[] buffer (ascending). Unstable; NaN
+// ordering (floats) is unspecified — an inconsistent comparator just yields
+// some permutation, never UB (no library qsort involved).
+@internal
+@extern("C")
+fun __sort_i64(buf: i64[]): void #{
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            int64_t t = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        int64_t t = buf_data[0]; buf_data[0] = buf_data[e]; buf_data[e] = t;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            int64_t t2 = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t2;
+            root = child;
+        }
+    }
+}#
+// In-place heapsort over the u16[] buffer (ascending). Unstable; NaN
+// ordering (floats) is unspecified — an inconsistent comparator just yields
+// some permutation, never UB (no library qsort involved).
+@internal
+@extern("C")
+fun __sort_u16(buf: u16[]): void #{
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            uint16_t t = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        uint16_t t = buf_data[0]; buf_data[0] = buf_data[e]; buf_data[e] = t;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            uint16_t t2 = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t2;
+            root = child;
+        }
+    }
+}#
+// In-place heapsort over the u32[] buffer (ascending). Unstable; NaN
+// ordering (floats) is unspecified — an inconsistent comparator just yields
+// some permutation, never UB (no library qsort involved).
+@internal
+@extern("C")
+fun __sort_u32(buf: u32[]): void #{
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            uint32_t t = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        uint32_t t = buf_data[0]; buf_data[0] = buf_data[e]; buf_data[e] = t;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            uint32_t t2 = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t2;
+            root = child;
+        }
+    }
+}#
+// In-place heapsort over the u64[] buffer (ascending). Unstable; NaN
+// ordering (floats) is unspecified — an inconsistent comparator just yields
+// some permutation, never UB (no library qsort involved).
+@internal
+@extern("C")
+fun __sort_u64(buf: u64[]): void #{
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            uint64_t t = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        uint64_t t = buf_data[0]; buf_data[0] = buf_data[e]; buf_data[e] = t;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            uint64_t t2 = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t2;
+            root = child;
+        }
+    }
+}#
+// In-place heapsort over the isize[] buffer (ascending). Unstable; NaN
+// ordering (floats) is unspecified — an inconsistent comparator just yields
+// some permutation, never UB (no library qsort involved).
+@internal
+@extern("C")
+fun __sort_isize(buf: isize[]): void #{
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            int64_t t = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        int64_t t = buf_data[0]; buf_data[0] = buf_data[e]; buf_data[e] = t;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            int64_t t2 = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t2;
+            root = child;
+        }
+    }
+}#
+// In-place heapsort over the usize[] buffer (ascending). Unstable; NaN
+// ordering (floats) is unspecified — an inconsistent comparator just yields
+// some permutation, never UB (no library qsort involved).
+@internal
+@extern("C")
+fun __sort_usize(buf: usize[]): void #{
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            size_t t = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        size_t t = buf_data[0]; buf_data[0] = buf_data[e]; buf_data[e] = t;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            size_t t2 = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t2;
+            root = child;
+        }
+    }
+}#
+// In-place heapsort over the f32[] buffer (ascending). Unstable; NaN
+// ordering (floats) is unspecified — an inconsistent comparator just yields
+// some permutation, never UB (no library qsort involved).
+@internal
+@extern("C")
+fun __sort_f32(buf: f32[]): void #{
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            float t = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        float t = buf_data[0]; buf_data[0] = buf_data[e]; buf_data[e] = t;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            float t2 = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t2;
+            root = child;
+        }
+    }
+}#
+// In-place heapsort over the f64[] buffer (ascending). Unstable; NaN
+// ordering (floats) is unspecified — an inconsistent comparator just yields
+// some permutation, never UB (no library qsort involved).
+@internal
+@extern("C")
+fun __sort_f64(buf: f64[]): void #{
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            double t = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        double t = buf_data[0]; buf_data[0] = buf_data[e]; buf_data[e] = t;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            double t2 = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t2;
+            root = child;
+        }
+    }
+}#
+
+// ── bool/char (full-width set completion) ────────────────────────────────
+
+// In-place heapsort over the bool[] buffer (ascending, unstable).
+@internal
+@extern("C")
+fun __sort_bool(buf: bool[]): void #{
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            uint8_t t = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        uint8_t t = buf_data[0]; buf_data[0] = buf_data[e]; buf_data[e] = t;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            uint8_t t2 = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t2;
+            root = child;
+        }
+    }
+}#
+// In-place heapsort over the char[] buffer (ascending, unstable).
+@internal
+@extern("C")
+fun __sort_char(buf: char[]): void #{
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            uint32_t t = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        uint32_t t = buf_data[0]; buf_data[0] = buf_data[e]; buf_data[e] = t;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && buf_data[child + 1] > buf_data[child]) child++;
+            if (buf_data[root] >= buf_data[child]) break;
+            uint32_t t2 = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t2;
+            root = child;
+        }
+    }
+}#
+
+// ── 128-bit / f16 sorts (full-width completion, engine-semantics comparators) ──
+
+// i128: signed high word, unsigned low word (two's complement pair order).
+@internal
+@extern("C")
+fun __sort_i128(buf: i128[]): void #{
+#define S_I128_GT(AH, AL, BH, BL) (((int64_t)(AH)) > ((int64_t)(BH)) || ((AH) == (BH) && (AL) > (BL)))
+#define S_I128_GE(AH, AL, BH, BL) (((int64_t)(AH)) > ((int64_t)(BH)) || ((AH) == (BH) && (AL) >= (BL)))
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && S_I128_GT(buf_data[2*(child+1)+1], buf_data[2*(child+1)], buf_data[2*child+1], buf_data[2*child])) child++;
+            if (S_I128_GE(buf_data[2*root+1], buf_data[2*root], buf_data[2*child+1], buf_data[2*child])) break;
+            uint64_t t0 = buf_data[2*root]; buf_data[2*root] = buf_data[2*child]; buf_data[2*child] = t0;
+            uint64_t t1 = buf_data[2*root+1]; buf_data[2*root+1] = buf_data[2*child+1]; buf_data[2*child+1] = t1;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        uint64_t t0 = buf_data[0]; buf_data[0] = buf_data[2*e]; buf_data[2*e] = t0;
+        uint64_t t1 = buf_data[1]; buf_data[1] = buf_data[2*e+1]; buf_data[2*e+1] = t1;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && S_I128_GT(buf_data[2*(child+1)+1], buf_data[2*(child+1)], buf_data[2*child+1], buf_data[2*child])) child++;
+            if (S_I128_GE(buf_data[2*root+1], buf_data[2*root], buf_data[2*child+1], buf_data[2*child])) break;
+            uint64_t u0 = buf_data[2*root]; buf_data[2*root] = buf_data[2*child]; buf_data[2*child] = u0;
+            uint64_t u1 = buf_data[2*root+1]; buf_data[2*root+1] = buf_data[2*child+1]; buf_data[2*child+1] = u1;
+            root = child;
+        }
+    }
+}#
+// u128: pure unsigned pair order.
+@internal
+@extern("C")
+fun __sort_u128(buf: u128[]): void #{
+#define S_U128_GT(AH, AL, BH, BL) ((AH) > (BH) || ((AH) == (BH) && (AL) > (BL)))
+#define S_U128_GE(AH, AL, BH, BL) ((AH) > (BH) || ((AH) == (BH) && (AL) >= (BL)))
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n && S_U128_GT(buf_data[2*(child+1)+1], buf_data[2*(child+1)], buf_data[2*child+1], buf_data[2*child])) child++;
+            if (S_U128_GE(buf_data[2*root+1], buf_data[2*root], buf_data[2*child+1], buf_data[2*child])) break;
+            uint64_t t0 = buf_data[2*root]; buf_data[2*root] = buf_data[2*child]; buf_data[2*child] = t0;
+            uint64_t t1 = buf_data[2*root+1]; buf_data[2*root+1] = buf_data[2*child+1]; buf_data[2*child+1] = t1;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        uint64_t t0 = buf_data[0]; buf_data[0] = buf_data[2*e]; buf_data[2*e] = t0;
+        uint64_t t1 = buf_data[1]; buf_data[1] = buf_data[2*e+1]; buf_data[2*e+1] = t1;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e && S_U128_GT(buf_data[2*(child+1)+1], buf_data[2*(child+1)], buf_data[2*child+1], buf_data[2*child])) child++;
+            if (S_U128_GE(buf_data[2*root+1], buf_data[2*root], buf_data[2*child+1], buf_data[2*child])) break;
+            uint64_t u0 = buf_data[2*root]; buf_data[2*root] = buf_data[2*child]; buf_data[2*child] = u0;
+            uint64_t u1 = buf_data[2*root+1]; buf_data[2*root+1] = buf_data[2*child+1]; buf_data[2*child+1] = u1;
+            root = child;
+        }
+    }
+}#
+// f16: numeric IEEE semantics via half→float promotion (matches the
+// engine's f16 </>; NaN ordering unspecified — an inconsistent comparator
+// only yields some permutation, never UB in this self-contained heapsort).
+@internal
+@extern("C")
+fun __sort_f16(buf: f16[]): void #{
+#define S_F16V(h, outf) do { \
+    uint32_t sgn_ = (uint32_t)((h) >> 15); \
+    uint32_t ex_ = (uint32_t)(((h) >> 10) & 0x1F); \
+    uint32_t mn_ = (uint32_t)((h) & 0x3FF); \
+    uint32_t b_; \
+    if (ex_ == 0) { \
+        if (mn_ == 0) { b_ = sgn_ << 31; } \
+        else { uint32_t e_ = 113; while ((mn_ & 0x400) == 0) { mn_ <<= 1; e_--; } mn_ &= 0x3FF; b_ = (sgn_ << 31) | (e_ << 23) | (mn_ << 13); } \
+    } else if (ex_ == 0x1F) { b_ = (sgn_ << 31) | 0x7F800000u | (mn_ << 13); } \
+    else { b_ = (sgn_ << 31) | ((ex_ + 112) << 23) | (mn_ << 13); } \
+    memcpy(&(outf), &b_, 4); \
+} while (0)
+
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n) {
+                float x, y;
+                S_F16V(buf_data[child + 1], x);
+                S_F16V(buf_data[child], y);
+                if (x > y) child++;
+            }
+            float r, c;
+            S_F16V(buf_data[root], r);
+            S_F16V(buf_data[child], c);
+            if (r >= c) break;
+            uint16_t t = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = t;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        uint16_t t = buf_data[0]; buf_data[0] = buf_data[e]; buf_data[e] = t;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e) {
+                float x, y;
+                S_F16V(buf_data[child + 1], x);
+                S_F16V(buf_data[child], y);
+                if (x > y) child++;
+            }
+            float r, c;
+            S_F16V(buf_data[root], r);
+            S_F16V(buf_data[child], c);
+            if (r >= c) break;
+            uint16_t u = buf_data[root]; buf_data[root] = buf_data[child]; buf_data[child] = u;
+            root = child;
+        }
+    }
+}#
+// f128: IEEE 754 totalOrder sort keys (exact port of the engine's F128 Ord —
+// negatives flip all bits, positives set the sign bit; -0.0 sorts strictly
+// before +0.0, NaNs order deterministically by payload). Elements are native
+// uint64 lo/hi pairs (first word = low).
+@internal
+@extern("C")
+fun __sort_f128(buf: f128[]): void #{
+#define S_F128_KH(HI, LO) (((HI) >> 63) ? ~(HI) : ((HI) | 0x8000000000000000ULL))
+#define S_F128_KL(HI, LO) (((HI) >> 63) ? ~(LO) : (LO))
+    if (buf_len < 2) return;
+    size_t n = buf_len;
+    for (size_t s = n / 2; s-- > 0; ) {
+        size_t root = s;
+        while (2 * root + 1 < n) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < n) {
+                uint64_t kh1 = S_F128_KH(buf_data[2*(child+1)+1], buf_data[2*(child+1)]);
+                uint64_t kl1 = S_F128_KL(buf_data[2*(child+1)+1], buf_data[2*(child+1)]);
+                uint64_t kh2 = S_F128_KH(buf_data[2*child+1], buf_data[2*child]);
+                uint64_t kl2 = S_F128_KL(buf_data[2*child+1], buf_data[2*child]);
+                if (kh1 != kh2 ? kh1 > kh2 : kl1 > kl2) child++;
+            }
+            uint64_t rh = S_F128_KH(buf_data[2*root+1], buf_data[2*root]);
+            uint64_t rl = S_F128_KL(buf_data[2*root+1], buf_data[2*root]);
+            uint64_t ch = S_F128_KH(buf_data[2*child+1], buf_data[2*child]);
+            uint64_t cl = S_F128_KL(buf_data[2*child+1], buf_data[2*child]);
+            if (rh != ch ? rh > ch : rl >= cl) break;
+            uint64_t t0 = buf_data[2*root]; buf_data[2*root] = buf_data[2*child]; buf_data[2*child] = t0;
+            uint64_t t1 = buf_data[2*root+1]; buf_data[2*root+1] = buf_data[2*child+1]; buf_data[2*child+1] = t1;
+            root = child;
+        }
+    }
+    for (size_t e = n - 1; e > 0; e--) {
+        uint64_t t0 = buf_data[0]; buf_data[0] = buf_data[2*e]; buf_data[2*e] = t0;
+        uint64_t t1 = buf_data[1]; buf_data[1] = buf_data[2*e+1]; buf_data[2*e+1] = t1;
+        size_t root = 0;
+        while (2 * root + 1 < e) {
+            size_t child = 2 * root + 1;
+            if (child + 1 < e) {
+                uint64_t kh1 = S_F128_KH(buf_data[2*(child+1)+1], buf_data[2*(child+1)]);
+                uint64_t kl1 = S_F128_KL(buf_data[2*(child+1)+1], buf_data[2*(child+1)]);
+                uint64_t kh2 = S_F128_KH(buf_data[2*child+1], buf_data[2*child]);
+                uint64_t kl2 = S_F128_KL(buf_data[2*child+1], buf_data[2*child]);
+                if (kh1 != kh2 ? kh1 > kh2 : kl1 > kl2) child++;
+            }
+            uint64_t rh = S_F128_KH(buf_data[2*root+1], buf_data[2*root]);
+            uint64_t rl = S_F128_KL(buf_data[2*root+1], buf_data[2*root]);
+            uint64_t ch = S_F128_KH(buf_data[2*child+1], buf_data[2*child]);
+            uint64_t cl = S_F128_KL(buf_data[2*child+1], buf_data[2*child]);
+            if (rh != ch ? rh > ch : rl >= cl) break;
+            uint64_t u0 = buf_data[2*root]; buf_data[2*root] = buf_data[2*child]; buf_data[2*child] = u0;
+            uint64_t u1 = buf_data[2*root+1]; buf_data[2*root+1] = buf_data[2*child+1]; buf_data[2*child+1] = u1;
+            root = child;
+        }
+    }
+}#

@@ -1,0 +1,400 @@
+// Mem.frond — T[] generic container primitives (part of std.core.mem)
+//
+// Grown from Frond's own model (no port of Go bytes / Rust mem / C mem.h):
+// values are typed, T[] is a reference-shared container, there are no raw
+// pointers — so "memory operations" here means container-wide writes, moves,
+// and comparisons over any element type, with u8[] AND the scalar element
+// types (i8..i64/u16..u64/isize/usize/f32/f64) routed to C where the win is
+// orders of magnitude; equal stays on the engine's SoA-SIMD array `==`.
+// Non-scalar element types (str[], records, 128-bit, f16) use the pure-Frond
+// loops below.
+//
+// Bounds contract: index/range violations panic (abort with a diagnostic in
+// the C path, the engine's index trap in the generic path). A zero count is
+// a no-op with no constraint on the offsets.
+//
+// Assignment semantics reminder: `val b = a`, element reads, and slices all
+// SHARE (no deep copy exists at the language level); use Mem.clone once
+// available for structural independence.
+
+// Fills the whole buffer with value. Scalar element types (u8 through f64)
+// take the C fast path; every other element type falls to the loop.
+pub fun fill<T>(buf: T[], value: T): void {
+    val n = buf.type_name()
+    if n == "u8[]" {
+        __mem_fill(buf as u8[], value as u8)
+    } else if n == "i8[]" {
+        __mem_fill_i8(buf as i8[], value as i8)
+    } else if n == "i16[]" {
+        __mem_fill_i16(buf as i16[], value as i16)
+    } else if n == "i32[]" {
+        __mem_fill_i32(buf as i32[], value as i32)
+    } else if n == "i64[]" {
+        __mem_fill_i64(buf as i64[], value as i64)
+    } else if n == "u16[]" {
+        __mem_fill_u16(buf as u16[], value as u16)
+    } else if n == "u32[]" {
+        __mem_fill_u32(buf as u32[], value as u32)
+    } else if n == "u64[]" {
+        __mem_fill_u64(buf as u64[], value as u64)
+    } else if n == "isize[]" {
+        __mem_fill_isize(buf as isize[], value as isize)
+    } else if n == "usize[]" {
+        __mem_fill_usize(buf as usize[], value as usize)
+    } else if n == "f32[]" {
+        __mem_fill_f32(buf as f32[], value as f32)
+    } else if n == "f64[]" {
+        __mem_fill_f64(buf as f64[], value as f64)
+    } else if n == "bool[]" {
+        __mem_fill_bool(buf as bool[], value as bool)
+    } else if n == "char[]" {
+        __mem_fill_char(buf as char[], value as char)
+    } else if n == "i128[]" {
+        // 128-bit/f16 fill values travel inside a single-element pattern
+        // array — the bits cross FFI as native bytes (no scalar param
+        // convention exists for these widths).
+        __mem_fill_i128(buf as i128[], [value] as i128[])
+    } else if n == "u128[]" {
+        __mem_fill_u128(buf as u128[], [value] as u128[])
+    } else if n == "f16[]" {
+        __mem_fill_f16(buf as f16[], [value] as f16[])
+    } else if n == "f128[]" {
+        __mem_fill_f128(buf as f128[], [value] as f128[])
+    } else {
+        var i = 0 as usize
+        while i < buf.len() {
+            buf[i] = value
+            i = i + 1
+        }
+    }
+}
+
+// Copies src[src_at..src_at+count] into dst[dst_at..dst_at+count]. Overlapping
+// windows of the same buffer are safe (as-if taken out first, then written).
+// Offsets must be explicit — slices are copies here, they cannot pass a window.
+pub fun copy<T>(dst: T[], dst_at: usize, src: T[], src_at: usize, count: usize): void {
+    val n = dst.type_name()
+    if n == "u8[]" {
+        __mem_copy(dst as u8[], dst_at, src as u8[], src_at, count)
+    } else if n == "i8[]" {
+        __mem_copy_i8(dst as i8[], dst_at, src as i8[], src_at, count)
+    } else if n == "i16[]" {
+        __mem_copy_i16(dst as i16[], dst_at, src as i16[], src_at, count)
+    } else if n == "i32[]" {
+        __mem_copy_i32(dst as i32[], dst_at, src as i32[], src_at, count)
+    } else if n == "i64[]" {
+        __mem_copy_i64(dst as i64[], dst_at, src as i64[], src_at, count)
+    } else if n == "u16[]" {
+        __mem_copy_u16(dst as u16[], dst_at, src as u16[], src_at, count)
+    } else if n == "u32[]" {
+        __mem_copy_u32(dst as u32[], dst_at, src as u32[], src_at, count)
+    } else if n == "u64[]" {
+        __mem_copy_u64(dst as u64[], dst_at, src as u64[], src_at, count)
+    } else if n == "isize[]" {
+        __mem_copy_isize(dst as isize[], dst_at, src as isize[], src_at, count)
+    } else if n == "usize[]" {
+        __mem_copy_usize(dst as usize[], dst_at, src as usize[], src_at, count)
+    } else if n == "f32[]" {
+        __mem_copy_f32(dst as f32[], dst_at, src as f32[], src_at, count)
+    } else if n == "f64[]" {
+        __mem_copy_f64(dst as f64[], dst_at, src as f64[], src_at, count)
+    } else if n == "bool[]" {
+        __mem_copy_bool(dst as bool[], dst_at, src as bool[], src_at, count)
+    } else if n == "char[]" {
+        __mem_copy_char(dst as char[], dst_at, src as char[], src_at, count)
+    } else if n == "i128[]" {
+        __mem_copy_i128(dst as i128[], dst_at, src as i128[], src_at, count)
+    } else if n == "u128[]" {
+        __mem_copy_u128(dst as u128[], dst_at, src as u128[], src_at, count)
+    } else if n == "f16[]" {
+        __mem_copy_f16(dst as f16[], dst_at, src as f16[], src_at, count)
+    } else if n == "f128[]" {
+        __mem_copy_f128(dst as f128[], dst_at, src as f128[], src_at, count)
+    } else {
+        var i = 0 as usize
+        while i < count {
+            dst[dst_at + i] = src[src_at + i]
+            i = i + 1
+        }
+    }
+}
+
+// Swaps buf[i] and buf[j].
+pub fun swap<T>(buf: T[], i: usize, j: usize): void {
+    if buf.type_name() == "u8[]" {
+        __mem_swap(buf as u8[], i, j)
+    } else {
+        val t = buf[i]
+        buf[i] = buf[j]
+        buf[j] = t
+    }
+}
+
+// Reverses the buffer in place.
+pub fun reverse<T>(buf: T[]): void {
+    val n = buf.type_name()
+    if n == "u8[]" {
+        __mem_reverse(buf as u8[])
+    } else if n == "i8[]" {
+        __mem_reverse_i8(buf as i8[])
+    } else if n == "i16[]" {
+        __mem_reverse_i16(buf as i16[])
+    } else if n == "i32[]" {
+        __mem_reverse_i32(buf as i32[])
+    } else if n == "i64[]" {
+        __mem_reverse_i64(buf as i64[])
+    } else if n == "u16[]" {
+        __mem_reverse_u16(buf as u16[])
+    } else if n == "u32[]" {
+        __mem_reverse_u32(buf as u32[])
+    } else if n == "u64[]" {
+        __mem_reverse_u64(buf as u64[])
+    } else if n == "isize[]" {
+        __mem_reverse_isize(buf as isize[])
+    } else if n == "usize[]" {
+        __mem_reverse_usize(buf as usize[])
+    } else if n == "f32[]" {
+        __mem_reverse_f32(buf as f32[])
+    } else if n == "f64[]" {
+        __mem_reverse_f64(buf as f64[])
+    } else if n == "bool[]" {
+        __mem_reverse_bool(buf as bool[])
+    } else if n == "char[]" {
+        __mem_reverse_char(buf as char[])
+    } else if n == "i128[]" {
+        __mem_reverse_i128(buf as i128[])
+    } else if n == "u128[]" {
+        __mem_reverse_u128(buf as u128[])
+    } else if n == "f16[]" {
+        __mem_reverse_f16(buf as f16[])
+    } else if n == "f128[]" {
+        __mem_reverse_f128(buf as f128[])
+    } else {
+        var i = 0 as usize
+        var j = buf.len() - 1
+        while i < j {
+            val t = buf[i]
+            buf[i] = buf[j]
+            buf[j] = t
+            i = i + 1
+            j = j - 1
+        }
+    }
+}
+
+// New array = pattern repeated count times (length pattern.len() * count).
+// Empty pattern or count == 0 yields an empty array.
+pub fun repeat<T>(pattern: T[], count: usize): T[] {
+    if pattern.len() == 0 || count == 0 {
+        return []
+    }
+    val n = pattern.len() * count
+    var out: T[] = [pattern[0], ..n]
+    var i = 0 as usize
+    while i < n {
+        out[i] = pattern[i % pattern.len()]
+        i = i + 1
+    }
+    out
+}
+
+// Byte-wise (u8[]) / structural (any T[]) equality: same length and same
+// elements. Identical in meaning to the builtin array `==`; exists as the
+// performance form — memcmp is two orders faster than element-wise compare.
+pub fun equal<T>(a: T[], b: T[]): bool {
+    if a.type_name() == "u8[]" {
+        __mem_equal(a as u8[], b as u8[]) != 0
+    } else {
+        a == b
+    }
+}
+
+// Whether the array's element type has the Mem C fast path (the scalar
+// element names fill/copy cover). Generic containers consult this at runtime
+// to route growth through fill + copy (a C memcpy) instead of engine concat —
+// the List.push / Set row-append seam.
+pub fun is_scalar_array<T>(arr: T[]): bool {
+    val n = arr.type_name()
+    n == "u8[]" || n == "i8[]" || n == "i16[]" || n == "i32[]" || n == "i64[]" || n == "u16[]" || n == "u32[]" || n == "u64[]" || n == "isize[]" || n == "usize[]" || n == "f32[]" || n == "f64[]" || n == "bool[]" || n == "char[]" || n == "i128[]" || n == "u128[]" || n == "f16[]" || n == "f128[]"
+}
+
+// Deep copy: arrays (incl. nested) and records recurse into fresh structure;
+// immutable leaves and runtime identities (closures/channels/FFI handles)
+// share. The only user-level deep-copy path — plain assignment, element
+// reads, and slices all SHARE, so this is how independent nested structure
+// is obtained.
+pub fun clone<T>(v: T): T {
+    v.clone()
+}
+
+// Lexicographic three-way comparison: -1 when a sorts before b, 0 when equal,
+// 1 when after. Element-wise first, then shorter-is-less. Requires ordered
+// elements (scalars, str); u8[] takes the memcmp fast path.
+pub fun compare<T>(a: T[], b: T[]): i32 {
+    val n = a.type_name()
+    if n == "u8[]" {
+        return __mem_compare_u8(a as u8[], b as u8[])
+    }
+    if n == "i8[]" {
+        return __mem_compare_i8(a as i8[], b as i8[])
+    }
+    if n == "i16[]" {
+        return __mem_compare_i16(a as i16[], b as i16[])
+    }
+    if n == "i32[]" {
+        return __mem_compare_i32(a as i32[], b as i32[])
+    }
+    if n == "i64[]" {
+        return __mem_compare_i64(a as i64[], b as i64[])
+    }
+    if n == "u16[]" {
+        return __mem_compare_u16(a as u16[], b as u16[])
+    }
+    if n == "u32[]" {
+        return __mem_compare_u32(a as u32[], b as u32[])
+    }
+    if n == "u64[]" {
+        return __mem_compare_u64(a as u64[], b as u64[])
+    }
+    if n == "isize[]" {
+        return __mem_compare_isize(a as isize[], b as isize[])
+    }
+    if n == "usize[]" {
+        return __mem_compare_usize(a as usize[], b as usize[])
+    }
+    if n == "f32[]" {
+        return __mem_compare_f32(a as f32[], b as f32[])
+    }
+    if n == "f64[]" {
+        return __mem_compare_f64(a as f64[], b as f64[])
+    }
+    if n == "bool[]" {
+        return __mem_compare_bool(a as bool[], b as bool[])
+    }
+    if n == "char[]" {
+        return __mem_compare_char(a as char[], b as char[])
+    }
+    if n == "i128[]" {
+        return __mem_compare_i128(a as i128[], b as i128[])
+    }
+    if n == "u128[]" {
+        return __mem_compare_u128(a as u128[], b as u128[])
+    }
+    if n == "f16[]" {
+        return __mem_compare_f16(a as f16[], b as f16[])
+    }
+    if n == "f128[]" {
+        return __mem_compare_f128(a as f128[], b as f128[])
+    }
+    if n == "str[]" {
+        // Generic < / > are numeric-tag-aware only; str elements compare by
+        // their UTF-8 bytes (same ordering as Str equality's byte semantics).
+        // Element-wise value cast (array-level cast to str[] is unsupported:
+        // a Ref target tag cannot be distinguished from records/arrays).
+        val n = if a.len() < b.len() { a.len() } else { b.len() }
+        var i = 0 as usize
+        while i < n {
+            val x = a[i] as str
+            val y = b[i] as str
+            val rc = __mem_compare_u8(x.bytes(), y.bytes())
+            if rc != 0 { return rc }
+            i = i + 1
+        }
+        if a.len() < b.len() { return -1 }
+        if a.len() > b.len() { return 1 }
+        return 0
+    }
+    val n = if a.len() < b.len() { a.len() } else { b.len() }
+    var i = 0 as usize
+    while i < n {
+        if a[i] < b[i] { return -1 }
+        if a[i] > b[i] { return 1 }
+        i = i + 1
+    }
+    if a.len() < b.len() {
+        -1
+    } else if a.len() > b.len() {
+        1
+    } else {
+        0
+    }
+}
+
+// Index of the first occurrence of needle inside hay; -1 when absent.
+// Empty needle matches at 0. u8[] takes the C fast path; every other element
+// type compares element-wise.
+pub fun index_of<T>(hay: T[], needle: T[]): i64 {
+    val n = hay.type_name()
+    if n == "u8[]" {
+        return __mem_index_of_u8(hay as u8[], needle as u8[])
+    }
+    if n == "i8[]" {
+        return __mem_index_of_i8(hay as i8[], needle as i8[])
+    }
+    if n == "i16[]" {
+        return __mem_index_of_i16(hay as i16[], needle as i16[])
+    }
+    if n == "i32[]" {
+        return __mem_index_of_i32(hay as i32[], needle as i32[])
+    }
+    if n == "i64[]" {
+        return __mem_index_of_i64(hay as i64[], needle as i64[])
+    }
+    if n == "u16[]" {
+        return __mem_index_of_u16(hay as u16[], needle as u16[])
+    }
+    if n == "u32[]" {
+        return __mem_index_of_u32(hay as u32[], needle as u32[])
+    }
+    if n == "u64[]" {
+        return __mem_index_of_u64(hay as u64[], needle as u64[])
+    }
+    if n == "isize[]" {
+        return __mem_index_of_isize(hay as isize[], needle as isize[])
+    }
+    if n == "usize[]" {
+        return __mem_index_of_usize(hay as usize[], needle as usize[])
+    }
+    if n == "f32[]" {
+        return __mem_index_of_f32(hay as f32[], needle as f32[])
+    }
+    if n == "f64[]" {
+        return __mem_index_of_f64(hay as f64[], needle as f64[])
+    }
+    if n == "bool[]" {
+        return __mem_index_of_bool(hay as bool[], needle as bool[])
+    }
+    if n == "char[]" {
+        return __mem_index_of_char(hay as char[], needle as char[])
+    }
+    if n == "i128[]" {
+        return __mem_index_of_i128(hay as i128[], needle as i128[])
+    }
+    if n == "u128[]" {
+        return __mem_index_of_u128(hay as u128[], needle as u128[])
+    }
+    if n == "f16[]" {
+        return __mem_index_of_f16(hay as f16[], needle as f16[])
+    }
+    if n == "f128[]" {
+        return __mem_index_of_f128(hay as f128[], needle as f128[])
+    }
+    if needle.len() == 0 { return 0 }
+    var i = 0 as usize
+    while i + needle.len() <= hay.len() {
+        var matched = true
+        var j = 0 as usize
+        while matched && j < needle.len() {
+            if hay[i + j] != needle[j] { matched = false }
+            j = j + 1
+        }
+        if matched { return i as i64 }
+        i = i + 1
+    }
+    -1
+}
+
+// Whether needle occurs inside hay.
+pub fun contains<T>(hay: T[], needle: T[]): bool {
+    index_of(hay, needle) >= 0
+}

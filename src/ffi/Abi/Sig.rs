@@ -58,10 +58,28 @@ pub fn abi_type_from_name(ty_name: &str) -> AbiType {
     }
 }
 
-/// Push `AbiType`(s) for a Frond type name. `str` and `u8[]` expand to the
-/// `(Ptr, Int)` two slots, mirroring the DataLen C-side expansion in ffi/Gen.rs.
+/// Scalar array type names that expand to `(Ptr, Int)` like `str`/`u8[]` — the
+/// scalar-intrinsic C fast path of std.core.mem. Keep in sync with the array
+/// entries of `TYPE_MAP` (ffi/Gen.rs) and Marshal's scalar serialization set:
+/// a name here without a TYPE_MAP entry cannot be declared in an `@extern("C")`
+/// signature; one without a Marshal serializer would fail at call time.
+/// Every scalar element width is covered, 128-bit elements included: they
+/// marshal as native 16-byte blocks and their C pointers are `uint64_t*`
+/// pair views (no portable 128-bit C type; fill VALUES cross FFI through a
+/// single-element pattern array, not a scalar param).
+pub const SCALAR_ARRAY_TYPES: &[&str] = &[
+    "i8[]", "i16[]", "i32[]", "i64[]", "u16[]", "u32[]", "u64[]",
+    "isize[]", "usize[]", "f32[]", "f64[]", "bool[]", "char[]",
+    "i128[]", "u128[]", "f16[]", "f128[]",
+];
+
+/// Push `AbiType`(s) for a Frond type name. `str`, `u8[]`, and scalar arrays
+/// expand to the `(Ptr, Int)` two slots, mirroring the DataLen C-side expansion
+/// in ffi/Gen.rs (`{p}_data` / `{p}_len`). For arrays the Int slot carries the
+/// ELEMENT count (u8[]: identical to its byte count); the C side knows its own
+/// element width from the typed `{p}_data` pointer.
 pub fn push_abi_types_for_name(ty_name: &str, out: &mut Vec<AbiType>) {
-    if ty_name == "str" || ty_name == "u8[]" {
+    if ty_name == "str" || ty_name == "u8[]" || SCALAR_ARRAY_TYPES.contains(&ty_name) {
         out.push(AbiType::Ptr);
         out.push(AbiType::Int { bits: 64, signed: false });
     } else {
@@ -85,7 +103,7 @@ pub fn parse_arg_sig(args_csv: &str, ret: AbiType) -> Result<AbiSig, String> {
             }
             if !is_known_atom(atom) {
                 return Err(format!(
-                    "unknown type '{}' in signature '{}' (allowed: i8..i64/isize, u8..u64/usize, f32, f64, bool, char, str, u8[])",
+                    "unknown type '{}' in signature '{}' (allowed: i8..i64/isize, u8..u64/usize, f32, f64, bool, char, str, scalar arrays)",
                     atom, args_csv
                 ));
             }
@@ -102,7 +120,8 @@ fn is_known_atom(atom: &str) -> bool {
         "i8" | "i16" | "i32" | "i64" | "isize"
             | "u8" | "u16" | "u32" | "u64" | "usize"
             | "f32" | "f64" | "bool" | "char" | "str" | "u8[]"
-    ) || atom.starts_with('*')
+    ) || SCALAR_ARRAY_TYPES.contains(&atom)
+        || atom.starts_with('*')
 }
 
 /// Runtime argument value (type-erased carrier), one-to-one with `AbiSig.params`.

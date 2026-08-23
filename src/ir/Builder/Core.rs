@@ -70,6 +70,9 @@ pub struct IrBuilder<'a> {
     /// `TraitDefaultInstance.type_name` in sema and obtain the concrete type of `self`
     /// (consuming sema output; the IR does not hold semantic information).
     pub current_trait_default_idx: Option<usize>,
+    /// Allocation counter for inheritance base-dispatch site indices (vtable
+    /// keys). Starts at 0x8000 to stay clear of trait method indices.
+    pub next_base_dispatch_idx: u16,
     /// The subgraph id of the function currently being compiled (used for `defer` registration).
     pub current_function_sg: Option<SubGraphId>,
     /// W3C region context: the INNERMOST branch/loop-body subgraph currently
@@ -95,6 +98,39 @@ pub struct IrBuilder<'a> {
     /// to the original node, so the closure can read the latest value from the parent frame
     /// during a `same_function` call (capture-by-reference semantics).
     pub captured_vars: rustc_hash::FxHashMap<String, NodeId>,
+    /// Place-model C1-①: names of THIS function whose address is taken
+    /// (`&x` outside lambda/nested-fn bodies), collected by the pre-pass in
+    /// `compile_function_body`. Their `val`/`var` declarations lower to a
+    /// Cell allocation at the DECL SITE and every name read/write routes
+    /// through it (`&x` then costs nothing — the cell already exists).
+    pub fn_address_taken: rustc_hash::FxHashSet<String>,
+    /// Names read inside lambda / nested-function bodies in this function.
+    /// A binding both address-taken AND captured stays plain: the capture
+    /// machinery snapshots the binding node, which must remain the raw value.
+    pub fn_lambda_captured: rustc_hash::FxHashSet<String>,
+    /// Scope-parallel stack of cell-backed bindings: name -> (cell node, owner
+    /// `current_function_id`). Pushed/popped with `scope_stack`; the owner tag
+    /// blocks cross-function leakage through the shared scope chain. A
+    /// cell-backed name's `scope_stack` entry points at the cell node itself.
+    pub cell_bound: Vec<rustc_hash::FxHashMap<String, (NodeId, u32)>>,
+    /// Place-model all-vars (C1-③④): true while compiling a function whose
+    /// scalar `var`s are ALL cell-backed (every non-transformed function).
+    /// Drives decl-site backing and the compile-time store→load forwarding.
+    pub fn_all_vars_slot: bool,
+    /// Compile-time forwarding memory: cell node -> the node producing its
+    /// CURRENT value. Reads of a tracked cell forward to that node directly
+    /// (zero-cost SSA edge, the mem2reg equivalent); stores update it;
+    /// barriers (loop bodies, branch exits, defer bodies) snapshot/clear it.
+    /// Only non-escaped cells are tracked (`no_forward_cells`).
+    pub cell_values: rustc_hash::FxHashMap<NodeId, NodeId>,
+    /// Cells whose reference escaped (`&x`): calls or stored refs may write
+    /// them, so forwarding would read stale compile-time values. Reads of
+    /// these cells always emit CF_DEREF_READ loads.
+    pub no_forward_cells: rustc_hash::FxHashSet<NodeId>,
+    /// Entry-call argument nodes for the while sg most recently registered
+    /// (the loop-carried cell params initial values). Consumed by the Stmt
+    /// While branch when emitting the launch call.
+    pub while_entry_args: Vec<NodeId>,
     /// Function subgraphs that contain a function-level defer (Bug #49). Historically this
     /// was `!defer_table.is_empty()`; now that defers register dynamically at runtime
     /// (CF_BLOCK_DEFER_REGISTER + frame.defer_stack), the table is always empty, so this
@@ -105,6 +141,13 @@ pub struct IrBuilder<'a> {
     /// Type-field scope stack: constructor/type name -> field name list
     /// (managed in parallel with `scope_stack`).
     pub type_scope_stack: Vec<rustc_hash::FxHashMap<String, TypeFieldInfo>>,
+    /// Per-module type-field scopes (module-scoped type resolution): module
+    /// name -> (bare type/ctor name -> TypeFieldInfo with CANONICAL
+    /// type_name). Own-module bindings shadow the base layer (`type_scope_stack[0]`),
+    /// so a local `type List` wins inside its module without clobbering the
+    /// std binding other modules compile against. Only user modules carry
+    /// entries — std/builtin keep the historical flat base layer.
+    pub module_type_scopes: rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<String, TypeFieldInfo>>,
     /// `function_id` of the function currently being compiled (used for subgraph tagging and
     /// `root_frame_ptr` inheritance decisions).
     pub current_function_id: u32,
@@ -130,7 +173,6 @@ pub struct IrBuilder<'a> {
     /// WriteBacks keep current across iterations), not through the mid-chain node of a
     /// previous assignment — otherwise the condition re-evaluates against a stale
     /// snapshot every iteration and the loop never terminates.
-    pub var_home: rustc_hash::FxHashMap<String, (NodeId, bool)>,
     /// Bug #66: Whether the current `compile_block` call is the function body's top-level block.
     /// Set to `true` at `compile_function_body` entry; reset to `false` by the first `compile_block`
     /// call (the function body itself). Nested blocks see `false`, so only they extract
@@ -167,6 +209,12 @@ pub struct IrBuilder<'a> {
     /// Used by `compile_method_call` to dispatch implicit-this method calls (where `recv`
     /// is the callee Ident, not the receiver — the receiver is `this`).
     pub current_method_type: Option<(Box<str>, u16)>,
+    /// Static type name of the match scrutinee currently being pattern-compiled
+    /// (`None` outside `compile_match`). Literal patterns route their equality
+    /// compute_fn by this: the literal's own spelling (suffix/magnitude) cannot
+    /// recover the scrutinee's width, and the eq_i32 default truncated both
+    /// sides (i64 4294967296 falsely matched pattern 0).
+    pub pattern_scrutinee_ty: Option<Box<str>>,
     /// Compile-time error list (unimplemented features, missing functions, etc.; inspectable
     /// after compilation).
     pub errors: Vec<String>,
@@ -255,28 +303,36 @@ pub(super) fn reflect_method_intrinsic(method: &str) -> Option<(crate::sema::Sem
     // BinOp: receiver + one index arg
     let bin = |id: u32| Some((IntrinsicKind::BinOp(id), 1));
     match method {
-        "kind" => un(328),              // CF_REFLECT_KIND_STR (kind() returns str)
-        "type_name" => un(327),         // CF_REFLECT_TYPE_NAME
-        "size" => un(330),              // CF_REFLECT_LAYOUT_SIZE (aggregate)
-        "alignment" => un(331),         // CF_REFLECT_LAYOUT_ALIGN
-        "field_count" => un(332),       // CF_REFLECT_FIELD_COUNT
-        "repr" => un(290),               // CF_REFLECT_FORMAT (renamed from format 2026-08-17)
-        "constructor" => un(336),       // CF_REFLECT_ADT_CTOR
-        "field_name" => bin(333),       // CF_REFLECT_FIELD_NAME
+        "kind" => un(325),              // CF_REFLECT_KIND_STR (kind() returns str)
+        "type_name" => un(324),         // CF_REFLECT_TYPE_NAME
+        "size" => un(327),              // CF_REFLECT_LAYOUT_SIZE (aggregate)
+        "alignment" => un(328),         // CF_REFLECT_LAYOUT_ALIGN
+        "field_count" => un(329),       // CF_REFLECT_FIELD_COUNT
+        "repr" => un(288),               // CF_REFLECT_FORMAT (renamed from format 2026-08-17)
+        "constructor" => un(333),       // CF_REFLECT_ADT_CTOR
+        "clone" => un(348),             // CF_REFLECT_CLONE (deep copy, data domain)
+        "field_name" => bin(330),       // CF_REFLECT_FIELD_NAME
         // field_value removed: its return type cannot be expressed without an "any"
-        // type in Frond's type system. CF_REFLECT_FIELD_VALUE (334) remains implemented
+        // type in Frond's type system. CF_REFLECT_FIELD_VALUE (331) remains implemented
         // in Compute.rs for potential future use (e.g. a typed field_value<T>(i): T).
         _ => None,
     }
 }
 
 /// Tail-recursion-to-iteration context: used by `compile_call` when intercepting self-calls.
-/// `self_name` is the current function name; `param_nodes` is the parameter node list.
+/// `self_name` is the current function name; `param_cells` are the parameter register Cells
+/// (B2): tail-call actuals are stored through CF_DEREF_WRITE and the re-evaluated condition
+/// loads the current values — replacing the old WriteBack param-register machinery.
 #[derive(Clone)]
 pub(crate) struct TailRecCtx {
     pub(super) self_name: String,
-    pub(super) param_nodes: Vec<NodeId>,
+    pub(super) param_cells: Vec<NodeId>,
 }
+
+/// call_result_map marker: the mapped call's result lives in the nontail-rec
+/// converter's result Cell — the consumer synthesizes a CF_DEREF_READ in its
+/// own state subgraph (never a valid NodeId).
+pub(crate) const RESULT_CELL_MARKER: NodeId = NodeId(u32::MAX);
 
 /// Non-tail-recursion-to-iteration context: intercepts self-calls as `push + continue` while
 /// compiling `body_sg`.
@@ -289,13 +345,14 @@ pub(crate) struct NonTailRecCtx {
     pub param_nodes: Vec<NodeId>,
     /// Work-stack array node (a local variable within the function subgraph).
     pub stack_node: NodeId,
-    /// Stack-pointer node (`sp`; a local variable within the function subgraph).
-    pub sp_node: NodeId,
-    /// Result variable node (`result`; a local variable within the function subgraph).
-    pub result_node: NodeId,
+    /// Stack-pointer Cell (B3): sp lives across iterations as engine state.
+    pub sp_cell: NodeId,
+    /// Result Cell (B3): the deepest completed state's result.
+    pub result_cell: NodeId,
     /// Call-site ExprId -> node mapping.
     /// When compiling a continuation, encountering an ExprId in this map returns the
-    /// corresponding node (`result` or a `saved` node).
+    /// corresponding node (a `saved` node, or [`RESULT_CELL_MARKER`] for the
+    /// result Cell).
     pub call_result_map: rustc_hash::FxHashMap<crate::ast::Ast::ExprId, NodeId>,
     /// Truncation flag: set to `true` after intercepting the first self-call; subsequent
     /// self-calls generate a void constant.
@@ -333,19 +390,26 @@ impl<'a> IrBuilder<'a> {
             method_subgraphs: rustc_hash::FxHashMap::default(),
             trait_default_subgraphs: rustc_hash::FxHashMap::default(),
             current_trait_default_idx: None,
+            next_base_dispatch_idx: 0x8000,
             current_function_sg: None,
             current_branch_sg: None,
             loop_stack: Vec::new(),
             scope_stack: Vec::new(),
             captured_scopes: Vec::new(),
             captured_vars: rustc_hash::FxHashMap::default(),
+            fn_address_taken: rustc_hash::FxHashSet::default(),
+            fn_lambda_captured: rustc_hash::FxHashSet::default(),
+            cell_bound: Vec::new(),
+            fn_all_vars_slot: false,
+            cell_values: rustc_hash::FxHashMap::default(),
+            no_forward_cells: rustc_hash::FxHashSet::default(),
+            while_entry_args: Vec::new(),
             function_defer_sgs: rustc_hash::FxHashSet::default(),
             current_function_id: 0,
             current_sg_start: 0,
             current_effect: None,
             in_tail_position: false,
             fn_returns_throw: false,
-            var_home: rustc_hash::FxHashMap::default(),
             in_function_top_block: false,
             param_scope_depth: 0,
             in_loop_body: false,
@@ -354,10 +418,12 @@ impl<'a> IrBuilder<'a> {
             current_type_args: Vec::new(),
             current_instance_id: None,
             current_method_type: None,
+            pattern_scrutinee_ty: None,
             errors: Vec::new(),
             global_var_slots: rustc_hash::FxHashMap::default(),
             top_level_var_decls: Vec::new(),
             type_scope_stack: Vec::new(),
+            module_type_scopes: rustc_hash::FxHashMap::default(),
             memo_table_count: 0,
             string_pool: Vec::new(),
             string_map: rustc_hash::FxHashMap::default(),
@@ -466,12 +532,14 @@ impl<'a> IrBuilder<'a> {
     pub(super) fn enter_scope(&mut self) {
         self.scope_stack.push(rustc_hash::FxHashMap::default());
         self.type_scope_stack.push(rustc_hash::FxHashMap::default());
+        self.cell_bound.push(rustc_hash::FxHashMap::default());
     }
 
     /// Exit a scope (variables and type fields are popped together).
     pub(super) fn exit_scope(&mut self) {
         self.scope_stack.pop();
         self.type_scope_stack.pop();
+        self.cell_bound.pop();
     }
 
     /// Register type field info in the current scope (constructor name / type name ->
@@ -482,101 +550,58 @@ impl<'a> IrBuilder<'a> {
         }
     }
 
-    /// Look up type field info by walking the scope stack from inner to outer (constructor name
-    /// or type name).
+    /// Register type field info into the BASE layer (index 0) without
+    /// displacing an existing binding — std modules bind first, so user
+    /// types only fill free bare keys (std keeps priority for cross-module
+    /// bare references). Canonical keys are unique and always land.
+    pub(super) fn bind_type_fields_base_first_wins(&mut self, name: &str, info: TypeFieldInfo) {
+        if self.type_scope_stack.is_empty() {
+            return;
+        }
+        self.type_scope_stack[0].entry(name.to_string()).or_insert(info);
+    }
+
+    /// Bind a user-module type/ctor binding into that module's dedicated
+    /// scope (shadow layer above the base).
+    pub(super) fn bind_module_type_fields(&mut self, module_name: &str, name: &str, info: TypeFieldInfo) {
+        self.module_type_scopes
+            .entry(module_name.to_string())
+            .or_default()
+            .insert(name.to_string(), info);
+    }
+
+    /// Look up type field info by walking the scope stack from inner to outer
+    /// (constructor name or type name). The per-module scope of the module
+    /// currently being compiled sits between the local (nested-type) layers
+    /// and the base layer — own-module types shadow the flat base.
     pub(super) fn lookup_type_fields(&self, name: &str) -> Option<TypeFieldInfo> {
-        for scope in self.type_scope_stack.iter().rev() {
+        // Local layers above the base (index 0), innermost first.
+        if self.type_scope_stack.len() > 1 {
+            for scope in self.type_scope_stack[1..].iter().rev() {
+                if let Some(info) = scope.get(name) {
+                    return Some(info.clone());
+                }
+            }
+        }
+        // The current module's own scope.
+        if let Some(scope) = self.module_type_scopes.get(self.current_module().name) {
             if let Some(info) = scope.get(name) {
                 return Some(info.clone());
             }
         }
-        None
+        // Base layer.
+        self.type_scope_stack.first()?.get(name).cloned()
     }
 
     /// Bind a variable name to a NodeId (in the current scope).
-
-    /// Bug #100 residual: a (re)declaration creates a FRESH home slot. bind_var keeps
-    /// the first home per name (loop-body WriteBack rebinds must not move it), so a
-    /// sequential redeclaration of the same name in one function (`var si` in an early
-    /// section, then `var si` again later) must reset the home explicitly — otherwise
-    /// the second declaration's initial value never reaches the home slot and later
-    /// loops reading through home start from the first declaration's stale final value.
     pub(super) fn declare_var(&mut self, name: &str, node_id: NodeId) {
         self.bind_var(name, node_id);
-        let fn_level = self.loop_stack.is_empty();
-        self.var_home.insert(name.to_string(), (node_id, fn_level));
-    }
-
-    /// Bug #100: rebind every loop-body-modified variable to its canonical HOME node
-    /// before compiling a while-loop condition. The condition re-evaluates every
-    /// iteration; WriteBacks update the home slot in the loop frame (via the frame
-    /// chain), so reading the home gives the current value. Reading the mid-chain node
-    /// of a pre-loop assignment instead freezes the condition at loop entry.
-    pub(super) fn rebind_modified_vars_to_home(&mut self, body: crate::ast::Ast::ExprId) {
-        let mut names = rustc_hash::FxHashSet::default();
-        let m = self.current_module();
-        collect_assigned_names(&m.arena, body, &mut names);
-        for name in names {
-            if let Some(&(home, fn_level)) = self.var_home.get(name.as_str()) {
-                if fn_level {
-                    // Rebind in the scope WHERE the name is bound (not the innermost
-                    // scope): a rebind performed inside an if-branch scope would be
-                    // discarded when the branch scope pops, leaving post-branch code
-                    // reading the stale pre-loop chain binding.
-                    for scope in self.scope_stack.iter_mut().rev() {
-                        if scope.contains_key(name.as_str()) {
-                            scope.insert(name.clone(), home);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Companion to `rebind_modified_vars_to_home`: BEFORE a loop is registered, any
-    /// pre-loop assignment to a loop-modified variable lives on the scope's value
-    /// chain (a fresh def node), while the loop's condition/post-loop reads go through
-    /// the variable's HOME slot — which still holds the declaration-time value. That
-    /// made `i = i - 1; while i > 1 {...}` evaluate the condition against the stale
-    /// declaration value. Sync each such variable's current def into its home slot with
-    /// a WriteBack chained onto the current effect, so loop entry sees the up-to-date
-    /// value exactly like an in-body WriteBack would.
-    pub(super) fn sync_modified_vars_to_home(&mut self, body: crate::ast::Ast::ExprId) {
-        let mut names = rustc_hash::FxHashSet::default();
-        let m = self.current_module();
-        collect_assigned_names(&m.arena, body, &mut names);
-        for name in names {
-            if let Some(&(home, fn_level)) = self.var_home.get(name.as_str()) {
-                if !fn_level {
-                    continue;
-                }
-                let cur = match self.lookup_var(name.as_str()) {
-                    Some(n) => n,
-                    None => continue,
-                };
-                if cur == home {
-                    continue; // no pre-loop assignment; home already current
-                }
-                let wb = self.compile_writeback_node(cur, home);
-                let eff = self.chain_effects(self.current_effect, wb);
-                self.current_effect = Some(eff);
-            }
-        }
     }
 
     pub(super) fn bind_var(&mut self, name: &str, node_id: NodeId) {
         if let Some(scope) = self.scope_stack.last_mut() {
             scope.insert(name.to_string(), node_id);
         }
-        // Bug #100: record the canonical home slot (first binding). Later re-bindings
-        // (loop-body WriteBacks) update the current binding but keep the home stable.
-        // The bool marks function-level declarations (bound outside any loop body):
-        // only those get rebound in loop conditions — a variable declared INSIDE an
-        // enclosing loop body is fresh each iteration and its binding chain is already
-        // correct (rebinding it broke nested-loop shapes like bubble sort).
-        let fn_level = self.loop_stack.is_empty();
-        self.var_home.entry(name.to_string()).or_insert((node_id, fn_level));
     }
 
     /// Look up the NodeId bound to a variable (searching from inner to outer scope).
@@ -587,20 +612,6 @@ impl<'a> IrBuilder<'a> {
             }
         }
         // Global variables: return None; the caller handles them via is_global_var + global_var_slots.
-        None
-    }
-
-    /// Look up the outermost binding of a variable (the original declaration in the
-    /// function-level scope). Used by `Assignment` to determine the correct WriteBack
-    /// target: when a variable is assigned in a nested same_function subgraph (e.g.
-    /// if branch inside a while body), WriteBack must target the outermost binding
-    /// (the root-frame declaration), not an intermediate node in a branch subgraph.
-    pub(super) fn lookup_root_frame_var(&self, name: &str) -> Option<NodeId> {
-        for scope in self.scope_stack.iter() {
-            if let Some(&node_id) = scope.get(name) {
-                return Some(node_id);
-            }
-        }
         None
     }
 
@@ -665,35 +676,149 @@ impl<'a> IrBuilder<'a> {
         node.0 >= self.current_sg_start
     }
 
-    /// Bug #49: check whether the current function subgraph contains a function-level defer.
-    /// Used to decide whether a local variable reassignment needs a WriteBack to the original
-    /// node (so defer bodies read the latest value, Reference-mode semantics).
-    pub(super) fn current_function_has_defer(&self) -> bool {
-        if let Some(sg_id) = self.current_function_sg {
-            return self.function_defer_sgs.contains(&sg_id);
+    /// Guard for cell-backed name traffic (reads/writes/`&name`): the site
+    /// must not be inside a lambda body (`captured_scopes` non-empty —
+    /// outer-name reads there route through the capture machinery) and the
+    /// name must have a cell binding visible from the current scope, owned by
+    /// the function being compiled (the owner tag blocks cross-function
+    /// leakage through the shared scope chain).
+    pub(super) fn lookup_cell_binding(&self, name: &str) -> Option<NodeId> {
+        // NOTE: no captured_scopes guard — the binding-identity check below
+        // already routes correctly inside lambda bodies: a cell-captured name
+        // resolves to the lambda's UPVALUE node (registered in cell_bound by
+        // compile_lambda), while a plain outer name resolves to its upvalue
+        // and fails the identity check against the outer cell entry.
+        let owner = self.current_function_id;
+        let cell_node = self
+            .cell_bound
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+            .filter(|(_, o)| *o == owner)
+            .map(|(node, _)| *node)?;
+        // Binding-identity guard: the name's scope_stack resolution must BE
+        // the cell node. A plain rebind of the same name (inline-expansion
+        // params binding formals via bind_var, pattern variables, for-vars)
+        // shadows the cell WITHOUT touching cell_bound — routing by name
+        // alone would read the wrong storage (observed: inlined callee param
+        // colliding with a cell-backed caller param of the same name).
+        if self.lookup_var(name) != Some(cell_node) {
+            return None;
+        }
+        Some(cell_node)
+    }
+
+    /// Register a cell-backed binding in the current scope and rebind the
+    /// name in `scope_stack` to the cell node.
+    pub(super) fn bind_cell(&mut self, name: &str, cell_node: NodeId) {
+        let owner = self.current_function_id;
+        if let Some(scope) = self.cell_bound.last_mut() {
+            scope.insert(name.to_string(), (cell_node, owner));
+        }
+        self.bind_var(name, cell_node);
+    }
+
+    /// Decl-site cell-backing eligibility (place model):
+    /// - `var` decls in all-vars functions (C1-③④): EVERY binding (any value
+    ///   type — scalars AND containers/records; `arr[i] = x` reads the cell
+    ///   for the current Arc and mutates in place, unchanged), not captured
+    ///   by a lambda / nested fn, not declared inside a lambda body.
+    /// - `val` decls: only when address-taken (C1-① shape).
+    pub(super) fn decl_cell_backing_eligible(
+        &self,
+        name: &str,
+        _value_expr: crate::ast::Ast::ExprId,
+        is_var: bool,
+    ) -> bool {
+        // ⑤ Lambda-body LOCAL vars are slot-backed too (④ removed the
+        // captured_scopes routing block — the binding-identity guard routes
+        // correctly inside lambda bodies). Nested-lambda captures ALSO stay
+        // slot-backed: ④'s cell-capture chain propagates the shared cell
+        // through upvalue levels (the outer lambda cell-captures, the inner
+        // registers against the outer's upvalue).
+        if is_var {
+            self.fn_all_vars_slot || self.fn_address_taken.contains(name)
+        } else {
+            self.fn_address_taken.contains(name)
+        }
+    }
+
+    /// Record the value a cell-backed binding holds right after its cell
+    /// allocation, and mark address-taken cells non-forwardable.
+    pub(super) fn track_cell_decl(&mut self, name: &str, cell_node: NodeId, value_node: NodeId) {
+        // Cell-captured by a lambda: like address-taken, the cell escapes —
+        // calls through the closure can mutate it invisibly to the compiler,
+        // so reads must always LOAD (a forwarded read would pin the
+        // compile-time value).
+        if self.fn_address_taken.contains(name) || self.fn_lambda_captured.contains(name) {
+            self.no_forward_cells.insert(cell_node);
+        } else {
+            self.cell_values.insert(cell_node, value_node);
+        }
+    }
+
+    /// A store to a tracked cell updates the forwarding memory.
+    pub(super) fn track_cell_store(&mut self, cell_node: NodeId, value_node: NodeId) {
+        if !self.no_forward_cells.contains(&cell_node) {
+            self.cell_values.insert(cell_node, value_node);
+        }
+    }
+
+    /// Forwarding lookup for a read of `cell_node`: the remembered current
+    /// value node, when the cell is tracked.
+    pub(super) fn cell_forwarded_value(&self, cell_node: NodeId) -> Option<NodeId> {
+        if self.no_forward_cells.contains(&cell_node) {
+            return None;
+        }
+        self.cell_values.get(&cell_node).copied()
+    }
+
+    /// Barrier (subgraph body, branch- AND loop-like): snapshot the
+    /// forwarding memory and clear it. Correctness rule: a body that
+    /// re-executes (loop) or executes conditionally (branch) invalidates
+    /// compile-time values BOTH ways — pre-entry values are stale after it,
+    /// and stores made inside it must not leak to code after it. Reads
+    /// inside and after the body emit real loads (stores still forward
+    /// WITHIN one body execution).
+    pub(super) fn cell_barrier_enter(&mut self) -> rustc_hash::FxHashMap<NodeId, NodeId> {
+        std::mem::take(&mut self.cell_values)
+    }
+
+    /// Defer-body barrier exit: RESTORE the pre-entry snapshot. The defer
+    /// body runs at exit time, so the enclosing function's subsequent code
+    /// still sees pre-defer values (the defer's stores must not leak).
+    pub(super) fn cell_barrier_exit_defer(
+        &mut self,
+        saved: rustc_hash::FxHashMap<NodeId, NodeId>,
+    ) {
+        self.cell_values = saved;
+    }
+
+    /// Subgraph-body barrier exit (branch- AND loop-like): clear EVERYTHING —
+    /// neither pre-body values (the body may have overwritten the cell) nor
+    /// the body's own stores (their nodes live inside the subgraph range the
+    /// parent frame never executes — forwarding them leaves reads pending
+    /// forever) may survive. Reads after the body emit real loads.
+    pub(super) fn cell_barrier_exit(&mut self) {
+        self.cell_values.clear();
+    }
+
+    /// True when `recv.field` is the `Type.Ctor` qualified-constructor form —
+    /// constructors are rvalues, not places (defense in depth behind the sema
+    /// place check).
+    pub(super) fn is_qualified_ctor_place(
+        &self,
+        recv_id: crate::ast::Ast::ExprId,
+        field: &str,
+    ) -> bool {
+        if let crate::ast::Ast::Expr::Ident(type_name) =
+            &self.current_module().arena.expr(recv_id).node
+        {
+            return self.check_qualified_ctor_ir(type_name, field).is_some();
         }
         false
     }
 
-    /// Compile a WriteBack node: assigns an outer variable, writing it back to the function's
-    /// root frame via `root_frame_ptr`.
-    /// Returns the NodeId of the WriteBack node.
-    pub(super) fn compile_writeback_node(&mut self, val_node: NodeId, target_outer: NodeId) -> NodeId {
-        let wb_off = self.graph.inputs_pool.push(&[val_node]);
-        let wb_node = self.graph.add_node(Node {
-            kind: NodeKind::BinOp,
-            input_count: 1,
-            inputs_offset: wb_off,
-            compute_fn: CF_WRITEBACK, // compute_writeback
-        });
-        self.graph.set_writeback_target(wb_node, target_outer);
-        wb_node
-    }
-
-    /// Map a `CompoundAssignOp` to the `ComputeFnId` of the corresponding binary operation.
-    ///
-    /// Looks up `arith_base` by concrete type: arithmetic operations use offsets 0-4;
-    /// bitwise operations use offsets 5-9 (integers only).
     pub(super) fn compound_assign_op_to_compute_fn(
         &mut self,
         op: crate::ast::Ast::CompoundAssignOp,
@@ -733,6 +858,7 @@ impl<'a> IrBuilder<'a> {
     ) -> SubGraphId {
         let id = SubGraphId(self.graph.subgraphs.len() as u32);
         let sg = SubGraph {
+            converter_generated: false,
             id,
             node_range: (NodeId(0), NodeId(0)),
             param_count,
@@ -913,14 +1039,125 @@ impl<'a> IrBuilder<'a> {
             // Take a reference `&expr` -> `compute_ref_of` (280): scalars are boxed into a Cell;
             // heap objects share an Arc.
             crate::ast::Ast::Expr::RefOf(inner) => {
+                let inner_ast = &self.current_module().arena.expr(*inner).node;
+                // ── Place references (place model B-stage) ──
+                // `&arr[i]` → ArrayElemRef (live element location, SoA-aware).
+                if let crate::ast::Ast::Expr::Index { recv, index } = inner_ast {
+                    let recv_node = self.compile_subexpr(*recv);
+                    let idx_node = self.compile_subexpr(*index);
+                    let inputs_offset = self.graph.inputs_pool.push(&[recv_node, idx_node]);
+                    return self.graph.add_node(Node {
+                        kind: NodeKind::UnOp,
+                        input_count: 2,
+                        inputs_offset,
+                        compute_fn: CF_REF_OF,
+                    });
+                }
+                // `&rec.field` → RecordFieldRef (1 input + field name side
+                // entry). Implicit-this `&field` inside methods resolves to
+                // `&this.field`. Qualified constructors (`Type.Ctor`) are NOT
+                // places — leave them to the normal path (sema rejects them).
+                let field_place: Option<(crate::ast::Ast::ExprId, &str)> = match inner_ast {
+                    crate::ast::Ast::Expr::FieldAccess { recv, field } => Some((*recv, field)),
+                    _ => None,
+                };
+                if let Some((recv_id, field)) = field_place {
+                    if !self.is_qualified_ctor_place(recv_id, field) {
+                        let recv_node = self.compile_subexpr(recv_id);
+                        let inputs_offset = self.graph.inputs_pool.push(&[recv_node]);
+                        let ref_node = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: 1,
+                            inputs_offset,
+                            compute_fn: CF_REF_OF,
+                        });
+                        self.graph.set_field_set_name(ref_node, field.to_string());
+                        return ref_node;
+                    }
+                }
+                if let crate::ast::Ast::Expr::Ident(_) = inner_ast {
+                    if let Some(crate::sema::Sema::ImplicitThisAccess::Field(field)) =
+                        self.expr_implicit_this(*inner).cloned()
+                    {
+                        let field_name = field.to_string();
+                        let this_node = self
+                            .lookup_var("this")
+                            .expect("this binding must exist in method body");
+                        let inputs_offset = self.graph.inputs_pool.push(&[this_node]);
+                        let ref_node = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: 1,
+                            inputs_offset,
+                            compute_fn: CF_REF_OF,
+                        });
+                        self.graph.set_field_set_name(ref_node, field_name);
+                        return ref_node;
+                    }
+                }
+                // `&global` → GlobalSlotRef (0 inputs + slot side entry) — a
+                // LIVE reference to the global slot, not a snapshot. Only
+                // when the name is NOT a local (locals take the Cell path).
+                if let crate::ast::Ast::Expr::Ident(name) = inner_ast {
+                    if self.lookup_var(name).is_none() {
+                        if let Some(slot) = self.lookup_global_var(name) {
+                            let inputs_offset = self.graph.inputs_pool.push(&[]);
+                            let ref_node = self.graph.add_node(Node {
+                                kind: NodeKind::UnOp,
+                                input_count: 0,
+                                inputs_offset,
+                                compute_fn: CF_REF_OF,
+                            });
+                            self.graph.set_global_load_slot(ref_node, slot);
+                            return ref_node;
+                        }
+                    }
+                }
+                // ── Binding references (locals/params; C1-① cell backing) ──
+                // Cell-backed binding: the decl site (or a previous `&x`)
+                // already allocated THE cell — the reference is that node
+                // itself, zero cost, and all aliases share one storage.
+                if let crate::ast::Ast::Expr::Ident(name) =
+                    &self.current_module().arena.expr(*inner).node
+                {
+                    if let Some(cell_node) = self.lookup_cell_binding(name) {
+                        return cell_node;
+                    }
+                }
                 let inner_node = self.compile_subexpr(*inner);
                 let inputs_offset = self.graph.inputs_pool.push(&[inner_node]);
-                self.graph.add_node(Node {
+                let ref_node = self.graph.add_node(Node {
                     kind: NodeKind::UnOp,
                     input_count: 1,
                     inputs_offset,
                     compute_fn: CF_REF_OF,
-                })
+                });
+                // LAZY cell backing: the first `&x` of a binding that did not
+                // get decl-site backing (a scalar PARAM — param slotting is
+                // off — or a local the pre-pass skipped in a
+                // strategy-transformed function). SCALARS ONLY: compute_ref_of
+                // SHARES heap-object Arcs (`&rec` object semantics), so a
+                // lazy "cell" for a container binding would be the Arc itself
+                // and name stores through it would silently no-op.
+                // Registers the cell so later name reads/writes route through
+                // it; the name is NOT value-tracked (forwarding is disabled:
+                // `val r = &x` binds a COPY of the cell node, so deref stores
+                // through `r` cannot be mapped back to the cell at compile
+                // time — a stale forward would be worse than a load).
+                if self.captured_scopes.is_empty() {
+                    if let crate::ast::Ast::Expr::Ident(name) =
+                        &self.current_module().arena.expr(*inner).node
+                    {
+                        let eligible = self.lookup_var(name)
+                            .map(|b| self.is_in_current_subgraph(b))
+                            .unwrap_or(false)
+                            && self.expr_type_is_scalar(*inner);
+                        if eligible {
+                            self.bind_cell(name, ref_node);
+                            self.no_forward_cells.insert(ref_node);
+                        }
+                    }
+                }
+                ref_node
             }
 
             // Dereference read `*ref` -> `compute_deref_read` (281): returns the inner value for a
@@ -1272,14 +1509,18 @@ impl<'a> IrBuilder<'a> {
         if cands.len() < 2 {
             return None;
         }
+        // Suggest the fully-qualified form of the first candidate: its head
+        // is the qualifier, the key's tail is the method (`A.f` + key "f" →
+        // "A.f(...)", not "f.f(...)").
+        let example = match cands.first().and_then(|c| c.rsplit_once('.')) {
+            Some((qual, _)) => format!("{}.{}(...)", qual, key.rsplit('.').next().unwrap_or(key)),
+            None => format!("{}(...)", key),
+        };
         Some(format!(
-            "ambiguous call '{}': [{}] — qualify the call (e.g. {}.{}(...))",
+            "ambiguous call '{}': [{}] — qualify the call (e.g. {})",
             key,
             cands.join(", "),
-            cands.first()
-                .and_then(|c| c.rsplit_once('.').map(|(_, tail)| tail))
-                .unwrap_or(key),
-            key.rsplit('.').next().unwrap_or(key),
+            example,
         ))
     }
 
@@ -1472,7 +1713,8 @@ impl<'a> IrBuilder<'a> {
         for m in &all_modules {
             for d in &m.declarations {
                 if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &d.node {
-                    let type_id = self.sema.type_def_index.get(*name).map(|&idx| crate::types::dynamic_type_id(idx));
+                    let canonical = self.sema.resolve_type_key_in(m.name, name);
+                    let type_id = self.sema.type_def_index.get(&canonical).map(|&idx| crate::types::dynamic_type_id(idx));
                     if let Some(tid) = type_id {
                         for (method_idx, method) in methods.iter().enumerate() {
                             if method.body.is_some() {
@@ -1500,7 +1742,8 @@ impl<'a> IrBuilder<'a> {
                 // Look up the TypeDecl (top-level or local) to get method info.
                 let method_info = self.find_type_method(type_name, *method_idx);
                 if let Some((method_name, params_count, is_async)) = method_info {
-                    let type_id = match self.sema.type_def_index.get(type_name.as_str()) {
+                    let canonical = self.sema.resolve_type_key(type_name.as_str());
+                    let type_id = match self.sema.type_def_index.get(&canonical) {
                         Some(&idx) => crate::types::dynamic_type_id(idx),
                         None => continue,
                     };
@@ -1513,6 +1756,17 @@ impl<'a> IrBuilder<'a> {
                     self.method_subgraphs.insert((type_id, *method_idx as u16), sg_id);
                     self.func_subgraphs.insert(mangled, sg_id);
                 }
+            }
+        }
+
+        // 0a-inh-links. Record (child, base) pairs for runtime match
+        // disambiguation (an ADT child inherits the base's ctor set verbatim,
+        // so a value of the child type must match arms compiled for the base).
+        for d in self.sema.type_defs.values() {
+            for b in d.bases.iter() {
+                self.graph
+                    .inheritance_links
+                    .push((d.name.clone(), b.clone()));
             }
         }
 
@@ -1533,7 +1787,8 @@ impl<'a> IrBuilder<'a> {
                 .find_map(|m| {
                     m.declarations.iter().find_map(|d| {
                         if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
-                            if *name == inst.trait_name.as_ref() {
+                            // trait_name is a canonical key — bare tail match.
+                            if inst.trait_name.as_ref().rsplit('.').next() == Some(name.as_ref()) {
                                 if let Some(method) = methods.get(inst.method_idx as usize) {
                                     return Some((
                                         method.name.to_string(),
@@ -1554,6 +1809,50 @@ impl<'a> IrBuilder<'a> {
             let sg_id = self.register_subgraph_placeholder(&mangled, params_count, is_async);
             self.trait_default_subgraphs
                 .insert((inst.type_id, inst.trait_idx, inst.method_idx), sg_id);
+        }
+
+        // 0a-inh. Pre-register inherited-method subgraphs (inheritance):
+        //   (child_type_id, child_method_idx) -> SubGraphId, mangled
+        //   "Child.method" — consumed by compile_inherited_method (step 2d),
+        //   which compiles the BASE's method body with the child as receiver.
+        for inst in &self.sema.inherited_method_instances {
+            let method_info = self
+                .builtin_modules
+                .iter()
+                .copied()
+                .chain(std::iter::once(self.module))
+                .find_map(|m| {
+                    m.declarations.iter().find_map(|d| {
+                        if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &d.node {
+                            // base_type_name is a canonical key — match the
+                            // AST declaration by bare (tail-segment) name.
+                            if inst.base_type_name.as_ref().rsplit('.').next() == Some(name.as_ref()) {
+                                if let Some(method) = methods.get(inst.base_method_idx as usize) {
+                                    return Some((
+                                        method.name.to_string(),
+                                        method.params.len() as u8,
+                                        method.is_async,
+                                    ));
+                                }
+                            }
+                        }
+                        None
+                    })
+                });
+            let (method_name, params_count, is_async) = match method_info {
+                Some(info) => info,
+                None => continue,
+            };
+            // The child's own methods (registered above by the top-level
+            // scan) take precedence for the same (type_id, idx) key — they
+            // never collide by construction (inherited idx = own len + k).
+            if self.method_subgraphs.contains_key(&(inst.type_id, inst.method_idx)) {
+                continue;
+            }
+            let mangled = format!("{}.{}", inst.type_name, method_name);
+            let sg_id = self.register_subgraph_placeholder(&mangled, params_count, is_async);
+            self.method_subgraphs.insert((inst.type_id, inst.method_idx), sg_id);
+            self.func_subgraphs.insert(mangled, sg_id);
         }
 
         // 0b. Register selective import aliases in func_subgraphs:
@@ -1674,43 +1973,112 @@ impl<'a> IrBuilder<'a> {
         // 0c. Register all modules' top-level types into the base scope (unified with nested types via type_scope_stack lookup)
         //     ADT registers both the type name and each constructor name (constructor name maps to type name, for type_name reflection)
         //     Newtype registers the constructor name (== type name); kind=Newtype drives compute_record_construct to build a NewtypeValue
+        //
+        //     Module-scoped: the recorded `type_name` is the CANONICAL key
+        //     (user modules module-qualified) — it flows into
+        //     RecordLitInfo and the runtime AdtValue identity. std/builtin
+        //     modules bind straight into the base layer (bare names, std
+        //     first). USER modules bind into their per-module scope (own
+        //     shadow layer) plus a first-wins base entry for cross-module
+        //     bare references — std keeps priority — and an unconditional
+        //     canonical base entry (unique per module).
         self.type_scope_stack.push(rustc_hash::FxHashMap::default());
         for m in &all_modules {
+            let is_user_module = !(m.name.starts_with("std/") || m.name.starts_with("builtin/"));
             for d in &m.declarations {
-                if let crate::ast::Ast::Decl::TypeDecl { name, def, .. } = &d.node {
+                if let crate::ast::Ast::Decl::TypeDecl { name, def, base_types, .. } = &d.node {
+                    let canonical: String = self.sema.resolve_type_key_in(m.name, name);
+                    // One bind closure: module scope + base-layer policy.
+                    let mut bind = |b: &mut Self, key: &str, info: TypeFieldInfo| {
+                        if is_user_module {
+                            b.bind_module_type_fields(m.name, key, info.clone());
+                            b.bind_type_fields_base_first_wins(key, info.clone());
+                            if key != canonical {
+                                b.bind_type_fields_base_first_wins(&canonical, info);
+                            }
+                        } else {
+                            b.bind_type_fields(key, info);
+                        }
+                    };
+                    // Inheritance: children bind the MERGED field list (base
+                    // fields + own) from sema — the AST ctor only shows own
+                    // fields, and a positional (unnamed) construct breaks
+                    // name-based field reads inside inherited/override methods.
+                    let merged_names: Option<Vec<String>> = if base_types.is_empty() {
+                        None
+                    } else {
+                        self.sema.type_def_index.get(&canonical).and_then(|&idx| {
+                            let def = &self.sema.type_defs[&idx];
+                            if def.bases.is_empty() { return None; }
+                            def.constructors.first().map(|c| {
+                                c.field_names.iter()
+                                    .map(|n| n.as_deref().unwrap_or("_").to_string())
+                                    .collect()
+                            })
+                        })
+                    };
                     match def {
                         crate::ast::Ast::TypeDef::Record { fields } => {
-                            let field_names: Vec<String> = fields.iter().map(|f| f.name.to_string()).collect();
-                            self.bind_type_fields(name, TypeFieldInfo {
+                            let field_names: Vec<String> = merged_names.unwrap_or_else(|| {
+                                fields.iter().map(|f| f.name.to_string()).collect()
+                            });
+                            bind(&mut self, name, TypeFieldInfo {
                                 field_names,
-                                type_name: name.to_string(),
+                                type_name: canonical.clone(),
                                 kind: RecordLitKind::Record,
                             });
                         }
                         crate::ast::Ast::TypeDef::Adt { constructors } => {
                             // Register the type name (nullary path used for type-name lookup; field_names is empty only when there are no field constructors)
-                            self.bind_type_fields(name, TypeFieldInfo {
+                            bind(&mut self, name, TypeFieldInfo {
                                 field_names: Vec::new(),
-                                type_name: name.to_string(),
+                                type_name: canonical.clone(),
                                 kind: RecordLitKind::Adt,
                             });
+                            // Multi-ctor ADT children: the ctor set lives in
+                            // sema (inherited verbatim) — bind EACH inherited
+                            // ctor name to the child so expected-type-guided
+                            // construction builds child values.
+                            if merged_names.is_some() {
+                                if let Some(&idx) = self.sema.type_def_index.get(&canonical) {
+                                    let def = &self.sema.type_defs[&idx];
+                                    if !def.bases.is_empty() && def.constructors.len() > 1 {
+                                        for c in def.constructors.iter() {
+                                            let field_names: Vec<String> = c
+                                                .field_names
+                                                .iter()
+                                                .map(|n| n.as_deref().unwrap_or("_").to_string())
+                                                .collect();
+                                            bind(&mut self, c.name.as_ref(), TypeFieldInfo {
+                                                field_names,
+                                                type_name: canonical.clone(),
+                                                kind: RecordLitKind::Adt,
+                                            });
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
                             // Register each constructor name (mapped to the type name)
                             for ctor in constructors {
-                                let field_names: Vec<String> = ctor.fields.iter()
-                                    .map(|f| f.name.unwrap_or("_").to_string())
-                                    .collect();
-                                self.bind_type_fields(ctor.name, TypeFieldInfo {
+                                let field_names: Vec<String> = match &merged_names {
+                                    Some(names) if constructors.len() == 1 => names.clone(),
+                                    _ => ctor.fields.iter()
+                                        .map(|f| f.name.unwrap_or("_").to_string())
+                                        .collect(),
+                                };
+                                bind(&mut self, ctor.name, TypeFieldInfo {
                                     field_names,
-                                    type_name: name.to_string(),
+                                    type_name: canonical.clone(),
                                     kind: RecordLitKind::Adt,
                                 });
                             }
                         }
                         crate::ast::Ast::TypeDef::Newtype { name: nt_name, .. } => {
                             // Newtype: constructor name == type name, kind=Newtype
-                            self.bind_type_fields(nt_name, TypeFieldInfo {
+                            bind(&mut self, nt_name, TypeFieldInfo {
                                 field_names: Vec::new(),
-                                type_name: nt_name.to_string(),
+                                type_name: canonical.clone(),
                                 kind: RecordLitKind::Newtype,
                             });
                         }
@@ -1728,7 +2096,7 @@ impl<'a> IrBuilder<'a> {
         for inst in self.sema.monomorph_instances.iter().filter(|inst| !inst.type_args.is_empty()) {
             let mangled = format!("{}#{}", inst.func_name, inst.instance_id);
             if !self.func_subgraphs.contains_key(mangled.as_str()) {
-                let param_count = self.sema.get_func_sig(&inst.func_name)
+                let param_count = self.sema.get_func_sig_in(&inst.module_name, &inst.func_name)
                     .map(|sig| sig.param_is_ref.len() as u8)
                     .unwrap_or(0);
                 let sg_id = self.register_subgraph_placeholder(&mangled, param_count, inst.is_async);
@@ -1842,6 +2210,13 @@ impl<'a> IrBuilder<'a> {
                 inst.type_name.as_ref(),
                 inst_idx,
             );
+        }
+
+        // 2d. Compile inherited-method instances (inheritance): base method
+        //     bodies compiled with the child as receiver. Entries in
+        //     method_subgraphs were pre-registered in step 0a-inh.
+        for inst_idx in 0..self.sema.inherited_method_instances.len() {
+            self.compile_inherited_method(inst_idx);
         }
 
         // 3. Compile user module functions (declaring module = the entry module)
@@ -1960,7 +2335,7 @@ impl<'a> IrBuilder<'a> {
 /// non-modified variable to its home is a no-op when home == current binding).
 /// Recurses through Block/If/Match/While/Loop/For and expression blocks; skips lambda
 /// bodies (their assignments are scoped to the nested function).
-fn collect_assigned_names(
+pub(super) fn collect_assigned_names(
     arena: &crate::ast::Ast::AstArena<'_>,
     expr: crate::ast::Ast::ExprId,
     out: &mut rustc_hash::FxHashSet<String>,
@@ -1990,6 +2365,72 @@ fn collect_assigned_names(
         }
         // Skip nested functions/lambdas: their assignments bind their own scopes.
         Expr::Lambda { .. } => {}
+        _ => {}
+    }
+}
+
+/// Deep variant for the param-slotting pass (③): recurses into loop/branch
+/// BODIES (the shallow variant deliberately does not — nested loops' own
+/// registrations rebind at their own level, and recursing would collect outer
+/// loop variables for inner conditions). Lambdas are still skipped: their
+/// assignments bind their own scopes.
+pub(super) fn collect_assigned_names_deep(
+    arena: &crate::ast::Ast::AstArena<'_>,
+    expr: crate::ast::Ast::ExprId,
+    out: &mut rustc_hash::FxHashSet<String>,
+) {
+    use crate::ast::Ast::Expr;
+    match &arena.expr(expr).node {
+        Expr::Block { stmts, trailing } => {
+            for &st in stmts {
+                collect_assigned_names_deep_stmt(arena, st, out);
+            }
+            if let Some(t) = trailing {
+                collect_assigned_names_deep(arena, *t, out);
+            }
+        }
+        Expr::If { cond, then_branch, else_branch } => {
+            collect_assigned_names_deep(arena, *cond, out);
+            collect_assigned_names_deep(arena, *then_branch, out);
+            if let Some(e) = else_branch {
+                collect_assigned_names_deep(arena, *e, out);
+            }
+        }
+        Expr::Match { scrutinee, arms } => {
+            collect_assigned_names_deep(arena, *scrutinee, out);
+            for arm in arms {
+                collect_assigned_names_deep(arena, arm.body, out);
+            }
+        }
+        Expr::Lambda { .. } => {}
+        _ => {}
+    }
+}
+
+fn collect_assigned_names_deep_stmt(
+    arena: &crate::ast::Ast::AstArena<'_>,
+    stmt: crate::ast::Ast::StmtId,
+    out: &mut rustc_hash::FxHashSet<String>,
+) {
+    use crate::ast::Ast::Stmt;
+    match &arena.stmt(stmt).node {
+        Stmt::Assignment { target, .. } | Stmt::CompoundAssignment { target, .. } => {
+            if let crate::ast::Ast::Expr::Ident(name) = &arena.expr(*target).node {
+                out.insert(name.to_string());
+            }
+        }
+        Stmt::Expression { expr } => collect_assigned_names_deep(arena, *expr, out),
+        Stmt::While { condition, body } => {
+            collect_assigned_names_deep(arena, *condition, out);
+            collect_assigned_names_deep(arena, *body, out);
+        }
+        Stmt::Loop { body } => collect_assigned_names_deep(arena, *body, out),
+        Stmt::For { iterable, body, .. } => {
+            collect_assigned_names_deep(arena, *iterable, out);
+            collect_assigned_names_deep(arena, *body, out);
+        }
+        Stmt::Return { value: Some(v) } => collect_assigned_names_deep(arena, *v, out),
+        Stmt::Throw { expr } => collect_assigned_names_deep(arena, *expr, out),
         _ => {}
     }
 }

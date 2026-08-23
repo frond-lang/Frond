@@ -1,0 +1,5 @@
+// builtin/encoding package declaration
+//
+// Exposes the hex/base64 C kernels to std/encoding (the C fast path of the
+// byte-text encoding facade).
+pub pack Raw

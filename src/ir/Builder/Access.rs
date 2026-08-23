@@ -102,6 +102,60 @@ impl<'a> IrBuilder<'a> {
         false
     }
 
+    /// Check if an expression's inferred type is a VALUE scalar (numeric /
+    /// bool / char) — the family for which `&x` boxes a Cell and name
+    /// rebinding applies. Str/arrays/records share an Arc (`*r = v` is not a
+    /// rebinding write there), so they are excluded. Unknown types
+    /// conservatively return false (no rebinding).
+    pub(super) fn expr_type_is_scalar(&self, expr_id: crate::ast::Ast::ExprId) -> bool {
+        let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr_id.0 as u64);
+        if let Some(info) = self.sema.expr_types.get(&key) {
+            if let Some(ref tn) = info.type_name {
+                if let Some(ty) = crate::types::Type::from_type_name(tn.as_ref()) {
+                    use crate::types::TypeFamily::*;
+                    return matches!(
+                        ty.family(),
+                        SignedInt32 | SignedInt64 | SignedInt128
+                            | UnsignedInt32 | UnsignedInt64 | UnsignedInt128
+                            | Float | Bool | Char
+                    );
+                }
+            }
+        }
+        false
+    }
+
+    /// Param scalar-ness from the AST type annotation (all-vars param slot
+    /// backing): plain named scalar types qualify; refs (`&T`), generics and
+    /// missing annotations are conservatively excluded (param stays plain).
+    pub(super) fn param_type_ref_is_scalar(
+        &self,
+        type_annotation: Option<crate::ast::Ast::TypeRef>,
+    ) -> bool {
+        let tr = match type_annotation {
+            Some(tr) => tr,
+            None => return false,
+        };
+        let arena = &self.current_module().arena;
+        match &arena.ty(tr).node {
+            crate::ast::Ast::TypeNode::Named { name } => {
+                match crate::types::Type::from_type_name(name) {
+                    Some(ty) => {
+                        use crate::types::TypeFamily::*;
+                        matches!(
+                            ty.family(),
+                            SignedInt32 | SignedInt64 | SignedInt128
+                                | UnsignedInt32 | UnsignedInt64 | UnsignedInt128
+                                | Float | Bool | Char
+                        )
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Compile a field access.
     ///
     /// Binds compute_record_field_get, storing only the field name as the runtime by-name lookup key.

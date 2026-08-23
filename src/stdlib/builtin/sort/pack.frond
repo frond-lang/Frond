@@ -1,0 +1,7 @@
+// builtin/sort package declaration
+//
+// Array sorting + sorted-array search, exposed as the method form:
+// arr.sort() / arr.sort_by(cmp) / arr.is_sorted() / arr.lower_bound(v) /
+// arr.upper_bound(v). Scalar element arrays take C heapsort fast paths
+// (Raw.frond); str[] and custom comparators use the pure-Frond heapsort.
+pub pack Sort

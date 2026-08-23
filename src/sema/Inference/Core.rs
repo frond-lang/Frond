@@ -32,7 +32,6 @@ pub struct InferContext<'a> {
     /// identifier/call resolves to an instance field/method. Consumed by infer_expr
     /// after store_expr_info to update the staged ExprInfo.
     pub pending_implicit_this: Option<(ExprId, crate::sema::Sema::ImplicitThisAccess)>,
-    pub env: EnvArena,
     /// Expected return type of the current function (used for reverse inference of throw expressions, etc.).
     pub expected_return: Option<TypeHandle>,
     /// sema v2: constraint solver (lazy solving + snapshot/rollback).
@@ -41,26 +40,13 @@ pub struct InferContext<'a> {
     pub flow_ctx: FlowContext,
     /// sema v2: witness table (static dispatch table for trait implementations).
     pub witness_table: WitnessTable,
-    /// Module path → module-specific EnvId mapping.
-    ///
-    /// Each module (including path prefixes) creates its own env at registration time (parent points to root_env or the parent path's env).
-    /// The module's functions/types are registered in this env. ModuleRef lookups search by bare name directly in the corresponding env, with no mangled name required.
-    ///
-    /// Hierarchical example:
-    ///   "std"            → env_std (parent=root_env), binds "io"→ModuleRef("std.io", env_std_io)
-    ///   "std.io"         → env_std_io (parent=env_std), binds "File"→ModuleRef("std.io.File", env_std_io_file)
-    ///   "std.io.File"    → env_std_io_file (parent=env_std_io), binds "open"→Fn(...)
-    ///
-    /// This makes lookups for `std.io.File.open(...)` fully structured through the env chain:
-    ///   std → env_std.lookup("io") → ModuleRef("std.io", env_std_io)
-    ///       → env_std_io.lookup("File") → ModuleRef("std.io.File", env_std_io_file)
-    ///       → Call: env_std_io_file.lookup("open") → Fn(...)
-    pub module_envs: FxHashMap<String, EnvId>,
     /// Logical path of the module currently being checked (e.g. "Math.Geometry"), used to register mangled names.
     /// Set at the start of check_module_with_env for use by methods like infer_stmt that do not take a module parameter.
     pub current_module_logical_path: Option<String>,
     /// Module-specific EnvId of the module currently being checked.
-    /// Looked up from module_envs at the start of check_module_with_env; used to register symbols during predeclare_declarations.
+    /// Looked up from the shared `sema_result.module_envs` at the start of
+    /// check_module_with_env; used to register symbols during
+    /// predeclare_declarations.
     pub current_module_env: Option<EnvId>,
     /// Filename of the module currently being checked (e.g. "Math/Geometry.frond"), used as part of the expr_types composite key.
     /// Prevents ExprIds from different modules from colliding in the global expr_types.
@@ -103,12 +89,10 @@ impl<'a> InferContext<'a> {
             type_binding_stack: TypeBindingStack::new(),
             this_binding_stack: ThisBindingStack::new(),
             pending_implicit_this: None,
-            env: EnvArena::new(),
             expected_return: None,
             solver: ConstraintSolver::new(),
             flow_ctx: FlowContext::new(),
             witness_table: WitnessTable::new(),
-            module_envs: FxHashMap::default(),
             current_module_logical_path: None,
             current_module_env: None,
             current_module_name: String::new(),
@@ -138,12 +122,10 @@ impl<'a> InferContext<'a> {
             type_binding_stack: TypeBindingStack::new(),
             this_binding_stack: ThisBindingStack::new(),
             pending_implicit_this: None,
-            env: EnvArena::new(),
             expected_return: None,
             solver: ConstraintSolver::new(),
             flow_ctx: FlowContext::new(),
             witness_table,
-            module_envs: FxHashMap::default(),
             current_module_logical_path: None,
             current_module_env: None,
             current_module_name: String::new(),
@@ -426,7 +408,7 @@ impl<'a> InferContext<'a> {
     pub fn check_module(&mut self, module: &Module<'_>) -> bool {
         // Single-module check: create a new root_env, register builtins, check the module.
         self.reset_state();
-        let root_env = self.env.root();
+        let root_env = self.sema_result.env.root();
         self.register_builtins(root_env);
         let all_modules = [module];
         self.check_module_with_env(module, root_env, &all_modules)
@@ -445,7 +427,7 @@ impl<'a> InferContext<'a> {
         all_modules: &[&'m Module<'m>],
     ) -> bool {
         // 1. Populate the definition tables (if not already populated).
-        populate_module(self.arena, self.sema_result, module);
+        populate_module(self.arena, self.sema_result, module, all_modules);
 
         // 1b. Check for cyclic type aliases (Bug #80).
         self.check_alias_cycles();
@@ -467,6 +449,9 @@ impl<'a> InferContext<'a> {
         let types_baseline = self.arena.len();
         self.current_module_logical_path = module_logical_path(module.name);
         self.current_module_name = module.name.to_string();
+        // Sync the SemaResult-side module context used by the free-function
+        // name resolvers (resolve_type_key / resolve_named_type_resolved).
+        self.sema_result.current_module_name = module.name.to_string();
 
         // 3. Process import declarations: register module reference aliases + import aliases.
         self.process_import_decls(module, root_env);
@@ -606,6 +591,29 @@ impl<'a> InferContext<'a> {
             }
         }
 
+        // 9z. ExprInfo type_name backfill: fixpoint stores snapshot the type
+        // BEFORE the solver finalizes; entries whose stored type_name is None
+        // but whose ty handle NOW resolves to a concrete named type get the
+        // name backfilled (method-sugar dispatch reads the name — without
+        // this, zero-arg ctor receivers degrade to `_` and lose dispatch).
+        {
+            let keys: Vec<u64> = self
+                .sema_result
+                .expr_types
+                .iter()
+                .filter(|(_, info)| info.type_name.is_none())
+                .map(|(k, _)| *k)
+                .collect();
+            for k in keys {
+                let ty = self.sema_result.expr_types[&k].ty;
+                if let Some(name) = self.arena.type_name_concrete(self.arena.resolve(ty)) {
+                    if let Some(info) = self.sema_result.expr_types.get_mut(&k) {
+                        info.type_name = Some(name.into_boxed_str());
+                    }
+                }
+            }
+        }
+
         // 10. Mirror witness_table into sema_result (so the IR layer can access trait method
         // dispatch info).
         // witness_table accumulates across modules; sync the latest state after each check.
@@ -616,6 +624,7 @@ impl<'a> InferContext<'a> {
         // defaults, delegate targets), then collect trait default-method
         // monomorphization instances (depends on the mirrored witness_table).
         crate::sema::Monomorph::validate_trait_method_bindings(module, self.sema_result);
+        crate::sema::Monomorph::validate_trait_inheritance(module, self.sema_result);
         crate::sema::Monomorph::collect_trait_default_instances(module, self.sema_result);
 
         // 11. Report global residual TypeVar diagnostics.

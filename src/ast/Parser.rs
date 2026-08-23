@@ -2165,6 +2165,16 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             let _ = self.expect_close_angle("expected '>' to close type parameter list");
         }
         let mut implemented_traits = Vec::new();
+        // Concrete base list: `type Child(Base1, Base2)` — inheritance.
+        // Mirrors the trait-parent form (`trait P(A)`); a `(` in this
+        // position is a hard syntax error today, so the slot is free.
+        let mut base_types = Vec::new();
+        if self.match_token(TokenKind::LParen) {
+            if !self.check(TokenKind::RParen) {
+                self.parse_trait_bound_list(&mut base_types)?;
+            }
+            let _ = self.expect(TokenKind::RParen, "expected ')' to close base type list");
+        }
         if self.match_token(TokenKind::Colon) {
             let has_paren = self.check(TokenKind::LParen);
             if has_paren {
@@ -2175,7 +2185,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 let _ = self.expect(TokenKind::RParen, "expected ')' after trait list");
             }
         }
-        let _ = self.expect(TokenKind::Eq, "expected '=' to define type body");
+        let _ = self.expect(TokenKind::Eq, "expected '=' to define type body")?;
         let def = self.parse_type_def()?;
         let mut methods = Vec::new();
         if self.match_token(TokenKind::LBrace) {
@@ -2188,6 +2198,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                 visibility,
                 name: name_tok.lexeme,
                 type_params,
+                base_types,
                 implemented_traits,
                 def,
                 methods,
@@ -2344,6 +2355,22 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     /// Attempt to parse a record type definition
     fn try_parse_record_type_def(&mut self) -> Option<TypeDef<'a>> {
         self.advance(); // '('
+        // `()` — zero own fields. Meaningful for inheritance declarations
+        // (`type Child(Base) = Child() { ... }` = all fields inherited) and
+        // harmless as a plain empty record otherwise. Yields to the function
+        // type form when an arrow follows (`type IntFn = () -> i32`).
+        if self.check(TokenKind::RParen) {
+            let next_is_arrow = self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|t| t.kind == TokenKind::MinusGt);
+            if !next_is_arrow {
+                self.advance();
+                return Some(TypeDef::Record { fields: Vec::new() });
+            }
+            // `() -> T`: fall through to the function-type parse.
+            return None;
+        }
         if self.peek().kind == TokenKind::Identifier || self.peek().kind == TokenKind::KwPub {
             let is_pub0 = self.match_token(TokenKind::KwPub);
             let name = self.advance();
@@ -3299,7 +3326,13 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             } else if self.match_token(TokenKind::Dot) {
                 let op_tok = self.previous();
                 let field_tok = self.expect(TokenKind::Identifier, "expected field or method name")?;
-                if self.check(TokenKind::LParen) {
+                // Method call: `(...)` directly, or an explicit type-argument
+                // list first — `recv.method<T>(args)` (parse_call_args handles
+                // both shapes). Without the turbofish arm, `.m<T>(...)` parses
+                // as FieldAccess followed by a `<` comparison chain.
+                if self.check(TokenKind::LParen)
+                    || (self.check(TokenKind::Lt) && self.is_turbofish_call())
+                {
                     let (args, type_args) = self.parse_call_args()?;
                     expr = self.alloc_expr(token_span(&op_tok), Expr::MethodCall {
                         recv: expr,

@@ -395,6 +395,25 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct F128(pub [u8; 16]);
 
+
+impl F128 {
+    /// IEEE 754 numeric equality (the 2026-08-18 ruling aligning F128 with
+    /// F16/F32/F64): +0.0 == -0.0, NaN != NaN. Bit-exact otherwise — no
+    /// lossy f64 roundtrip (binary128 has a 113-bit mantissa).
+    pub fn ieee_eq(&self, other: &F128) -> bool {
+        let a = u128::from_le_bytes(self.0);
+        let b = u128::from_le_bytes(other.0);
+        let sign = 1u128 << 127;
+        let expo = 0x7FFFu128 << 112;
+        let mag_a = a & !sign;
+        let mag_b = b & !sign;
+        let a_nan = (mag_a & expo) == expo && (mag_a & !expo) != 0;
+        let b_nan = (mag_b & expo) == expo && (mag_b & !expo) != 0;
+        if a_nan || b_nan { return false; }
+        if mag_a == 0 && mag_b == 0 { return true; } // ±0.0
+        a == b
+    }
+}
 /// f64→f128 is lossless (f64's 53-bit mantissa shifted left by 60 fills binary128's 113 bits with no loss).
 /// f128→f64 (to_f64) implements round-to-nearest-even, correctly rounding the low bits beyond f64 precision.
 /// Therefore f64→f128→f64 round-trips losslessly; f128→f64→f128 only rounds when the f128 value exceeds f64 precision (per IEEE 754 semantics).
@@ -1144,7 +1163,18 @@ impl Value {
     }
 
     // ---- Heap object constructors ----
-    pub fn ref_val(obj: HeapObj) -> Self { Value::Ref(Arc::new(obj)) }
+    pub fn ref_val(obj: HeapObj) -> Self {
+        let arc = Arc::new(obj);
+        super::Registry::register(Arc::as_ptr(&arc) as usize);
+        Value::Ref(arc)
+    }
+
+    /// Arc<HeapObj> allocation funnel for sites that build the Arc directly
+    /// (deep clone): registers the object in the cycle registry.
+    pub fn register_arc(arc: std::sync::Arc<HeapObj>) -> std::sync::Arc<HeapObj> {
+        super::Registry::register(std::sync::Arc::as_ptr(&arc) as usize);
+        arc
+    }
     pub fn from_ref(r: HeapRef) -> Self { Value::Ref(r) }
 
     pub const NULL: Value = Value::Null;
@@ -1634,6 +1664,14 @@ impl fmt::Display for Str {
     }
 }
 
+impl Drop for HeapObj {
+    fn drop(&mut self) {
+        // Normal (acyclic) reclamation leaves the cycle registry. Cyclic
+        // garbage never runs this until a collection releases its edges.
+        super::Registry::deregister(self as *const HeapObj as usize);
+    }
+}
+
 // ---- composite.rs → ArrayValue, RecordField, RecordValue, AdtField, AdtValue, NewtypeValue, Cell, Range, RangeIter ----
 
 /// Array value: elements are mutable (supports push/pop); `fixed_size` of `Some` denotes a fixed-size array
@@ -1695,37 +1733,472 @@ impl ScalarSoA {
             _ => false, // type mismatch
         }
     }
+
+    /// Element count of the contiguous storage.
+    pub fn soa_len(&self) -> usize {
+        match self {
+            ScalarSoA::I8(v) => v.len(),
+            ScalarSoA::I16(v) => v.len(),
+            ScalarSoA::I32(v) => v.len(),
+            ScalarSoA::I64(v) => v.len(),
+            ScalarSoA::U8(v) => v.len(),
+            ScalarSoA::U16(v) => v.len(),
+            ScalarSoA::U32(v) => v.len(),
+            ScalarSoA::U64(v) => v.len(),
+            ScalarSoA::I128(v) => v.len(),
+            ScalarSoA::U128(v) => v.len(),
+            ScalarSoA::Isize(v) => v.len(),
+            ScalarSoA::Usize(v) => v.len(),
+            ScalarSoA::Bool(v) => v.len(),
+            ScalarSoA::Char(v) => v.len(),
+            ScalarSoA::F16(v) => v.len(),
+            ScalarSoA::F32(v) => v.len(),
+            ScalarSoA::F64(v) => v.len(),
+            ScalarSoA::F128(v) => v.len(),
+        }
+    }
+
+    /// The scalar tag this storage holds (mirrors the element type name).
+    pub fn tag(&self) -> crate::value::ValueTag {
+        match self {
+            ScalarSoA::I8(_) => crate::value::ValueTag::I8,
+            ScalarSoA::I16(_) => crate::value::ValueTag::I16,
+            ScalarSoA::I32(_) => crate::value::ValueTag::I32,
+            ScalarSoA::I64(_) => crate::value::ValueTag::I64,
+            ScalarSoA::U8(_) => crate::value::ValueTag::U8,
+            ScalarSoA::U16(_) => crate::value::ValueTag::U16,
+            ScalarSoA::U32(_) => crate::value::ValueTag::U32,
+            ScalarSoA::U64(_) => crate::value::ValueTag::U64,
+            ScalarSoA::I128(_) => crate::value::ValueTag::I128,
+            ScalarSoA::U128(_) => crate::value::ValueTag::U128,
+            ScalarSoA::Isize(_) => crate::value::ValueTag::Isize,
+            ScalarSoA::Usize(_) => crate::value::ValueTag::Usize,
+            ScalarSoA::Bool(_) => crate::value::ValueTag::Bool,
+            ScalarSoA::Char(_) => crate::value::ValueTag::Char,
+            ScalarSoA::F16(_) => crate::value::ValueTag::F16,
+            ScalarSoA::F32(_) => crate::value::ValueTag::F32,
+            ScalarSoA::F64(_) => crate::value::ValueTag::F64,
+            ScalarSoA::F128(_) => crate::value::ValueTag::F128,
+        }
+    }
+
+    /// Element type name ("u8", "i32", ...) via the ValueTag mapping.
+    pub fn type_name(&self) -> &'static str {
+        self.tag().type_name()
+    }
+
+    /// Read-side mirror of `try_store`: the Value at idx, or None when out of
+    /// bounds. Never resizes. SoA is the source of truth when present, so
+    /// scalar reads materialize straight from the contiguous storage.
+    pub fn get_value(&self, idx: usize) -> Option<Value> {
+        match self {
+            ScalarSoA::I8(v) => v.get(idx).map(|&x| Value::i8(x)),
+            ScalarSoA::I16(v) => v.get(idx).map(|&x| Value::i16(x)),
+            ScalarSoA::I32(v) => v.get(idx).map(|&x| Value::i32(x)),
+            ScalarSoA::I64(v) => v.get(idx).map(|&x| Value::i64(x)),
+            ScalarSoA::U8(v) => v.get(idx).map(|&x| Value::u8(x)),
+            ScalarSoA::U16(v) => v.get(idx).map(|&x| Value::u16(x)),
+            ScalarSoA::U32(v) => v.get(idx).map(|&x| Value::u32(x)),
+            ScalarSoA::U64(v) => v.get(idx).map(|&x| Value::u64(x)),
+            ScalarSoA::I128(v) => v.get(idx).map(|&x| Value::i128(x)),
+            ScalarSoA::U128(v) => v.get(idx).map(|&x| Value::u128(x)),
+            ScalarSoA::Isize(v) => v.get(idx).map(|&x| Value::isize_val(x)),
+            ScalarSoA::Usize(v) => v.get(idx).map(|&x| Value::usize_val(x)),
+            ScalarSoA::Bool(v) => v.get(idx).map(|&x| Value::bool_val(x)),
+            ScalarSoA::Char(v) => v.get(idx).map(|&x| Value::char_val(char::from_u32(x).unwrap_or(' '))),
+            ScalarSoA::F16(v) => v.get(idx).map(|&x| Value::f16(F16(x))),
+            ScalarSoA::F32(v) => v.get(idx).map(|&x| Value::f32(x)),
+            ScalarSoA::F64(v) => v.get(idx).map(|&x| Value::f64(x)),
+            ScalarSoA::F128(v) => v.get(idx).map(|&x| Value::f128(x)),
+        }
+    }
 }
 
 impl ArrayValue {
     pub fn new(elements: Vec<Value>) -> Self {
-        Self { elements, fixed_size: None, elem_is_ref: false, scalar_soa: None }
+        let mut s = Self { elements, fixed_size: None, elem_is_ref: false, scalar_soa: None };
+        s.optimize_soa();
+        s
     }
     pub fn new_fixed(elements: Vec<Value>, size: u64) -> Self {
-        Self { elements, fixed_size: Some(size), elem_is_ref: false, scalar_soa: None }
+        let mut s = Self { elements, fixed_size: Some(size), elem_is_ref: false, scalar_soa: None };
+        s.optimize_soa();
+        s
     }
+    /// Length: SoA-first. In the single-source model a cloned SoA array may
+    /// carry an EMPTY elements vector (deep clone copies only the contiguous
+    /// storage); elements.len() would report 0.
     pub fn len(&self) -> usize {
+        if let Some(soa) = &self.scalar_soa {
+            return soa.soa_len();
+        }
         self.elements.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.elements.is_empty()
+        self.len() == 0
     }
-    pub fn get(&self, index: usize) -> Option<&Value> {
-        self.elements.get(index)
-    }
-    pub fn push(&mut self, val: Value) {
-        self.elements.push(val);
-    }
-    pub fn pop(&mut self) -> Option<Value> {
-        self.elements.pop()
-    }
-    /// Uniformly collects u8 bytes: SOA fast path (U8 contiguous storage) or fallback to per-element extraction.
-    /// Encapsulates dual-representation access; callers need not care whether SOA is enabled.
-    pub fn collect_u8_bytes(&self) -> Vec<u8> {
-        if let Some(crate::value::ScalarSoA::U8(ref data)) = self.scalar_soa {
-            return data.clone();
+    /// Element read. SoA is the source of truth when present (marshal
+    /// writebacks may leave `elements` stale); scalar construction from the
+    /// contiguous storage costs the same as cloning a scalar Value.
+    pub fn get(&self, index: usize) -> Option<Value> {
+        if let Some(soa) = &self.scalar_soa {
+            return soa.get_value(index);
         }
-        self.elements.iter().map(|e| e.as_u8()).collect()
+        self.elements.get(index).cloned()
+    }
+    /// Fill the SoA fast-path storage when every element is a scalar of the
+    /// same tag (same criteria as the former ValueArena::optimize_array_soa,
+    /// moved here so EVERY construction site gets it automatically).
+    pub fn optimize_soa(&mut self) {
+        if self.elements.is_empty() { return; }
+        let tag = match self.elements[0].scalar_tag() {
+            Some(t) => t,
+            None => return,
+        };
+        if !self.elements.iter().all(|h| h.scalar_tag() == Some(tag)) {
+            return;
+        }
+        self.scalar_soa = Some(match tag {
+            ValueTag::I8 => ScalarSoA::I8(self.elements.iter().map(|h| h.as_i8()).collect()),
+            ValueTag::I16 => ScalarSoA::I16(self.elements.iter().map(|h| h.as_i16()).collect()),
+            ValueTag::I32 => ScalarSoA::I32(self.elements.iter().map(|h| h.as_i32()).collect()),
+            ValueTag::I64 => ScalarSoA::I64(self.elements.iter().map(|h| h.as_i64()).collect()),
+            ValueTag::U8 => ScalarSoA::U8(self.elements.iter().map(|h| h.as_u8()).collect()),
+            ValueTag::U16 => ScalarSoA::U16(self.elements.iter().map(|h| h.as_u16()).collect()),
+            ValueTag::U32 => ScalarSoA::U32(self.elements.iter().map(|h| h.as_u32()).collect()),
+            ValueTag::U64 => ScalarSoA::U64(self.elements.iter().map(|h| h.as_u64()).collect()),
+            ValueTag::Bool => ScalarSoA::Bool(self.elements.iter().map(|h| h.as_bool()).collect()),
+            ValueTag::Char => ScalarSoA::Char(self.elements.iter().map(|h| h.as_char() as u32).collect()),
+            ValueTag::F32 => ScalarSoA::F32(self.elements.iter().map(|h| h.as_f32()).collect()),
+            ValueTag::F64 => ScalarSoA::F64(self.elements.iter().map(|h| h.as_f64()).collect()),
+            ValueTag::I128 => ScalarSoA::I128(self.elements.iter().map(|h| h.as_i128()).collect()),
+            ValueTag::U128 => ScalarSoA::U128(self.elements.iter().map(|h| h.as_u128()).collect()),
+            ValueTag::Isize => ScalarSoA::Isize(self.elements.iter().map(|h| h.as_isize()).collect()),
+            ValueTag::Usize => ScalarSoA::Usize(self.elements.iter().map(|h| h.as_usize()).collect()),
+            // F16/F128: read the union bit pattern directly (no f64
+            // intermediate, no numeric accessor — as_u16 truncated f16 values
+            // into denormal garbage and as_f128 dropped NaN payloads).
+            ValueTag::F16 => ScalarSoA::F16(self.elements.iter().map(|h| match h {
+                Value::Scalar(sv, ValueTag::F16) => unsafe { sv.f16_val },
+                _ => 0,
+            }).collect()),
+            ValueTag::F128 => ScalarSoA::F128(self.elements.iter().map(|h| match h {
+                Value::Scalar(sv, ValueTag::F128) => unsafe {
+                    crate::value::F128(std::mem::transmute::<_, [u8; 16]>(sv.f128_val))
+                },
+                _ => crate::value::F128([0u8; 16]),
+            }).collect()),
+            // scalar_tag() only yields the 18 scalar tags; Null/Void/Ref are
+            // unreachable here but must be covered for exhaustiveness.
+            ValueTag::Null | ValueTag::Void | ValueTag::Ref => return,
+        });
+    }
+    /// Native-endian byte serialization for FFI scalar-array marshaling: SoA
+    /// column first, else the element vector when it is homogeneous scalars.
+    /// Returns `(bytes, element_tag)` — the tag fixes the element width the C
+    /// side assumes. `None` for non-scalar / mixed elements: callers treat
+    /// that as "not a marshalable scalar array" and fail the call. Every
+    /// scalar element width marshals (1..16 bytes; 128-bit elements as
+    /// native 16-byte blocks, f16 as raw bits).
+    /// The byte length is always `elements * width_of(tag)`.
+    pub fn collect_scalar_bytes(&self) -> Option<(Vec<u8>, ValueTag)> {
+        use crate::value::ScalarSoA;
+        if let Some(soa) = &self.scalar_soa {
+            // The column is contiguous plain scalars — its raw bytes ARE the
+            // native-endian serialization, so this is one block copy (a
+            // per-element to_ne_bytes loop costs ~40ns/element in debug
+            // builds — 1M-element fills would spend the whole budget there).
+            let (bytes, tag) = match soa {
+                ScalarSoA::I8(v) => (scalar_column_bytes(v), ValueTag::I8),
+                ScalarSoA::I16(v) => (scalar_column_bytes(v), ValueTag::I16),
+                ScalarSoA::I32(v) => (scalar_column_bytes(v), ValueTag::I32),
+                ScalarSoA::I64(v) => (scalar_column_bytes(v), ValueTag::I64),
+                ScalarSoA::U8(v) => (scalar_column_bytes(v), ValueTag::U8),
+                ScalarSoA::U16(v) => (scalar_column_bytes(v), ValueTag::U16),
+                ScalarSoA::U32(v) => (scalar_column_bytes(v), ValueTag::U32),
+                ScalarSoA::U64(v) => (scalar_column_bytes(v), ValueTag::U64),
+                ScalarSoA::Isize(v) => (scalar_column_bytes(v), ValueTag::Isize),
+                ScalarSoA::Usize(v) => (scalar_column_bytes(v), ValueTag::Usize),
+                ScalarSoA::F32(v) => (scalar_column_bytes(v), ValueTag::F32),
+                ScalarSoA::F64(v) => (scalar_column_bytes(v), ValueTag::F64),
+                ScalarSoA::Bool(v) => (scalar_column_bytes(v), ValueTag::Bool),
+                ScalarSoA::Char(v) => (scalar_column_bytes(v), ValueTag::Char),
+                // 128-bit elements serialize as native 16-byte blocks (the C
+                // side views them as uint64 pairs); f16 as its 2 raw bits.
+                // Fill VALUES cross FFI via a single-element pattern array, so
+                // no 128-bit scalar param convention is needed.
+                ScalarSoA::I128(v) => (scalar_column_bytes(v), ValueTag::I128),
+                ScalarSoA::U128(v) => (scalar_column_bytes(v), ValueTag::U128),
+                ScalarSoA::F16(v) => (scalar_column_bytes(v), ValueTag::F16),
+                ScalarSoA::F128(v) => (scalar_column_bytes(v), ValueTag::F128),
+            };
+            return Some((bytes, tag));
+        }
+        // AoS fallback. Two shapes reach here (no SoA column):
+        // 1. The legacy u8-blob idiom: `blob ++ args[i].bytes() ++ [0]` — the
+        //    `[0]` literal is i32-tagged, so a u8[]-typed array can carry MIXED
+        //    integer tags. Those serialize per-element to single bytes (exact
+        //    legacy `collect_u8_bytes` semantics; writeback rewrites every
+        //    element to u8, normalizing the tags).
+        // 2. A homogeneous scalar array whose SoA was invalidated by a soft
+        //    store — serialize natively by that tag.
+        let first = self.elements.first()?.scalar_tag()?;
+        if self.elements.iter().all(|e| e.scalar_tag().is_some_and(is_int_scalar_tag)) {
+            return Some((self.elements.iter().map(|e| e.as_u8()).collect(), ValueTag::U8));
+        }
+        let tag = first;
+        if !self.elements.iter().all(|e| e.scalar_tag() == Some(tag)) {
+            return None;
+        }
+        let bytes: Vec<u8> = match tag {
+            ValueTag::I8 => self.elements.iter().flat_map(|e| e.as_i8().to_ne_bytes()).collect(),
+            ValueTag::I16 => self.elements.iter().flat_map(|e| e.as_i16().to_ne_bytes()).collect(),
+            ValueTag::I32 => self.elements.iter().flat_map(|e| e.as_i32().to_ne_bytes()).collect(),
+            ValueTag::I64 => self.elements.iter().flat_map(|e| e.as_i64().to_ne_bytes()).collect(),
+            ValueTag::U8 => self.elements.iter().map(|e| e.as_u8()).collect(),
+            ValueTag::U16 => self.elements.iter().flat_map(|e| e.as_u16().to_ne_bytes()).collect(),
+            ValueTag::U32 => self.elements.iter().flat_map(|e| e.as_u32().to_ne_bytes()).collect(),
+            ValueTag::U64 => self.elements.iter().flat_map(|e| e.as_u64().to_ne_bytes()).collect(),
+            ValueTag::Isize => self.elements.iter().flat_map(|e| e.as_isize().to_ne_bytes()).collect(),
+            ValueTag::Usize => self.elements.iter().flat_map(|e| e.as_usize().to_ne_bytes()).collect(),
+            ValueTag::F32 => self.elements.iter().flat_map(|e| e.as_f32().to_ne_bytes()).collect(),
+            ValueTag::F64 => self.elements.iter().flat_map(|e| e.as_f64().to_ne_bytes()).collect(),
+            ValueTag::Bool => self.elements.iter().map(|e| e.as_bool() as u8).collect(),
+            ValueTag::Char => self.elements.iter().flat_map(|e| (e.as_char() as u32).to_ne_bytes()).collect(),
+            ValueTag::I128 => self.elements.iter().flat_map(|e| e.as_i128().to_ne_bytes()).collect(),
+            ValueTag::U128 => self.elements.iter().flat_map(|e| e.as_u128().to_ne_bytes()).collect(),
+            // f16/f128 read the union bit pattern directly (no f64 intermediate
+            // — NaN payloads must survive the round-trip), mirroring optimize_soa.
+            ValueTag::F16 => self.elements.iter().flat_map(|e| match e {
+                Value::Scalar(sv, ValueTag::F16) => unsafe { sv.f16_val }.to_ne_bytes(),
+                _ => 0u16.to_ne_bytes(),
+            }).collect(),
+            ValueTag::F128 => self.elements.iter().flat_map(|e| match e {
+                Value::Scalar(sv, ValueTag::F128) => unsafe { std::mem::transmute::<_, [u8; 16]>(sv.f128_val) },
+                _ => [0u8; 16],
+            }).collect(),
+            _ => return None,
+        };
+        Some((bytes, tag))
+    }
+
+    /// The element tag `collect_scalar_bytes` will serialize this array with
+    /// (single decision table: SoA column tag; all-integer AoS → U8; else the
+    /// homogeneous scalar tag; `None` = not marshalable). Marshal uses this for
+    /// writeback decoding so it can never disagree with the serialization.
+    pub fn scalar_marshal_tag(&self) -> Option<ValueTag> {
+        use crate::value::ScalarSoA;
+        if let Some(soa) = &self.scalar_soa {
+            return match soa {
+                ScalarSoA::I8(_) => Some(ValueTag::I8),
+                ScalarSoA::I16(_) => Some(ValueTag::I16),
+                ScalarSoA::I32(_) => Some(ValueTag::I32),
+                ScalarSoA::I64(_) => Some(ValueTag::I64),
+                ScalarSoA::U8(_) => Some(ValueTag::U8),
+                ScalarSoA::U16(_) => Some(ValueTag::U16),
+                ScalarSoA::U32(_) => Some(ValueTag::U32),
+                ScalarSoA::U64(_) => Some(ValueTag::U64),
+                ScalarSoA::Isize(_) => Some(ValueTag::Isize),
+                ScalarSoA::Usize(_) => Some(ValueTag::Usize),
+                ScalarSoA::F32(_) => Some(ValueTag::F32),
+                ScalarSoA::F64(_) => Some(ValueTag::F64),
+                ScalarSoA::Bool(_) => Some(ValueTag::Bool),
+                ScalarSoA::Char(_) => Some(ValueTag::Char),
+                ScalarSoA::I128(_) => Some(ValueTag::I128),
+                ScalarSoA::U128(_) => Some(ValueTag::U128),
+                ScalarSoA::F16(_) => Some(ValueTag::F16),
+                ScalarSoA::F128(_) => Some(ValueTag::F128),
+            };
+        }
+        let first = self.elements.first()?.scalar_tag()?;
+        if self.elements.iter().all(|e| e.scalar_tag().is_some_and(is_int_scalar_tag)) {
+            return Some(ValueTag::U8);
+        }
+        if self.elements.iter().all(|e| e.scalar_tag() == Some(first)) {
+            return Some(first);
+        }
+        None
+    }
+
+    /// Inverse of `collect_scalar_bytes` for C-side mutation writeback:
+    /// decodes native-endian `bytes` (as many whole elements as it holds,
+    /// capped at the current length — C never resizes) into this array's own
+    /// representation. SoA column first (source of truth when present);
+    /// otherwise the element vector. `tag` is the tag the bytes were
+    /// serialized with (same array object, single-threaded engine — it cannot
+    /// disagree with the current representation).
+    pub fn write_scalar_bytes(&mut self, bytes: &[u8], tag: ValueTag) {
+        use crate::value::ScalarSoA;
+        let esize = match tag {
+            ValueTag::I8 | ValueTag::U8 | ValueTag::Bool => 1usize,
+            ValueTag::I16 | ValueTag::U16 => 2,
+            ValueTag::I32 | ValueTag::U32 | ValueTag::F32 | ValueTag::Char => 4,
+            ValueTag::I64 | ValueTag::U64 | ValueTag::Isize | ValueTag::Usize | ValueTag::F64 => 8,
+            ValueTag::F16 => 2,
+            ValueTag::I128 | ValueTag::U128 | ValueTag::F128 => 16,
+            _ => return,
+        };
+        let n = bytes.len() / esize;
+        if let Some(soa) = &mut self.scalar_soa {
+            // Column storage is the exact native layout of `tag` — one block
+            // copy back (see collect_scalar_bytes for the cost rationale).
+            if soa_matches_tag(soa, tag) {
+                let cap = soa_len(soa);
+                let m = n.min(cap);
+                if m > 0 {
+                    let dst = soa_as_byte_ptr(soa);
+                    // SAFETY: `m * esize` bytes fit both the source slice and
+                    // the column (m <= cap elements of width esize).
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, m * esize);
+                    }
+                }
+                return;
+            }
+            match (soa, tag) {
+                (ScalarSoA::I8(v), ValueTag::I8) => { let m = n.min(v.len()); for i in 0..m { v[i] = i8::from_ne_bytes(bytes[i*esize..(i+1)*esize].try_into().unwrap()); } }
+                (ScalarSoA::I16(v), ValueTag::I16) => { let m = n.min(v.len()); for i in 0..m { v[i] = i16::from_ne_bytes(bytes[i*esize..(i+1)*esize].try_into().unwrap()); } }
+                (ScalarSoA::I32(v), ValueTag::I32) => { let m = n.min(v.len()); for i in 0..m { v[i] = i32::from_ne_bytes(bytes[i*esize..(i+1)*esize].try_into().unwrap()); } }
+                (ScalarSoA::I64(v), ValueTag::I64) => { let m = n.min(v.len()); for i in 0..m { v[i] = i64::from_ne_bytes(bytes[i*esize..(i+1)*esize].try_into().unwrap()); } }
+                (ScalarSoA::U8(v), ValueTag::U8) => { let m = n.min(v.len()); v[..m].copy_from_slice(&bytes[..m]); }
+                (ScalarSoA::U16(v), ValueTag::U16) => { let m = n.min(v.len()); for i in 0..m { v[i] = u16::from_ne_bytes(bytes[i*esize..(i+1)*esize].try_into().unwrap()); } }
+                (ScalarSoA::U32(v), ValueTag::U32) => { let m = n.min(v.len()); for i in 0..m { v[i] = u32::from_ne_bytes(bytes[i*esize..(i+1)*esize].try_into().unwrap()); } }
+                (ScalarSoA::U64(v), ValueTag::U64) => { let m = n.min(v.len()); for i in 0..m { v[i] = u64::from_ne_bytes(bytes[i*esize..(i+1)*esize].try_into().unwrap()); } }
+                (ScalarSoA::Isize(v), ValueTag::Isize) => { let m = n.min(v.len()); for i in 0..m { v[i] = isize::from_ne_bytes(bytes[i*esize..(i+1)*esize].try_into().unwrap()); } }
+                (ScalarSoA::Usize(v), ValueTag::Usize) => { let m = n.min(v.len()); for i in 0..m { v[i] = usize::from_ne_bytes(bytes[i*esize..(i+1)*esize].try_into().unwrap()); } }
+                (ScalarSoA::F32(v), ValueTag::F32) => { let m = n.min(v.len()); for i in 0..m { v[i] = f32::from_ne_bytes(bytes[i*esize..(i+1)*esize].try_into().unwrap()); } }
+                (ScalarSoA::F64(v), ValueTag::F64) => { let m = n.min(v.len()); for i in 0..m { v[i] = f64::from_ne_bytes(bytes[i*esize..(i+1)*esize].try_into().unwrap()); } }
+                (ScalarSoA::Bool(v), ValueTag::Bool) => { let m = n.min(v.len()); for i in 0..m { v[i] = bytes[i] != 0; } }
+                (ScalarSoA::Char(v), ValueTag::Char) => { let m = n.min(v.len()); for i in 0..m { v[i] = u32::from_ne_bytes(bytes[i*esize..(i+1)*esize].try_into().unwrap()); } }
+                _ => {}
+            }
+            return;
+        }
+        let m = n.min(self.elements.len());
+        for i in 0..m {
+            let b: &[u8] = &bytes[i*esize..(i+1)*esize];
+            self.elements[i] = match tag {
+                ValueTag::I8 => Value::i8(i8::from_ne_bytes(b.try_into().unwrap())),
+                ValueTag::I16 => Value::i16(i16::from_ne_bytes(b.try_into().unwrap())),
+                ValueTag::I32 => Value::i32(i32::from_ne_bytes(b.try_into().unwrap())),
+                ValueTag::I64 => Value::i64(i64::from_ne_bytes(b.try_into().unwrap())),
+                ValueTag::U8 => Value::u8(b[0]),
+                ValueTag::U16 => Value::u16(u16::from_ne_bytes(b.try_into().unwrap())),
+                ValueTag::U32 => Value::u32(u32::from_ne_bytes(b.try_into().unwrap())),
+                ValueTag::U64 => Value::u64(u64::from_ne_bytes(b.try_into().unwrap())),
+                ValueTag::Isize => Value::isize_val(isize::from_ne_bytes(b.try_into().unwrap())),
+                ValueTag::Usize => Value::usize_val(usize::from_ne_bytes(b.try_into().unwrap())),
+                ValueTag::F32 => Value::f32(f32::from_ne_bytes(b.try_into().unwrap())),
+                ValueTag::F64 => Value::f64(f64::from_ne_bytes(b.try_into().unwrap())),
+                ValueTag::Bool => Value::bool_val(b[0] != 0),
+                ValueTag::Char => match char::from_u32(u32::from_ne_bytes(b.try_into().unwrap())) {
+                    Some(c) => Value::char_val(c),
+                    None => return,
+                },
+                ValueTag::I128 => Value::i128(i128::from_ne_bytes(b.try_into().unwrap())),
+                ValueTag::U128 => Value::u128(u128::from_ne_bytes(b.try_into().unwrap())),
+                ValueTag::F16 => Value::f16(crate::value::F16(u16::from_ne_bytes(b.try_into().unwrap()))),
+                ValueTag::F128 => Value::f128(crate::value::F128(b.try_into().unwrap())),
+                _ => return,
+            };
+        }
+    }
+}
+
+/// Integer scalar tags (the legacy u8-blob idiom may mix any of these in one
+/// array — they serialize per-element to single bytes).
+fn is_int_scalar_tag(tag: ValueTag) -> bool {
+    matches!(
+        tag,
+        ValueTag::I8 | ValueTag::I16 | ValueTag::I32 | ValueTag::I64
+            | ValueTag::U8 | ValueTag::U16 | ValueTag::U32 | ValueTag::U64
+            | ValueTag::Isize | ValueTag::Usize
+    )
+}
+
+/// Raw native-endian bytes of a contiguous scalar column (one block copy).
+///
+/// SAFETY: only valid for plain scalar element types (i8..u64, isize/usize,
+/// f32/f64, bool, char-as-u32) — no padding, so the slice's raw bytes are
+/// exactly `len * size_of::<T>()` and native-endian by construction.
+fn scalar_column_bytes<T>(v: &[T]) -> Vec<u8> {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)).to_vec() }
+}
+
+/// Whether the SoA variant matches the tag the bytes were serialized with.
+fn soa_matches_tag(soa: &crate::value::ScalarSoA, tag: ValueTag) -> bool {
+    use crate::value::ScalarSoA;
+    matches!(
+        (soa, tag),
+        (ScalarSoA::I8(_), ValueTag::I8)
+            | (ScalarSoA::I16(_), ValueTag::I16)
+            | (ScalarSoA::I32(_), ValueTag::I32)
+            | (ScalarSoA::I64(_), ValueTag::I64)
+            | (ScalarSoA::U8(_), ValueTag::U8)
+            | (ScalarSoA::U16(_), ValueTag::U16)
+            | (ScalarSoA::U32(_), ValueTag::U32)
+            | (ScalarSoA::U64(_), ValueTag::U64)
+            | (ScalarSoA::Isize(_), ValueTag::Isize)
+            | (ScalarSoA::Usize(_), ValueTag::Usize)
+            | (ScalarSoA::F32(_), ValueTag::F32)
+            | (ScalarSoA::F64(_), ValueTag::F64)
+            | (ScalarSoA::Bool(_), ValueTag::Bool)
+            | (ScalarSoA::Char(_), ValueTag::Char)
+            | (ScalarSoA::I128(_), ValueTag::I128)
+            | (ScalarSoA::U128(_), ValueTag::U128)
+            | (ScalarSoA::F16(_), ValueTag::F16)
+            | (ScalarSoA::F128(_), ValueTag::F128)
+    )
+}
+
+fn soa_len(soa: &crate::value::ScalarSoA) -> usize {
+    use crate::value::ScalarSoA;
+    match soa {
+        ScalarSoA::I8(v) => v.len(),
+        ScalarSoA::I16(v) => v.len(),
+        ScalarSoA::I32(v) => v.len(),
+        ScalarSoA::I64(v) => v.len(),
+        ScalarSoA::U8(v) => v.len(),
+        ScalarSoA::U16(v) => v.len(),
+        ScalarSoA::U32(v) => v.len(),
+        ScalarSoA::U64(v) => v.len(),
+        ScalarSoA::Isize(v) => v.len(),
+        ScalarSoA::Usize(v) => v.len(),
+        ScalarSoA::F32(v) => v.len(),
+        ScalarSoA::F64(v) => v.len(),
+        ScalarSoA::Bool(v) => v.len(),
+        ScalarSoA::Char(v) => v.len(),
+        ScalarSoA::I128(v) => v.len(),
+        ScalarSoA::U128(v) => v.len(),
+        ScalarSoA::F128(v) => v.len(),
+        ScalarSoA::F16(v) => v.len(),
+    }
+}
+
+/// Mutable byte view of a SoA column's storage.
+///
+/// SAFETY: same plain-scalar precondition as `scalar_column_bytes`.
+fn soa_as_byte_ptr(soa: &mut crate::value::ScalarSoA) -> *mut u8 {
+    use crate::value::ScalarSoA;
+    match soa {
+        ScalarSoA::I8(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::I16(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::I32(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::I64(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::U8(v) => v.as_mut_ptr(),
+        ScalarSoA::U16(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::U32(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::U64(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::Isize(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::Usize(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::F32(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::F64(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::Bool(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::Char(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::I128(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::U128(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::F16(v) => v.as_mut_ptr() as *mut u8,
+        ScalarSoA::F128(v) => v.as_mut_ptr() as *mut u8,
     }
 }
 
@@ -1813,25 +2286,35 @@ pub struct NewtypeValue {
 /// `*r = v` writes the Cell. Multiple references share the same Arc; writes are visible to all references.
 #[derive(Debug)]
 pub struct Cell {
-    pub inner: parking_lot::Mutex<Value>,
+    inner: std::cell::UnsafeCell<Value>,
 }
+
+// Safety: the engine executes user graphs single-threaded (the same argument
+// as the `Arc::as_ptr` in-place mutation in compute_record_field_set /
+// compute_array_store — frames are suspended while callees run; async is
+// cooperative; rayon only parallelizes arena construction, never graph
+// execution). Cell get/set therefore need no lock; the previous
+// parking_lot::Mutex cost an uncontended lock per scalar `var` store, which
+// the all-vars place model made per-iteration in hot loops.
+unsafe impl Send for Cell {}
+unsafe impl Sync for Cell {}
 
 impl Clone for Cell {
     fn clone(&self) -> Self {
-        Self { inner: parking_lot::Mutex::new(self.get()) }
+        Self { inner: std::cell::UnsafeCell::new(self.get()) }
     }
 }
 
 impl Cell {
     pub fn new(val: Value) -> Self {
-        Self { inner: parking_lot::Mutex::new(val) }
+        Self { inner: std::cell::UnsafeCell::new(val) }
     }
     /// Returns a clone of the inner value.
     pub fn get(&self) -> Value {
-        self.inner.lock().clone()
+        unsafe { (*self.inner.get()).clone() }
     }
     pub fn set(&self, val: Value) {
-        *self.inner.lock() = val;
+        unsafe { *self.inner.get() = val; }
     }
 
     /// Returns a Weak reference to itself (used to break reference cycles).
@@ -2142,6 +2625,13 @@ impl ChannelSendError {
 }
 
 impl ChannelValue {
+    /// Cycle-collector edge enumeration: visits every buffered Value.
+    pub(crate) fn each_buffered(&self, f: &mut dyn FnMut(&Value)) {
+        for v in self.buffer.lock().unwrap().iter() {
+            f(v);
+        }
+    }
+
     pub fn new(capacity: usize) -> Self {
         Self {
             id: CHANNEL_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -2326,6 +2816,15 @@ pub enum HeapObj {
     Adt(AdtValue),
     Newtype(NewtypeValue),
     Cell(Cell),
+    /// Place reference (place model B-stage): handle to a mutable storage
+    /// location. `&arr[i]` creates this; `*r` reads the element LIVE (SoA
+    /// -aware) and `*r = v` stores in place (same semantics as `arr[i] = v`).
+    ArrayElemRef { arr: Value, idx: Value },
+    /// Place reference: `&rec.field` / `&this.field`. Field is by name
+    /// (records/ADTs store names); read/write mirror record_field_get/set.
+    RecordFieldRef { rec: Value, field: Box<str> },
+    /// Place reference: `&global` — indexes `graph.global_var_storage`.
+    GlobalSlotRef { slot: u32 },
     Range(Range),
     Closure(Closure),
     Partial(PartialApplication),
@@ -2355,7 +2854,7 @@ pub type HeapRef = Arc<HeapObj>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefKind {
     Str, Array, Record, Adt, Newtype, Cell, Range, Closure, Partial, Builtin,
-    TraitVal, LazyVal, ErrorVal, ThrowVal,
+    TraitVal, LazyVal, ErrorVal, ThrowVal, ArrayElemRef, RecordFieldRef, GlobalSlotRef,
     AtomicVal, AsyncVal, ChannelVal, SenderVal, ReceiverVal, CoroutineFrame,
     OpaquePtr, LibVal, ForeignFnVal,
 }
@@ -2396,6 +2895,9 @@ impl HeapObj {
             HeapObj::Adt(_) => RefKind::Adt,
             HeapObj::Newtype(_) => RefKind::Newtype,
             HeapObj::Cell(_) => RefKind::Cell,
+            HeapObj::ArrayElemRef { .. } => RefKind::ArrayElemRef,
+            HeapObj::RecordFieldRef { .. } => RefKind::RecordFieldRef,
+            HeapObj::GlobalSlotRef { .. } => RefKind::GlobalSlotRef,
             HeapObj::Range(_) => RefKind::Range,
             HeapObj::Closure(_) => RefKind::Closure,
             HeapObj::Partial(_) => RefKind::Partial,
@@ -2424,6 +2926,9 @@ impl HeapObj {
             HeapObj::Adt(_) => "adt",
             HeapObj::Newtype(_) => "newtype",
             HeapObj::Cell(_) => "cell",
+            HeapObj::ArrayElemRef { .. } => "array_elem_ref",
+            HeapObj::RecordFieldRef { .. } => "record_field_ref",
+            HeapObj::GlobalSlotRef { .. } => "global_slot_ref",
             HeapObj::Range(_) => "range",
             HeapObj::Closure(_) => "closure",
             HeapObj::Partial(_) => "partial",
@@ -2452,6 +2957,9 @@ impl HeapObj {
             HeapObj::Adt(_) => "adt",
             HeapObj::Newtype(_) => "newtype",
             HeapObj::Cell(_) => "cell",
+            HeapObj::ArrayElemRef { .. } => "array_elem_ref",
+            HeapObj::RecordFieldRef { .. } => "record_field_ref",
+            HeapObj::GlobalSlotRef { .. } => "global_slot_ref",
             HeapObj::Range(_) => "range",
             HeapObj::Closure(_) => "<closure>",
             HeapObj::Partial(_) => "<partial>",
@@ -2487,7 +2995,7 @@ impl Hash for HeapObj {
         match self {
             HeapObj::Str(s) => s.hash(state),
             HeapObj::Array(a) => {
-                a.elements.len().hash(state);
+                a.len().hash(state);
                 // SoA SIMD fast path: batch-hash scalars
                 if let Some(soa) = &a.scalar_soa {
                     simd_hash_soa(soa, state);
@@ -2519,8 +3027,17 @@ impl Hash for HeapObj {
                 n.inner.hash(state);
             }
             HeapObj::Cell(c) => {
-                c.inner.lock().hash(state);
+                c.get().hash(state);
             }
+            HeapObj::ArrayElemRef { arr, idx } => {
+                arr.hash(state);
+                idx.hash(state);
+            }
+            HeapObj::RecordFieldRef { rec, field } => {
+                rec.hash(state);
+                field.hash(state);
+            }
+            HeapObj::GlobalSlotRef { slot } => slot.hash(state),
             HeapObj::Range(r) => {
                 r.start.hash(state);
                 r.end.hash(state);

@@ -91,10 +91,40 @@ impl<'a> InferContext<'a> {
             Expr::Binary { .. } => self.infer_binary_expr(expr, ast, env),
 
             // ── Unary operations ──
-            Expr::Unary { operand, .. } => {
-                let _ = self.infer_expr(*operand, ast, env, None);
-                // ! / ~ / - all return the operand's type.
-                self.infer_expr(*operand, ast, env, None)
+            Expr::Unary { op, operand } => {
+                let opnd_ty = self.infer_expr(*operand, ast, env, None);
+                // `!` is LOGICAL not — a bool-only operator. The runtime
+                // compute reads the operand via as_bool(), which answers
+                // false for every non-bool value, so `!count` silently
+                // evaluated to `true`. Gate it at sema (soft TypeVar/Unknown
+                // operands stay lenient for generic code). `~` and `-` keep
+                // the operand's type.
+                if matches!(op, crate::ast::Ast::UnaryOp::Not) {
+                    let r = self.arena.resolve(opnd_ty);
+                    let non_bool = match self.arena.get(r) {
+                        crate::types::Type::Bool
+                        | crate::types::Type::TypeVar(_)
+                        | crate::types::Type::Unknown => false,
+                        _ => true,
+                    };
+                    if non_bool {
+                        let sp = ast.expr(*operand).span;
+                        let ty_desc = self
+                            .arena
+                            .type_name_concrete(r)
+                            .unwrap_or_else(|| "value".to_string());
+                        self.add_error_at(
+                            &format!(
+                                "'!' is logical not and requires a bool operand (found '{}'); use '~' for bitwise not",
+                                ty_desc
+                            ),
+                            sp.line,
+                            sp.column,
+                        );
+                    }
+                    return self.arena.make(crate::types::Type::Bool);
+                }
+                opnd_ty
             }
 
             // ── Type cast `expr as T` ──
@@ -128,6 +158,48 @@ impl<'a> InferContext<'a> {
 
             // ── Reference / dereference ──
             Expr::RefOf(operand) => {
+                // Place check: `&` requires a place — a variable, `arr[i]`,
+                // or `rec.field`. Rvalue borrows (`&(a+b)`, `&f()`,
+                // `&Type.Ctor`) and immutable str elements (`&s[i]`) are
+                // rejected here instead of compiling to a silent snapshot.
+                let node = &ast.expr(*operand).node;
+                let span = ast.expr(expr).span;
+                let is_place = matches!(
+                    node,
+                    Expr::Ident(_) | Expr::Index { .. } | Expr::FieldAccess { .. }
+                );
+                if !is_place {
+                    self.add_error_at(
+                        "cannot take a reference to this expression: only variables, arr[i], and rec.field are addressable",
+                        span.line,
+                        span.column,
+                    );
+                }
+                if let Expr::FieldAccess { recv, field } = node {
+                    if let Expr::Ident(type_name) = &ast.expr(*recv).node {
+                        if self.check_qualified_ctor(type_name, field).is_some() {
+                            self.add_error_at(
+                                &format!(
+                                    "'{}.{}' is a constructor call, not a variable; constructors are not addressable",
+                                    type_name, field
+                                ),
+                                span.line,
+                                span.column,
+                            );
+                        }
+                    }
+                }
+                if let Expr::Index { recv, .. } = node {
+                    let recv_ty = self.infer_expr(*recv, ast, env, None);
+                    let resolved = self.arena.resolve(recv_ty);
+                    if matches!(self.arena.get(resolved), Type::Str) {
+                        self.add_error_at(
+                            "cannot take a reference to a str element: str is immutable",
+                            span.line,
+                            span.column,
+                        );
+                    }
+                }
                 let inner_ty = self.infer_expr(*operand, ast, env, None);
                 self.arena.make_ref(inner_ty, false)
             }
@@ -179,7 +251,7 @@ impl<'a> InferContext<'a> {
                 let recv_resolved = self.arena.resolve(recv_ty);
                 if let Type::ModuleRef(_) = self.arena.get(recv_resolved) {
                     let (path, module_env) = self.arena.module_ref_parts(recv_resolved);
-                    if self.env.lookup_local(module_env, field).is_some() {
+                    if self.sema_result.env.lookup_local(module_env, field).is_some() {
                         let mangled = format!("{}.{}", path, field);
                         let recv_key = crate::sema::Sema::module_expr_key(
                             &self.current_module_name,
@@ -303,7 +375,14 @@ impl<'a> InferContext<'a> {
                 for &e in elements.iter().skip(1) {
                     let elem_ty = self.infer_expr(e, ast, env, expected_elem);
                     if let Err(e_err) = self.try_widen_unify(first_ty, elem_ty) {
-                        self.add_error(&format!("array element type mismatch: {}", e_err));
+                        // Span-bearing diagnostic: the spanless form printed
+                        // "0:0" and gave no clue which element mismatched.
+                        let sp = ast.expr(e).span;
+                        self.add_error_at(
+                            &format!("array element type mismatch: {}", e_err),
+                            sp.line,
+                            sp.column,
+                        );
                     }
                     elem_tys.push(elem_ty);
                 }
@@ -415,7 +494,7 @@ impl<'a> InferContext<'a> {
                 if return_type.is_none() {
                     self.add_error("lambda requires an explicit return type annotation: fun(params): T { ... }");
                 }
-                let child_env = self.env.child(env);
+                let child_env = self.sema_result.env.child(env);
                 let param_types: Vec<TypeHandle> = params
                     .iter()
                     .map(|p| {
@@ -423,7 +502,7 @@ impl<'a> InferContext<'a> {
                             Some(ta) => self.type_from_ast(ta, ast),
                             None => self.arena.fresh_type_var(),
                         };
-                        self.env.define(child_env, p.name, param_ty);
+                        self.sema_result.env.define(child_env, p.name, param_ty);
                         param_ty
                     })
                     .collect();
@@ -515,10 +594,10 @@ impl<'a> InferContext<'a> {
                     ast,
                     *cond,
                     env,
-                    &self.env,
+                    &self.sema_result.env,
                 );
 
-                let then_env = self.env.child(env);
+                let then_env = self.sema_result.env.child(env);
                 // Enter the then scope and apply the then facts.
                 self.flow_ctx.push_scope();
                 for fact in &then_facts {
@@ -528,7 +607,7 @@ impl<'a> InferContext<'a> {
                 self.flow_ctx.pop_scope();
 
                 if let Some(else_br) = else_branch {
-                    let else_env = self.env.child(env);
+                    let else_env = self.sema_result.env.child(env);
                     // Enter the else scope and apply the else facts.
                     self.flow_ctx.push_scope();
                     for fact in &else_facts {
@@ -552,7 +631,7 @@ impl<'a> InferContext<'a> {
 
             // ── Block expressions ──
             Expr::Block { stmts, trailing } => {
-                let child_env = self.env.child(env);
+                let child_env = self.sema_result.env.child(env);
                 let mut diverges = false;
                 for &stmt in stmts.iter() {
                     if diverges {
@@ -622,7 +701,7 @@ impl<'a> InferContext<'a> {
             Expr::Select(arms) => {
                 let mut arm_tys: Vec<TypeHandle> = Vec::new();
                 for arm in arms.iter() {
-                    let child_env = self.env.child(env);
+                    let child_env = self.sema_result.env.child(env);
                     self.flow_ctx.push_scope();
                     match arm {
                         crate::ast::Ast::SelectArm::Receive { channel_expr, binding, body } => {
@@ -644,7 +723,7 @@ impl<'a> InferContext<'a> {
                                 _ => chan_ty,
                             };
                             if let Some(name) = binding {
-                                let _ = self.env.define(child_env, name, elem_ty);
+                                let _ = self.sema_result.env.define(child_env, name, elem_ty);
                             }
                             let body_ty = self.infer_expr(*body, ast, child_env, None);
                             arm_tys.push(body_ty);
@@ -759,7 +838,7 @@ impl<'a> InferContext<'a> {
                 let this_ty_opt = self.current_this_type();
                 if let Some(this_ty) = this_ty_opt {
                     // 1. Local variables and parameters only.
-                    if let Some(scheme) = self.env.lookup_local(env, name) {
+                    if let Some(scheme) = self.sema_result.env.lookup_local(env, name) {
                         return self.freshen_type(scheme);
                     }
                     let is_typevar = matches!(
@@ -777,7 +856,7 @@ impl<'a> InferContext<'a> {
                         }
                     }
                     // 3. Full lookup (methods registered in parent env, top-level functions).
-                    if let Some(scheme) = self.env.lookup(env, name) {
+                    if let Some(scheme) = self.sema_result.env.lookup(env, name) {
                         return self.freshen_type(scheme);
                     }
                     // 4. Trait default methods: permissive field fallback (TypeVar can't
@@ -793,7 +872,7 @@ impl<'a> InferContext<'a> {
                     }
                 } else {
                     // Outside methods: full env lookup.
-                    if let Some(scheme) = self.env.lookup(env, name) {
+                    if let Some(scheme) = self.sema_result.env.lookup(env, name) {
                         return self.freshen_type(scheme);
                     }
                 }
@@ -1100,13 +1179,13 @@ impl<'a> InferContext<'a> {
                     // This is the data source for IR-compile-time type queries (e.g. str + str → concat).
                     for m in methods.iter() {
                         if let Some(body) = m.body {
-                            let method_env = self.env.child(env);
+                            let method_env = self.sema_result.env.child(env);
                             for param in m.params.iter() {
                                 let param_ty = match param.type_annotation {
                                     Some(ta) => self.type_from_ast(ta, ast),
                                     None => self.arena.fresh_type_var(),
                                 };
-                                self.env.define(method_env, param.name, param_ty);
+                                self.sema_result.env.define(method_env, param.name, param_ty);
                             }
                             let prev_return = self.expected_return;
                             self.expected_return =

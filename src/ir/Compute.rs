@@ -119,6 +119,9 @@ fn reflect_kind(v: &Value) -> u8 {
             crate::value::HeapObj::Adt(_) => k::ADT,
             crate::value::HeapObj::Newtype(_) => k::NEWTYPE,
             crate::value::HeapObj::Cell(_) => k::CELL,
+            crate::value::HeapObj::ArrayElemRef { .. }
+            | crate::value::HeapObj::RecordFieldRef { .. }
+            | crate::value::HeapObj::GlobalSlotRef { .. } => k::CELL,
             crate::value::HeapObj::Range(_) => k::RANGE,
             crate::value::HeapObj::Closure(_) => k::CLOSURE,
             crate::value::HeapObj::Partial(_) => k::PARTIAL,
@@ -153,6 +156,9 @@ fn reflect_kind_str(v: &Value) -> &'static str {
             crate::value::HeapObj::Adt(_) => "Adt",
             crate::value::HeapObj::Newtype(_) => "Newtype",
             crate::value::HeapObj::Cell(_) => "Cell",
+            crate::value::HeapObj::ArrayElemRef { .. }
+            | crate::value::HeapObj::RecordFieldRef { .. }
+            | crate::value::HeapObj::GlobalSlotRef { .. } => "Cell",
             crate::value::HeapObj::Range(_) => "Range",
             crate::value::HeapObj::Closure(_) => "Closure",
             crate::value::HeapObj::Partial(_) => "Partial",
@@ -174,6 +180,31 @@ fn reflect_kind_str(v: &Value) -> &'static str {
     }
 }
 
+/// Element-aware array type name: `"u8[]"`, `"i32[]"`, `"str[]"`,
+/// `"Point[]"`, nested `"u8[][]"`, ... Falls back to `"array"` when there
+/// are no elements to inspect (empty) or they are not uniform — type_name
+/// is reflect metadata, not a static type, so the element type is derived
+/// from the values (SoA stays parallel to `elements`, which is
+/// authoritative).
+fn array_type_name(arr: &crate::value::ArrayValue) -> String {
+    // SoA presence implies uniform scalar elements — O(1) instead of an
+    // O(n) per-element reflect walk (1M-element buffers spent ~20ms there).
+    if let Some(soa) = &arr.scalar_soa {
+        return format!("{}[]", soa.type_name());
+    }
+    match arr.elements.first() {
+        None => TYPE_NAME_ARRAY.to_string(),
+        Some(first) => {
+            let first_name = reflect_type_name(first);
+            if arr.elements.iter().all(|e| reflect_type_name(e) == first_name) {
+                format!("{}[]", first_name)
+            } else {
+                TYPE_NAME_ARRAY.to_string()
+            }
+        }
+    }
+}
+
 /// Returns the type name of a `Value` (single source of truth, shared by FFI,
 /// fallback, and `cast_to_str`).
 fn reflect_type_name(v: &Value) -> String {
@@ -183,10 +214,10 @@ fn reflect_type_name(v: &Value) -> String {
         Value::Scalar(_, tag) => tag.type_name().to_string(),
         Value::Ref(r) => match &**r {
             crate::value::HeapObj::Str(_) => TYPE_NAME_STR.to_string(),
-            crate::value::HeapObj::Array(_) => TYPE_NAME_ARRAY.to_string(),
-            crate::value::HeapObj::Record(rec) => rec.type_name.clone(),
-            crate::value::HeapObj::Adt(a) => a.type_name.clone(),
-            crate::value::HeapObj::Newtype(n) => n.type_name.clone(),
+            crate::value::HeapObj::Array(arr) => array_type_name(arr),
+            crate::value::HeapObj::Record(rec) => crate::sema::Sema::display_type_name(&rec.type_name),
+            crate::value::HeapObj::Adt(a) => crate::sema::Sema::display_type_name(&a.type_name),
+            crate::value::HeapObj::Newtype(n) => crate::sema::Sema::display_type_name(&n.type_name),
             crate::value::HeapObj::LazyVal(_) => "Lazy".to_string(),
             crate::value::HeapObj::ErrorVal(_) => "Error".to_string(),
             crate::value::HeapObj::ThrowVal(_) => "Throw".to_string(),
@@ -197,6 +228,9 @@ fn reflect_type_name(v: &Value) -> String {
             crate::value::HeapObj::ReceiverVal(_) => "Receiver".to_string(),
             crate::value::HeapObj::CoroutineFrame => "Coroutine".to_string(),
             crate::value::HeapObj::Cell(_) => "Cell".to_string(),
+            crate::value::HeapObj::ArrayElemRef { .. }
+            | crate::value::HeapObj::RecordFieldRef { .. }
+            | crate::value::HeapObj::GlobalSlotRef { .. } => "Cell".to_string(),
             crate::value::HeapObj::Range(_) => "Range".to_string(),
             crate::value::HeapObj::Partial(_) => "Partial".to_string(),
             crate::value::HeapObj::Builtin(b) => b.name.clone(),
@@ -866,7 +900,7 @@ pub fn compute_throw_err(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> 
     Value::ref_val(HeapObj::ThrowVal(ThrowValue { payload: ThrowPayload::Err(v) }))
 }
 
-/// compute_fn (idx 47): the `?` operator (Propagate).
+/// compute_fn (idx 46): the `?` operator (Propagate).
 ///
 /// Input is a `ThrowVal`:
 /// - `Ok(val)` → returns `NodeResult::Value(val)` (unwrapped).
@@ -1238,7 +1272,7 @@ pub fn compute_ffn_call(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> V
 //   - the lazy-force logic is colocated with the reflect formatting logic.
 // =========================================================================
 
-/// compute_fn (idx 290): `format(x)` / `x.format()` — any value → str.
+/// compute_fn (idx 288): `format(x)` / `x.format()` — any value → str.
 ///
 /// Before formatting, forces evaluation of the LazyValue (if the input is
 /// lazy), then calls `value::format_value`. Does not depend on
@@ -1251,7 +1285,7 @@ pub fn compute_reflect_format(frame: &mut Frame, node: NodeId, ctx: &EvalContext
     Value::ref_val(crate::value::HeapObj::Str(crate::value::Str::from_rust_str(&s)))
 }
 
-/// compute_fn (idx 291): scalar value → str.
+/// compute_fn (idx 289): scalar value → str.
 ///
 /// Semantically identical to `compute_reflect_format` (both go through
 /// `format_value`); kept as a distinct id for historical compatibility
@@ -1335,7 +1369,7 @@ pub fn compute_reflect_field_count(frame: &mut Frame, node: NodeId, ctx: &EvalCo
         Some(crate::value::HeapObj::Record(rec)) => rec.fields.len().min(u16::MAX as usize) as u16,
         Some(crate::value::HeapObj::Adt(a)) => a.fields.len().min(u16::MAX as usize) as u16,
         Some(crate::value::HeapObj::Newtype(_)) => 1,
-        Some(crate::value::HeapObj::Array(a)) => a.elements.len().min(u16::MAX as usize) as u16,
+        Some(crate::value::HeapObj::Array(a)) => a.len().min(u16::MAX as usize) as u16,
         _ => 0,
     };
     Value::u16(count)
@@ -1390,7 +1424,7 @@ pub fn compute_reflect_array_len(frame: &mut Frame, node: NodeId, ctx: &EvalCont
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let len = match v.heap_obj() {
-        Some(crate::value::HeapObj::Array(a)) => a.elements.len(),
+        Some(crate::value::HeapObj::Array(a)) => a.len(),
         _ => 0,
     };
     Value::usize_val(len)
@@ -1422,7 +1456,14 @@ pub fn compute_record_construct(frame: &mut Frame, node: NodeId, ctx: &EvalConte
     let info: &RecordLitInfo = info
         .as_ref()
         .expect("record construct node has no RecordLitInfo");
-    match info.kind {
+    // E8 nullary cache: a 0-input construct's value is metadata-determined —
+    // build once per node, Arc-clone thereafter.
+    if inputs.is_empty() {
+        if let Some(&(_, ref v)) = frame.construct_cache.iter().find(|(g, _)| *g == node.0) {
+            return v.clone();
+        }
+    }
+    let built = match info.kind {
         RecordLitKind::Record => {
             Value::ref_val(HeapObj::Record(RecordValue {
                 type_name: info.type_name.clone(),
@@ -1456,7 +1497,11 @@ pub fn compute_record_construct(frame: &mut Frame, node: NodeId, ctx: &EvalConte
                 inner,
             }))
         }
+    };
+    if inputs.is_empty() {
+        frame.construct_cache.push((node.0, built.clone()));
     }
+    built
 }
 
 /// compute_fn: record field access (fetches a field value from a Record/Adt by field name).
@@ -1539,7 +1584,7 @@ pub fn compute_array_index(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     let idx = idx_raw as usize;
     match recv_val.heap_obj() {
         Some(crate::value::HeapObj::Array(arr)) => {
-            arr.get(idx).cloned().unwrap_or_else(|| {
+            arr.get(idx).unwrap_or_else(|| {
                 panic!("index {} out of bounds (len {})", idx, arr.len())
             })
         }
@@ -1579,7 +1624,12 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Valu
             if s > e {
                 return make_err(&format!("slice start {} > end {}", s, e));
             }
-            let sliced: Vec<Value> = arr.elements[s..e].to_vec();
+            // SoA is truth after marshal writebacks; slice from it when present.
+            let sliced: Vec<Value> = if let Some(soa) = &arr.scalar_soa {
+                (s..e).map(|i| soa.get_value(i).unwrap_or(Value::VOID)).collect()
+            } else {
+                arr.elements[s..e].to_vec()
+            };
             Value::ref_val(HeapObj::Array(ArrayValue {
                 elements: sliced,
                 fixed_size: None,
@@ -1623,7 +1673,7 @@ pub fn compute_str_concat(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
     }
 }
 
-/// compute_fn (idx 319): multi-input string concatenation.
+/// compute_fn (idx 316): multi-input string concatenation.
 ///
 /// All inputs (>=2) are concatenated into a single str in one pass, O(n) time complexity.
 /// Used for the compile-time lowering of string interpolation `"a{b}c{d}e"`, replacing the chained `compute_str_concat` which is O(n^2).
@@ -1659,7 +1709,7 @@ pub fn compute_str_multi_concat(frame: &mut Frame, node: NodeId, ctx: &EvalConte
     Value::ref_val(HeapObj::Str(Str::from_rust_str(&buf)))
 }
 
-/// compute_fn (idx 320): string array join — `str[] + sep → str`.
+/// compute_fn (idx 317): string array join — `str[] + sep → str`.
 ///
 /// One-shot O(n) concat, replacing the stdlib loop `result = result + seg` (O(n^2)).
 /// inputs[0] = str[] array, inputs[1] = sep separator.
@@ -1706,7 +1756,7 @@ pub fn compute_str_array_join(frame: &mut Frame, node: NodeId, ctx: &EvalContext
     Value::ref_val(HeapObj::Str(Str::from_rust_str(&buf)))
 }
 
-/// compute_fn (idx 343): `s.is_empty()` / `arr.is_empty()`.
+/// compute_fn (idx 340): `s.is_empty()` / `arr.is_empty()`.
 ///
 /// Previously declared in Sema with no implementation (phantom method): calling
 /// it built a Call node with no target and panicked the engine. Now lowered as
@@ -1722,7 +1772,7 @@ pub fn compute_is_empty(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> V
     }
 }
 
-/// compute_fn (idx 270): global variable read.
+/// compute_fn (idx 268): global variable read.
 ///
 /// No inputs; reads the value from `graph.global_var_storage[slot]`.
 /// The slot index is obtained from `graph.global_load_slots[node]`.
@@ -1736,7 +1786,7 @@ pub fn compute_global_load(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) 
     val
 }
 
-/// compute_fn (idx 271): global variable write.
+/// compute_fn (idx 269): global variable write.
 ///
 /// `inputs[0]` is the value-source node; the value is written to
 /// `graph.global_var_storage[slot]`. The slot index is obtained from
@@ -1752,7 +1802,7 @@ pub fn compute_global_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) 
     val
 }
 
-/// compute_fn (idx 308): memoization cache lookup.
+/// compute_fn (idx 306): memoization cache lookup.
 ///
 /// `inputs[0..param_count]` are the parameter values (used as the cache key).
 /// `MemoInfo.table_index` indexes into `graph.memo_tables`'s hash table.
@@ -1809,7 +1859,7 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
     }
 }
 
-/// compute_fn (idx 309): memoization cache write.
+/// compute_fn (idx 307): memoization cache write.
 ///
 /// `inputs[0..param_count]` are the parameter values (used as the cache key),
 /// and `inputs[param_count]` is the result value. Writes the result into the
@@ -1843,7 +1893,7 @@ pub fn compute_memo_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
     result_val
 }
 
-/// compute_fn (idx 272): record extension.
+/// compute_fn (idx 270): record extension.
 ///
 /// `inputs[0]` is the base RecordValue; `inputs[1..]` are the updated field
 /// values. `RecordExtendInfo.update_names` gives the field names corresponding
@@ -1902,7 +1952,7 @@ pub fn compute_record_extend(frame: &mut Frame, node: NodeId, ctx: &EvalContext)
     }))
 }
 
-/// compute_fn (idx 273): atomic construction.
+/// compute_fn (idx 271): atomic construction.
 ///
 /// `inputs[0]` is the initial-value node; it is wrapped in an `AtomicValue`
 /// (an atomic container sharing the underlying memory). `AtomicValue.data` is a
@@ -1914,7 +1964,7 @@ pub fn compute_atomic_construct(frame: &mut Frame, node: NodeId, ctx: &EvalConte
     Value::ref_val(HeapObj::AtomicVal(AtomicValue::new(val)))
 }
 
-/// compute_fn (idx 315): atomic load.
+/// compute_fn (idx 312): atomic load.
 ///
 /// Input: the Atomic<T> reference. Returns a clone of the inner value.
 pub fn compute_atomic_load(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
@@ -1926,7 +1976,7 @@ pub fn compute_atomic_load(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     }
 }
 
-/// compute_fn (idx 316): atomic store.
+/// compute_fn (idx 313): atomic store.
 ///
 /// Inputs: [Atomic<T>, new_value]. Stores `new_value` into the atomic and returns void.
 pub fn compute_atomic_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
@@ -1939,7 +1989,7 @@ pub fn compute_atomic_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) 
     Value::VOID
 }
 
-/// compute_fn (idx 317): atomic swap.
+/// compute_fn (idx 314): atomic swap.
 ///
 /// Inputs: [Atomic<T>, new_value]. Replaces the inner value with `new_value` and
 /// returns the previous value.
@@ -1953,7 +2003,7 @@ pub fn compute_atomic_swap(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     }
 }
 
-/// compute_fn (idx 318): atomic compare-and-exchange.
+/// compute_fn (idx 315): atomic compare-and-exchange.
 ///
 /// Inputs: [Atomic<T>, expected, new]. If the current value equals `expected`,
 /// replaces it with `new` and returns true; otherwise returns false.
@@ -1978,7 +2028,18 @@ pub fn compute_atomic_compare_exchange(frame: &mut Frame, node: NodeId, ctx: &Ev
 /// Returns `bool`.
 pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
-    let val = force_input(frame, inputs[0]);
+    // Peek (borrow) instead of force_input (clone): pattern tests fire 2-3x per
+    // match per iteration; the scrutinee's Arc incref/decref pair per test is
+    // pure overhead. Lazy thunks still need forcing (rare — fall through).
+    let peeked = frame.peek_value_by_global(inputs[0]);
+    let forced;
+    let val: &Value = match peeked {
+        Some(v) if !matches!(v, Value::Ref(r) if matches!(**r, crate::value::HeapObj::LazyVal(_))) => v,
+        _ => {
+            forced = force_input(frame, inputs[0]);
+            &forced
+        }
+    };
     let ctor_name = graph.pattern_ctor_name(node.0 as usize)
         .expect("pattern ctor match node has no ctor name");
     let type_name = graph.pattern_type_name(node.0 as usize);
@@ -1987,11 +2048,23 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId, ctx: &EvalCon
         // disambiguate same-named constructors across different types.
         Some(crate::value::HeapObj::Adt(a)) => {
             a.constructor == ctor_name
-                && type_name.map_or(true, |tn| a.type_name == tn)
+                && type_name.map_or(true, |tn| {
+                    a.type_name == tn || type_inherits(graph, &a.type_name, tn)
+                })
         }
-        Some(crate::value::HeapObj::Record(r)) => r.type_name == ctor_name,
+        // Record/Newtype patterns key on the TYPE name (ctor name == type
+        // name for these kinds). Canonical identity: prefer the pattern's
+        // type-name metadata (module-qualified); the ctor-name slot is the
+        // legacy bare fallback.
+        Some(crate::value::HeapObj::Record(r)) => match type_name {
+            Some(tn) => r.type_name == tn,
+            None => r.type_name == ctor_name,
+        },
         // Newtype: constructor name == type name; match `NewtypeValue.type_name`.
-        Some(crate::value::HeapObj::Newtype(n)) => n.type_name == ctor_name,
+        Some(crate::value::HeapObj::Newtype(n)) => match type_name {
+            Some(tn) => n.type_name == tn,
+            None => n.type_name == ctor_name,
+        },
         Some(crate::value::HeapObj::ThrowVal(tv)) => match &tv.payload {
             crate::value::ThrowPayload::Ok(_) => ctor_name == CTOR_OK,
             crate::value::ThrowPayload::Err(payload) => {
@@ -2008,8 +2081,14 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId, ctx: &EvalCon
                             a.constructor == ctor_name
                                 && type_name.map_or(true, |tn| a.type_name == tn)
                         }
-                        Some(crate::value::HeapObj::Newtype(n)) => n.type_name == ctor_name,
-                        Some(crate::value::HeapObj::Record(r)) => r.type_name == ctor_name,
+                        Some(crate::value::HeapObj::Newtype(n)) => match type_name {
+                            Some(tn) => n.type_name == tn,
+                            None => n.type_name == ctor_name,
+                        },
+                        Some(crate::value::HeapObj::Record(r)) => match type_name {
+                            Some(tn) => r.type_name == tn,
+                            None => r.type_name == ctor_name,
+                        },
                         _ => false,
                     }
                 }
@@ -2164,13 +2243,28 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
         Value::Ref(r) => match r.as_ref() {
             HeapObj::Str(frond_str) => frond_str.bytes().to_string(),
             HeapObj::Array(arr) => {
-                // u8[] → str: extract bytes from SoA or elements
+                // u8[] → str: lossless when the bytes are valid UTF-8; str is
+                // UTF-8 by construction (Arc<str>), so invalid bytes are a
+                // programming error and fail loudly (previously they were
+                // silently replaced with U+FFFD, corrupting binary data).
                 use crate::value::ScalarSoA;
                 if let Some(ScalarSoA::U8(bytes)) = &arr.scalar_soa {
-                    String::from_utf8_lossy(bytes).into_owned()
+                    match String::from_utf8(bytes.clone()) {
+                        Ok(s) => s,
+                        Err(e) => panic!(
+                            "u8[] as str: invalid UTF-8 at byte {} — bytes are not text, keep them as u8[]",
+                            e.utf8_error().valid_up_to()
+                        ),
+                    }
                 } else if !arr.elem_is_ref {
                     let bytes: Vec<u8> = arr.elements.iter().map(|v| v.as_int_i128() as u8).collect();
-                    String::from_utf8_lossy(&bytes).into_owned()
+                    match String::from_utf8(bytes) {
+                        Ok(s) => s,
+                        Err(e) => panic!(
+                            "u8[] as str: invalid UTF-8 at byte {} — bytes are not text, keep them as u8[]",
+                            e.utf8_error().valid_up_to()
+                        ),
+                    }
                 } else {
                     "<non-scalar>".to_string()
                 }
@@ -2179,6 +2273,102 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
         },
     };
     Value::ref_val(HeapObj::Str(Str::new(s)))
+}
+
+/// Convert one scalar `Value` to the target tag (shared by the scalar and
+/// array casters: int↔int truncate/extend, int↔float, float↔float).
+fn cast_scalar_value(val: &Value, target_tag: crate::value::ValueTag) -> Value {
+    use crate::value::ValueTag;
+    // Whether the source value is a float.
+    let src_is_float = matches!(
+        val,
+        Value::Scalar(_, ValueTag::F16 | ValueTag::F32 | ValueTag::F64 | ValueTag::F128)
+    );
+    // Read the source value uniformly as f64: floats use `as_float_f64`, integers use `as_int_i128 as f64`.
+    let src_f64 = if src_is_float { val.as_float_f64() } else { val.as_int_i128() as f64 };
+
+    match target_tag {
+        ValueTag::I8 => Value::i8(if src_is_float { src_f64 as i8 } else { val.as_i8() }),
+        ValueTag::I16 => Value::i16(if src_is_float { src_f64 as i16 } else { val.as_i16() }),
+        ValueTag::I32 => Value::i32(if src_is_float { src_f64 as i32 } else { val.as_i32() }),
+        ValueTag::I64 => Value::i64(if src_is_float { src_f64 as i64 } else { val.as_i64() }),
+        ValueTag::I128 => Value::i128(if src_is_float { src_f64 as i128 } else { val.as_i128() }),
+        ValueTag::U8 => Value::u8(if src_is_float { src_f64 as u8 } else { val.as_u8() }),
+        ValueTag::U16 => Value::u16(if src_is_float { src_f64 as u16 } else { val.as_u16() }),
+        ValueTag::U32 => Value::u32(if src_is_float { src_f64 as u32 } else { val.as_u32() }),
+        ValueTag::U64 => Value::u64(if src_is_float { src_f64 as u64 } else { val.as_u64() }),
+        ValueTag::U128 => Value::u128(if src_is_float { src_f64 as u128 } else { val.as_u128() }),
+        ValueTag::Isize => Value::isize_val(if src_is_float { src_f64 as isize } else { val.as_isize() }),
+        ValueTag::Usize => Value::usize_val(if src_is_float { src_f64 as usize } else { val.as_usize() }),
+        ValueTag::F16 => Value::f16(crate::value::F16::from_f64(src_f64)),
+        ValueTag::F32 => Value::f32(src_f64 as f32),
+        ValueTag::F64 => Value::f64(src_f64),
+        // Use the precise `as_f128()` accessor: integer sources go through from_i128/from_u128, float sources go through to_f64 (already precisely rounded).
+        ValueTag::F128 => Value::f128(val.as_f128()),
+        ValueTag::Bool => Value::bool_val(if src_is_float { src_f64 != 0.0 } else { val.as_int_i128() != 0 }),
+        ValueTag::Char => Value::char_val(char_from_u32_or_nul(if src_is_float { src_f64 as u32 } else { val.as_int_i128() as u32 })),
+        _ => unreachable!("non-scalar target_tag {:?} in cast", target_tag),
+    }
+}
+
+/// compute_fn (idx 347): array cast — `x as T[]`.
+///
+/// Carries the array through: same-tag scalar elements pass the whole value
+/// untouched (SoA kept); different scalar element tags convert element-wise
+/// through the shared scalar caster; non-scalar element targets (str[],
+/// records, ...) are reference casts (passthrough). Null passes through.
+/// The previous lowering never reached a cast like this — array targets were
+/// misread as "i64" and the optimistic scalar cast destroyed the value.
+pub fn compute_cast_array(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    use crate::value::{ArrayValue, HeapObj, ValueTag};
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
+    let val = force_input(frame, inputs[0]);
+    if val.is_null() {
+        return Value::Null;
+    }
+    let target_ty = graph
+        .cast_target_type(node.0 as usize)
+        .expect("cast_array node has no target type");
+    let elem_name = target_ty.strip_suffix("[]").unwrap_or(&target_ty);
+    let target_tag = match ValueTag::from_name(elem_name) {
+        Some(tag) => tag,
+        // Non-scalar element target (str[], record arrays): reference cast.
+        None => return val.clone(),
+    };
+    let arr = match &val {
+        Value::Ref(r) => match r.as_ref() {
+            HeapObj::Array(a) => a,
+            // Permissive passthrough for nonsense casts (`x as i32[]` on a
+            // scalar), matching the legacy scalar-cast behavior these call
+            // sites used to get.
+            _ => return val.clone(),
+        },
+        _ => return val.clone(),
+    };
+    // Same-tag fast path (also covers empty arrays): value passes through.
+    let same_tag = arr
+        .elements
+        .first()
+        .map(|e| e.scalar_tag() == Some(target_tag))
+        .unwrap_or(true);
+    if same_tag {
+        return val.clone();
+    }
+    let src_elems: Vec<Value> = if let Some(soa) = &arr.scalar_soa {
+        (0..arr.len()).map(|i| soa.get_value(i).unwrap_or(Value::VOID)).collect()
+    } else {
+        arr.elements.clone()
+    };
+    let elements: Vec<Value> = src_elems
+        .iter()
+        .map(|e| cast_scalar_value(e, target_tag))
+        .collect();
+    Value::ref_val(HeapObj::Array(ArrayValue {
+        elements,
+        fixed_size: arr.fixed_size,
+        elem_is_ref: false,
+        scalar_soa: None,
+    }))
 }
 
 /// compute_fn: generic type conversion — scalar → scalar (idx 278).
@@ -2211,40 +2401,10 @@ pub fn compute_cast_scalar(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
             };
         }
     };
-
-    // Whether the source value is a float.
-    let src_is_float = matches!(
-        &val,
-        Value::Scalar(_, ValueTag::F16 | ValueTag::F32 | ValueTag::F64 | ValueTag::F128)
-    );
-    // Read the source value uniformly as f64: floats use `as_float_f64`, integers use `as_int_i128 as f64`.
-    let src_f64 = if src_is_float { val.as_float_f64() } else { val.as_int_i128() as f64 };
-
-    match target_tag {
-        ValueTag::I8 => Value::i8(if src_is_float { src_f64 as i8 } else { val.as_i8() }),
-        ValueTag::I16 => Value::i16(if src_is_float { src_f64 as i16 } else { val.as_i16() }),
-        ValueTag::I32 => Value::i32(if src_is_float { src_f64 as i32 } else { val.as_i32() }),
-        ValueTag::I64 => Value::i64(if src_is_float { src_f64 as i64 } else { val.as_i64() }),
-        ValueTag::I128 => Value::i128(if src_is_float { src_f64 as i128 } else { val.as_i128() }),
-        ValueTag::U8 => Value::u8(if src_is_float { src_f64 as u8 } else { val.as_u8() }),
-        ValueTag::U16 => Value::u16(if src_is_float { src_f64 as u16 } else { val.as_u16() }),
-        ValueTag::U32 => Value::u32(if src_is_float { src_f64 as u32 } else { val.as_u32() }),
-        ValueTag::U64 => Value::u64(if src_is_float { src_f64 as u64 } else { val.as_u64() }),
-        ValueTag::U128 => Value::u128(if src_is_float { src_f64 as u128 } else { val.as_u128() }),
-        ValueTag::Isize => Value::isize_val(if src_is_float { src_f64 as isize } else { val.as_isize() }),
-        ValueTag::Usize => Value::usize_val(if src_is_float { src_f64 as usize } else { val.as_usize() }),
-        ValueTag::F16 => Value::f16(crate::value::F16::from_f64(src_f64)),
-        ValueTag::F32 => Value::f32(src_f64 as f32),
-        ValueTag::F64 => Value::f64(src_f64),
-        // Use the precise `as_f128()` accessor: integer sources go through from_i128/from_u128, float sources go through to_f64 (already precisely rounded).
-        ValueTag::F128 => Value::f128(val.as_f128()),
-        ValueTag::Bool => Value::bool_val(if src_is_float { src_f64 != 0.0 } else { val.as_int_i128() != 0 }),
-        ValueTag::Char => Value::char_val(char_from_u32_or_nul(if src_is_float { src_f64 as u32 } else { val.as_int_i128() as u32 })),
-        _ => unreachable!("non-scalar target_tag {:?} in cast", target_tag),
-    }
+    cast_scalar_value(&val, target_tag)
 }
 
-/// compute_fn (idx 279): non-null assertion `expr!`.
+/// compute_fn (idx 277): non-null assertion `expr!`.
 ///
 /// Input is a nullable value: `Null` → panic (a programming error, not a
 /// recoverable flow); non-Null → returned as-is (Scalar/Ref pass-through, i.e.
@@ -2258,7 +2418,7 @@ pub fn compute_non_null_assert(frame: &mut Frame, node: NodeId, ctx: &EvalContex
     v
 }
 
-/// compute_fn (idx 280): take a reference `&expr` (RefOf).
+/// compute_fn (idx 278): take a reference `&expr` (RefOf).
 ///
 /// Wraps the input value in an `Arc<HeapObj::Cell>` and returns
 /// `Value::Ref(arc)`. Multiple references share the same Cell (via Arc clone),
@@ -2266,9 +2426,38 @@ pub fn compute_non_null_assert(frame: &mut Frame, node: NodeId, ctx: &EvalContex
 /// (records, etc.), the same Arc is shared directly (no second wrapping needed).
 pub fn compute_ref_of(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
+    // Place-ref forms (input-count + side-entry dispatch keeps ONE compute fn,
+    // so the .fndo table stays compatible):
+    //   0 inputs + global_load_slot  -> `&global`   (GlobalSlotRef)
+    //   2 inputs                     -> `&arr[i]`   (ArrayElemRef)
+    //   1 input + field_set_name     -> `&rec.field` / `&this.field`
+    match n.input_count {
+        0 => {
+            let slot = graph
+                .global_load_slot(node.0 as usize)
+                .expect("global place-ref node has no slot");
+            return Value::ref_val(crate::value::HeapObj::GlobalSlotRef { slot });
+        }
+        2 => {
+            let arr = force_input(frame, inputs[0]);
+            let idx = force_input(frame, inputs[1]);
+            return Value::ref_val(crate::value::HeapObj::ArrayElemRef { arr, idx });
+        }
+        _ => {}
+    }
+    if let Some(field) = graph.field_set_name(node.0 as usize) {
+        let rec = force_input(frame, inputs[0]);
+        return Value::ref_val(crate::value::HeapObj::RecordFieldRef {
+            rec,
+            field: field.to_string().into_boxed_str(),
+        });
+    }
     let v = force_input(frame, inputs[0]);
     match &v {
-        // Scalar/Null/Void → wrap in a Cell.
+        // Scalar/Null/Void → wrap in a fresh Cell. Binding-level write-through
+        // (`&x` then `x = v` observed through the ref) is handled at COMPILE
+        // time by the Builder's static rebinding (name reads/writes route
+        // through this same Cell); the runtime ref itself is just the cell.
         Value::Scalar(_, _) | Value::Null | Value::Void => {
             let cell = crate::value::Cell::new(v.clone());
             Value::ref_val(crate::value::HeapObj::Cell(cell))
@@ -2278,21 +2467,104 @@ pub fn compute_ref_of(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Val
     }
 }
 
-/// compute_fn (idx 281): dereference read `*ref` (Deref).
+/// compute_fn (idx 349): unconditional Cell allocation (place-model
+/// decl-site slotting). Boxes ANY value into a fresh Cell — scalars and heap
+/// objects alike. Unlike `compute_ref_of` (which shares heap-object Arcs to
+/// preserve `&rec` object-reference semantics), this creates the binding's
+/// STORAGE location: name reads are loads of this cell, name assignments are
+/// stores into it.
+pub fn compute_cell_alloc(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, n, inputs);
+    let v = force_input(frame, inputs[0]);
+    let cell = crate::value::Cell::new(v);
+    Value::ref_val(crate::value::HeapObj::Cell(cell))
+}
+
+/// compute_fn (idx 279): dereference read `*ref` (Deref).
 ///
 /// Input is an `Arc<HeapObj::Cell>`: returns the value inside the Cell.
 /// Input is any other Ref (record/array, etc.): returned as-is (`&rec` shares
 /// the Arc, so `*r` is just `rec` itself).
 pub fn compute_deref_read(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
+    // Hot path: borrow the ref value from the input slot directly — no Arc
+    // clone per cell read (place-model loops do this every iteration). Cell
+    // get() is a scalar copy; place-ref reads borrow the heap object's own
+    // fields. Falls through to force_input for pending/lazy inputs and for
+    // non-ref pass-through values.
+    if let Some(Value::Ref(arc)) = frame.peek_value_by_global(inputs[0]) {
+        match &**arc {
+            crate::value::HeapObj::Cell(c) => {
+                return c.get();
+            }
+            crate::value::HeapObj::ArrayElemRef { arr, idx } => {
+                return place_read_array_elem(arr, idx)
+            }
+            crate::value::HeapObj::RecordFieldRef { rec, field } => {
+                return place_read_record_field(rec, field)
+            }
+            crate::value::HeapObj::GlobalSlotRef { slot } => {
+                let storage = &graph.global_var_storage;
+                return storage[*slot as usize].lock().unwrap().clone().unwrap_or(Value::NULL);
+            }
+            _ => {}
+        }
+    }
     let v = force_input(frame, inputs[0]);
     match v.heap_obj() {
         Some(crate::value::HeapObj::Cell(c)) => c.get(),
+        // Place refs read their location LIVE (SoA-aware for arrays), so
+        // container mutations between ref creation and read are observed.
+        Some(crate::value::HeapObj::ArrayElemRef { arr, idx }) => {
+            place_read_array_elem(arr, idx)
+        }
+        Some(crate::value::HeapObj::RecordFieldRef { rec, field }) => {
+            place_read_record_field(rec, field)
+        }
+        Some(crate::value::HeapObj::GlobalSlotRef { slot }) => {
+            let storage = &graph.global_var_storage;
+            storage[*slot as usize].lock().unwrap().clone().unwrap_or(Value::NULL)
+        }
         _ => v,
     }
 }
 
-/// compute_fn (idx 282): dereference write `*ref = value` (DerefAssign).
+/// Place-ref live element read (mirrors compute_array_index's SoA-aware path
+/// and panic messages; OOB is a runtime panic like direct indexing).
+fn place_read_array_elem(arr: &Value, idx: &Value) -> Value {
+    let idx_raw = idx.as_i32();
+    if idx_raw < 0 {
+        panic!("index {} out of bounds (negative index)", idx_raw);
+    }
+    match arr.heap_obj() {
+        Some(crate::value::HeapObj::Array(a)) => a.get(idx_raw as usize).unwrap_or_else(|| {
+            panic!("index {} out of bounds (len {})", idx_raw, a.len())
+        }),
+        _ => panic!("place ref: index on non-array value"),
+    }
+}
+
+/// Place-ref live field read (Record by name position, Adt by field name).
+fn place_read_record_field(rec: &Value, field: &str) -> Value {
+    match rec.heap_obj() {
+        Some(crate::value::HeapObj::Record(r)) => r
+            .field_names
+            .iter()
+            .position(|n| n.as_deref() == Some(field))
+            .and_then(|i| r.fields.get(i))
+            .cloned()
+            .unwrap_or_else(|| panic!("place ref: record has no field '{}'", field)),
+        Some(crate::value::HeapObj::Adt(a)) => a
+            .fields
+            .iter()
+            .find(|f| f.name.as_deref() == Some(field))
+            .map(|f| f.value.clone())
+            .unwrap_or_else(|| panic!("place ref: variant has no field '{}'", field)),
+        _ => panic!("place ref: field access on non-record value"),
+    }
+}
+
+/// compute_fn (idx 280): dereference write `*ref = value` (DerefAssign).
 ///
 /// `inputs[0]` is the reference (Cell); `inputs[1]` is the new value. Writes
 /// the new value into the Cell and returns the written value (for chained use).
@@ -2300,10 +2572,49 @@ pub fn compute_deref_read(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
 /// writes go through `record_field_set`).
 pub fn compute_deref_write(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
+    // Hot path (same borrow trick as compute_deref_read): skip the Arc clone
+    // on the ref input when its slot is ready. The Cell escapes the immutable
+    // frame borrow as a raw pointer so force_input can take &mut frame.
+    if let Some(Value::Ref(arc)) = frame.peek_value_by_global(inputs[0]) {
+        let cell_raw: *const crate::value::Cell = match &**arc {
+            crate::value::HeapObj::Cell(c) => c as *const _,
+            _ => std::ptr::null(),
+        };
+        if !cell_raw.is_null() {
+            let new_val = force_input(frame, inputs[1]);
+            // SAFETY: the frame (and its slot's Arc) outlives this compute_fn
+            // call and the engine executes single-threaded — the Cell is
+            // neither freed nor concurrently mutated.
+            unsafe { (*cell_raw).set(new_val.clone()) };
+            return new_val;
+        }
+    }
     let ref_val = force_input(frame, inputs[0]);
     let new_val = force_input(frame, inputs[1]);
-    if let Some(crate::value::HeapObj::Cell(c)) = ref_val.heap_obj() {
-        c.set(new_val.clone());
+
+    match ref_val.heap_obj() {
+        Some(crate::value::HeapObj::Cell(c)) => c.set(new_val.clone()),
+        // Place refs store into their location — identical semantics to the
+        // direct statements (`arr[i] = v` / `rec.f = v` / `g = v`), including
+        // SoA materialization and in-place Arc mutation.
+        Some(crate::value::HeapObj::ArrayElemRef { arr, idx }) => {
+            let idx_raw = idx.as_i32();
+            if idx_raw < 0 {
+                panic!("index {} out of bounds (negative index)", idx_raw);
+            }
+            match arr.heap_ref() {
+                Some(arc) => array_store_inplace(&arc, idx_raw as usize, &new_val),
+                None => panic!("place ref: index on non-array value"),
+            }
+        }
+        Some(crate::value::HeapObj::RecordFieldRef { rec, field }) => match rec.heap_ref() {
+            Some(arc) => record_field_set_inplace(&arc, field, &new_val),
+            None => panic!("place ref: field access on non-record value"),
+        },
+        Some(crate::value::HeapObj::GlobalSlotRef { slot }) => {
+            *graph.global_var_storage[*slot as usize].lock().unwrap() = Some(new_val.clone());
+        }
+        _ => {}
     }
     new_val
 }
@@ -2341,30 +2652,42 @@ pub fn compute_record_field_set(frame: &mut Frame, node: NodeId, ctx: &EvalConte
     // drop), only the heap data is mutated.
     if let Some(val) = frame.value_table.get_value_mut(record_node_local.0 as usize) {
         if let Value::Ref(arc) = val {
-            let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::value::HeapObj;
-            unsafe {
-                match &mut *ptr {
-                    crate::value::HeapObj::Record(r) => {
-                        if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(field_name)) {
-                            if idx < r.fields.len() {
-                                    r.fields[idx] = new_value.clone();
-                            }
-                        }
-                    }
-                    crate::value::HeapObj::Adt(a) => {
-                        if let Some(idx) = a.fields.iter().position(|f| f.name.as_deref() == Some(field_name)) {
-                            a.fields[idx].value = new_value.clone();
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            record_field_set_inplace(arc, field_name, &new_value);
         }
     }
     Value::VOID
 }
 
-/// compute_fn (idx 301): array index store `arr[i] = x`.
+/// Shared in-place record/ADT field store (used by `rec.f = v` statements and
+/// place-ref deref writes). Mutates the heap object through `Arc::as_ptr`,
+/// bypassing COW so every owner of the Arc observes the write — see
+/// compute_record_field_set for the safety argument (single-threaded engine).
+pub(crate) fn record_field_set_inplace(
+    rec_arc: &std::sync::Arc<crate::value::HeapObj>,
+    field_name: &str,
+    new_value: &Value,
+) {
+    let ptr = std::sync::Arc::as_ptr(rec_arc) as *mut crate::value::HeapObj;
+    unsafe {
+        match &mut *ptr {
+            crate::value::HeapObj::Record(r) => {
+                if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(field_name)) {
+                    if idx < r.fields.len() {
+                        r.fields[idx] = new_value.clone();
+                    }
+                }
+            }
+            crate::value::HeapObj::Adt(a) => {
+                if let Some(idx) = a.fields.iter().position(|f| f.name.as_deref() == Some(field_name)) {
+                    a.fields[idx].value = new_value.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// compute_fn (idx 299): array index store `arr[i] = x`.
 ///
 /// Three inputs: arr, index, value. Mutates the Array heap object's `elements`
 /// vector in place. Same semantics as `record_field_set`: mutates the heap data
@@ -2382,26 +2705,61 @@ pub fn compute_array_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     let arr_node_local = NodeId(inputs[0].0.wrapping_sub(frame.node_offset));
     if let Some(val) = frame.value_table.get_value_mut(arr_node_local.0 as usize) {
         if let Value::Ref(arc) = val {
-            let ptr = std::sync::Arc::as_ptr(arc) as *mut crate::value::HeapObj;
-            unsafe {
-                if let crate::value::HeapObj::Array(arr) = &mut *ptr {
-                    if idx >= arr.elements.len() {
-                        arr.elements.resize(idx + 1, Value::VOID);
-                        // SOA layout must be rebuilt after resize (new elements are padded with Void; SOA cannot simply extend).
+            array_store_inplace(arc, idx, &new_value);
+        }
+    }
+    Value::VOID
+}
+
+/// Shared in-place array element store (used by `arr[i] = v` statements and
+/// place-ref deref writes). Mutates the heap object through `Arc::as_ptr`
+/// (same safety argument as compute_array_store). SoA is single-source truth:
+/// growth materializes from the SoA first, in-bounds writes keep the SoA in
+/// sync or invalidate it on type mismatch.
+pub(crate) fn array_store_inplace(
+    arr_arc: &std::sync::Arc<crate::value::HeapObj>,
+    idx: usize,
+    new_value: &Value,
+) {
+    let ptr = std::sync::Arc::as_ptr(arr_arc) as *mut crate::value::HeapObj;
+    unsafe {
+        if let crate::value::HeapObj::Array(arr) = &mut *ptr {
+            if idx >= arr.len() {
+                // Single-source model: the live data may exist ONLY in
+                // the SoA (elements can be an empty shell after a
+                // single-source clone) — materialize elements from the
+                // SoA first, then grow, then drop the SoA (it cannot
+                // extend past the old length).
+                if let Some(soa) = arr.scalar_soa.take() {
+                    arr.elements = (0..soa.soa_len())
+                        .map(|i| soa.get_value(i).unwrap_or(Value::VOID))
+                        .collect();
+                }
+                arr.elements.resize(idx + 1, Value::VOID);
+            } else if arr.elements.len() <= idx {
+                // In-bounds for the array but beyond the (possibly
+                // empty/stale) elements shell: the SoA is the truth —
+                // write it there; elements may stay stale.
+                if let Some(ref mut soa) = arr.scalar_soa {
+                    if soa.try_store(idx, new_value) {
+                        // Written to the truth; the stale elements
+                        // shell is skipped via the length check below.
+                    } else {
                         arr.scalar_soa = None;
                     }
-                    arr.elements[idx] = new_value.clone();
-                    // Sync the SOA: if the type matches, write in place; otherwise invalidate the SOA cache.
-                    if let Some(ref mut soa) = arr.scalar_soa {
-                        if !soa.try_store(idx, &new_value) {
-                            arr.scalar_soa = None;
-                        }
-                    }
+                }
+            }
+            if arr.elements.len() > idx {
+                arr.elements[idx] = new_value.clone();
+            }
+            // Sync the SoA: if the type matches, write in place; otherwise invalidate the SoA cache.
+            if let Some(ref mut soa) = arr.scalar_soa {
+                if !soa.try_store(idx, new_value) {
+                    arr.scalar_soa = None;
                 }
             }
         }
     }
-    Value::VOID
 }
 
 /// compute_fn: null check (checks whether a value is null; returns `bool`).
@@ -2486,8 +2844,17 @@ pub fn compute_concat_list(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     match (lhs.heap_obj(), rhs.heap_obj()) {
         (Some(HeapObj::Array(a)), Some(HeapObj::Array(b))) => {
             let mut elements = Vec::with_capacity(a.len() + b.len());
-            elements.extend(a.elements.iter().cloned());
-            elements.extend(b.elements.iter().cloned());
+            let push_truth = |arr: &crate::value::ArrayValue, out: &mut Vec<Value>| {
+                if let Some(soa) = &arr.scalar_soa {
+                    for i in 0..arr.len() {
+                        out.push(soa.get_value(i).unwrap_or(Value::VOID));
+                    }
+                } else {
+                    out.extend(arr.elements.iter().cloned());
+                }
+            };
+            push_truth(a, &mut elements);
+            push_truth(b, &mut elements);
             Value::ref_val(HeapObj::Array(ArrayValue::new(elements)))
         }
         _ => make_error_throw("TypeError", "list concat on non-array operand"),
@@ -2694,6 +3061,12 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
             node, cond_raw, cond, frame.subgraph_id.0, frame.node_offset,
             sg.node_range.0 .0, sg.node_range.1 .0,
             branches.branches.iter().map(|(c, sg, _)| (*c, sg.0)).collect::<Vec<_>>());
+        if node.0 == 27947 && std::env::var("FROND_DBG_PHI").is_ok() {
+            let l36 = frame.get_value_by_global(NodeId(27936));
+            let p32 = frame.get_value_by_global(NodeId(27932));
+            let a35 = frame.get_value_by_global(NodeId(27935));
+            eprintln!("[PHI] gate27947 ctx: lt={:?} param_si={:?} assert={:?}", l36, p32, a35);
+        }
     }
 
     // Select a branch (borrowed — no branch-inputs clone per Gate execution).
@@ -3615,7 +3988,32 @@ pub fn compute_continue(_frame: &mut Frame, _node: NodeId, _ctx: &EvalContext) -
     NodeResult::Continue
 }
 
-/// compute_fn (idx 314): match fallback — panics when no match arm matches.
+/// Whether `child` (transitively) inherits `ancestor` per the graph's
+/// inheritance links (sema TypeDefInfo.bases, embedded at build time).
+fn type_inherits(graph: &crate::ir::Ir::DataFlowGraph, child: &str, ancestor: &str) -> bool {
+    if child == ancestor {
+        return true;
+    }
+    let mut frontier: Vec<&str> = vec![child];
+    let mut hops = 0;
+    while let Some(c) = frontier.pop() {
+        hops += 1;
+        if hops > 64 {
+            return false;
+        }
+        for (cn, bn) in &graph.inheritance_links {
+            if cn.as_ref() == c {
+                if bn.as_ref() == ancestor {
+                    return true;
+                }
+                frontier.push(bn.as_ref());
+            }
+        }
+    }
+    false
+}
+
+/// compute_fn (idx 311): match fallback — panics when no match arm matches.
 /// This is a runtime safety net; sema's exhaustiveness check should prevent
 /// reaching this node for ADT matches. For non-ADT matches without a catch-all,
 /// this serves as the unconditional panic.
@@ -3623,7 +4021,7 @@ pub fn compute_match_fallback(_frame: &mut Frame, _node: NodeId, _ctx: &EvalCont
     panic!("non-exhaustive match: no arm matched at runtime");
 }
 
-/// compute_fn (idx 48): sequence node — waits for all inputs to be ready, then returns
+/// compute_fn (idx 47): sequence node — waits for all inputs to be ready, then returns
 /// the value of the last input.
 ///
 /// Used for statement sequencing: `inputs = [prev_effect, current_value]`, returns `current_value`.
@@ -3636,146 +4034,6 @@ pub fn compute_seq(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value 
     }
     let last_input = inputs[n.input_count as usize - 1];
     frame.get_value_by_global(last_input)
-}
-
-/// compute_writeback (idx 49): assigns an outer variable, writing back to the function
-/// root frame via `root_frame_ptr`.
-///
-/// `inputs[0]` = value source (a node in the current frame),
-/// `writeback_targets[node]` = the outer global `NodeId`.
-/// Non-blocking: the write completes directly inside the `compute_fn` — no pending state,
-/// no Engine-layer consumption.
-///
-/// Three writeback paths (in priority order):
-/// 1. `parent_frame_ptr` chain: same-function closure call, writes to the nearest parent
-///    frame containing the target.
-/// 2. `root_frame_ptr`: same-function closure call, writes to the function root frame
-///    (so other `same_function` calls can observe the latest value).
-/// 3. `closure_val` Cell: escaped closure (cross-function call, frame chain is null),
-///    updates the closure upvalues via the `Cell`'s interior mutability so the next call
-///    reads the latest value.
-pub fn compute_writeback(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
-    let graph = ctx.graph;
-    let n = graph.node(node.0 as usize);
-    if n.input_count == 0 {
-        return NodeResult::Value(Value::VOID);
-    }
-    let val_node = graph.inputs(n.inputs_offset, n.input_count)[0];
-    let val = frame.get_value_by_global(val_node);
-    let target = graph.writeback_target(node.0 as usize)
-        .expect("WriteBack node missing target");
-    let consumer_count = graph.downstream_count(target.0 as usize);
-
-    if env_flag("FROND_DEBUG_WB") {
-        let sg = &graph.subgraphs[frame.subgraph_id.0 as usize];
-        eprintln!("[WB] node={:?} target={:?} val={:?} val_node={:?} frame.sg={} frame.offset={} sg.range=[{},{}) sg.func_id={} vt_len={}",
-            node, target, val, val_node, frame.subgraph_id.0, frame.node_offset,
-            sg.node_range.0 .0, sg.node_range.1 .0, sg.function_id, frame.value_table.len());
-    }
-
-    // Path 0: write to the current frame (same_function closure call scenario).
-    // The value table of a same_function frame is extended to the parent frame size,
-    // so the target may fall within the current frame's range.
-    // If the current frame is not written: after a() modifies `log`, WriteBack only
-    // writes the parent frame chain (the main frame); the `log` in a's own child frame
-    // remains stale. A subsequent b() reading the upvalue from a's child frame
-    // (parent_frame) gets a stale value, breaking mutable capture sharing across the
-    // closure chain (Bug #31).
-    let cur_local = target.0.wrapping_sub(frame.node_offset);
-    if (cur_local as usize) < frame.value_table.len() {
-        frame.set_value(NodeId(cur_local), val.clone(), consumer_count);
-    }
-
-    // Path 1: walk the `parent_frame_ptr` chain, writing to every ancestor frame that
-    // contains the target.
-    // We cannot break after writing only the nearest parent: in nested same_function
-    // subgraphs (e.g. if branch -> loop body -> loop frame -> main), intermediate frames
-    // (the loop frame) also need updating; otherwise the next iteration's body reads a
-    // stale value when copying from the loop frame.
-    // SAFETY: `parent_frame_ptr` points to a same-function frame (set by `setup_frame_chain`);
-    // the caller frame is in the Suspended state while the callee executes, so there is no
-    // concurrent access.
-    let mut written_parent = false;
-    let mut ptr = frame.parent_frame_ptr;
-    while !ptr.is_null() {
-        let f = unsafe { &mut *ptr };
-        let local = target.0.wrapping_sub(f.node_offset);
-        if (local as usize) < f.value_table.len() {
-            f.set_value(NodeId(local), val.clone(), consumer_count);
-            written_parent = true;
-        }
-        ptr = f.parent_frame_ptr;
-    }
-
-    // Path 2: write to `root_frame_ptr` (the function root frame) so that same-function
-    // closure calls can read the latest value from the root frame.
-    if !frame.root_frame_ptr.is_null() {
-        let root = unsafe { &mut *frame.root_frame_ptr };
-        let local = target.0.wrapping_sub(root.node_offset);
-        if (local as usize) < root.value_table.len() {
-            root.set_value(NodeId(local), val.clone(), consumer_count);
-        } else {
-            return NodeResult::Return(make_error_throw("InternalError",
-                &format!("writeback target {:?} out of root frame range", target)));
-        }
-    } else if !written_parent {
-        // Path 3: escaped closure (frame chain is null) — write back the upvalue via the
-        // `closure_val`'s Cell.
-        // When an escaped closure is called across functions, both `parent` and `root`
-        // are null, so writeback via the frame chain is impossible.
-        // The upvalues inside `closure_val` are wrapped in Cells (see `compute_closure_construct`);
-        // we persist the mutation via `Cell::set` so the next call reads the latest value.
-        let mut written_cell = false;
-        if let Some(ref closure_val) = frame.closure_val {
-            if let Value::Ref(arc) = closure_val {
-                let upvalues: &[Value] = match arc.as_ref() {
-                    crate::value::HeapObj::Closure(c) => &c.upvalues,
-                    crate::value::HeapObj::Partial(p) => &p.upvalues,
-                    _ => &[],
-                };
-                if !upvalues.is_empty() {
-                    let sg_idx = frame.subgraph_id.0 as usize;
-                    for (i, &outer_node) in frame.graph.sg_upvalue_outer_nodes(sg_idx).iter().enumerate() {
-                        if outer_node == target && i < upvalues.len() {
-                            if let Some(crate::value::HeapObj::Cell(cell)) = upvalues[i].heap_obj() {
-                                cell.set(val.clone());
-                                written_cell = true;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        // Path 4: non-escaped closure root-frame scenario (assignment inside a top-level
-        // function) — write to the current frame.
-        if !written_cell {
-            let local = target.0.wrapping_sub(frame.node_offset);
-            if (local as usize) < frame.value_table.len() {
-                frame.set_value(NodeId(local), val.clone(), consumer_count);
-            } else {
-                return NodeResult::Return(make_error_throw("InternalError",
-                    &format!("writeback target {:?} out of current frame range", target)));
-            }
-        }
-    }
-    NodeResult::Value(val)
-}
-
-/// compute_tailrec_writeback (idx 310): a WriteBack specialized for tail-recursion-to-iteration.
-///
-/// Performs the same writeback logic as `compute_writeback`, but additionally returns
-/// `NodeResult::Continue`.
-/// In a TailRec loop, when `body_sg` completes:
-/// - `Continue` (returned by the rec arm's WriteBack) -> `reset_loop_iteration` (loop continues)
-/// - `None` (base arm has no WriteBack) -> loop exits, returning `body_sg`'s return value
-pub fn compute_tailrec_writeback(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> NodeResult {
-    // Normal writeback -> Continue (loop continues); out-of-bounds and other errors
-    // (NodeResult::Return) -> propagate upward (not silent).
-    match compute_writeback(frame, node, ctx) {
-        NodeResult::Value(_) => NodeResult::Continue,
-        other => other,
-    }
 }
 
 /// compute_defer_register (idx 322): registers a defer body onto the loop frame's
@@ -3923,4 +4181,16 @@ pub fn compute_defer_run(frame: &mut Frame, _node: NodeId, ctx: &EvalContext) ->
     };
     run_defer_entries_sync(loop_frame, &defers, &graph);
     NodeResult::Value(Value::VOID)
+}
+
+/// compute_fn (351): `v.clone()` — deep copy of the data domain.
+///
+/// Arrays (incl. SoA scalar storage) and records recurse into fresh heap
+/// objects; immutable leaves and runtime identities (closures, channels,
+/// FFI pointers, ...) share the Arc — see `value::Arena::deep_clone_data_value`.
+pub fn compute_reflect_clone(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
+    read_node_inputs!(frame, node, ctx, graph, _n, inputs);
+    let v = force_input(frame, inputs[0]);
+    let v = force_lazy_value_sync(frame, &v);
+    crate::value::Arena::deep_clone_data_value(&v)
 }

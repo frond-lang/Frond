@@ -65,6 +65,13 @@ impl DataFlowGraph {
     /// are elided, 8B otherwise — read from the mmap slice).
     #[inline]
     pub fn node(&self, idx: usize) -> Node {
+        // Materialized fast path: .fndo graphs copy the packed Nodes
+        // section into `nodes` once at EngineRef::new (per-call mmap
+        // unpacking was the artifact 2-3x hot-loop regression);
+        // build-path graphs live here natively.
+        if !self.nodes.is_empty() {
+            return self.nodes[idx];
+        }
         if let Some(ref mem) = self.mem {
             let r = mem.section(SectionKind::Nodes);
             let elided = self.node_inputs_elided();
@@ -89,6 +96,11 @@ impl DataFlowGraph {
     /// Reads the input slice for a node (zerocopy: transmuted from the mmap Inputs section into `&[NodeId]`).
     #[inline]
     pub fn inputs(&self, offset: u32, count: u8) -> &[NodeId] {
+        // Materialized fast path (see node()); build-path graphs live
+        // in the pool natively.
+        if !self.inputs_pool.data.is_empty() {
+            return self.inputs_pool.get(offset, count);
+        }
         if let Some(ref mem) = self.mem {
             let r = mem.section(SectionKind::Inputs);
             let start = offset as usize * 4;
@@ -117,8 +129,6 @@ impl DataFlowGraph {
     pub fn vtable_call_method(&self, idx: usize) -> Option<u16> { self.vtable_call_methods[idx] }
     #[inline]
     pub fn await_event_source(&self, idx: usize) -> Option<NodeId> { self.await_event_sources[idx] }
-    #[inline]
-    pub fn writeback_target(&self, idx: usize) -> Option<NodeId> { self.writeback_targets[idx] }
     #[inline]
     pub fn global_load_slot(&self, idx: usize) -> Option<u32> { self.global_load_slots[idx] }
     #[inline]
@@ -150,6 +160,12 @@ impl DataFlowGraph {
 
     #[inline]
     pub fn tail_call_flag(&self, idx: usize) -> bool {
+        // Materialized fast path (see node()): .fndo graphs fill the
+        // Vec at EngineRef::new; per-call bitmap reads through the
+        // mmap section cost measurably on hot loops.
+        if !self.tail_call_flags.is_empty() {
+            return self.tail_call_flags[idx];
+        }
         if let Some(ref mem) = self.mem {
             let r = mem.section(SectionKind::TailCallFlags);
             r[idx / 8] & (1 << (idx % 8)) != 0
@@ -160,6 +176,12 @@ impl DataFlowGraph {
 
     #[inline]
     pub fn safe_op_flag(&self, idx: usize) -> bool {
+        // Materialized fast path (see node()): .fndo graphs fill the
+        // Vec at EngineRef::new; per-call bitmap reads through the
+        // mmap section cost measurably on hot loops.
+        if !self.safe_op_flags.is_empty() {
+            return self.safe_op_flags[idx];
+        }
         if let Some(ref mem) = self.mem {
             let r = mem.section(SectionKind::SafeOpFlags);
             r[idx / 8] & (1 << (idx % 8)) != 0
@@ -170,6 +192,12 @@ impl DataFlowGraph {
 
     #[inline]
     pub fn slice_inclusive(&self, idx: usize) -> bool {
+        // Materialized fast path (see node()): .fndo graphs fill the
+        // Vec at EngineRef::new; per-call bitmap reads through the
+        // mmap section cost measurably on hot loops.
+        if !self.slice_inclusive.is_empty() {
+            return self.slice_inclusive[idx];
+        }
         if let Some(ref mem) = self.mem {
             let r = mem.section(SectionKind::SliceInclusive);
             r[idx / 8] & (1 << (idx % 8)) != 0

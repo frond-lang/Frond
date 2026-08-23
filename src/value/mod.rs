@@ -20,6 +20,8 @@ mod value;
 #[macro_use]
 pub mod Arena;
 
+pub mod Registry;
+
 pub mod Ops;
 pub mod Reflect;
 pub mod Tag;

@@ -22,29 +22,23 @@ use super::Ops::par_chunk_size;
 // Part 3: Bucket<T> + ValueArena (fully bucketed SoA storage)
 // =========================================================================
 
-/// Type bucket: contiguous storage of same-type values + parallel reference counting + free-list recycling.
+/// Type bucket: contiguous storage of same-type values.
+/// (Slot-level reference counting and free-list recycling were dead
+/// infrastructure — the Value model uses frame-granular batch reset + Arc
+/// RAII — and have been removed; slots live until the bucket resets.)
 struct Bucket<T: Clone> {
     data: Vec<T>,
-    refcounts: Vec<u32>,
-    free_list: Vec<u32>,
 }
 
 impl<T: Clone> Bucket<T> {
     fn new() -> Self {
-        Self { data: Vec::new(), refcounts: Vec::new(), free_list: Vec::new() }
+        Self { data: Vec::new() }
     }
 
     fn alloc(&mut self, val: T) -> u32 {
-        if let Some(idx) = self.free_list.pop() {
-            self.data[idx as usize] = val;
-            self.refcounts[idx as usize] = 1;
-            idx
-        } else {
-            let idx = self.data.len() as u32;
-            self.data.push(val);
-            self.refcounts.push(1);
-            idx
-        }
+        let idx = self.data.len() as u32;
+        self.data.push(val);
+        idx
     }
 
     #[inline]
@@ -63,30 +57,9 @@ impl<T: Clone> Bucket<T> {
         self.data.len()
     }
 
-    fn inc_ref(&mut self, idx: u32) {
-        self.refcounts[idx as usize] += 1;
-    }
-
-    fn dec_ref(&mut self, idx: u32) -> bool {
-        let rc = &mut self.refcounts[idx as usize];
-        *rc = rc.saturating_sub(1);
-        if *rc == 0 {
-            self.free_list.push(idx);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn _refcount(&self, idx: u32) -> u32 {
-        self.refcounts[idx as usize]
-    }
-
-    /// Clears all data, refcounts, and free-list of this bucket, reclaiming memory.
+    /// Clears all data of this bucket, reclaiming memory.
     fn reset(&mut self) {
         self.data.clear();
-        self.refcounts.clear();
-        self.free_list.clear();
     }
 }
 
@@ -94,34 +67,6 @@ impl<T: Clone> Bucket<T> {
 // Macros for eliminating repetitive 20-arm ValueTag → bucket dispatch.
 // Adding a new scalar ValueTag only requires updating these macros.
 // =========================================================================
-
-/// Dispatches a single-argument method call to the correct bucket by ValueTag.
-/// `Null | Void | Bool` are singletons (no-op). Used by inc_ref / dec_ref.
-macro_rules! dispatch_bucket_method {
-    ($self:expr, $tag:expr, $idx:expr, $method:ident) => {
-        match $tag {
-            ValueTag::Null | ValueTag::Void | ValueTag::Bool => {}
-            ValueTag::Char => { $self.char_bucket.$method($idx); }
-            ValueTag::I8 => { $self.i8_bucket.$method($idx); }
-            ValueTag::I16 => { $self.i16_bucket.$method($idx); }
-            ValueTag::I32 => { $self.i32_bucket.$method($idx); }
-            ValueTag::I64 => { $self.i64_bucket.$method($idx); }
-            ValueTag::I128 => { $self.i128_bucket.$method($idx); }
-            ValueTag::U8 => { $self.u8_bucket.$method($idx); }
-            ValueTag::U16 => { $self.u16_bucket.$method($idx); }
-            ValueTag::U32 => { $self.u32_bucket.$method($idx); }
-            ValueTag::U64 => { $self.u64_bucket.$method($idx); }
-            ValueTag::U128 => { $self.u128_bucket.$method($idx); }
-            ValueTag::Isize => { $self.isz_bucket.$method($idx); }
-            ValueTag::Usize => { $self.usz_bucket.$method($idx); }
-            ValueTag::F16 => { $self.f16_bucket.$method($idx); }
-            ValueTag::F32 => { $self.f32_bucket.$method($idx); }
-            ValueTag::F64 => { $self.f64_bucket.$method($idx); }
-            ValueTag::F128 => { $self.f128_bucket.$method($idx); }
-            ValueTag::Ref => { $self.ref_bucket.$method($idx); }
-        }
-    };
-}
 
 /// Checks `idx < bucket.len()` for the correct bucket by ValueTag.
 /// `Null | Void | Bool` are singletons (always valid).
@@ -544,17 +489,16 @@ impl ValueArena {
         }
     }
 
-    // ---- Reference counting ----
-    pub fn inc_ref(&mut self, h: ValueHandle) {
-        dispatch_bucket_method!(self, h.tag(), h.index() as u32, inc_ref);
-    }
-    pub fn dec_ref(&mut self, h: ValueHandle) {
-        dispatch_bucket_method!(self, h.tag(), h.index() as u32, dec_ref);
-    }
-
     /// Fills the SoA fast path for an array (when elements are same-type scalars).
     /// Elements have been migrated to Value; the Value's built-in scalar accessors are used directly, without going through arena buckets.
-    pub fn optimize_array_soa(&mut self, arr: &mut ArrayValue) {
+        /// Cycle-collector roots: every heap-object Arc held in an arena slot
+    /// (arena handles are opaque to the collector's edge walk, so the
+    /// arena itself conservatively keeps them alive).
+    pub fn collect_ref_arcs(&self, out: &mut Vec<std::sync::Arc<HeapObj>>) {
+        out.extend(self.ref_bucket.data.iter().cloned());
+    }
+
+pub fn optimize_array_soa(&mut self, arr: &mut ArrayValue) {
         if arr.elements.is_empty() { return; }
         // Take the first element's scalar tag; all elements must have the same tag to enable SoA
         let tag = match arr.elements[0].scalar_tag() {
@@ -1240,7 +1184,7 @@ impl ValueTrait for ValueHandle {
             ValueTag::F64 => {
                 arena.get_f64(*self).to_bits() == arena.get_f64(*other).to_bits()
             }
-            ValueTag::F128 => arena.get_f128(*self) == arena.get_f128(*other),
+            ValueTag::F128 => arena.get_f128(*self).ieee_eq(&arena.get_f128(*other)),
             ValueTag::Ref => {
                 let a = arena.get_ref(*self);
                 let b = arena.get_ref(*other);
@@ -1268,8 +1212,10 @@ fn try_simd_soa_equals(a: &ScalarSoA, b: &ScalarSoA) -> Option<bool> {
     match (a, b) {
         (ScalarSoA::I32(va), ScalarSoA::I32(vb)) => Some(simd_eq_i32(va, vb)),
         (ScalarSoA::I64(va), ScalarSoA::I64(vb)) => Some(simd_eq_i64(va, vb)),
-        (ScalarSoA::F32(va), ScalarSoA::F32(vb)) => Some(simd_eq_f32_bits(va, vb)),
-        (ScalarSoA::F64(va), ScalarSoA::F64(vb)) => Some(simd_eq_f64_bits(va, vb)),
+        // IEEE numeric semantics (matching value_equals): ±0.0 equal, NaN ≠ NaN.
+        // The former bit-pattern SIMD paths disagreed with the element-wise path.
+        (ScalarSoA::F32(va), ScalarSoA::F32(vb)) => Some(va.iter().zip(vb.iter()).all(|(x, y)| x == y)),
+        (ScalarSoA::F64(va), ScalarSoA::F64(vb)) => Some(va.iter().zip(vb.iter()).all(|(x, y)| x == y)),
         // Remaining types use plain slice comparison (Rust slice PartialEq is already optimized)
         (ScalarSoA::I8(va), ScalarSoA::I8(vb)) => Some(va == vb),
         (ScalarSoA::I16(va), ScalarSoA::I16(vb)) => Some(va == vb),
@@ -1283,9 +1229,15 @@ fn try_simd_soa_equals(a: &ScalarSoA, b: &ScalarSoA) -> Option<bool> {
         (ScalarSoA::U128(va), ScalarSoA::U128(vb)) => Some(va == vb),
         (ScalarSoA::Isize(va), ScalarSoA::Isize(vb)) => Some(va == vb),
         (ScalarSoA::Usize(va), ScalarSoA::Usize(vb)) => Some(va == vb),
-        // F16/F128 compared by bit pattern (consistent with F32/F64 to_bits() semantics; NaN == NaN is true)
-        (ScalarSoA::F16(va), ScalarSoA::F16(vb)) => Some(va == vb),
-        (ScalarSoA::F128(va), ScalarSoA::F128(vb)) => Some(va == vb),
+        // F16: numeric semantics via f32 (storage is raw u16 bits); F128:
+        // numeric semantics via exact bit-decomposition ieee_eq (2026-08-18
+        // ruling — all four float types now IEEE-numeric).
+        (ScalarSoA::F16(va), ScalarSoA::F16(vb)) => Some(va.iter().zip(vb.iter()).all(|(x, y)| {
+            crate::value::F16(*x).to_f32() == crate::value::F16(*y).to_f32()
+        })),
+        (ScalarSoA::F128(va), ScalarSoA::F128(vb)) => Some(
+            va.iter().zip(vb.iter()).all(|(x, y)| x.ieee_eq(y)),
+        ),
         _ => None, // type mismatch, fall back
     }
 }
@@ -1638,8 +1590,8 @@ pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
             x.type_name == y.type_name && x.inner.equals(&y.inner, arena)
         }
         (HeapObj::Cell(x), HeapObj::Cell(y)) => {
-            let xb = x.inner.lock().clone();
-            let yb = y.inner.lock().clone();
+            let xb = x.get();
+            let yb = y.get();
             value_equals_with_arena(&xb, &yb, arena)
         }
         (HeapObj::Range(x), HeapObj::Range(y)) => {
@@ -1767,10 +1719,42 @@ pub fn value_equals_with_arena(a: &Value, b: &Value, arena: &ValueArena) -> bool
                 ValueTag::U128 => (unsafe { av.u128_val } == unsafe { bv.u128_val }),
                 ValueTag::Isize => (unsafe { av.isize_val } == unsafe { bv.isize_val }),
                 ValueTag::Usize => (unsafe { av.usize_val } == unsafe { bv.usize_val }),
-                ValueTag::F16 => (unsafe { av.f16_val } == unsafe { bv.f16_val }),
-                ValueTag::F32 => unsafe { av.f32_val }.to_bits() == unsafe { bv.f32_val }.to_bits(),
-                ValueTag::F64 => unsafe { av.f64_val }.to_bits() == unsafe { bv.f64_val }.to_bits(),
-                ValueTag::F128 => (unsafe { av.f128_val } == unsafe { bv.f128_val }),
+                // Floats: IEEE equality by value (`as_float_f64` is exact for
+                // f16/f32/f64), matching the dedicated scalar comparison
+                // paths (compute_eq_f64) and the cross-tag branch below. The
+                // former bit comparison answered `-0.0 == 0.0` false in
+                // exactly the contexts routed here (record/array fields,
+                // nullables, soft-typed operands) while bare scalar `==`
+                // answered true — one operator, two semantics (HashMap's
+                // bucket walk missed ±0.0 keys). Bit-identical NaN pairs
+                // flip to IEEE false (NaN != NaN), aligning deep equality
+                // with bare NaN semantics.
+                ValueTag::F16 | ValueTag::F32 | ValueTag::F64 => {
+                    let va = Value::Scalar(av.clone(), *at);
+                    let vb = Value::Scalar(bv.clone(), *bt);
+                    va.as_float_f64() == vb.as_float_f64()
+                }
+                // F128: byte-wise for now — F128's PartialEq is byte-derived
+                // Numeric IEEE equality (NaN != NaN, -0.0 == 0.0) — matches
+                // the observable array equality (SoA-SIMD path) and the
+                // dedicated scalar == path. The former bitwise comparison
+                // answered two identical-NaN values equal here while the
+                // array `==` on the same data said not equal (one operator,
+                // two semantics depending on container).
+                ValueTag::F128 => {
+                    let fa = crate::value::F128(unsafe { std::mem::transmute::<_, [u8; 16]>(av.f128_val) });
+                    let fb = crate::value::F128(unsafe { std::mem::transmute::<_, [u8; 16]>(bv.f128_val) });
+                    if fa == fb {
+                        !fa.is_nan()
+                    } else {
+                        // Different bits: numerically equal only across the
+                        // two zero signs (value bits all zero).
+                        let xa = u128::from_le_bytes(fa.0);
+                        let xb = u128::from_le_bytes(fb.0);
+                        (xa & 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF) == 0
+                            && (xb & 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF) == 0
+                    }
+                }
                 _ => unreachable!("non-scalar tag in ScalarValue"),
             }
         }
@@ -1946,9 +1930,34 @@ fn deep_clone_heap(
             inner: deep_clone_handle(n.inner, arena, cache),
         }),
         HeapObj::Cell(c) => {
-            let inner = c.inner.lock().clone();
+            let inner = c.get();
             HeapObj::Cell(Cell::new(deep_clone_value(&inner, arena, cache)))
         }
+        // Place refs deep-clone as independent copies (same philosophy as
+
+        // Cell): the base container is deep-cloned, so the clone refers to a
+
+        // detached location. Live aliasing lives on the REF itself, not its
+
+        // deep clone (mem.clone contract).
+
+        HeapObj::ArrayElemRef { arr, idx } => HeapObj::ArrayElemRef {
+
+            arr: deep_clone_value(arr, arena, cache),
+
+            idx: idx.clone(),
+
+        },
+
+        HeapObj::RecordFieldRef { rec, field } => HeapObj::RecordFieldRef {
+
+            rec: deep_clone_value(rec, arena, cache),
+
+            field: field.clone(),
+
+        },
+
+        HeapObj::GlobalSlotRef { slot } => HeapObj::GlobalSlotRef { slot: *slot },
         HeapObj::Range(r) => HeapObj::Range(r.clone()),
         HeapObj::Closure(c) => {
             // upvalues have been migrated to Value; bound_args are still ValueHandles
@@ -2320,4 +2329,63 @@ impl ValueArena {
     }
 }
 
-
+/// Self-contained deep copy for the reflect `clone()` intrinsic (Arc domain,
+/// no ValueArena needed — unlike `deep_clone_value`, this never touches
+/// ValueHandle-embedding variants that require an arena to resolve).
+///
+/// Semantics: the DATA domain recurses (arrays, including SoA scalar storage;
+/// records, including nested arrays/records); everything else shares the Arc —
+/// immutable leaves (str, scalars, ranges) because sharing is invisible, and
+/// runtime identities (closures, async/channel/sender/receiver handles, atomic
+/// cells, FFI opaque pointers, Lib/ForeignFn) because a handle is not a copy
+/// of the resource it refers to.
+pub fn deep_clone_data_value(v: &Value) -> Value {
+    match v {
+        Value::Null | Value::Void | Value::Scalar(_, _) => v.clone(),
+        Value::Ref(rc) => match rc.as_ref() {
+            HeapObj::Array(a) => {
+                // Single-source: an SoA array clones ONLY the contiguous
+                // storage (memcpy); `elements` stays empty — len()/get() and
+                // every value read are SoA-first, so the per-element boxed
+                // copy would be pure waste (1M u8 clone: ~5ms → ~0.3ms).
+                if let Some(soa) = &a.scalar_soa {
+                    Value::Ref(crate::value::Value::register_arc(std::sync::Arc::new(HeapObj::Array(ArrayValue {
+                        elements: Vec::new(),
+                        fixed_size: a.fixed_size,
+                        elem_is_ref: a.elem_is_ref,
+                        scalar_soa: Some(soa.clone()),
+                    }))))
+                } else {
+                    Value::Ref(crate::value::Value::register_arc(std::sync::Arc::new(HeapObj::Array(ArrayValue {
+                        elements: a.elements.iter().map(deep_clone_data_value).collect(),
+                        fixed_size: a.fixed_size,
+                        elem_is_ref: a.elem_is_ref,
+                        scalar_soa: None,
+                    }))))
+                }
+            }
+            HeapObj::Record(r) => Value::Ref(crate::value::Value::register_arc(std::sync::Arc::new(HeapObj::Record(RecordValue {
+                type_name: r.type_name.clone(),
+                fields: r.fields.iter().map(deep_clone_data_value).collect(),
+                field_names: r.field_names.clone(),
+                field_ref_bits: r.field_ref_bits,
+            })))),
+            // `type X = X(...)` positional constructors are Adts (kind() == "Adt"),
+            // the most common user-declared shape — they deep-clone too.
+            HeapObj::Adt(a) => Value::Ref(crate::value::Value::register_arc(std::sync::Arc::new(HeapObj::Adt(AdtValue {
+                type_name: a.type_name.clone(),
+                constructor: a.constructor.clone(),
+                fields: a
+                    .fields
+                    .iter()
+                    .map(|f| AdtField {
+                        name: f.name.clone(),
+                        value: deep_clone_data_value(&f.value),
+                    })
+                    .collect(),
+                field_ref_bits: a.field_ref_bits,
+            })))),
+            _ => v.clone(),
+        },
+    }
+}

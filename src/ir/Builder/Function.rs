@@ -89,7 +89,6 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         self.fn_returns_throw = fn_returns_throw;
         // Bug #100: var homes are per-function (the same name in different functions
         // maps to unrelated nodes); save/clear on entry, restore on exit.
-        let prev_var_home = std::mem::take(&mut self.var_home);
         // Bug #66: Mark that the next compile_block call is the function body's top-level block.
         // compile_block reads and resets this flag so that only nested blocks extract
         // block-scoped defers; function-level defers stay in defer_table for function-exit execution.
@@ -101,15 +100,104 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         if std::env::var("FROND_DEBUG_MEMO").is_ok() {
             eprintln!("[MEMO] {}{} -> {:?}", self_type.unwrap_or(""), name, strategy.as_ref().map(|s| match s { crate::pass::Analyzer::MemoStrategy::TailRecToLoop { .. } => "TailRecToLoop", crate::pass::Analyzer::MemoStrategy::NonTailRecToLoop { .. } => "NonTailRecToLoop", crate::pass::Analyzer::MemoStrategy::Memoize { .. } => "Memoize", _ => "Other" }));
         }
+        // Place-model C1-① pre-pass: collect address-taken / lambda-captured
+        // names for THIS function (all functions — B1 2026-08-22 removed the
+        // strategy-fn skip along with the writeback lowering it protected).
+        // `cell_bound` needs no hygiene: entries carry the owner
+        // `current_function_id` and lookups filter on it.
+        let prev_address_taken = std::mem::take(&mut self.fn_address_taken);
+        let prev_lambda_captured = std::mem::take(&mut self.fn_lambda_captured);
+
+        // All-vars slot backing (C1-③④): every `var` of every function is
+        // cell-backed (B/C 2026-08-22: unconditional — the WriteBack ladder is
+        // physically deleted, so the non-cell lowering no longer exists);
+        // reads forward to the last store's value node at compile time (the
+        // mem2reg equivalent), so straight-line code lowers to the same SSA
+        // shape as before.
+        //
+        // The FROND_ALL_VARS=0 escape hatch is gone with the machinery: without
+        // slot backing there is no correct assignment lowering left.
+        // The one honest cost: loop-carried first reads are one load node per
+        // iteration (~112ns — the engine's per-node dispatch cost). Closing it
+        // is the optimizer phi-reconstruction pass; slot-mutation mirroring was
+        // evaluated and rejected (it rebuilds the #99 bug family the place
+        // model exists to eliminate).
+        let prev_all_vars_slot = self.fn_all_vars_slot;
+        self.fn_all_vars_slot = true;
+        let prev_cell_values = std::mem::take(&mut self.cell_values);
+        let prev_no_forward = std::mem::take(&mut self.no_forward_cells);
+        {
+            let mut at = std::mem::take(&mut self.fn_address_taken);
+            let mut lc = std::mem::take(&mut self.fn_lambda_captured);
+            self.collect_place_names(body_expr, &mut at, &mut lc);
+            self.fn_address_taken = at;
+            self.fn_lambda_captured = lc;
+        }
+        // Param slot backing (③): only params ASSIGNED in this function get
+        // a cell at entry — their assignments become cell stores, replacing
+        // the rebind+WriteBack machinery in loops/branches. Never-assigned
+        // params (the hot-call shape: fib's `n`) stay plain — a cell per such
+        // param is a heap allocation per call (fib regressed ~70% when ALL
+        // params were slotted). Captured params stay plain (the capture
+        // machinery snapshots binding nodes). `&param` continues to work
+        // through the lazy RefOf path for non-slotted params.
+        if self.fn_all_vars_slot {
+            let mut assigned_params = rustc_hash::FxHashSet::default();
+            collect_assigned_names_deep(
+                &self.current_module().arena,
+                body_expr,
+                &mut assigned_params,
+            );
+            for param in params {
+                if assigned_params.contains(param.name) {
+                    if let Some(param_node) = self.lookup_var(param.name) {
+                        let off = self.graph.inputs_pool.push(&[param_node]);
+                        let cell_node = self.graph.add_node(Node {
+                            kind: NodeKind::UnOp,
+                            input_count: 1,
+                            inputs_offset: off,
+                            compute_fn: CF_CELL_ALLOC,
+                        });
+                        self.bind_cell(param.name, cell_node);
+                        self.track_cell_decl(param.name, cell_node, param_node);
+                        // Chain the alloc into the effect stream: WITHOUT this,
+                        // a subsequent branch's store depends on the cell via a
+                        // cross-frame edge, and when the branch launches before
+                        // the alloc executed (a bare-param gate condition is
+                        // ready at frame start), the alloc's completion cannot
+                        // satisfy the branch frame's pending — the store is
+                        // skipped silently. Local decls get this ordering for
+                        // free (the decl statement chains the alloc); params
+                        // must chain explicitly.
+                        self.current_effect =
+                            Some(self.chain_effects(self.current_effect, cell_node));
+                    }
+                }
+            }
+        }
         let r = match strategy {
+            // converter scope: stamp generated sgs (E7 exclusion). Only the three
+            // machine-building converters — LoopInvariantHoist is a plain rewrite.
             Some(crate::pass::Analyzer::MemoStrategy::TailRecToLoop { info }) => {
-                self.compile_tail_rec_to_loop(name, body_expr, params, &info)
+                let prev = self.graph.converter_scope;
+                self.graph.converter_scope = true;
+                let r = self.compile_tail_rec_to_loop(name, body_expr, params, &info);
+                self.graph.converter_scope = prev;
+                r
             }
             Some(crate::pass::Analyzer::MemoStrategy::NonTailRecToLoop { info }) => {
-                self.compile_non_tail_rec_to_loop(name, body_expr, params, &info)
+                let prev = self.graph.converter_scope;
+                self.graph.converter_scope = true;
+                let r = self.compile_non_tail_rec_to_loop(name, body_expr, params, &info);
+                self.graph.converter_scope = prev;
+                r
             }
             Some(crate::pass::Analyzer::MemoStrategy::Memoize { cache_key, .. }) => {
-                self.compile_memoize(name, body_expr, params, &cache_key)
+                let prev = self.graph.converter_scope;
+                self.graph.converter_scope = true;
+                let r = self.compile_memoize(name, body_expr, params, &cache_key);
+                self.graph.converter_scope = prev;
+                r
             }
             _ => {
                 let node = self.compile_expr(body_expr);
@@ -128,7 +216,11 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         };
         self.in_tail_position = prev_tail;
         self.fn_returns_throw = prev_fn_throw;
-        self.var_home = prev_var_home;
+        self.fn_address_taken = prev_address_taken;
+        self.fn_lambda_captured = prev_lambda_captured;
+        self.fn_all_vars_slot = prev_all_vars_slot;
+        self.cell_values = prev_cell_values;
+        self.no_forward_cells = prev_no_forward;
         self.in_function_top_block = prev_top_block;
         r
     }
@@ -217,6 +309,7 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
             let node_end = self.graph.nodes.len() as u32;
             let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
             self.graph.add_subgraph(crate::ir::Ir::SubGraph {
+                converter_generated: false,
                 id: sg_id,
                 node_range: (NodeId(node_start), NodeId(node_end)),
                 param_count: 0,
@@ -279,6 +372,7 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
             let node_end = self.graph.nodes.len() as u32;
             let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
             self.graph.add_subgraph(crate::ir::Ir::SubGraph {
+                converter_generated: false,
                 id: sg_id,
                 node_range: (NodeId(node_start), NodeId(node_end)),
                 param_count: 0,
@@ -486,7 +580,13 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         // void function is a side effect (e.g. println("done")) and should not be tail-called
         // (switch_subgraph would lose the current frame state).
         // Consumes sema's FuncSigInfo.return_type to determine void (builtin modules fall back to AST).
-        let is_void_fn = self.sema.get_func_sig(name)
+        // Module-qualified lookup: same-named functions in different modules
+        // must read their OWN sig's flags.
+        let sig_module_name = match location {
+            None => self.module.name,
+            Some(i) => self.builtin_modules[i].name,
+        };
+        let is_void_fn = self.sema.get_func_sig_in(sig_module_name, name)
             .map(|sig| matches!(self.type_arena.get(sig.return_type), crate::sema::Sema::Type::Void))
             .unwrap_or_else(|| match return_type {
                 None => true,
@@ -495,11 +595,11 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
                 }
             });
         // Compute is_async before compile_function_body so it can auto-await Async<T> bodies (Bug #79).
-        let fn_is_async = self.sema.get_func_sig(name)
+        let fn_is_async = self.sema.get_func_sig_in(sig_module_name, name)
             .map(|sig| sig.is_async)
             .unwrap_or(is_async);
         // Bug #97: tail `expr?` must re-wrap into Ok when the function returns Throw.
-        let fn_returns_throw = self.sema.get_func_sig(name)
+        let fn_returns_throw = self.sema.get_func_sig_in(sig_module_name, name)
             .map(|sig| self.handle_returns_throw(sig.return_type))
             .unwrap_or_else(|| Self::type_ref_returns_throw(&module.arena, return_type));
         let return_node = self.compile_function_body(name, None, body_expr, &params, is_void_fn, fn_is_async, fn_returns_throw);
@@ -537,6 +637,18 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         sg_id
     }
 
+    /// Locate a loaded module by its module name: `None` = the entry module,
+    /// `Some(i)` = builtin_modules[i]. Missing name → `None` result.
+    pub(super) fn find_module_location_by_name(&self, module_name: &str) -> Option<Option<usize>> {
+        if self.module.name == module_name {
+            return Some(None);
+        }
+        self.builtin_modules
+            .iter()
+            .position(|m| m.name == module_name)
+            .map(Some)
+    }
+
     /// Compile a monomorphization instance into a specialized subgraph.
     ///
     /// Differences from `compile_function`:
@@ -548,13 +660,24 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
     pub(super) fn compile_monomorph_instance(&mut self, instance: &crate::sema::Sema::MonomorphInstance) {
         let func_name = instance.func_name.as_ref();
 
-        // Look up the function declaration location (user module or builtin module)
-        let location = match self.find_function_location(func_name) {
+        // Resolve the declaring module from the instance's module_name —
+        // never a bare-name scan (`find_function_location`): with same-named
+        // functions in different modules every instance would compile the
+        // FIRST module's body, the wrong-callee class compile_function_in's
+        // docstring warns about. Fall back to the bare scan only when the
+        // name lookup misses (defensive; keeps legacy behavior).
+        let location = match self.find_module_location_by_name(&instance.module_name) {
             Some(loc) => loc,
-            None => {
-                self.errors.push(format!("monomorph instance function {} not found", func_name));
-                return;
-            }
+            None => match self.find_function_location(func_name) {
+                Some(loc) => loc,
+                None => {
+                    self.errors.push(format!(
+                        "monomorph instance function {} not found (module {})",
+                        func_name, instance.module_name
+                    ));
+                    return;
+                }
+            },
         };
 
         let module = match location {
@@ -568,11 +691,20 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
             Some(i) => Some(self.builtin_modules[i]),
         };
 
-        let (body_expr, is_async, params, return_type) = match module.find_function(func_name) {
+        let (body_expr, is_async, params, return_type, type_param_names) = match module.find_function(func_name) {
             Some(d) => match &d.node {
                 crate::ast::Ast::Decl::FunDecl {
-                    body, is_async, params, return_type, ..
-                } => (*body, *is_async, params.clone(), *return_type),
+                    body, is_async, params, return_type, type_params, ..
+                } => (
+                    *body,
+                    *is_async,
+                    params.clone(),
+                    *return_type,
+                    // Type-param names come from the DECL (the func_sig table
+                    // is bare-name keyed and collision-prone across modules);
+                    // declaration order matches instance.type_args order.
+                    type_params.iter().map(|tp| tp.name.to_string()).collect::<Vec<_>>(),
+                ),
                 _ => {
                     self.errors.push(format!("{} is not a function", func_name));
                     self.compiling_builtin = prev_builtin;
@@ -580,18 +712,16 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
                 }
             },
             None => {
-                self.errors.push(format!("monomorph instance function {} not found", func_name));
+                self.errors.push(format!(
+                    "monomorph instance function {} not found in module {}",
+                    func_name, instance.module_name
+                ));
                 self.compiling_builtin = prev_builtin;
                 return;
             }
         };
         let param_count = params.len();
 
-        // Build the type parameter map: type_params name -> type_args TypeHandle
-        // type_params come from FuncSigInfo (in the same order as instance.type_args)
-        let type_param_names: Vec<String> = self.sema.get_func_sig(func_name)
-            .map(|sig| sig.type_params.iter().map(|n| n.to_string()).collect())
-            .unwrap_or_default();
         let prev_type_args = std::mem::take(&mut self.current_type_args);
         self.current_type_args = type_param_names.iter().zip(instance.type_args.iter())
             .map(|(name, &h)| (name.clone(), h))
@@ -637,7 +767,10 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         }
 
         // Compile the function body (unified entry: memoize/tail_rec/non_tail_rec apply to generic instances too)
-        let is_void_fn = self.sema.get_func_sig(func_name)
+        // Module-qualified lookup: same-named functions in different modules
+        // must read their OWN sig's flags (`module` is the instance's resolved
+        // declaring module).
+        let is_void_fn = self.sema.get_func_sig_in(module.name, func_name)
             .map(|sig| matches!(self.type_arena.get(sig.return_type), crate::sema::Sema::Type::Void))
             .unwrap_or_else(|| match return_type {
                 None => true,
@@ -646,10 +779,10 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
                 }
             });
         // Compute is_async before compile_function_body so it can auto-await Async<T> bodies (Bug #79).
-        let fn_is_async = self.sema.get_func_sig(func_name)
+        let fn_is_async = self.sema.get_func_sig_in(module.name, func_name)
             .map(|sig| sig.is_async)
             .unwrap_or(is_async);
-        let fn_returns_throw = self.sema.get_func_sig(func_name)
+        let fn_returns_throw = self.sema.get_func_sig_in(module.name, func_name)
             .map(|sig| self.handle_returns_throw(sig.return_type))
             .unwrap_or_else(|| Self::type_ref_returns_throw(&module.arena, return_type));
         let return_node = self.compile_function_body(func_name, None, body_expr, &params, is_void_fn, fn_is_async, fn_returns_throw);
@@ -707,7 +840,8 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         let m = self.builtin_modules[mod_i];
 
         // Obtain the pre-registered sg_id from method_subgraphs (created in build() step 0a)
-        let type_id = match self.sema.type_def_index.get(type_name) {
+        let canonical_type = self.sema.resolve_type_key_in(m.name, type_name);
+        let type_id = match self.sema.type_def_index.get(&canonical_type) {
             Some(&idx) => crate::types::dynamic_type_id(idx),
             None => return,
         };
@@ -804,7 +938,9 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         };
 
         // Obtain the pre-registered sg_id from method_subgraphs (created in build() step 0a)
-        let type_id = match self.sema.type_def_index.get(type_name) {
+        // User-module methods: the AST name resolves to the canonical key.
+        let canonical_type = self.sema.resolve_type_key_in(self.module.name, type_name);
+        let type_id = match self.sema.type_def_index.get(&canonical_type) {
             Some(&idx) => crate::types::dynamic_type_id(idx),
             None => return,
         };
@@ -881,13 +1017,16 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
             .find_map(|m| {
                 m.declarations.iter().find_map(|d| {
                     if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &d.node {
-                        if *name == trait_name {
+                        // trait_name is a canonical key — bare tail match.
+                        if trait_name.rsplit('.').next() == Some(name.as_ref()) {
                             if let Some(method) = methods.get(method_idx) {
                                 if method.body.is_some() {
                                     return Some((
+                                        method.name.to_string(),
                                         method.body.unwrap(),
                                         method.is_async,
                                         method.params.clone(),
+                                        method.return_type,
                                         m,
                                     ));
                                 }
@@ -898,7 +1037,7 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
                 })
             });
 
-        let (body_expr, is_async, params, decl_module) = match found {
+        let (method_name, body_expr, is_async, params, return_type, decl_module) = match found {
             Some(x) => x,
             None => return,
         };
@@ -950,11 +1089,152 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
             self.bind_var(param.name, param_node);
         }
 
-        let return_node = self.compile_expr(body_expr);
+        // MUST go through compile_function_body (not raw compile_expr): it
+        // performs the place-model function entry setup (fn_all_vars_slot,
+        // place-name collection, fresh cell_values) — without it every `var`
+        // in a default body lowers through the deleted non-cell path and
+        // forwards to a frozen constant (while-loops spin forever on a
+        // constant-true condition; same fix as compile_inherited_method).
+        let is_void_fn = match return_type {
+            None => true,
+            Some(tr) => {
+                matches!(decl_module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
+            }
+        };
+        let fn_returns_throw = Self::type_ref_returns_throw(&decl_module.arena, return_type);
+        let return_node = self.compile_function_body(
+            &method_name,
+            None,
+            body_expr,
+            &params,
+            is_void_fn,
+            is_async,
+            fn_returns_throw,
+        );
         self.exit_scope();
         self.current_effect = prev_effect;
         self.current_function_sg = None;
         self.current_trait_default_idx = None;
+        self.current_method_type = prev_method_type;
+        self.compiling_builtin = prev_builtin;
+
+        let node_end = self.graph.nodes.len() as u32;
+        let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
+        sg.node_range = (NodeId(node_start), NodeId(node_end));
+        sg.entry_node = NodeId(node_start);
+        sg.return_node = return_node;
+        sg.has_suspend = is_async;
+        sg.function_id = sg_id.0;
+    }
+
+    /// Compile an INHERITED method instance (inheritance): the child's method
+    /// table entry whose BODY is the base type's method. The body is compiled
+    /// with the CHILD as receiver type (`current_method_type`), so bare field
+    /// names resolve against the merged field list and bare method calls
+    /// dispatch to the child's table — per-child compilation is what makes
+    /// `this`-dispatch late-bound (the TraitDefaultInstance mechanism, lifted
+    /// to concrete bases).
+    pub(super) fn compile_inherited_method(&mut self, inst_idx: usize) {
+        let inst = match self.sema.inherited_method_instances.get(inst_idx) {
+            Some(i) => i.clone(),
+            None => return,
+        };
+        // Locate the base's method AST (builtin modules + user module).
+        let found = self
+            .builtin_modules
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.module))
+            .find_map(|m| {
+                m.declarations.iter().find_map(|d| {
+                    if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &d.node {
+                        // base_type_name is a canonical key — bare tail match.
+                        if inst.base_type_name.as_ref().rsplit('.').next() == Some(name.as_ref()) {
+                            if let Some(method) = methods.get(inst.base_method_idx as usize) {
+                                if method.body.is_some() {
+                                    return Some((
+                                        method.name.to_string(),
+                                        method.body.unwrap(),
+                                        method.is_async,
+                                        method.params.clone(),
+                                        method.return_type,
+                                        m,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    None
+                })
+            });
+        let (method_name, body_expr, is_async, params, return_type, decl_module) = match found {
+            Some(x) => x,
+            None => return,
+        };
+        let sg_id = match self.method_subgraphs.get(&(inst.type_id, inst.method_idx)) {
+            Some(&sg) => sg,
+            None => return,
+        };
+
+        let node_start = self.graph.nodes.len() as u32;
+
+        // Switch the AST arena context to the base's declaring module while
+        // compiling the body.
+        let prev_builtin = self.compiling_builtin;
+        self.compiling_builtin = if std::ptr::eq(decl_module, self.module) {
+            None
+        } else {
+            Some(decl_module)
+        };
+
+        self.current_function_sg = Some(sg_id);
+        self.current_function_id = sg_id.0;
+        let prev_effect = self.current_effect;
+        self.current_effect = None;
+        let prev_sg_start = self.current_sg_start;
+        self.current_sg_start = node_start;
+        let prev_method_type = self.current_method_type.take();
+        self.current_method_type = Some((inst.type_name.clone(), inst.type_id));
+        self.enter_scope();
+
+        for param in &params {
+            let inputs_offset = self.graph.inputs_pool.push(&[]);
+            let param_node = self.graph.add_node(Node {
+                kind: NodeKind::Const,
+                input_count: 0,
+                inputs_offset,
+                compute_fn: CF_NOOP,
+            });
+            self.bind_var(param.name, param_node);
+        }
+
+        // MUST go through compile_function_body (not raw compile_expr): it
+        // performs the place-model function entry setup (fn_all_vars_slot,
+        // place-name collection, fresh cell_values) — without it every `var`
+        // in an inherited body lowers through the deleted non-cell path and
+        // forwards to a frozen constant (observed: while-loops in inherited
+        // methods spin forever on a constant-true condition). Same latent gap
+        // exists for trait-default bodies containing `var`.
+        let is_void_fn = match return_type {
+            None => true,
+            Some(tr) => {
+                matches!(decl_module.arena.ty(tr).node, crate::ast::Ast::TypeNode::Named { name } if crate::value::ValueTag::from_name(name).is_some_and(|t| t.family() == crate::types::TypeFamily::Void))
+            }
+        };
+        let fn_returns_throw = Self::type_ref_returns_throw(&decl_module.arena, return_type);
+        let return_node = self.compile_function_body(
+            &method_name,
+            Some(inst.type_name.as_ref()),
+            body_expr,
+            &params,
+            is_void_fn,
+            is_async,
+            fn_returns_throw,
+        );
+        self.exit_scope();
+        self.current_effect = prev_effect;
+        self.current_sg_start = prev_sg_start;
+        self.current_function_sg = None;
         self.current_method_type = prev_method_type;
         self.compiling_builtin = prev_builtin;
 
@@ -972,7 +1252,7 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
     /// `(method_name, params_count, is_async)`.
     ///
     /// This is used by the IR build to pre-register and compile local type methods
-    /// (step 0a-local / step 2b-local), complementing `compile_user_method` which only
+    /// (step 0a-local / 2b-local), complementing `compile_user_method` which only
     /// searches `self.module.declarations`.
     pub(super) fn find_type_method(
         &self,

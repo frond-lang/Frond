@@ -159,8 +159,14 @@ impl<'a> IrBuilder<'a> {
             if let Some(b) = base {
                 return ComputeFnId(b + off);
             }
-            // Unknown type falls back to the i32 path
-            return ComputeFnId(116 + off);
+            // Unknown type falls back to the i32 path. CAUTION: this is
+            // load-bearing — monomorphized generic arithmetic routinely lands
+            // here with junk type names ('offset', '_', soft typevars), and
+            // as_i32/as_int reads the runtime int values correctly for the
+            // 32-bit range. Erroring here breaks the stdlib build; the real
+            // fix is hardening soft types so concrete arithmetic never
+            // reaches this fallback (floats/large i64s silently truncate).
+            return ComputeFnId(114 + off); // i32 full-family base (renumbered 2026-08-22)
         }
 
         // Bitwise (bitand/bitor/bitxor/shl/shr): only supported by integers
@@ -177,7 +183,7 @@ impl<'a> IrBuilder<'a> {
                 if let Some(b) = base {
                     return ComputeFnId(b + off);
                 }
-                return ComputeFnId(CF_ADD_I32_FULL.0 + off); // fall back to i32
+                return ComputeFnId(CF_ADD_I32_FULL.0 + off); // fall back to i32 (see arithmetic note above)
             }
         }
 
@@ -372,17 +378,28 @@ impl<'a> IrBuilder<'a> {
     ) -> NodeId {
         let cond_node = self.compile_subexpr(lhs);
         let is_and = matches!(op, crate::ast::Ast::BinaryOp::And);
+        // `compile_branch_subgraph` does not isolate `current_effect` (same
+        // contract as `compile_if`): an effectful RHS body leaves it pointing
+        // at branch-internal nodes, and the gate below must never reference
+        // those — its pending lives in the PARENT frame, where a child-sg
+        // node's completion can never be observed (silent stall). Save/restore
+        // around both branch compiles.
+        let prev_effect = self.current_effect;
         // && : lhs=true -> evaluate rhs ; lhs=false -> false (short-circuit)
         // || : lhs=true -> true (short-circuit)   ; lhs=false -> evaluate rhs
         let (then_sg, then_inputs) = if is_and {
-            self.compile_branch_subgraph(rhs)
+            let r = self.compile_branch_subgraph(rhs);
+            self.current_effect = prev_effect;
+            r
         } else {
             self.compile_bool_branch(true)
         };
         let (else_sg, else_inputs) = if is_and {
             self.compile_bool_branch(false)
         } else {
-            self.compile_branch_subgraph(rhs)
+            let r = self.compile_branch_subgraph(rhs);
+            self.current_effect = prev_effect;
+            r
         };
         let gate_inputs: Vec<NodeId> = match self.current_effect {
             Some(eff) => vec![cond_node, eff],
@@ -421,6 +438,7 @@ impl<'a> IrBuilder<'a> {
         let node_end = self.graph.nodes.len() as u32;
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
+            converter_generated: false,
             id: sg_id,
             node_range: (NodeId(node_start), NodeId(node_end)),
             param_count: 0,
@@ -532,41 +550,59 @@ impl<'a> IrBuilder<'a> {
     /// Two codegen paths, both single-node:
     ///   - target is str: `compute_cast_to_str` (idx 277) — covers scalar/char/bool/array→str
     ///   - scalar→scalar: `compute_cast_scalar` (idx 278) — covers all int↔int/int↔float/char↔int
+    /// Render an `as`-target TypeRef to a type-name string. Honors
+    /// type-parameter substitution (`current_type_args`) and array suffixes
+    /// (`u8[]`, nested `u8[][]`); other nodes fall back to "i64" (legacy).
+    /// Nullable is NOT peeled here — only compile_as_cast peels it, and only
+    /// at the top level: `i32?[]` (array of nullables) must stay distinct
+    /// from `(i32[])?`, and its rendered element name ("i32?") fails
+    /// ValueTag::from_name, giving the permissive reference-cast passthrough.
+    fn render_cast_target_name(&self, ty: crate::ast::Ast::TypeRef) -> String {
+        let s = &self.current_module().arena.types[ty.0 as usize];
+        match &s.node {
+            crate::ast::Ast::TypeNode::Nullable { inner } => {
+                format!("{}?", self.render_cast_target_name(*inner))
+            }
+            crate::ast::Ast::TypeNode::Named { name } => {
+                let name = *name;
+                // Type-parameter replacement (monomorphization instance context)
+                if let Some((_, h)) = self.current_type_args.iter().find(|(n, _)| n == name) {
+                    if let Some(resolved) = self.type_arena.type_name_concrete(*h) {
+                        resolved
+                    } else {
+                        name.to_string()
+                    }
+                } else {
+                    name.to_string()
+                }
+            }
+            crate::ast::Ast::TypeNode::Array { element_type, .. } => {
+                format!("{}[]", self.render_cast_target_name(*element_type))
+            }
+            _ => "i64".to_string(),
+        }
+    }
+
     pub(super) fn compile_as_cast(
         &mut self,
         expr: crate::ast::Ast::ExprId,
         target: crate::ast::Ast::TypeRef,
     ) -> NodeId {
-        // Get the target type name.
+        // Get the target type name (array suffixes included: "u8[]", ...).
         // In a generic context, target may be a type-parameter name (e.g. "T"); look up
         // current_type_args to replace it with the concrete type name.
         // Nullable wrappers (`f32?`) peel to the inner scalar: the runtime Value
         // of a nullable scalar IS the scalar (null is the Null sentinel), so the
         // cast targets the base type and null passes through at runtime.
+        // (Top-level peel only — see render_cast_target_name.)
         let target_ty = {
             let mut ty = target;
-            let spanned = loop {
+            loop {
                 let s = &self.current_module().arena.types[ty.0 as usize];
                 match &s.node {
                     crate::ast::Ast::TypeNode::Nullable { inner } => ty = *inner,
-                    _ => break s,
+                    _ => break self.render_cast_target_name(ty),
                 }
-            };
-            match &spanned.node {
-                crate::ast::Ast::TypeNode::Named { name } => {
-                    let name = *name;
-                    // Type-parameter replacement (monomorphization instance context)
-                    if let Some((_, h)) = self.current_type_args.iter().find(|(n, _)| n == name) {
-                        if let Some(resolved) = self.type_arena.type_name(*h) {
-                            resolved.to_string()
-                        } else {
-                            name.to_string()
-                        }
-                    } else {
-                        name.to_string()
-                    }
-                }
-                _ => "i64".to_string(),
             }
         };
 
@@ -601,6 +637,23 @@ impl<'a> IrBuilder<'a> {
                 input_count: 1,
                 inputs_offset,
                 compute_fn: CF_CAST_SCALAR, // compute_cast_scalar
+            });
+            self.graph.set_cast_target_type(node, target_ty.clone());
+            return node;
+        }
+
+        // Path 3: array target (`x as u8[]`). Array targets used to fall into
+        // the optimistic scalar-cast fallback below — non-Named targets were
+        // misread as "i64", destroying the value (the cast result behaved as
+        // an empty array). The array cast carries the value through and
+        // converts scalar elements when the tags differ.
+        if target_ty.ends_with("[]") {
+            let inputs_offset = self.graph.inputs_pool.push(&[input]);
+            let node = self.graph.add_node(Node {
+                kind: NodeKind::UnOp,
+                input_count: 1,
+                inputs_offset,
+                compute_fn: CF_CAST_ARRAY, // compute_cast_array
             });
             self.graph.set_cast_target_type(node, target_ty.clone());
             return node;

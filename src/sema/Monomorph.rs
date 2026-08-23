@@ -164,9 +164,26 @@ pub fn hash_type_args(arena: &TypeArena, type_args: &[TypeHandle]) -> u64 {
 }
 
 /// Build a monomorphization cache key: an FNV-1a combined u64 hash of
-/// `func_name` and `type_args` (no String allocation).
-pub fn build_cache_key(func_name: &str, arena: &TypeArena, type_args: &[TypeHandle]) -> u64 {
+/// `module_name`, `func_name` and `type_args` (no String allocation).
+///
+/// The module component is what makes same-named generics in different
+/// modules distinct: keyed by bare name, `A.f<i32>` and `B.f<i32>` mapped to
+/// ONE entry, so whichever module instantiated first supplied the body for
+/// every caller (observed: `A.f(1)` executing module B's function).
+pub fn build_cache_key(
+    module_name: &str,
+    func_name: &str,
+    arena: &TypeArena,
+    type_args: &[TypeHandle],
+) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
+    for &b in module_name.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    // Separator: keep ("mod", "ulef") from colliding with ("module", "f").
+    h ^= 0xFF;
+    h = h.wrapping_mul(0x100000001b3);
     for &b in func_name.as_bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
@@ -180,16 +197,132 @@ pub fn build_cache_key(func_name: &str, arena: &TypeArena, type_args: &[TypeHand
 pub fn find_instance(
     arena: &TypeArena,
     sema_result: &SemaResult,
+    module_name: &str,
     func_name: &str,
     type_args: &[TypeHandle],
 ) -> Option<u32> {
-    let cache_key = build_cache_key(func_name, arena, type_args);
+    let cache_key = build_cache_key(module_name, func_name, arena, type_args);
     sema_result.monomorph_index.get(&cache_key).copied()
 }
 
 // ── AST traversal context ──
 
-/// AST traversal context: carries the function-name → declaration mapping and
+/// Function symbol tables for the monomorph walk, keyed by module-qualified
+/// name.
+///
+/// The previous bare-name maps made same-named functions in different
+/// modules collide: registration was last-wins, so `A.f` and `B.f` both
+/// resolved to one declaration, and the dedup cache (then keyed by bare
+/// name + type args) shared a single instance — `A.f(1)` executed module
+/// B's body. Resolution now mirrors the non-generic path:
+///
+/// - qualified receiver (`Hash.key(...)`, `std.core.hash.Hash.key(...)`):
+///   the receiver's path segments suffix-match a module name (unique match
+///   required), and that module must define the callee;
+/// - bare name: the calling module's own definition first, then the unique
+///   defining module, else the last registered (legacy behavior for
+///   ambiguous cross-module names).
+#[derive(Clone)]
+pub struct FuncTables<'a> {
+    /// "module\x00name" → declaration.
+    decls: FxHashMap<String, &'a Spanned<Decl<'a>>>,
+    /// "module\x00name" → owning module arena.
+    arenas: FxHashMap<String, &'a AstArena<'a>>,
+    /// All registered module names (registration order).
+    modules: Vec<&'a str>,
+    /// Bare name → defining modules in registration order.
+    owners: FxHashMap<&'a str, Vec<&'a str>>,
+}
+
+impl<'a> FuncTables<'a> {
+    fn key(module: &str, name: &str) -> String {
+        let mut k = String::with_capacity(module.len() + name.len() + 1);
+        k.push_str(module);
+        k.push('\x00');
+        k.push_str(name);
+        k
+    }
+
+    /// Register every top-level `fun` of module `m`.
+    fn register(&mut self, m: &'a Module<'a>) {
+        self.modules.push(m.name);
+        for decl in &m.declarations {
+            if let Decl::FunDecl { name, .. } = &decl.node {
+                self.decls.insert(Self::key(m.name, name), decl);
+                self.arenas.insert(Self::key(m.name, name), &m.arena);
+                self.owners.entry(*name).or_default().push(m.name);
+            }
+        }
+    }
+
+    /// Which module a bare callee name refers to, viewed from `from`: the
+    /// calling module's own definition, else the unique defining module.
+    /// Contested names resolve to `None` — no silent pick; the IR resolver
+    /// then reports the call as unknown, with its qualified-name suggestions.
+    fn resolve_owner(&self, name: &str, from: &str) -> Option<&'a str> {
+        let owners = self.owners.get(name)?;
+        if let Some(m) = owners.iter().find(|m| **m == from) {
+            return Some(m);
+        }
+        match owners.len() {
+            1 => Some(owners[0]),
+            _ => None,
+        }
+    }
+
+    /// Match qualifier path segments (dotted receiver path) against module
+    /// names (slash-separated, trailing ".frond" stripped) by suffix; a
+    /// unique match wins. `all_modules` may list a module more than once
+    /// (directory-module registration runs per dependent) — same-name
+    /// duplicates count as one hit; only two DIFFERENT matching names are
+    /// an ambiguity (`None`; caller falls back to bare-name resolution).
+    fn module_by_path(&self, segs: &[&str]) -> Option<&'a str> {
+        let mut hit: Option<&'a str> = None;
+        for m in &self.modules {
+            let base = m.strip_suffix(".frond").unwrap_or(m);
+            let m_segs: Vec<&str> = base.split('/').collect();
+            if m_segs.len() >= segs.len() && &m_segs[m_segs.len() - segs.len()..] == segs {
+                if hit.is_some_and(|h| h != *m) {
+                    return None;
+                }
+                hit = Some(m);
+            }
+        }
+        hit
+    }
+
+    fn decl(&self, module: &str, name: &str) -> Option<&'a Spanned<Decl<'a>>> {
+        self.decls.get(&Self::key(module, name)).copied()
+    }
+
+    fn arena(&self, module: &str, name: &str) -> Option<&'a AstArena<'a>> {
+        self.arenas.get(&Self::key(module, name)).copied()
+    }
+}
+
+/// Receiver path segments when `recv` is a pure module/namespace path
+/// (`Ident` or `FieldAccess` chains, e.g. `Hash` / `std.core.hash.Hash`);
+/// `None` for value receivers (calls, indexing, literals, ...).
+fn recv_path_segments<'a>(ast: &'a AstArena<'a>, mut recv: ExprId) -> Option<Vec<&'a str>> {
+    let mut segs: Vec<&'a str> = Vec::new();
+    loop {
+        match &ast.expr(recv).node {
+            Expr::Ident(name) => {
+                segs.push(*name);
+                break;
+            }
+            Expr::FieldAccess { recv: r, field } => {
+                segs.push(*field);
+                recv = *r;
+            }
+            _ => return None,
+        }
+    }
+    segs.reverse();
+    Some(segs)
+}
+
+/// AST traversal context: carries the module-qualified function tables and
 /// the cycle-detection table.
 ///
 /// Deliberately does not hold `sema_result`: all functions needing
@@ -197,18 +330,8 @@ pub fn find_instance(
 /// and `&mut sema_result` can coexist (split borrow).
 struct WalkCtx<'a> {
     ast: &'a AstArena<'a>,
-    /// Function name → `FunDecl` reference, used to look up parameter type
-    /// annotations and return types while inferring type_args.
-    func_decls: FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
-    /// Function name → owning module arena (for cross-module monomorphization,
-    /// `get_or_create_instance` must use the callee's module arena to
-    /// dereference body ExprIds / parameter type annotations, not the call-site
-    /// module arena).
-    func_arenas: FxHashMap<&'a str, &'a AstArena<'a>>,
-    /// Function name → owning module name (for cross-module monomorphization,
-    /// the `expr_types` key must use the callee's module name, not the call-site
-    /// module name, so the IR Builder lookup keys match).
-    func_module_names: FxHashMap<&'a str, &'a str>,
+    /// Module-qualified function tables (see `FuncTables`).
+    tables: FuncTables<'a>,
     /// Cycle detection: cache_key currently being instantiated → instance_id
     /// (forward-reference support).
     in_progress: FxHashMap<u64, u32>,
@@ -237,9 +360,9 @@ fn infer_type_args<'a>(
     arguments: &[ExprId],
     type_args_hint: Option<&[AstTypeRef]>,
     type_params: &[Box<str>],
+    fd_decl: &'a Spanned<Decl<'a>>,
+    fd_ast: &'a AstArena<'a>,
     ast: &'a AstArena<'a>,
-    func_decls: &FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
-    func_arenas: &FxHashMap<&'a str, &'a AstArena<'a>>,
     module_name: &str,
     sema_result: &mut SemaResult,
     arena: &mut TypeArena,
@@ -249,7 +372,7 @@ fn infer_type_args<'a>(
         if !hints.is_empty() {
             let mut args = Vec::with_capacity(hints.len());
             for &tn in hints {
-                let h = resolve_type_node_resolved(arena, Some(tn), &[], ast, sema_result)
+                let h = resolve_type_node_resolved(arena, Some(tn), &[], fd_ast, sema_result)
                     .unwrap_or_else(|| {
                         sema_result.add_error(SemaError::new(
                             &format!("failed to resolve type argument in {}", func_name),
@@ -264,22 +387,6 @@ fn infer_type_args<'a>(
     }
 
     // 2. Implicit inference.
-    let fd_decl = match func_decls.get(func_name).copied() {
-        Some(d) => d,
-        None => {
-            // AST-unreachable (likely a method or built-in): create a named Adt
-            // placeholder for each type parameter.
-            return type_params
-                .iter()
-                .map(|tp| arena.make_adt((*tp).clone(), Box::new([])))
-                .collect();
-        }
-    };
-    // The callee's owning module arena: for cross-module calls the type
-    // annotation TypeIds belong to the callee's module arena, so they must be
-    // accessed via `fd_ast` (not `ctx.ast`), otherwise indexing goes out of
-    // bounds.
-    let fd_ast = func_arenas.get(func_name).copied().unwrap_or(ast);
     let fd = match &fd_decl.node {
         Decl::FunDecl {
             type_params,
@@ -295,7 +402,7 @@ fn infer_type_args<'a>(
             body: *body,
             is_async: *is_async,
         },
-        _ => unreachable!("func_decls only stores FunDecl"),
+        _ => unreachable!("infer_type_args only takes FunDecl"),
     };
 
     let mut name_to_handle: FxHashMap<&str, TypeHandle> = FxHashMap::default();
@@ -320,6 +427,44 @@ fn infer_type_args<'a>(
         let arg_key = module_expr_key(module_name, arg.0 as u64);
         if let Some(info) = sema_result.get_expr(arg_key) {
             name_to_handle.insert(pname, info.ty);
+        }
+    }
+
+    // Pass 1b: match `.array` type annotations (e.g. `a: T[]`) — bind the bare
+    // type-param element to the argument's concrete element type. This is the
+    // most common generic shape (`iter<T>`, `Mem.*`, `Sort.*`); without it the
+    // parameter stayed a placeholder Adt("T") and every instance compiled a
+    // soft-typed body (i32 survived via numeric soft comparison; str/f64
+    // silently misbehaved). A str argument binds the u8 byte element, mirroring
+    // the sema unification gate (str ↔ T[], byte semantics).
+    for (i, arg) in arguments.iter().enumerate().take(param_count) {
+        let param_type = match fd.params[i].type_annotation {
+            Some(t) => t,
+            None => continue,
+        };
+        let elem = match &fd_ast.ty(param_type).node {
+            TypeNode::Array { element_type, .. } => *element_type,
+            _ => continue,
+        };
+        let pname = match &fd_ast.ty(elem).node {
+            TypeNode::Named { name } => *name,
+            _ => continue,
+        };
+        if !is_type_param(pname) || name_to_handle.contains_key(pname) {
+            continue;
+        }
+        let arg_key = module_expr_key(module_name, arg.0 as u64);
+        if let Some(info) = sema_result.get_expr(arg_key) {
+            let r = arena.resolve(info.ty);
+            match arena.get(r) {
+                crate::types::Type::Array(_) => {
+                    name_to_handle.insert(pname, arena.array_parts(r).0);
+                }
+                crate::types::Type::Str => {
+                    name_to_handle.insert(pname, arena.make(crate::types::Type::U8));
+                }
+                _ => {}
+            }
         }
     }
 
@@ -450,15 +595,15 @@ fn get_or_create_instance<'a>(
     type_args: &[TypeHandle],
     fd_decl: &'a Spanned<Decl<'a>>,
     ast: &'a AstArena<'a>,
-    func_decls: &FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
-    func_arenas: &FxHashMap<&'a str, &'a AstArena<'a>>,
-    func_module_names: &FxHashMap<&'a str, &'a str>,
+    tables: &FuncTables<'a>,
     in_progress: &mut FxHashMap<u64, u32>,
     sema_result: &mut SemaResult,
     module_name: &'a str,
     arena: &mut TypeArena,
 ) -> u32 {
-    let cache_key = build_cache_key(func_name, arena, type_args);
+    // The cache key includes the callee's module: same-named generics in
+    // different modules are distinct instances.
+    let cache_key = build_cache_key(module_name, func_name, arena, type_args);
 
     // 1. Check the cache.
     if let Some(&idx) = sema_result.monomorph_index.get(&cache_key) {
@@ -517,6 +662,27 @@ fn get_or_create_instance<'a>(
         field_accesses: FxHashMap::default(),
     };
 
+    // Reserve the table slot IMMEDIATELY: the instance is only pushed after
+    // body resolution, and that resolution can trigger NESTED instantiations
+    // (a generic body calling another generic). Allocating the id from
+    // `len()` before the push handed the SAME id to the nested instance —
+    // two instances with one id, and `monomorph_instances.get(id)` then
+    // answered with the wrong one (its module_name poisoned every expr-type
+    // key the IR builder computed). Reserve now, fill after resolution.
+    let placeholder = MonomorphInstance {
+        instance_id,
+        func_name: func_name.into(),
+        module_name: module_name.into(),
+        type_args: type_args.to_vec().into_boxed_slice(),
+        chan_layout: ChanLayout::empty(),
+        return_type: return_handle,
+        is_async: fd.is_async,
+        expr_types: FxHashMap::default(),
+        field_accesses: FxHashMap::default(),
+    };
+    debug_assert_eq!(sema_result.monomorph_instances.len() as u32, instance_id);
+    sema_result.monomorph_instances.push(placeholder);
+
     // 4. Mark as in-progress (forward-reference support).
     in_progress.insert(cache_key, instance_id);
 
@@ -528,9 +694,7 @@ fn get_or_create_instance<'a>(
         &mut instance,
         &fd,
         ast,
-        func_decls,
-        func_arenas,
-        func_module_names,
+        tables,
         in_progress,
         sema_result,
         type_args,
@@ -538,8 +702,8 @@ fn get_or_create_instance<'a>(
         arena,
     );
 
-    // 6. Write to the instance table and cache.
-    sema_result.monomorph_instances.push(instance);
+    // 6. Fill the reserved slot and write the cache.
+    sema_result.monomorph_instances[instance_id as usize] = instance;
     sema_result.monomorph_index.insert(cache_key, instance_id);
     // Record module ownership for incremental purge (monomorph index).
     sema_result.module_ownership.monomorph_indices
@@ -573,9 +737,7 @@ fn process_call<'a>(
     type_args_hint: Option<&[AstTypeRef]>,
     call_expr: ExprId,
     ast: &'a AstArena<'a>,
-    func_decls: &FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
-    func_arenas: &FxHashMap<&'a str, &'a AstArena<'a>>,
-    func_module_names: &FxHashMap<&'a str, &'a str>,
+    tables: &FuncTables<'a>,
     in_progress: &mut FxHashMap<u64, u32>,
     sema_result: &mut SemaResult,
     module_name: &'a str,
@@ -586,20 +748,31 @@ fn process_call<'a>(
         Expr::Ident(name) => *name,
         _ => return,
     };
-    // Look up the function signature: skip unregistered and non-generic
-    // functions. Clone only the lightweight type_params (short names like "T")
-    // instead of the entire FuncSigInfo, to release the sema_result borrow
-    // before the mutable borrow in infer_type_args.
-    let type_params: Box<[Box<str>]> = match sema_result.get_func_sig(func_name) {
-        Some(s) if !s.type_params.is_empty() => s.type_params.clone(),
-        _ => return,
+    // Resolve the callee's owning module: the calling module's own
+    // definition first, then the unique defining module, else last
+    // registered (legacy behavior for ambiguous cross-module names).
+    let owner = match tables.resolve_owner(func_name, module_name) {
+        Some(m) => m,
+        None => return,
     };
-
     // Look up the function AST (for parameter type annotations and return type).
-    let fd_decl = match func_decls.get(func_name).copied() {
+    let fd_decl = match tables.decl(owner, func_name) {
         Some(d) => d,
         None => return,
     };
+    // Generic-ness comes from the declaration itself (the func_sig table is
+    // bare-name keyed and itself collision-prone across modules).
+    let type_params: Vec<Box<str>> = match &fd_decl.node {
+        Decl::FunDecl { type_params, .. } => {
+            if type_params.is_empty() {
+                return;
+            }
+            type_params.iter().map(|tp| Box::from(tp.name)).collect()
+        }
+        _ => return,
+    };
+    // The callee's owning module arena: the decl's TypeIds belong to it.
+    let fd_ast = tables.arena(owner, func_name).unwrap_or(ast);
 
     // Infer type_args (explicit or implicit).
     // `module_name` must be the call-site module: argument expression type info
@@ -611,30 +784,26 @@ fn process_call<'a>(
         arguments,
         type_args_hint,
         &type_params,
+        fd_decl,
+        fd_ast,
         ast,
-        func_decls,
-        func_arenas,
         module_name,
         sema_result,
         arena,
     );
 
-    // Find or create the instance.
     // `ast` uses the callee's module arena (for cross-module calls the body
-    // ExprIds belong to the callee's arena), falling back to the call-site arena
-    // (same-module call case).
-    let callee_ast = func_arenas.get(func_name).copied().unwrap_or(ast);
+    // ExprIds belong to the callee's arena).
+    let callee_ast = fd_ast;
     // `module_name` uses the callee's module name (for cross-module calls the
     // `expr_types` key must match the IR Builder lookup).
-    let callee_module_name = func_module_names.get(func_name).copied().unwrap_or(module_name);
+    let callee_module_name = owner;
     let instance_id = get_or_create_instance(
         func_name,
         &type_args,
         fd_decl,
         callee_ast,
-        func_decls,
-        func_arenas,
-        func_module_names,
+        tables,
         in_progress,
         sema_result,
         callee_module_name,
@@ -653,47 +822,84 @@ fn process_call<'a>(
 ///
 /// Method calls go through trait dispatch, and full resolution requires the
 /// object type to construct the mangled name. A best-effort strategy is used
-/// here: look up `func_sig` directly by method name and process on hit, skip
-/// otherwise. Recursive traversal still descends into recv/arguments, ensuring
-/// nested calls are collected.
+/// here: resolve the callee's module (a pure-path receiver like `Hash.key(...)`
+/// qualifies the module; anything else falls back to bare-name resolution) and
+/// process the same-named top-level function on hit, skip otherwise. Recursive
+/// traversal still descends into recv/arguments, ensuring nested calls are
+/// collected.
 #[allow(clippy::too_many_arguments)]
 fn process_method_call<'a>(
+    recv: ExprId,
     method: &str,
     arguments: &[ExprId],
     type_args_hint: Option<&[AstTypeRef]>,
     call_expr: ExprId,
     ast: &'a AstArena<'a>,
-    func_decls: &FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
-    func_arenas: &FxHashMap<&'a str, &'a AstArena<'a>>,
-    func_module_names: &FxHashMap<&'a str, &'a str>,
+    tables: &FuncTables<'a>,
     in_progress: &mut FxHashMap<u64, u32>,
     sema_result: &mut SemaResult,
     module_name: &'a str,
     arena: &mut TypeArena,
 ) {
-    // Look up `func_sig` directly by method name (covers the rare case of a
-    // same-named top-level function). Clone only the lightweight type_params
-    // (short names like "T") instead of the entire FuncSigInfo, to release the
-    // sema_result borrow before the mutable borrow in infer_type_args.
-    let type_params: Box<[Box<str>]> = match sema_result.get_func_sig(method) {
-        Some(s) if !s.type_params.is_empty() => s.type_params.clone(),
-        Some(_) => return,
+    // Resolve the callee's module. A pure-path receiver (`Hash`,
+    // `std.core.hash.Hash`) qualifies the module by path-suffix match —
+    // accepted only when that module actually defines the method (the
+    // receiver may name a type/variable that merely shares a module's
+    // name). Non-path receivers (real values) fall back to bare-name
+    // resolution.
+    let owner = recv_path_segments(ast, recv)
+        .and_then(|segs| tables.module_by_path(&segs))
+        .filter(|m| tables.decl(m, method).is_some())
+        .or_else(|| tables.resolve_owner(method, module_name));
+    let owner = match owner {
+        Some(m) => m,
         None => return,
     };
 
-    let fd_decl = match func_decls.get(method).copied() {
+    let fd_decl = match tables.decl(owner, method) {
         Some(d) => d,
         None => return,
+    };
+    // Generic-ness comes from the declaration itself (see process_call).
+    let type_params: Vec<Box<str>> = match &fd_decl.node {
+        Decl::FunDecl { type_params, .. } => {
+            if type_params.is_empty() {
+                return;
+            }
+            type_params.iter().map(|tp| Box::from(tp.name)).collect()
+        }
+        _ => return,
+    };
+    let fd_ast = tables.arena(owner, method).unwrap_or(ast);
+
+    // Method-sugar form (`recv.method(args)` desugars to `method(recv, args)`):
+    // when the receiver is a VALUE (not a module-namespace recv flagged by
+    // sema in `module_func_recv_exprs`), it occupies the function's FIRST
+    // parameter. Without feeding it to type-arg inference, a `T[]` first
+    // parameter can never bind T when there are no further arguments
+    // (`arr.sort()`), and partial binds (`lower_bound`'s `v: T`) produce a
+    // wrong instance whose body compares soft-typed values — correct for i32
+    // by accident, silently wrong for f64/str.
+    let recv_is_namespace = sema_result
+        .module_func_recv_exprs
+        .contains(&crate::sema::Sema::module_expr_key(module_name, recv.0 as u64));
+    let sugar_args: Vec<ExprId> = if recv_is_namespace {
+        arguments.to_vec()
+    } else {
+        let mut v = Vec::with_capacity(arguments.len() + 1);
+        v.push(recv);
+        v.extend_from_slice(arguments);
+        v
     };
 
     let type_args = infer_type_args(
         method,
-        arguments,
+        &sugar_args,
         type_args_hint,
         &type_params,
+        fd_decl,
+        fd_ast,
         ast,
-        func_decls,
-        func_arenas,
         module_name,
         sema_result,
         arena,
@@ -701,18 +907,16 @@ fn process_method_call<'a>(
 
     // `ast` uses the callee's module arena (for cross-module `Module.fun()`
     // calls the body belongs to the callee's module).
-    let callee_ast = func_arenas.get(method).copied().unwrap_or(ast);
+    let callee_ast = fd_ast;
     // `module_name` uses the callee's module name (for cross-module calls the
     // `expr_types` key must match the IR Builder lookup).
-    let callee_module_name = func_module_names.get(method).copied().unwrap_or(module_name);
+    let callee_module_name = owner;
     let instance_id = get_or_create_instance(
         method,
         &type_args,
         fd_decl,
         callee_ast,
-        func_decls,
-        func_arenas,
-        func_module_names,
+        tables,
         in_progress,
         sema_result,
         callee_module_name,
@@ -806,9 +1010,7 @@ fn walk_expr<'a>(
     // Copy the immutable-reference fields first, then use
     // `&mut ctx.in_progress` (split borrow).
     let ast = ctx.ast;
-    let func_decls = &ctx.func_decls;
-    let func_arenas = &ctx.func_arenas;
-    let func_module_names = &ctx.func_module_names;
+    let tables = &ctx.tables;
     let node = &ast.expr(expr).node;
     match node {
         // ── Call expressions: primary collection target ──
@@ -824,9 +1026,7 @@ fn walk_expr<'a>(
                 hint,
                 expr,
                 ast,
-                func_decls,
-                func_arenas,
-                func_module_names,
+                tables,
                 &mut ctx.in_progress,
                 sema_result,
                 ctx.module_name,
@@ -845,14 +1045,13 @@ fn walk_expr<'a>(
         } => {
             let hint = type_args.as_deref();
             process_method_call(
+                *recv,
                 method,
                 args.as_slice(),
                 hint,
                 expr,
                 ast,
-                func_decls,
-                func_arenas,
-                func_module_names,
+                tables,
                 &mut ctx.in_progress,
                 sema_result,
                 ctx.module_name,
@@ -871,14 +1070,13 @@ fn walk_expr<'a>(
         } => {
             let hint = type_args.as_deref();
             process_method_call(
+                *recv,
                 method,
                 args.as_slice(),
                 hint,
                 expr,
                 ast,
-                func_decls,
-                func_arenas,
-                func_module_names,
+                tables,
                 &mut ctx.in_progress,
                 sema_result,
                 ctx.module_name,
@@ -1064,28 +1262,25 @@ pub fn collect_monomorph_instances<'a>(
 
     let mut ctx = WalkCtx {
         ast: &module.arena,
-        func_decls: FxHashMap::default(),
-        func_arenas: FxHashMap::default(),
-        func_module_names: FxHashMap::default(),
+        tables: FuncTables {
+            decls: FxHashMap::default(),
+            arenas: FxHashMap::default(),
+            modules: Vec::new(),
+            owners: FxHashMap::default(),
+        },
         in_progress: FxHashMap::default(),
         module_name: module.name,
     };
 
-    // 1. Build func_name → &Spanned<Decl> + owning module arena + owning module
-    //    name mappings (collect top-level fun_decls across modules).
+    // 1. Build the module-qualified function tables: top-level fun_decls of
+    // every module, keyed by (module, name).
     // Cross-module monomorphization: when calling `std.math.Math.abs<T>(x)`,
-    // `func_decls` must find `abs` (defined in the Math module), `func_arenas`
-    // provides the arena of abs's module so `get_or_create_instance` can
-    // dereference body ExprIds, and `func_module_names` provides abs's module
-    // name so the `expr_types` key matches the IR Builder lookup.
+    // the tables resolve `abs` to the Math module's declaration and arena so
+    // `get_or_create_instance` can dereference body ExprIds, with the module
+    // name making the instance/cache key distinct from any same-named `abs`
+    // declared elsewhere.
     for m in all_modules {
-        for decl in &m.declarations {
-            if let Decl::FunDecl { name, .. } = &decl.node {
-                ctx.func_decls.insert(name, decl);
-                ctx.func_arenas.insert(name, &m.arena);
-                ctx.func_module_names.insert(name, m.name);
-            }
-        }
+        ctx.tables.register(m);
     }
 
     // 2. Walk all top-level declarations.
@@ -1193,9 +1388,7 @@ fn resolve_instance_body_types<'a>(
     instance: &mut MonomorphInstance,
     fd: &FunDeclView<'a>,
     ast: &'a AstArena<'a>,
-    func_decls: &'a FxHashMap<&'a str, &'a Spanned<Decl<'a>>>,
-    func_arenas: &'a FxHashMap<&'a str, &'a AstArena<'a>>,
-    func_module_names: &'a FxHashMap<&'a str, &'a str>,
+    tables: &FuncTables<'a>,
     in_progress: &mut FxHashMap<u64, u32>,
     sema_result: &mut SemaResult,
     type_args: &[TypeHandle],
@@ -1210,8 +1403,14 @@ fn resolve_instance_body_types<'a>(
     // types into `local_expr_types`.
     let local_expr_types: FxHashMap<u64, ExprInfo>;
     {
+        // Sync the free-function resolvers' module context (resolve_type_key
+        // reads sema_result.current_module_name): signature/body name
+        // resolution must happen in the GENERIC FUNCTION'S module, not the
+        // last-checked one (a local shadow would hijack std names otherwise).
+        let saved_sema_module = sema_result.current_module_name.clone();
         let mut infer_ctx = InferContext::new(arena, sema_result);
         infer_ctx.current_module_name = module_name.to_string();
+        infer_ctx.sema_result.current_module_name = module_name.to_string();
 
         // Push type bindings (place rigid vars first; `enter_instantiation_mode`
         // will replace them with the concrete type_args).
@@ -1230,14 +1429,29 @@ fn resolve_instance_body_types<'a>(
         );
 
         // Create the environment and register the function parameters.
-        let fn_env = infer_ctx.env.root();
+        // Child of the DECLARING MODULE's env (module-scoped: bare names in
+        // the generic body must resolve the module's own symbols first — a
+        // root-anchored child would resolve contested bare names to the
+        // first root registrant, e.g. one of the nine container `empty`s),
+        // falling back to the shared root when the module env is unknown.
+        // Never the root itself: the root is global now, and defining the
+        // instance's parameters into it would leak them into every other
+        // lookup.
+        let parent_env = {
+            let logical = crate::sema::Sema::module_logical_path(module_name);
+            logical
+                .as_deref()
+                .and_then(|lp| infer_ctx.sema_result.module_envs.get(lp).copied())
+                .unwrap_or_else(|| infer_ctx.sema_result.env.root())
+        };
+        let fn_env = infer_ctx.sema_result.env.child(parent_env);
         for param in fd.params {
             let h = if let Some(ta) = param.type_annotation {
                 infer_ctx.type_from_ast(ta, ast)
             } else {
                 infer_ctx.arena.fresh_type_var()
             };
-            infer_ctx.env.define(fn_env, param.name, h);
+            infer_ctx.sema_result.env.define(fn_env, param.name, h);
         }
 
         // Set the return type.
@@ -1263,7 +1477,9 @@ fn resolve_instance_body_types<'a>(
         }
 
         infer_ctx.pop_type_bindings();
-    } // infer_ctx dropped, releasing &mut arena and &mut sema_result
+        drop(infer_ctx);
+        sema_result.current_module_name = saved_sema_module;
+    }
 
     // Merge `local_expr_types` into `instance.expr_types` +
     // `sema_result.expr_types`.
@@ -1285,9 +1501,7 @@ fn resolve_instance_body_types<'a>(
     // creates nested instances.
     let mut walk_ctx = WalkCtx {
         ast,
-        func_decls: func_decls.clone(),
-        func_arenas: func_arenas.clone(),
-        func_module_names: func_module_names.clone(),
+        tables: tables.clone(),
         in_progress: in_progress.clone(),
         module_name,
     };
@@ -1337,12 +1551,19 @@ pub fn validate_trait_method_bindings<'a>(
         else {
             continue;
         };
-        // Implemented trait names, deduped in declaration order.
+        // Implemented trait names, deduped in declaration order — plus the
+        // transitive PARENT closure (trait inheritance): a parent's default
+        // participates in conflict detection exactly like a listed trait's.
         let mut traits: Vec<Box<str>> = Vec::new();
         for it in implemented_traits.iter() {
             let t: Box<str> = it.trait_name.into();
             if !traits.iter().any(|x| x.as_ref() == t.as_ref()) {
                 traits.push(t);
+            }
+            for pt in sema_result.trait_parent_closure(it.trait_name) {
+                if !traits.iter().any(|x| x.as_ref() == pt.as_ref()) {
+                    traits.push(pt);
+                }
             }
         }
         // Union of method names across the implemented traits (owned, to release
@@ -1467,7 +1688,21 @@ pub fn validate_trait_method_bindings<'a>(
                     ));
                 }
             } else if providers.len() > 1 {
-                // R3: ambiguous inherited default.
+                // R3: ambiguous inherited default — UNLESS one provider is a
+                // descendant of all others (trait inheritance: the child
+                // trait's own declaration shadows its parents').
+                let shadowed = providers.iter().any(|c| {
+                    providers.iter().all(|o| {
+                        o == c
+                            || sema_result
+                                .trait_parent_closure(c)
+                                .iter()
+                                .any(|a| a.as_ref() == o.as_str())
+                    })
+                });
+                if shadowed {
+                    continue;
+                }
                 findings.push(Finding(
                     format!(
                         "ambiguous trait default '{}': type '{}' inherits conflicting defaults from [{}]; resolve with an explicit override or a delegate ('fun {}(...): ... = {}.{}')",
@@ -1509,13 +1744,149 @@ pub fn validate_trait_method_bindings<'a>(
 /// wins dispatch); the exception is `super`: when sema recorded the
 /// (type, trait, method) triple in `super_targets`, the default subgraph must
 /// exist even though the type overrides it.
+/// Trait-declaration-site validation (trait inheritance):
+/// 1. A trait whose parents provide CONFLICTING defaults for a name it does
+///    not re-declare is rejected at the declaration ("resolve it in the
+///    child trait"); re-declaring ABSTRACT while parents conflict is also
+///    rejected (an abstract re-declaration cannot shadow a default).
+/// 2. Abstract requirements: every type implementing a trait (directly or
+///    through a child) must implement its abstract methods or inherit a
+///    default for them from somewhere in the closure.
+pub fn validate_trait_inheritance<'a>(
+    module: &'a Module<'a>,
+    sema_result: &mut SemaResult,
+) {
+    // ── 1. Declaration-site parent-default conflicts ──
+    for decl in &module.declarations {
+        let crate::ast::Ast::Decl::TraitDecl { name, parents, .. } = &decl.node
+        else {
+            continue;
+        };
+        if parents.is_empty() {
+            continue;
+        }
+        // Parents' defaults grouped by method name.
+        use std::collections::BTreeMap;
+        let mut defaults: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for p in parents {
+            for (_origin, m) in sema_result.trait_effective_methods(p.trait_name) {
+                if m.has_body {
+                    defaults.entry(m.name.to_string()).or_default().push(p.trait_name.to_string());
+                }
+            }
+        }
+        let own_names: Vec<String> = sema_result
+            .get_trait_def(name)
+            .map(|td| td.methods.iter().map(|m| m.name.to_string()).collect())
+            .unwrap_or_default();
+        for (m_name, providers) in defaults {
+            if providers.len() <= 1 {
+                continue;
+            }
+            let providers_dedup: Vec<String> = {
+                let mut v = providers.clone();
+                v.sort();
+                v.dedup();
+                v
+            };
+            if providers_dedup.len() <= 1 {
+                continue;
+            }
+            if own_names.iter().any(|n| n == &m_name) {
+                let has_body = sema_result
+                    .get_trait_def(name)
+                    .and_then(|td| td.methods.iter().find(|m| m.name.as_ref() == m_name))
+                    .map(|m| m.has_body)
+                    .unwrap_or(false);
+                if !has_body {
+                    sema_result.add_error(crate::sema::Sema::SemaError::new_with_path(
+                        &format!(
+                            "trait '{}' re-declares '{}' abstract while parents [{}] provide conflicting defaults; give '{}' a default body in '{}'",
+                            name, m_name, providers_dedup.join(", "), m_name, name
+                        ), module.name, decl.span.line, decl.span.column));
+                }
+                continue;
+            }
+            sema_result.add_error(crate::sema::Sema::SemaError::new_with_path(
+                &format!(
+                    "trait '{}' inherits conflicting defaults for '{}' from [{}]; declare its own '{}' (with a body) in the trait to resolve",
+                    name, m_name, providers_dedup.join(", "), m_name
+                ), module.name, decl.span.line, decl.span.column));
+        }
+    }
+
+    // ── 2. Abstract-requirement enforcement for implementing types ──
+    for decl in &module.declarations {
+        let crate::ast::Ast::Decl::TypeDecl { name, implemented_traits, methods, .. } = &decl.node
+        else {
+            continue;
+        };
+        if implemented_traits.is_empty() {
+            continue;
+        }
+        // The full closure (direct + parents).
+        let mut closure: Vec<String> = Vec::new();
+        for it in implemented_traits.iter() {
+            if !closure.iter().any(|x| x == it.trait_name) {
+                closure.push(it.trait_name.to_string());
+            }
+            for pt in sema_result.trait_parent_closure(it.trait_name) {
+                if !closure.iter().any(|x| x == pt.as_ref()) {
+                    closure.push(pt.to_string());
+                }
+            }
+        }
+        let own: Vec<String> = methods.iter().map(|m| m.name.to_string()).collect();
+        for t in &closure {
+            // Owned snapshot of this trait's abstract method names (borrow
+            // hygiene: the default-scan below re-borrows sema_result).
+            let abstracts: Vec<String> = sema_result
+                .get_trait_def(t)
+                .map(|td| {
+                    td.methods
+                        .iter()
+                        .filter(|m| !m.has_body)
+                        .map(|m| m.name.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for m_name in abstracts {
+                if own.iter().any(|n| n == &m_name) {
+                    continue;
+                }
+                // A default elsewhere in the closure satisfies the requirement.
+                let defaulted = closure.iter().any(|ct| {
+                    sema_result
+                        .get_trait_def(ct)
+                        .map(|ctd| {
+                            ctd.methods
+                                .iter()
+                                .any(|cm| cm.name.as_ref() == m_name && cm.has_body)
+                        })
+                        .unwrap_or(false)
+                });
+                if !defaulted {
+                    sema_result.add_error(crate::sema::Sema::SemaError::new_with_path(
+                        &format!(
+                            "type '{}' does not implement trait method '{}.{}' (required directly or through trait inheritance)",
+                            name, t, m_name
+                        ), module.name, decl.span.line, decl.span.column));
+                }
+            }
+        }
+    }
+}
+
 pub fn collect_trait_default_instances<'a>(
     module: &'a Module<'a>,
     sema_result: &mut SemaResult,
 ) {
     for decl in &module.declarations {
         if let crate::ast::Ast::Decl::TraitDecl { name, methods, .. } = &decl.node {
-            let trait_idx = match sema_result.trait_def_index.get(*name).copied() {
+            // Module-scoped canonical key — matches registration and the
+            // witness entries' trait names.
+            let canonical: Box<str> = sema_result.resolve_trait_key(name).into();
+            let trait_idx = match sema_result.trait_def_index.get(canonical.as_ref()).copied() {
                 Some(idx) => idx,
                 None => continue,
             };
@@ -1524,7 +1895,7 @@ pub fn collect_trait_default_instances<'a>(
             let impl_entries: Vec<(u16, String)> = sema_result
                 .witness_table
                 .entries()
-                .filter(|e| e.trait_name.as_ref() == *name)
+                .filter(|e| e.trait_name.as_ref() == canonical.as_ref())
                 .filter_map(|e| {
                     // type_id → type_name (O(1) reverse-lookup via
                     // type_id_to_name index, replacing the former O(n) linear
@@ -1533,6 +1904,62 @@ pub fn collect_trait_default_instances<'a>(
                         .map(|name| (e.type_id, name.to_string()))
                 })
                 .collect();
+
+            // Trait-inheritance super support: when a type witnesses THIS
+            // trait and the trait (or the type) overrides a PARENT's default,
+            // the parent default must ALSO specialize for that type — the
+            // child's body may `super.m()` into it (compile-side target).
+            for pt in sema_result.trait_parent_closure(name) {
+                // Owned snapshot of the parent's (idx, name, has_body) triples
+                // (borrow hygiene: the instance push below re-borrows).
+                let parent_methods: Vec<(usize, String, bool)> = sema_result
+                    .get_trait_def(pt.as_ref())
+                    .map(|ptd| {
+                        ptd.methods
+                            .iter()
+                            .enumerate()
+                            .map(|(i, m)| (i, m.name.to_string(), m.has_body))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let parent_idx = match sema_result.trait_def_index.get(pt.as_ref()) {
+                    Some(&i) => i,
+                    None => continue,
+                };
+                for (pm_idx, pm_name_owned, pm_has_body) in parent_methods {
+                    if !pm_has_body {
+                        continue;
+                    }
+                    let pm_name: &str = pm_name_owned.as_str();
+                    let child_overrides = methods
+                        .iter()
+                        .any(|m| &*m.name == pm_name && m.body.is_some());
+                    for (type_id, type_name) in &impl_entries {
+                        let type_overrides = sema_result
+                            .get_type_def(type_name.as_str())
+                            .map(|td| td.methods.iter().any(|m| &*m.name == pm_name))
+                            .unwrap_or(false);
+                        if !child_overrides && !type_overrides {
+                            continue; // parent default dispatches directly; normal collection covers it
+                        }
+                        let already = sema_result.trait_default_instances.iter().any(|i| {
+                            i.type_id == *type_id
+                                && i.trait_idx == parent_idx
+                                && i.method_idx as usize == pm_idx
+                        });
+                        if already {
+                            continue;
+                        }
+                        sema_result.trait_default_instances.push(TraitDefaultInstance {
+                            type_id: *type_id,
+                            type_name: type_name.as_str().into(),
+                            trait_idx: parent_idx,
+                            trait_name: pt.clone(),
+                            method_idx: pm_idx as u16,
+                        });
+                    }
+                }
+            }
 
             for (method_idx, method) in methods.iter().enumerate() {
                 if method.body.is_none() {
@@ -1549,7 +1976,7 @@ pub fn collect_trait_default_instances<'a>(
                         .collect();
                     match sema_result.resolve_method_binding(&traits, type_name, method_name) {
                         crate::sema::Sema::MethodBinding::Bound { trait_name, overridden }
-                            if trait_name.as_ref() == *name =>
+                            if trait_name.as_ref() == canonical.as_ref() =>
                         {
                             if overridden
                                 && !sema_result.super_targets.contains(&(
@@ -1566,7 +1993,7 @@ pub fn collect_trait_default_instances<'a>(
                                 type_id: *type_id,
                                 type_name: type_name.as_str().into(),
                                 trait_idx,
-                                trait_name: (*name).into(),
+                                trait_name: canonical.clone().into(),
                                 method_idx: method_idx as u16,
                             });
                         }
@@ -1596,6 +2023,7 @@ pub fn run_monomorphization<'a>(
     sema_result: &mut SemaResult,
     arena: &mut TypeArena,
 ) {
+    validate_trait_inheritance(module, sema_result);
     collect_monomorph_instances(module, all_modules, sema_result, arena);
     collect_trait_default_instances(module, sema_result);
 }

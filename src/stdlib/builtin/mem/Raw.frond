@@ -1,0 +1,1413 @@
+// builtin/mem/Raw.frond — u8[] buffer primitives over libc mem* (builtin, visible by default)
+//
+// The C fast path of std.core.mem: u8[] buffers route here (memset/memmove/
+// memcmp are 4 orders of magnitude faster than the pure-Frond element loop —
+// measured ~2s/MB interpreted vs tens of µs/MB in C). The generic T[] facade
+// dispatches on type_name(); every other element type falls back to the
+// pure-Frond loop in std/core/mem/Mem.frond.
+//
+// Bounds contract (panic, mirroring the engine's index-out-of-bounds trap):
+// a zero count is a no-op with no constraint; a positive count requires
+// [at, at+count) inside the buffer, violated → diagnostic on stderr + abort.
+
+@c_include("string.h")
+@c_include("stdio.h")
+@c_include("stdlib.h")
+
+// Fills the whole buffer with byte (memset).
+@internal
+@extern("C")
+fun __mem_fill(buf: u8[], byte: u8): void #{
+    memset(buf_data, byte, buf_len);
+}#
+
+// Copies count bytes src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy(dst: u8[], dst_at: usize, src: u8[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove(dst_data + dst_at, src_data + src_at, count);
+}#
+
+// Byte-wise equality: 1 when lengths match and contents are equal, else 0.
+@internal
+@extern("C")
+fun __mem_equal(a: u8[], b: u8[]): i32 #{
+    if (a_len != b_len) return 0;
+    return memcmp(a_data, b_data, a_len) == 0 ? 1 : 0;
+}#
+
+// Swaps buf[i] and buf[j].
+@internal
+@extern("C")
+fun __mem_swap(buf: u8[], i: usize, j: usize): void #{
+    if (i >= buf_len || j >= buf_len) {
+        fprintf(stderr, "mem.swap: index %llu or %llu out of bounds (len %llu)\n",
+                (unsigned long long)i, (unsigned long long)j,
+                (unsigned long long)buf_len);
+        abort();
+    }
+    uint8_t t = buf_data[i];
+    buf_data[i] = buf_data[j];
+    buf_data[j] = t;
+}#
+
+// Reverses the buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse(buf: u8[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        uint8_t t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+
+// Lexicographic three-way comparison of two u8[] buffers (memcmp semantics:
+// element-wise, then shorter-is-less). Returns <0 / 0 / >0.
+@internal
+@extern("C")
+fun __mem_compare_u8(a: u8[], b: u8[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    int rc = memcmp(a_data, b_data, n);
+    if (rc != 0) return rc < 0 ? -1 : 1;
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+
+// Byte offset of the first occurrence of needle in hay; -1 when absent.
+// Empty needle matches at 0. Naive O(n*m) — still ~100x the interpreted loop.
+@internal
+@extern("C")
+fun __mem_index_of_u8(hay: u8[], needle: u8[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        if (hay_data[i] == needle_data[0] && memcmp(hay_data + i, needle_data, needle_len) == 0) {
+            return (int64_t)i;
+        }
+    }
+    return -1;
+}#
+
+// ── Scalar-intrinsic fast paths ─────────────────────────────────────────────
+// Same contracts as the u8[] primitives above, instantiated per scalar element
+// type. The generic facade in std/core/mem/Mem.frond routes by type_name();
+// every other element type (str[], records, 128-bit, f16) stays on the
+// pure-Frond path. Marshaling: the SoA column / element vector is serialized
+// to native-endian bytes in an 8-aligned buffer; `{p}_data` is a typed pointer
+// and `{p}_len` is the ELEMENT count. Float compare/index_of use IEEE `<`/`>`
+// /`!=` loops (memcmp would misorder negatives and equate NaN bit patterns —
+// the engine's equality is IEEE: NaN != NaN, -0.0 == 0.0).
+// isize[] marshals to int64_t (same width, no ssize_t on MSVC).
+// Fills the whole i8[] buffer with value.
+@internal
+@extern("C")
+fun __mem_fill_i8(buf: i8[], v: i8): void #{
+    for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
+}#
+// Fills the whole i16[] buffer with value.
+@internal
+@extern("C")
+fun __mem_fill_i16(buf: i16[], v: i16): void #{
+    for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
+}#
+// Fills the whole i32[] buffer with value.
+@internal
+@extern("C")
+fun __mem_fill_i32(buf: i32[], v: i32): void #{
+    for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
+}#
+// Fills the whole i64[] buffer with value.
+@internal
+@extern("C")
+fun __mem_fill_i64(buf: i64[], v: i64): void #{
+    for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
+}#
+// Fills the whole u16[] buffer with value.
+@internal
+@extern("C")
+fun __mem_fill_u16(buf: u16[], v: u16): void #{
+    for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
+}#
+// Fills the whole u32[] buffer with value.
+@internal
+@extern("C")
+fun __mem_fill_u32(buf: u32[], v: u32): void #{
+    for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
+}#
+// Fills the whole u64[] buffer with value.
+@internal
+@extern("C")
+fun __mem_fill_u64(buf: u64[], v: u64): void #{
+    for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
+}#
+// Fills the whole isize[] buffer with value.
+@internal
+@extern("C")
+fun __mem_fill_isize(buf: isize[], v: isize): void #{
+    for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
+}#
+// Fills the whole usize[] buffer with value.
+@internal
+@extern("C")
+fun __mem_fill_usize(buf: usize[], v: usize): void #{
+    for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
+}#
+// Fills the whole f32[] buffer with value.
+@internal
+@extern("C")
+fun __mem_fill_f32(buf: f32[], v: f32): void #{
+    for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
+}#
+// Fills the whole f64[] buffer with value.
+@internal
+@extern("C")
+fun __mem_fill_f64(buf: f64[], v: f64): void #{
+    for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
+}#
+// Reverses the i8[] buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse_i8(buf: i8[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        int8_t t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+// Reverses the i16[] buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse_i16(buf: i16[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        int16_t t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+// Reverses the i32[] buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse_i32(buf: i32[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        int32_t t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+// Reverses the i64[] buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse_i64(buf: i64[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        int64_t t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+// Reverses the u16[] buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse_u16(buf: u16[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        uint16_t t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+// Reverses the u32[] buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse_u32(buf: u32[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        uint32_t t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+// Reverses the u64[] buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse_u64(buf: u64[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        uint64_t t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+// Reverses the isize[] buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse_isize(buf: isize[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        int64_t t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+// Reverses the usize[] buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse_usize(buf: usize[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        size_t t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+// Reverses the f32[] buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse_f32(buf: f32[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        float t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+// Reverses the f64[] buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse_f64(buf: f64[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        double t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_i8(dst: i8[], dst_at: usize, src: i8[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove(dst_data + dst_at, src_data + src_at, (size_t)count * sizeof(int8_t));
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_i16(dst: i16[], dst_at: usize, src: i16[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove(dst_data + dst_at, src_data + src_at, (size_t)count * sizeof(int16_t));
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_i32(dst: i32[], dst_at: usize, src: i32[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove(dst_data + dst_at, src_data + src_at, (size_t)count * sizeof(int32_t));
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_i64(dst: i64[], dst_at: usize, src: i64[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove(dst_data + dst_at, src_data + src_at, (size_t)count * sizeof(int64_t));
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_u16(dst: u16[], dst_at: usize, src: u16[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove(dst_data + dst_at, src_data + src_at, (size_t)count * sizeof(uint16_t));
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_u32(dst: u32[], dst_at: usize, src: u32[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove(dst_data + dst_at, src_data + src_at, (size_t)count * sizeof(uint32_t));
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_u64(dst: u64[], dst_at: usize, src: u64[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove(dst_data + dst_at, src_data + src_at, (size_t)count * sizeof(uint64_t));
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_isize(dst: isize[], dst_at: usize, src: isize[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove(dst_data + dst_at, src_data + src_at, (size_t)count * sizeof(int64_t));
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_usize(dst: usize[], dst_at: usize, src: usize[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove(dst_data + dst_at, src_data + src_at, (size_t)count * sizeof(size_t));
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_f32(dst: f32[], dst_at: usize, src: f32[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove(dst_data + dst_at, src_data + src_at, (size_t)count * sizeof(float));
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_f64(dst: f64[], dst_at: usize, src: f64[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove(dst_data + dst_at, src_data + src_at, (size_t)count * sizeof(double));
+}#
+// Lexicographic three-way comparison (element-wise, shorter-is-less).
+@internal
+@extern("C")
+fun __mem_compare_i8(a: i8[], b: i8[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        if (a_data[k] < b_data[k]) return -1;
+        if (a_data[k] > b_data[k]) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Lexicographic three-way comparison (element-wise, shorter-is-less).
+@internal
+@extern("C")
+fun __mem_compare_i16(a: i16[], b: i16[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        if (a_data[k] < b_data[k]) return -1;
+        if (a_data[k] > b_data[k]) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Lexicographic three-way comparison (element-wise, shorter-is-less).
+@internal
+@extern("C")
+fun __mem_compare_i32(a: i32[], b: i32[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        if (a_data[k] < b_data[k]) return -1;
+        if (a_data[k] > b_data[k]) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Lexicographic three-way comparison (element-wise, shorter-is-less).
+@internal
+@extern("C")
+fun __mem_compare_i64(a: i64[], b: i64[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        if (a_data[k] < b_data[k]) return -1;
+        if (a_data[k] > b_data[k]) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Lexicographic three-way comparison (element-wise, shorter-is-less).
+@internal
+@extern("C")
+fun __mem_compare_u16(a: u16[], b: u16[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        if (a_data[k] < b_data[k]) return -1;
+        if (a_data[k] > b_data[k]) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Lexicographic three-way comparison (element-wise, shorter-is-less).
+@internal
+@extern("C")
+fun __mem_compare_u32(a: u32[], b: u32[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        if (a_data[k] < b_data[k]) return -1;
+        if (a_data[k] > b_data[k]) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Lexicographic three-way comparison (element-wise, shorter-is-less).
+@internal
+@extern("C")
+fun __mem_compare_u64(a: u64[], b: u64[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        if (a_data[k] < b_data[k]) return -1;
+        if (a_data[k] > b_data[k]) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Lexicographic three-way comparison (element-wise, shorter-is-less).
+@internal
+@extern("C")
+fun __mem_compare_isize(a: isize[], b: isize[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        if (a_data[k] < b_data[k]) return -1;
+        if (a_data[k] > b_data[k]) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Lexicographic three-way comparison (element-wise, shorter-is-less).
+@internal
+@extern("C")
+fun __mem_compare_usize(a: usize[], b: usize[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        if (a_data[k] < b_data[k]) return -1;
+        if (a_data[k] > b_data[k]) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Lexicographic three-way comparison (element-wise, shorter-is-less).
+@internal
+@extern("C")
+fun __mem_compare_f32(a: f32[], b: f32[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        if (a_data[k] < b_data[k]) return -1;
+        if (a_data[k] > b_data[k]) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Lexicographic three-way comparison (element-wise, shorter-is-less).
+@internal
+@extern("C")
+fun __mem_compare_f64(a: f64[], b: f64[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        if (a_data[k] < b_data[k]) return -1;
+        if (a_data[k] > b_data[k]) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent.
+@internal
+@extern("C")
+fun __mem_index_of_i8(hay: i8[], needle: i8[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        if (hay_data[i] == needle_data[0] &&
+            memcmp(hay_data + i, needle_data, (size_t)needle_len * sizeof(int8_t)) == 0) {
+            return (int64_t)i;
+        }
+    }
+    return -1;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent.
+@internal
+@extern("C")
+fun __mem_index_of_i16(hay: i16[], needle: i16[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        if (hay_data[i] == needle_data[0] &&
+            memcmp(hay_data + i, needle_data, (size_t)needle_len * sizeof(int16_t)) == 0) {
+            return (int64_t)i;
+        }
+    }
+    return -1;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent.
+@internal
+@extern("C")
+fun __mem_index_of_i32(hay: i32[], needle: i32[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        if (hay_data[i] == needle_data[0] &&
+            memcmp(hay_data + i, needle_data, (size_t)needle_len * sizeof(int32_t)) == 0) {
+            return (int64_t)i;
+        }
+    }
+    return -1;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent.
+@internal
+@extern("C")
+fun __mem_index_of_i64(hay: i64[], needle: i64[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        if (hay_data[i] == needle_data[0] &&
+            memcmp(hay_data + i, needle_data, (size_t)needle_len * sizeof(int64_t)) == 0) {
+            return (int64_t)i;
+        }
+    }
+    return -1;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent.
+@internal
+@extern("C")
+fun __mem_index_of_u16(hay: u16[], needle: u16[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        if (hay_data[i] == needle_data[0] &&
+            memcmp(hay_data + i, needle_data, (size_t)needle_len * sizeof(uint16_t)) == 0) {
+            return (int64_t)i;
+        }
+    }
+    return -1;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent.
+@internal
+@extern("C")
+fun __mem_index_of_u32(hay: u32[], needle: u32[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        if (hay_data[i] == needle_data[0] &&
+            memcmp(hay_data + i, needle_data, (size_t)needle_len * sizeof(uint32_t)) == 0) {
+            return (int64_t)i;
+        }
+    }
+    return -1;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent.
+@internal
+@extern("C")
+fun __mem_index_of_u64(hay: u64[], needle: u64[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        if (hay_data[i] == needle_data[0] &&
+            memcmp(hay_data + i, needle_data, (size_t)needle_len * sizeof(uint64_t)) == 0) {
+            return (int64_t)i;
+        }
+    }
+    return -1;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent.
+@internal
+@extern("C")
+fun __mem_index_of_isize(hay: isize[], needle: isize[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        if (hay_data[i] == needle_data[0] &&
+            memcmp(hay_data + i, needle_data, (size_t)needle_len * sizeof(int64_t)) == 0) {
+            return (int64_t)i;
+        }
+    }
+    return -1;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent.
+@internal
+@extern("C")
+fun __mem_index_of_usize(hay: usize[], needle: usize[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        if (hay_data[i] == needle_data[0] &&
+            memcmp(hay_data + i, needle_data, (size_t)needle_len * sizeof(size_t)) == 0) {
+            return (int64_t)i;
+        }
+    }
+    return -1;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent. IEEE
+// equality loop: NaN never matches (matches the engine's != semantics).
+@internal
+@extern("C")
+fun __mem_index_of_f32(hay: f32[], needle: f32[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        size_t j = 0;
+        while (j < needle_len && hay_data[i + j] == needle_data[j]) j++;
+        if (j == needle_len) return (int64_t)i;
+    }
+    return -1;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent. IEEE
+// equality loop: NaN never matches (matches the engine's != semantics).
+@internal
+@extern("C")
+fun __mem_index_of_f64(hay: f64[], needle: f64[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        size_t j = 0;
+        while (j < needle_len && hay_data[i + j] == needle_data[j]) j++;
+        if (j == needle_len) return (int64_t)i;
+    }
+    return -1;
+}#
+
+// ── Full-width scalar set (bool/char/i128/u128/f16/f128) ────────────────────
+// Completes the element-type matrix: every scalar element type now has a C
+// fast path. 128-bit elements marshal as native 16-byte blocks viewed as
+// uint64 pairs; their fill VALUES travel inside a single-element pattern
+// array (no portable 128-bit scalar param). f16 equality/ordering is IEEE
+// via half→float promotion (engine semantics); f128 equality is bitwise and
+// ordering is totalOrder (engine semantics) — see the compare bodies.
+// Fills the whole bool[] buffer with value.
+@internal
+@extern("C")
+fun __mem_fill_bool(buf: bool[], v: bool): void #{
+    for (size_t k = 0; k < buf_len; k++) buf_data[k] = (uint8_t)(v ? 1 : 0);
+}#
+// Fills the whole char[] buffer with value.
+@internal
+@extern("C")
+fun __mem_fill_char(buf: char[], v: char): void #{
+    for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
+}#
+// Reverses the bool[] buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse_bool(buf: bool[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        uint8_t t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+// Reverses the char[] buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse_char(buf: char[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        uint32_t t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_bool(dst: bool[], dst_at: usize, src: bool[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove((unsigned char*)dst_data + dst_at * 1,
+            (const unsigned char*)src_data + src_at * 1,
+            (size_t)count * 1);
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_char(dst: char[], dst_at: usize, src: char[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove((unsigned char*)dst_data + dst_at * 4,
+            (const unsigned char*)src_data + src_at * 4,
+            (size_t)count * 4);
+}#
+// Lexicographic three-way comparison (element-wise, shorter-is-less).
+@internal
+@extern("C")
+fun __mem_compare_bool(a: bool[], b: bool[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        if (a_data[k] < b_data[k]) return -1;
+        if (a_data[k] > b_data[k]) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Lexicographic three-way comparison (element-wise, shorter-is-less).
+@internal
+@extern("C")
+fun __mem_compare_char(a: char[], b: char[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        if (a_data[k] < b_data[k]) return -1;
+        if (a_data[k] > b_data[k]) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent
+// (equality is bitwise — exact for i128/u128, and for f128 whose engine
+// equality is byte-wise too).
+@internal
+@extern("C")
+fun __mem_index_of_bool(hay: bool[], needle: bool[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    size_t nb = (size_t)needle_len * 1;
+    const unsigned char* hp = (const unsigned char*)hay_data;
+    const unsigned char* np = (const unsigned char*)needle_data;
+    for (size_t i = 0; i <= last; i++) {
+        if (memcmp(hp + i * 1, np, nb) == 0) return (int64_t)i;
+    }
+    return -1;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent
+// (equality is bitwise — exact for i128/u128, and for f128 whose engine
+// equality is byte-wise too).
+@internal
+@extern("C")
+fun __mem_index_of_char(hay: char[], needle: char[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    size_t nb = (size_t)needle_len * 4;
+    const unsigned char* hp = (const unsigned char*)hay_data;
+    const unsigned char* np = (const unsigned char*)needle_data;
+    for (size_t i = 0; i <= last; i++) {
+        if (memcmp(hp + i * 4, np, nb) == 0) return (int64_t)i;
+    }
+    return -1;
+}#
+// Fills the whole i128[] buffer with the element bits taken from the
+// single-element pattern array (128-bit/f16 values cannot cross FFI as
+// scalars — MSVC has no 128-bit param convention and a u16 param would lose
+// the f16 bit pattern).
+@internal
+@extern("C")
+fun __mem_fill_i128(buf: i128[], pattern: i128[]): void #{
+    if (buf_len == 0 || pattern_len == 0) return;
+    const uint64_t lo = pattern_data[0];
+    const uint64_t hi = pattern_data[1];
+    for (size_t k = 0; k < buf_len; k++) {
+        buf_data[2 * k] = lo;
+        buf_data[2 * k + 1] = hi;
+    }
+}#
+// Fills the whole u128[] buffer with the element bits taken from the
+// single-element pattern array (128-bit/f16 values cannot cross FFI as
+// scalars — MSVC has no 128-bit param convention and a u16 param would lose
+// the f16 bit pattern).
+@internal
+@extern("C")
+fun __mem_fill_u128(buf: u128[], pattern: u128[]): void #{
+    if (buf_len == 0 || pattern_len == 0) return;
+    const uint64_t lo = pattern_data[0];
+    const uint64_t hi = pattern_data[1];
+    for (size_t k = 0; k < buf_len; k++) {
+        buf_data[2 * k] = lo;
+        buf_data[2 * k + 1] = hi;
+    }
+}#
+// Fills the whole f128[] buffer with the element bits taken from the
+// single-element pattern array (128-bit/f16 values cannot cross FFI as
+// scalars — MSVC has no 128-bit param convention and a u16 param would lose
+// the f16 bit pattern).
+@internal
+@extern("C")
+fun __mem_fill_f128(buf: f128[], pattern: f128[]): void #{
+    if (buf_len == 0 || pattern_len == 0) return;
+    const uint64_t lo = pattern_data[0];
+    const uint64_t hi = pattern_data[1];
+    for (size_t k = 0; k < buf_len; k++) {
+        buf_data[2 * k] = lo;
+        buf_data[2 * k + 1] = hi;
+    }
+}#
+// Reverses the i128[] buffer in place (2 x 8-byte word swaps per element).
+@internal
+@extern("C")
+fun __mem_reverse_i128(buf: i128[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        for (size_t w = 0; w < 2; w++) {
+            uint64_t t = buf_data[i * 2 + w];
+            buf_data[i * 2 + w] = buf_data[j * 2 + w];
+            buf_data[j * 2 + w] = t;
+        }
+        i++;
+    }
+}#
+// Reverses the u128[] buffer in place (2 x 8-byte word swaps per element).
+@internal
+@extern("C")
+fun __mem_reverse_u128(buf: u128[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        for (size_t w = 0; w < 2; w++) {
+            uint64_t t = buf_data[i * 2 + w];
+            buf_data[i * 2 + w] = buf_data[j * 2 + w];
+            buf_data[j * 2 + w] = t;
+        }
+        i++;
+    }
+}#
+// Reverses the f128[] buffer in place (2 x 8-byte word swaps per element).
+@internal
+@extern("C")
+fun __mem_reverse_f128(buf: f128[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        for (size_t w = 0; w < 2; w++) {
+            uint64_t t = buf_data[i * 2 + w];
+            buf_data[i * 2 + w] = buf_data[j * 2 + w];
+            buf_data[j * 2 + w] = t;
+        }
+        i++;
+    }
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_i128(dst: i128[], dst_at: usize, src: i128[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove((unsigned char*)dst_data + dst_at * 16,
+            (const unsigned char*)src_data + src_at * 16,
+            (size_t)count * 16);
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_u128(dst: u128[], dst_at: usize, src: u128[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove((unsigned char*)dst_data + dst_at * 16,
+            (const unsigned char*)src_data + src_at * 16,
+            (size_t)count * 16);
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_f128(dst: f128[], dst_at: usize, src: f128[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove((unsigned char*)dst_data + dst_at * 16,
+            (const unsigned char*)src_data + src_at * 16,
+            (size_t)count * 16);
+}#
+// Lexicographic three-way comparison over uint64-pair elements (signed 128: high word signed, low word unsigned (two's complement)).
+@internal
+@extern("C")
+fun __mem_compare_i128(a: i128[], b: i128[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        int64_t ah = (int64_t)a_data[2 * k + 1]; int64_t bh = (int64_t)b_data[2 * k + 1];
+        if (ah != bh) return ah < bh ? -1 : 1;
+        uint64_t alo = a_data[2 * k];
+        uint64_t blo = b_data[2 * k];
+        if (alo != blo) return alo < blo ? -1 : 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Lexicographic three-way comparison over uint64-pair elements (unsigned 128).
+@internal
+@extern("C")
+fun __mem_compare_u128(a: u128[], b: u128[]): i32 #{
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        uint64_t ah = a_data[2 * k + 1]; uint64_t bh = b_data[2 * k + 1];
+        if (ah != bh) return ah < bh ? -1 : 1;
+        uint64_t alo = a_data[2 * k];
+        uint64_t blo = b_data[2 * k];
+        if (alo != blo) return alo < blo ? -1 : 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Lexicographic three-way comparison using IEEE 754 totalOrder sort keys
+// (exact port of the engine's F128 Ord: negatives flip all bits, positives
+// set the sign bit — so -0.0 sorts strictly before +0.0, NaNs order by
+// payload). Elements are native uint64 lo/hi pairs.
+@internal
+@extern("C")
+fun __mem_compare_f128(a: f128[], b: f128[]): i32 #{
+    #define FROND_K128(hi, lo, kh, kl) do {         if ((hi) >> 63) { kh = ~(hi); kl = ~(lo); }         else { kh = (hi) | 0x8000000000000000ULL; kl = (lo); }     } while (0)
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        uint64_t ah0, al0, bh0, bl0;
+        FROND_K128(a_data[2 * k + 1], a_data[2 * k], ah0, al0);
+        FROND_K128(b_data[2 * k + 1], b_data[2 * k], bh0, bl0);
+        if (ah0 != bh0) return ah0 < bh0 ? -1 : 1;
+        if (al0 != bl0) return al0 < bl0 ? -1 : 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+    #undef FROND_K128
+}#
+// Index of the first occurrence of needle in hay; -1 when absent
+// (equality is bitwise — exact for i128/u128, and for f128 whose engine
+// equality is byte-wise too).
+@internal
+@extern("C")
+fun __mem_index_of_i128(hay: i128[], needle: i128[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    size_t nb = (size_t)needle_len * 16;
+    const unsigned char* hp = (const unsigned char*)hay_data;
+    const unsigned char* np = (const unsigned char*)needle_data;
+    for (size_t i = 0; i <= last; i++) {
+        if (memcmp(hp + i * 16, np, nb) == 0) return (int64_t)i;
+    }
+    return -1;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent
+// (equality is bitwise — exact for i128/u128, and for f128 whose engine
+// equality is byte-wise too).
+@internal
+@extern("C")
+fun __mem_index_of_u128(hay: u128[], needle: u128[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    size_t nb = (size_t)needle_len * 16;
+    const unsigned char* hp = (const unsigned char*)hay_data;
+    const unsigned char* np = (const unsigned char*)needle_data;
+    for (size_t i = 0; i <= last; i++) {
+        if (memcmp(hp + i * 16, np, nb) == 0) return (int64_t)i;
+    }
+    return -1;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent.
+// NUMERIC IEEE equality (NaN never matches, -0.0 == 0.0) — matching the
+// engine's observable f128 array semantics (its SoA-SIMD array `==` and
+// scalar != both treat NaN as unequal). Implemented bitwise: identical bits
+// that are not NaN, or the two zero signs.
+@internal
+@extern("C")
+fun __mem_index_of_f128(hay: f128[], needle: f128[]): i64 #{
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        size_t j = 0;
+        while (j < needle_len) {
+            uint64_t alo = hay_data[2 * (i + j)], ahi = hay_data[2 * (i + j) + 1];
+            uint64_t blo = needle_data[2 * j], bhi = needle_data[2 * j + 1];
+            int eq;
+            if (ahi == bhi && alo == blo) {
+                /* identical bits: numeric equal unless NaN (exponent all ones + nonzero mantissa) */
+                eq = !((ahi & 0x7FFF000000000000ULL) == 0x7FFF000000000000ULL &&
+                       (((ahi & 0x0000FFFFFFFFFFFFULL) != 0) || alo != 0));
+            } else {
+                /* different bits: numeric equal only across the two zero signs */
+                eq = ((ahi & 0x7FFFFFFFFFFFFFFFULL) == 0 && alo == 0 &&
+                      (bhi & 0x7FFFFFFFFFFFFFFFULL) == 0 && blo == 0);
+            }
+            if (!eq) break;
+            j++;
+        }
+        if (j == needle_len) return (int64_t)i;
+    }
+    return -1;
+}#
+// Fills the whole f16[] buffer with the raw bits of the single-element
+// pattern array (bit pattern preserved: NaN payloads survive).
+@internal
+@extern("C")
+fun __mem_fill_f16(buf: f16[], pattern: f16[]): void #{
+    if (buf_len == 0 || pattern_len == 0) return;
+    const uint16_t p = pattern_data[0];
+    for (size_t k = 0; k < buf_len; k++) buf_data[k] = p;
+}#
+// Reverses the f16[] buffer in place.
+@internal
+@extern("C")
+fun __mem_reverse_f16(buf: f16[]): void #{
+    size_t i = 0;
+    size_t j = buf_len;
+    while (j > i + 1) {
+        j--;
+        uint16_t t = buf_data[i];
+        buf_data[i] = buf_data[j];
+        buf_data[j] = t;
+        i++;
+    }
+}#
+// Copies count elements src[src_at..] → dst[dst_at..] (memmove: overlapping
+// windows of the same buffer behave as if taken out first, then written).
+@internal
+@extern("C")
+fun __mem_copy_f16(dst: f16[], dst_at: usize, src: f16[], src_at: usize, count: usize): void #{
+    if (count == 0) return;
+    if (dst_at > dst_len || count > dst_len - dst_at) {
+        fprintf(stderr, "mem.copy: destination range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)dst_at, (unsigned long long)(dst_at + count),
+                (unsigned long long)dst_len);
+        abort();
+    }
+    if (src_at > src_len || count > src_len - src_at) {
+        fprintf(stderr, "mem.copy: source range [%llu, %llu) out of bounds (len %llu)\n",
+                (unsigned long long)src_at, (unsigned long long)(src_at + count),
+                (unsigned long long)src_len);
+        abort();
+    }
+    memmove((unsigned char*)dst_data + dst_at * 2,
+            (const unsigned char*)src_data + src_at * 2,
+            (size_t)count * 2);
+}#
+// Lexicographic three-way comparison, IEEE semantics via half→float
+// promotion (matches the engine: f16 </> == its f64-promoted comparison, so
+// NaN comparisons are false and -0.0 == 0.0).
+
+
+@internal
+@extern("C")
+fun __mem_compare_f16(a: f16[], b: f16[]): i32 #{
+#define FROND_H2F(h, outf) do { \
+    uint32_t sgn_ = (uint32_t)((h) >> 15); \
+    uint32_t ex_ = (uint32_t)(((h) >> 10) & 0x1F); \
+    uint32_t mn_ = (uint32_t)((h) & 0x3FF); \
+    uint32_t b_; \
+    if (ex_ == 0) { \
+        if (mn_ == 0) { b_ = sgn_ << 31; } \
+        else { uint32_t e_ = 113; while ((mn_ & 0x400) == 0) { mn_ <<= 1; e_--; } mn_ &= 0x3FF; b_ = (sgn_ << 31) | (e_ << 23) | (mn_ << 13); } \
+    } else if (ex_ == 0x1F) { b_ = (sgn_ << 31) | 0x7F800000u | (mn_ << 13); } \
+    else { b_ = (sgn_ << 31) | ((ex_ + 112) << 23) | (mn_ << 13); } \
+    memcpy(&(outf), &b_, 4); \
+} while (0)
+
+    size_t n = a_len < b_len ? a_len : b_len;
+    for (size_t k = 0; k < n; k++) {
+        float x, y;
+        FROND_H2F(a_data[k], x);
+        FROND_H2F(b_data[k], y);
+        if (x < y) return -1;
+        if (x > y) return 1;
+    }
+    if (a_len < b_len) return -1;
+    if (a_len > b_len) return 1;
+    return 0;
+}#
+// Index of the first occurrence of needle in hay; -1 when absent. IEEE
+// numeric equality via half→float promotion (matches the engine's f16 ==:
+// NaN never equals anything, -0.0 == 0.0).
+@internal
+@extern("C")
+fun __mem_index_of_f16(hay: f16[], needle: f16[]): i64 #{
+#define FROND_H2F(h, outf) do { \
+    uint32_t sgn_ = (uint32_t)((h) >> 15); \
+    uint32_t ex_ = (uint32_t)(((h) >> 10) & 0x1F); \
+    uint32_t mn_ = (uint32_t)((h) & 0x3FF); \
+    uint32_t b_; \
+    if (ex_ == 0) { \
+        if (mn_ == 0) { b_ = sgn_ << 31; } \
+        else { uint32_t e_ = 113; while ((mn_ & 0x400) == 0) { mn_ <<= 1; e_--; } mn_ &= 0x3FF; b_ = (sgn_ << 31) | (e_ << 23) | (mn_ << 13); } \
+    } else if (ex_ == 0x1F) { b_ = (sgn_ << 31) | 0x7F800000u | (mn_ << 13); } \
+    else { b_ = (sgn_ << 31) | ((ex_ + 112) << 23) | (mn_ << 13); } \
+    memcpy(&(outf), &b_, 4); \
+} while (0)
+
+    if (needle_len == 0) return 0;
+    if (needle_len > hay_len) return -1;
+    size_t last = hay_len - needle_len;
+    for (size_t i = 0; i <= last; i++) {
+        size_t j = 0;
+        while (j < needle_len) {
+            float x, y;
+            FROND_H2F(hay_data[i + j], x);
+            FROND_H2F(needle_data[j], y);
+            if (x != y) break;
+            j++;
+        }
+        if (j == needle_len) return (int64_t)i;
+    }
+    return -1;
+}#

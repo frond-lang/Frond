@@ -9,3 +9,4 @@ pub pack TimeError
 pub pack OsError
 pub pack FfiError
 pub pack JsonError
+pub pack FmtError

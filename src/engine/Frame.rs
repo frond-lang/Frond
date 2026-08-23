@@ -195,6 +195,9 @@ impl<S: LockStrategy> Engine<S> {
             frame.graph = self.graph.clone();
             frame.value_table.resize(node_count);
             frame.value_table.reset_all();
+            // E6: re-targeted pooled frame — dirty tracking belongs to the previous
+            // loop-boundary pairing only.
+            frame.value_table.disable_dirty_tracking();
             frame.pending_inputs.resize(node_count, 0);
             frame.ready_queue.clear();
             frame.state = FrameState::Ready;
@@ -214,6 +217,8 @@ impl<S: LockStrategy> Engine<S> {
             // E3: per-subgraph derivation cache is invalid once the frame is re-targeted.
             frame.same_fn_prep_cache = None;
             frame.closure_val = None;
+            frame.branch_relays.clear();
+            frame.construct_cache.clear();
             frame_box
         } else {
             drop(pool);
@@ -338,6 +343,15 @@ impl<S: LockStrategy> Engine<S> {
         loop_fid: FrameId,
         body_frame: &mut Frame,
     ) {
+        // Both frames re-enter the loop protocol with a clean slate: scrub any
+        // stale waiter registrations so a leftover entry from the finished
+        // iteration can never disturb a later one.
+        {
+            let body_fid = body_frame.id;
+            self.event_waiters
+                .lock()
+                .retain(|(_, wf)| *wf != loop_fid && *wf != body_fid);
+        }
         let loop_sg_id = loop_frame.subgraph_id;
         // Borrow the plan from the graph instead of cloning: reset_plan stays immutable for the
         // whole run, and both this borrow and reset_condition_tree(&self) are shared borrows.
@@ -349,7 +363,34 @@ impl<S: LockStrategy> Engine<S> {
         // correction).
         let loop_offset = loop_frame.node_offset;
 
-        // 0. Clear ready_queue (must precede steps 1-3 pushing cond/iter_next/gate).
+        // 0. Place-model phi carries: loop-carried cell values ride the sg's
+        // param slots. The body's final values are READ now (before its frame
+        // is reset_all'd) and STASHED; the slot writes + consumer pokes happen
+        // at the END of this reset — the gate is only reset to pending=1 in
+        // step 4 below, so poking any earlier lands on an already-executed
+        // gate and the re-check never fires (loop stalls after one round).
+        // The `carries_cell` variant dereferences through the Cell (for
+        // conditionally stored vars with no statically known final node).
+        let mut stashed_carries: Vec<(NodeId, Value)> = Vec::new();
+        if let Some(plan) = reset_plan {
+            for &(param_gid, src_gid) in &plan.carries_value {
+                let v = body_frame.get_value_by_global(src_gid);
+                stashed_carries.push((param_gid, v));
+            }
+            for &(param_gid, cell_gid) in &plan.carries_cell {
+                let cv = body_frame.get_value_by_global(cell_gid);
+                let v = match cv.heap_ref() {
+                    Some(arc) => match arc.as_ref() {
+                        crate::value::HeapObj::Cell(c) => c.get(),
+                        _ => cv,
+                    },
+                    None => cv,
+                };
+                stashed_carries.push((param_gid, v));
+            }
+        }
+
+        // 0b. Clear ready_queue (must precede steps 1-3 pushing cond/iter_next/gate).
         loop_frame.ready_queue.clear();
 
         // 1-3. Data-driven reset via ResetPlan when present; otherwise fall back to the LoopKind
@@ -412,12 +453,104 @@ impl<S: LockStrategy> Engine<S> {
         // not be called (it would reset node_offset to the body subgraph's node_range.0, misaligning
         // value-table indices and causing WriteBack's target - node_offset to compute a wrong local,
         // skipping the body frame).
-        body_frame.value_table.reset_all();
+        //
+        // E6 incremental path: the body frame's value table is sized to the whole parent
+        // function, but the slots it actually owns are its subgraph's node range. Clearing
+        // that static range is O(body) instead of reset_all's O(function); out-of-branch
+        // slots are refreshed from the loop frame's dirty set below (only the loop frame
+        // needs dirty tracking — every write the body makes outside its range is mirrored
+        // into the loop frame by WriteBack's chain walk, so the delta source sees it).
+        // Untouched out-of-branch slots still mirror the loop frame from the previous
+        // boundary, so skipping their re-copy is value-identical.
+        let body_sg = &self.graph.subgraphs[body_frame.subgraph_id.0 as usize];
+        let (body_branch_start, body_branch_end) = body_sg.node_range;
+        // First boundary runs the legacy full reset + full copy, which leaves the two frames
+        // value-synchronized; tracking is enabled there, so from the second boundary on the
+        // delta path has a complete dirty history.
+        let delta_eligible = reset_plan.is_some()
+            && !super::env_flag("FROND_NO_DELTA_RESET")
+            && !super::env_flag("FROND_NO_REUSECHAIN");
+        let delta_reset = delta_eligible && loop_frame.value_table.dirty_tracking_enabled();
+        let body_offset = body_frame.node_offset;
+        let body_len = body_frame.value_table.len();
+        if delta_reset {
+            let clear_start = body_branch_start.0.wrapping_sub(body_offset) as usize;
+            let clear_end = body_branch_end.0.wrapping_sub(body_offset) as usize;
+            let clear_end = clear_end.min(body_len);
+            for i in clear_start..clear_end {
+                body_frame.value_table.reset_slot(i);
+            }
+        } else {
+            body_frame.value_table.reset_all();
+        }
         body_frame.ready_queue.clear();
         body_frame.select_timers.clear();
+        body_frame.branch_relays.clear();
         body_frame.cached_child_frame = None;
         body_frame.hot_body = None;
         body_frame.control_signal = ControlSignal::None;
+
+        // Apply the stashed phi carries BEFORE copy_outer_ready_values: the
+        // copy materializes the loop frame's ready slots (params included)
+        // into the body frame — carrying after it would leave the body with
+        // the previous iteration's param values. The gate was reset to
+        // pending=1 in step 4 (before the body reset), so the pokes land on a
+        // waiting gate and re-fire the condition chain.
+        if !stashed_carries.is_empty() {
+            // E2 fused path: when the precomputed plan is present, the
+            // application is direct slot arithmetic — no chain walk, no
+            // downstream-slice lookup, no consumer-count recompute. Falls
+            // back to the generic path when the plan is missing (fresh
+            // build before precompute, exotic frames).
+            let fused = reset_plan.and_then(|p| {
+                (!p.fused_carries.is_empty()).then(|| &p.fused_carries)
+            });
+            match fused {
+                Some(fused) => {
+                    // The stashed values were read BEFORE the body frame's
+                    // reset_all (which wipes it) — match them to the fused
+                    // plan by param id, never re-read the body frame here.
+                    for fc in fused {
+                        let param_gid = NodeId(fc.param_local.wrapping_add(loop_offset));
+                        let v = stashed_carries
+                            .iter()
+                            .find(|(g, _)| *g == param_gid)
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(Value::NULL);
+                        let pl = fc.param_local as usize;
+                        if pl < loop_frame.value_table.len() {
+                            loop_frame.value_table.values[pl] = v;
+                            loop_frame.value_table.set_ready(pl);
+                            loop_frame.value_table.record_dirty_slot(pl);
+                            for &ds in &fc.consumers {
+                                let d = ds as usize;
+                                if d < loop_frame.pending_inputs.len() {
+                                    let p = loop_frame.pending_inputs[d];
+                                    if p > 0 && p != PENDING_EXTERNAL {
+                                        let np = p - 1;
+                                        loop_frame.pending_inputs[d] = np;
+                                        if np == 0
+                                            && !loop_frame.value_table.is_ready(d)
+                                        {
+                                            loop_frame.push_ready(NodeId(ds));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let graph = &self.graph;
+                    for &(param_gid, ref v) in &stashed_carries {
+                        let param_local = NodeId(param_gid.0.wrapping_sub(loop_offset));
+                        let consumers = graph.downstream_count(param_gid.0 as usize);
+                        loop_frame.set_value(param_local, v.clone(), consumers);
+                        notify_downstream(loop_frame, graph, param_local, param_gid, NodeId(loop_offset));
+                    }
+                }
+            }
+        }
 
         // Re-copy outer-variable values from loop_frame first (consistent with start_subgraph).
         // This copy must happen before prepare_same_function_frame: the 0-input enqueue logic in
@@ -425,10 +558,39 @@ impl<S: LockStrategy> Engine<S> {
         // if outer variables are not ready, nodes depending on outer variables would be incorrectly
         // marked pending==0 and enqueued, then read empty values at execution (repro: a for-in loop
         // body executing only its first iteration).
-        let body_sg = &self.graph.subgraphs[body_frame.subgraph_id.0 as usize];
-        let (body_branch_start, body_branch_end) = body_sg.node_range;
-        let copy_count = loop_frame.value_table.len().min(body_frame.value_table.len());
-        copy_outer_ready_values(body_frame, loop_frame, copy_count, body_branch_start.0, body_branch_end.0);
+        if delta_reset {
+            // E6 delta copy: refresh only the loop-frame slots written since the last
+            // boundary. In-branch slots are the body's own (recomputed each iteration —
+            // skipped, matching the full copy's branch-range skip). An unready loop slot
+            // (e.g. a condition-tree node reset by the plan) clears the body's mirror.
+            let loop_dirty_len = loop_frame.value_table.dirty_len();
+            for k in 0..loop_dirty_len {
+                let idx = loop_frame.value_table.dirty_slot(k);
+                let gid = loop_offset.wrapping_add(idx);
+                if gid >= body_branch_start.0 && gid < body_branch_end.0 {
+                    continue;
+                }
+                let i = idx as usize;
+                if i >= body_len {
+                    continue;
+                }
+                if loop_frame.value_table.is_ready(i) {
+                    body_frame.value_table.copy_slot_from(i, &loop_frame.value_table);
+                } else {
+                    body_frame.value_table.reset_slot(i);
+                }
+            }
+            loop_frame.value_table.end_dirty_generation();
+        } else {
+            let copy_count = loop_frame.value_table.len().min(body_frame.value_table.len());
+            copy_outer_ready_values(body_frame, loop_frame, copy_count, body_branch_start.0, body_branch_end.0);
+            if delta_eligible {
+                // The full reset + full copy above synchronized the frames; start tracking
+                // so the NEXT boundary can take the delta path. Only the loop frame needs
+                // tracking — it is the delta source.
+                loop_frame.value_table.enable_dirty_tracking();
+            }
+        }
 
         // After copying outer variables, set pending_inputs + enqueue 0-input nodes.
         // E5: when the body has a linearized plan, skip the readiness derivation entirely —
@@ -455,7 +617,9 @@ impl<S: LockStrategy> Engine<S> {
             loop_ptr
         };
 
+
         // 5. Reset the loop frame state.
+        loop_frame.branch_relays.clear();
         loop_frame.control_signal = ControlSignal::None;
         loop_frame.state = FrameState::Ready;
         loop_frame.suspend_state = SuspendState::NotSuspended;
@@ -506,7 +670,12 @@ impl<S: LockStrategy> Engine<S> {
             .map(|s| (s.node_range.0 .0, s.node_range.1 .0))
             .collect();
         let is_nested = |gid: u32| nested_ranges.iter().any(|&(s, e)| gid >= s && gid < e);
-        let is_in_sg = |gid: u32| gid >= sg_start.0 && gid < sg_end.0 && !is_nested(gid);
+        // The sg's PARAM-prefix nodes are excluded: their slots are injected
+        // (call args / phi carries), never re-computed — re-firing their
+        // CF_NOOP would overwrite the injected value with VOID.
+        let param_end = sg_start.0 + sg.param_count as u32;
+        let is_in_sg =
+            |gid: u32| gid >= param_end && gid < sg_end.0 && !is_nested(gid);
 
         // DFS-collect all nodes in the cond_node dependency tree that lie inside the loop subgraph.
         //
@@ -542,14 +711,18 @@ impl<S: LockStrategy> Engine<S> {
                 .graph
                 .inputs(node.inputs_offset, node.input_count);
 
-            // pending = number of inputs within the dependency tree (these inputs will be
-            // re-evaluated). External inputs (e.g. variables outside the loop) are accessed via the
-            // frame chain and are already ready, so they are not counted.
+            // pending = number of inputs within the dependency tree (re-evaluated
+            // this iteration) PLUS param-prefix inputs (their completion signal
+            // is the phi carry's poke — counting them prevents an early fire
+            // that would read freshly-cleared sibling slots as 0). Other
+            // external inputs (variables outside the loop) are accessed via
+            // the frame chain and already ready, so they are not counted.
+            let in_param_prefix =
+                |gid: u32| gid >= sg_start.0 && gid < sg_start.0 + sg.param_count as u32;
             let pending: u16 = inputs
                 .iter()
                 .filter(|&&inp| {
-                    visited.contains(&inp.0)
-                        && is_in_sg(inp.0)
+                    in_param_prefix(inp.0) || (visited.contains(&inp.0) && is_in_sg(inp.0))
                 })
                 .count() as u16;
 

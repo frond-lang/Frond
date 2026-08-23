@@ -14,10 +14,40 @@
 //!
 //! Supported since the u8[] expansion fix: `u8[]` → `(Ptr, Int)` (data + length),
 //! with post-call writeback of C-side mutations (`apply_writebacks`).
-//! Not supported (later stages): str out-param returns.
+//! Scalar arrays (i32[], f64[], …) use the same `(Ptr, Int)` shape since the
+//! mem scalar-intrinsic batch: the SoA column / element vector is serialized to
+//! native-endian bytes, the Int slot carries the ELEMENT count (for u8[] that
+//! is identical to its byte count), and mutations are decoded back by the
+//! array's own element tag. Not supported (later stages): str out-param returns.
 
 use crate::ffi::Abi::{AbiSig, AbiSlot, AbiType, RetSlot};
-use crate::value::{HeapObj, OpaquePointer, PtrKind, ScalarSoA, Value};
+use crate::value::{HeapObj, OpaquePointer, PtrKind, Value, ValueTag};
+
+/// Keepalive buffer backing one marshaled str / array argument.
+pub enum ArgBuf {
+    /// NUL-ended byte buffer for a str argument (`len` excludes the NUL).
+    Str { buf: Vec<u8>, len: usize },
+    /// Native-endian scalar-array bytes stored as u64 words so the data
+    /// pointer handed to C is at least 8-byte aligned — the C side
+    /// dereferences TYPED pointers (`int32_t*` etc.) into this buffer.
+    /// `nbytes` is the semantic byte length (elements × width), never
+    /// including the word padding.
+    Array { words: Vec<u64>, nbytes: usize },
+}
+
+/// Element width of an FFI-marshalable scalar tag (matches the C pointer
+/// types in ffi/Gen.rs `TYPE_MAP` and `ArrayValue::collect_scalar_bytes`).
+fn scalar_tag_esize(tag: ValueTag) -> usize {
+    match tag {
+        ValueTag::I8 | ValueTag::U8 | ValueTag::Bool => 1,
+        ValueTag::I16 | ValueTag::U16 => 2,
+        ValueTag::I32 | ValueTag::U32 | ValueTag::F32 | ValueTag::Char => 4,
+        ValueTag::I64 | ValueTag::U64 | ValueTag::Isize | ValueTag::Usize | ValueTag::F64 => 8,
+        ValueTag::F16 => 2,
+        ValueTag::I128 | ValueTag::U128 | ValueTag::F128 => 16,
+        _ => 0,
+    }
+}
 
 /// Encode `args` into a list of `AbiSlot`s according to `sig.params`.
 ///
@@ -31,12 +61,18 @@ use crate::value::{HeapObj, OpaquePointer, PtrKind, ScalarSoA, Value};
 ///
 /// Returns `Err(msg)` on a type mismatch.
 pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> {
-    // NULL-ended buffers for str args (and plain byte buffers for u8[] args); must
-    // outlive the call (str: C functions like strlen/printf require NULL-terminated
-    // strings, but Str's Arc<str> has no trailing NULL; u8[]: the buffer doubles as
-    // the writeback target for C-side mutations).
-    let mut str_buffers: Vec<Vec<u8>> = Vec::new();
-    let mut writebacks: Vec<(Value, usize)> = Vec::new();
+    // Keepalive buffers for str / array args; must outlive the call (str: C
+    // functions like strlen/printf require NUL-terminated strings, but Str's
+    // Arc<str> has no trailing NULL; arrays: the buffer doubles as the
+    // writeback target for C-side mutations).
+    let mut buffers: Vec<ArgBuf> = Vec::new();
+    // Heap address of each buffer's source array (null for str-arg buffers):
+    // alias detection so the SAME array passed as two array params shares ONE
+    // buffer instead of round-tripping stale bytes over each other's writeback.
+    let mut buf_owners: Vec<*const core::ffi::c_void> = Vec::new();
+    // (array Value, keepalive buffer index, element tag) for out-parameter
+    // writeback; consumed by `apply_writebacks` after the call returns.
+    let mut writebacks: Vec<(Value, usize, ValueTag)> = Vec::new();
     let mut slots = Vec::with_capacity(sig.params.len());
     let mut arg_idx = 0usize;
     let mut param_idx = 0usize;
@@ -50,23 +86,81 @@ pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> 
         let param = &sig.params[param_idx];
         let arg = &args[arg_idx];
 
-        // Detect u8[] expansion: the current param is Ptr, the next is Int, and the
-        // arg is HeapObj::Array. Bytes are copied into a keepalive buffer whose
-        // pointer is handed to C; `apply_writebacks` copies C-side mutations back
-        // into the array after the call (out-parameter pattern, e.g. read_into).
+        // Detect array expansion: the current param is Ptr, the next is Int, and
+        // the arg is HeapObj::Array. The SoA column (or element vector) is
+        // serialized to native-endian bytes in an 8-aligned keepalive buffer;
+        // the Int slot carries the ELEMENT count — the C side reads elements
+        // through its typed `{p}_data` pointer (for u8[] the element count is
+        // the byte count, unchanged from the original contract).
+        // `apply_writebacks` decodes C-side mutations back into the array
+        // (out-parameter pattern, e.g. read_into, Mem.fill).
         if matches!(param, AbiType::Ptr)
             && param_idx + 1 < sig.params.len()
             && matches!(sig.params[param_idx + 1], AbiType::Int { .. })
         {
             if let Some(HeapObj::Array(arr)) = arg.heap_obj() {
-                let bytes = arr.collect_u8_bytes();
-                let len = bytes.len();
-                let ptr = bytes.as_ptr();
-                str_buffers.push(bytes);
-                let buf_idx = str_buffers.len() - 1;
+                // Aliased array args (the SAME array as two array params, e.g.
+                // __mem_copy(dst, .., src, ..) with dst === src) must share ONE
+                // buffer: per-arg copies would have C mutate dst's copy only,
+                // then apply_writebacks writes src's stale copy back over it —
+                // the whole call silently becomes a no-op. Sharing the buffer
+                // lets C see the true overlapping windows (memmove semantics
+                // hold) and the duplicate writebacks are idempotent.
+                let owner = match arg {
+                    Value::Ref(arc) => std::sync::Arc::as_ptr(arc) as *const core::ffi::c_void,
+                    _ => core::ptr::null(),
+                };
+                // Empty array (no SoA, no elements — element type invisible):
+                // zero-length calls are legal C shapes (e.g. Mem.compare with
+                // an empty operand), so hand C a non-null aligned pointer with
+                // element count 0. Nothing to serialize, nothing to write back.
+                if arr.len() == 0 && arr.scalar_soa.is_none() {
+                    static EMPTY_ELEMS: u64 = 0;
+                    slots.push(AbiSlot::Ptr(&EMPTY_ELEMS as *const u64 as *mut core::ffi::c_void));
+                    slots.push(AbiSlot::Int(0));
+                    param_idx += 2;
+                    arg_idx += 1;
+                    continue;
+                }
+                let tag = arr.scalar_marshal_tag().ok_or_else(|| {
+                    "encode_args: array argument is not a marshalable scalar array \
+                     (non-scalar or mixed elements)"
+                        .to_string()
+                })?;
+                let existing = if owner.is_null() {
+                    None
+                } else {
+                    buf_owners.iter().position(|p| !p.is_null() && *p == owner)
+                };
+                let buf_idx = match existing {
+                    Some(i) => i,
+                    None => {
+                        let (bytes, ser_tag) = arr.collect_scalar_bytes().ok_or_else(|| {
+                            "encode_args: array argument is not a marshalable scalar array \
+                             (non-scalar or mixed elements)"
+                                .to_string()
+                        })?;
+                        debug_assert_eq!(ser_tag, tag);
+                        let words = bytes_to_aligned_words(&bytes);
+                        buffers.push(ArgBuf::Array { words, nbytes: bytes.len() });
+                        buf_owners.push(owner);
+                        buffers.len() - 1
+                    }
+                };
+                let (ptr, nbytes) = match &buffers[buf_idx] {
+                    ArgBuf::Array { words, nbytes } => (words.as_ptr(), *nbytes),
+                    // Same array aliased across a str param is not a real call
+                    // shape (the str branch fires on Str args first); reaching
+                    // this arm means a type-confused signature.
+                    ArgBuf::Str { .. } => {
+                        return Err("encode_args: array argument aliases a str buffer".to_string())
+                    }
+                };
+                let esize = scalar_tag_esize(tag);
+                let elems = (nbytes / esize) as u64;
                 slots.push(AbiSlot::Ptr(ptr as *mut core::ffi::c_void));
-                slots.push(AbiSlot::Int(len as u64));
-                writebacks.push((arg.clone(), buf_idx));
+                slots.push(AbiSlot::Int(elems));
+                writebacks.push((arg.clone(), buf_idx, tag));
                 param_idx += 2;
                 arg_idx += 1;
                 continue;
@@ -91,7 +185,10 @@ pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> 
             buf.push(0);
             let len = bytes.len();
             let ptr = buf.as_ptr();
-            str_buffers.push(buf);
+            buffers.push(ArgBuf::Str { buf, len });
+            // str buffers never join the array writeback path; keep the owners
+            // index aligned by pushing a null entry.
+            buf_owners.push(core::ptr::null());
             slots.push(AbiSlot::Ptr(ptr as *mut core::ffi::c_void));
             slots.push(AbiSlot::Int(len as u64));
             param_idx += 2;
@@ -121,23 +218,24 @@ pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> 
         arg_idx += 1;
     }
 
-    Ok(MarshalArgs { slots, _keepalive: str_buffers, writebacks })
+    Ok(MarshalArgs { slots, _keepalive: buffers, writebacks })
 }
 
-/// Return value of `encode_args`: the slots plus the NULL-buffer keepalive.
+/// Return value of `encode_args`: the slots plus the keepalive buffers.
 /// The caller must keep this value alive until `Abi::call_dynamic` returns.
 pub struct MarshalArgs {
     pub slots: Vec<AbiSlot>,
-    /// NULL-ended str buffers / u8[] byte buffers. Prevents C functions from
-    /// reading out of bounds and keeps u8[] writeback targets alive for the
-    /// duration of the call.
-    pub _keepalive: Vec<Vec<u8>>,
-    /// (array Value, keepalive buffer index) pairs for u8[] out-parameter
-    /// writeback; consumed by `apply_writebacks` after the call returns.
-    pub writebacks: Vec<(Value, usize)>,
+    /// NUL-ended str buffers / 8-aligned array byte buffers. Prevents C
+    /// functions from reading out of bounds and keeps writeback targets alive
+    /// for the duration of the call.
+    pub _keepalive: Vec<ArgBuf>,
+    /// (array Value, keepalive buffer index, element tag) pairs for
+    /// out-parameter writeback; consumed by `apply_writebacks` after the call
+    /// returns.
+    pub writebacks: Vec<(Value, usize, ValueTag)>,
 }
 
-/// Copy C-side mutations from the keepalive buffers back into the u8[] heap
+/// Copy C-side mutations from the keepalive buffers back into the array heap
 /// objects recorded during `encode_args`. Must run after `Abi::call_dynamic`
 /// returns (and only if the call actually happened — on dispatch error the C
 /// function never ran, so there is nothing to write back).
@@ -147,36 +245,40 @@ pub fn apply_writebacks(m: &mut MarshalArgs) {
     }
     let buffers = std::mem::take(&mut m._keepalive);
     let wbs = std::mem::take(&mut m.writebacks);
-    for (val, idx) in wbs {
-        if let Some(bytes) = buffers.get(idx) {
-            write_bytes_back(&val, bytes);
-        }
-    }
-}
-
-/// Write bytes into a `u8[]` heap object in place via `Arc::as_ptr` (the same
-/// shared-mutation pattern as `compute_array_store`: the engine is
-/// single-threaded, and the change is visible to every owner of the Arc).
-/// SOA U8 storage is the source of truth when present (mirrors
-/// `ArrayValue::collect_u8_bytes`' read preference); otherwise the per-element
-/// `elements` vector is updated.
-fn write_bytes_back(val: &Value, bytes: &[u8]) {
-    if let Value::Ref(arc) = val {
-        let ptr = std::sync::Arc::as_ptr(arc) as *mut HeapObj;
-        unsafe {
-            if let HeapObj::Array(arr) = &mut *ptr {
-                if let Some(ScalarSoA::U8(ref mut data)) = arr.scalar_soa {
-                    let n = bytes.len().min(data.len());
-                    data[..n].copy_from_slice(&bytes[..n]);
-                    return;
-                }
-                let n = bytes.len().min(arr.elements.len());
-                for i in 0..n {
-                    arr.elements[i] = Value::u8(bytes[i]);
+    for (val, idx, tag) in wbs {
+        let bytes: &[u8] = match buffers.get(idx) {
+            Some(ArgBuf::Array { words, nbytes }) => {
+                // SAFETY: `words` is owned by `buffers` and outlives this
+                // slice use; `nbytes` is within the word storage by
+                // construction (elements × width, padded up to words).
+                unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, *nbytes) }
+            }
+            _ => continue,
+        };
+        if let Value::Ref(arc) = &val {
+            // Shared in-place mutation via `Arc::as_ptr` (same pattern as
+            // `compute_array_store`: the engine is single-threaded, and the
+            // change is visible to every owner of the Arc).
+            let ptr = std::sync::Arc::as_ptr(arc) as *mut HeapObj;
+            unsafe {
+                if let HeapObj::Array(arr) = &mut *ptr {
+                    arr.write_scalar_bytes(bytes, tag);
                 }
             }
         }
     }
+}
+
+/// Pack bytes into u64-word storage (little copying, 8-byte-aligned pointer).
+/// Trailing bytes occupy the final (zero-padded) word.
+fn bytes_to_aligned_words(bytes: &[u8]) -> Vec<u64> {
+    let mut words = vec![0u64; bytes.len().div_ceil(8)];
+    // SAFETY: copying exactly `bytes.len()` into storage of
+    // `words.len() * 8 >= bytes.len()` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), words.as_mut_ptr() as *mut u8, bytes.len());
+    }
+    words
 }
 
 /// Decode `RetSlot` back into a `Value` according to `ret_type`.
