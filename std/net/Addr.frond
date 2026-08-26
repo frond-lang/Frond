@@ -1,0 +1,162 @@
+// Addr.frond — IpAddr/Ipv4Addr/Ipv6Addr/SocketAddr address types
+//
+// Design doc §6.2: network address types and constructors/accessors.
+// Scalar bit storage (zero waste): Ipv4Addr=u32, Ipv6Addr=hi/lo u64.
+// Types use newtype/ADT form so that values constructed by the syscall layer via
+// Value.makeRecordWithNames(type_name="Ipv4Addr"/"Ipv6Addr"/"IpAddr", ...)
+// can be recognized on the Frond side.
+//
+// Method dispatch is not yet supported; use module function call syntax (see std_instant/Main.frond):
+//   std.net.Addr.v4_loopback()
+//   std.net.Addr.v4_octet(addr, 0)
+
+// ─── Type definitions ──────────────────────────────────────────────────────
+
+// Ipv4Addr: newtype, fields = [__tag=0, bits=u32] (network byte order, big-endian)
+pub type Ipv4Addr = Ipv4Addr(pub bits: u32) {
+    // ─── Ipv4Addr accessors ──────────────────────────────────────────────
+
+    pub fun v4_octet(i: u8): u8 {
+        val idx = (i as u32)
+        val shift = (3 - idx) * 8
+        ((bits >> shift) & 0xFFu32) as u8
+    }
+
+    pub fun v4_bits(): u32 {
+        bits
+    }
+
+    pub fun v4_is_loopback(): bool {
+        v4_octet(0) == 127
+    }
+
+    pub fun v4_is_unspecified(): bool {
+        bits == 0
+    }
+}
+
+// Ipv6Addr: newtype, fields = [__tag=0, hi=u64, lo=u64] (hi/lo each 8 bytes, big-endian)
+pub type Ipv6Addr = Ipv6Addr(pub hi: u64, pub lo: u64) {
+    // ─── Ipv6Addr accessors ──────────────────────────────────────────────
+
+    pub fun v6_segment(i: u8): u16 {
+        val idx = (i as u64)
+        val word = if idx < 4 { hi } else { lo }
+        val shift = (3 - (idx % 4)) * 16
+        ((word >> shift) & 0xFFFFu64) as u16
+    }
+
+    pub fun v6_hi(): u64 {
+        hi
+    }
+
+    pub fun v6_lo(): u64 {
+        lo
+    }
+
+    pub fun v6_is_loopback(): bool {
+        hi == 0 && lo == 1
+    }
+
+    pub fun v6_is_unspecified(): bool {
+        hi == 0 && lo == 0
+    }
+}
+
+// IpAddr: ADT, V4(__tag=0, addr=Ipv4Addr) | V6(__tag=1, addr=Ipv6Addr)
+pub type IpAddr = | V4(Ipv4Addr) | V6(Ipv6Addr) {
+    pub fun ip_is_v4(): bool {
+        match this {
+            V4(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fun ip_is_v6(): bool {
+        match this {
+            V6(_) => true,
+            _ => false,
+        }
+    }
+}
+
+// SocketAddr: newtype, fields = [__tag=0, ip=IpAddr, port=u16]
+pub type SocketAddr = SocketAddr(pub ip: IpAddr, pub port: u16) {
+    pub fun socket_ip(): IpAddr {
+        ip
+    }
+
+    pub fun socket_port(): u16 {
+        port
+    }
+}
+
+// ─── Ipv4Addr constructors ──────────────────────────────────────────────
+
+pub fun v4_from_octets(a: u8, b: u8, c: u8, d: u8): Ipv4Addr {
+    Ipv4Addr(((a as u32) << 24) | ((b as u32) << 16) | ((c as u32) << 8) | (d as u32))
+}
+
+pub fun v4_from_bits(bits: u32): Ipv4Addr {
+    Ipv4Addr(bits)
+}
+
+pub fun v4_loopback(): Ipv4Addr {
+    v4_from_octets(127, 0, 0, 1)
+}
+
+pub fun v4_unspecified(): Ipv4Addr {
+    v4_from_bits(0)
+}
+
+// ─── Ipv6Addr constructors ──────────────────────────────────────────────
+
+pub fun v6_from_segments(w0: u16, w1: u16, w2: u16, w3: u16, w4: u16, w5: u16, w6: u16, w7: u16): Ipv6Addr {
+    val hi = ((w0 as u64) << 48) | ((w1 as u64) << 32) | ((w2 as u64) << 16) | (w3 as u64)
+    val lo = ((w4 as u64) << 48) | ((w5 as u64) << 32) | ((w6 as u64) << 16) | (w7 as u64)
+    Ipv6Addr(hi, lo)
+}
+
+pub fun v6_from_bits(hi: u64, lo: u64): Ipv6Addr {
+    Ipv6Addr(hi, lo)
+}
+
+pub fun v6_loopback(): Ipv6Addr {
+    v6_from_bits(0, 1)
+}
+
+pub fun v6_unspecified(): Ipv6Addr {
+    v6_from_bits(0, 0)
+}
+
+// ─── IpAddr constructors and predicates ──────────────────────────────────
+
+pub fun ip_from_v4(addr: Ipv4Addr): IpAddr {
+    V4(addr)
+}
+
+pub fun ip_from_v6(addr: Ipv6Addr): IpAddr {
+    V6(addr)
+}
+
+// Family predicate as a module function: pattern-matching the variants
+// must live in this module where V4/V6 are locally visible.
+pub fun is_v4(ip: IpAddr): bool {
+    match ip {
+        V4(_) => true,
+        V6(_) => false,
+    }
+}
+
+pub fun is_v6(ip: IpAddr): bool {
+    match ip {
+        V4(_) => false,
+        V6(_) => true,
+    }
+}
+
+// ─── SocketAddr ───────────────────────────────────────────────────
+
+pub fun socket_from(ip: IpAddr, port: u16): SocketAddr {
+    SocketAddr(ip, port)
+}

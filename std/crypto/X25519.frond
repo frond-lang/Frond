@@ -1,0 +1,30 @@
+// X25519.frond — Diffie-Hellman over Curve25519 (RFC 7748)
+//
+// Thin wrapper over the embedded-C __x25519 kernel. All arrays are 32-byte
+// little-endian; the scalar is clamped inside the kernel.
+
+// X25519 scalar multiplication: shared = x25519(my_scalar, their_public).
+// Also used with the base point to derive a public key from a secret.
+// The kernel returns 0 on success and fills `out` unconditionally (all-zero
+// on degenerate input, per RFC 7748 contributory-behavior allowance).
+pub fun x25519(scalar: u8[], point: u8[]): u8[] {
+    val out: u8[] = [0u8, ..32]
+    val _rc = __x25519(out, scalar, point)
+    out
+}
+
+// The X25519 base point (u = 9, little-endian).
+pub fun base_point(): u8[] {
+    var g: u8[] = [9u8]
+    var i = 0 as usize
+    while i < 31 {
+        g = g ++ [0u8]
+        i = i + 1
+    }
+    g
+}
+
+// Public key from a 32-byte secret scalar.
+pub fun public_key(secret: u8[]): u8[] {
+    x25519(secret, base_point())
+}

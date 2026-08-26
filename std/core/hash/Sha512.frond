@@ -1,0 +1,25 @@
+// Sha512.frond — SHA-512 / SHA-384 digests (part of std.core.hash)
+//
+// Both sit on the embedded-C __sha512_into (builtin/crypto, one body with
+// an is384 variant selector); this file is the thin width-facing wrapper.
+
+// SHA-512 digest of a byte array (64 bytes out).
+pub fun sha512(data: u8[]): u8[] {
+    val out: u8[] = [0u8, ..64]
+    val rc = __sha512_into(data, out, 0u32)
+    if rc != 0 {
+        return out
+    }
+    out
+}
+
+// SHA-384 digest of a byte array (48 bytes out; first-six-word truncation
+// of the shared compression core with its own IV).
+pub fun sha384(data: u8[]): u8[] {
+    val out: u8[] = [0u8, ..48]
+    val rc = __sha512_into(data, out, 1u32)
+    if rc != 0 {
+        return out
+    }
+    out
+}

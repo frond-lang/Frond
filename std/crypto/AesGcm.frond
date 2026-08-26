@@ -1,0 +1,39 @@
+// AesGcm.frond — AES-128/256-GCM AEAD (part of std.crypto)
+//
+// Thin wrapper over the embedded-C __aes_gcm_seal/__aes_gcm_open kernels.
+// Key length selects the variant (16 = AES-128, 32 = AES-256). IV is
+// conventionally 12 bytes (any length works per spec). Tag is always 16
+// bytes. open() verifies the tag in constant time and throws on mismatch.
+
+// seal result: ciphertext + authentication tag.
+pub type Sealed = Sealed(pub ct: u8[], pub tag: u8[])
+
+fun gcm_io_err(stage: str): IOError {
+    IOError(Other, "aes-gcm: " + stage, 0, null)
+}
+
+pub fun seal(key: u8[], iv: u8[], aad: u8[], pt: u8[]): Throw<Sealed, IOError> {
+    if key.len() != 16 && key.len() != 32 {
+        throw gcm_io_err("key must be 16 or 32 bytes")
+    }
+    val ct: u8[] = [0u8, ..pt.len()]
+    val tag: u8[] = [0u8, ..16]
+    val rc = __aes_gcm_seal(key, iv, aad, pt, ct, tag)
+    if rc != 0 {
+        throw gcm_io_err("seal failed")
+    }
+    Ok(Sealed(ct, tag))
+}
+
+// Verified decryption: Ok(pt) on tag match, Err on mismatch.
+pub fun open(key: u8[], iv: u8[], aad: u8[], ct: u8[], tag: u8[]): Throw<u8[], IOError> {
+    if key.len() != 16 && key.len() != 32 {
+        throw gcm_io_err("key must be 16 or 32 bytes")
+    }
+    val pt: u8[] = [0u8, ..ct.len()]
+    val rc = __aes_gcm_open(key, iv, aad, ct, tag, pt)
+    if rc != 0 {
+        throw gcm_io_err("tag verification failed")
+    }
+    Ok(pt)
+}

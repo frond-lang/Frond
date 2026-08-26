@@ -1,0 +1,81 @@
+// Sha256.frond — SHA-256 digest, HMAC-SHA256, HKDF-SHA256 (part of std.core.hash)
+//
+// The digest primitive is the embedded-C __sha256_into (builtin/crypto);
+// HMAC and HKDF are pure-Frond compositions over it (two/few hash calls —
+// graph-VM speed is plenty for these short messages).
+// First cryptographic members of the hash family (Crc32/Adler32/Xxh64 are
+// checksums, not cryptographic).
+
+// Materialize a fresh array from the prefix (slices of concat-built arrays
+// can confuse the C marshal layer in FFI calls).
+fun materialize_prefix(src: u8[], n: usize): u8[] {
+    var out: u8[] = [0u8, ..n]
+    var i = 0 as usize
+    while i < n {
+        out[i] = src[i]
+        i = i + 1
+    }
+    out
+}
+
+// SHA-256 digest of a byte array (32 bytes out).
+pub fun sha256(data: u8[]): u8[] {
+    val out: u8[] = [0u8, ..32]
+    val rc = __sha256_into(data, out)
+    if rc != 0 {
+        // The C body always returns 0; defensive passthrough of the zeroed
+        // buffer keeps the failure observable without inventing an error
+        // channel for a cannot-happen case.
+        return out
+    }
+    out
+}
+
+// HMAC-SHA256 (RFC 2104): key > 64 bytes is hashed down, shorter keys are
+// zero-padded; inner/outer pads are key XOR 0x36 / 0x5C.
+pub fun hmac_sha256(key: u8[], msg: u8[]): u8[] {
+    var k: u8[] = key
+    if k.len() > 64 {
+        k = sha256(k)
+    }
+    while k.len() < 64 {
+        k = k ++ [0u8]
+    }
+    var ipad: u8[] = []
+    var opad: u8[] = []
+    var i = 0 as usize
+    while i < 64 {
+        ipad = ipad ++ [(k[i] ^ 0x36u8)]
+        opad = opad ++ [(k[i] ^ 0x5Cu8)]
+        i = i + 1
+    }
+    sha256(opad ++ sha256(ipad ++ msg))
+}
+
+// HKDF-SHA256 (RFC 5869): extract-then-expand, up to 255 * 32 bytes.
+pub fun hkdf_sha256(salt: u8[], ikm: u8[], info: u8[], out_len: usize): u8[] {
+    val prk = hmac_sha256(salt, ikm)
+    var okm: u8[] = []
+    var t: u8[] = []
+    var counter: u8 = 1
+    while okm.len() < out_len {
+        t = hmac_sha256(prk, t ++ info ++ [counter])
+        okm = okm ++ t
+        counter = counter + 1
+    }
+    materialize_prefix(okm, out_len)
+}
+
+// HKDF-Expand only (RFC 5869 §2.3): takes the PRK directly, no Extract.
+// Needed when the caller already holds a PRK (e.g. TLS 1.3 HKDF-Expand-Label).
+pub fun hkdf_expand_sha256(prk: u8[], info: u8[], out_len: usize): u8[] {
+    var t: u8[] = []
+    var okm: u8[] = []
+    var counter: u8 = 1
+    while okm.len() < out_len {
+        t = hmac_sha256(prk, t ++ info ++ [counter])
+        okm = okm ++ t
+        counter = counter + 1
+    }
+    materialize_prefix(okm, out_len)
+}

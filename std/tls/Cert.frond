@@ -1,0 +1,405 @@
+// Cert.frond — minimal X.509 certificate (DER) parsing for chain
+// verification, part of std.tls.
+//
+// Scope is deliberately narrow and FAILS CLOSED on anything outside it:
+// EC public keys (P-256), ecdsa-with-SHA256 signatures, UTCTime /
+// GeneralizedTime validity, dNSName SAN entries (exact match or a
+// single left-most wildcard label), basicConstraints CA flag. Anything
+// else parses to a field the chain verifier will reject explicitly.
+//
+// DER model: TLV walkers only — no full ASN.1 grammar. A certificate
+// is walked structurally:
+//   Certificate ::= SEQ{ tbs SEQ, sigAlg SEQ, sig BITSTRING }
+//   tbs: [0]version? INTserial SEQsigalg SEQissuer SEQvalidity
+//        SEQsubject SEQspki [3]extensions?
+import std.time.Calendar
+import std.core.types.Str
+
+// ─── DER TLV walker ──────────────────────────────────────────────────
+
+pub type Tlv = Tlv(tag: u8, cstart: usize, clen: usize, start: usize, next: usize)
+
+// parse one TLV at `at`; tag must be single-byte (all X.509 tags are)
+pub fun tlv(b: u8[], at: usize): Tlv {
+    val tag = b[at]
+    var lstart = at + 1
+    var len = b[lstart] as usize
+    lstart = lstart + 1
+    if len >= 0x80 {
+        val nlen = len & 0x7F
+        len = 0
+        var i = 0 as usize
+        while i < nlen {
+            len = (len << 8) | (b[lstart + i] as usize)
+            i = i + 1
+        }
+        lstart = lstart + nlen
+    }
+    Tlv(tag, lstart, len, at, lstart + len)
+}
+
+// first content child TLV of the TLV at `at` (or the TLV itself if it
+// is not constructed — used for tolerant walking)
+pub fun child(b: u8[], t: Tlv): Tlv {
+    tlv(b, t.cstart)
+}
+
+pub fun bytes_equal(a: u8[], b: u8[]): bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var diff = 0 as u8
+    var i = 0 as usize
+    while i < a.len() {
+        diff = diff | (a[i] ^ b[i])
+        i = i + 1
+    }
+    diff == 0
+}
+
+// decode an OBJECT IDENTIFIER content to dotted form
+pub fun oid_text(b: u8[], at: usize, len: usize): str {
+    if len == 0 {
+        return ""
+    }
+    var first = b[at] as u64
+    var out = ""
+    if first < 40 {
+        out = "0.{first}"
+    } else if first < 80 {
+        out = "1.{first - 40}"
+    } else {
+        out = "2.{first - 80}"
+    }
+    var acc = 0 as u64
+    var i = 1 as usize
+    while i < len {
+        acc = (acc << 7) | ((b[at + i] as u64) & 0x7F)
+        if (b[at + i] & 0x80) == 0 {
+            out = out + ".{acc}"
+            acc = 0
+        }
+        i = i + 1
+    }
+    out
+}
+
+// ─── time parsing ────────────────────────────────────────────────────
+
+fun two(b: u8[], at: usize): i64 {
+    (((b[at] - '0' as u8) as i64) * 10) + ((b[at + 1] - '0' as u8) as i64)
+}
+
+// UTCTime "YYMMDDHHMMSSZ" (YY>=50 → 19YY else 20YY) or GeneralizedTime
+// "YYYYMMDDHHMMSSZ" → seconds since epoch
+pub fun parse_time(b: u8[], at: usize, len: usize): i64 {
+    if len < 10 {
+        return 0
+    }
+    var year = two(b, at)
+    var pos = 2 as usize
+    if len >= 14 && b[at + 14] == 'Z' as u8 {
+        // GeneralizedTime: YYYY...
+        year = year * 100 + two(b, at + 2)
+        pos = 4
+    } else {
+        if year >= 50 {
+            year = year + 1900
+        } else {
+            year = year + 2000
+        }
+    }
+    val month = two(b, at + pos)
+    val day = two(b, at + pos + 2)
+    val hour = two(b, at + pos + 4)
+    val minute = two(b, at + pos + 6)
+    val second = two(b, at + pos + 8)
+    Calendar.days_from_civil(year as i32, month as u8, day as u8) * 86400
+        + hour * 3600 + minute * 60 + second
+}
+
+// ─── certificate model ───────────────────────────────────────────────
+
+pub type Certificate = Certificate(
+    pub tbs: u8[],          // tbsCertificate TLV bytes (hash input)
+    pub sig_oid: str,       // signature algorithm OID (dotted)
+    pub sig: u8[],          // signature BIT STRING contents (DER ECDSA-Sig)
+    pub issuer: u8[],       // issuer name TLV bytes
+    pub subject: u8[],      // subject name TLV bytes
+    pub key_oid: str,       // SPKI algorithm OID
+    pub curve_oid: str,     // namedCurve OID ("" when absent)
+    pub pub_point: u8[],    // EC point, 0x04 || X || Y
+    pub not_before: i64,    // epoch seconds
+    pub not_after: i64,
+    pub san: str[],         // dNSName entries
+    pub is_ca: bool,
+)
+
+val OID_ECDSA_SHA256: str = "1.2.840.10045.4.3.2"
+val OID_EC_PUBKEY: str = "1.2.840.10045.2.1"
+val OID_P256: str = "1.2.840.10045.3.1.7"
+
+pub fun supports_sig(oid: str): bool {
+    oid == OID_ECDSA_SHA256
+}
+
+pub type SpkiParts = SpkiParts(key_oid: str, curve_oid: str, point: u8[])
+
+// walk the subjectPublicKeyInfo: key algorithm OID, curve OID, point
+fun parse_spki(b: u8[], spki: Tlv): SpkiParts {
+    val alg = tlv(b, spki.cstart)
+    val oid = tlv(b, alg.cstart)
+    var key_oid = ""
+    if oid.tag == 0x06u8 {
+        key_oid = oid_text(b, oid.cstart, oid.clen)
+    }
+    var curve = ""
+    // optional namedCurve parameter after the algorithm OID
+    val param = tlv(b, oid.next)
+    if param.tag == 0x06u8 && param.next <= alg.next {
+        curve = oid_text(b, param.cstart, param.clen)
+    }
+    val bits = tlv(b, alg.next)
+    var point: u8[] = []
+    if bits.tag == 0x03u8 && bits.clen > 1 {
+        // BIT STRING: first content byte = unused-bit count (0 for keys)
+        point = b[bits.cstart + 1..bits.next]
+    }
+    SpkiParts(key_oid, curve, point)
+}
+
+// parse extensions for SAN dNSName entries and basicConstraints CA
+pub type ExtParts = ExtParts(san: str[], is_ca: bool)
+
+fun parse_extensions(b: u8[], exts: Tlv, san_out: str[], ca_out: bool): ExtParts {
+    var san = san_out
+    var ca = ca_out
+    // [3] EXPLICIT wraps SEQ{ Extension, ... }; start at the first
+    // Extension inside that inner SEQUENCE
+    val wrapper = tlv(b, exts.cstart)
+    if wrapper.tag != 0x30u8 {
+        return ExtParts(san, ca)
+    }
+    var e = tlv(b, wrapper.cstart)
+    while e.start < exts.next {
+        // Extension SEQ{ OID, critical? BOOLEAN, value OCTET STRING }
+        var f = tlv(b, e.cstart)
+        var oid = ""
+        if f.tag == 0x06u8 {
+            oid = oid_text(b, f.cstart, f.clen)
+        }
+        var cursor = f.next
+        var val_tlv = tlv(b, cursor)
+        // skip optional critical BOOLEAN
+        if val_tlv.tag == 0x01u8 {
+            cursor = val_tlv.next
+            val_tlv = tlv(b, cursor)
+        }
+        if val_tlv.tag == 0x04u8 {
+            if oid == "2.5.29.17" {
+                // SAN OCTET STRING wraps SEQ of GeneralName; [2] = dNSName
+                val san_seq = tlv(b, val_tlv.cstart)
+                if san_seq.tag == 0x30u8 {
+                    var g2 = tlv(b, san_seq.cstart)
+                    while g2.start < san_seq.next {
+                        if g2.tag == 0x82u8 && g2.clen > 0 {
+                            var name_bytes: u8[] = []
+                            var k = 0 as usize
+                            while k < g2.clen {
+                                val c = b[g2.cstart + k]
+                                if c >= 32 && c < 127 {
+                                    name_bytes = name_bytes ++ [c]
+                                }
+                                k = k + 1
+                            }
+                            san = san ++ [name_bytes as str]
+                        }
+                        g2 = tlv(b, g2.next)
+                    }
+                }
+            } else if oid == "2.5.29.19" {
+                // basicConstraints OCTET STRING wraps SEQ{ BOOLEAN? , INT? }
+                var inner = tlv(b, val_tlv.cstart)
+                if inner.tag == 0x30u8 && inner.clen > 0 {
+                    var first = tlv(b, inner.cstart)
+                    if first.tag == 0x01u8 && first.clen > 0 && b[first.cstart] != 0 {
+                        ca = true
+                    }
+                }
+            }
+        }
+        e = tlv(b, e.next)
+    }
+    ExtParts(san, ca)
+}
+
+// Parse a DER certificate. Structural violations return Error; policy
+// (supported algorithms, curve) is the chain verifier's call.
+pub fun parse(der: u8[]): Throw<Certificate, str> {
+    if der.len() < 4 {
+        throw "certificate: truncated"
+    }
+    val cert = tlv(der, 0)
+    if cert.tag != 0x30u8 || cert.next != der.len() {
+        throw "certificate: not a DER sequence"
+    }
+    if cert.cstart >= der.len() {
+        throw "certificate: empty"
+    }
+    val tbs = tlv(der, cert.cstart)
+    if tbs.tag != 0x30u8 || tbs.next > der.len() {
+        throw "certificate: tbsCertificate missing"
+    }
+    if tbs.next >= der.len() {
+        throw "certificate: truncated after tbs"
+    }
+    val sig_alg = tlv(der, tbs.next)
+    if sig_alg.tag != 0x30u8 || sig_alg.next > der.len() {
+        throw "certificate: signatureAlgorithm missing"
+    }
+    if sig_alg.next >= der.len() {
+        throw "certificate: truncated after sigAlg"
+    }
+    val sig_bits = tlv(der, sig_alg.next)
+    if sig_bits.tag != 0x03u8 || sig_bits.clen < 2 || sig_bits.next > der.len() {
+        throw "certificate: signature BIT STRING missing"
+    }
+    val sig = der[sig_bits.cstart + 1..sig_bits.next]
+
+    // walk tbs children
+    var at = tbs.cstart
+    var c = tlv(der, at)
+    if c.tag == 0xA0u8 {
+        // [0] version
+        if c.next > tbs.next {
+            throw "certificate: version runs past tbs"
+        }
+        c = tlv(der, c.next)
+    }
+    // serial INTEGER
+    if c.tag != 0x02u8 {
+        throw "certificate: serialNumber missing"
+    }
+    val tbs_sig_alg = tlv(der, c.next)
+    if tbs_sig_alg.tag != 0x30u8 {
+        throw "certificate: tbs signature field missing"
+    }
+    val issuer = tlv(der, tbs_sig_alg.next)
+    if issuer.tag != 0x30u8 {
+        throw "certificate: issuer missing"
+    }
+    val validity = tlv(der, issuer.next)
+    if validity.tag != 0x30u8 {
+        throw "certificate: validity missing"
+    }
+    val not_before_t = tlv(der, validity.cstart)
+    val not_after_t = tlv(der, not_before_t.next)
+    if not_before_t.tag != 0x17u8 && not_before_t.tag != 0x18u8 {
+        throw "certificate: notBefore not a time"
+    }
+    if not_after_t.tag != 0x17u8 && not_after_t.tag != 0x18u8 {
+        throw "certificate: notAfter not a time"
+    }
+    val subject = tlv(der, validity.next)
+    if subject.tag != 0x30u8 {
+        throw "certificate: subject missing"
+    }
+    val spki = tlv(der, subject.next)
+    if spki.tag != 0x30u8 {
+        throw "certificate: subjectPublicKeyInfo missing"
+    }
+    val spki_parts = parse_spki(der, spki)
+
+    var san: str[] = []
+    var is_ca = false
+    val exts = tlv(der, spki.next)
+    if exts.tag == 0xA3u8 && exts.next <= tbs.next {
+        val parsed_ext = parse_extensions(der, exts, san, is_ca)
+        san = parsed_ext.san
+        is_ca = parsed_ext.is_ca
+    }
+
+    var sig_oid = ""
+    val alg_oid = tlv(der, sig_alg.cstart)
+    if alg_oid.tag == 0x06u8 {
+        sig_oid = oid_text(der, alg_oid.cstart, alg_oid.clen)
+    }
+
+    Ok(Certificate(
+        der[tbs.start..tbs.next],
+        sig_oid,
+        sig,
+        der[issuer.start..issuer.next],
+        der[subject.start..subject.next],
+        spki_parts.key_oid,
+        spki_parts.curve_oid,
+        spki_parts.point,
+        parse_time(der, not_before_t.cstart, not_before_t.clen),
+        parse_time(der, not_after_t.cstart, not_after_t.clen),
+        san,
+        is_ca,
+    ))
+}
+
+// ─── ECDSA signature: DER SEQUENCE{r, s} → r||s (2*N bytes) ──────────
+
+// N = 32 for P-256, 48 for P-384; each of r, s is left-padded to N
+pub fun sig_to_rs(der: u8[], n: usize): Throw<u8[], str> {
+    val seq = tlv(der, 0)
+    if seq.tag != 0x30u8 {
+        throw "sig: not a sequence"
+    }
+    val r_int = tlv(der, seq.cstart)
+    val s_int = tlv(der, r_int.next)
+    if r_int.tag != 0x02u8 || s_int.tag != 0x02u8 {
+        throw "sig: r/s not integers"
+    }
+    var rbytes = der[r_int.cstart..r_int.next]
+    var sbytes = der[s_int.cstart..s_int.next]
+    while rbytes.len() > 1 && rbytes[0] == 0 {
+        rbytes = rbytes[1..rbytes.len()]
+    }
+    while sbytes.len() > 1 && sbytes[0] == 0 {
+        sbytes = sbytes[1..sbytes.len()]
+    }
+    if rbytes.len() > n || sbytes.len() > n {
+        throw "sig: r or s too large"
+    }
+    var rout: u8[] = [0u8, ..n - rbytes.len()]
+    var i = 0 as usize
+    while i < rbytes.len() {
+        rout = rout ++ [rbytes[i]]
+        i = i + 1
+    }
+    var sout: u8[] = [0u8, ..n - sbytes.len()]
+    i = 0
+    while i < sbytes.len() {
+        sout = sout ++ [sbytes[i]]
+        i = i + 1
+    }
+    Ok(rout ++ sout)
+}
+
+// ─── hostname matching ───────────────────────────────────────────────
+
+// exact match, or a single left-most wildcard "*.x.y" covering "a.x.y"
+// (one label; no multi-level wildcards, no partial-label matching)
+pub fun host_matches(pattern: str, host: str): bool {
+    if Str.starts_with(pattern, "*.") {
+        val rest = Str.substring(pattern, 2, pattern.len())
+        // host must be "<label>." + rest with at least one label and no
+        // further dot inside the label
+        if host.len() <= rest.len() + 1 {
+            return false
+        }
+        if !Str.ends_with(host, rest) {
+            return false
+        }
+        val label = Str.substring(host, 0, host.len() - rest.len() - 1)
+        if label.len() == 0 {
+            return false
+        }
+        return !Str.contains(label, ".")
+    }
+    pattern == host
+}

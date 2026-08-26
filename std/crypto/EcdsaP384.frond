@@ -1,0 +1,26 @@
+// EcdsaP384.frond - ECDSA P-384 (secp384r1) verification (std.crypto)
+//
+// Same shape as EcdsaP256: pub_xy = X||Y (96 bytes), hash = 48-byte
+// digest (SHA-384), sig = r||s (96 bytes, both big-endian). DER
+// unpacking lives in std.tls.Cert.
+
+fun bad_input384(msg: str): IOError {
+    IOError(InvalidInput, "ecdsa-p384: " + msg, 0, null)
+}
+
+pub fun verify(pub_xy: u8[], hash: u8[], sig_rs: u8[]): Throw<bool, IOError> {
+    if pub_xy.len() != 96 {
+        throw bad_input384("public key must be 96 bytes (X||Y)")
+    }
+    if hash.len() != 48 {
+        throw bad_input384("hash must be 48 bytes")
+    }
+    if sig_rs.len() != 96 {
+        throw bad_input384("signature must be 96 bytes (r||s)")
+    }
+    val rc = __ecdsa_p384_verify(pub_xy, hash, sig_rs)
+    if rc < 0 {
+        throw bad_input384("kernel rejected input lengths")
+    }
+    Ok(rc == 1)
+}
