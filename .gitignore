@@ -1,4 +1,5 @@
 # Rust build output
+/core/target/
 /target/
 **/*.rs.bk
 Cargo.lock
