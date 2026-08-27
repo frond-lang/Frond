@@ -18,6 +18,7 @@ pub fn cmd_debug(file: Option<String>, stage: Option<DebugStage>) {
     match stage {
         DebugStage::Tokens => debug_tokens(&source),
         DebugStage::Ast => debug_ast(&source),
+        DebugStage::Sema => super::Dump::dump_sema(&entry_path),
         DebugStage::EmitC => debug_emit_c(&source),
         DebugStage::Check => debug_check(&source, &entry_path),
         DebugStage::Full => run_from_project(crate::pass::Optimizer::OptLevel::default(), true),

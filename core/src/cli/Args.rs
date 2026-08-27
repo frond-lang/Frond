@@ -95,6 +95,8 @@ pub enum DebugStage {
     Ast,
     /// Type check only.
     Check,
+    /// Canonical sema dump (differential oracle; see cli/Dump.rs).
+    Sema,
     /// Extract @extern("C") functions and emit .c to stdout.
     EmitC,
     /// Full pipeline + execution statistics (default).

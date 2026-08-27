@@ -9,6 +9,7 @@
 pub mod Args;
 pub mod Manifest;
 pub mod Pipeline;
+pub mod Dump;
 pub mod Init;
 pub mod Debug;
 pub mod Build;
