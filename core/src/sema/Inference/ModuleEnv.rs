@@ -532,6 +532,26 @@ impl<'a> InferContext<'a> {
     }
 
     pub fn predeclare_declarations(&mut self, module: &Module<'_>, root_env: EnvId) {
+        // Module context for name canonicalization (mirrors populate_module).
+        // The pipeline-level predeclare rounds run BEFORE any populate, so
+        // without this the type-ctor pre-binding resolves against a stale/
+        // empty current module: user dep modules mint BARE Adt names ('Ctx')
+        // that never match the canonical registration keys ('Mut.Ctx'), and
+        // the first-wins define keeps that stale binding even after the
+        // check-time re-predeclare — field access and self-type unification
+        // inside sibling modules then fail. Entry modules were immune (their
+        // first predeclare happens inside check, context already set) and so
+        // were std/builtin modules (they keep bare names by design).
+        self.sema_result.current_module_name = module.name.to_string();
+        self.sema_result.pending_own_types = collect_module_type_names(module);
+        self.sema_result.pending_own_traits = collect_module_trait_names(module);
+        for decl in &module.declarations {
+            if let crate::ast::Ast::Decl::ImportDecl { module_path, .. } = &decl.node {
+                if !module_path.is_empty() {
+                    record_module_import(self.sema_result, module.name, &module_path.join("."));
+                }
+            }
+        }
         let module_path = module_logical_path(module.name);
         // Get or create the module-dedicated env (idempotent: ensure_module_env reuses existing envs).
         let module_env = match &module_path {

@@ -1,0 +1,7 @@
+[package]
+name = "frondc"
+entry = "src/Main.frond"
+
+[build]
+output_dir = "out"
+opt_level = 2

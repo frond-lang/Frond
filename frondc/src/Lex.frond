@@ -1,0 +1,1037 @@
+// Lex.frond — frondc 词法器(Stage 1 / 1A)。
+//
+// 忠实转写 Frond/core/src/ast/Parser.rs 的 Lexer(Rust 侧为唯一规范):
+// 字节级状态机;列按字节计;scan_char 的非 ASCII 分支整序列只进 1 列;
+// 未知非 ASCII 字节按 UTF-8 前导长度消费且不动列;#{...}# 原始块 lexeme
+// 为内芯(不含定界符);字符串插值 {expr} 支持嵌套串与转义跳过。
+// 差分口径:kind.repr()(即 Rust Debug 名)+ lexeme + line + column 与
+// `frond debug --stage tokens` 逐字节一致(见 tests/scripts/diff_lex.sh)。
+
+import std.collections.List
+
+// ── Token 种类(名字与 Rust TokenKind 的 Debug 输出一一对应)──
+
+pub type TokKind =
+    | IntLiteral | FloatLiteral | CharLiteral | StringLiteral
+    | TrueLiteral | FalseLiteral | NullLiteral
+    | KwFun | KwType | KwTrait | KwOverride | KwPack | KwPub | KwImport | KwAs
+    | KwVal | KwVar | KwMatch | KwIf | KwElse | KwAsync | KwChannel | KwSelect
+    | KwAtomic | KwLoop | KwFor | KwIn | KwWhile | KwBreak | KwContinue
+    | KwReturn | KwThrow | KwLazy | KwDefer | KwThis | KwSuper
+    | Identifier
+    | Plus | Minus | Star | Slash | Percent
+    | EqEq | BangEq | RefEq | RefNeq | Lt | Gt | LtEq | GtEq | LtMinus
+    | AmpAmp | PipePipe | Bang | Ampersand | Caret
+    | QuestionDot | QuestionQuestion | Question
+    | DotDot | DotDotEq | Ellipsis
+    | Eq | PlusEq | PlusPlus | MinusEq | StarEq | SlashEq | PercentEq
+    | AmpEq | PipeEq | CaretEq | LtLt | GtGt | LtLtEq | GtGtEq
+    | Tilde | EqGt | MinusGt
+    | LParen | RParen | LBracket | RBracket | LBrace | RBrace
+    | Comma | Colon | Dot | Pipe
+    | At | RawBlock
+    | Eof | Err
+
+// 词法单词:lexeme 用源字节区间表示(start 含 / end 不含)。
+pub type Tk = Tk(pub kind: TokKind, pub start: i64, pub end: i64, pub line: i64, pub column: i64)
+
+// ── 字节常量(与 Rust 的 b'..' 对位)──
+
+val B_TAB: u8 = 9 as u8
+val B_LF: u8 = 10 as u8
+val B_CR: u8 = 13 as u8
+val B_SP: u8 = 32 as u8
+val B_BANG: u8 = 33 as u8
+val B_DQ: u8 = 34 as u8
+val B_HASH: u8 = 35 as u8
+val B_PCT: u8 = 37 as u8
+val B_AMP: u8 = 38 as u8
+val B_SQ: u8 = 39 as u8
+val B_LP: u8 = 40 as u8
+val B_RP: u8 = 41 as u8
+val B_STAR: u8 = 42 as u8
+val B_PLUS: u8 = 43 as u8
+val B_COMMA: u8 = 44 as u8
+val B_MINUS: u8 = 45 as u8
+val B_DOT: u8 = 46 as u8
+val B_SLASH: u8 = 47 as u8
+val B_COLON: u8 = 58 as u8
+val B_LT: u8 = 60 as u8
+val B_EQ: u8 = 61 as u8
+val B_GT: u8 = 62 as u8
+val B_AT: u8 = 64 as u8
+val B_BS: u8 = 92 as u8
+val B_CARET: u8 = 94 as u8
+val B_USCORE: u8 = 95 as u8
+val B_LBR: u8 = 123 as u8
+val B_PIPE: u8 = 124 as u8
+val B_RBR: u8 = 125 as u8
+val B_TILDE: u8 = 126 as u8
+val B_C0: u8 = 192 as u8
+val B_E0: u8 = 224 as u8
+val B_F0: u8 = 240 as u8
+val B_U0: u8 = 48 as u8
+val B_U1: u8 = 49 as u8
+val B_U7: u8 = 55 as u8
+val B_U9: u8 = 57 as u8
+val B_UA: u8 = 65 as u8
+val B_UF: u8 = 70 as u8
+val B_UZ: u8 = 90 as u8
+val B_UX: u8 = 88 as u8
+val B_LA: u8 = 97 as u8
+val B_LB: u8 = 98 as u8
+val B_LE: u8 = 101 as u8
+val B_LF_LOW: u8 = 102 as u8
+val B_LO: u8 = 111 as u8
+val B_LP_LOW: u8 = 112 as u8
+val B_LX: u8 = 120 as u8
+val B_LZ: u8 = 122 as u8
+val B_N: u8 = 110 as u8
+val B_T_LOW: u8 = 116 as u8
+val B_R_LOW: u8 = 114 as u8
+val B_U_LOW: u8 = 117 as u8
+val B_SEMI: u8 = 59 as u8
+val B_LBRK: u8 = 91 as u8
+val B_RBRK: u8 = 93 as u8
+val B_QUEST: u8 = 63 as u8
+
+// ── 字符类别(ASCII 判定,与 Rust 助手函数对位)──
+
+fun is_digit(ch: u8): bool { ch >= B_U0 && ch <= B_U9 }
+
+fun is_hex_digit(ch: u8): bool {
+    (ch >= B_U0 && ch <= B_U9) || (ch >= B_UA && ch <= B_UF) || (ch >= B_LA && ch <= B_LF_LOW)
+}
+
+fun is_octal_digit(ch: u8): bool { ch >= B_U0 && ch <= B_U7 }
+
+fun is_binary_digit(ch: u8): bool { ch == B_U0 || ch == B_U1 }
+
+fun is_identifier_start(ch: u8): bool {
+    (ch >= B_LA && ch <= B_LZ) || (ch >= B_UA && ch <= B_UZ) || ch == B_USCORE
+}
+
+fun is_identifier_continue(ch: u8): bool { is_identifier_start(ch) || is_digit(ch) }
+
+fun hex_value(ch: u8): i64 {
+    if ch >= B_U0 && ch <= B_U9 {
+        (ch as i64) - 48
+    } else if ch >= B_LA && ch <= B_LF_LOW {
+        (ch as i64) - 87
+    } else {
+        (ch as i64) - 55
+    }
+}
+
+// u32 环回语义(Rust wrapping_mul/wrapping_add 的对位)。
+fun u32_wrap(v: i64): i64 { v % 4294967296 }
+
+// char::from_u32 的合法性:代理区与 > U+10FFFF 无字符形式。
+fun valid_codepoint(value: i64): bool {
+    if value > 1114111 { return false }
+    if value >= 55296 && value <= 57343 { return false }
+    true
+}
+
+// 关键字表(true/false/null 是字面量种类)。
+fun keyword_type(text: str): TokKind {
+    match text {
+        "fun" => KwFun
+        "type" => KwType
+        "trait" => KwTrait
+        "override" => KwOverride
+        "pack" => KwPack
+        "pub" => KwPub
+        "import" => KwImport
+        "as" => KwAs
+        "val" => KwVal
+        "var" => KwVar
+        "match" => KwMatch
+        "if" => KwIf
+        "else" => KwElse
+        "async" => KwAsync
+        "channel" => KwChannel
+        "select" => KwSelect
+        "atomic" => KwAtomic
+        "loop" => KwLoop
+        "for" => KwFor
+        "in" => KwIn
+        "while" => KwWhile
+        "break" => KwBreak
+        "continue" => KwContinue
+        "return" => KwReturn
+        "throw" => KwThrow
+        "lazy" => KwLazy
+        "defer" => KwDefer
+        "this" => KwThis
+        "super" => KwSuper
+        "true" => TrueLiteral
+        "false" => FalseLiteral
+        "null" => NullLiteral
+        _ => Identifier
+    }
+}
+
+pub type LexErr = LexErr(msg: str)
+
+// ── 词法器本体 ──
+
+pub type Lexer = Lexer(src: u8[], pos: i64, line: i64, column: i64) {
+
+    fun n(): i64 { src.len() as i64 }
+
+    fun at(i: i64): u8 { src[i as usize] }
+
+    // 消费当前字节并前进;换行更新行列(与 Rust advance 对位)。
+    fun &advance(): u8? {
+        if pos >= n() { return null }
+        val ch = at(pos)
+        pos = pos + 1
+        if ch == B_LF {
+            line = line + 1
+            column = 1
+        } else {
+            column = column + 1
+        }
+        ch
+    }
+
+    // 当前字节等于期望则消费(与 Rust match_char 对位)。
+    fun &match_char(expected: u8): bool {
+        if pos >= n() { return false }
+        if at(pos) != expected { return false }
+        pos = pos + 1
+        if expected == B_LF {
+            line = line + 1
+            column = 1
+        } else {
+            column = column + 1
+        }
+        true
+    }
+
+    fun make(kind: TokKind, start: i64, sl: i64, sc: i64): Tk {
+        Tk(kind, start, pos, sl, sc)
+    }
+
+    // 扫整个源码流入 out;词法错误发 Err 单词后继续(不中断)。
+    fun &run(out: List<Tk>): void {
+        while pos < n() {
+            val start = pos
+            val sl = line
+            val sc = column
+            match scan_token() {
+                Ok(tok) => {
+                    match tok {
+                        null => {}
+                        t => { out.push(t) }
+                    }
+                },
+                Error(_) => { out.push(Tk(Err, start, pos, sl, sc)) },
+            }
+        }
+        out.push(Tk(Eof, pos, pos, line, column))
+    }
+
+    // 扫单个单词;Ok(null) = 空白/注释/分号(不产单词)。
+    fun &scan_token(): Throw<Tk?, LexErr> {
+        val start = pos
+        val sl = line
+        val sc = column
+        val got = advance()
+        if got == null { return Ok(null) }
+        val ch = match got {
+            null => B_U0
+            c => c
+        }
+        if ch == B_SP || ch == B_TAB || ch == B_CR || ch == B_LF {
+            Ok(null)
+        } else if ch == B_SLASH {
+            if match_char(B_SLASH) {
+                skip_line_comment()
+                Ok(null)
+            } else if match_char(B_STAR) {
+                skip_block_comment()?
+                Ok(null)
+            } else if match_char(B_EQ) {
+                Ok(make(SlashEq, start, sl, sc))
+            } else {
+                Ok(make(Slash, start, sl, sc))
+            }
+        } else if ch == B_LP {
+            Ok(make(LParen, start, sl, sc))
+        } else if ch == B_RP {
+            Ok(make(RParen, start, sl, sc))
+        } else if ch == B_LBRK {
+            Ok(make(LBracket, start, sl, sc))
+        } else if ch == B_RBRK {
+            Ok(make(RBracket, start, sl, sc))
+        } else if ch == B_LBR {
+            Ok(make(LBrace, start, sl, sc))
+        } else if ch == B_RBR {
+            Ok(make(RBrace, start, sl, sc))
+        } else if ch == B_COMMA {
+            Ok(make(Comma, start, sl, sc))
+        } else if ch == B_SEMI {
+            // 分号视作空白跳过
+            Ok(null)
+        } else if ch == B_COLON {
+            Ok(make(Colon, start, sl, sc))
+        } else if ch == B_PCT {
+            if match_char(B_EQ) {
+                Ok(make(PercentEq, start, sl, sc))
+            } else {
+                Ok(make(Percent, start, sl, sc))
+            }
+        } else if ch == B_PLUS {
+            if match_char(B_EQ) {
+                Ok(make(PlusEq, start, sl, sc))
+            } else if match_char(B_PLUS) {
+                Ok(make(PlusPlus, start, sl, sc))
+            } else {
+                Ok(make(Plus, start, sl, sc))
+            }
+        } else if ch == B_STAR {
+            if match_char(B_EQ) {
+                Ok(make(StarEq, start, sl, sc))
+            } else {
+                Ok(make(Star, start, sl, sc))
+            }
+        } else if ch == B_PIPE {
+            if match_char(B_PIPE) {
+                Ok(make(PipePipe, start, sl, sc))
+            } else if match_char(B_EQ) {
+                Ok(make(PipeEq, start, sl, sc))
+            } else {
+                Ok(make(Pipe, start, sl, sc))
+            }
+        } else if ch == B_EQ {
+            if match_char(B_EQ) {
+                if match_char(B_EQ) {
+                    Ok(make(RefEq, start, sl, sc))
+                } else {
+                    Ok(make(EqEq, start, sl, sc))
+                }
+            } else if match_char(B_GT) {
+                Ok(make(EqGt, start, sl, sc))
+            } else {
+                Ok(make(Eq, start, sl, sc))
+            }
+        } else if ch == B_BANG {
+            if match_char(B_EQ) {
+                if match_char(B_EQ) {
+                    Ok(make(RefNeq, start, sl, sc))
+                } else {
+                    Ok(make(BangEq, start, sl, sc))
+                }
+            } else {
+                Ok(make(Bang, start, sl, sc))
+            }
+        } else if ch == B_LT {
+            if match_char(B_LT) {
+                if match_char(B_EQ) {
+                    Ok(make(LtLtEq, start, sl, sc))
+                } else {
+                    Ok(make(LtLt, start, sl, sc))
+                }
+            } else if match_char(B_EQ) {
+                Ok(make(LtEq, start, sl, sc))
+            } else if match_char(B_MINUS) {
+                Ok(make(LtMinus, start, sl, sc))
+            } else {
+                Ok(make(Lt, start, sl, sc))
+            }
+        } else if ch == B_GT {
+            if match_char(B_GT) {
+                if match_char(B_EQ) {
+                    Ok(make(GtGtEq, start, sl, sc))
+                } else {
+                    Ok(make(GtGt, start, sl, sc))
+                }
+            } else if match_char(B_EQ) {
+                Ok(make(GtEq, start, sl, sc))
+            } else {
+                Ok(make(Gt, start, sl, sc))
+            }
+        } else if ch == B_MINUS {
+            if match_char(B_GT) {
+                Ok(make(MinusGt, start, sl, sc))
+            } else if match_char(B_EQ) {
+                Ok(make(MinusEq, start, sl, sc))
+            } else {
+                Ok(make(Minus, start, sl, sc))
+            }
+        } else if ch == B_DOT {
+            if match_char(B_DOT) {
+                if match_char(B_EQ) {
+                    Ok(make(DotDotEq, start, sl, sc))
+                } else if match_char(B_DOT) {
+                    Ok(make(Ellipsis, start, sl, sc))
+                } else {
+                    Ok(make(DotDot, start, sl, sc))
+                }
+            } else {
+                // 单点后跟数字视为 .float(如 .5)
+                if pos < n() && is_digit(at(pos)) {
+                    scan_dot_float(start, sl, sc)
+                } else {
+                    Ok(make(Dot, start, sl, sc))
+                }
+            }
+        } else if ch == B_QUEST {
+            if match_char(B_DOT) {
+                Ok(make(QuestionDot, start, sl, sc))
+            } else if match_char(B_QUEST) {
+                Ok(make(QuestionQuestion, start, sl, sc))
+            } else {
+                Ok(make(Question, start, sl, sc))
+            }
+        } else if ch == B_AMP {
+            if match_char(B_AMP) {
+                Ok(make(AmpAmp, start, sl, sc))
+            } else if match_char(B_EQ) {
+                Ok(make(AmpEq, start, sl, sc))
+            } else {
+                Ok(make(Ampersand, start, sl, sc))
+            }
+        } else if ch == B_CARET {
+            if match_char(B_EQ) {
+                Ok(make(CaretEq, start, sl, sc))
+            } else {
+                Ok(make(Caret, start, sl, sc))
+            }
+        } else if ch == B_TILDE {
+            Ok(make(Tilde, start, sl, sc))
+        } else if ch == B_AT {
+            Ok(make(At, start, sl, sc))
+        } else if ch == B_HASH {
+            if match_char(B_LBR) {
+                scan_raw_block(start, sl, sc)
+            } else {
+                Ok(make(Err, start, sl, sc))
+            }
+        } else if ch == B_SQ {
+            scan_char(start, sl, sc)
+        } else if ch == B_DQ {
+            scan_string(start, sl, sc)
+        } else if is_digit(ch) {
+            scan_number(start, sl, sc)
+        } else if is_identifier_start(ch) {
+            scan_identifier(start, sl, sc)
+        } else {
+            // 未知字符:非 ASCII 消费整段 UTF-8 序列(不动列);ASCII 单字节。
+            if ch >= B_C0 {
+                val utf8_len: i64 = if ch < B_E0 {
+                    2
+                } else if ch < B_F0 {
+                    3
+                } else {
+                    4
+                }
+                val end = if start + utf8_len < n() { start + utf8_len } else { n() }
+                pos = end
+            }
+            Ok(make(Err, start, sl, sc))
+        }
+    }
+
+    // 行注释:到行尾,不消费换行。
+    fun &skip_line_comment(): void {
+        while pos < n() {
+            if at(pos) == B_LF { break }
+            pos = pos + 1
+            column = column + 1
+        }
+    }
+
+    // 块注释:支持嵌套;未闭合报错。
+    fun &skip_block_comment(): Throw<void, LexErr> {
+        var depth: i64 = 1
+        while pos < n() && depth > 0 {
+            val ch = at(pos)
+            if ch == B_SLASH && pos + 1 < n() && at(pos + 1) == B_STAR {
+                depth = depth + 1
+                pos = pos + 2
+                column = column + 2
+            } else if ch == B_STAR && pos + 1 < n() && at(pos + 1) == B_SLASH {
+                depth = depth - 1
+                pos = pos + 2
+                column = column + 2
+            } else if ch == B_LF {
+                pos = pos + 1
+                line = line + 1
+                column = 1
+            } else {
+                pos = pos + 1
+                column = column + 1
+            }
+        }
+        if depth > 0 {
+            throw LexErr("unterminated comment")
+        }
+        Ok(void)
+    }
+
+    // 十进制数:数字 + 下划线分隔 + 小数 + 指数 + 类型后缀。
+    fun &scan_number(start: i64, sl: i64, sc: i64): Throw<Tk?, LexErr> {
+        if at(start) == B_U0 && pos < n() {
+            val prefix = at(pos)
+            if prefix == B_LX || prefix == B_UX {
+                pos = pos + 1
+                column = column + 1
+                return scan_hex_number(start, sl, sc)
+            } else if prefix == B_LO || prefix == (79 as u8) {
+                pos = pos + 1
+                column = column + 1
+                return scan_octal_number(start, sl, sc)
+            } else if prefix == B_LB || prefix == (66 as u8) {
+                pos = pos + 1
+                column = column + 1
+                return scan_binary_number(start, sl, sc)
+            }
+        }
+        while pos < n() && is_digit(at(pos)) {
+            pos = pos + 1
+            column = column + 1
+        }
+        skip_underscore_digits(false)
+        var is_float = false
+        if pos < n() && at(pos) == B_DOT && pos + 1 < n() && is_digit(at(pos + 1)) {
+            is_float = true
+            pos = pos + 1
+            column = column + 1
+            while pos < n() && is_digit(at(pos)) {
+                pos = pos + 1
+                column = column + 1
+            }
+            skip_underscore_digits(false)
+        }
+        if pos < n() && (at(pos) == B_LE || at(pos) == (69 as u8)) {
+            is_float = true
+            pos = pos + 1
+            column = column + 1
+            if pos < n() && (at(pos) == B_PLUS || at(pos) == B_MINUS) {
+                pos = pos + 1
+                column = column + 1
+            }
+            if pos < n() && is_digit(at(pos)) {
+                while pos < n() && is_digit(at(pos)) {
+                    pos = pos + 1
+                    column = column + 1
+                }
+            } else {
+                throw LexErr("invalid number")
+            }
+        }
+        // 类型后缀(如 i32/f64):吃掉全部标识符字符,合法性交给 sema。
+        if pos < n() && is_identifier_start(at(pos)) {
+            while pos < n() && is_identifier_continue(at(pos)) {
+                pos = pos + 1
+                column = column + 1
+            }
+        }
+        val kind = if is_float { FloatLiteral } else { IntLiteral }
+        Ok(make(kind, start, sl, sc))
+    }
+
+    // 下划线数字分隔(1_000);hex 控制按十六进制判位。
+    fun &skip_underscore_digits(hex: bool): void {
+        while pos < n() {
+            if at(pos) == B_USCORE && pos + 1 < n() {
+                val next = at(pos + 1)
+                val valid = if hex { is_hex_digit(next) } else { is_digit(next) }
+                if valid {
+                    pos = pos + 1
+                    column = column + 1
+                    pos = pos + 1
+                    column = column + 1
+                    while pos < n() {
+                        val ch = at(pos)
+                        val ok = if hex { is_hex_digit(ch) } else { is_digit(ch) }
+                        if !ok { break }
+                        pos = pos + 1
+                        column = column + 1
+                    }
+                } else {
+                    break
+                }
+            } else {
+                break
+            }
+        }
+    }
+
+    // 点开头的浮点(.5)。
+    fun &scan_dot_float(start: i64, sl: i64, sc: i64): Throw<Tk?, LexErr> {
+        while pos < n() && is_digit(at(pos)) {
+            pos = pos + 1
+            column = column + 1
+        }
+        skip_underscore_digits(false)
+        if pos < n() && (at(pos) == B_LE || at(pos) == (69 as u8)) {
+            pos = pos + 1
+            column = column + 1
+            if pos < n() && (at(pos) == B_PLUS || at(pos) == B_MINUS) {
+                pos = pos + 1
+                column = column + 1
+            }
+            if pos < n() && is_digit(at(pos)) {
+                while pos < n() && is_digit(at(pos)) {
+                    pos = pos + 1
+                    column = column + 1
+                }
+            } else {
+                throw LexErr("invalid number")
+            }
+        }
+        if pos < n() && is_identifier_start(at(pos)) {
+            while pos < n() && is_identifier_continue(at(pos)) {
+                pos = pos + 1
+                column = column + 1
+            }
+        }
+        Ok(make(FloatLiteral, start, sl, sc))
+    }
+
+    // 十六进制(0x 前缀):十六进制小数 + p 指数。
+    fun &scan_hex_number(start: i64, sl: i64, sc: i64): Throw<Tk?, LexErr> {
+        var has_digits = false
+        while pos < n() && is_hex_digit(at(pos)) {
+            has_digits = true
+            pos = pos + 1
+            column = column + 1
+        }
+        skip_underscore_digits(true)
+        var is_float = false
+        if pos < n() && at(pos) == B_DOT && pos + 1 < n()
+            && (is_hex_digit(at(pos + 1)) || at(pos + 1) == B_LP_LOW || at(pos + 1) == (80 as u8)) {
+            is_float = true
+            pos = pos + 1
+            column = column + 1
+            while pos < n() && is_hex_digit(at(pos)) {
+                pos = pos + 1
+                column = column + 1
+            }
+            skip_underscore_digits(true)
+        }
+        if pos < n() && (at(pos) == B_LP_LOW || at(pos) == (80 as u8)) {
+            is_float = true
+            pos = pos + 1
+            column = column + 1
+            if pos < n() && (at(pos) == B_PLUS || at(pos) == B_MINUS) {
+                pos = pos + 1
+                column = column + 1
+            }
+            if pos < n() && is_digit(at(pos)) {
+                while pos < n() && is_digit(at(pos)) {
+                    pos = pos + 1
+                    column = column + 1
+                }
+            } else {
+                throw LexErr("invalid number")
+            }
+        }
+        if !has_digits {
+            throw LexErr("invalid hex digit")
+        }
+        if pos < n() && is_identifier_start(at(pos)) {
+            while pos < n() && is_identifier_continue(at(pos)) {
+                pos = pos + 1
+                column = column + 1
+            }
+        }
+        val kind = if is_float { FloatLiteral } else { IntLiteral }
+        Ok(make(kind, start, sl, sc))
+    }
+
+    // 八进制(0o 前缀)。
+    fun &scan_octal_number(start: i64, sl: i64, sc: i64): Throw<Tk?, LexErr> {
+        var has_digits = false
+        while pos < n() && is_octal_digit(at(pos)) {
+            has_digits = true
+            pos = pos + 1
+            column = column + 1
+        }
+        while pos < n() {
+            if at(pos) == B_USCORE && pos + 1 < n() && is_octal_digit(at(pos + 1)) {
+                has_digits = true
+                pos = pos + 1
+                column = column + 1
+                pos = pos + 1
+                column = column + 1
+                while pos < n() && is_octal_digit(at(pos)) {
+                    pos = pos + 1
+                    column = column + 1
+                }
+            } else {
+                break
+            }
+        }
+        if !has_digits {
+            throw LexErr("invalid octal digit")
+        }
+        if pos < n() && is_identifier_start(at(pos)) {
+            while pos < n() && is_identifier_continue(at(pos)) {
+                pos = pos + 1
+                column = column + 1
+            }
+        }
+        Ok(make(IntLiteral, start, sl, sc))
+    }
+
+    // 二进制(0b 前缀)。
+    fun &scan_binary_number(start: i64, sl: i64, sc: i64): Throw<Tk?, LexErr> {
+        var has_digits = false
+        while pos < n() && is_binary_digit(at(pos)) {
+            has_digits = true
+            pos = pos + 1
+            column = column + 1
+        }
+        while pos < n() {
+            if at(pos) == B_USCORE && pos + 1 < n() && is_binary_digit(at(pos + 1)) {
+                has_digits = true
+                pos = pos + 1
+                column = column + 1
+                pos = pos + 1
+                column = column + 1
+                while pos < n() && is_binary_digit(at(pos)) {
+                    pos = pos + 1
+                    column = column + 1
+                }
+            } else {
+                break
+            }
+        }
+        if !has_digits {
+            throw LexErr("invalid binary digit")
+        }
+        if pos < n() && is_identifier_start(at(pos)) {
+            while pos < n() && is_identifier_continue(at(pos)) {
+                pos = pos + 1
+                column = column + 1
+            }
+        }
+        Ok(make(IntLiteral, start, sl, sc))
+    }
+
+    // 字符字面量('x'):转义 + \uXXXX/\u{...}/\xHH;非 ASCII 按序列消费、列只进 1。
+    fun &scan_char(start: i64, sl: i64, sc: i64): Throw<Tk?, LexErr> {
+        if pos >= n() {
+            throw LexErr("unterminated char")
+        }
+        if at(pos) == B_BS {
+            pos = pos + 1
+            column = column + 1
+            if pos >= n() {
+                throw LexErr("unterminated char")
+            }
+            val escaped = at(pos)
+            if escaped == B_N || escaped == B_T_LOW || escaped == B_R_LOW
+                || escaped == B_BS || escaped == B_SQ || escaped == B_U0 {
+                pos = pos + 1
+                column = column + 1
+            } else if escaped == B_U_LOW {
+                pos = pos + 1
+                column = column + 1
+                if pos >= n() {
+                    throw LexErr("invalid unicode escape")
+                }
+                if at(pos) == B_LBR {
+                    // \u{XXXX}:1-6 位十六进制
+                    pos = pos + 1
+                    column = column + 1
+                    var digit_count: i64 = 0
+                    var value: i64 = 0
+                    while pos < n() && at(pos) != B_RBR {
+                        if !is_hex_digit(at(pos)) {
+                            throw LexErr("invalid unicode escape")
+                        }
+                        value = u32_wrap(value * 16 + hex_value(at(pos)))
+                        pos = pos + 1
+                        column = column + 1
+                        digit_count = digit_count + 1
+                    }
+                    if digit_count == 0 || pos >= n() {
+                        throw LexErr("invalid unicode escape")
+                    }
+                    if !valid_codepoint(value) {
+                        throw LexErr("invalid unicode escape")
+                    }
+                    pos = pos + 1
+                    column = column + 1
+                } else {
+                    // \uXXXX(无花括号):恰好 4 位 + 范围检查
+                    var value: i64 = 0
+                    var k: i64 = 0
+                    while k < 4 {
+                        if pos >= n() || !is_hex_digit(at(pos)) {
+                            throw LexErr("invalid unicode escape")
+                        }
+                        value = u32_wrap(value * 16 + hex_value(at(pos)))
+                        pos = pos + 1
+                        column = column + 1
+                        k = k + 1
+                    }
+                    if !valid_codepoint(value) {
+                        throw LexErr("invalid unicode escape")
+                    }
+                }
+            } else if escaped == B_LX {
+                // \xHH:恰好 2 位十六进制
+                pos = pos + 1
+                column = column + 1
+                var k: i64 = 0
+                while k < 2 {
+                    if pos >= n() || !is_hex_digit(at(pos)) {
+                        throw LexErr("invalid escape")
+                    }
+                    pos = pos + 1
+                    column = column + 1
+                    k = k + 1
+                }
+            } else {
+                throw LexErr("invalid escape")
+            }
+        } else {
+            // 非 ASCII:多字节序列按字符边界前进(列只进 1)
+            val ch_start = pos
+            val first = at(ch_start)
+            val utf8_len: i64 = if first < (128 as u8) {
+                1
+            } else if first < B_C0 {
+                1
+            } else if first < B_E0 {
+                2
+            } else if first < B_F0 {
+                3
+            } else {
+                4
+            }
+            val end = if ch_start + utf8_len < n() { ch_start + utf8_len } else { n() }
+            pos = end
+            column = column + 1
+        }
+        if pos >= n() || at(pos) != B_SQ {
+            throw LexErr("unterminated char")
+        }
+        pos = pos + 1
+        column = column + 1
+        Ok(make(CharLiteral, start, sl, sc))
+    }
+
+    // 字符串字面量:转义 + {{/}} 字面花括号 + {表达式} 插值(含嵌套串)。
+    fun &scan_string(start: i64, sl: i64, sc: i64): Throw<Tk?, LexErr> {
+        while pos < n() {
+            val ch = at(pos)
+            if ch == B_DQ {
+                pos = pos + 1
+                column = column + 1
+                return Ok(make(StringLiteral, start, sl, sc))
+            }
+            if ch == B_BS {
+                pos = pos + 1
+                column = column + 1
+                if pos >= n() {
+                    throw LexErr("unterminated string")
+                }
+                val escaped = at(pos)
+                if escaped == B_DQ || escaped == B_BS || escaped == B_N
+                    || escaped == B_T_LOW || escaped == B_R_LOW
+                    || escaped == B_LBR || escaped == B_RBR || escaped == B_U0 {
+                    pos = pos + 1
+                    column = column + 1
+                } else if escaped == B_U_LOW {
+                    pos = pos + 1
+                    column = column + 1
+                    if pos >= n() {
+                        throw LexErr("invalid unicode escape")
+                    }
+                    if at(pos) == B_LBR {
+                        pos = pos + 1
+                        column = column + 1
+                        var digit_count: i64 = 0
+                        var value: i64 = 0
+                        while pos < n() && at(pos) != B_RBR {
+                            if !is_hex_digit(at(pos)) {
+                                throw LexErr("invalid unicode escape")
+                            }
+                            value = u32_wrap(value * 16 + hex_value(at(pos)))
+                            pos = pos + 1
+                            column = column + 1
+                            digit_count = digit_count + 1
+                        }
+                        if digit_count == 0 || pos >= n() {
+                            throw LexErr("invalid unicode escape")
+                        }
+                        if !valid_codepoint(value) {
+                            throw LexErr("invalid unicode escape")
+                        }
+                        pos = pos + 1
+                        column = column + 1
+                    } else {
+                        var value: i64 = 0
+                        var k: i64 = 0
+                        while k < 4 {
+                            if pos >= n() || !is_hex_digit(at(pos)) {
+                                throw LexErr("invalid unicode escape")
+                            }
+                            value = u32_wrap(value * 16 + hex_value(at(pos)))
+                            pos = pos + 1
+                            column = column + 1
+                            k = k + 1
+                        }
+                        if !valid_codepoint(value) {
+                            throw LexErr("invalid unicode escape")
+                        }
+                    }
+                } else if escaped == B_LX {
+                    pos = pos + 1
+                    column = column + 1
+                    var k: i64 = 0
+                    while k < 2 {
+                        if pos >= n() || !is_hex_digit(at(pos)) {
+                            throw LexErr("invalid escape")
+                        }
+                        pos = pos + 1
+                        column = column + 1
+                        k = k + 1
+                    }
+                } else {
+                    throw LexErr("invalid escape")
+                }
+            } else if ch == B_LBR {
+                // {{ 为字面 {;否则进入插值表达式扫描
+                if pos + 1 < n() && at(pos + 1) == B_LBR {
+                    pos = pos + 2
+                    column = column + 2
+                } else {
+                    pos = pos + 1
+                    column = column + 1
+                    var brace_depth: i64 = 1
+                    while pos < n() && brace_depth > 0 {
+                        val inner = at(pos)
+                        if inner == B_BS {
+                            pos = pos + 1
+                            column = column + 1
+                            if pos < n() {
+                                pos = pos + 1
+                                column = column + 1
+                            }
+                        } else if inner == B_LBR {
+                            brace_depth = brace_depth + 1
+                            column = column + 1
+                            pos = pos + 1
+                        } else if inner == B_RBR {
+                            brace_depth = brace_depth - 1
+                            column = column + 1
+                            pos = pos + 1
+                        } else if inner == B_DQ {
+                            // 嵌套字符串:整段消费(含 \" 转义)
+                            pos = pos + 1
+                            column = column + 1
+                            while pos < n() {
+                                val nc = at(pos)
+                                if nc == B_BS {
+                                    pos = pos + 1
+                                    column = column + 1
+                                    if pos < n() {
+                                        pos = pos + 1
+                                        column = column + 1
+                                    }
+                                } else if nc == B_DQ {
+                                    break
+                                } else {
+                                    if nc == B_LF {
+                                        line = line + 1
+                                        column = 1
+                                    } else {
+                                        column = column + 1
+                                    }
+                                    pos = pos + 1
+                                }
+                            }
+                            if pos < n() && at(pos) == B_DQ {
+                                pos = pos + 1
+                                column = column + 1
+                            }
+                        } else {
+                            if inner == B_LF {
+                                line = line + 1
+                                column = 1
+                            } else {
+                                column = column + 1
+                            }
+                            pos = pos + 1
+                        }
+                    }
+                }
+            } else if ch == B_RBR {
+                // }} 为字面 }
+                if pos + 1 < n() && at(pos + 1) == B_RBR {
+                    pos = pos + 2
+                    column = column + 2
+                } else {
+                    pos = pos + 1
+                    column = column + 1
+                }
+            } else if ch == B_LF {
+                throw LexErr("unterminated string")
+            } else {
+                pos = pos + 1
+                column = column + 1
+            }
+        }
+        throw LexErr("unterminated string")
+    }
+
+    // 原始块 #{ ... }#:扫到匹配 }#;lexeme 为内芯(不含 #{ 与 }#)。
+    fun &scan_raw_block(start: i64, sl: i64, sc: i64): Throw<Tk?, LexErr> {
+        val content_start = pos
+        var content_end: i64 = -1
+        while pos < n() {
+            val ch = at(pos)
+            if ch == B_RBR && pos + 1 < n() && at(pos + 1) == B_HASH {
+                content_end = pos
+                pos = pos + 2
+                column = column + 2
+                return Ok(Tk(RawBlock, content_start, content_end, sl, sc))
+            }
+            if ch == B_LF {
+                pos = pos + 1
+                line = line + 1
+                column = 1
+            } else {
+                pos = pos + 1
+                column = column + 1
+            }
+        }
+        throw LexErr("unterminated string")
+    }
+
+    // 标识符/关键字。
+    fun &scan_identifier(start: i64, sl: i64, sc: i64): Throw<Tk?, LexErr> {
+        while pos < n() && is_identifier_continue(at(pos)) {
+            pos = pos + 1
+            column = column + 1
+        }
+        val text = (src[start as usize..pos as usize]) as str
+        val kind = keyword_type(text)
+        Ok(make(kind, start, sl, sc))
+    }
+}
+
+
+// ── 对外入口 ──
+
+// 源文本 → 单词表(含尾部 Eof)。
+pub fun tokenize(source: str): List<Tk> {
+    val out = List.empty()
+    val lx = Lexer(source.bytes(), 0, 1, 1)
+    lx.run(out)
+    out
+}
+
+// 取单词的原文(按源字节区间切片;调用方持有源)。
+pub fun lexeme(src: u8[], t: Tk): str {
+    (src[t.start as usize..t.end as usize]) as str
+}

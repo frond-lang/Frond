@@ -1,0 +1,74 @@
+// frondc — 自举编译器 CLI(Stage 1)。
+//
+// 子命令:
+//   lex <file>   词法分析,输出与 `frond debug --stage tokens` 逐字节
+//                一致的 token 清单(1A 差分口径)。
+//
+// 用法(跑在 Rust 引擎上):
+//   cd Frond/frondc && frond run -- lex <abs-path-to-file.frond>
+
+import std.os.Proc
+import std.io.Fs
+import std.io.Path
+import std.core.types.Str
+
+import Lex
+
+// {:>4} 的对位:右对齐补空格。
+fun pad_left(s: str, width: i64): str {
+    val n = s.len() as i64
+    if n >= width {
+        s
+    } else {
+        Str.repeat(" ", (width - n) as i32) + s
+    }
+}
+
+// {:<3}/{:<20} 的对位:左对齐补空格。
+fun pad_right(s: str, width: i64): str {
+    val n = s.len() as i64
+    if n >= width {
+        s
+    } else {
+        s + Str.repeat(" ", (width - n) as i32)
+    }
+}
+
+// 一行 token 输出:与 Rust debug_tokens 的 "{:>4}:{:<3} {:<20} {}" 对位。
+fun format_line(sb: u8[], t: Tk): str {
+    val lex = Lex.lexeme(sb, t)
+    pad_left("{t.line}", 4) + ":" + pad_right("{t.column}", 3) + " " +
+        pad_right(t.kind.repr(), 20) + " " + lex
+}
+
+fun dump_tokens(text: str): void {
+    val sb = text.bytes()
+    val toks = Lex.tokenize(text)
+    var i: i64 = 0
+    val count = toks.len() as i64
+    while i < count {
+        match toks.get(i as usize) {
+            null => {}
+            t => { println(format_line(sb, t)) }
+        }
+        i = i + 1
+    }
+}
+
+async fun main(): void {
+    val args = Proc.args()
+    if args.len() < 2 {
+        println("usage: frondc lex <file>")
+        return
+    }
+    val cmd = args[0]
+    val path = args[1]
+    if cmd != "lex" {
+        println("unknown command: {cmd}")
+        return
+    }
+    match Fs.read_file(Path.from(path)).await() {
+        Ok(text) => { dump_tokens(text) },
+        Error(e) => { println("read error: {e}") },
+    }
+}
