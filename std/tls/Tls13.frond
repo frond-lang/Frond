@@ -1,0 +1,750 @@
+// Tls13.frond — TLS 1.3 (RFC 8446) client, pure Frond.
+//
+// Single suite: TLS_AES_128_GCM_SHA256 (0x1301) with X25519 key share.
+// Authentication model: WebPKI chain validation is intentionally out of
+// scope; identity is anchored EITHER by an SPKI pin (RFC 7469-style
+// sha256 of the leaf subjectPublicKeyInfo DER — connect_pinned fails
+// closed on mismatch) or out-of-band by a known content hash on the
+// consumer side. The server Finished HMAC IS verified — a cheap, strong
+// check that the handshake transcript survived untampered and the peer
+// holds the handshake secret.
+//
+// Layout: byte helpers / record layer (plain + AEAD, nonce = iv XOR
+// be64(seq), true type hidden in ciphertext per RFC 8446 §5.2) / key
+// schedule (HKDF-Expand-Label over std.core.hash.Sha256) / ClientHello
+// (SNI + key_share + supported_versions) / ServerHello minimal parse /
+// handshake state machine with cross-record message reassembly / leaf
+// certificate SPKI pinning / application-data read/write.
+import std.net.TcpStream
+import std.net.Addr
+import std.net.Dns
+import std.core.hash.Sha256
+import std.crypto.X25519
+import std.crypto.AesGcm
+import std.encoding.Hex
+import std.rand.Rand
+
+// ─── byte helpers ────────────────────────────────────────────────────
+
+fun be16(v: u32): u8[] {
+    [(v >> 8) as u8, (v & 0xFFu32) as u8]
+}
+
+fun be24(v: u32): u8[] {
+    [(v >> 16) as u8, ((v >> 8) & 0xFFu32) as u8, (v & 0xFFu32) as u8]
+}
+
+fun rd16(b: u8[], at: usize): u32 {
+    ((b[at] as u32) << 8) | (b[at + 1] as u32)
+}
+
+fun rd24(b: u8[], at: usize): u32 {
+    ((b[at] as u32) << 16) | ((b[at + 1] as u32) << 8) | (b[at + 2] as u32)
+}
+
+fun zeros(n: usize): u8[] {
+    [0u8, ..n]
+}
+
+// ─── HKDF-Expand-Label / key schedule (RFC 8446 §7.1) ────────────────
+
+fun expand_label(secret: u8[], label: str, context: u8[], out_len: usize): u8[] {
+    val fb = ("tls13 " + label).bytes()
+    val info: u8[] = be16(out_len as u32) ++ [fb.len() as u8] ++ fb ++ [context.len() as u8] ++ context
+    Sha256.hkdf_expand_sha256(secret, info, out_len)
+}
+
+// hkdf_sha256(salt, ikm, info, len) is extract-then-expand; extract alone
+// is the same call with empty info and a 32-byte output.
+fun extract(salt: u8[], ikm: u8[]): u8[] {
+    var s = salt
+    if s.len() == 0 {
+        s = zeros(32)
+    }
+    Sha256.hmac_sha256(s, ikm)
+}
+
+fun derive_secret(secret: u8[], label: str, transcript_hash: u8[]): u8[] {
+    expand_label(secret, label, transcript_hash, 32)
+}
+
+fun traffic_key(secret: u8[]): u8[] {
+    expand_label(secret, "key", zeros(0), 16)
+}
+
+fun traffic_iv(secret: u8[]): u8[] {
+    expand_label(secret, "iv", zeros(0), 12)
+}
+
+// ─── record layer ────────────────────────────────────────────────────
+
+pub type TlsConn = TlsConn(
+    stream: TcpStream,
+    key_c: u8[], iv_c: u8[], seq_c: u64,
+    key_s: u8[], iv_s: u8[], seq_s: u64,
+    // observed sha256(SPKI DER) of the peer's leaf certificate (empty if
+    // the peer sent none — servers always send one in our flow)
+    pub leaf_spki_sha256: u8[],
+    // certificate chain as the server sent it (leaf first); feeds
+    // std.tls.Chain verification
+    pub peer_chain: u8[][],
+)
+
+fun tls_io(msg: str): IOError {
+    IOError(Other, "tls: " + msg, 0, null)
+}
+
+fun xor_seq_iv(iv: u8[], seq: u64): u8[] {
+    val n = iv.len()
+    // fresh copy — writing through an alias mutates the caller's array
+    // (in-place store mechanism), corrupting the stored IV for later calls
+    var out: u8[] = [0u8, ..n]
+    var i = 0 as usize
+    while i < n {
+        out[i] = iv[i]
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        val shift = (7 - i) * 8
+        out[n - 8 + i] = out[n - 8 + i] ^ ((seq >> shift) as u8)
+        i = i + 1
+    }
+    out
+}
+
+fun write_plain(stream: TcpStream, rtype: u8, payload: u8[]): Throw<void, IOError> {
+    val head: u8[] = [rtype, 0x03u8, 0x01u8] ++ be16(payload.len() as u32)
+    val all = head ++ payload
+    stream.write_all(all, all.len()).await()?
+    Ok(void)
+}
+
+// write an encrypted record; the true content type is appended inside the
+// ciphertext, the outer header is always appdata(23); AAD is that header.
+fun write_enc(conn: TlsConn, inner_type: u8, payload: u8[]): Throw<void, IOError> {
+    val plain = payload ++ [inner_type]
+    val ct_len = plain.len() + 16
+    val head: u8[] = [0x17u8, 0x03u8, 0x03u8] ++ be16(ct_len as u32)
+    val nonce = xor_seq_iv(conn.iv_c, conn.seq_c)
+    val sealed = match AesGcm.seal(conn.key_c, nonce, head, plain) {
+        Ok(s) => s,
+        Error(e) => throw tls_io("seal: " + e.message),
+    }
+    val all = head ++ sealed.ct ++ sealed.tag
+    conn.stream.write_all(all, all.len()).await()?
+    conn.seq_c = conn.seq_c + 1
+    Ok(void)
+}
+
+// read exactly n bytes (short-read loop)
+fun read_exact(stream: TcpStream, n: usize): Throw<u8[], IOError> {
+    var out: u8[] = []
+    while out.len() < n {
+        val chunk = stream.read(n - out.len()).await()?
+        if chunk.len() == 0 {
+            throw tls_io("connection closed mid-record")
+        }
+        out = out ++ chunk
+    }
+    Ok(out)
+}
+
+type RawRec = RawRec(rtype: u8, body: u8[], head: u8[])
+
+fun read_record(stream: TcpStream): Throw<RawRec, IOError> {
+    val head = read_exact(stream, 5)?
+    val rtype = head[0]
+    val len = rd16(head, 3)
+    if len > 16640 {
+        throw tls_io("record too large")
+    }
+    val body = read_exact(stream, len as usize)?
+    Ok(RawRec(rtype, body, head))
+}
+
+// decrypt an appdata record; returns (inner_type, payload) flattened as
+// RawRec. body layout: ciphertext(len-17 bytes inner) + tag(16) + type(1).
+fun open_record(conn: TlsConn, rec: RawRec): Throw<RawRec, IOError> {
+    if rec.body.len() < 17 {
+        throw tls_io("record too short")
+    }
+    val ct_len = rec.body.len() - 16
+    val ct = rec.body[0..ct_len]
+    val tag = rec.body[ct_len..ct_len + 16]
+    val aad = rec.head
+    val nonce = xor_seq_iv(conn.iv_s, conn.seq_s)
+    val pt: u8[] = [0u8, ..ct_len]
+    val orc = __aes_gcm_open(conn.key_s, nonce, aad, ct, tag, pt)
+    if orc != 0 {
+        throw tls_io("decrypt failed rc={orc}")
+    }
+    val plain = pt
+    conn.seq_s = conn.seq_s + 1
+    val rtype = plain[plain.len() - 1]
+    Ok(RawRec(rtype, plain[0..plain.len() - 1], [0x17u8, 0x03u8, 0x03u8] ++ be16(rec.body.len() as u32)))
+}
+
+
+// crude IPv4-shape test: three dots and nothing but digits between them
+fun host_looks_like_ip(host: str): bool {
+    var dots = 0
+    var i = 0 as usize
+    val hb = host.bytes()
+    while i < hb.len() {
+        val c = hb[i]
+        if c == '.' as u8 {
+            dots = dots + 1
+        } else {
+            if c < '0' as u8 || c > '9' as u8 {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    dots == 3
+}
+
+// ─── ClientHello ─────────────────────────────────────────────────────
+
+// Build the ClientHello handshake message (header included) for the
+// single suite with an X25519 key share and the given SNI.
+fun build_client_hello(sni: str, random32: u8[], session_id: u8[], pubkey: u8[]): u8[] {
+    val suites: u8[] = be16(2) ++ be16(0x1301)
+    val methods: u8[] = [0x01u8, 0x00u8]
+    val hb = sni.bytes()
+    // ServerNameList is a length-prefixed vector: u16 list_len + entry
+    // (name_type(0) + u16 host_len + host)
+    val sni_entry: u8[] = [0x00u8] ++ be16(hb.len() as u32) ++ hb
+    val sni_body: u8[] = be16(sni_entry.len() as u32) ++ sni_entry
+    val ext_sni: u8[] = be16(0) ++ be16(sni_body.len() as u32) ++ sni_body
+    val groups: u8[] = be16(2) ++ be16(0x001d)
+    val ext_groups: u8[] = be16(10) ++ be16(groups.len() as u32) ++ groups
+    val sigalgs: u8[] = be16(6) ++ be16(0x0403) ++ be16(0x0804) ++ be16(0x0401)
+    val ext_sig: u8[] = be16(13) ++ be16(sigalgs.len() as u32) ++ sigalgs
+    val versions: u8[] = [0x02u8, 0x03u8, 0x04u8]
+    val ext_ver: u8[] = be16(43) ++ be16(versions.len() as u32) ++ versions
+    // ClientHello key_share body = u16 total length + KeyShareEntry list
+    // (the bare single-entry form is the SERVER's ServerHello shape).
+    val ks_entry: u8[] = be16(0x001d) ++ be16(32) ++ pubkey
+    val ks_body: u8[] = be16(ks_entry.len() as u32) ++ ks_entry
+    val ext_ks: u8[] = be16(51) ++ be16(ks_body.len() as u32) ++ ks_body
+    val pkem: u8[] = [0x01u8, 0x01u8]
+    val ext_pkem: u8[] = be16(45) ++ be16(pkem.len() as u32) ++ pkem
+
+    // SNI must be a DNS name — RFC 6066 forbids IP literals and OpenSSL
+    // rejects the whole extension (skip it for IP-shaped hosts).
+    var exts: u8[] = ext_groups ++ ext_sig ++ ext_ver ++ ext_ks ++ ext_pkem
+    if !host_looks_like_ip(sni) {
+        exts = ext_sni ++ exts
+    }
+    val body: u8[] = be16(0x0303) ++ random32
+        ++ [session_id.len() as u8] ++ session_id
+        ++ suites ++ methods
+        ++ be16(exts.len() as u32) ++ exts
+    [0x01u8] ++ be24(body.len() as u32) ++ body
+}
+
+// ─── ServerHello minimal parse ───────────────────────────────────────
+
+fun parse_server_key_share(sh: u8[]): Throw<u8[], IOError> {
+    var at = 0 as usize
+    at = at + 34
+    val sid_len = sh[at] as usize
+    at = at + 1 + sid_len
+    at = at + 3
+    val ext_end = at + (rd16(sh, at) as usize)
+    at = at + 2
+    while at + 4 <= ext_end {
+        val etype = rd16(sh, at)
+        val elen = rd16(sh, at + 2) as usize
+        if etype == 51 {
+            val ebody = sh[at + 4..at + 4 + elen]
+            if ebody.len() >= 36 {
+                val group = rd16(ebody, 0)
+                val klen = rd16(ebody, 2) as usize
+                if group == 0x001d && klen == 32 {
+                    return Ok(ebody[4..36])
+                }
+            }
+        }
+        at = at + 4 + elen
+    }
+    throw tls_io("no x25519 key_share in ServerHello")
+}
+
+// ─── handshake ───────────────────────────────────────────────────────
+
+fun hmac_equal(a: u8[], b: u8[]): bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var diff = 0 as u8
+    var i = 0 as usize
+    while i < a.len() {
+        diff = diff | (a[i] ^ b[i])
+        i = i + 1
+    }
+    diff == 0
+}
+
+// ─── leaf certificate SPKI pinning (RFC 7469-style) ──────────────────
+//
+// Minimal DER TLV walk — just enough to reach subjectPublicKeyInfo:
+// Certificate ::= SEQUENCE { tbsCertificate SEQUENCE {
+//     [0] version (optional), INTEGER serial, SEQ sigalg, SEQ issuer,
+//     SEQ validity, SEQ subject, SEQ subjectPublicKeyInfo, ... } ... }
+// The pin is sha256 over the SPKI's full TLV bytes (tag+len+content).
+
+type DerTlv = DerTlv(tag: u8, cstart: usize, clen: usize, next: usize)
+
+fun der_tlv(b: u8[], at: usize): DerTlv {
+    val tag = b[at]
+    var lstart = at + 1
+    var len = b[lstart] as usize
+    lstart = lstart + 1
+    if len >= 0x80 {
+        // long form: next (len & 0x7f) bytes are the length, big-endian
+        val nlen = len & 0x7F
+        len = 0
+        var i = 0 as usize
+        while i < nlen {
+            len = (len << 8) | (b[lstart + i] as usize)
+            i = i + 1
+        }
+        lstart = lstart + nlen
+    }
+    DerTlv(tag, lstart, len, lstart + len)
+}
+
+fun hex_of(b: u8[]): str {
+    Hex.encode(b)
+}
+
+// sha256 of the leaf SPKI DER, from the DER certificate bytes.
+fun spki_sha256_of_cert(cert: u8[]): u8[] {
+    val outer = der_tlv(cert, 0)
+    if outer.tag != 0x30u8 {
+        return zeros(0)
+    }
+    val tbs = der_tlv(cert, outer.cstart)
+    if tbs.tag != 0x30u8 {
+        return zeros(0)
+    }
+    var at = tbs.cstart
+    // optional [0] version
+    var t = der_tlv(cert, at)
+    if t.tag == 0xA0u8 {
+        at = t.next
+        t = der_tlv(cert, at)
+    }
+    // serial (INTEGER), sigalg, issuer, validity, subject
+    var skip = 0
+    while skip < 5 {
+        at = t.next
+        t = der_tlv(cert, at)
+        skip = skip + 1
+    }
+    if t.tag != 0x30u8 {
+        return zeros(0)
+    }
+    // hash the SPKI's full TLV bytes: [at, t.next)
+    val spki: u8[] = cert[at..t.next]
+    Sha256.sha256(spki)
+}
+
+// Extract the leaf DER from a TLS 1.3 Certificate handshake message
+// (header included): u8 context_len(=0) + u24 list_len + first entry
+// (u24 entry_len + DER + u16 ext_len).
+fun leaf_der_of_cert_msg(msg: u8[]): u8[] {
+    if msg.len() < 11 {
+        return zeros(0)
+    }
+    val list_len = rd24(msg, 5) as usize
+    if list_len == 0 {
+        return zeros(0)
+    }
+    val entry_len = rd24(msg, 8) as usize
+    if entry_len == 0 || 11 + entry_len > msg.len() {
+        return zeros(0)
+    }
+    msg[11..11 + entry_len]
+}
+
+// Extract EVERY certificate DER from the message (leaf first, then the
+// intermediates the server sent) — chain verification input.
+fun cert_ders_of_cert_msg(msg: u8[]): u8[][] {
+    var out: u8[][] = []
+    if msg.len() < 8 {
+        return out
+    }
+    var at = 8 as usize
+    var list_end = at + (rd24(msg, 5) as usize)
+    if list_end > msg.len() {
+        list_end = msg.len()
+    }
+    while at + 3 <= list_end {
+        val entry_len = rd24(msg, at) as usize
+        at = at + 3
+        if entry_len == 0 || at + entry_len > list_end {
+            return out
+        }
+        out = out ++ [msg[at..at + entry_len]]
+        at = at + entry_len
+        // skip the u16 extensions of this entry
+        if at + 2 <= list_end {
+            at = at + 2 + (rd16(msg, at) as usize)
+        }
+    }
+    out
+}
+
+fun alert_text(body: u8[]): str {
+    if body.len() >= 2 {
+        return "level {body[0]} code {body[1]}"
+    }
+    "malformed"
+}
+
+pub fun connect(host: str, port: u16, timeout_ns: i64): Throw<TlsConn, IOError> {
+    val ips = match Dns.resolve(host).await() {
+        Ok(list) => list,
+        Error(e) => throw tls_io("dns: " + e.message),
+    }
+    if ips.len() == 0 {
+        throw tls_io("no addresses for host")
+    }
+    // prefer IPv4 (localhost often lists ::1 first and servers bind v4)
+    var target = ips[0]
+    var ai = 0 as usize
+    while ai < ips.len() {
+        val cand = ips[ai]
+        if Addr.is_v4(cand) {
+            target = cand
+            ai = ips.len()
+        }
+        ai = ai + 1
+    }
+    connect_via(target, host, port, timeout_ns, zeros(0), false)
+}
+
+// SPKI-pinned connect (fails closed): sha256(SPKI DER) of the peer's
+// leaf certificate must equal `pin` (32 bytes), else the handshake
+// aborts. Host is resolved normally; SNI uses `host`.
+pub fun connect_pinned(host: str, port: u16, timeout_ns: i64, pin: u8[]): Throw<TlsConn, IOError> {
+    val ips = match Dns.resolve(host).await() {
+        Ok(list) => list,
+        Error(e) => throw tls_io("dns: " + e.message),
+    }
+    if ips.len() == 0 {
+        throw tls_io("no addresses for host")
+    }
+    var target = ips[0]
+    var ai = 0 as usize
+    while ai < ips.len() {
+        val cand = ips[ai]
+        if Addr.is_v4(cand) {
+            target = cand
+            ai = ips.len()
+        }
+        ai = ai + 1
+    }
+    connect_via(target, host, port, timeout_ns, pin, true)
+}
+
+// Chain-verified connect: the handshake completes only if the server's
+// certificate chain verifies against `anchor_ders` (DER bytes), the
+// leaf is inside its validity window, and the leaf SAN matches `host`.
+// Uses the built-in std.tls.Roots anchors when none are given.
+pub fun connect_verified(host: str, port: u16, timeout_ns: i64): Throw<TlsConn, IOError> {
+    connect_verified_with(host, port, timeout_ns, std.tls.Roots.list())
+}
+
+pub fun connect_verified_with(host: str, port: u16, timeout_ns: i64, anchor_ders: u8[][]): Throw<TlsConn, IOError> {
+    val conn = match connect(host, port, timeout_ns) {
+        Ok(c) => c,
+        Error(e) => throw e,
+    }
+    finish_verified(conn, host, anchor_ders)
+}
+
+// direct-IP chain-verified connect (bypasses a hijacked resolver; SNI
+// and hostname checks still use `host`)
+pub fun connect_addr_verified(ip: IpAddr, host: str, port: u16, timeout_ns: i64, anchor_ders: u8[][]): Throw<TlsConn, IOError> {
+    val conn = match connect_addr_pinned_open(ip, host, port, timeout_ns) {
+        Ok(c) => c,
+        Error(e) => throw e,
+    }
+    finish_verified(conn, host, anchor_ders)
+}
+
+fun connect_addr_pinned_open(ip: IpAddr, host: str, port: u16, timeout_ns: i64): Throw<TlsConn, IOError> {
+    connect_via(ip, host, port, timeout_ns, zeros(0), false)
+}
+
+fun finish_verified(conn: TlsConn, host: str, anchor_ders: u8[][]): Throw<TlsConn, IOError> {
+    if conn.peer_chain.len() == 0 {
+        match conn.stream.close().await() {
+            Ok(_) => {}
+            Error(_) => {}
+        }
+        throw tls_io("chain verification: server sent no certificate chain")
+    }
+    // wall clock as epoch seconds (SystemTime is epoch nanos under a
+    // positional field, exposed via its methods)
+    val utc = std.time.SystemTime.now().to_utc()
+    val comp = utc.to_components()
+    val now_secs = (std.time.Calendar.days_from_civil(comp.year, comp.month, comp.day) * 86400
+        + (comp.hour as i64) * 3600 + (comp.minute as i64) * 60 + (comp.second as i64))
+    val verdict = std.tls.Chain.verify(conn.peer_chain[0], conn.peer_chain[1..conn.peer_chain.len()], anchor_ders, host, now_secs)
+    match verdict {
+        Ok(_) => Ok(conn),
+        Error(m) => {
+            match conn.stream.close().await() {
+                Ok(_) => {}
+                Error(_) => {}
+            }
+            throw tls_io("chain verification failed: {m}")
+        },
+    }
+}
+
+// Direct-IP pinned connect: TCP to `ip`, SNI/ClientHello use `host`.
+// Lets callers bypass a hijacked resolver while keeping the hostname
+// for SNI — the certificate is still pinned, so a wrong-party answer
+// fails closed.
+pub fun connect_addr_pinned(ip: IpAddr, host: str, port: u16, timeout_ns: i64, pin: u8[]): Throw<TlsConn, IOError> {
+    connect_via(ip, host, port, timeout_ns, pin, true)
+}
+
+fun connect_via(target: IpAddr, host: str, port: u16, timeout_ns: i64, pin: u8[], require_pin: bool): Throw<TlsConn, IOError> {
+    val stream = match std.net.TcpStream.connect(
+        std.net.Addr.socket_from(target, port), timeout_ns).await() {
+        Ok(s) => s,
+        Error(e) => throw tls_io("tcp: " + e.message),
+    }
+    // single error funnel: a failed handshake must NOT leak the TCP
+    // connection — the server would block forever waiting for the rest
+    // of the handshake on a socket nobody will ever finish.
+    match handshake(stream, host, pin, require_pin) {
+        Ok(conn) => Ok(conn),
+        Error(e) => {
+            match stream.close().await() {
+                Ok(_) => {}
+                Error(_) => {}
+            }
+            throw e
+        },
+    }
+}
+
+fun handshake(stream: TcpStream, host: str, pin: u8[], require_pin: bool): Throw<TlsConn, IOError> {
+    val client_secret = match Rand.secure_bytes(32) {
+        Ok(b) => b,
+        Error(e) => throw tls_io("rng: " + e.message),
+    }
+    val client_pub = X25519.public_key(client_secret)
+    val client_random = match Rand.secure_bytes(32) {
+        Ok(b) => b,
+        Error(e) => throw tls_io("rng: " + e.message),
+    }
+    val session_id = match Rand.secure_bytes(32) {
+        Ok(b) => b,
+        Error(e) => throw tls_io("rng: " + e.message),
+    }
+
+    val ch = build_client_hello(host, client_random, session_id, client_pub)
+    write_plain(stream, 22, ch)?
+
+    var transcript: u8[] = ch
+    var hs_secret: u8[] = []
+    var s_hs: u8[] = []
+    var c_hs: u8[] = []
+    var have_hs_keys = false
+    var hs_buf: u8[] = []
+    var leaf_spki: u8[] = zeros(0)
+    var peer_chain: u8[][] = []
+    var conn: TlsConn = TlsConn(stream, zeros(16), zeros(12), 0, zeros(16), zeros(12), 0, zeros(0), [])
+
+    loop {
+        val rec = read_record(stream)?
+        if rec.rtype == 20 {
+            // ChangeCipherSpec compatibility — ignore
+        } else if rec.rtype == 22 {
+            if have_hs_keys {
+                throw tls_io("unexpected plaintext handshake after keys")
+            }
+            if rec.body.len() > 0 && rec.body[0] == 2 {
+                transcript = transcript ++ rec.body
+                val server_pub = match parse_server_key_share(rec.body[4..rec.body.len()]) {
+                    Ok(k) => k,
+                    Error(e) => throw e,
+                }
+                val shared = X25519.x25519(client_secret, server_pub)
+                val early = extract(zeros(0), zeros(32))
+                val derived1 = expand_label(early, "derived", Sha256.sha256(zeros(0)), 32)
+                hs_secret = extract(derived1, shared)
+                val th = Sha256.sha256(transcript)
+                s_hs = derive_secret(hs_secret, "s hs traffic", th)
+                c_hs = derive_secret(hs_secret, "c hs traffic", th)
+                conn = TlsConn(stream, traffic_key(c_hs), traffic_iv(c_hs), 0, traffic_key(s_hs), traffic_iv(s_hs), 0, leaf_spki, peer_chain)
+                have_hs_keys = true
+            } else {
+                throw tls_io("unexpected plaintext handshake message")
+            }
+        } else if rec.rtype == 23 {
+            if !have_hs_keys {
+                throw tls_io("encrypted record before ServerHello")
+            }
+            val inner = open_record(conn, rec)?
+            if inner.rtype == 22 {
+                hs_buf = hs_buf ++ inner.body
+                loop {
+                    if hs_buf.len() < 4 {
+                        break
+                    }
+                    val mtype = hs_buf[0]
+                    val mlen = rd24(hs_buf, 1) as usize
+                    if hs_buf.len() < 4 + mlen {
+                        break
+                    }
+                    val msg = hs_buf[0..4 + mlen]
+                    hs_buf = hs_buf[4 + mlen..hs_buf.len()]
+                    if mtype == 20 {
+                        // server Finished — verify against transcript so far
+                        val th_before = Sha256.sha256(transcript)
+                        val fin_key = expand_label(s_hs, "finished", zeros(0), 32)
+                        val expect = Sha256.hmac_sha256(fin_key, th_before)
+                        val got = msg[4..4 + mlen]
+                        if expect.len() != got.len() || !hmac_equal(expect, got) {
+                            throw tls_io("server Finished verification failed")
+                        }
+                        transcript = transcript ++ msg
+                        // application secrets
+                        val derived2 = expand_label(hs_secret, "derived", Sha256.sha256(zeros(0)), 32)
+                        val master = extract(derived2, zeros(32))
+                        val th_after = Sha256.sha256(transcript)
+                        val c_ap = derive_secret(master, "c ap traffic", th_after)
+                        val s_ap = derive_secret(master, "s ap traffic", th_after)
+                        // CCS compatibility record before the first encrypted
+                        // client record (middlebox mode — OpenSSL expects it).
+                        // RFC 8446 §5.1: legacy_record_version is 0x0303 for
+                        // every record except the initial ClientHello.
+                        val ccs_rec: u8[] = [0x14u8, 0x03u8, 0x03u8, 0x00u8, 0x01u8, 0x01u8]
+                        stream.write_all(ccs_rec, 6).await()?
+                        // client Finished under handshake keys
+                        val c_fin_key = expand_label(c_hs, "finished", zeros(0), 32)
+                        val c_verify = Sha256.hmac_sha256(c_fin_key, th_after)
+                        val fin_msg = [0x14u8] ++ be24(c_verify.len() as u32) ++ c_verify
+                        transcript = transcript ++ fin_msg
+                        // inner content type is the RECORD type (22 =
+                        // handshake), not the message type (20 = Finished)
+                        write_enc(conn, 22, fin_msg)?
+                        // switch to application keys
+                        conn = TlsConn(stream, traffic_key(c_ap), traffic_iv(c_ap), 0, traffic_key(s_ap), traffic_iv(s_ap), 0, leaf_spki, peer_chain)
+                        return Ok(conn)
+                    } else {
+                        // EE / Certificate / CertificateVerify: transcript +
+                        // (for Certificate) leaf SPKI observation & pin check
+                        if mtype == 11 {
+                            val leaf = leaf_der_of_cert_msg(msg)
+                            if leaf.len() == 0 {
+                                throw tls_io("malformed Certificate message")
+                            }
+                            peer_chain = cert_ders_of_cert_msg(msg)
+                            leaf_spki = spki_sha256_of_cert(leaf)
+                            if leaf_spki.len() == 0 {
+                                throw tls_io("leaf certificate is not valid DER")
+                            }
+                            if require_pin {
+                                if pin.len() != 32 {
+                                    throw tls_io("pin must be 32 bytes (sha256 of SPKI DER)")
+                                }
+                                if !hmac_equal(leaf_spki, pin) {
+                                    throw tls_io("certificate pin mismatch: got " + hex_of(leaf_spki)
+                                        + " expected " + hex_of(pin))
+                                }
+                            }
+                        }
+                        transcript = transcript ++ msg
+                    }
+                }
+            } else if inner.rtype == 21 {
+                throw tls_io("alert during handshake: " + alert_text(inner.body))
+            } else {
+                throw tls_io("unexpected inner type during handshake")
+            }
+        } else if rec.rtype == 21 {
+            throw tls_io("alert: " + alert_text(rec.body))
+        } else {
+            throw tls_io("unexpected record type {rec.rtype}")
+        }
+    }
+}
+
+// ─── application data ────────────────────────────────────────────────
+
+pub fun write_app(conn: TlsConn, data: u8[]): Throw<void, IOError> {
+    // fragment large writes into <= 16KiB records
+    var off = 0 as usize
+    while off < data.len() {
+        var n = data.len() - off
+        if n > 16384 {
+            n = 16384
+        }
+        write_enc(conn, 23, data[off..off + n])?
+        off = off + n
+    }
+    Ok(void)
+}
+
+pub fun read_app(conn: TlsConn): Throw<u8[], IOError> {
+    loop {
+        val rec = read_record(conn.stream)?
+        if rec.rtype == 23 {
+            val inner = open_record(conn, rec)?
+            if inner.rtype == 23 {
+                return Ok(inner.body)
+            }
+            if inner.rtype == 21 {
+                // close_notify (code 0) = clean EOF; surface it as an
+                // empty read so "read until EOF" loops terminate without
+                // treating an orderly shutdown as an error
+                if inner.body.len() >= 2 && inner.body[1] == 0 {
+                    return Ok(zeros(0))
+                }
+                throw tls_io("alert: " + alert_text(inner.body))
+            }
+            if inner.rtype == 22 {
+                // post-handshake handshake messages ride the handshake
+                // record type; NewSessionTicket(4)/KeyUpdate(24) and friends
+                // are skipped whole-message at a time
+                var buf = inner.body
+                while buf.len() >= 4 {
+                    val mlen2 = rd24(buf, 1) as usize
+                    if buf.len() < 4 + mlen2 {
+                        break
+                    }
+                    buf = buf[4 + mlen2..buf.len()]
+                }
+            } else {
+                throw tls_io("unexpected inner type {inner.rtype} in application data")
+            }
+        }
+        if rec.rtype == 21 {
+            if rec.body.len() >= 2 && rec.body[1] == 0 {
+                return Ok(zeros(0))
+            }
+            throw tls_io("alert: " + alert_text(rec.body))
+        }
+        // skip anything else (e.g. stray CCS)
+    }
+}
+
+pub fun close(conn: TlsConn): Throw<void, IOError> {
+    // close_notify(0) alert, level warning(1)
+    val alert: u8[] = [0x01u8, 0x00u8]
+    write_enc(conn, 21, alert)?
+    conn.stream.close().await()?
+    Ok(void)
+}

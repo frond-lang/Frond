@@ -1,0 +1,106 @@
+// Rand.frond — pseudo-random numbers (xorshift64*, single global stream)
+// + secure randomness (CSPRNG, see secure_bytes below)
+//
+// The xorshift stream is NOT cryptographic. The integer surface is
+// usize-shaped (the platform's natural integer): index/len arithmetic
+// composes without width casts. Other domains are one explicit cast away
+// (`next() as u64`, `as i32`, ...).
+// The stream is a process-wide top-level var: seeding makes runs
+// reproducible; seed(0) maps to the default constant (xorshift's zero is a
+// fixed point).
+
+import std.os.Info
+import std.io.File
+import std.io.Path
+
+var state: u64 = 0x9E3779B97F4A7C15
+
+// Re-seed the global stream (0 falls back to the default constant).
+pub fun seed(v: usize): void {
+    if v == 0 {
+        state = 0x9E3779B97F4A7C15
+    } else {
+        state = v as u64
+    }
+}
+
+// Next raw value (full platform width), advancing the global stream.
+pub fun next(): usize {
+    state = __rand_step(state)
+    state as usize
+}
+
+// Next value in [0, 1) with 53 bits of mantissa precision.
+pub fun next_f64(): f64 {
+    ((next() as u64) >> 11) as f64 / 9007199254740992.0
+}
+
+// Next integer in [min, max] (inclusive both ends; max < min swaps them).
+pub fun range(min: usize, max: usize): usize {
+    if max < min { return range(max, min) }
+    if max == min { return min }
+    min + next() % (max - min + 1)
+}
+
+// ── Secure randomness (CSPRNG) ─────────────────────────────────────────
+//
+// Cryptographically secure bytes from the OS entropy source — the seed
+// material for everything crypto (keys, nonces, TLS client randomness).
+// Composed from platform primitives with zero new native code:
+//   Windows: bcrypt.dll!BCryptGenRandom(NULL, buf, len,
+//            BCRYPT_USE_SYSTEM_PREFERRED_RNG) — system library, always
+//            present; buffer filled via the cbuf writeback.
+//   Unix:    /dev/urandom (read exactly n bytes, short-read loop).
+// Keys must come from here, never from the xorshift stream above.
+
+// FfiError → IOError 收口(FfiError 域的 Err 在 IOError 通道里重新包装)。
+fun ffi_io_err(stage: str, e: FfiError): IOError {
+    IOError(Other, stage + ": " + e.message, 0, null)
+}
+
+// lookup 的 canonical 形态:R 必须在 `?` 解包点被 val 注解钉住 —— match 臂
+// 绑定会丢掉 ForeignFn 的 R(运行期 call 返回 void),这条注释就是防线。
+fun bcrypt_gen(lib: Lib): Throw<ForeignFn<i32>, FfiError> {
+    // (hAlgorithm=NULL as u64, pbBuffer via cbuf, cbBuffer, dwFlags)
+    val f: ForeignFn<i32> = lib.lookup("BCryptGenRandom", "u64, cbuf, u32, u32")?
+    Ok(f)
+}
+
+pub fun secure_bytes(n: usize): Throw<u8[], IOError> {
+    if n == 0 {
+        return Ok([])
+    }
+    if Info.os_name() == "windows" {
+        val lib = match Lib.open("bcrypt.dll") {
+            Ok(l) => l,
+            Error(e) => throw ffi_io_err("secure_bytes: bcrypt.dll", e),
+        }
+        val gen = match bcrypt_gen(lib) {
+            Ok(f) => f,
+            Error(e) => throw ffi_io_err("secure_bytes: lookup", e),
+        }
+        val buf: u8[] = [0u8, ..n]
+        // (NULL alg, buf, len, BCRYPT_USE_SYSTEM_PREFERRED_RNG=2): the NULL
+        // algorithm handle requires this flag.
+        val rc = match gen.call(0u64, buf, n as u32, 2u32) {
+            Ok(r) => r,
+            Error(e) => throw ffi_io_err("secure_bytes: call", e),
+        }
+        lib.close()
+        if rc != 0 {
+            throw IOError(Other, "secure_bytes: BCryptGenRandom rc={rc}", 0, null)
+        }
+        return Ok(buf)
+    }
+    val f = File.open(Path.from("/dev/urandom"), File.read_only()).await()?
+    defer f.close().await()
+    var out: u8[] = []
+    while out.len() < n {
+        val chunk = f.read(n - out.len()).await()?
+        if chunk.len() == 0 {
+            throw IOError(Other, "secure_bytes: /dev/urandom EOF", 0, null)
+        }
+        out = out ++ chunk
+    }
+    Ok(out)
+}

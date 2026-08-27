@@ -1,0 +1,9 @@
+// std/crypto package declaration
+//
+// Cryptographic key-agreement / AEAD primitives (thin std wrappers over the
+// embedded-C kernels in builtin/crypto). Hashes live in std.core.hash;
+// this module is the TLS-building half.
+pub pack X25519
+pub pack AesGcm
+pub pack EcdsaP256
+pub pack EcdsaP384

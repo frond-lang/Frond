@@ -1,0 +1,79 @@
+// Json.frond — JSON value ADT + accessors (part of std.json)
+//
+// The value layer only: the recursive ADT, object field lookup, and payload
+// accessors. Text conversion lives in sibling modules (Parse.frond /
+// Format.frond); import std.json loads all three.
+// Object is an ordered entry array; duplicate keys are kept as separate
+// entries (get returns the FIRST match). JNum holds f64 (integers beyond
+// 2^53 lose precision, same as JS numbers).
+// Note: literal braces inside Frond string literals are written
+// backslash-brace.
+
+// ─── Value ADT ────────────────────────────────────────────────────
+
+pub type JEntry = JEntry(pub key: str, pub value: Json)
+
+pub type Json =
+    | JStr(str)
+    | JNum(f64)
+    | JBool(bool)
+    | JNull
+    | JArr(Json[])
+    | JObj(JEntry[])
+
+// ─── Accessors ────────────────────────────────────────────────────
+
+// Object field lookup: first matching key; null if v is not an object or
+// the key is absent.
+pub fun get(v: Json?, key: str): Json? {
+    match v {
+        JObj(entries) => {
+            var i: usize = 0
+            while i < entries.len() {
+                if entries[i].key == key {
+                    return entries[i].value
+                }
+                i = i + 1
+            }
+            null
+        }
+        _ => null
+    }
+}
+
+// Payload accessors: unwrap a Json value to its scalar/container payload,
+// null if the variant does not match.
+pub fun as_str(v: Json?): str? {
+    match v {
+        JStr(s) => s
+        _ => null
+    }
+}
+
+pub fun as_num(v: Json?): f64? {
+    match v {
+        JNum(n) => n
+        _ => null
+    }
+}
+
+pub fun as_bool(v: Json?): bool? {
+    match v {
+        JBool(b) => b
+        _ => null
+    }
+}
+
+pub fun as_arr(v: Json?): Json[]? {
+    match v {
+        JArr(items) => items
+        _ => null
+    }
+}
+
+pub fun as_obj(v: Json?): JEntry[]? {
+    match v {
+        JObj(entries) => entries
+        _ => null
+    }
+}

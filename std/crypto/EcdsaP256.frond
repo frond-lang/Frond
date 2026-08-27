@@ -1,0 +1,31 @@
+// EcdsaP256.frond — ECDSA P-256 (secp256r1) verification (part of std.crypto)
+//
+// Thin wrapper over the embedded-C __ecdsa_p256_verify kernel.
+// Inputs are fixed-size: pub_xy = X||Y (64 bytes, the uncompressed point
+// minus the 0x04 prefix), hash = 32-byte digest (the curve's hash is
+// SHA-256), sig = r||s (64 bytes, both big-endian). DER signature
+// structures are the caller's job (std.tls.Cert unpacks them).
+//
+// verify() returns true only on a fully valid signature; malformed
+// sizes throw.
+
+fun bad_input(msg: str): IOError {
+    IOError(InvalidInput, "ecdsa-p256: " + msg, 0, null)
+}
+
+pub fun verify(pub_xy: u8[], hash: u8[], sig_rs: u8[]): Throw<bool, IOError> {
+    if pub_xy.len() != 64 {
+        throw bad_input("public key must be 64 bytes (X||Y)")
+    }
+    if hash.len() != 32 {
+        throw bad_input("hash must be 32 bytes")
+    }
+    if sig_rs.len() != 64 {
+        throw bad_input("signature must be 64 bytes (r||s)")
+    }
+    val rc = __ecdsa_p256_verify(pub_xy, hash, sig_rs)
+    if rc < 0 {
+        throw bad_input("kernel rejected input lengths")
+    }
+    Ok(rc == 1)
+}

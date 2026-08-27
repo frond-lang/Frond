@@ -1,0 +1,1432 @@
+// builtin/crypto/Raw.frond — cryptographic hash primitive
+//
+// SHA-256 as one compact C body (public-domain-style implementation).
+// Why embedded C instead of platform APIs: system SHA is fragmented
+// (BCrypt on Windows, CommonCrypto on macOS, nothing on plain Linux) — a
+// ~100-line software implementation is uniform, fast enough (~hundreds of
+// MB/s), and pulls no new headers or link dependencies.
+//
+// The C-body constraint (bodies cannot define helper functions) is handled
+// with a #define'd compression macro used three times (data blocks, first
+// tail block, optional second tail block).
+
+@internal
+@extern("C")
+fun __sha256_into(data: u8[], out: u8[]): i64 #{
+    static const uint32_t K[64] = {
+        0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+        0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+        0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+        0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+        0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+        0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+        0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+        0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
+    };
+    uint32_t h0=0x6a09e667u,h1=0xbb67ae85u,h2=0x3c6ef372u,h3=0xa54ff53au;
+    uint32_t h4=0x510e527fu,h5=0x9b05688cu,h6=0x1f83d9abu,h7=0x5be0cd19u;
+
+#define SHA256_COMPRESS(P) do { \
+    uint32_t w[64]; int t; \
+    const unsigned char* p = (P); \
+    for (t = 0; t < 16; t++) \
+        w[t] = ((uint32_t)p[t*4] << 24) | ((uint32_t)p[t*4+1] << 16) | ((uint32_t)p[t*4+2] << 8) | (uint32_t)p[t*4+3]; \
+    for (t = 16; t < 64; t++) { \
+        uint32_t m = w[t-15], n = w[t-2]; \
+        uint32_t s0 = ((m >> 7) | (m << 25)) ^ ((m >> 18) | (m << 14)) ^ (m >> 3); \
+        uint32_t s1 = ((n >> 17) | (n << 15)) ^ ((n >> 19) | (n << 13)) ^ (n >> 10); \
+        w[t] = w[t-16] + s0 + w[t-7] + s1; \
+    } \
+    uint32_t a=h0,b=h1,c=h2,d=h3,e=h4,f=h5,g=h6,hh=h7; \
+    for (t = 0; t < 64; t++) { \
+        uint32_t S1 = ((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7)); \
+        uint32_t ch = (e & f) ^ (~e & g); \
+        uint32_t t1 = hh + S1 + ch + K[t] + w[t]; \
+        uint32_t S0 = ((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10)); \
+        uint32_t mj = (a & b) ^ (a & c) ^ (b & c); \
+        uint32_t t2 = S0 + mj; \
+        hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2; \
+    } \
+    h0+=a; h1+=b; h2+=c; h3+=d; h4+=e; h5+=f; h6+=g; h7+=hh; \
+} while (0)
+
+    size_t pos = 0;
+    while ((data_len - pos) >= 64) {
+        SHA256_COMPRESS(data_data + pos);
+        pos += 64;
+    }
+    unsigned char tail[128];
+    size_t tl = data_len - pos;
+    size_t r;
+    for (r = 0; r < tl; r++) tail[r] = data_data[pos + r];
+    tail[tl] = 0x80;
+    tl++;
+    size_t padded = (tl + 8 <= 64) ? 64 : 128;
+    while (tl < padded) { tail[tl] = 0; tl++; }
+    uint64_t bits = (uint64_t)data_len * 8u;
+    for (r = 0; r < 8; r++) tail[padded - 1 - r] = (unsigned char)((bits >> (8 * r)) & 0xFFu);
+    SHA256_COMPRESS(tail);
+    if (padded == 128) SHA256_COMPRESS(tail + 64);
+    for (r = 0; r < 4; r++) {
+        out_data[r]      = (unsigned char)((h0 >> (24 - 8 * r)) & 0xFFu);
+        out_data[4 + r]  = (unsigned char)((h1 >> (24 - 8 * r)) & 0xFFu);
+        out_data[8 + r]  = (unsigned char)((h2 >> (24 - 8 * r)) & 0xFFu);
+        out_data[12 + r] = (unsigned char)((h3 >> (24 - 8 * r)) & 0xFFu);
+        out_data[16 + r] = (unsigned char)((h4 >> (24 - 8 * r)) & 0xFFu);
+        out_data[20 + r] = (unsigned char)((h5 >> (24 - 8 * r)) & 0xFFu);
+        out_data[24 + r] = (unsigned char)((h6 >> (24 - 8 * r)) & 0xFFu);
+        out_data[28 + r] = (unsigned char)((h7 >> (24 - 8 * r)) & 0xFFu);
+    }
+#undef SHA256_COMPRESS
+    return 0;
+}#
+
+// SHA-512 / SHA-384 in one body: is384 selects the IV and truncates the
+// output to the first six words (384 bits); the compression rounds and the
+// 128-bit length field are shared. Same macro trick as SHA-256.
+@internal
+@extern("C")
+fun __sha512_into(data: u8[], out: u8[], is384: u32): i64 #{
+    static const uint64_t K[80] = {
+        0x428A2F98D728AE22ull,0x7137449123EF65CDull,0xB5C0FBCFEC4D3B2Full,0xE9B5DBA58189DBBCull,
+        0x3956C25BF348B538ull,0x59F111F1B605D019ull,0x923F82A4AF194F9Bull,0xAB1C5ED5DA6D8118ull,
+        0xD807AA98A3030242ull,0x12835B0145706FBEull,0x243185BE4EE4B28Cull,0x550C7DC3D5FFB4E2ull,
+        0x72BE5D74F27B896Full,0x80DEB1FE3B1696B1ull,0x9BDC06A725C71235ull,0xC19BF174CF692694ull,
+        0xE49B69C19EF14AD2ull,0xEFBE4786384F25E3ull,0x0FC19DC68B8CD5B5ull,0x240CA1CC77AC9C65ull,
+        0x2DE92C6F592B0275ull,0x4A7484AA6EA6E483ull,0x5CB0A9DCBD41FBD4ull,0x76F988DA831153B5ull,
+        0x983E5152EE66DFABull,0xA831C66D2DB43210ull,0xB00327C898FB213Full,0xBF597FC7BEEF0EE4ull,
+        0xC6E00BF33DA88FC2ull,0xD5A79147930AA725ull,0x06CA6351E003826Full,0x142929670A0E6E70ull,
+        0x27B70A8546D22FFCull,0x2E1B21385C26C926ull,0x4D2C6DFC5AC42AEDull,0x53380D139D95B3DFull,
+        0x650A73548BAF63DEull,0x766A0ABB3C77B2A8ull,0x81C2C92E47EDAEE6ull,0x92722C851482353Bull,
+        0xA2BFE8A14CF10364ull,0xA81A664BBC423001ull,0xC24B8B70D0F89791ull,0xC76C51A30654BE30ull,
+        0xD192E819D6EF5218ull,0xD69906245565A910ull,0xF40E35855771202Aull,0x106AA07032BBD1B8ull,
+        0x19A4C116B8D2D0C8ull,0x1E376C085141AB53ull,0x2748774CDF8EEB99ull,0x34B0BCB5E19B48A8ull,
+        0x391C0CB3C5C95A63ull,0x4ED8AA4AE3418ACBull,0x5B9CCA4F7763E373ull,0x682E6FF3D6B2B8A3ull,
+        0x748F82EE5DEFB2FCull,0x78A5636F43172F60ull,0x84C87814A1F0AB72ull,0x8CC702081A6439ECull,
+        0x90BEFFFA23631E28ull,0xA4506CEBDE82BDE9ull,0xBEF9A3F7B2C67915ull,0xC67178F2E372532Bull,
+        0xCA273ECEEA26619Cull,0xD186B8C721C0C207ull,0xEADA7DD6CDE0EB1Eull,0xF57D4F7FEE6ED178ull,
+        0x06F067AA72176FBAull,0x0A637DC5A2C898A6ull,0x113F9804BEF90DAEull,0x1B710B35131C471Bull,
+        0x28DB77F523047D84ull,0x32CAAB7B40C72493ull,0x3C9EBE0A15C9BEBCull,0x431D67C49C100D4Cull,
+        0x4CC5D4BECB3E42B6ull,0x597F299CFC657E2Aull,0x5FCB6FAB3AD6FAECull,0x6C44198C4A475817ull
+    };
+    uint64_t h0,h1,h2,h3,h4,h5,h6,h7;
+    if (is384 == 0u) {
+        h0=0x6A09E667F3BCC908ull; h1=0xBB67AE8584CAA73Bull; h2=0x3C6EF372FE94F82Bull; h3=0xA54FF53A5F1D36F1ull;
+        h4=0x510E527FADE682D1ull; h5=0x9B05688C2B3E6C1Full; h6=0x1F83D9ABFB41BD6Bull; h7=0x5BE0CD19137E2179ull;
+    } else {
+        h0=0xCBBB9D5DC1059ED8ull; h1=0x629A292A367CD507ull; h2=0x9159015A3070DD17ull; h3=0x152FECD8F70E5939ull;
+        h4=0x67332667FFC00B31ull; h5=0x8EB44A8768581511ull; h6=0xDB0C2E0D64F98FA7ull; h7=0x47B5481DBEFA4FA4ull;
+    }
+
+#define SHA512_COMPRESS(P) do { \
+    uint64_t w[80]; int t; \
+    const unsigned char* p = (P); \
+    for (t = 0; t < 16; t++) \
+        w[t] = ((uint64_t)p[t*8] << 56) | ((uint64_t)p[t*8+1] << 48) | ((uint64_t)p[t*8+2] << 40) | ((uint64_t)p[t*8+3] << 32) \
+             | ((uint64_t)p[t*8+4] << 24) | ((uint64_t)p[t*8+5] << 16) | ((uint64_t)p[t*8+6] << 8) | (uint64_t)p[t*8+7]; \
+    for (t = 16; t < 80; t++) { \
+        uint64_t m = w[t-15], n = w[t-2]; \
+        uint64_t s0 = ((m >> 1) | (m << 63)) ^ ((m >> 8) | (m << 56)) ^ (m >> 7); \
+        uint64_t s1 = ((n >> 19) | (n << 45)) ^ ((n >> 61) | (n << 3)) ^ (n >> 6); \
+        w[t] = w[t-16] + s0 + w[t-7] + s1; \
+    } \
+    uint64_t a=h0,b=h1,c=h2,d=h3,e=h4,f=h5,g=h6,hh=h7; \
+    for (t = 0; t < 80; t++) { \
+        uint64_t S1 = ((e >> 14) | (e << 50)) ^ ((e >> 18) | (e << 46)) ^ ((e >> 41) | (e << 23)); \
+        uint64_t ch = (e & f) ^ (~e & g); \
+        uint64_t t1 = hh + S1 + ch + K[t] + w[t]; \
+        uint64_t S0 = ((a >> 28) | (a << 36)) ^ ((a >> 34) | (a << 30)) ^ ((a >> 39) | (a << 25)); \
+        uint64_t mj = (a & b) ^ (a & c) ^ (b & c); \
+        uint64_t t2 = S0 + mj; \
+        hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2; \
+    } \
+    h0+=a; h1+=b; h2+=c; h3+=d; h4+=e; h5+=f; h6+=g; h7+=hh; \
+} while (0)
+
+    size_t pos = 0;
+    while ((data_len - pos) >= 128) {
+        SHA512_COMPRESS(data_data + pos);
+        pos += 128;
+    }
+    unsigned char tail[256];
+    size_t tl = data_len - pos;
+    size_t r;
+    for (r = 0; r < tl; r++) tail[r] = data_data[pos + r];
+    tail[tl] = 0x80;
+    tl++;
+    size_t padded = (tl + 17 <= 128) ? 128 : 256;
+    while (tl < padded) { tail[tl] = 0; tl++; }
+    uint64_t bits = (uint64_t)data_len * 8u;
+    for (r = 0; r < 8; r++) tail[padded - 16 + r] = 0;   /* high 64 bits of the 128-bit length */
+    for (r = 0; r < 8; r++) tail[padded - 1 - r] = (unsigned char)((bits >> (8 * r)) & 0xFFu);
+    SHA512_COMPRESS(tail);
+    if (padded == 256) SHA512_COMPRESS(tail + 128);
+    int words = (is384 == 0u) ? 8 : 6;
+    uint64_t hs[8];
+    hs[0]=h0; hs[1]=h1; hs[2]=h2; hs[3]=h3; hs[4]=h4; hs[5]=h5; hs[6]=h6; hs[7]=h7;
+    for (r = 0; r < (size_t)words; r++) {
+        size_t b;
+        for (b = 0; b < 8; b++) out_data[r*8 + b] = (unsigned char)((hs[r] >> (56 - 8 * b)) & 0xFFu);
+    }
+#undef SHA512_COMPRESS
+    return 0;
+}#
+
+// X25519 (RFC 7748) Diffie-Hellman scalar multiplication, 12-limb x 22-bit
+// form. Equal-width limbs keep the convolution weight-aligned; the fold
+// factor is 2^264 mod p = 19*512 = 9728; every intermediate stays below
+// 2^63 so plain uint64_t arithmetic is safe (MSVC: no __int128). The full
+// algorithm was validated in Python against PyNaCl before this translation.
+// Ladder formulas follow RFC 7748 section 5 verbatim (z_2 = E*(AA+a24*E));
+// the final encode folds 2^255-bits with 19*c and conditionally subtracts p.
+@internal
+@extern("C")
+fun __x25519(out: u8[], scalar: u8[], point: u8[]): i64 #{
+    uint64_t x1[12], x2[12], z2[12], x3[12], z3[12];
+    uint64_t t0[12], t1[12], t2[12], t3[12], t4[12], t5[12];
+    uint64_t a24e[12];
+    uint64_t pl[12];
+    int i, k;
+    /* p = 2^255-19 in 22-bit limbs */
+    {
+        static const unsigned char pv[32] = {
+            0xed,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x7f
+        };
+        int bi = 0;
+        for (i = 0; i < 12; i++) {
+            int wlim = (i == 11) ? 13 : 22;
+            uint64_t v = 0;
+            int j;
+            for (j = 0; j < wlim; j++) {
+                v |= ((uint64_t)((pv[(bi + j) >> 3] >> ((bi + j) & 7)) & 1)) << j;
+            }
+            pl[i] = v;
+            bi += wlim;
+        }
+    }
+
+#define FW 22
+#define FMASK 0x3FFFFFull
+#define FFOLD 9728ull
+
+#define FEXP(o, in) do { \
+    int fbi = 0; int fci, fdj; \
+    for (fci = 0; fci < 12; fci++) { \
+        int wlim = (fci == 11) ? 13 : FW; \
+        uint64_t v = 0; \
+        for (fdj = 0; fdj < wlim; fdj++) { \
+            v |= ((uint64_t)(((in)[(fbi + fdj) >> 3] >> ((fbi + fdj) & 7)) & 1)) << fdj; \
+        } \
+        (o)[fci] = v; \
+        fbi += wlim; \
+    } \
+} while (0)
+
+#define FMUL(o, a, bb) do { \
+    uint64_t tt[23]; uint64_t carry; int fci, fdj; \
+    for (fci = 0; fci < 23; fci++) tt[fci] = 0; \
+    for (fci = 0; fci < 12; fci++) for (fdj = 0; fdj < 12; fdj++) tt[fci + fdj] += (a)[fci] * (bb)[fdj]; \
+    for (fci = 0; fci < 11; fci++) tt[fci] += FFOLD * tt[fci + 12]; \
+    carry = 0; \
+    for (fci = 0; fci < 11; fci++) { tt[fci] += carry; carry = tt[fci] >> FW; tt[fci] &= FMASK; } \
+    tt[11] += carry; \
+    carry = tt[11] >> FW; tt[11] &= FMASK; \
+    tt[0] += FFOLD * carry; \
+    carry = tt[0] >> FW; tt[0] &= FMASK; tt[1] += carry; \
+    for (fci = 0; fci < 12; fci++) (o)[fci] = tt[fci]; \
+} while (0)
+
+#define FSQ(o, a) FMUL(o, a, a)
+#define FADD(o, a, bb) do { int fci; for (fci = 0; fci < 12; fci++) (o)[fci] = (a)[fci] + (bb)[fci]; } while (0)
+
+/* Borrow-chain subtraction; on final borrow the limb value is (a-b)+2^264,
+   and since 2^264 mod p = 9728 subtracting 9728 (another chain, terminates
+   because the value exceeds p) lands back on (a-b) mod p. */
+#define FSUB(o, a, bb) do { \
+    int fci; uint64_t fborrow = 0; \
+    for (fci = 0; fci < 12; fci++) { \
+        uint64_t bv = (bb)[fci] + fborrow; \
+        if ((a)[fci] >= bv) { (o)[fci] = (a)[fci] - bv; fborrow = 0; } \
+        else { (o)[fci] = (a)[fci] + (1ull << FW) - bv; fborrow = 1; } \
+    } \
+    if (fborrow) { \
+        uint64_t fsub = FFOLD; \
+        for (fci = 0; fci < 12 && fsub != 0; fci++) { \
+            if ((o)[fci] >= fsub) { (o)[fci] -= fsub; fsub = 0; } \
+            else { (o)[fci] += (1ull << FW) - fsub; fsub = 1; } \
+        } \
+    } \
+} while (0)
+
+#define FCSWAP(swp, a, bb) do { \
+    uint64_t m0 = (uint64_t)(-(int64_t)(swp)); int fci; \
+    for (fci = 0; fci < 12; fci++) { uint64_t t_ = m0 & ((a)[fci] ^ (bb)[fci]); (a)[fci] ^= t_; (bb)[fci] ^= t_; } \
+} while (0)
+
+    /* clamp scalar, decode u (MSB masked) */
+    unsigned char kk[32];
+    unsigned char uu[32];
+    for (i = 0; i < 32; i++) kk[i] = scalar_data[i];
+    kk[0] &= 248; kk[31] &= 127; kk[31] |= 64;
+    for (i = 0; i < 32; i++) uu[i] = point_data[i];
+    uu[31] &= 127;
+
+    FEXP(x1, uu);
+    for (i = 0; i < 12; i++) { x2[i] = 0; z2[i] = 0; x3[i] = x1[i]; z3[i] = 0; }
+    x2[0] = 1; z3[0] = 1;
+    int swap = 0;
+    for (k = 254; k >= 0; k--) {
+        int kt = (kk[k >> 3] >> (k & 7)) & 1;
+        swap ^= kt;
+        FCSWAP(swap, x2, x3);
+        FCSWAP(swap, z2, z3);
+        swap = kt;
+
+        FADD(t0, x2, z2);          /* A */
+        FSQ(t1, t0);               /* AA */
+        FSUB(t2, x2, z2);          /* B */
+        FSQ(t3, t2);               /* BB */
+        FSUB(t4, t1, t3);          /* E */
+        FADD(t5, x3, z3);          /* C */
+        FSUB(x3, x3, z3);          /* D */
+        FMUL(x3, x3, t0);          /* DA = D*A (x3 <- DA) */
+        FMUL(t2, t5, t2);          /* CB = C*B (t2 <- CB) */
+        FADD(t5, x3, t2);          /* DA+CB */
+        FSUB(t0, x3, t2);          /* DA-CB (x3 still holds DA) */
+        FSQ(x3, t5);               /* x3 = (DA+CB)^2 */
+        FSQ(t0, t0);               /* (DA-CB)^2 */
+        FMUL(z3, x1, t0);          /* z3 = x1*(DA-CB)^2 */
+        FMUL(x2, t1, t3);          /* x2 = AA*BB */
+        /* z2 = E*(AA + a24*E) */
+        {
+            uint64_t carry = 0; int ri;
+            for (ri = 0; ri < 12; ri++) a24e[ri] = 121665ull * t4[ri];
+            for (ri = 0; ri < 11; ri++) { a24e[ri] += carry; carry = a24e[ri] >> FW; a24e[ri] &= FMASK; }
+            a24e[11] += carry;
+            carry = a24e[11] >> FW; a24e[11] &= FMASK;
+            a24e[0] += FFOLD * carry;
+            carry = a24e[0] >> FW; a24e[0] &= FMASK; a24e[1] += carry;
+        }
+        FADD(t0, t1, a24e);
+        FMUL(z2, t4, t0);
+    }
+    FCSWAP(swap, x2, x3);
+    FCSWAP(swap, z2, z3);
+
+    /* res = z2^(p-2), then t1 = x2*res (square-and-multiply, MSB first).
+       p-2 = 2^255-21. */
+    {
+        static const unsigned char pm2[32] = {
+            0xeb,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x7f
+        };
+        int started = 0;
+        int b;
+        for (b = 255; b >= 0; b--) {
+            if (started) { FSQ(t0, t0); }
+            if ((pm2[b >> 3] >> (b & 7)) & 1) {
+                if (started) { FMUL(t0, t0, z2); }
+                else { for (i = 0; i < 12; i++) t0[i] = z2[i]; started = 1; }
+            }
+        }
+        FMUL(t1, x2, t0);
+    }
+    /* encode t1: carry chain, fold 2^255 bits by 19*c, conditional subtract p */
+    {
+        uint64_t e[12];
+        uint64_t carry = 0;
+        int j2;
+        for (i = 0; i < 11; i++) { e[i] = t1[i] + carry; carry = e[i] >> FW; e[i] &= FMASK; }
+        e[11] = t1[11] + carry;
+        carry = e[11] >> 13;
+        e[11] &= 0x1FFF;
+        if (carry) {
+            e[0] += 19ull * carry;
+            carry = e[0] >> FW; e[0] &= FMASK; e[1] += carry;
+        }
+        /* conditional subtract p: d = e - pl; keep d when no final borrow */
+        {
+            uint64_t d[12];
+            uint64_t borrow = 0;
+            for (i = 0; i < 12; i++) {
+                uint64_t bv = pl[i] + borrow;
+                if (e[i] >= bv) { d[i] = e[i] - bv; borrow = 0; }
+                else { d[i] = e[i] + (1ull << FW) - bv; borrow = 1; }
+            }
+            if (borrow == 0) {
+                for (i = 0; i < 12; i++) e[i] = d[i];
+            }
+        }
+        /* write little-endian bits */
+        {
+            int bi = 0;
+            for (i = 0; i < 32; i++) out_data[i] = 0;
+            for (i = 0; i < 12; i++) {
+                int wlim = (i == 11) ? 13 : FW;
+                for (j2 = 0; j2 < wlim; j2++) {
+                    int bit = (int)((e[i] >> j2) & 1ull);
+                    out_data[(bi + j2) >> 3] |= (unsigned char)(bit << ((bi + j2) & 7));
+                }
+                bi += wlim;
+            }
+        }
+    }
+#undef FCSWAP
+#undef FSUB
+#undef FADD
+#undef FSQ
+#undef FMUL
+#undef FEXP
+#undef FMASK
+#undef FW
+    return 0;
+}#
+
+// AES-GCM (FIPS-197 + NIST SP 800-38D), 128- and 256-bit keys selected by
+// key length. The S-box and encryption T-table are generated at call time
+// from the specification (GF(2^8) inverse + affine, then 2/1/1/3 column
+// weighting) — no hand-copied 256-entry constants to mistranscribe.
+// GHASH uses the right-shift bit-serial multiply (fast enough for download
+// workloads; table variants can come later if profiles demand).
+@internal
+@extern("C")
+fun __aes_gcm_seal(key: u8[], iv: u8[], aad: u8[], pt: u8[], out_ct: u8[], out_tag: u8[]): i64 #{
+    unsigned char sbox[256];
+    uint32_t rk[60];
+    uint32_t H[4], J0[4], EJ0[4], Y[4], X[4];
+    uint32_t s0, s1, s2, s3, t0, t1, t2, t3;
+    int i, r, Nr, Nk;
+
+#define ROTL8(x) ((unsigned char)(((x) << 1) | ((x) >> 7)))
+#define ROR32W(x) (((x) >> 8) | ((x) << 24))
+#define MUL2B(x) ((unsigned char)(((x) << 1) ^ (((x) & 0x80) ? 0x1b : 0)))
+
+    /* generate S-box */
+    {
+        unsigned char p = 1, q = 1;
+        do {
+            p = (unsigned char)(p ^ (p << 1) ^ ((p & 0x80) ? 0x1b : 0));
+            q ^= (unsigned char)(q << 1);
+            q ^= (unsigned char)(q << 2);
+            q ^= (unsigned char)(q << 4);
+            if (q & 0x80) q ^= 0x09;
+            sbox[p] = (unsigned char)(q ^ ROTL8(q) ^ ROTL8(ROTL8(q)) ^ ROTL8(ROTL8(ROTL8(q))) ^ ROTL8(ROTL8(ROTL8(ROTL8(q)))) ^ 0x63);
+        } while (p != 1);
+        sbox[0] = 0x63;
+    }
+
+    if (key_len == 16) { Nk = 4; Nr = 10; }
+    else if (key_len == 32) { Nk = 8; Nr = 14; }
+    else { return -1; }
+    for (i = 0; i < Nk; i++) {
+        rk[i] = ((uint32_t)key_data[4*i] << 24) | ((uint32_t)key_data[4*i+1] << 16) | ((uint32_t)key_data[4*i+2] << 8) | (uint32_t)key_data[4*i+3];
+    }
+    {
+        unsigned char rc = 1;
+        for (i = Nk; i < 4 * (Nr + 1); i++) {
+            uint32_t t = rk[i-1];
+            if (i % Nk == 0) {
+                t = ((uint32_t)sbox[(t >> 16) & 0xff] << 24) | ((uint32_t)sbox[(t >> 8) & 0xff] << 16) | ((uint32_t)sbox[t & 0xff] << 8) | (uint32_t)sbox[(t >> 24) & 0xff];
+                t ^= (uint32_t)rc << 24;
+                rc = MUL2B(rc);
+            } else if (Nk > 6 && (i % Nk) == 4) {
+                t = ((uint32_t)sbox[(t >> 24) & 0xff] << 24) | ((uint32_t)sbox[(t >> 16) & 0xff] << 16) | ((uint32_t)sbox[(t >> 8) & 0xff] << 8) | (uint32_t)sbox[t & 0xff];
+            }
+            rk[i] = rk[i - Nk] ^ t;
+        }
+    }
+
+#define AES_ENC(BLK, OUTW) do { \
+    unsigned char sa_[16], sb_[16]; int ai_, ar_, ac_, rr_; \
+    for (ai_ = 0; ai_ < 16; ai_++) sa_[ai_] = (unsigned char)((BLK)[ai_] ^ ((rk[ai_ >> 2] >> (24 - 8 * (ai_ & 3))) & 0xff)); \
+    for (rr_ = 1; rr_ <= Nr; rr_++) { \
+        for (ac_ = 0; ac_ < 4; ac_++) { \
+            for (ar_ = 0; ar_ < 4; ar_++) { \
+                sb_[4 * ac_ + ar_] = sbox[sa_[4 * ((ac_ + ar_) % 4) + ar_]]; \
+            } \
+        } \
+        if (rr_ < Nr) { \
+            for (ac_ = 0; ac_ < 4; ac_++) { \
+                unsigned char a0_ = sb_[4*ac_]; unsigned char a1_ = sb_[4*ac_+1]; unsigned char a2_ = sb_[4*ac_+2]; unsigned char a3_ = sb_[4*ac_+3]; \
+                sa_[4*ac_+0] = (unsigned char)(MUL2B(a0_) ^ MUL2B(a1_) ^ a1_ ^ a2_ ^ a3_); \
+                sa_[4*ac_+1] = (unsigned char)(a0_ ^ MUL2B(a1_) ^ MUL2B(a2_) ^ a2_ ^ a3_); \
+                sa_[4*ac_+2] = (unsigned char)(a0_ ^ a1_ ^ MUL2B(a2_) ^ MUL2B(a3_) ^ a3_); \
+                sa_[4*ac_+3] = (unsigned char)(MUL2B(a0_) ^ a0_ ^ a1_ ^ a2_ ^ MUL2B(a3_)); \
+            } \
+        } else { \
+            for (ai_ = 0; ai_ < 16; ai_++) sa_[ai_] = sb_[ai_]; \
+        } \
+        for (ac_ = 0; ac_ < 4; ac_++) { \
+            for (ar_ = 0; ar_ < 4; ar_++) sa_[4*ac_+ar_] ^= (unsigned char)((rk[4*rr_ + ac_] >> (24 - 8*ar_)) & 0xff); \
+        } \
+    } \
+    (OUTW)[0] = ((uint32_t)sa_[0] << 24) | ((uint32_t)sa_[1] << 16) | ((uint32_t)sa_[2] << 8) | (uint32_t)sa_[3]; \
+    (OUTW)[1] = ((uint32_t)sa_[4] << 24) | ((uint32_t)sa_[5] << 16) | ((uint32_t)sa_[6] << 8) | (uint32_t)sa_[7]; \
+    (OUTW)[2] = ((uint32_t)sa_[8] << 24) | ((uint32_t)sa_[9] << 16) | ((uint32_t)sa_[10] << 8) | (uint32_t)sa_[11]; \
+    (OUTW)[3] = ((uint32_t)sa_[12] << 24) | ((uint32_t)sa_[13] << 16) | ((uint32_t)sa_[14] << 8) | (uint32_t)sa_[15]; \
+} while (0)
+
+#define GH_MUL do { \
+    uint32_t z_[4], v_[4]; int gi; uint32_t lsb_; \
+    z_[0] = 0; z_[1] = 0; z_[2] = 0; z_[3] = 0; \
+    v_[0] = H[0]; v_[1] = H[1]; v_[2] = H[2]; v_[3] = H[3]; \
+    for (gi = 0; gi < 128; gi++) { \
+        if ((Y[gi >> 5] >> (31 - (gi & 31))) & 1u) { \
+            z_[0] ^= v_[0]; z_[1] ^= v_[1]; z_[2] ^= v_[2]; z_[3] ^= v_[3]; \
+        } \
+        lsb_ = v_[3] & 1u; \
+        v_[3] = (v_[3] >> 1) | (v_[2] << 31); \
+        v_[2] = (v_[2] >> 1) | (v_[1] << 31); \
+        v_[1] = (v_[1] >> 1) | (v_[0] << 31); \
+        v_[0] = (v_[0] >> 1); \
+        if (lsb_) v_[0] ^= 0xe1000000u; \
+    } \
+    Y[0] = z_[0]; Y[1] = z_[1]; Y[2] = z_[2]; Y[3] = z_[3]; \
+} while (0)
+
+    /* H = E(0^128) */
+    {
+        unsigned char zblk[16];
+        for (i = 0; i < 16; i++) zblk[i] = 0;
+        AES_ENC(zblk, H);
+    }
+    /* E(J0) is needed for the tag; compute J0 first */
+    if (iv_len == 12) {
+        J0[0] = ((uint32_t)iv_data[0] << 24) | ((uint32_t)iv_data[1] << 16) | ((uint32_t)iv_data[2] << 8) | (uint32_t)iv_data[3];
+        J0[1] = ((uint32_t)iv_data[4] << 24) | ((uint32_t)iv_data[5] << 16) | ((uint32_t)iv_data[6] << 8) | (uint32_t)iv_data[7];
+        J0[2] = ((uint32_t)iv_data[8] << 24) | ((uint32_t)iv_data[9] << 16) | ((uint32_t)iv_data[10] << 8) | (uint32_t)iv_data[11];
+        J0[3] = 0x00000001u;
+    } else {
+        /* J0 = GHASH(iv) */
+        Y[0] = 0; Y[1] = 0; Y[2] = 0; Y[3] = 0;
+        for (i = 0; i < iv_len; i += 16) {
+            int n2 = iv_len - i; if (n2 > 16) n2 = 16;
+            int q2;
+            X[0] = 0; X[1] = 0; X[2] = 0; X[3] = 0;
+            for (q2 = 0; q2 < n2; q2++) X[q2 >> 2] ^= (uint32_t)iv_data[i + q2] << (24 - 8 * (q2 & 3));
+            Y[0] ^= X[0]; Y[1] ^= X[1]; Y[2] ^= X[2]; Y[3] ^= X[3];
+            GH_MUL;
+        }
+        X[0] = 0; X[1] = (uint32_t)(((uint64_t)iv_len * 8) >> 32); X[2] = 0; X[3] = (uint32_t)((uint64_t)iv_len * 8);
+        Y[0] ^= X[0]; Y[1] ^= X[1]; Y[2] ^= X[2]; Y[3] ^= X[3];
+        GH_MUL;
+        J0[0] = Y[0]; J0[1] = Y[1]; J0[2] = Y[2]; J0[3] = Y[3];
+    }
+    {
+        unsigned char jblk[16];
+        int wq;
+        for (wq = 0; wq < 4; wq++) {
+            jblk[4*wq] = (unsigned char)(J0[wq] >> 24);
+            jblk[4*wq+1] = (unsigned char)(J0[wq] >> 16);
+            jblk[4*wq+2] = (unsigned char)(J0[wq] >> 8);
+            jblk[4*wq+3] = (unsigned char)(J0[wq]);
+        }
+        AES_ENC(jblk, EJ0);
+    }
+
+    /* CTR: ct = pt ^ E(inc32(J0) ...), keystream bytes big-endian */
+    {
+        uint32_t c0 = J0[0], c1 = J0[1], c2 = J0[2], c3 = J0[3] + 1;
+        if (c3 == 0) { c2++; if (c2 == 0) { c1++; if (c1 == 0) c0++; } }
+        for (i = 0; i < pt_len; i += 16) {
+            unsigned char cblk[16];
+            uint32_t ks[4];
+            int n2 = pt_len - i; if (n2 > 16) n2 = 16;
+            int q2;
+            cblk[0] = (unsigned char)(c0 >> 24); cblk[1] = (unsigned char)(c0 >> 16); cblk[2] = (unsigned char)(c0 >> 8); cblk[3] = (unsigned char)c0;
+            cblk[4] = (unsigned char)(c1 >> 24); cblk[5] = (unsigned char)(c1 >> 16); cblk[6] = (unsigned char)(c1 >> 8); cblk[7] = (unsigned char)c1;
+            cblk[8] = (unsigned char)(c2 >> 24); cblk[9] = (unsigned char)(c2 >> 16); cblk[10] = (unsigned char)(c2 >> 8); cblk[11] = (unsigned char)c2;
+            cblk[12] = (unsigned char)(c3 >> 24); cblk[13] = (unsigned char)(c3 >> 16); cblk[14] = (unsigned char)(c3 >> 8); cblk[15] = (unsigned char)c3;
+            AES_ENC(cblk, ks);
+            for (q2 = 0; q2 < n2; q2++) {
+                out_ct_data[i + q2] = (unsigned char)(pt_data[i + q2] ^ ((unsigned char)(ks[q2 >> 2] >> (24 - 8 * (q2 & 3)))));
+            }
+            c3++; if (c3 == 0) { c2++; if (c2 == 0) { c1++; if (c1 == 0) c0++; } }
+        }
+    }
+
+    /* S = GHASH(aad, ct) */
+    Y[0] = 0; Y[1] = 0; Y[2] = 0; Y[3] = 0;
+    for (i = 0; i < aad_len; i += 16) {
+        int n2 = aad_len - i; if (n2 > 16) n2 = 16;
+        int q2;
+        X[0] = 0; X[1] = 0; X[2] = 0; X[3] = 0;
+        for (q2 = 0; q2 < n2; q2++) X[q2 >> 2] ^= (uint32_t)aad_data[i + q2] << (24 - 8 * (q2 & 3));
+        Y[0] ^= X[0]; Y[1] ^= X[1]; Y[2] ^= X[2]; Y[3] ^= X[3];
+        GH_MUL;
+    }
+    for (i = 0; i < pt_len; i += 16) {
+        int n2 = pt_len - i; if (n2 > 16) n2 = 16;
+        int q2;
+        X[0] = 0; X[1] = 0; X[2] = 0; X[3] = 0;
+        for (q2 = 0; q2 < n2; q2++) X[q2 >> 2] ^= (uint32_t)out_ct_data[i + q2] << (24 - 8 * (q2 & 3));
+        Y[0] ^= X[0]; Y[1] ^= X[1]; Y[2] ^= X[2]; Y[3] ^= X[3];
+        GH_MUL;
+    }
+    X[0] = 0; X[1] = (uint32_t)(((uint64_t)aad_len * 8) >> 32); X[2] = 0; X[3] = (uint32_t)((uint64_t)pt_len * 8);
+    /* lengths are 64-bit fields per spec: X[0..1] = aad bits, X[2..3] = ct bits */
+    X[0] = (uint32_t)(((uint64_t)aad_len * 8) >> 32); X[1] = (uint32_t)((uint64_t)aad_len * 8);
+    X[2] = (uint32_t)(((uint64_t)pt_len * 8) >> 32); X[3] = (uint32_t)((uint64_t)pt_len * 8);
+    Y[0] ^= X[0]; Y[1] ^= X[1]; Y[2] ^= X[2]; Y[3] ^= X[3];
+    GH_MUL;
+
+    /* tag = EJ0 ^ S */
+    {
+        int q2;
+        for (q2 = 0; q2 < 4; q2++) {
+            out_tag_data[4*q2] = (unsigned char)((EJ0[q2] ^ Y[q2]) >> 24);
+            out_tag_data[4*q2+1] = (unsigned char)((EJ0[q2] ^ Y[q2]) >> 16);
+            out_tag_data[4*q2+2] = (unsigned char)((EJ0[q2] ^ Y[q2]) >> 8);
+            out_tag_data[4*q2+3] = (unsigned char)((EJ0[q2] ^ Y[q2]));
+        }
+    }
+#undef GH_MUL
+#undef AES_ENC
+#undef AES_ROUND
+#undef MUL2B
+#undef ROR32W
+#undef ROTL8
+    return 0;
+}#
+
+// open = verify tag then CTR-decrypt. Kept as a separate thin body that
+// reuses the same generated tables internally.
+@internal
+@extern("C")
+fun __aes_gcm_open(key: u8[], iv: u8[], aad: u8[], ct: u8[], tag: u8[], out_pt: u8[]): i64 #{
+
+    unsigned char sbox[256];
+    uint32_t rk[60];
+    uint32_t H[4], J0[4], EJ0[4], Y[4], X[4];
+    uint32_t s0, s1, s2, s3, t0, t1, t2, t3;
+    int i, r, Nr, Nk;
+
+#define ROTL8(x) ((unsigned char)(((x) << 1) | ((x) >> 7)))
+#define ROR32W(x) (((x) >> 8) | ((x) << 24))
+#define MUL2B(x) ((unsigned char)(((x) << 1) ^ (((x) & 0x80) ? 0x1b : 0)))
+
+    {
+        unsigned char p = 1, q = 1;
+        do {
+            p = (unsigned char)(p ^ (p << 1) ^ ((p & 0x80) ? 0x1b : 0));
+            q ^= (unsigned char)(q << 1);
+            q ^= (unsigned char)(q << 2);
+            q ^= (unsigned char)(q << 4);
+            if (q & 0x80) q ^= 0x09;
+            sbox[p] = (unsigned char)(q ^ ROTL8(q) ^ ROTL8(ROTL8(q)) ^ ROTL8(ROTL8(ROTL8(q))) ^ ROTL8(ROTL8(ROTL8(ROTL8(q)))) ^ 0x63);
+        } while (p != 1);
+        sbox[0] = 0x63;
+    }
+    if (key_len == 16) { Nk = 4; Nr = 10; }
+    else if (key_len == 32) { Nk = 8; Nr = 14; }
+    else { return -1; }
+    for (i = 0; i < Nk; i++) {
+        rk[i] = ((uint32_t)key_data[4*i] << 24) | ((uint32_t)key_data[4*i+1] << 16) | ((uint32_t)key_data[4*i+2] << 8) | (uint32_t)key_data[4*i+3];
+    }
+    {
+        unsigned char rc = 1;
+        for (i = Nk; i < 4 * (Nr + 1); i++) {
+            uint32_t t = rk[i-1];
+            if (i % Nk == 0) {
+                t = ((uint32_t)sbox[(t >> 16) & 0xff] << 24) | ((uint32_t)sbox[(t >> 8) & 0xff] << 16) | ((uint32_t)sbox[t & 0xff] << 8) | (uint32_t)sbox[(t >> 24) & 0xff];
+                t ^= (uint32_t)rc << 24;
+                rc = MUL2B(rc);
+            } else if (Nk > 6 && (i % Nk) == 4) {
+                t = ((uint32_t)sbox[(t >> 24) & 0xff] << 24) | ((uint32_t)sbox[(t >> 16) & 0xff] << 16) | ((uint32_t)sbox[(t >> 8) & 0xff] << 8) | (uint32_t)sbox[t & 0xff];
+            }
+            rk[i] = rk[i - Nk] ^ t;
+        }
+    }
+
+#define AES_ENC(BLK, OUTW) do { \
+    unsigned char sa_[16], sb_[16]; int ai_, ar_, ac_, rr_; \
+    for (ai_ = 0; ai_ < 16; ai_++) sa_[ai_] = (unsigned char)((BLK)[ai_] ^ ((rk[ai_ >> 2] >> (24 - 8 * (ai_ & 3))) & 0xff)); \
+    for (rr_ = 1; rr_ <= Nr; rr_++) { \
+        for (ac_ = 0; ac_ < 4; ac_++) { \
+            for (ar_ = 0; ar_ < 4; ar_++) { \
+                sb_[4 * ac_ + ar_] = sbox[sa_[4 * ((ac_ + ar_) % 4) + ar_]]; \
+            } \
+        } \
+        if (rr_ < Nr) { \
+            for (ac_ = 0; ac_ < 4; ac_++) { \
+                unsigned char a0_ = sb_[4*ac_]; unsigned char a1_ = sb_[4*ac_+1]; unsigned char a2_ = sb_[4*ac_+2]; unsigned char a3_ = sb_[4*ac_+3]; \
+                sa_[4*ac_+0] = (unsigned char)(MUL2B(a0_) ^ MUL2B(a1_) ^ a1_ ^ a2_ ^ a3_); \
+                sa_[4*ac_+1] = (unsigned char)(a0_ ^ MUL2B(a1_) ^ MUL2B(a2_) ^ a2_ ^ a3_); \
+                sa_[4*ac_+2] = (unsigned char)(a0_ ^ a1_ ^ MUL2B(a2_) ^ MUL2B(a3_) ^ a3_); \
+                sa_[4*ac_+3] = (unsigned char)(MUL2B(a0_) ^ a0_ ^ a1_ ^ a2_ ^ MUL2B(a3_)); \
+            } \
+        } else { \
+            for (ai_ = 0; ai_ < 16; ai_++) sa_[ai_] = sb_[ai_]; \
+        } \
+        for (ac_ = 0; ac_ < 4; ac_++) { \
+            for (ar_ = 0; ar_ < 4; ar_++) sa_[4*ac_+ar_] ^= (unsigned char)((rk[4*rr_ + ac_] >> (24 - 8*ar_)) & 0xff); \
+        } \
+    } \
+    (OUTW)[0] = ((uint32_t)sa_[0] << 24) | ((uint32_t)sa_[1] << 16) | ((uint32_t)sa_[2] << 8) | (uint32_t)sa_[3]; \
+    (OUTW)[1] = ((uint32_t)sa_[4] << 24) | ((uint32_t)sa_[5] << 16) | ((uint32_t)sa_[6] << 8) | (uint32_t)sa_[7]; \
+    (OUTW)[2] = ((uint32_t)sa_[8] << 24) | ((uint32_t)sa_[9] << 16) | ((uint32_t)sa_[10] << 8) | (uint32_t)sa_[11]; \
+    (OUTW)[3] = ((uint32_t)sa_[12] << 24) | ((uint32_t)sa_[13] << 16) | ((uint32_t)sa_[14] << 8) | (uint32_t)sa_[15]; \
+} while (0)
+
+#define GH_MUL do { \
+    uint32_t z_[4], v_[4]; int gi; uint32_t lsb_; \
+    z_[0] = 0; z_[1] = 0; z_[2] = 0; z_[3] = 0; \
+    v_[0] = H[0]; v_[1] = H[1]; v_[2] = H[2]; v_[3] = H[3]; \
+    for (gi = 0; gi < 128; gi++) { \
+        if ((Y[gi >> 5] >> (31 - (gi & 31))) & 1u) { \
+            z_[0] ^= v_[0]; z_[1] ^= v_[1]; z_[2] ^= v_[2]; z_[3] ^= v_[3]; \
+        } \
+        lsb_ = v_[3] & 1u; \
+        v_[3] = (v_[3] >> 1) | (v_[2] << 31); \
+        v_[2] = (v_[2] >> 1) | (v_[1] << 31); \
+        v_[1] = (v_[1] >> 1) | (v_[0] << 31); \
+        v_[0] = (v_[0] >> 1); \
+        if (lsb_) v_[0] ^= 0xe1000000u; \
+    } \
+    Y[0] = z_[0]; Y[1] = z_[1]; Y[2] = z_[2]; Y[3] = z_[3]; \
+} while (0)
+
+    {
+        unsigned char zblk[16];
+        for (i = 0; i < 16; i++) zblk[i] = 0;
+        AES_ENC(zblk, H);
+    }
+    if (iv_len == 12) {
+        J0[0] = ((uint32_t)iv_data[0] << 24) | ((uint32_t)iv_data[1] << 16) | ((uint32_t)iv_data[2] << 8) | (uint32_t)iv_data[3];
+        J0[1] = ((uint32_t)iv_data[4] << 24) | ((uint32_t)iv_data[5] << 16) | ((uint32_t)iv_data[6] << 8) | (uint32_t)iv_data[7];
+        J0[2] = ((uint32_t)iv_data[8] << 24) | ((uint32_t)iv_data[9] << 16) | ((uint32_t)iv_data[10] << 8) | (uint32_t)iv_data[11];
+        J0[3] = 0x00000001u;
+    } else {
+        Y[0] = 0; Y[1] = 0; Y[2] = 0; Y[3] = 0;
+        for (i = 0; i < iv_len; i += 16) {
+            int n2 = iv_len - i; if (n2 > 16) n2 = 16;
+            int q2;
+            X[0] = 0; X[1] = 0; X[2] = 0; X[3] = 0;
+            for (q2 = 0; q2 < n2; q2++) X[q2 >> 2] ^= (uint32_t)iv_data[i + q2] << (24 - 8 * (q2 & 3));
+            Y[0] ^= X[0]; Y[1] ^= X[1]; Y[2] ^= X[2]; Y[3] ^= X[3];
+            GH_MUL;
+        }
+        X[0] = (uint32_t)(((uint64_t)iv_len * 8) >> 32); X[1] = (uint32_t)((uint64_t)iv_len * 8);
+        X[2] = 0; X[3] = 0;
+        Y[0] ^= X[0]; Y[1] ^= X[1]; Y[2] ^= X[2]; Y[3] ^= X[3];
+        GH_MUL;
+        J0[0] = Y[0]; J0[1] = Y[1]; J0[2] = Y[2]; J0[3] = Y[3];
+    }
+    {
+        unsigned char jblk[16];
+        int wq;
+        for (wq = 0; wq < 4; wq++) {
+            jblk[4*wq] = (unsigned char)(J0[wq] >> 24);
+            jblk[4*wq+1] = (unsigned char)(J0[wq] >> 16);
+            jblk[4*wq+2] = (unsigned char)(J0[wq] >> 8);
+            jblk[4*wq+3] = (unsigned char)(J0[wq]);
+        }
+        AES_ENC(jblk, EJ0);
+    }
+
+    /* S = GHASH(aad, ct) */
+    Y[0] = 0; Y[1] = 0; Y[2] = 0; Y[3] = 0;
+    for (i = 0; i < aad_len; i += 16) {
+        int n2 = aad_len - i; if (n2 > 16) n2 = 16;
+        int q2;
+        X[0] = 0; X[1] = 0; X[2] = 0; X[3] = 0;
+        for (q2 = 0; q2 < n2; q2++) X[q2 >> 2] ^= (uint32_t)aad_data[i + q2] << (24 - 8 * (q2 & 3));
+        Y[0] ^= X[0]; Y[1] ^= X[1]; Y[2] ^= X[2]; Y[3] ^= X[3];
+        GH_MUL;
+    }
+    for (i = 0; i < ct_len; i += 16) {
+        int n2 = ct_len - i; if (n2 > 16) n2 = 16;
+        int q2;
+        X[0] = 0; X[1] = 0; X[2] = 0; X[3] = 0;
+        for (q2 = 0; q2 < n2; q2++) X[q2 >> 2] ^= (uint32_t)ct_data[i + q2] << (24 - 8 * (q2 & 3));
+        Y[0] ^= X[0]; Y[1] ^= X[1]; Y[2] ^= X[2]; Y[3] ^= X[3];
+        GH_MUL;
+    }
+    X[0] = (uint32_t)(((uint64_t)aad_len * 8) >> 32); X[1] = (uint32_t)((uint64_t)aad_len * 8);
+    X[2] = (uint32_t)(((uint64_t)ct_len * 8) >> 32); X[3] = (uint32_t)((uint64_t)ct_len * 8);
+    Y[0] ^= X[0]; Y[1] ^= X[1]; Y[2] ^= X[2]; Y[3] ^= X[3];
+    GH_MUL;
+
+    /* constant-time tag comparison */
+    {
+        unsigned char diff = 0;
+        int q2;
+        for (q2 = 0; q2 < 16; q2++) {
+            unsigned char expect = (unsigned char)((EJ0[q2 >> 2] ^ Y[q2 >> 2]) >> (24 - 8 * (q2 & 3)));
+            diff |= (unsigned char)(expect ^ tag_data[q2]);
+        }
+        if (diff != 0) {
+            return -1;
+        }
+    }
+
+    /* CTR decrypt */
+    {
+        uint32_t c0 = J0[0], c1 = J0[1], c2 = J0[2], c3 = J0[3] + 1;
+        if (c3 == 0) { c2++; if (c2 == 0) { c1++; if (c1 == 0) c0++; } }
+        for (i = 0; i < ct_len; i += 16) {
+            unsigned char cblk[16];
+            uint32_t ks[4];
+            int n2 = ct_len - i; if (n2 > 16) n2 = 16;
+            int q2;
+            cblk[0] = (unsigned char)(c0 >> 24); cblk[1] = (unsigned char)(c0 >> 16); cblk[2] = (unsigned char)(c0 >> 8); cblk[3] = (unsigned char)c0;
+            cblk[4] = (unsigned char)(c1 >> 24); cblk[5] = (unsigned char)(c1 >> 16); cblk[6] = (unsigned char)(c1 >> 8); cblk[7] = (unsigned char)c1;
+            cblk[8] = (unsigned char)(c2 >> 24); cblk[9] = (unsigned char)(c2 >> 16); cblk[10] = (unsigned char)(c2 >> 8); cblk[11] = (unsigned char)c2;
+            cblk[12] = (unsigned char)(c3 >> 24); cblk[13] = (unsigned char)(c3 >> 16); cblk[14] = (unsigned char)(c3 >> 8); cblk[15] = (unsigned char)c3;
+            AES_ENC(cblk, ks);
+            for (q2 = 0; q2 < n2; q2++) {
+                out_pt_data[i + q2] = (unsigned char)(ct_data[i + q2] ^ ((unsigned char)(ks[q2 >> 2] >> (24 - 8 * (q2 & 3)))));
+            }
+            c3++; if (c3 == 0) { c2++; if (c2 == 0) { c1++; if (c1 == 0) c0++; } }
+        }
+    }
+#undef GH_MUL
+#undef AES_ENC
+#undef AES_ROUND
+#undef MUL2B
+#undef ROR32W
+#undef ROTL8
+    return 0;
+}#
+
+// ECDSA P-256 (secp256r1) signature verification, FIPS 186-4 style.
+// Portable C: 4x64-bit limbs, no __int128; fold reduction where each
+// fold CONSUMES the high limbs (V = L + H*2^256 == L + H*k mod m,
+// k = 2^256 - m); Jacobian coordinates, a = -3 doubling uses
+// E = 3*(A - Z^4); modular inverse by Fermat (m prime).
+// Validation trail: Python reference vs the cryptography library
+// (64 signatures + tampered negatives), C prototype vs the same plus
+// 336 exact mul64 vectors and ground-truth scalar multiples; the C
+// bugs fixed en route: fold must consume high limbs, Z^4 (not Z^2) in
+// the doubling E term, LSB-first scalar loop, out-aliasing in doubling
+// (Y3 written before the last read of Y1), and macro-hygiene shadowing.
+// All macro locals carry per-macro prefixes (m64/ra/rs/ma/ml/mm/mp/
+// mi/db/ad) so nested expansions cannot capture each other.
+@internal
+@extern("C")
+fun __ecdsa_p256_verify(pub_xy: u8[], hash: u8[], rs: u8[]): i64 #{
+
+typedef uint64_t ecv_u64;
+typedef uint32_t ecv_u32;
+
+static const ecv_u64 ECV_P[4]  = {0xffffffffffffffffull, 0x00000000ffffffffull, 0x0000000000000000ull, 0xffffffff00000001ull};
+static const ecv_u64 ECV_KP[4] = {0x0000000000000001ull, 0xffffffff00000000ull, 0xffffffffffffffffull, 0x00000000fffffffeull};
+static const ecv_u64 ECV_N[4]  = {0xf3b9cac2fc632551ull, 0xbce6faada7179e84ull, 0xffffffffffffffffull, 0xffffffff00000000ull};
+static const ecv_u64 ECV_KN[4] = {0x0c46353d039cdaafull, 0x4319055258e8617bull, 0x0000000000000000ull, 0x00000000ffffffffull};
+static const ecv_u64 ECV_GX[4] = {0xf4a13945d898c296ull, 0x77037d812deb33a0ull, 0xf8bce6e563a440f2ull, 0x6b17d1f2e12c4247ull};
+static const ecv_u64 ECV_GY[4] = {0xcbb6406837bf51f5ull, 0x2bce33576b315eceull, 0x8ee7eb4a7c0f9e16ull, 0x4fe342e2fe1a7f9bull};
+static const ecv_u64 ECV_B[4]  = {0x3bce3c3e27d2604bull, 0x651d06b0cc53b0f6ull, 0xb3ebbd55769886bcull, 0x5ac635d8aa3a93e7ull};
+
+/* 4-limb compare: A >= B */
+#define ECV_GEQX(A, B) (((A)[3] != (B)[3]) ? ((A)[3] > (B)[3]) : \
+    ((A)[2] != (B)[2]) ? ((A)[2] > (B)[2]) : \
+    ((A)[1] != (B)[1]) ? ((A)[1] > (B)[1]) : \
+    ((A)[0] >= (B)[0]))
+
+#define ECV_ISZERO(Z) ((Z)[0] == 0 && (Z)[1] == 0 && (Z)[2] == 0 && (Z)[3] == 0)
+
+/* portable 64x64 -> 128: a*b = p11*2^64 + S*2^32 + p00, S = p01+p10 */
+#define ECV_MUL64(A, B, HI, LO) do { \
+    ecv_u32 _m64_a0 = (ecv_u32)(A), _m64_a1 = (ecv_u32)((ecv_u64)(A) >> 32); \
+    ecv_u32 _m64_b0 = (ecv_u32)(B), _m64_b1 = (ecv_u32)((ecv_u64)(B) >> 32); \
+    ecv_u64 _m64_p00 = (ecv_u64)_m64_a0 * _m64_b0; \
+    ecv_u64 _m64_p01 = (ecv_u64)_m64_a0 * _m64_b1; \
+    ecv_u64 _m64_p10 = (ecv_u64)_m64_a1 * _m64_b0; \
+    ecv_u64 _m64_p11 = (ecv_u64)_m64_a1 * _m64_b1; \
+    ecv_u64 _m64_sraw = (_m64_p01 & 0xffffffffull) + (_m64_p10 & 0xffffffffull); \
+    ecv_u64 _m64_shi = (_m64_p01 >> 32) + (_m64_p10 >> 32) + (_m64_sraw >> 32); \
+    ecv_u64 _m64_l = _m64_p00 + ((_m64_sraw & 0xffffffffull) << 32); \
+    ecv_u64 _m64_c = (_m64_l < _m64_p00) ? 1 : 0; \
+    (LO) = _m64_l; (HI) = _m64_p11 + _m64_shi + _m64_c; \
+} while (0)
+
+#define ECV_RADD(A, B, OUT, CARRY) do { \
+    ecv_u64 _ra_c = 0; int _ra_i; \
+    for (_ra_i = 0; _ra_i < 4; _ra_i++) { \
+        ecv_u64 _ra_t1 = (A)[_ra_i] + _ra_c; \
+        ecv_u64 _ra_c1 = (_ra_t1 < (A)[_ra_i]) ? 1 : 0; \
+        ecv_u64 _ra_t2 = _ra_t1 + (B)[_ra_i]; \
+        ecv_u64 _ra_c2 = (_ra_t2 < _ra_t1) ? 1 : 0; \
+        (OUT)[_ra_i] = _ra_t2; _ra_c = _ra_c1 | _ra_c2; \
+    } \
+    (CARRY) = _ra_c; \
+} while (0)
+
+#define ECV_RSUB(A, B, OUT, BORROW) do { \
+    ecv_u64 _rs_bw = 0; int _rs_i; \
+    for (_rs_i = 0; _rs_i < 4; _rs_i++) { \
+        ecv_u64 _rs_t1 = (A)[_rs_i] - _rs_bw; \
+        ecv_u64 _rs_b1 = ((A)[_rs_i] < _rs_bw) ? 1 : 0; \
+        ecv_u64 _rs_t2 = _rs_t1 - (B)[_rs_i]; \
+        ecv_u64 _rs_b2 = (_rs_t1 < (B)[_rs_i]) ? 1 : 0; \
+        (OUT)[_rs_i] = _rs_t2; _rs_bw = _rs_b1 | _rs_b2; \
+    } \
+    (BORROW) = _rs_bw; \
+} while (0)
+
+/* modular add over (M, K): fold a 2^256 carry term with k = 2^256 - m */
+#define ECV_MADD(M, K, A, B, OUT) do { \
+    ecv_u64 _ma_c; ecv_u64 _ma_bw; \
+    ECV_RADD((A), (B), (OUT), _ma_c); \
+    if (_ma_c) { ecv_u64 _ma_c2; ECV_RADD((OUT), (K), (OUT), _ma_c2); } \
+    if (ECV_GEQX((OUT), (M))) { ECV_RSUB((OUT), (M), (OUT), _ma_bw); } \
+} while (0)
+
+#define ECV_MSUB(M, A, B, OUT) do { \
+    ecv_u64 _ms_bw; \
+    ECV_RSUB((A), (B), (OUT), _ms_bw); \
+    if (_ms_bw) { ecv_u64 _ms_c; ECV_RADD((OUT), (M), (OUT), _ms_c); } \
+} while (0)
+
+/* 4x4 -> 8 limbs schoolbook, no reduction */
+#define ECV_MULLIMBS(A, B, T) do { \
+    int _ml_i, _ml_j; \
+    for (_ml_i = 0; _ml_i < 8; _ml_i++) (T)[_ml_i] = 0; \
+    for (_ml_i = 0; _ml_i < 4; _ml_i++) { \
+        ecv_u64 _ml_carry = 0; \
+        for (_ml_j = 0; _ml_j < 4; _ml_j++) { \
+            ecv_u64 _ml_hi, _ml_lo; \
+            ECV_MUL64((A)[_ml_i], (B)[_ml_j], _ml_hi, _ml_lo); \
+            ecv_u64 _ml_t1 = _ml_lo + (T)[_ml_i + _ml_j]; \
+            ecv_u64 _ml_c1 = (_ml_t1 < _ml_lo) ? 1 : 0; \
+            ecv_u64 _ml_t2 = _ml_t1 + _ml_carry; \
+            ecv_u64 _ml_c2 = (_ml_t2 < _ml_t1) ? 1 : 0; \
+            (T)[_ml_i + _ml_j] = _ml_t2; \
+            _ml_carry = _ml_hi + _ml_c1 + _ml_c2; \
+        } \
+        { int _ml_idx = _ml_i + 4; \
+          while (_ml_carry && _ml_idx < 8) { \
+              ecv_u64 _ml_s = (T)[_ml_idx] + _ml_carry; \
+              ecv_u64 _ml_done = (_ml_s < _ml_carry) ? 1 : 0; \
+              (T)[_ml_idx] = _ml_s; _ml_carry = _ml_done; _ml_idx++; \
+          } } \
+    } \
+} while (0)
+
+/* modular multiply: schoolbook then fold-reduce; high limbs CONSUMED */
+#define ECV_MMUL(M, K, A, B, OUT) do { \
+    ecv_u64 _mm_t[8]; int _mm_rnd, _mm_i; \
+    ECV_MULLIMBS((A), (B), _mm_t); \
+    for (_mm_rnd = 0; _mm_rnd < 16; _mm_rnd++) { \
+        int _mm_zero = 1; \
+        for (_mm_i = 4; _mm_i < 8; _mm_i++) if (_mm_t[_mm_i]) { _mm_zero = 0; break; } \
+        if (_mm_zero) break; \
+        ecv_u64 _mm_hk[8]; \
+        ECV_MULLIMBS(&_mm_t[4], (K), _mm_hk); \
+        ecv_u64 _mm_carry = 0; \
+        for (_mm_i = 0; _mm_i < 8; _mm_i++) { \
+            ecv_u64 _mm_base = (_mm_i < 4) ? _mm_t[_mm_i] : 0; \
+            ecv_u64 _mm_t1 = _mm_base + _mm_hk[_mm_i]; \
+            ecv_u64 _mm_c1 = (_mm_t1 < _mm_base) ? 1 : 0; \
+            ecv_u64 _mm_t2 = _mm_t1 + _mm_carry; \
+            ecv_u64 _mm_c2 = (_mm_t2 < _mm_t1) ? 1 : 0; \
+            _mm_t[_mm_i] = _mm_t2; _mm_carry = _mm_c1 | _mm_c2; \
+        } \
+    } \
+    { ecv_u64 _mm_v[4]; ecv_u64 _mm_bw; \
+      memcpy(_mm_v, _mm_t, 32); \
+      while (ECV_GEQX(_mm_v, (M))) { ECV_RSUB(_mm_v, (M), _mm_v, _mm_bw); } \
+      memcpy((OUT), _mm_v, 32); } \
+} while (0)
+
+#define ECV_MPOW(M, K, A, E, OUT) do { \
+    ecv_u64 _mp_r[4] = {1, 0, 0, 0}; \
+    ecv_u64 _mp_base[4]; int _mp_i; \
+    memcpy(_mp_base, (A), 32); \
+    for (_mp_i = 255; _mp_i >= 0; _mp_i--) { \
+        ECV_MMUL((M), (K), _mp_r, _mp_r, _mp_r); \
+        if (((E)[_mp_i >> 6] >> (_mp_i & 63)) & 1) { \
+            ECV_MMUL((M), (K), _mp_r, _mp_base, _mp_r); \
+        } \
+    } \
+    memcpy((OUT), _mp_r, 32); \
+} while (0)
+
+#define ECV_MINV(M, K, A, OUT) do { \
+    ecv_u64 _mi_e[4]; ecv_u64 _mi_bw; ecv_u64 _mi_two[4] = {2, 0, 0, 0}; \
+    ECV_RSUB((M), _mi_two, _mi_e, _mi_bw); \
+    ECV_MPOW((M), (K), (A), _mi_e, (OUT)); \
+} while (0)
+
+/* Jacobian doubling, a = -3; locals so OUT may alias the inputs */
+#define ECV_DBL(M, K, X1, Y1, Z1, XO, YO, ZO) do { \
+    ecv_u64 _db_X3[4], _db_Y3[4], _db_Z3[4]; \
+    if (ECV_ISZERO((Z1))) { \
+        memcpy(_db_X3, (X1), 32); memcpy(_db_Y3, (Y1), 32); memcpy(_db_Z3, (Z1), 32); \
+    } else { \
+        ecv_u64 _db_A[4], _db_B[4], _db_C[4], _db_D[4], _db_E[4], _db_F[4]; \
+        ecv_u64 _db_t[4], _db_t2[4], _db_xb[4], _db_xbs[4]; \
+        ecv_u64 _db_z2[4], _db_z4[4], _db_d2[4], _db_dx[4], _db_c8[4], _db_yz[4]; \
+        ECV_MMUL((M), (K), (X1), (X1), _db_A); \
+        ECV_MMUL((M), (K), (Y1), (Y1), _db_B); \
+        ECV_MMUL((M), (K), _db_B, _db_B, _db_C); \
+        ECV_MADD((M), (K), (X1), _db_B, _db_xb); \
+        ECV_MMUL((M), (K), _db_xb, _db_xb, _db_xbs); \
+        ECV_MSUB((M), _db_xbs, _db_A, _db_t); \
+        ECV_MSUB((M), _db_t, _db_C, _db_t); \
+        ECV_MADD((M), (K), _db_t, _db_t, _db_D); \
+        ECV_MMUL((M), (K), (Z1), (Z1), _db_z2); \
+        ECV_MMUL((M), (K), _db_z2, _db_z2, _db_z4); \
+        ECV_MSUB((M), _db_A, _db_z4, _db_t); \
+        ECV_MADD((M), (K), _db_t, _db_t, _db_E); \
+        ECV_MADD((M), (K), _db_E, _db_t, _db_E); \
+        ECV_MMUL((M), (K), _db_E, _db_E, _db_F); \
+        ECV_MADD((M), (K), _db_D, _db_D, _db_d2); \
+        ECV_MSUB((M), _db_F, _db_d2, _db_X3); \
+        ECV_MSUB((M), _db_D, _db_X3, _db_dx); \
+        ECV_MMUL((M), (K), _db_E, _db_dx, _db_t2); \
+        ECV_MADD((M), (K), _db_C, _db_C, _db_c8); \
+        ECV_MADD((M), (K), _db_c8, _db_c8, _db_c8); \
+        ECV_MADD((M), (K), _db_c8, _db_c8, _db_c8); \
+        ECV_MSUB((M), _db_t2, _db_c8, _db_Y3); \
+        ECV_MMUL((M), (K), (Y1), (Z1), _db_yz); \
+        ECV_MADD((M), (K), _db_yz, _db_yz, _db_Z3); \
+    } \
+    memcpy((XO), _db_X3, 32); memcpy((YO), _db_Y3, 32); memcpy((ZO), _db_Z3, 32); \
+} while (0)
+
+/* Jacobian addition (add-2007-bl form) */
+#define ECV_ADD(M, K, X1, Y1, Z1, X2, Y2, Z2, XO, YO, ZO) do { \
+    ecv_u64 _ad_X3[4], _ad_Y3[4], _ad_Z3[4]; \
+    if (ECV_ISZERO((Z1))) { \
+        memcpy(_ad_X3, (X2), 32); memcpy(_ad_Y3, (Y2), 32); memcpy(_ad_Z3, (Z2), 32); \
+    } else if (ECV_ISZERO((Z2))) { \
+        memcpy(_ad_X3, (X1), 32); memcpy(_ad_Y3, (Y1), 32); memcpy(_ad_Z3, (Z1), 32); \
+    } else { \
+        ecv_u64 _ad_z1z1[4], _ad_z2z2[4], _ad_u1[4], _ad_u2[4]; \
+        ecv_u64 _ad_s1[4], _ad_s2[4], _ad_t1[4], _ad_t2[4]; \
+        ECV_MMUL((M), (K), (Z1), (Z1), _ad_z1z1); \
+        ECV_MMUL((M), (K), (Z2), (Z2), _ad_z2z2); \
+        ECV_MMUL((M), (K), (X1), _ad_z2z2, _ad_u1); \
+        ECV_MMUL((M), (K), (X2), _ad_z1z1, _ad_u2); \
+        ECV_MMUL((M), (K), (Y1), (Z2), _ad_t1); \
+        ECV_MMUL((M), (K), _ad_t1, _ad_z2z2, _ad_s1); \
+        ECV_MMUL((M), (K), (Y2), (Z1), _ad_t2); \
+        ECV_MMUL((M), (K), _ad_t2, _ad_z1z1, _ad_s2); \
+        if (memcmp(_ad_u1, _ad_u2, 32) == 0) { \
+            if (memcmp(_ad_s1, _ad_s2, 32) != 0) { \
+                _ad_X3[0] = 1; _ad_X3[1] = 0; _ad_X3[2] = 0; _ad_X3[3] = 0; \
+                _ad_Y3[0] = 1; _ad_Y3[1] = 0; _ad_Y3[2] = 0; _ad_Y3[3] = 0; \
+                _ad_Z3[0] = 0; _ad_Z3[1] = 0; _ad_Z3[2] = 0; _ad_Z3[3] = 0; \
+            } else { \
+                ECV_DBL((M), (K), (X1), (Y1), (Z1), _ad_X3, _ad_Y3, _ad_Z3); \
+            } \
+        } else { \
+            ecv_u64 _ad_h[4], _ad_h2[4], _ad_ii[4], _ad_jj[4]; \
+            ecv_u64 _ad_r[4], _ad_v[4], _ad_r2[4], _ad_t3[4]; \
+            ecv_u64 _ad_vx[4], _ad_s1j[4], _ad_s1j2[4], _ad_zz[4]; \
+            ECV_MSUB((M), _ad_u2, _ad_u1, _ad_h); \
+            ECV_MADD((M), (K), _ad_h, _ad_h, _ad_h2); \
+            ECV_MMUL((M), (K), _ad_h2, _ad_h2, _ad_ii); \
+            ECV_MMUL((M), (K), _ad_h, _ad_ii, _ad_jj); \
+            ECV_MSUB((M), _ad_s2, _ad_s1, _ad_t3); \
+            ECV_MADD((M), (K), _ad_t3, _ad_t3, _ad_r); \
+            ECV_MMUL((M), (K), _ad_u1, _ad_ii, _ad_v); \
+            ECV_MMUL((M), (K), _ad_r, _ad_r, _ad_r2); \
+            ECV_MSUB((M), _ad_r2, _ad_jj, _ad_r2); \
+            ECV_MSUB((M), _ad_r2, _ad_v, _ad_r2); \
+            ECV_MSUB((M), _ad_r2, _ad_v, _ad_X3); \
+            ECV_MSUB((M), _ad_v, _ad_X3, _ad_vx); \
+            ECV_MMUL((M), (K), _ad_r, _ad_vx, _ad_t3); \
+            ECV_MMUL((M), (K), _ad_s1, _ad_jj, _ad_s1j); \
+            ECV_MADD((M), (K), _ad_s1j, _ad_s1j, _ad_s1j2); \
+            ECV_MSUB((M), _ad_t3, _ad_s1j2, _ad_Y3); \
+            ECV_MADD((M), (K), (Z1), (Z2), _ad_zz); \
+            ECV_MMUL((M), (K), _ad_zz, _ad_zz, _ad_zz); \
+            ECV_MSUB((M), _ad_zz, _ad_z1z1, _ad_zz); \
+            ECV_MSUB((M), _ad_zz, _ad_z2z2, _ad_zz); \
+            ECV_MMUL((M), (K), _ad_zz, _ad_h, _ad_Z3); \
+        } \
+    } \
+    memcpy((XO), _ad_X3, 32); memcpy((YO), _ad_Y3, 32); memcpy((ZO), _ad_Z3, 32); \
+} while (0)
+
+    if (pub_xy_len != 64 || hash_len != 32 || rs_len != 64) return -1;
+    {
+        const unsigned char *ecv_pub = pub_xy_data;
+        const unsigned char *ecv_h = hash_data;
+        const unsigned char *ecv_rsig = rs_data;
+        int ecv_i, ecv_j;
+        ecv_u64 qx[4], qy[4], r[4], s[4], e[4], w[4], u1[4], u2[4];
+        ecv_u64 rx[4], ry[4], zi[4], zi2[4], zi3[4];
+        ecv_u64 gX[4], gY[4], gZ[4], qX[4], qY[4], qZ[4];
+        ecv_u64 rX[4], rY[4], rZ[4], aX[4], aY[4], aZ[4], bX[4], bY[4], bZ[4];
+        ecv_u64 t0[4], t1_[4], x3x[4], rhs[4], rxm[4];
+        ecv_u64 zero[4] = {0, 0, 0, 0};
+        ecv_u64 bw;
+
+        /* big-endian bytes -> little-endian limbs */
+        for (ecv_i = 0; ecv_i < 4; ecv_i++) { qx[ecv_i] = 0; for (ecv_j = 0; ecv_j < 8; ecv_j++) qx[ecv_i] = (qx[ecv_i] << 8) | ecv_pub[(3 - ecv_i) * 8 + ecv_j]; }
+        for (ecv_i = 0; ecv_i < 4; ecv_i++) { qy[ecv_i] = 0; for (ecv_j = 0; ecv_j < 8; ecv_j++) qy[ecv_i] = (qy[ecv_i] << 8) | ecv_pub[32 + (3 - ecv_i) * 8 + ecv_j]; }
+        for (ecv_i = 0; ecv_i < 4; ecv_i++) { r[ecv_i] = 0;  for (ecv_j = 0; ecv_j < 8; ecv_j++) r[ecv_i]  = (r[ecv_i] << 8) | ecv_rsig[(3 - ecv_i) * 8 + ecv_j]; }
+        for (ecv_i = 0; ecv_i < 4; ecv_i++) { s[ecv_i] = 0;  for (ecv_j = 0; ecv_j < 8; ecv_j++) s[ecv_i]  = (s[ecv_i] << 8) | ecv_rsig[32 + (3 - ecv_i) * 8 + ecv_j]; }
+        for (ecv_i = 0; ecv_i < 4; ecv_i++) { e[ecv_i] = 0;  for (ecv_j = 0; ecv_j < 8; ecv_j++) e[ecv_i]  = (e[ecv_i] << 8) | ecv_h[(3 - ecv_i) * 8 + ecv_j]; }
+
+        /* 1 <= r, s < n */
+        if (memcmp(r, zero, 32) == 0 || ECV_GEQX(r, ECV_N)) return 0;
+        if (memcmp(s, zero, 32) == 0 || ECV_GEQX(s, ECV_N)) return 0;
+
+        /* public key on curve: y^2 == x^3 - 3x + b (mod p) */
+        ECV_MMUL(ECV_P, ECV_KP, qy, qy, t0);
+        ECV_MMUL(ECV_P, ECV_KP, qx, qx, t1_);
+        ECV_MMUL(ECV_P, ECV_KP, t1_, qx, t1_);
+        ECV_MADD(ECV_P, ECV_KP, qx, qx, x3x);
+        ECV_MADD(ECV_P, ECV_KP, x3x, qx, x3x);
+        ECV_MSUB(ECV_P, t1_, x3x, rhs);
+        ECV_MADD(ECV_P, ECV_KP, rhs, ECV_B, rhs);
+        if (memcmp(t0, rhs, 32) != 0) return 0;
+
+        /* w = s^-1 mod n; u1 = e*w mod n; u2 = r*w mod n */
+        ECV_MINV(ECV_N, ECV_KN, s, w);
+        ECV_MMUL(ECV_N, ECV_KN, e, w, u1);
+        ECV_MMUL(ECV_N, ECV_KN, r, w, u2);
+
+        /* R = u1*G + u2*Q, LSB-first double-and-add, two accumulators */
+        memcpy(gX, ECV_GX, 32); memcpy(gY, ECV_GY, 32);
+        gZ[0] = 1; gZ[1] = 0; gZ[2] = 0; gZ[3] = 0;
+        memcpy(qX, qx, 32); memcpy(qY, qy, 32);
+        qZ[0] = 1; qZ[1] = 0; qZ[2] = 0; qZ[3] = 0;
+        aX[0] = 1; aX[1] = 0; aX[2] = 0; aX[3] = 0;
+        aY[0] = 1; aY[1] = 0; aY[2] = 0; aY[3] = 0;
+        aZ[0] = 0; aZ[1] = 0; aZ[2] = 0; aZ[3] = 0;
+        bX[0] = 1; bX[1] = 0; bX[2] = 0; bX[3] = 0;
+        bY[0] = 1; bY[1] = 0; bY[2] = 0; bY[3] = 0;
+        bZ[0] = 0; bZ[1] = 0; bZ[2] = 0; bZ[3] = 0;
+        for (ecv_i = 0; ecv_i < 256; ecv_i++) {
+            if ((u1[ecv_i >> 6] >> (ecv_i & 63)) & 1) {
+                ECV_ADD(ECV_P, ECV_KP, aX, aY, aZ, gX, gY, gZ, aX, aY, aZ);
+            }
+            ECV_DBL(ECV_P, ECV_KP, gX, gY, gZ, gX, gY, gZ);
+            if ((u2[ecv_i >> 6] >> (ecv_i & 63)) & 1) {
+                ECV_ADD(ECV_P, ECV_KP, bX, bY, bZ, qX, qY, qZ, bX, bY, bZ);
+            }
+            ECV_DBL(ECV_P, ECV_KP, qX, qY, qZ, qX, qY, qZ);
+        }
+        ECV_ADD(ECV_P, ECV_KP, aX, aY, aZ, bX, bY, bZ, rX, rY, rZ);
+        if (ECV_ISZERO(rZ)) return 0;
+
+        /* affine x of R, reduced mod n, compared to r */
+        ECV_MINV(ECV_P, ECV_KP, rZ, zi);
+        ECV_MMUL(ECV_P, ECV_KP, zi, zi, zi2);
+        ECV_MMUL(ECV_P, ECV_KP, zi2, zi, zi3);
+        ECV_MMUL(ECV_P, ECV_KP, rX, zi2, rx);
+        (void)sizeof(ry);
+        memcpy(rxm, rx, 32);
+        while (ECV_GEQX(rxm, ECV_N)) { ECV_RSUB(rxm, ECV_N, rxm, bw); }
+        if (memcmp(rxm, r, 32) == 0) return 1;
+        return 0;
+    }
+}#
+
+// ECDSA P-384 (secp384r1) signature verification — the P-256 kernel
+// widened to 6x64 limbs / 12-limb products / 384-bit exponent loops.
+// Same fold-reduction (2^384 == k mod m, high limbs CONSUMED), Jacobian
+// a = -3 doubling (E = 3*(A - Z^4)), Fermat inverse. Validated against
+// 16 signature vectors generated by the Python cryptography library.
+// Constant note: the curve b constant was initially mistranscribed and
+// then "re-derived" with a typo'd 408-bit p literal — the lesson (all
+// constants must come from formulas/limb tables, never hand-typed hex)
+// is recorded in the session notes. Macro locals carry the e3_ prefix.
+@internal
+@extern("C")
+fun __ecdsa_p384_verify(pub_xy: u8[], hash: u8[], rs: u8[]): i64 #{
+
+typedef uint64_t e3_u64;
+typedef uint32_t e3_u32;
+
+static const e3_u64 E3_P[6]  = {0x00000000ffffffffull, 0xffffffff00000000ull, 0xfffffffffffffffeull, 0xffffffffffffffffull, 0xffffffffffffffffull, 0xffffffffffffffffull};
+static const e3_u64 E3_KP[6] = {0xffffffff00000001ull, 0x00000000ffffffffull, 0x0000000000000001ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull};
+static const e3_u64 E3_N[6]  = {0xecec196accc52973ull, 0x581a0db248b0a77aull, 0xc7634d81f4372ddfull, 0xffffffffffffffffull, 0xffffffffffffffffull, 0xffffffffffffffffull};
+static const e3_u64 E3_KN[6] = {0x1313e695333ad68dull, 0xa7e5f24db74f5885ull, 0x389cb27e0bc8d220ull, 0x0000000000000000ull, 0x0000000000000000ull, 0x0000000000000000ull};
+static const e3_u64 E3_GX[6] = {0x3a545e3872760ab7ull, 0x5502f25dbf55296cull, 0x59f741e082542a38ull, 0x6e1d3b628ba79b98ull, 0x8eb1c71ef320ad74ull, 0xaa87ca22be8b0537ull};
+static const e3_u64 E3_GY[6] = {0x7a431d7c90ea0e5full, 0x0a60b1ce1d7e819dull, 0xe9da3113b5f0b8c0ull, 0xf8f41dbd289a147cull, 0x5d9e98bf9292dc29ull, 0x3617de4a96262c6full};
+static const e3_u64 E3_B[6]  = {0x2a85c8edd3ec2aefull, 0xc656398d8a2ed19dull, 0x0314088f5013875aull, 0x181d9c6efe814112ull, 0x988e056be3f82d19ull, 0xb3312fa7e23ee7e4ull};
+
+#define E3_GEQX(A, B) (((A)[5] != (B)[5]) ? ((A)[5] > (B)[5]) : \
+    ((A)[4] != (B)[4]) ? ((A)[4] > (B)[4]) : \
+    ((A)[3] != (B)[3]) ? ((A)[3] > (B)[3]) : \
+    ((A)[2] != (B)[2]) ? ((A)[2] > (B)[2]) : \
+    ((A)[1] != (B)[1]) ? ((A)[1] > (B)[1]) : \
+    ((A)[0] >= (B)[0]))
+
+#define E3_ISZERO(Z) ((Z)[0] == 0 && (Z)[1] == 0 && (Z)[2] == 0 && (Z)[3] == 0 && (Z)[4] == 0 && (Z)[5] == 0)
+
+#define E3_MUL64(A, B, HI, LO) do { \
+    e3_u32 _m64_a0 = (e3_u32)(A), _m64_a1 = (e3_u32)((e3_u64)(A) >> 32); \
+    e3_u32 _m64_b0 = (e3_u32)(B), _m64_b1 = (e3_u32)((e3_u64)(B) >> 32); \
+    e3_u64 _m64_p00 = (e3_u64)_m64_a0 * _m64_b0; \
+    e3_u64 _m64_p01 = (e3_u64)_m64_a0 * _m64_b1; \
+    e3_u64 _m64_p10 = (e3_u64)_m64_a1 * _m64_b0; \
+    e3_u64 _m64_p11 = (e3_u64)_m64_a1 * _m64_b1; \
+    e3_u64 _m64_sraw = (_m64_p01 & 0xffffffffull) + (_m64_p10 & 0xffffffffull); \
+    e3_u64 _m64_shi = (_m64_p01 >> 32) + (_m64_p10 >> 32) + (_m64_sraw >> 32); \
+    e3_u64 _m64_l = _m64_p00 + ((_m64_sraw & 0xffffffffull) << 32); \
+    e3_u64 _m64_c = (_m64_l < _m64_p00) ? 1 : 0; \
+    (LO) = _m64_l; (HI) = _m64_p11 + _m64_shi + _m64_c; \
+} while (0)
+
+#define E3_RADD(A, B, OUT, CARRY) do { \
+    e3_u64 _ra_c = 0; int _ra_i; \
+    for (_ra_i = 0; _ra_i < 6; _ra_i++) { \
+        e3_u64 _ra_t1 = (A)[_ra_i] + _ra_c; \
+        e3_u64 _ra_c1 = (_ra_t1 < (A)[_ra_i]) ? 1 : 0; \
+        e3_u64 _ra_t2 = _ra_t1 + (B)[_ra_i]; \
+        e3_u64 _ra_c2 = (_ra_t2 < _ra_t1) ? 1 : 0; \
+        (OUT)[_ra_i] = _ra_t2; _ra_c = _ra_c1 | _ra_c2; \
+    } \
+    (CARRY) = _ra_c; \
+} while (0)
+
+#define E3_RSUB(A, B, OUT, BORROW) do { \
+    e3_u64 _rs_bw = 0; int _rs_i; \
+    for (_rs_i = 0; _rs_i < 6; _rs_i++) { \
+        e3_u64 _rs_t1 = (A)[_rs_i] - _rs_bw; \
+        e3_u64 _rs_b1 = ((A)[_rs_i] < _rs_bw) ? 1 : 0; \
+        e3_u64 _rs_t2 = _rs_t1 - (B)[_rs_i]; \
+        e3_u64 _rs_b2 = (_rs_t1 < (B)[_rs_i]) ? 1 : 0; \
+        (OUT)[_rs_i] = _rs_t2; _rs_bw = _rs_b1 | _rs_b2; \
+    } \
+    (BORROW) = _rs_bw; \
+} while (0)
+
+#define E3_MADD(M, K, A, B, OUT) do { \
+    e3_u64 _ma_c; e3_u64 _ma_bw; \
+    E3_RADD((A), (B), (OUT), _ma_c); \
+    if (_ma_c) { e3_u64 _ma_c2; E3_RADD((OUT), (K), (OUT), _ma_c2); } \
+    if (E3_GEQX((OUT), (M))) { E3_RSUB((OUT), (M), (OUT), _ma_bw); } \
+} while (0)
+
+#define E3_MSUB(M, A, B, OUT) do { \
+    e3_u64 _ms_bw; \
+    E3_RSUB((A), (B), (OUT), _ms_bw); \
+    if (_ms_bw) { e3_u64 _ms_c; E3_RADD((OUT), (M), (OUT), _ms_c); } \
+} while (0)
+
+#define E3_MULLIMBS(A, B, T) do { \
+    int _ml_i, _ml_j; \
+    for (_ml_i = 0; _ml_i < 12; _ml_i++) (T)[_ml_i] = 0; \
+    for (_ml_i = 0; _ml_i < 6; _ml_i++) { \
+        e3_u64 _ml_carry = 0; \
+        for (_ml_j = 0; _ml_j < 6; _ml_j++) { \
+            e3_u64 _ml_hi, _ml_lo; \
+            E3_MUL64((A)[_ml_i], (B)[_ml_j], _ml_hi, _ml_lo); \
+            e3_u64 _ml_t1 = _ml_lo + (T)[_ml_i + _ml_j]; \
+            e3_u64 _ml_c1 = (_ml_t1 < _ml_lo) ? 1 : 0; \
+            e3_u64 _ml_t2 = _ml_t1 + _ml_carry; \
+            e3_u64 _ml_c2 = (_ml_t2 < _ml_t1) ? 1 : 0; \
+            (T)[_ml_i + _ml_j] = _ml_t2; \
+            _ml_carry = _ml_hi + _ml_c1 + _ml_c2; \
+        } \
+        { int _ml_idx = _ml_i + 6; \
+          while (_ml_carry && _ml_idx < 12) { \
+              e3_u64 _ml_s = (T)[_ml_idx] + _ml_carry; \
+              e3_u64 _ml_done = (_ml_s < _ml_carry) ? 1 : 0; \
+              (T)[_ml_idx] = _ml_s; _ml_carry = _ml_done; _ml_idx++; \
+          } } \
+    } \
+} while (0)
+
+#define E3_MMUL(M, K, A, B, OUT) do { \
+    e3_u64 _mm_t[12]; int _mm_rnd, _mm_i; \
+    E3_MULLIMBS((A), (B), _mm_t); \
+    for (_mm_rnd = 0; _mm_rnd < 16; _mm_rnd++) { \
+        int _mm_zero = 1; \
+        for (_mm_i = 6; _mm_i < 12; _mm_i++) if (_mm_t[_mm_i]) { _mm_zero = 0; break; } \
+        if (_mm_zero) break; \
+        e3_u64 _mm_hk[12]; \
+        E3_MULLIMBS(&_mm_t[6], (K), _mm_hk); \
+        e3_u64 _mm_carry = 0; \
+        for (_mm_i = 0; _mm_i < 12; _mm_i++) { \
+            e3_u64 _mm_base = (_mm_i < 6) ? _mm_t[_mm_i] : 0; \
+            e3_u64 _mm_t1 = _mm_base + _mm_hk[_mm_i]; \
+            e3_u64 _mm_c1 = (_mm_t1 < _mm_base) ? 1 : 0; \
+            e3_u64 _mm_t2 = _mm_t1 + _mm_carry; \
+            e3_u64 _mm_c2 = (_mm_t2 < _mm_t1) ? 1 : 0; \
+            _mm_t[_mm_i] = _mm_t2; _mm_carry = _mm_c1 | _mm_c2; \
+        } \
+    } \
+    { e3_u64 _mm_v[6]; e3_u64 _mm_bw; \
+      memcpy(_mm_v, _mm_t, 48); \
+      while (E3_GEQX(_mm_v, (M))) { E3_RSUB(_mm_v, (M), _mm_v, _mm_bw); } \
+      memcpy((OUT), _mm_v, 48); } \
+} while (0)
+
+#define E3_MPOW(M, K, A, E, OUT) do { \
+    e3_u64 _mp_r[6] = {1, 0, 0, 0, 0, 0}; \
+    e3_u64 _mp_base[6]; int _mp_i; \
+    memcpy(_mp_base, (A), 48); \
+    for (_mp_i = 383; _mp_i >= 0; _mp_i--) { \
+        E3_MMUL((M), (K), _mp_r, _mp_r, _mp_r); \
+        if (((E)[_mp_i >> 6] >> (_mp_i & 63)) & 1) { \
+            E3_MMUL((M), (K), _mp_r, _mp_base, _mp_r); \
+        } \
+    } \
+    memcpy((OUT), _mp_r, 48); \
+} while (0)
+
+#define E3_MINV(M, K, A, OUT) do { \
+    e3_u64 _mi_e[6]; e3_u64 _mi_bw; e3_u64 _mi_two[6] = {2, 0, 0, 0, 0, 0}; \
+    E3_RSUB((M), _mi_two, _mi_e, _mi_bw); \
+    E3_MPOW((M), (K), (A), _mi_e, (OUT)); \
+} while (0)
+
+#define E3_DBL(M, K, X1, Y1, Z1, XO, YO, ZO) do { \
+    e3_u64 _db_X3[6], _db_Y3[6], _db_Z3[6]; \
+    if (E3_ISZERO((Z1))) { \
+        memcpy(_db_X3, (X1), 48); memcpy(_db_Y3, (Y1), 48); memcpy(_db_Z3, (Z1), 48); \
+    } else { \
+        e3_u64 _db_A[6], _db_B[6], _db_C[6], _db_D[6], _db_E[6], _db_F[6]; \
+        e3_u64 _db_t[6], _db_t2[6], _db_xb[6], _db_xbs[6]; \
+        e3_u64 _db_z2[6], _db_z4[6], _db_d2[6], _db_dx[6], _db_c8[6], _db_yz[6]; \
+        E3_MMUL((M), (K), (X1), (X1), _db_A); \
+        E3_MMUL((M), (K), (Y1), (Y1), _db_B); \
+        E3_MMUL((M), (K), _db_B, _db_B, _db_C); \
+        E3_MADD((M), (K), (X1), _db_B, _db_xb); \
+        E3_MMUL((M), (K), _db_xb, _db_xb, _db_xbs); \
+        E3_MSUB((M), _db_xbs, _db_A, _db_t); \
+        E3_MSUB((M), _db_t, _db_C, _db_t); \
+        E3_MADD((M), (K), _db_t, _db_t, _db_D); \
+        E3_MMUL((M), (K), (Z1), (Z1), _db_z2); \
+        E3_MMUL((M), (K), _db_z2, _db_z2, _db_z4); \
+        E3_MSUB((M), _db_A, _db_z4, _db_t); \
+        E3_MADD((M), (K), _db_t, _db_t, _db_E); \
+        E3_MADD((M), (K), _db_E, _db_t, _db_E); \
+        E3_MMUL((M), (K), _db_E, _db_E, _db_F); \
+        E3_MADD((M), (K), _db_D, _db_D, _db_d2); \
+        E3_MSUB((M), _db_F, _db_d2, _db_X3); \
+        E3_MSUB((M), _db_D, _db_X3, _db_dx); \
+        E3_MMUL((M), (K), _db_E, _db_dx, _db_t2); \
+        E3_MADD((M), (K), _db_C, _db_C, _db_c8); \
+        E3_MADD((M), (K), _db_c8, _db_c8, _db_c8); \
+        E3_MADD((M), (K), _db_c8, _db_c8, _db_c8); \
+        E3_MSUB((M), _db_t2, _db_c8, _db_Y3); \
+        E3_MMUL((M), (K), (Y1), (Z1), _db_yz); \
+        E3_MADD((M), (K), _db_yz, _db_yz, _db_Z3); \
+    } \
+    memcpy((XO), _db_X3, 48); memcpy((YO), _db_Y3, 48); memcpy((ZO), _db_Z3, 48); \
+} while (0)
+
+#define E3_ADD(M, K, X1, Y1, Z1, X2, Y2, Z2, XO, YO, ZO) do { \
+    e3_u64 _ad_X3[6], _ad_Y3[6], _ad_Z3[6]; \
+    if (E3_ISZERO((Z1))) { \
+        memcpy(_ad_X3, (X2), 48); memcpy(_ad_Y3, (Y2), 48); memcpy(_ad_Z3, (Z2), 48); \
+    } else if (E3_ISZERO((Z2))) { \
+        memcpy(_ad_X3, (X1), 48); memcpy(_ad_Y3, (Y1), 48); memcpy(_ad_Z3, (Z1), 48); \
+    } else { \
+        e3_u64 _ad_z1z1[6], _ad_z2z2[6], _ad_u1[6], _ad_u2[6]; \
+        e3_u64 _ad_s1[6], _ad_s2[6], _ad_t1[6], _ad_t2[6]; \
+        E3_MMUL((M), (K), (Z1), (Z1), _ad_z1z1); \
+        E3_MMUL((M), (K), (Z2), (Z2), _ad_z2z2); \
+        E3_MMUL((M), (K), (X1), _ad_z2z2, _ad_u1); \
+        E3_MMUL((M), (K), (X2), _ad_z1z1, _ad_u2); \
+        E3_MMUL((M), (K), (Y1), (Z2), _ad_t1); \
+        E3_MMUL((M), (K), _ad_t1, _ad_z2z2, _ad_s1); \
+        E3_MMUL((M), (K), (Y2), (Z1), _ad_t2); \
+        E3_MMUL((M), (K), _ad_t2, _ad_z1z1, _ad_s2); \
+        if (memcmp(_ad_u1, _ad_u2, 48) == 0) { \
+            if (memcmp(_ad_s1, _ad_s2, 48) != 0) { \
+                _ad_X3[0] = 1; _ad_X3[1] = 0; _ad_X3[2] = 0; _ad_X3[3] = 0; _ad_X3[4] = 0; _ad_X3[5] = 0; \
+                _ad_Y3[0] = 1; _ad_Y3[1] = 0; _ad_Y3[2] = 0; _ad_Y3[3] = 0; _ad_Y3[4] = 0; _ad_Y3[5] = 0; \
+                memset(_ad_Z3, 0, 48); \
+            } else { \
+                E3_DBL((M), (K), (X1), (Y1), (Z1), _ad_X3, _ad_Y3, _ad_Z3); \
+            } \
+        } else { \
+            e3_u64 _ad_h[6], _ad_h2[6], _ad_ii[6], _ad_jj[6]; \
+            e3_u64 _ad_r[6], _ad_v[6], _ad_r2[6], _ad_t3[6]; \
+            e3_u64 _ad_vx[6], _ad_s1j[6], _ad_s1j2[6], _ad_zz[6]; \
+            E3_MSUB((M), _ad_u2, _ad_u1, _ad_h); \
+            E3_MADD((M), (K), _ad_h, _ad_h, _ad_h2); \
+            E3_MMUL((M), (K), _ad_h2, _ad_h2, _ad_ii); \
+            E3_MMUL((M), (K), _ad_h, _ad_ii, _ad_jj); \
+            E3_MSUB((M), _ad_s2, _ad_s1, _ad_t3); \
+            E3_MADD((M), (K), _ad_t3, _ad_t3, _ad_r); \
+            E3_MMUL((M), (K), _ad_u1, _ad_ii, _ad_v); \
+            E3_MMUL((M), (K), _ad_r, _ad_r, _ad_r2); \
+            E3_MSUB((M), _ad_r2, _ad_jj, _ad_r2); \
+            E3_MSUB((M), _ad_r2, _ad_v, _ad_r2); \
+            E3_MSUB((M), _ad_r2, _ad_v, _ad_X3); \
+            E3_MSUB((M), _ad_v, _ad_X3, _ad_vx); \
+            E3_MMUL((M), (K), _ad_r, _ad_vx, _ad_t3); \
+            E3_MMUL((M), (K), _ad_s1, _ad_jj, _ad_s1j); \
+            E3_MADD((M), (K), _ad_s1j, _ad_s1j, _ad_s1j2); \
+            E3_MSUB((M), _ad_t3, _ad_s1j2, _ad_Y3); \
+            E3_MADD((M), (K), (Z1), (Z2), _ad_zz); \
+            E3_MMUL((M), (K), _ad_zz, _ad_zz, _ad_zz); \
+            E3_MSUB((M), _ad_zz, _ad_z1z1, _ad_zz); \
+            E3_MSUB((M), _ad_zz, _ad_z2z2, _ad_zz); \
+            E3_MMUL((M), (K), _ad_zz, _ad_h, _ad_Z3); \
+        } \
+    } \
+    memcpy((XO), _ad_X3, 48); memcpy((YO), _ad_Y3, 48); memcpy((ZO), _ad_Z3, 48); \
+} while (0)
+
+    if (pub_xy_len != 96 || hash_len != 48 || rs_len != 96) return -1;
+    {
+        const unsigned char *pub = pub_xy_data;
+        const unsigned char *h = hash_data;
+        const unsigned char *rsig = rs_data;
+        int e3_i, e3_j;
+        e3_u64 qx[6], qy[6], r[6], s[6], e[6], w[6], u1[6], u2[6];
+        e3_u64 rx[6], zi[6], zi2[6], zi3[6];
+        e3_u64 gX[6], gY[6], gZ[6], qX[6], qY[6], qZ[6];
+        e3_u64 rX[6], rY[6], rZ[6], aX[6], aY[6], aZ[6], bX[6], bY[6], bZ[6];
+        e3_u64 t0[6], t1_[6], x3x[6], rhs[6], rxm[6];
+        e3_u64 zero[6] = {0, 0, 0, 0, 0, 0};
+        e3_u64 bw;
+
+        for (e3_i = 0; e3_i < 6; e3_i++) { qx[e3_i] = 0; for (e3_j = 0; e3_j < 8; e3_j++) qx[e3_i] = (qx[e3_i] << 8) | pub[(5 - e3_i) * 8 + e3_j]; }
+        for (e3_i = 0; e3_i < 6; e3_i++) { qy[e3_i] = 0; for (e3_j = 0; e3_j < 8; e3_j++) qy[e3_i] = (qy[e3_i] << 8) | pub[48 + (5 - e3_i) * 8 + e3_j]; }
+        for (e3_i = 0; e3_i < 6; e3_i++) { r[e3_i] = 0;  for (e3_j = 0; e3_j < 8; e3_j++) r[e3_i]  = (r[e3_i] << 8) | rsig[(5 - e3_i) * 8 + e3_j]; }
+        for (e3_i = 0; e3_i < 6; e3_i++) { s[e3_i] = 0;  for (e3_j = 0; e3_j < 8; e3_j++) s[e3_i]  = (s[e3_i] << 8) | rsig[48 + (5 - e3_i) * 8 + e3_j]; }
+        for (e3_i = 0; e3_i < 6; e3_i++) { e[e3_i] = 0;  for (e3_j = 0; e3_j < 8; e3_j++) e[e3_i]  = (e[e3_i] << 8) | h[(5 - e3_i) * 8 + e3_j]; }
+
+        if (memcmp(r, zero, 48) == 0 || E3_GEQX(r, E3_N)) return 0;
+        if (memcmp(s, zero, 48) == 0 || E3_GEQX(s, E3_N)) return 0;
+
+        /* on curve: y^2 == x^3 - 3x + b (mod p) */
+        E3_MMUL(E3_P, E3_KP, qy, qy, t0);
+        E3_MMUL(E3_P, E3_KP, qx, qx, t1_);
+        E3_MMUL(E3_P, E3_KP, t1_, qx, t1_);
+        E3_MADD(E3_P, E3_KP, qx, qx, x3x);
+        E3_MADD(E3_P, E3_KP, x3x, qx, x3x);
+        E3_MSUB(E3_P, t1_, x3x, rhs);
+        E3_MADD(E3_P, E3_KP, rhs, E3_B, rhs);
+        if (memcmp(t0, rhs, 48) != 0) return 0;
+
+        E3_MINV(E3_N, E3_KN, s, w);
+        E3_MMUL(E3_N, E3_KN, e, w, u1);
+        E3_MMUL(E3_N, E3_KN, r, w, u2);
+
+        memcpy(gX, E3_GX, 48); memcpy(gY, E3_GY, 48);
+        memset(gZ, 0, 48); gZ[0] = 1;
+        memcpy(qX, qx, 48); memcpy(qY, qy, 48);
+        memset(qZ, 0, 48); qZ[0] = 1;
+        memset(aX, 0, 48); memset(aY, 0, 48); memset(aZ, 0, 48);
+        aX[0] = 1; aY[0] = 1;
+        memset(bX, 0, 48); memset(bY, 0, 48); memset(bZ, 0, 48);
+        bX[0] = 1; bY[0] = 1;
+        for (e3_i = 0; e3_i < 384; e3_i++) {
+            if ((u1[e3_i >> 6] >> (e3_i & 63)) & 1) {
+                E3_ADD(E3_P, E3_KP, aX, aY, aZ, gX, gY, gZ, aX, aY, aZ);
+            }
+            E3_DBL(E3_P, E3_KP, gX, gY, gZ, gX, gY, gZ);
+            if ((u2[e3_i >> 6] >> (e3_i & 63)) & 1) {
+                E3_ADD(E3_P, E3_KP, bX, bY, bZ, qX, qY, qZ, bX, bY, bZ);
+            }
+            E3_DBL(E3_P, E3_KP, qX, qY, qZ, qX, qY, qZ);
+        }
+        E3_ADD(E3_P, E3_KP, aX, aY, aZ, bX, bY, bZ, rX, rY, rZ);
+        if (E3_ISZERO(rZ)) return 0;
+
+        E3_MINV(E3_P, E3_KP, rZ, zi);
+        E3_MMUL(E3_P, E3_KP, zi, zi, zi2);
+        E3_MMUL(E3_P, E3_KP, zi2, zi, zi3);
+        E3_MMUL(E3_P, E3_KP, rX, zi2, rx);
+        memcpy(rxm, rx, 48);
+        while (E3_GEQX(rxm, E3_N)) { E3_RSUB(rxm, E3_N, rxm, bw); }
+        if (memcmp(rxm, r, 48) == 0) return 1;
+        return 0;
+    }
+}#

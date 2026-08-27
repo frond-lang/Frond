@@ -1,0 +1,175 @@
+// Chain.frond — X.509 chain verification for std.tls.
+//
+// Model: leaf + intermediates come from the TLS Certificate message;
+// anchors are caller-supplied or std.tls.Roots. The chain is built by
+// issuer-DER == anchor/intermediate subject-DER; every verified edge
+// must use ecdsa-with-SHA256 over a P-256 key (anything else fails
+// closed with an explicit unsupported-algorithm error). Validity
+// windows and the leaf's SAN (with single-label wildcards) are checked.
+import std.core.hash.Sha256
+import std.core.hash.Sha512
+import std.crypto.EcdsaP384
+import std.crypto.EcdsaP256
+import std.tls.Cert
+
+// verify one edge: `signed` was signed by `signer`. Routes by signature
+// OID and signer key curve; anything else fails closed.
+fun verify_edge(signed: Certificate, signer: Certificate): Throw<void, str> {
+    val P256_KEY = "1.2.840.10045.2.1"
+    val P256 = "1.2.840.10045.3.1.7"
+    val P384 = "1.2.840.10045.3.1.8"
+    val P384_NIST = "1.3.132.0.34"
+    val SHA256_SIG = "1.2.840.10045.4.3.2"
+    val SHA384_SIG = "1.2.840.10045.4.3.3"
+    if signer.key_oid != P256_KEY {
+        throw "issuer key is not an EC key"
+    }
+    val n: usize = if signed.sig_oid == SHA256_SIG {
+        32
+    } else if signed.sig_oid == SHA384_SIG {
+        48
+    } else {
+        throw "unsupported signature algorithm (ecdsa-with-SHA256/384 only)"
+    }
+    if signer.curve_oid != P256 && signer.curve_oid != P384 && signer.curve_oid != P384_NIST {
+        throw "issuer curve is not P-256/P-384"
+    }
+    if signer.curve_oid == P256 && n != 32 {
+        throw "SHA-384 signature over a P-256 key is not expected"
+    }
+    if (signer.curve_oid == P384 || signer.curve_oid == P384_NIST) && n != 48 {
+        throw "SHA-256 signature over a P-384 key is not expected"
+    }
+    val coord = n
+    if signer.pub_point.len() != 2 * coord + 1 || signer.pub_point[0] != 4 {
+        throw "issuer public key is not an uncompressed point"
+    }
+    val rs = match Cert.sig_to_rs(signed.sig, n) {
+        Ok(v) => v,
+        Error(m) => throw "signature structure: {m}",
+    }
+    val digest = if n == 32 {
+        Sha256.sha256(signed.tbs)
+    } else {
+        Sha512.sha384(signed.tbs)
+    }
+    val ok = if n == 32 {
+        match EcdsaP256.verify(signer.pub_point[1..2 * coord + 1], digest, rs) {
+            Ok(v) => v,
+            Error(e) => throw "verify error: {e.message}",
+        }
+    } else {
+        match EcdsaP384.verify(signer.pub_point[1..2 * coord + 1], digest, rs) {
+            Ok(v) => v,
+            Error(e) => throw "verify error: {e.message}",
+        }
+    }
+    if !ok {
+        throw "signature does not verify"
+    }
+    Ok(void)
+}
+
+fun in_window(c: Certificate, now_secs: i64): bool {
+    now_secs >= c.not_before && now_secs <= c.not_after
+}
+
+fun name_ok(san: str[], host: str): bool {
+    var i = 0 as usize
+    while i < san.len() {
+        if Cert.host_matches(san[i], host) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+// Find the anchor index whose subject matches  (-1 = none)
+fun find_anchor(issuer_der: u8[], anchors: Certificate[]): i64 {
+    var i = 0 as usize
+    while i < anchors.len() {
+        if Cert.bytes_equal(issuer_der, anchors[i].subject) {
+            return i as i64
+        }
+        i = i + 1
+    }
+    -1
+}
+
+// Verify the server chain: leaf_ders[0] is the leaf,  are
+// intermediates the server sent (used when the leaf issuer is one of
+// them rather than an anchor directly). Fails closed on every shortcut.
+pub fun verify(leaf_der: u8[], rest_ders: u8[][], anchor_ders: u8[][], host: str, now_secs: i64): Throw<void, str> {
+    val leaf = match Cert.parse(leaf_der) {
+        Ok(c) => c,
+        Error(m) => throw "leaf: {m}",
+    }
+    var anchors: Certificate[] = []
+    var ai = 0 as usize
+    while ai < anchor_ders.len() {
+        match Cert.parse(anchor_ders[ai]) {
+            Ok(c) => {
+                anchors = anchors ++ [c]
+            },
+            Error(m) => throw "anchor: {m}",
+        }
+        ai = ai + 1
+    }
+
+    var anchor_idx = find_anchor(leaf.issuer, anchors)
+    if anchor_idx >= 0 {
+        // leaf issued directly by an anchor
+        match verify_edge(leaf, anchors[anchor_idx as usize]) {
+            Ok(_) => {},
+            Error(m) => throw "leaf edge: {m}",
+        }
+    } else {
+        // try to bridge through one provided intermediate
+        var bridged = false
+        var ri = 0 as usize
+        while ri < rest_ders.len() && !bridged {
+            match Cert.parse(rest_ders[ri]) {
+                Ok(inter) => {
+                    if Cert.bytes_equal(leaf.issuer, inter.subject) {
+                        bridged = true
+                        match verify_edge(leaf, inter) {
+                            Ok(_) => {},
+                            Error(m) => throw "leaf edge: {m}",
+                        }
+                        if !in_window(inter, now_secs) {
+                            throw "intermediate outside validity window"
+                        }
+                        if !inter.is_ca {
+                            throw "intermediate is not a CA"
+                        }
+                        val idx2 = find_anchor(inter.issuer, anchors)
+                        if idx2 < 0 {
+                            throw "chain does not reach a trust anchor"
+                        }
+                        match verify_edge(inter, anchors[idx2 as usize]) {
+                            Ok(_) => {},
+                            Error(m) => throw "intermediate edge: {m}",
+                        }
+                    }
+                },
+                Error(m) => throw "intermediate: {m}",
+            }
+            ri = ri + 1
+        }
+        if !bridged {
+            throw "issuer not in trust anchors"
+        }
+    }
+
+    if !in_window(leaf, now_secs) {
+        throw "certificate outside validity window"
+    }
+    if leaf.san.len() == 0 {
+        throw "certificate has no SAN entries"
+    }
+    if !name_ok(leaf.san, host) {
+        throw "hostname does not match certificate SAN"
+    }
+    Ok(void)
+}
