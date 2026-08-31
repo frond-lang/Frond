@@ -509,19 +509,30 @@ CRLF 词素);批解析 411 文件 ≈5 分钟,timeout ≥900。
 
 ## 八、下一步
 
-**Stage 2 第一刀探针:首跑绿(2026-08-31,macOS/aarch64 实证)**——
-`tests/functional/llvm_probe`:Lib.open 资产 llvm.dylib → LLVM-C 装配
-main ret 42 → verify → TargetMachine emit .obj → spawn 资产 lld
-(macOS 零库链接,-platform_version 11.0)→ 跑产物 → **退出码 42**,
-runner PASS。绑定层新增 const_int / function_type0(空数组不可 cbuf 编
-组,零参走 NULL)。**引擎边角立案(未深挖)**:顶层全局 `val` 以模块
-函数调用作初始化器(读 Env)→ 运行期全局初始化 panic(index out of
-bounds len 0)——探针规避为函数体内解析,根因待查。资产 =
-`assets/toolchain`(git 不跟踪,CI 预取步骤按 triple 拉 tarball 填
-充;Linux/Windows 分支的 lld 参数表已写好,**待 CI 五平台首跑实证**——
-linkview 完整性缺口将在此暴露)。macOS
-链接视图的新事实见 4c 记账。下一步:CI 首跑收五平台 → frondc 后端
-模块(lower AST→LLVM)→ frondc 自举(Stage 3 闭环)。
+**里程碑(2026-09-01):CI 矩阵 + 差分门 + llvm_probe 全绿**——四
+suite 作业通过(mac/linux×2/windows;第五平台 macOS-x64 因 Intel
+runner 退役并入资产层覆盖),differential 首次完整跑完,llvm_probe
+全链(Lib → LLVM-C → .obj → 资产 lld+linkview → 原生 exe → 42)在
+Linux(libc_nonshared.a 补齐)与 Windows(mingw 运行库按文件名 find)
+收官。教训入册:① 绕开 libc.so 链接脚本直吃真身,必须自带
+libc_nonshared.a(__libc_csu_init/fini 的家);② 目录名排序选目录必
+踩坑(16.1.0/ 与 lib/ 并存,sort -V 挑错),文件一律按名 find;
+③ 链接失败必须透传诊断(探针 `FAIL: lld|` 前缀穿透 runner 的
+失败报告 grep——没有它这轮要多三趟盲改)。遗留:mem 计时断言按
+CI 并行负载放宽(意图不变);tls13 留 NOCI 待引擎修。
+**下一步 = Stage 2 后端本体**:frondc/src/backend 已立(Toolchain
+资产解析序 + Llvm 绑定副本),下一片 = Back lowering(切片 0:
+字面量/算术/main)→ `native` 子命令端到端 → AST 全量。
+
+## 附:Stage 2 首刀记录(2026-08-31,macOS 首绿)
+
+`tests/functional/llvm_probe` 首跑绿:Lib.open 资产 llvm.dylib →
+LLVM-C 装配 main ret 42 → verify → TargetMachine emit .obj → spawn
+资产 lld(macOS 零库链接,-platform_version 11.0)→ 跑产物 →
+**退出码 42**。绑定层新增 const_int / function_type0(空数组不可
+cbuf 编组,零参走 NULL)。**引擎边角立案(未深挖)**:顶层全局 `val`
+以模块函数调用作初始化器(读 Env)→ 运行期全局初始化 panic(index
+out of bounds len 0)——探针规避为函数体内解析,根因待查。
 
 ## 三f、片5 进展与阻断(2026-08-29 夜)
 
