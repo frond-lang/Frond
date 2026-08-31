@@ -144,6 +144,14 @@ pub fun function_type(lib: Lib, ret: u64, params: u64[], is_vararg: bool): Throw
     f.call(ret, params, params.len() as u32, flag)
 }
 
+// 零参变体:params 位传 NULL(裸 u64 句柄位 0u64 = NULL,见文件头约定);
+// 空 u64[] 无法按 cbuf 编组(元素类型无从判定)。
+pub fun function_type0(lib: Lib, ret: u64, is_vararg: bool): Throw<u64, FfiError> {
+    val flag = if is_vararg { 1u32 } else { 0u32 }
+    val f: ForeignFn<u64> = lib.lookup("LLVMFunctionType", "u64, u64, u32, u32")?
+    f.call(ret, 0u64, 0u32, flag)
+}
+
 // ── 函数 / 块 ──────────────────────────────────────────────────────
 
 pub fun add_function(lib: Lib, module: u64, name: str, fn_type: u64): Throw<u64, FfiError> {
@@ -215,6 +223,13 @@ pub fun position_builder_at_end(lib: Lib, builder: u64, block: u64): Throw<void,
 pub fun build_add(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
     val f: ForeignFn<u64> = lib.lookup("LLVMBuildAdd", "u64, u64, u64, cstr")?
     f.call(builder, lhs, rhs, name)
+}
+
+// 整常量(LLVMConstInt;负数按位型传,如 (-1i64) as u64)。
+pub fun const_int(lib: Lib, int_ty: u64, val: u64, sign_extend: bool): Throw<u64, FfiError> {
+    val flag = if sign_extend { 1u32 } else { 0u32 }
+    val f: ForeignFn<u64> = lib.lookup("LLVMConstInt", "u64, u64, u32")?
+    f.call(int_ty, val, flag)
 }
 
 pub fun build_ret(lib: Lib, builder: u64, v: u64): Throw<void, FfiError> {

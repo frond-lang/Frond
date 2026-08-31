@@ -106,6 +106,32 @@ jobs:
           cp "$lib" tests/functional/llvm_bind/src/assets/llvm-native.bin
         working-directory: apps/llvmfetch
 
+      # llvm_probe(Stage 2 第一刀探针)需要完整工具链视图:动态库 + lld
+      # + linkview(git 不跟踪,见 tests/.gitignore)。五个平台都拉——
+      # Windows 的 lld-link/linkview 也来自资产,不经 SDK。
+      - name: Prefetch toolchain assets for llvm_probe
+        shell: bash
+        run: |
+          case "${{ matrix.name }}" in
+            linux-x64)   triple=x86_64-unknown-linux-gnu ;;
+            linux-arm64) triple=aarch64-unknown-linux-gnu ;;
+            macos-arm64) triple=aarch64-apple-darwin ;;
+            windows-x64) triple=x86_64-pc-windows-msvc ;;
+            *)           triple=x86_64-apple-darwin ;;
+          esac
+          dest="tests/functional/llvm_probe/assets/toolchain"
+          mkdir -p "$dest/lib" "$dest/bin"
+          curl -sL --retry 3 -o "$RUNNER_TEMP/toolchain.tar.gz" \
+            "https://github.com/frond-lang/llvm/releases/download/llvm-static-21.1.8/llvm-static-$triple.tar.gz"
+          tar -xzf "$RUNNER_TEMP/toolchain.tar.gz" -C "$RUNNER_TEMP"
+          root="$(find "$RUNNER_TEMP" -maxdepth 2 -type d -name "llvm-static-$triple" | head -1)"
+          test -n "$root"
+          cp "$root"/lib/llvm.* "$dest/lib/" 2>/dev/null || true
+          cp "$root"/bin/lld* "$dest/bin/"
+          cp -R "$root/linkview" "$dest/"
+          cp "$root/VERSION" "$dest/"
+          ls -la "$dest/lib" "$dest/bin"
+
       - name: Functional suite
         shell: bash
         run: bash tests/scripts/run_functional.sh

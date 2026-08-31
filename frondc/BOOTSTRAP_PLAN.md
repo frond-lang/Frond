@@ -25,7 +25,7 @@
 |---|---|---|
 | **Stage 0** | Rust 编译器+引擎(现状) | ✓ 存在 |
 | **Stage 1** | frondc 跑在 Rust 引擎上:词法+语法+全套 sema(含 monomorph)。**不碰 LLVM**——验证"Frond 语言表达力足以承载自己的语义系统" | ✓ **完成(2026-08-31:全节差分绿 + 终局验收三级)** |
-| **Stage 2** | frondc 的后端模块用 std.llvm(Frond 代码调 LLVM-C)lower AST→.obj,内嵌 lld 解出后 spawn 链接(零宿主工具链,见 四) | 未开始 |
+| **Stage 2** | frondc 的后端模块用 std.llvm(Frond 代码调 LLVM-C)lower AST→.obj,内嵌 lld 解出后 spawn 链接(零宿主工具链,见 四) | **探针首跑绿(2026-08-31,macOS 实证;CI 五平台待首跑)** |
 | **Stage 3** | 引擎里跑 frondc.frond 编译它自己 → 原生 fronc.exe。**此刻闭环达成** | 未开始 |
 | **Stage 4** | (可选)Rust 引擎退役,fronc 为唯一编译器 | 未开始 |
 
@@ -367,6 +367,16 @@ Tya/Asta 别名桥随后一并物理删除,见上文 1E 段二更)。
 
 ### 4b 内嵌三件套(同一资产管道,三种消费方式)
 
+**单产物 + 全内嵌 + 无工具链子命令(2026-08-31 用户裁决,再次确认)**:
+最终 frondc 每平台一个同源构建,工具链资产(LLVM-C/lld/linkview/后续
+C 层)全部内嵌于二进制。运行期按系统自适应的**只有加载与链接策略**
+(lld `-flavor`、链接参数表、dynamic-loader 路径、arch)——统一文件名
+裁决已把"打开哪个文件"也抹平(恒为 llvm.dll/.so/.dylib 对应形态)。
+工具链管理不进 CLI(无 fetch/use 类子命令);llvmfetch 仅为开发/CI 侧
+资产获取器。**资产解析序**:内嵌解出(发布态默认,`Assets.extract`)
+→ `FRONDC_TOOLCHAIN` 环境变量(开发态换版本不重编)→ `<exe 同目录>/
+assets/toolchain`(套件/便携形态)。探针已按此实现(Env 哨兵 = 空串)。
+
 | 资产 | 形态 | 消费方式 |
 |---|---|---|
 | LLVM-C | 动态库(llvm-static 21.1.8,五 triple) | `Lib.embed` → 解出 → dlopen/LoadLibraryW |
@@ -432,6 +442,13 @@ Tya/Asta 别名桥随后一并物理删除,见上文 1E 段二更)。
   musl(MIT)全静态 = 不碰 Lib 的用户程序可选(frndc 自身不可用——要
   dlopen libLLVM)。许可:glibc LGPL 未修改再分发(工具链常规,指源);
   mingw-w64 CRT/import 档案 permissive。
+- **macOS 记账(2026-08-31 探针实测)**:macOS 26 起系统库全部进 dyld
+  共享缓存,**盘上已无 /usr/lib/libSystem 真身**——「零资产」假设对
+  链接期失效(链接视图只在 SDK 的 libSystem.tbd,装 CLT 才有)。两个
+  事实:① 零外部符号的程序可**零库链接**(产物无 LC_LOAD_DYLIB,dyld
+  直跑 LC_MAIN——探针即此形态,零资产成立);② 真 C 层(frond_rt 调
+  libc)时代需要 macOS 链接视图,裁决待做:xcrun 探测 SDK tbd(要求
+  CLT)vs 资产自带 tbd(零依赖)。
 
 ### 4d 验收口径
 
@@ -492,13 +509,19 @@ CRLF 词素);批解析 411 文件 ≈5 分钟,timeout ≥900。
 
 ## 八、下一步
 
-**Stage 1 已收官(2026-08-31)——下一步是 Stage 2 第一刀探针**。
-工具链资产已五平台发布(LLVM-C/lld/linkview 同 tarball,见 四):
-main ret 42 → `Lib.open` 解出的 llvm.so/dll/dylib 走 LLVM-C 导出
-.obj → 提取 lld + linkview 链接 → 跑 exe 断言退出码 → 五平台各一遍,
-转正 functional/llvm_probe 进 CI(顺带验证 linkview 文件清单的完整性
-缺口)。探针绿后:frondc 后端模块(lower AST→LLVM)→ frondc 自举
-(Stage 3 闭环)。
+**Stage 2 第一刀探针:首跑绿(2026-08-31,macOS/aarch64 实证)**——
+`tests/functional/llvm_probe`:Lib.open 资产 llvm.dylib → LLVM-C 装配
+main ret 42 → verify → TargetMachine emit .obj → spawn 资产 lld
+(macOS 零库链接,-platform_version 11.0)→ 跑产物 → **退出码 42**,
+runner PASS。绑定层新增 const_int / function_type0(空数组不可 cbuf 编
+组,零参走 NULL)。**引擎边角立案(未深挖)**:顶层全局 `val` 以模块
+函数调用作初始化器(读 Env)→ 运行期全局初始化 panic(index out of
+bounds len 0)——探针规避为函数体内解析,根因待查。资产 =
+`assets/toolchain`(git 不跟踪,CI 预取步骤按 triple 拉 tarball 填
+充;Linux/Windows 分支的 lld 参数表已写好,**待 CI 五平台首跑实证**——
+linkview 完整性缺口将在此暴露)。macOS
+链接视图的新事实见 4c 记账。下一步:CI 首跑收五平台 → frondc 后端
+模块(lower AST→LLVM)→ frondc 自举(Stage 3 闭环)。
 
 ## 三f、片5 进展与阻断(2026-08-29 夜)
 
