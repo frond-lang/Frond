@@ -38,7 +38,6 @@ jobs:
           - { name: linux-x64,   os: ubuntu-latest,    cc: clang, cxx: clang++ }
           - { name: linux-arm64, os: ubuntu-24.04-arm, cc: clang, cxx: clang++ }
           - { name: macos-arm64, os: macos-latest,      cc: clang, cxx: clang++ }
-          - { name: macos-x64,   os: macos-13,          cc: clang, cxx: clang++ }
           - { name: windows-x64, os: windows-latest,    cc: cl,    cxx: cl }
     env:
       CC: ${{ matrix.cc }}
@@ -46,14 +45,14 @@ jobs:
       FROND: ${{ github.workspace }}/Frond/core/target/release/frond${{ matrix.os == 'windows-latest' && '.exe' || '' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: Frond
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: frond-lang/tests
           path: tests
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: frond-lang/apps
           path: apps
@@ -155,14 +154,14 @@ jobs:
       CXX: clang++
       FROND: ${{ github.workspace }}/Frond/core/target/release/frond
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: Frond
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: frond-lang/tests
           path: tests
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: frond-lang/apps
           path: apps

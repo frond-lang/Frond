@@ -1,0 +1,76 @@
+// backend/Toolchain.frond — Stage 2 工具链消费(BOOTSTRAP_PLAN 4b/4c)。
+//
+// 资产解析序(单产物 + 全内嵌 + 无工具链子命令,2026-08-31 裁决):
+//   发布态默认 = Assets.extract 从内嵌字节解出(落地前的过渡形态 =
+//   下方两级)→ FRONDC_TOOLCHAIN 环境变量(开发态换版本不重编)→
+//   <cwd>/assets/toolchain(套件/便携形态)。
+// lld 是通用驱动:按 -flavor 分派 darwin/gnu/link。链接参数表按
+// 4c 下限矩阵:macOS 零库(无外部符号的程序)+ -platform_version 11.0;
+// Linux 用资产 linkview 的 crt + 真身 libc;Windows 用 mingw 视图。
+import std.os.Env
+import std.os.Info
+import std.os.Proc
+
+pub fun toolchain_dir(): str {
+    val env = Env.get("FRONDC_TOOLCHAIN")
+    if env != "" {
+        return env
+    }
+    "assets/toolchain"
+}
+
+pub fun link_args(tc: str, os: str, arch: str, obj: str, exe: str): str[] {
+    if os == "macos" {
+        // 零外部符号 → 零库链接(产物无 LC_LOAD_DYLIB)。真 C 层时代
+        // 需 macOS 链接视图(系统盘上已无 libSystem 真身),见 4c 记账。
+        val a = if arch == "aarch64" { "arm64" } else { "x86_64" }
+        return ["-flavor", "darwin", obj,
+                "-arch", a, "-platform_version", "macos", "11.0", "15.0",
+                "-o", exe]
+    }
+    if os == "windows" {
+        return ["-flavor", "link", obj,
+                tc + "/linkview/crt2.o",
+                tc + "/linkview/libmingw32.a",
+                tc + "/linkview/libmingwex.a",
+                tc + "/linkview/libgcc.a",
+                tc + "/linkview/libmsvcrt.a",
+                tc + "/linkview/libkernel32.a",
+                "/entry:mainCRTStartup", "/subsystem:console",
+                "/out:" + exe]
+    }
+    val loader = if arch == "aarch64" {
+        "/lib/ld-linux-aarch64.so.1"
+    } else {
+        "/lib64/ld-linux-x86-64.so.2"
+    }
+    return ["-flavor", "gnu", obj,
+            tc + "/linkview/Scrt1.o",
+            tc + "/linkview/crti.o",
+            tc + "/linkview/crtn.o",
+            tc + "/linkview/libc.so.6",
+            "-dynamic-linker", loader,
+            "-o", exe]
+}
+
+pub fun link(tc: str, os: str, arch: str, obj: str, exe: str): Throw<i32, str> {
+    val proc = match Proc.spawn(tc + "/bin/lld", link_args(tc, os, arch, obj, exe)) {
+        Ok(p) => p,
+        Error(e) => throw "spawn lld failed: {e.message}",
+    }
+    match proc.wait() {
+        Ok(rc) => Ok(rc),
+        Error(e) => throw "wait lld failed: {e.message}",
+    }
+}
+
+pub fun run(exe: str): Throw<i32, str> {
+    val proc = match Proc.spawn("./" + exe, []) {
+        Ok(p) => p,
+        Error(e) => throw "spawn {exe} failed: {e.message}",
+    }
+    match proc.wait() {
+        Ok(rc) => Ok(rc),
+        Error(e) => throw "wait {exe} failed: {e.message}",
+    }
+}
