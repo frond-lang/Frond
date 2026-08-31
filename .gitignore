@@ -18,6 +18,7 @@ Cargo.lock
 *.dylib
 *.dll
 *.exe
+*.astbin
 
 # Logs and local files
 *.log

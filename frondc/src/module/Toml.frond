@@ -117,7 +117,7 @@ type Tc = Tc(data: u8[], pos: i64, table: str, kvs: List<TKv>, tables: List<str>
             advance()
         }
         if pos == start {
-            return throw TomlErr("expected bare key in " + what)
+            throw TomlErr("expected bare key in " + what)
         }
         Ok((data[start as usize..pos as usize]) as str)
     }

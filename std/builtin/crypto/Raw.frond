@@ -10,6 +10,7 @@
 // with a #define'd compression macro used three times (data blocks, first
 // tail block, optional second tail block).
 
+@c_include("string.h")
 @internal
 @extern("C")
 fun __sha256_into(data: u8[], out: u8[]): i64 #{

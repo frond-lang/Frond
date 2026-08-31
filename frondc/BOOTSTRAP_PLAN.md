@@ -24,8 +24,8 @@
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | **Stage 0** | Rust 编译器+引擎(现状) | ✓ 存在 |
-| **Stage 1** | frondc 跑在 Rust 引擎上:词法+语法+全套 sema(含 monomorph)。**不碰 LLVM**——验证"Frond 语言表达力足以承载自己的语义系统" | 进行中(1A/1B 完成) |
-| **Stage 2** | frondc 的后端模块用 std.llvm(Frond 代码调 LLVM-C)lower AST→.obj,os.spawn 调 lld/clang 链接 | 未开始 |
+| **Stage 1** | frondc 跑在 Rust 引擎上:词法+语法+全套 sema(含 monomorph)。**不碰 LLVM**——验证"Frond 语言表达力足以承载自己的语义系统" | ✓ **完成(2026-08-31:全节差分绿 + 终局验收三级)** |
+| **Stage 2** | frondc 的后端模块用 std.llvm(Frond 代码调 LLVM-C)lower AST→.obj,内嵌 lld 解出后 spawn 链接(零宿主工具链,见 四) | 未开始 |
 | **Stage 3** | 引擎里跑 frondc.frond 编译它自己 → 原生 fronc.exe。**此刻闭环达成** | 未开始 |
 | **Stage 4** | (可选)Rust 引擎退役,fronc 为唯一编译器 | 未开始 |
 
@@ -45,7 +45,7 @@ FFI 的雷。
 | **1B 语法器** | AST 定义 + S 表达式 printer + 递归下降(Pratt/虚拟>/三路回溯/插值子解析) | Ast.rs + Parser.rs(主体) | ✓ **401+10 差分全对齐** |
 | **1C 模块加载** | mini-TOML(Toml.frond)+ 模块加载器六步解析 + import 后序图(Loader.frond)+ stdlib 有序清单(StdPaths.frond,生成) | module/Loader.rs(717)+ cli/Manifest.rs | ✓ **load-dump v1 全语料对齐** |
 | 1D 类型系统 | 类型 ADT/TypeArena/unify/occurs/kind/display | types/(核心 1810:Tag+Ty+Arena+Display) | ✓ **ty-ops 差分 75 操作逐字节对齐** |
-| 1E sema 全家 | 推理/trait 见证/继承/monomorph | sema/(~17.4k) | **进行中:M1 声明层落地**(见 三e) |
+| 1E sema 全家 | 推理/trait 见证/继承/monomorph | sema/(~17.4k) | ✓ **完成(2026-08-31:全节差分绿 + 终局验收三级,见 三f)** |
 
 **1E 终局验收三级**:87+62 套件双跑等价 → **std/ 全库自检**(frondc-check
 检查它未来要编译的代码)→ apps 语料(editor + llvmfetch)。
@@ -350,21 +350,113 @@ Tya/Asta 别名桥随后一并物理删除,见上文 1E 段二更)。
 
 ## 四、Stage 2 设计裁决(已定,待实施)
 
+**零宿主工具链 + 平台一致性(2026-08-31 用户裁决)**:frondc 发行包
+自包含全部工具链资产,宿主机不需要装 LLVM/SDK/链接器;驱动不变量 =
+跨平台一致性。
+
+### 4a 一致性规则(设计律)
+
+**平台差异只允许住在两个地方**,两层之上(语言语义/std 包装层/构建
+行为/发行结构/验收口径)必须平台无感;新增平台相关物必须归入其一,
+两头都不属于 = 设计缺陷:
+
+| 层 | 允许的平台差异 | 对外契约 |
+|---|---|---|
+| C 原语体(`#{ }#` 内 `#if`) | Win32/POSIX API 选择、编码桥 | 统一:out-buffer -1/-2、句柄 0=失败、退出码 128+signal、UTF-8 进出 |
+| 链接视图资产(按 triple 分发) | crt/import 库/CRT 名 | 统一逻辑名 + 内容寻址缓存,`Assets.extract` 同一 API |
+
+### 4b 内嵌三件套(同一资产管道,三种消费方式)
+
+| 资产 | 形态 | 消费方式 |
+|---|---|---|
+| LLVM-C | 动态库(llvm-static 21.1.8,五 triple) | `Lib.embed` → 解出 → dlopen/LoadLibraryW |
+| lld | 可执行(lld 无 C API,进程内免谈;**与 LLVM 同仓同 tag 构建**——vendored lld 21.1.8 两段式独立构建,对着刚建好的 LLVM 树静态互链,自包含) | 提取 → `os.spawn`(单二进制按调用名分派 lld-link/ld.lld/ld64.lld) |
+| C 层(std C 原语 + frond_rt + 启动对象) | `.obj` × 5 triple | 提取 → 链接输入 |
+
+- **C 层发布期预编译**(CI 五 triple 全工具链),构建期只链接不编译 C
+  ——主线不需要 C 编译器,**clang 不内嵌**;用户手写 `@extern` C 片段的
+  编译能力 = 可选后续(宿主 clang 或再议)。
+- **资产管道统一**(2026-08-31 已落地到 llvm 仓工作流):llvm-static release
+  = frond 工具链资产集——同一 tag、五 triple 同构 tarball:`lib/`(LLVM 库)
+  + `bin/lld` + `linkview/`(钉下限的链接视图)+ MANIFEST + sha256 sidecar;
+  llvmfetch 一并拉取校验。资产分管道 = 版本漂移 = 一致性事故。
+  **动态库统一文件名 `lib/llvm.{dll,so,dylib}`**(Windows import 库配对
+  `llvm.lib`;版本标识移入 tarball 的 `VERSION`):Frond 永远按显式路径
+  dlopen,文件名不参与符号搜索,统一安全;按名链接(SONAME/install_name)
+  的路径在新设计里不存在,配对改名顺带消掉这层含糊。
+  **边界**:C 层 `.obj` 不在此管道——它是 std 的版本锁定代码,归 Frond 仓库
+  release CI 预编译(需要 std 源码,天然住在那边)。
+- **`Assets.extract(name): Path` 泛化**(提取与 Lib 解耦);修 TOCTOU
+  (临时名+rename 原子落盘)与提取目录(专用缓存目录 %LOCALAPPDATA%/
+  ~/.cache/frond——temp 即写即载的 DLL 易被 AV 拦,只读环境另议)。
+- **原生 fronc.exe 的资产内嵌落点**:字节数组 `.c` 进同一 cc 管线
+  (零新工具;objcopy/.res 三平台各异);降级 = 发行包 assets/ 同目录
+  + `Lib.embed` 失败回退 `Lib.open`。
+- **frond_rt 清单具体化**(2026-08-31 盘点):argv 三件套
+  (`frond_runtime_argc/arg_ptr/arg_len`——std C 原语唯一的引擎宿主
+  符号耦合,os/Raw)+ UTF-16 桥两 helper(从 Gen.rs 逐文件注入收编为
+  frond_rt 单一定义)+ Arc 加减/分配/字符串/panic/abort + dlopen/
+  dlsym + ForeignFn 动态调用 trampoline(AbiTable 117 臂的 C 移植;
+  或 frondc 后端对字面量 lookup 常量折叠成直调,frondc 自身零
+  trampoline 依赖)。
+
+### 4c 下限矩阵(第二档:单一钉死下限,产物与构建机无关)
+
+| 平台 | 链接视图 | 产物下限 |
+|---|---|---|
+| linux-gnu | manylinux_2_28 的 crt(Scrt1/crti/crtn)+ 真身 `libc/libm/libdl`(仅链接期,tarball 内置) | glibc ≥ 2.28(RHEL8+/Ubuntu 20.04+/Debian 10+) |
+| windows-msvc | mingw-w64 crt + import 档案(crt2/dllcrt2/libmingwex + kernel32/ws2_32/msvcrt 等,tarball 内置;来源 = niXman 16.1.0 **msvcrt** 定版下载,GCC 运行库在其版本化目录) | 一切 x64 Windows(msvcrt.dll 冻结随系统) |
+| apple-darwin | 零资产,链接旗标 `-platform_version macos 11.0 …` 钉住 | macOS ≥ 11 |
+
+- 符号版本绑定发生在**链接期** → C 层 `.obj` 版本中立,一套 `.obj`
+  配不同链接视图即可(多版本全换不用重编)。
+- Windows flavor 裁决:**msvcrt 优先于 ucrt**(下限 = 一切 x64 机器 vs
+  Win10+;std Windows 分支全是老稳 API,msvcrt.dll 全覆盖)。**C 层
+  Windows 资产换靶 `clang --target x86_64-w64-mingw32`**(头/启动/
+  import 库同属 mingw 视图;引擎侧 Rust 构建不动)。
+- **资产自身下限同批钉死**(2026-08-31 落地 llvm 仓工作流):
+  ① Linux 基线定为 **glibc 2.28(manylinux_2_28 容器)**——这是机制允许的
+  绝对下限:actions 的 node20 运行时自身要求 glibc ≥ 2.28,manylinux2014
+  (2.17)容器无法执行任何 step;且 LLVM 21 需 gcc ≥ 11,centos7 生态 EOL
+  得不偿失。CI 加了下限断言(objdump 查 libLLVM.so/lld 引用的最高
+  GLIBC 符号版本 ≤ 2.28),换 runner/依赖变化时红灯在 CI 而非用户机器。
+  ② macOS 资产加 `CMAKE_OSX_DEPLOYMENT_TARGET=11.0` + minos 断言(否则
+  macos-latest SDK 默认值 = macOS 版 glibc 事故);③ Windows `libLLVM.dll`
+  已 /MT 零 CRT 依赖。
+  ④ Linux 链接细节:glibc 2.34 之前 dl/m 未并入 libc → linkview 带真身
+  `libc.so.6/libm.so.6/libdl.so.2`(libdl 的 soname 历来是 .so.2;
+  frondc 自身 dlopen libLLVM 要 libdl),
+  链接期按绝对路径直接吃 `libc.so.6` 真身,绕开用户机无 glibc-dev 时缺失
+  的 libc.so 链接脚本。
+- 多版本 glibc 全家桶(Zig 式逐版 stub)= 交叉编译特性,Stage 4 后;
+  musl(MIT)全静态 = 不碰 Lib 的用户程序可选(frndc 自身不可用——要
+  dlopen libLLVM)。许可:glibc LGPL 未修改再分发(工具链常规,指源);
+  mingw-w64 CRT/import 档案 permissive。
+
+### 4d 验收口径
+
+- **最小宿主环境 = 三平台零工具链**(发行包 = fronc + 三件套资产)。
+- 第一刀探针(五 triple):main ret 42 → `Assets.extract(lld)` → 链接
+  → 跑 exe 断言退出码;外加下限断言:产物在 glibc 2.17 容器跑通、
+  Windows 产物 `llvm-readobj` 查 import ∈ {msvcrt, kernel32, ws2_32}。
+- **支持矩阵(明写,替代隐性约束)**:linux-gnu(glibc≥2.28)/
+  windows-msvc x64 / apple-darwin(x64+arm64)。`posix_spawn_file_
+  actions_addchdir_np` 的 glibc/macOS 专属性由此背书;macOS 26 SDK 已
+  标其 deprecated(换 `posix_spawn_file_actions_addchdir`),记账。
+- **CI 平台矩阵 = 一致性的执法者**(五 runner × functional + negative +
+  差分 + llvm_bind):设计文档不保证同源同行为,矩阵才保证。
+
+### 4e 其余裁决(沿旧)
 
 - **降低起点**:AST(Analyzer 后)→LLVM 全新路径,不复用 .fndo IR
   (帧模型是解释器机械,E 系列优化对原生无意义)。
 - **值表示**:v0 统一 Value 盒(正确性优先,约解释器 2-5×);
   v1 标量 unbox(i64/f64 进寄存器,聚合保持盒式)。
-- **运行时库**:frond_rt C 库 ~50-100 函数(Arc 加减/分配/字符串/panic);
+- **运行时库**:frond_rt C 库(~50-100 函数,清单见 4b);
   **cycle collector 明确后置**(v0 可泄漏)。
 - **async/defer**:v1 后端 sync-only(frndc 自身写成纯 sync);
   async→状态机是自举之后的大件。
 - **Throw**:先 setjmp/longjmp,后迁零成本 unwinding。
-- **链接**:emit .obj + 子进程调 lld(lld C API 不稳,别指望进程内)。
-- **stdlib**:C 内核直接链接(自举 ≠ stdlib 纯 Frond);缺口是 builtin
-  层→frond_rt 清单,需提前盘出。
-- **第一刀探针**:Frond 程序:create_context→module→main ret 42→
-  TargetMachine emit .obj→spawn lld→跑 exe 验证退出码。
 
 ## 五、差分基础设施(验收方法论)
 
@@ -400,11 +492,13 @@ CRLF 词素);批解析 411 文件 ≈5 分钟,timeout ≥900。
 
 ## 八、下一步
 
-**1E:sema 移植**(sema/ ~17.4k,最大件)——按 Inference 文件族切片,
-每片接 sema-dump 差分;首片建议:符号表/环境(Symbols/ModuleEnv,
-与 1C 的 env 占位接通)→ 类型节点解析(type_from_ast 族,消费 1D
-竞技场)→ 推断核心。之后 Stage 2 探针(main ret 42 → lld → exe)→
-闭环。
+**Stage 1 已收官(2026-08-31)——下一步是 Stage 2 第一刀探针**。
+工具链资产已五平台发布(LLVM-C/lld/linkview 同 tarball,见 四):
+main ret 42 → `Lib.open` 解出的 llvm.so/dll/dylib 走 LLVM-C 导出
+.obj → 提取 lld + linkview 链接 → 跑 exe 断言退出码 → 五平台各一遍,
+转正 functional/llvm_probe 进 CI(顺带验证 linkview 文件清单的完整性
+缺口)。探针绿后:frondc 后端模块(lower AST→LLVM)→ frondc 自举
+(Stage 3 闭环)。
 
 ## 三f、片5 进展与阻断(2026-08-29 夜)
 
@@ -423,17 +517,27 @@ MethodCall` 的显式类型实参此前被 HM 推断忽略(`List.empty<str>()` �
 路径 + 方法糖 0a/0b/Path-0。验收:探针全绿 + functional 94 + negative
 64 + 语料 sema 0 错 + perf 同量级。
 
-**阻断(引擎 bug,已最小复现立案)**:`tests/fixtures/stmt_drop_repro
-.frond`(~35 行)——**三层 match 臂嵌套 × 循环内副作用语句**的组合下,
-被调函数行为正确,但**调用方后续语句静默丢失**(PW:post×3 + 3 后
-main 的第二条 println 消失,exit=0);更深形态(镜像 Populate.expand_
-inherited_methods 的 ~10 层嵌套)`s.inherited_method_instances.push`
-本身不落地 + 后继语句被丢 → **镜像 `! inherited` 恒 0**(引擎 53)。
-单层嵌套或无循环内语句均正常;疑 E7 同帧分支 / E9 分段线性计划的交互。
-零静默违例(语句丢失无任何诊断)。**修复前片5 的 inherited 节无法对齐;
-arithmetic 语料其余全节(monomorph 798/trait-defaults/witness/field-
-ids/errors/stats)已逐字节一致。**
+**片5 阻断(已销案,2026-08-31 复核)**:~~check 运行期 compute_match_
+fallback panic / 三层 match 臂嵌套 × 循环内副作用语句静默丢失~~——
+引擎侧修复随 2026-08-31 提交(75a6496,EngineCore/Schedule/Subgraph/
+Frame 一组)落地。**复核证据**:① `stmt_drop_repro.frond` 输出正确
+(post×3 + 3 + len=3,缺失的第二条 println 回归);② arithmetic 语料
+**全节差分逐字节一致**(含 `! monomorph 823`/`! inherited 53`——片5
+最后一块 inherited 对齐达成;引擎侧基准同数);③ 默认 6 语料 5/6 绿,
+warnings 节随全节比对通过(原「镜像多 6 条 unreachable」残差同灭)。
+**新立案(未复现)**:qualified_types 的一次 checkmany 运行 >900s 被
+超时杀(stdout 空致差分假红),此后同命令 3/3 复跑全绿(39s/2551 行,
+warm cache)。疑引擎 async 调度偶发挂起,观察项:再遇即取 stack/计时
+分段定位,不阻断主线。**1E 剩余 = 终局验收三级(2026-08-31 全数达成,Stage 1 收官)**:
+① 双跑等价:functional 93 过/2 平台跳过(ffi_lib、crypto_primitives
+= Windows 特化夹具,PLATFORMS 声明)+ llvm_bind 待平台资产(CI 预取
+覆盖)+ **negative 64/64**;② **std 全库自检**:checkmany 全部 128 个
+std 文件作入口,0 错误,唯一 warning 为 frondc 自身 module/Toml.frond
+的 unreachable(历史良性);③ **apps 语料**:editor + llvmfetch 引擎
+vs 镜像 sema-dump 逐字节一致。计时备注:std 自检单进程 66 分钟——
+parse 已跨入口共享(std_cache/AST 盘缓存),sema 检查环仍逐入口重跑;
+跨入口 sema 共享 = 优化积压项(与 §7 IntMap 同族,不阻断)。
 
-**镜像侧已知残差(引擎修复后处理)**:`! warnings` 镜像多 6 条
-"unreachable match arm"(引擎不报——臂可达性判定的 is_useful 分歧,
-待引擎修复后复核)。
+**镜像侧已知残差(已销案,2026-08-31)**:~~`! warnings` 镜像多 6 条
+"unreachable match arm"~~——随引擎修复(75a6496)消散:默认语料全节
+比对(含 warnings 节)逐字节通过。

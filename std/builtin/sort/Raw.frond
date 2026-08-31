@@ -10,6 +10,7 @@
 
 @c_include("stdint.h")
 @c_include("stddef.h")
+@c_include("string.h")
 
 // In-place heapsort over the i8[] buffer (ascending). Unstable; NaN
 // ordering (floats) is unspecified — an inconsistent comparator just yields

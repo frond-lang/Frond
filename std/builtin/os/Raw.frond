@@ -146,9 +146,16 @@ fun __os_set_cwd(path: str): i32 #{
 @extern("C")
 fun __os_hostname_into(buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
-        DWORD n = (DWORD)buf_len;
-        if (!GetComputerNameA((LPSTR)buf_data, &n)) return -1;
-        return (int64_t)n;
+        // Wide bridge: GetComputerNameA re-encodes through the active ANSI
+        // code page, mangling non-ASCII hostnames. NetBIOS names cap far
+        // below 256 chars, so a stack buffer is enough.
+        wchar_t wname[256];
+        DWORD wn = (DWORD)(sizeof(wname) / sizeof(wchar_t));
+        if (!GetComputerNameW(wname, &wn)) return -1;
+        int64_t bytes = frond_utf16_to_utf8_into(wname, (char*)buf_data, buf_len);
+        if (bytes == -1) return -2;
+        if (bytes < 0) return -1;
+        return bytes;
     #else
         if (gethostname((char*)buf_data, buf_len) != 0) return -1;
         return (int64_t)strlen((char*)buf_data);
@@ -303,15 +310,23 @@ fun __os_env_var_get_into(i: i64, buf: u8[]): i64 #{
 
 // ─── Common directories / user identification ───
 
-// Temporary directory. Windows GetTempPathA; POSIX TMPDIR with "/tmp" fallback.
+// Temporary directory. Windows GetTempPathW (+ UTF-8 bridge); POSIX TMPDIR with "/tmp" fallback.
 @internal
 @extern("C")
 fun __os_tmp_dir_into(buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
-        DWORD n = GetTempPathA((DWORD)buf_len, (LPSTR)buf_data);
-        if (n == 0 || n >= buf_len) return -2;
-        while (n > 1 && ((char*)buf_data)[n-1] == '\\') n--;  // strip trailing separator
-        return (int64_t)n;
+        // Wide bridge: GetTempPathA emits ANSI code-page bytes — a non-ASCII
+        // username (TEMP lives under the profile) yields a mojibake path.
+        // GetTempPathW never returns more than MAX_PATH(+1) wchars.
+        wchar_t wpath[262];
+        DWORD wn = GetTempPathW((DWORD)(sizeof(wpath) / sizeof(wchar_t)), wpath);
+        if (wn == 0 || wn >= (DWORD)(sizeof(wpath) / sizeof(wchar_t))) return -2;
+        while (wn > 1 && wpath[wn-1] == L'\\') wn--;  // strip trailing separator
+        wpath[wn] = 0;
+        int64_t bytes = frond_utf16_to_utf8_into(wpath, (char*)buf_data, buf_len);
+        if (bytes == -1) return -2;
+        if (bytes < 0) return -1;
+        return bytes;
     #else
         const char* s = getenv("TMPDIR");
         if (!s || !*s) s = "/tmp";
@@ -993,9 +1008,15 @@ fun __os_cpu_count(): i64 #{
 @extern("C")
 fun __os_disk_space_into(path: str, buf: u8[]): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
+        // Wide bridge: the A variant decodes path bytes through the ANSI code
+        // page, so non-ASCII paths never resolve.
+        wchar_t* wpath = frond_utf8_to_utf16(path_data, path_len);
+        if (!wpath) return -1;
         ULARGE_INTEGER free_avail;
         ULARGE_INTEGER total;
-        if (!GetDiskFreeSpaceExA(path_data, &free_avail, &total, NULL)) return -1;
+        BOOL ok = GetDiskFreeSpaceExW(wpath, &free_avail, &total, NULL);
+        free(wpath);
+        if (!ok) return -1;
         memcpy(buf_data, &free_avail.QuadPart, 8);
         memcpy(buf_data + 8, &total.QuadPart, 8);
         return 0;
