@@ -367,7 +367,7 @@ impl<S: LockStrategy> Engine<S> {
         // already been released inside EventSource::resolve, so the event_waiters lock here does
         // not nest with a source lock, avoiding lock-ordering conflicts.
         if val.is_none() {
-            self.event_waiters.lock().push((event, fid));
+            self.event_waiters.lock().entry(event).or_default().push(fid);
             // Post-registration re-poll (Multi await-loop hang root): the
             // awaited child may complete BETWEEN resolve()'s first poll and
             // this registration — on_event_arrived then finds no waiter and
@@ -410,9 +410,9 @@ impl<S: LockStrategy> Engine<S> {
                 eprintln!("[AWAIT] fid={:?} repoll raced={}", fid, raced.is_some());
             }
             if let Some(v) = raced {
-                self.event_waiters
-                    .lock()
-                    .retain(|(e, f)| !(*e == event && *f == fid));
+                if let Some(bucket) = self.event_waiters.lock().get_mut(&event) {
+                    bucket.retain(|f| *f != fid);
+                }
                 return (event, Some(v), await_node);
             }
         }
@@ -475,15 +475,9 @@ impl<S: LockStrategy> Engine<S> {
         // Find the frames waiting on this event (short critical section).
         let waiters: Vec<FrameId> = {
             let mut event_waiters = self.event_waiters.lock();
-            let waiters: Vec<FrameId> = event_waiters
-                .iter()
-                .filter(|(e, _)| *e == event)
-                .map(|(_, fid)| *fid)
-                .collect();
-            // Use a HashSet to avoid O(n^2) retain (Vec::contains is O(n)).
-            let waiter_set: std::collections::HashSet<FrameId> = waiters.iter().copied().collect();
-            event_waiters.retain(|(_, fid)| !waiter_set.contains(fid));
-            waiters
+            // Take this event's whole bucket: registration order preserved,
+            // O(bucket) instead of a full-table scan per arrival.
+            event_waiters.remove(&event).unwrap_or_default()
         };
         let mut delivered = 0usize;
         if super::env_flag("FROND_DEBUG_AWAIT") {
@@ -578,14 +572,18 @@ impl<S: LockStrategy> Engine<S> {
 
         // Remove the event-waiter registration.
         if let Some(event) = frame.suspend_event {
-            self.event_waiters
-                .lock()
-                .retain(|(e, fid)| !(*e == event && *fid == frame_id));
+            if let Some(bucket) = self.event_waiters.lock().get_mut(&event) {
+                bucket.retain(|fid| *fid != frame_id);
+            }
         } else {
             // select frame: remove all event-waiter entries for this frame.
-            self.event_waiters
-                .lock()
-                .retain(|(_, fid)| *fid != frame_id);
+            // Select frames are rare (one per select); a per-bucket sweep is
+            // bounded by the number of distinct awaited events, strictly
+            // cheaper than the old full-table retain.
+            let mut event_waiters = self.event_waiters.lock();
+            for bucket in event_waiters.values_mut() {
+                bucket.retain(|fid| *fid != frame_id);
+            }
         }
         // Clean up pending_events (events stashed when the frame was absent from the HashMap on
         // arrival).

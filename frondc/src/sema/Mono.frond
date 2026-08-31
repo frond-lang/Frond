@@ -1,0 +1,1597 @@
+// Mono.frond — monomorph 收集与实例化(1E 片5):Rust core/src/sema/
+// Monomorph.rs 的镜像。collect_monomorph_instances(泛型调用点 → 实例集
+// + 实例化模式体重放)/ infer_type_args / validate_trait_method_bindings
+// / validate_trait_inheritance / collect_trait_default_instances。
+//
+// 表示裁决(超越镜像原则):
+// - 实例缓存键:引擎 FNV-u64 → 镜像结构串(module\x01func\x01各实参
+//   display);键不进 dump,行为等价(结构区分更精确);
+// - MAX_MONOMORPH_DEPTH:引擎 panic;镜像到顶即弃(病态语料不进差分);
+// - ChanLayout 不移植(dump 无此字段);
+// - walk 与引擎同构(含 LocalDecl 仅 FunDecl 体下钻)。
+
+import std.collections.List
+import std.collections.Map
+import std.core.types.Str
+import syntax.Ast
+import types.Arena
+import types.Ty
+
+import sema.Data
+import sema.Envs
+import sema.Semares
+import sema.Ictx
+import sema.Populate
+import sema.Typeast
+import sema.Infer
+
+// ─── 类型节点展平解析(resolve_type_node_resolved 镜像)────────────
+// 注意:这是 monomorph 专用展平器,不是 type_from_ast/concretize ——
+// Generic 丢实参(Lazy 剥壳)、Nullable 剥壳、Ref/RawPtr → 裸 Adt、
+// Array → 裸 "array"、Function → fn([], Unknown)。怪癖即差分契约
+// (! monomorph 的 ret= 由它产出)。
+
+fun resolve_named_flat(a: TypeArena, s: SemaRes, name: str, type_args: u32[],
+    visiting: List<str>): u32 {
+    // 1. type_args 名匹配(占位 Adt(形参名) 命中)。
+    var i: usize = 0
+    while i < type_args.len() {
+        if Populate.type_handle_name_matches(a, type_args[i], name) {
+            return type_args[i]
+        }
+        i = i + 1
+    }
+    // 2. 内建标量。
+    match Populate.from_type_name_full(name) {
+        null => {}
+        t => { return Arena.make(a, t) }
+    }
+    // 3. canonical + alias 链(visiting 环检测 + 深度保险丝 256)。
+    val canonical = Semares.resolve_type_key(s, name)
+    if Semares.list_has_str(visiting, canonical) {
+        return Arena.make_adt(a, canonical, [])
+    }
+    if visiting.len() >= 256 {
+        return Arena.make_adt(a, canonical, [])
+    }
+    visiting.push(canonical)
+    var target_ty: u32? = null
+    var target_name: str? = null
+    match Semares.get_type_def(s, canonical) {
+        null => {}
+        td => {
+            target_ty = td.target_type
+            target_name = td.target_type_name
+        },
+    }
+    if target_ty != null {
+        Semares.list_remove_str(visiting, canonical)
+        return target_ty ?? 0
+    }
+    if target_name != null {
+        val result = resolve_named_flat(a, s, target_name ?? "", type_args, visiting)
+        Semares.list_remove_str(visiting, canonical)
+        return result
+    }
+    Semares.list_remove_str(visiting, canonical)
+    Arena.make_adt(a, canonical, [])
+}
+
+pub fun resolve_tn_flat(a: TypeArena, s: SemaRes, type_ref: i64?, type_args: u32[],
+    ast: AstArena): u32? {
+    match type_ref {
+        null => { return null }
+        tr => {
+            val tn = ast.ty(tr).node
+            match tn {
+                TNamed(name) => {
+                    val visiting = List.empty<str>()
+                    resolve_named_flat(a, s, name, type_args, visiting)
+                },
+                TGeneric(name, args) => {
+                    // Lazy<T> 剥壳;其余丢实参为裸 Generic。
+                    if name == "Lazy" && args.len() > 0 {
+                        match resolve_tn_flat(a, s, args[0], type_args, ast) {
+                            null => {}
+                            inner => { return inner }
+                        }
+                    }
+                    Arena.make_generic(a, name, [])
+                },
+                TNullable(inner) => {
+                    resolve_tn_flat(a, s, inner, type_args, ast)
+                },
+                TRef(inner) => {
+                    var iname = "ref"
+                    match Populate.type_name_from_node(ast, inner) {
+                        null => {}
+                        n => { iname = n }
+                    }
+                    val canonical = Semares.resolve_type_key(s, iname)
+                    Arena.make_adt(a, canonical, [])
+                },
+                TRawPtr(inner) => {
+                    var iname = "ptr"
+                    match Populate.type_name_from_node(ast, inner) {
+                        null => {}
+                        n => { iname = n }
+                    }
+                    val canonical = Semares.resolve_type_key(s, iname)
+                    Arena.make_adt(a, canonical, [])
+                },
+                TRecord(_) => { Arena.make_record(a, [], null) },
+                TFunction(_, _) => {
+                    val ret = Arena.make(a, TUnknown)
+                    Arena.make_fn(a, [], ret)
+                },
+                TArray(_, _) => { Arena.make_adt(a, "array", []) },
+                TThis => {
+                    var i: usize = 0
+                    while i < type_args.len() {
+                        if Populate.type_handle_name_matches(a, type_args[i], "This") {
+                            return type_args[i]
+                        }
+                        i = i + 1
+                    }
+                    Arena.make_adt(a, "This", [])
+                },
+                TKindAnn(inner, _) => {
+                    resolve_tn_flat(a, s, inner, type_args, ast)
+                },
+            }
+        },
+    }
+}
+
+// ─── 函数符号表(FuncTables 镜像)─────────────────────────────────
+
+pub type FTabs = FTabs(
+    // "module\0name" → 顶层 fun 声明。
+    pub decls: Map<str, Sd>,
+    // "module\0name" → 声明模块 arena。
+    pub arenas: Map<str, AstArena>,
+    // 注册序模块名。
+    pub modules: List<str>,
+    // 裸名 → 定义模块(注册序)。
+    pub owners: Map<str, List<str>>,
+)
+
+pub fun ftabs_new(): FTabs {
+    FTabs(Map.empty<str, Sd>(), Map.empty<str, AstArena>(), List.empty<str>(), Map.empty<str, List<str>>())
+}
+
+fun ftabs_key(module: str, name: str): str {
+    "{module}\u{0}{name}"
+}
+
+pub fun ftabs_register(t: FTabs, m: ModuleAst): void {
+    t.modules.push(m.name)
+    var di: usize = 0
+    while di < m.decls.len() {
+        match m.decls[di].decl {
+            FunDeclD(_, name, _, _, _, _, _, _, _, _) => {
+                t.decls.set(ftabs_key(m.name, name), m.decls[di])
+                t.arenas.set(ftabs_key(m.name, name), m.arena)
+                match t.owners.get(name) {
+                    null => {
+                        val bucket = List.empty<str>()
+                        bucket.push(m.name)
+                        t.owners.set(name, bucket)
+                    },
+                    l => { l.push(m.name) },
+                }
+            },
+            _ => {},
+        }
+        di = di + 1
+    }
+}
+
+// 裸名归属:调用方模块自有 → 唯一定义模块;竞争 = null(不静默挑)。
+fun ftabs_resolve_owner(t: FTabs, name: str, from: str): str? {
+    match t.owners.get(name) {
+        null => { return null }
+        owners => {
+            var i: usize = 0
+            while i < owners.len() {
+                if (owners.get(i) ?? "") == from {
+                    return owners.get(i)
+                }
+                i = i + 1
+            }
+            if owners.len() == 1 {
+                return owners.get(0)
+            }
+            null
+        },
+    }
+}
+
+// 限定接收者路径段 → 后缀唯一匹配的模块名。
+fun ftabs_module_by_path(t: FTabs, segs: str[]): str? {
+    var hit: str? = null
+    var mi: usize = 0
+    while mi < t.modules.len() {
+        val m = t.modules.get(mi) ?? ""
+        var base = m
+        if Str.ends_with(base, ".frond") {
+            base = Str.substring(base, 0, base.len() - 6)
+        }
+        val m_segs = Str.split(base, "/")
+        if m_segs.len() >= segs.len() {
+            var suffix_ok = true
+            var k: usize = 0
+            while k < segs.len() {
+                if m_segs[m_segs.len() - segs.len() + k] != segs[k] {
+                    suffix_ok = false
+                }
+                k = k + 1
+            }
+            if suffix_ok {
+                var clash = false
+                match hit {
+                    null => {}
+                    h => {
+                        if h != m {
+                            clash = true
+                        }
+                    },
+                }
+                if clash {
+                    return null
+                }
+                hit = if true { m } else { null }
+            }
+        }
+        mi = mi + 1
+    }
+    hit
+}
+
+fun ftabs_decl(t: FTabs, module: str, name: str): Sd? {
+    t.decls.get(ftabs_key(module, name))
+}
+
+fun ftabs_arena(t: FTabs, module: str, name: str): AstArena? {
+    t.arenas.get(ftabs_key(module, name))
+}
+
+// 接收者为纯模块路径(Ident/FieldAccess 链)时的段列表。
+fun recv_path_segments(ast: AstArena, recv0: i64): List<str>? {
+    val segs = List.empty<str>()
+    var recv = recv0
+    var go = true
+    while go {
+        match ast.expr(recv).node {
+            Ident(name) => {
+                segs.push(name)
+                go = false
+            },
+            FieldAccessE(r, field) => {
+                segs.push(field)
+                recv = r
+            },
+            _ => { return null }
+        }
+    }
+    // 逆序。
+    val out = List.empty<str>()
+    var i: i64 = segs.len() as i64 - 1
+    while i >= 0 {
+        out.push(segs.get(i as usize) ?? "")
+        i = i - 1
+    }
+    out
+}
+
+// ─── 实例缓存键(结构串)─────────────────────────────────────────
+
+pub fun mono_cache_key(a: TypeArena, module_name: str, func_name: str, type_args: u32[]): str {
+    var key = "{module_name}\u{1}{func_name}"
+    var i: usize = 0
+    while i < type_args.len() {
+        key = key + "\u{1}" + Arena.display(a, type_args[i])
+        i = i + 1
+    }
+    key
+}
+
+
+// str[] 包含。
+fun tp_has(arr: str[], key: str): bool {
+    var i: usize = 0
+    while i < arr.len() {
+        if arr[i] == key {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+// ─── infer_type_args(泛型调用实参推断)───────────────────────────
+
+pub fun infer_type_args(a: TypeArena, s: SemaRes, func_name: str, arguments: i64[],
+    type_args_hint: i64[], type_params: str[], fd_decl: Sd, fd_ast: AstArena,
+    ast: AstArena, module_name: str): u32[] {
+    // 1. 显式类型实参(turbofish):调用方 arena 解析。
+    if type_args_hint.len() > 0 {
+        var args: u32[] = []
+        var i: usize = 0
+        while i < type_args_hint.len() {
+            match resolve_tn_flat(a, s, type_args_hint[i], [], ast) {
+                null => {
+                    Semares.add_error(s, new_err(
+                        "failed to resolve type argument in {func_name}", 0, 0))
+                    args = args ++ [Arena.make(a, TUnknown)]
+                },
+                h => { args = args ++ [h ?? 0] },
+            }
+            i = i + 1
+        }
+        return args
+    }
+    // 2. 隐式推断。
+    var params: Prm[] = []
+    var rt: i64? = null
+    match fd_decl.decl {
+        FunDeclD(_, _, _, ps, r0, _, _, _, _, _) => {
+            params = ps
+            rt = r0
+        },
+        _ => {},
+    }
+    val name_to_handle = Map.empty<str, u32>()
+    val param_count = if params.len() < arguments.len() { params.len() } else { arguments.len() }
+
+    // Pass 1:.named 注解(init: A → 实参 ExprInfo 类型)。
+    var i: usize = 0
+    while i < param_count {
+        match params[i].ta {
+            null => {}
+            pt => {
+                match fd_ast.ty(pt).node {
+                    TNamed(pname) => {
+                        if tp_has(type_params, pname) && !name_to_handle.has(pname) {
+                            val arg_key = Semares.module_expr_key(module_name, arguments[i])
+                            match Semares.get_expr(s, arg_key) {
+                                null => {}
+                                info => { name_to_handle.set(pname, info ?? 0) }
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+            },
+        }
+        i = i + 1
+    }
+
+    // Pass 1b:.array 注解(a: T[] → 实参元素类型;str → u8)。
+    i = 0
+    while i < param_count {
+        match params[i].ta {
+            null => {}
+            pt => {
+                match fd_ast.ty(pt).node {
+                    TArray(elem, _) => {
+                        match fd_ast.ty(elem).node {
+                            TNamed(pname) => {
+                                if tp_has(type_params, pname) && !name_to_handle.has(pname) {
+                                    val arg_key = Semares.module_expr_key(module_name, arguments[i])
+                                    match Semares.get_expr(s, arg_key) {
+                                        null => {}
+                                        info => {
+                                            val r = Arena.resolve(a, info ?? 0)
+                                            match Arena.get(a, r) {
+                                                TArray(_) => {
+                                                    name_to_handle.set(pname, Arena.array_parts(a, r).a)
+                                                },
+                                                TStr => {
+                                                    name_to_handle.set(pname, Arena.make(a, TU8))
+                                                },
+                                                _ => {},
+                                            }
+                                        },
+                                    }
+                                }
+                            },
+                            _ => {},
+                        }
+                    },
+                    _ => {},
+                }
+            },
+        }
+        i = i + 1
+    }
+
+    // Pass 2:.function 注解(f: (A, T) -> A)× lambda 实参。
+    i = 0
+    while i < param_count {
+        match params[i].ta {
+            null => {}
+            pt => {
+                match fd_ast.ty(pt).node {
+                    TFunction(fn_params, fn_ret) => {
+                        match ast.expr(arguments[i]).node {
+                            LambdaE(lambda_params, lambda_body, _, lambda_rt) => {
+                                // 函数形参 × lambda 形参注解。
+                                val match_count = if fn_params.len() < lambda_params.len() { fn_params.len() } else { lambda_params.len() }
+                                var j: usize = 0
+                                while j < match_count {
+                                    match fd_ast.ty(fn_params[j]).node {
+                                        TNamed(fp_name) => {
+                                            if tp_has(type_params, fp_name) && !name_to_handle.has(fp_name) {
+                                                match lambda_params[j].ta {
+                                                    null => {}
+                                                    lt => {
+                                                        match resolve_tn_flat(a, s, lt, [], ast) {
+                                                            null => {}
+                                                            h => { name_to_handle.set(fp_name, h ?? 0) }
+                                                        }
+                                                    },
+                                                }
+                                            }
+                                        },
+                                        _ => {},
+                                    }
+                                    j = j + 1
+                                }
+                                // 函数返回注解名 × lambda 返回。
+                                match fd_ast.ty(fn_ret).node {
+                                    TNamed(ret_name) => {
+                                        if tp_has(type_params, ret_name) && !name_to_handle.has(ret_name) {
+                                            var got: u32? = null
+                                            match lambda_rt {
+                                                null => {
+                                                    got = infer_lambda_return_type(a, s, lambda_body, ast, module_name)
+                                                },
+                                                lrt => {
+                                                    match resolve_tn_flat(a, s, lrt, [], ast) {
+                                                        null => {}
+                                                        h => { got = if true { h } else { null } }
+                                                    }
+                                                },
+                                            }
+                                            match got {
+                                                null => {}
+                                                g => { name_to_handle.set(ret_name, g) }
+                                            }
+                                        }
+                                    },
+                                    _ => {},
+                                }
+                            },
+                            _ => {},
+                        }
+                    },
+                    _ => {},
+                }
+            },
+        }
+        i = i + 1
+    }
+
+    // 发射:未绑定形参 → 占位 Adt(形参名)。
+    var args: u32[] = []
+    var ti: usize = 0
+    while ti < type_params.len() {
+        match name_to_handle.get(type_params[ti]) {
+            null => {
+                args = args ++ [Arena.make_adt(a, type_params[ti], [])]
+            },
+            h => { args = args ++ [h ?? 0] },
+        }
+        ti = ti + 1
+    }
+    args
+}
+
+// lambda 返回类型:显式注解 → 体表达式 ExprInfo → 块尾表达式 ExprInfo。
+fun infer_lambda_return_type(a: TypeArena, s: SemaRes,
+    body: LBody, ast: AstArena, module_name: str): u32? {
+    match body {
+        LExpr(body_expr) => {
+            val key = Semares.module_expr_key(module_name, body_expr)
+            Semares.get_expr(s, key)
+        },
+        LBlock(block_expr) => {
+            match ast.expr(block_expr).node {
+                BlockE(_, trailing) => {
+                    match trailing {
+                        null => { null }
+                        t => {
+                            val key = Semares.module_expr_key(module_name, t ?? 0)
+                            Semares.get_expr(s, key)
+                        },
+                    }
+                },
+                _ => { null }
+            }
+        },
+    }
+}
+
+// ─── get_or_create_instance(占位预留 + 实例化重放 + 填充)────────
+
+pub fun get_or_create_instance(a: TypeArena, s: SemaRes, func_name: str, type_args: u32[],
+    fd_decl: Sd, ast: AstArena, tables: FTabs, in_progress: Map<str, i64>,
+    module_name: str): i64 {
+    val cache_key = mono_cache_key(a, module_name, func_name, type_args)
+    // 1. 缓存命中。
+    match s.monomorph_index.get(cache_key) {
+        null => {}
+        idx => { return idx ?? 0 }
+    }
+    // 2. 环检测(前向引用)+ 深度保险丝(引擎 panic;镜像弃)。
+    match in_progress.get(cache_key) {
+        null => {}
+        existing => { return existing ?? 0 }
+    }
+    if in_progress.len() >= 256 {
+        return -1
+    }
+    // 3. 声明视图。
+    var type_params: str[] = []
+    var params: Prm[] = []
+    var rt: i64? = null
+    var body: i64 = 0
+    var is_async = false
+    match fd_decl.decl {
+        FunDeclD(_, _, tps, ps, r0, b, ia, _, _, _) => {
+            var k: usize = 0
+            while k < tps.len() {
+                type_params = type_params ++ [tps[k].name]
+                k = k + 1
+            }
+            params = ps
+            rt = r0
+            body = b
+            is_async = ia
+        },
+        _ => {},
+    }
+    val instance_id = s.monomorph_instances.len() as i64
+    // 返回类型(展平器 + type_args)。
+    var return_handle = Arena.make(a, TUnknown)
+    match resolve_tn_flat(a, s, rt, type_args, ast) {
+        null => {
+            Semares.add_error(s, new_err("failed to resolve return type of {func_name}", 0, 0))
+        },
+        h => { return_handle = h ?? 0 },
+    }
+    // 占位先行(嵌套实例化会取新 id)。
+    s.monomorph_instances.push(Mono(instance_id, func_name, module_name, type_args,
+        return_handle, is_async, 0))
+    in_progress.set(cache_key, instance_id)
+    // 4. 实例化重放(局部表 + resolved;随后嵌套 walk)。
+    var local_count = resolve_instance_body_types(a, s, type_params, params, rt, body,
+        func_name, type_args, ast, tables, in_progress, module_name, instance_id)
+    // 5. 填槽 + 缓存。
+    s.monomorph_instances.set(instance_id as usize, Mono(instance_id, func_name, module_name,
+        type_args, return_handle, is_async, local_count))
+    s.monomorph_index.set(cache_key, instance_id)
+    instance_id
+}
+
+// 实例化体解析:Step1 重放(Infer 实例化模式)→ Step2 walk 收嵌套调用点。
+fun resolve_instance_body_types(a: TypeArena, s: SemaRes, type_params: str[], params: Prm[],
+    rt: i64?, body: i64, func_name: str, type_args: u32[], ast: AstArena, tables: FTabs,
+    in_progress: Map<str, i64>, module_name: str, instance_id: i64): i64 {
+    // Step 1:临时 InferContext,rigid → 具体实参,重放 infer_expr。
+    val saved_sema_module = s.current_module_name
+    val ictx2 = Ictx.new_ictx()
+    ictx2.current_module_name = module_name
+    s.current_module_name = module_name
+    // 泛型绑定(先 rigid,后覆写为具体实参 = enter_instantiation_mode)。
+    var tps: Tp[] = []
+    var k: usize = 0
+    while k < type_params.len() {
+        tps = tps ++ [Tp(type_params[k], null, [])]
+        k = k + 1
+    }
+    if tps.len() > 0 {
+        Ictx.push_type_bindings(ictx2, a, tps)
+    }
+    val instc = Data.new_inst_ctx(func_name, type_args, module_name, in_progress)
+    ictx2.inst = instc
+    k = 0
+    while k < type_params.len() && k < type_args.len() {
+        Ictx.insert_top(ictx2, type_params[k], type_args[k])
+        k = k + 1
+    }
+    // 声明模块 env 为父(裸名先解析本模块符号)。
+    var parent_env = Envs.root(s.env)
+    match Semares.module_logical_path(module_name) {
+        null => {}
+        lp => {
+            match s.module_envs.get(lp) {
+                null => {}
+                me => { parent_env = me ?? 0 }
+            }
+        },
+    }
+    val fn_env = Envs.child(s.env, parent_env)
+    var pi: usize = 0
+    while pi < params.len() {
+        var h = Arena.fresh_type_var(a)
+        match params[pi].ta {
+            null => {}
+            ta => { h = Typeast.type_from_ast(ictx2, a, s, ta, ast) }
+        }
+        Envs.define(s.env, fn_env, params[pi].name, h)
+        pi = pi + 1
+    }
+    var ret_ty = Arena.fresh_type_var(a)
+    match rt {
+        null => {}
+        r0 => { ret_ty = Typeast.type_from_ast(ictx2, a, s, r0, ast) }
+    }
+    ictx2.expected_return = ret_ty
+    val _bt = Infer.infer_expr(ictx2, a, s, body, ast, fn_env, ictx2.expected_return)
+    // Step 1 收尾:局部表并入全局 expr_types(键集 = HM 已覆盖,计数不变)。
+    var ki: usize = 0
+    while ki < instc.local_expr_types.len() {
+        val pair = instc.local_expr_types.get(ki) ?? ETMap(0, 0)
+        Semares.put_expr(s, Semares.module_expr_key(instc.module_name, pair.expr), pair.ty)
+        ki = ki + 1
+    }
+    s.current_module_name = saved_sema_module
+    // Step 2:walk 函数体,收集嵌套泛型调用点(实例化类型已在全局表)。
+    walk_expr_m(a, body, ast, tables, in_progress, s, module_name)
+    instc.local_expr_types.len() as i64
+}
+
+// 空 Sd 兜底(类型层面的非空;路径上已被 null 门拦)。
+fun m_decls_dummy(): Sd {
+    Sd(Span(0, 0), FunDeclD(Priv, "", [], [], null, 0, false, false, [], null))
+}
+
+// ─── 调用点处理 ───────────────────────────────────────────────────
+
+// 直接调用(callee 为标识符)。
+fun process_call(a: TypeArena, callee: i64, arguments: i64[], type_args_hint: i64[],
+    call_expr: i64, ast: AstArena, tables: FTabs, in_progress: Map<str, i64>,
+    s: SemaRes, module_name: str): void {
+    var func_name = ""
+    match ast.expr(callee).node {
+        Ident(name) => { func_name = name }
+        _ => { return }
+    }
+    // 归属:自有 → 唯一;竞争 = 放弃。
+    val own0 = ftabs_resolve_owner(tables, func_name, module_name)
+    if own0 == null {
+        return
+    }
+    val owner = own0 ?? ""
+    val fdd0 = ftabs_decl(tables, owner, func_name)
+    if fdd0 == null {
+        return
+    }
+    val fd_decl = fdd0 ?? m_decls_dummy()
+    // 泛型性看声明本身。
+    var type_params: str[] = []
+    match fd_decl.decl {
+        FunDeclD(_, _, tps, _, _, _, _, _, _, _) => {
+            if tps.len() == 0 {
+                return
+            }
+            var k: usize = 0
+            while k < tps.len() {
+                type_params = type_params ++ [tps[k].name]
+                k = k + 1
+            }
+        },
+        _ => { return },
+    }
+    val fd_ast = ftabs_arena(tables, owner, func_name) ?? ast
+    val type_args = infer_type_args(a, s, func_name, arguments, type_args_hint, type_params,
+        fd_decl, fd_ast, ast, module_name)
+    val instance_id = get_or_create_instance(a, s, func_name, type_args, fd_decl, fd_ast,
+        tables, in_progress, owner)
+    if instance_id < 0 {
+        return
+    }
+    s.call_instantiations.set(Semares.module_expr_key(module_name, call_expr), instance_id)
+}
+
+// 方法糖调用(recv.method(args)):纯路径接收者限定模块;值接收者占首参。
+fun process_method_call(a: TypeArena, recv: i64, method: str, arguments: i64[],
+    type_args_hint: i64[], call_expr: i64, ast: AstArena, tables: FTabs,
+    in_progress: Map<str, i64>, s: SemaRes, module_name: str): void {
+    // 归属:纯路径接收者后缀匹配模块(且该模块定义此方法)→ 裸名解析。
+    var owner: str? = null
+    match recv_path_segments(ast, recv) {
+        null => {}
+        segs => {
+            var segs2: str[] = []
+            var si: usize = 0
+            while si < segs.len() {
+                segs2 = segs2 ++ [segs.get(si) ?? ""]
+                si = si + 1
+            }
+            match ftabs_module_by_path(tables, segs2) {
+                null => {}
+                m => {
+                    if ftabs_decl(tables, m, method) != null {
+                        owner = if true { m } else { null }
+                    }
+                },
+            }
+        },
+    }
+    if owner == null {
+        owner = ftabs_resolve_owner(tables, method, module_name)
+    }
+    if owner == null {
+        return
+    }
+    val owner2 = owner ?? ""
+    val fdd0 = ftabs_decl(tables, owner2, method)
+    if fdd0 == null {
+        return
+    }
+    val fd_decl = fdd0 ?? m_decls_dummy()
+    var type_params: str[] = []
+    match fd_decl.decl {
+        FunDeclD(_, _, tps, _, _, _, _, _, _, _) => {
+            if tps.len() == 0 {
+                return
+            }
+            var k: usize = 0
+            while k < tps.len() {
+                type_params = type_params ++ [tps[k].name]
+                k = k + 1
+            }
+        },
+        _ => { return },
+    }
+    val fd_ast = ftabs_arena(tables, owner2, method) ?? ast
+    // 方法糖形参序:值接收者占首参(命名空间接收者除外)。
+    val recv_is_namespace = s.module_func_recv_exprs.has(Semares.module_expr_key(module_name, recv))
+    var sugar_args: i64[] = []
+    if !recv_is_namespace {
+        sugar_args = sugar_args ++ [recv]
+    }
+    var ai: usize = 0
+    while ai < arguments.len() {
+        sugar_args = sugar_args ++ [arguments[ai]]
+        ai = ai + 1
+    }
+    val type_args = infer_type_args(a, s, method, sugar_args, type_args_hint, type_params,
+        fd_decl, fd_ast, ast, module_name)
+    val instance_id = get_or_create_instance(a, s, method, type_args, fd_decl, fd_ast,
+        tables, in_progress, owner2)
+    if instance_id < 0 {
+        return
+    }
+    s.call_instantiations.set(Semares.module_expr_key(module_name, call_expr), instance_id)
+    // v3 phase 1:方法糖分派元数据(与 call_instantiations 同键)。
+    Semares.put_dispatch(s, Semares.module_expr_key(module_name, call_expr))
+}
+
+// ─── AST 递归遍历 ────────────────────────────────────────────────
+
+fun walk_expr_m(a: TypeArena, expr: i64, ast: AstArena, tables: FTabs,
+    in_progress: Map<str, i64>, s: SemaRes, module_name: str): void {
+    match ast.expr(expr).node {
+        CallE(callee, args, targs) => {
+            process_call(a, callee, args, targs, expr, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, callee, ast, tables, in_progress, s, module_name)
+            var i: usize = 0
+            while i < args.len() {
+                walk_expr_m(a, args[i], ast, tables, in_progress, s, module_name)
+                i = i + 1
+            }
+        },
+        MethodCallE(recv, method, args, targs) => {
+            process_method_call(a, recv, method, args, targs, expr, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, recv, ast, tables, in_progress, s, module_name)
+            var i: usize = 0
+            while i < args.len() {
+                walk_expr_m(a, args[i], ast, tables, in_progress, s, module_name)
+                i = i + 1
+            }
+        },
+        SafeMethodCallE(recv, method, args, targs) => {
+            process_method_call(a, recv, method, args, targs, expr, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, recv, ast, tables, in_progress, s, module_name)
+            var i: usize = 0
+            while i < args.len() {
+                walk_expr_m(a, args[i], ast, tables, in_progress, s, module_name)
+                i = i + 1
+            }
+        },
+        BinaryE(_, l, r) => {
+            walk_expr_m(a, l, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, r, ast, tables, in_progress, s, module_name)
+        },
+        UnaryE(_, x) => { walk_expr_m(a, x, ast, tables, in_progress, s, module_name) },
+        AsCast(x, _) => { walk_expr_m(a, x, ast, tables, in_progress, s, module_name) },
+        RefOfE(x) => { walk_expr_m(a, x, ast, tables, in_progress, s, module_name) },
+        DerefE(x) => { walk_expr_m(a, x, ast, tables, in_progress, s, module_name) },
+        AssignE(t, v) => {
+            walk_expr_m(a, t, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, v, ast, tables, in_progress, s, module_name)
+        },
+        CompAssignE(_, t, v) => {
+            walk_expr_m(a, t, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, v, ast, tables, in_progress, s, module_name)
+        },
+        NonNullAssertE(x) => { walk_expr_m(a, x, ast, tables, in_progress, s, module_name) },
+        PropagateE(x) => { walk_expr_m(a, x, ast, tables, in_progress, s, module_name) },
+        ElvisE(l, r) => {
+            walk_expr_m(a, l, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, r, ast, tables, in_progress, s, module_name)
+        },
+        FieldAccessE(recv, _) => { walk_expr_m(a, recv, ast, tables, in_progress, s, module_name) },
+        SafeAccessE(recv, _) => { walk_expr_m(a, recv, ast, tables, in_progress, s, module_name) },
+        IndexE(recv, idx) => {
+            walk_expr_m(a, recv, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, idx, ast, tables, in_progress, s, module_name)
+        },
+        SliceE(recv, start, end, _) => {
+            walk_expr_m(a, recv, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, start, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, end, ast, tables, in_progress, s, module_name)
+        },
+        ArrayLitE(elements, fv, fc, has_fill) => {
+            var i: usize = 0
+            while i < elements.len() {
+                walk_expr_m(a, elements[i], ast, tables, in_progress, s, module_name)
+                i = i + 1
+            }
+            if has_fill {
+                walk_expr_m(a, fv, ast, tables, in_progress, s, module_name)
+                walk_expr_m(a, fc, ast, tables, in_progress, s, module_name)
+            }
+        },
+        RecordLitE(fields) => {
+            var i: usize = 0
+            while i < fields.len() {
+                walk_expr_m(a, fields[i].value, ast, tables, in_progress, s, module_name)
+                i = i + 1
+            }
+        },
+        RecordExtendE(base, updates) => {
+            walk_expr_m(a, base, ast, tables, in_progress, s, module_name)
+            var i: usize = 0
+            while i < updates.len() {
+                walk_expr_m(a, updates[i].value, ast, tables, in_progress, s, module_name)
+                i = i + 1
+            }
+        },
+        LambdaE(_, body, _, _) => {
+            match body {
+                LBlock(b) => { walk_expr_m(a, b, ast, tables, in_progress, s, module_name) }
+                LExpr(x) => { walk_expr_m(a, x, ast, tables, in_progress, s, module_name) }
+            }
+        },
+        IfE(cond, then_b, else_b) => {
+            walk_expr_m(a, cond, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, then_b, ast, tables, in_progress, s, module_name)
+            match else_b {
+                null => {}
+                eb => { walk_expr_m(a, eb, ast, tables, in_progress, s, module_name) }
+            }
+        },
+        BlockE(stmts, trailing) => {
+            var i: usize = 0
+            while i < stmts.len() {
+                walk_stmt_m(a, stmts[i], ast, tables, in_progress, s, module_name)
+                i = i + 1
+            }
+            match trailing {
+                null => {}
+                t => { walk_expr_m(a, t, ast, tables, in_progress, s, module_name) }
+            }
+        },
+        MatchE(scrut, arms) => {
+            walk_expr_m(a, scrut, ast, tables, in_progress, s, module_name)
+            var i: usize = 0
+            while i < arms.len() {
+                match arms[i].guard {
+                    null => {}
+                    g => { walk_expr_m(a, g, ast, tables, in_progress, s, module_name) }
+                }
+                walk_expr_m(a, arms[i].body, ast, tables, in_progress, s, module_name)
+                i = i + 1
+            }
+        },
+        AtomicE(x) => { walk_expr_m(a, x, ast, tables, in_progress, s, module_name) },
+        LazyE(x) => { walk_expr_m(a, x, ast, tables, in_progress, s, module_name) },
+        SelectE(arms) => {
+            var i: usize = 0
+            while i < arms.len() {
+                match arms[i] {
+                    SelRecv(channel_expr, _, body) => {
+                        walk_expr_m(a, channel_expr, ast, tables, in_progress, s, module_name)
+                        walk_expr_m(a, body, ast, tables, in_progress, s, module_name)
+                    },
+                    SelTimeout(duration, body) => {
+                        walk_expr_m(a, duration, ast, tables, in_progress, s, module_name)
+                        walk_expr_m(a, body, ast, tables, in_progress, s, module_name)
+                    },
+                }
+                i = i + 1
+            }
+        },
+        StrInterp(parts) => {
+            var i: usize = 0
+            while i < parts.len() {
+                match parts[i] {
+                    IpExpr(x) => { walk_expr_m(a, x, ast, tables, in_progress, s, module_name) }
+                    IpLit(_) => {},
+                }
+                i = i + 1
+            }
+        },
+        InlineTraitE(methods) => {
+            var i: usize = 0
+            while i < methods.len() {
+                match methods[i].body {
+                    null => {}
+                    b => { walk_expr_m(a, b, ast, tables, in_progress, s, module_name) }
+                }
+                i = i + 1
+            }
+        },
+        _ => {},
+    }
+}
+
+fun walk_stmt_m(a: TypeArena, stmt: i64, ast: AstArena, tables: FTabs,
+    in_progress: Map<str, i64>, s: SemaRes, module_name: str): void {
+    match ast.stmt(stmt).node {
+        ValDeclS(_, _, value, _) => { walk_expr_m(a, value, ast, tables, in_progress, s, module_name) },
+        VarDeclS(_, _, value, _) => { walk_expr_m(a, value, ast, tables, in_progress, s, module_name) },
+        AssignS(t, v) => {
+            walk_expr_m(a, t, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, v, ast, tables, in_progress, s, module_name)
+        },
+        FieldAssignS(object, _, v) => {
+            walk_expr_m(a, object, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, v, ast, tables, in_progress, s, module_name)
+        },
+        CompAssignS(t, _, v) => {
+            walk_expr_m(a, t, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, v, ast, tables, in_progress, s, module_name)
+        },
+        ExprS(x) => { walk_expr_m(a, x, ast, tables, in_progress, s, module_name) },
+        ReturnS(value) => {
+            match value {
+                null => {}
+                v => { walk_expr_m(a, v, ast, tables, in_progress, s, module_name) }
+            }
+        },
+        DeferS(x) => { walk_expr_m(a, x, ast, tables, in_progress, s, module_name) },
+        ThrowS(x) => { walk_expr_m(a, x, ast, tables, in_progress, s, module_name) },
+        BreakS => {},
+        ContinueS => {},
+        ForS(_, iter, body) => {
+            walk_expr_m(a, iter, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, body, ast, tables, in_progress, s, module_name)
+        },
+        WhileS(c, b) => {
+            walk_expr_m(a, c, ast, tables, in_progress, s, module_name)
+            walk_expr_m(a, b, ast, tables, in_progress, s, module_name)
+        },
+        LoopS(b) => { walk_expr_m(a, b, ast, tables, in_progress, s, module_name) },
+        LocalDeclS(d) => {
+            match d {
+                FunDeclD(_, _, _, _, _, body, _, _, _, _) => {
+                    walk_expr_m(a, body, ast, tables, in_progress, s, module_name)
+                },
+                TypeDeclD(_, _, _, _, _, _, methods) => {
+                    var i: usize = 0
+                    while i < methods.len() {
+                        match methods[i].body {
+                            null => {}
+                            b => { walk_expr_m(a, b, ast, tables, in_progress, s, module_name) }
+                        }
+                        i = i + 1
+                    }
+                },
+                TraitDeclD(_, _, _, _, _, methods) => {
+                    var i: usize = 0
+                    while i < methods.len() {
+                        match methods[i].body {
+                            null => {}
+                            b => { walk_expr_m(a, b, ast, tables, in_progress, s, module_name) }
+                        }
+                        i = i + 1
+                    }
+                },
+                _ => {},
+            }
+        },
+    }
+}
+
+// ─── 主入口:collect_monomorph_instances ─────────────────────────
+
+pub fun collect_monomorph_instances(a: TypeArena, s: SemaRes, m: ModuleAst,
+    all_modules: List<ModuleAst>): void {
+    val tables = ftabs_new()
+    var mi: usize = 0
+    while mi < all_modules.len() {
+        ftabs_register(tables, all_modules.get(mi) ?? m)
+        mi = mi + 1
+    }
+    val in_progress = Map.empty<str, i64>()
+    var di: usize = 0
+    while di < m.decls.len() {
+        val sd = m.decls[di]
+        match sd.decl {
+            FunDeclD(_, name, tps, _, rt, body, is_async, _, _, _) => {
+                // 非泛型:空实参实例(泛型由调用点驱动,不建空实例)。
+                if tps.len() == 0 {
+                    var return_handle = Arena.make(a, TUnknown)
+                    match resolve_tn_flat(a, s, rt, [], m.arena) {
+                        null => {
+                            Semares.add_error(s, new_err("failed to resolve return type of {name}", 0, 0))
+                        },
+                        h => { return_handle = h ?? 0 },
+                    }
+                    val instance_id = s.monomorph_instances.len() as i64
+                    s.monomorph_instances.push(Mono(instance_id, name, m.name, [],
+                        return_handle, is_async, 0))
+                    walk_expr_m(a, body, m.arena, tables, in_progress, s, m.name)
+                }
+            },
+            TypeDeclD(_, _, _, _, _, _, methods) => {
+                var i: usize = 0
+                while i < methods.len() {
+                    if methods[i].tps.len() == 0 {
+                        match methods[i].body {
+                            null => {}
+                            b => { walk_expr_m(a, b, m.arena, tables, in_progress, s, m.name) }
+                        }
+                    }
+                    i = i + 1
+                }
+            },
+            ExprDeclD(expr, stmt) => {
+                walk_expr_m(a, expr, m.arena, tables, in_progress, s, m.name)
+                match stmt {
+                    null => {}
+                    st => { walk_stmt_m(a, st, m.arena, tables, in_progress, s, m.name) }
+                }
+            },
+            _ => {},
+        }
+        di = di + 1
+    }
+}
+
+// ─── trait 方法绑定验证(R1-R4)+ trait 继承验证 + 默认实例收集 ────
+
+// reflect 自动实现方法名(override 可无 trait 默认目标)。
+fun is_reflect_method_name(name: str): bool {
+    match name {
+        "repr" => { true }
+        "type_name" => { true }
+        "kind" => { true }
+        "constructor" => { true }
+        "size" => { true }
+        "alignment" => { true }
+        "field_count" => { true }
+        "field_name" => { true }
+        _ => { false }
+    }
+}
+
+// R1: 有体覆写须 override;R2: override 须指向已实现 trait 默认;
+// R3: 多 trait 同名默认未裁决 → 歧义;R4: delegate 目标校验。
+pub fun validate_trait_method_bindings(a: TypeArena, s: SemaRes, m: ModuleAst): void {
+    var di: usize = 0
+    while di < m.decls.len() {
+        val sd = m.decls[di]
+        match sd.decl {
+            TypeDeclD(_, name, _, _, implemented_traits, _, methods) => {
+                // 实现 trait(声明序去重)+ 传递父闭包。
+                val traits = List.empty<str>()
+                var ti: usize = 0
+                while ti < implemented_traits.len() {
+                    val t = implemented_traits[ti].trait_name
+                    if !Semares.list_has_str(traits, t) {
+                        traits.push(t)
+                    }
+                    val closure = Semares.trait_parent_closure(s, t)
+                    var ci: usize = 0
+                    while ci < closure.len() {
+                        val pt = closure.get(ci) ?? ""
+                        if !Semares.list_has_str(traits, pt) {
+                            traits.push(pt)
+                        }
+                        ci = ci + 1
+                    }
+                    ti = ti + 1
+                }
+                // 方法名并集。
+                val method_names = List.empty<str>()
+                ti = 0
+                while ti < traits.len() {
+                    match Semares.get_trait_def(s, traits.get(ti) ?? "") {
+                        null => {}
+                        td => {
+                            var mi: usize = 0
+                            while mi < td.methods.len() {
+                                if !Semares.list_has_str(method_names, td.methods[mi].name) {
+                                    method_names.push(td.methods[mi].name)
+                                }
+                                mi = mi + 1
+                            }
+                        },
+                    }
+                    ti = ti + 1
+                }
+                var ni: usize = 0
+                while ni < method_names.len() {
+                    val m_name = method_names.get(ni) ?? ""
+                    var declared: Md? = null
+                    var mi: usize = 0
+                    while mi < methods.len() && declared == null {
+                        if methods[mi].name == m_name {
+                            declared = if true { methods[mi] } else { null }
+                        }
+                        mi = mi + 1
+                    }
+                    // 默认提供者集合。
+                    val providers = List.empty<str>()
+                    ti = 0
+                    while ti < traits.len() {
+                        val t = traits.get(ti) ?? ""
+                        var has_default = false
+                        match Semares.get_trait_def(s, t) {
+                            null => {}
+                            td => {
+                                var k: usize = 0
+                                while k < td.methods.len() && !has_default {
+                                    if td.methods[k].name == m_name && td.methods[k].has_body {
+                                        has_default = true
+                                    }
+                                    k = k + 1
+                                }
+                            },
+                        }
+                        if has_default {
+                            providers.push(t)
+                        }
+                        ti = ti + 1
+                    }
+                    val line = sd.span.line
+                    val column = sd.span.column
+                    match declared {
+                        null => {
+                            // R3:多默认未声明 → 歧义(子 trait 遮蔽豁免)。
+                            if providers.len() > 1 {
+                                var shadowed = false
+                                var pi: usize = 0
+                                while pi < providers.len() && !shadowed {
+                                    val c = providers.get(pi) ?? ""
+                                    var all_covered = true
+                                    var k: usize = 0
+                                    while k < providers.len() && all_covered {
+                                        val o = providers.get(k) ?? ""
+                                        if o != c {
+                                            if !Semares.list_has_str(Semares.trait_parent_closure(s, c), o) {
+                                                all_covered = false
+                                            }
+                                        }
+                                        k = k + 1
+                                    }
+                                    if all_covered {
+                                        shadowed = true
+                                    }
+                                    pi = pi + 1
+                                }
+                                if !shadowed {
+                                    var pnames: str[] = []
+                                    var k: usize = 0
+                                    while k < providers.len() {
+                                        pnames = pnames ++ [providers.get(k) ?? ""]
+                                        k = k + 1
+                                    }
+                                    Semares.add_error(s, new_err(
+                                        "ambiguous trait default '{m_name}': type '{name}' inherits conflicting defaults from [{Semares.str_join(pnames, ", ")}]; resolve with an explicit override or a delegate ('fun {m_name}(...): ... = {pnames[0]}.{m_name}')",
+                                        line, column))
+                                }
+                            }
+                        },
+                        dm => {
+                            val mm = dm ?? Md("", [], [], null, null, false, null, Priv, false)
+                            val has_body = mm.body != null
+                            val is_override = mm.is_override
+                            // R4:delegate 目标。
+                            match mm.delegate {
+                                null => {}
+                                d => {
+                                    if !Semares.list_has_str(traits, d.trait_name) {
+                                        Semares.add_error(s, new_err(
+                                            "type '{name}' does not implement trait '{d.trait_name}'; cannot delegate '{m_name}'",
+                                            line, column))
+                                    } else {
+                                        if d.method_name != m_name {
+                                            Semares.add_error(s, new_err(
+                                                "delegate target must use the same method name: '{d.trait_name}.{d.method_name}' on '{name}.{m_name}'",
+                                                line, column))
+                                        } else {
+                                            var has_default2 = false
+                                            match Semares.get_trait_def(s, d.trait_name) {
+                                                null => {}
+                                                td => {
+                                                    var k: usize = 0
+                                                    while k < td.methods.len() && !has_default2 {
+                                                        if td.methods[k].name == m_name && td.methods[k].has_body {
+                                                            has_default2 = true
+                                                        }
+                                                        k = k + 1
+                                                    }
+                                                },
+                                            }
+                                            if !has_default2 {
+                                                Semares.add_error(s, new_err(
+                                                    "trait '{d.trait_name}' has no default implementation of '{m_name}'; a delegate must target a trait default",
+                                                    line, column))
+                                            }
+                                        }
+                                    }
+                                    if is_override && !has_body {
+                                        Semares.add_error(s, new_err(
+                                            "pure delegation of '{name}.{m_name}' inherits the default; remove 'override'",
+                                            line, column))
+                                    }
+                                },
+                            }
+                            // R2:override 须有默认目标(reflect 名豁免)。
+                            if is_override && providers.len() == 0 && !is_reflect_method_name(m_name) {
+                                Semares.add_error(s, new_err(
+                                    "'override' on '{name}.{m_name}' but no implemented trait provides a default '{m_name}'",
+                                    line, column))
+                            }
+                            // R1:有体遮蔽默认须 override。
+                            if has_body && !is_override && providers.len() > 0 {
+                                var pnames: str[] = []
+                                var k: usize = 0
+                                while k < providers.len() {
+                                    pnames = pnames ++ [providers.get(k) ?? ""]
+                                    k = k + 1
+                                }
+                                Semares.add_error(s, new_err(
+                                    "'{name}.{m_name}' overrides a trait default (from [{Semares.str_join(pnames, ", ")}]); mark it 'override'",
+                                    line, column))
+                            }
+                        },
+                    }
+                    ni = ni + 1
+                }
+            },
+            _ => {},
+        }
+        di = di + 1
+    }
+}
+
+// trait 继承验证:声明位父默认冲突 + 实现位抽象要求。
+pub fun validate_trait_inheritance(a: TypeArena, s: SemaRes, m: ModuleAst): void {
+    // 1. 声明位:父默认冲突(子未重声明 → 错;重声明为抽象 → 错)。
+    var di: usize = 0
+    while di < m.decls.len() {
+        val sd = m.decls[di]
+        match sd.decl {
+            TraitDeclD(_, name, _, parents, _, _) => {
+                if parents.len() > 0 {
+                    // 父默认按方法名聚合(名排序 = 引擎 BTreeMap 序)。
+                    val names = List.empty<str>()
+                    val providers_map = Map.empty<str, List<str>>()
+                    var pi: usize = 0
+                    while pi < parents.len() {
+                        val pname = parents[pi].trait_name
+                        val eff = Semares.trait_effective_methods(s, pname)
+                        var ei: usize = 0
+                        while ei < eff.len() {
+                            val pair = eff.get(ei) ?? ET("", TMS("", 0, 0, false, false))
+                            if pair.m.has_body {
+                                val map_key = pair.m.name
+                                match providers_map.get(map_key) {
+                                    null => {
+                                        val bucket = List.empty<str>()
+                                        bucket.push(pname)
+                                        providers_map.set(pair.m.name, bucket)
+                                        names.push(pair.m.name)
+                                    },
+                                    l => { l.push(pname) },
+                                }
+                            }
+                            ei = ei + 1
+                        }
+                        pi = pi + 1
+                    }
+                    Modenv.str_list_sort(names)
+                    // 子自身方法名集。
+                    val own_has_body = Map.empty<str, bool>()
+                    match Semares.get_trait_def(s, name) {
+                        null => {}
+                        td => {
+                            var k: usize = 0
+                            while k < td.methods.len() {
+                                own_has_body.set(td.methods[k].name, td.methods[k].has_body)
+                                k = k + 1
+                            }
+                        },
+                    }
+                    var ni: usize = 0
+                    while ni < names.len() {
+                        val m_name = names.get(ni) ?? ""
+                        val prov = providers_map.get(m_name) ?? List.empty<str>()
+                        val dedup = List.empty<str>()
+                        var k: usize = 0
+                        while k < prov.len() {
+                            if !Semares.list_has_str(dedup, prov.get(k) ?? "") {
+                                dedup.push(prov.get(k) ?? "")
+                            }
+                            k = k + 1
+                        }
+                        if dedup.len() > 1 {
+                            var pnames: str[] = []
+                            k = 0
+                            while k < dedup.len() {
+                                pnames = pnames ++ [dedup.get(k) ?? ""]
+                                k = k + 1
+                            }
+                            val joined = Semares.str_join(pnames, ", ")
+                            match own_has_body.get(m_name) {
+                                null => {
+                                    Semares.add_error(s, Data.new_err_path(
+                                        "trait '{name}' inherits conflicting defaults for '{m_name}' from [{joined}]; declare its own '{m_name}' (with a body) in the trait to resolve",
+                                        m.name, sd.span.line, sd.span.column))
+                                },
+                                hb => {
+                                    if !(hb ?? false) {
+                                        Semares.add_error(s, Data.new_err_path(
+                                            "trait '{name}' re-declares '{m_name}' abstract while parents [{joined}] provide conflicting defaults; give '{m_name}' a default body in '{name}'",
+                                            m.name, sd.span.line, sd.span.column))
+                                    }
+                                },
+                            }
+                        }
+                        ni = ni + 1
+                    }
+                }
+            },
+            _ => {},
+        }
+        di = di + 1
+    }
+    // 2. 实现位:闭包内抽象方法须实现或继承默认。
+    di = 0
+    while di < m.decls.len() {
+        val sd = m.decls[di]
+        match sd.decl {
+            TypeDeclD(_, name, _, _, implemented_traits, _, methods) => {
+                if implemented_traits.len() > 0 {
+                    val closure = List.empty<str>()
+                    var ti: usize = 0
+                    while ti < implemented_traits.len() {
+                        val t = implemented_traits[ti].trait_name
+                        if !Semares.list_has_str(closure, t) {
+                            closure.push(t)
+                        }
+                        val pc = Semares.trait_parent_closure(s, t)
+                        var ci: usize = 0
+                        while ci < pc.len() {
+                            if !Semares.list_has_str(closure, pc.get(ci) ?? "") {
+                                closure.push(pc.get(ci) ?? "")
+                            }
+                            ci = ci + 1
+                        }
+                        ti = ti + 1
+                    }
+                    ti = 0
+                    while ti < closure.len() {
+                        val t = closure.get(ti) ?? ""
+                        match Semares.get_trait_def(s, t) {
+                            null => {}
+                            td => {
+                                var k: usize = 0
+                                while k < td.methods.len() {
+                                    val m_name = td.methods[k].name
+                                    if !td.methods[k].has_body {
+                                        var own_has = false
+                                        var oi: usize = 0
+                                        while oi < methods.len() && !own_has {
+                                            if methods[oi].name == m_name {
+                                                own_has = true
+                                            }
+                                            oi = oi + 1
+                                        }
+                                        if !own_has {
+                                            var defaulted = false
+                                            var ci: usize = 0
+                                            while ci < closure.len() && !defaulted {
+                                                match Semares.get_trait_def(s, closure.get(ci) ?? "") {
+                                                    null => {}
+                                                    ctd => {
+                                                        var q: usize = 0
+                                                        while q < ctd.methods.len() && !defaulted {
+                                                            if ctd.methods[q].name == m_name && ctd.methods[q].has_body {
+                                                                defaulted = true
+                                                            }
+                                                            q = q + 1
+                                                        }
+                                                    },
+                                                }
+                                                ci = ci + 1
+                                            }
+                                            if !defaulted {
+                                                Semares.add_error(s, Data.new_err_path(
+                                                    "type '{name}' does not implement trait method '{t}.{m_name}' (required directly or through trait inheritance)",
+                                                    m.name, sd.span.line, sd.span.column))
+                                            }
+                                        }
+                                    }
+                                    k = k + 1
+                                }
+                            },
+                        }
+                        ti = ti + 1
+                    }
+                }
+            },
+            _ => {},
+        }
+        di = di + 1
+    }
+}
+
+// trait 默认方法实例收集(绑定裁决驱动;父默认 super 支持含 override)。
+pub fun collect_trait_default_instances(a: TypeArena, s: SemaRes, m: ModuleAst): void {
+    var di: usize = 0
+    while di < m.decls.len() {
+        val sd = m.decls[di]
+        match sd.decl {
+            TraitDeclD(_, name, _, _, _, methods) => {
+                val canonical = Semares.resolve_trait_key(s, name)
+                match Semares.trait_def_idx(s, canonical) {
+                    null => {}
+                    trait_idx0 => {
+                        val trait_idx = trait_idx0 ?? 0
+                        // 实现类型(见证表;去重保序)。
+                        val impl_ids = List.empty<i64>()
+                        val impl_names = Map.empty<str, str>()
+                        var wi: usize = 0
+                        while wi < s.witness_entries.len() {
+                            val e = s.witness_entries.get(wi) ?? WEnt("", 0, Map.empty<str, i64>(), "")
+                            if e.trait_name == canonical {
+                                var seen = false
+                                var si: usize = 0
+                                while si < impl_ids.len() && !seen {
+                                    if (impl_ids.get(si) ?? 0) == e.type_id {
+                                        seen = true
+                                    }
+                                    si = si + 1
+                                }
+                                if !seen {
+                                    impl_ids.push(e.type_id)
+                                    impl_names.set("{e.type_id}", e.type_name)
+                                }
+                            }
+                            wi = wi + 1
+                        }
+                        // 父闭包:子/类型覆写了父默认 → 父默认也须特化(super)。
+                        val pc = Semares.trait_parent_closure(s, name)
+                        var ci: usize = 0
+                        while ci < pc.len() {
+                            val pt = pc.get(ci) ?? ""
+                            match Semares.trait_def_idx(s, pt) {
+                                null => {}
+                                parent_idx0 => {
+                                    val parent_idx = parent_idx0 ?? 0
+                                    match Semares.get_trait_def(s, pt) {
+                                        null => {}
+                                        ptd => {
+                                            var pm: usize = 0
+                                            while pm < ptd.methods.len() {
+                                                if ptd.methods[pm].has_body {
+                                                    val pm_name = ptd.methods[pm].name
+                                                    val pm_idx = pm as i64
+                                                    var child_overrides = false
+                                                    var k: usize = 0
+                                                    while k < methods.len() && !child_overrides {
+                                                        if methods[k].name == pm_name && methods[k].body != null {
+                                                            child_overrides = true
+                                                        }
+                                                        k = k + 1
+                                                    }
+                                                    var ii: usize = 0
+                                                    while ii < impl_ids.len() {
+                                                        val tid = impl_ids.get(ii) ?? 0
+                                                        val tname = impl_names.get("{tid}") ?? ""
+                                                        var type_overrides = false
+                                                        match Semares.get_type_def(s, tname) {
+                                                            null => {}
+                                                            td => {
+                                                                var q: usize = 0
+                                                                while q < td.methods.len() && !type_overrides {
+                                                                    if td.methods[q].name == pm_name {
+                                                                        type_overrides = true
+                                                                    }
+                                                                    q = q + 1
+                                                                }
+                                                            },
+                                                        }
+                                                        if child_overrides || type_overrides {
+                                                            var already = false
+                                                            var ai: usize = 0
+                                                            while ai < s.trait_default_instances.len() && !already {
+                                                                val inst = s.trait_default_instances.get(ai) ?? TDefI(0, "", 0, "", 0)
+                                                                if inst.type_id == tid && inst.trait_idx == parent_idx && inst.method_idx == pm_idx {
+                                                                    already = true
+                                                                }
+                                                                ai = ai + 1
+                                                            }
+                                                            if !already {
+                                                                s.trait_default_instances.push(TDefI(tid, tname, parent_idx, pt, pm_idx))
+                                                            }
+                                                        }
+                                                        ii = ii + 1
+                                                    }
+                                                }
+                                                pm = pm + 1
+                                            }
+                                        },
+                                    }
+                                },
+                            }
+                            ci = ci + 1
+                        }
+                        // 自身默认方法:绑定到本 trait → 特化(override 且无
+                        // super 目标 → 跳过)。
+                        var mi: usize = 0
+                        while mi < methods.len() {
+                            if methods[mi].body != null {
+                                val method_name = methods[mi].name
+                                val method_idx = mi as i64
+                                var ii: usize = 0
+                                while ii < impl_ids.len() {
+                                    val tid = impl_ids.get(ii) ?? 0
+                                    val tname = impl_names.get("{tid}") ?? ""
+                                    val traits2 = List.empty<str>()
+                                    var wi2: usize = 0
+                                    while wi2 < s.witness_entries.len() {
+                                        val e = s.witness_entries.get(wi2) ?? WEnt("", 0, Map.empty<str, i64>(), "")
+                                        if e.type_id == tid {
+                                            if !Semares.list_has_str(traits2, e.trait_name) {
+                                                traits2.push(e.trait_name)
+                                            }
+                                        }
+                                        wi2 = wi2 + 1
+                                    }
+                                    match Semares.resolve_method_binding(s, traits2, tname, method_name) {
+                                        MBBound(bt, overridden) => {
+                                            if bt == canonical {
+                                                val super_key = "{tname}\u{0}{bt}\u{0}{method_name}"
+                                                if overridden && !s.super_targets.has(super_key) {
+                                                    // 已覆写且不 super 进默认 → 无需特化。
+                                                } else {
+                                                    s.trait_default_instances.push(TDefI(tid, tname, trait_idx, canonical, method_idx))
+                                                }
+                                            }
+                                        },
+                                        _ => {},
+                                    }
+                                    ii = ii + 1
+                                }
+                            }
+                            mi = mi + 1
+                        }
+                    },
+                }
+            },
+            _ => {},
+        }
+        di = di + 1
+    }
+}

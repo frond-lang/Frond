@@ -2013,13 +2013,35 @@ fn inline_call(graph: &mut DataFlowGraph, ctx: &mut OptimizerContext, candidate:
             })
             .collect();
 
+    // Hoist owner: the INNERMOST same-function sg containing the call site
+    // (the arm / loop-body the call lives in), not the function-level sg.
+    // rebuild places each sg's hoisted nodes directly after that sg's native
+    // nodes, so the cloned body executes within the same launch context as
+    // the call site. Function-level attribution left the clones outside every
+    // branch range: the branch frame never ran them and their consumers
+    // inside the arm never fired — silently dropped statements (the
+    // stmt-drop bug; repro: frondc checkmany ctor_name_clash inherited=0).
+    let caller_fn = graph.subgraphs[candidate.caller_func_sg.0 as usize].function_id;
+    let mut owner_sg = candidate.caller_func_sg;
+    let mut best_span = u32::MAX;
+    for sg in &graph.subgraphs {
+        if sg.function_id != caller_fn || sg.id.0 == sg.function_id {
+            continue;
+        }
+        let (bs, be) = sg.node_range;
+        if call_node.0 >= bs.0 && call_node.0 < be.0 && be.0 - bs.0 < best_span {
+            best_span = be.0 - bs.0;
+            owner_sg = sg.id;
+        }
+    }
+
     // First pass: allocate a new_id for every body node (with empty inputs), building a complete node_map
     for &(src_idx, kind, cf, _) in &body_snapshots {
         let new_id = graph.add_node_raw(kind, &[], cf);
         let new_idx = new_id.0 as usize;
         graph.clone_node_metadata(src_idx, new_idx);
         graph.hoisted_node[new_idx] = true;
-        graph.hoisted_owners[new_idx] = candidate.caller_func_sg;
+        graph.hoisted_owners[new_idx] = owner_sg;
         if let Some(cv) = &graph.const_values[src_idx] {
             graph.const_values[new_idx] = Some(cv.clone());
         }

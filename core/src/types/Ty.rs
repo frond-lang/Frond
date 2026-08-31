@@ -305,10 +305,10 @@ impl Type {
         builtin_info_by_tag(self.to_value_tag()).map(|i| i.type_id)
     }
 
-    /// Type family name (used for diagnostics and formatting).
-    /// Scalars return a concrete name like "i32"; builtin generics return a family name
-    /// like "Channel"; the concrete names of Adt/Trait/Generic must be looked up in the
-    /// arena via `TypeDetail`.
+    /// Constructor kind label: uniform lowercase snake_case ("i32", "channel",
+    /// "trait_object", "type_var"). Never compare this against a user-written
+    /// name and never display it as source spelling — use `source_name()` for
+    /// both. Payload names (Adt/Trait/Generic) must be looked up in the arena.
     pub fn name(&self) -> &'static str {
         match self {
             Type::I8 => "i8", Type::I16 => "i16", Type::I32 => "i32",
@@ -319,16 +319,16 @@ impl Type {
             Type::F16 => "f16", Type::F32 => "f32", Type::F64 => "f64", Type::F128 => "f128",
             Type::Bool => "bool", Type::Char => "char",
             Type::Str => "str", Type::Null => "null", Type::Void => "void",
-            Type::Lib => "Lib",
-            Type::Throw(_) => "Throw",
-            Type::Channel(_) => "Channel",
-            Type::Async(_) => "Async",
-            Type::Lazy(_) => "Lazy",
-            Type::Atomic(_) => "Atomic",
-            Type::Sender(_) => "Sender",
-            Type::Receiver(_) => "Receiver",
-            Type::ForeignFn(_) => "ForeignFn",
-            Type::Timer(_) => "Timer",
+            Type::Lib => "lib",
+            Type::Throw(_) => "throw",
+            Type::Channel(_) => "channel",
+            Type::Async(_) => "async",
+            Type::Lazy(_) => "lazy",
+            Type::Atomic(_) => "atomic",
+            Type::Sender(_) => "sender",
+            Type::Receiver(_) => "receiver",
+            Type::ForeignFn(_) => "foreign_fn",
+            Type::Timer(_) => "timer",
             Type::Array(_) => "array",
             Type::Ref(_) => "ref",
             Type::Fn(_) => "fn",
@@ -340,8 +340,30 @@ impl Type {
             Type::ModuleRef(_) => "module_ref",
             Type::Generic(_) => "generic",
             Type::Never => "never",
-            Type::TypeVar(_) => "_",
+            Type::TypeVar(_) => "type_var",
             Type::Unknown => "unknown",
+        }
+    }
+
+    /// Source-level spelling: how the type is written in user code. Builtin
+    /// generics and Lib keep their PascalCase names (`Channel`, `ForeignFn`,
+    /// …); a TypeVar is the `_` placeholder; everything else delegates to
+    /// `name()` (scalars already read like source). Used by display and by
+    /// name matching against user-written identifiers.
+    pub fn source_name(&self) -> &'static str {
+        match self {
+            Type::Lib => "Lib",
+            Type::Throw(_) => "Throw",
+            Type::Channel(_) => "Channel",
+            Type::Async(_) => "Async",
+            Type::Lazy(_) => "Lazy",
+            Type::Atomic(_) => "Atomic",
+            Type::Sender(_) => "Sender",
+            Type::Receiver(_) => "Receiver",
+            Type::ForeignFn(_) => "ForeignFn",
+            Type::Timer(_) => "Timer",
+            Type::TypeVar(_) => "_",
+            t => t.name(),
         }
     }
 

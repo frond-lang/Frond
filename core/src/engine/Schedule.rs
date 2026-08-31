@@ -269,7 +269,7 @@ pub(super) fn relay_branch_value(
             return;
         };
         let (_, gate_local) = frame.branch_relays.swap_remove(pos);
-        if super::env_flag("FROND_DEBUG_SF") {
+        if super::env_flag("FROND_DEBUG_SF") && super::EngineCore::sf_trace_match(graph, frame.subgraph_id.0) {
             eprintln!("[SF-FIRE] ret_local={} -> gate_local={}", cur.0, gate_local.0);
         }
         let offset = frame.node_offset;
@@ -394,7 +394,9 @@ impl<S: LockStrategy> Engine<S> {
             let local_id = match frame.pop_ready() {
                 Some(n) => n,
                 None => {
-                    if super::env_flag("FROND_DEBUG_STALL") {
+                    if super::env_flag("FROND_DEBUG_STALL")
+                        && super::EngineCore::sf_trace_match(&graph, frame.subgraph_id.0)
+                    {
                         let sg_id = frame.subgraph_id;
                         let (ns, ne) = graph.subgraphs[sg_id.0 as usize].node_range;
                         let ncnt = (ne.0 - ns.0) as usize;
@@ -422,6 +424,7 @@ impl<S: LockStrategy> Engine<S> {
             let ctx = EvalContext { node_start, graph: &graph };
 
             // COMPUTE: uniformly invoke compute_fn, with no specialization checks.
+            super::EngineCore::exec_count_bump(&graph, frame.subgraph_id);
             let result = (graph.compute_fns[node.compute_fn.0 as usize])(frame, graph_node_id, &ctx);
 
             // MATCH NodeResult: unified side-effect handling.
@@ -514,7 +517,12 @@ impl<S: LockStrategy> Engine<S> {
                                 let mut frames = self.frames.lock();
                                 frames.remove(&caller_fid).and_then(|cf| cf.caller)
                             };
-                            self.event_waiters.lock().retain(|(_, f)| *f != caller_fid);
+                            {
+                                let mut ew = self.event_waiters.lock();
+                                for bucket in ew.values_mut() {
+                                    bucket.retain(|f| *f != caller_fid);
+                                }
+                            }
                             self.pending_completions.lock().remove(&caller_fid);
                             frame.caller = orig_caller;
                             switch_subgraph(
@@ -560,7 +568,7 @@ impl<S: LockStrategy> Engine<S> {
                         let gate_gid =
                             NodeId(pending.call_node_local.0 + frame.node_offset);
                         if same_frame_branch_ok(&graph, frame, gate_gid, pending.target_sg) {
-                            if super::env_flag("FROND_DEBUG_SF") {
+                            if super::env_flag("FROND_DEBUG_SF") && super::EngineCore::sf_trace_match(&graph, frame.subgraph_id.0) {
                                 eprintln!("[DRV-GATE] gate={} target={}", gate_gid.0, pending.target_sg.0);
                             }
                             self.launch_same_frame_branch(
@@ -674,10 +682,11 @@ impl<S: LockStrategy> Engine<S> {
                             self.frames.lock().insert(body_fid, body);
                             frame.cached_child_frame = Some(body_fid);
                             queue.push(body_fid);
-                            self.event_waiters.lock().push((
-                                RuntimeEvent::SubgraphComplete(body_fid),
-                                fid,
-                            ));
+                            self.event_waiters
+                                .lock()
+                                .entry(RuntimeEvent::SubgraphComplete(body_fid))
+                                .or_default()
+                                .push(fid);
                             frame.state = FrameState::Suspended;
                             frame.suspend_state =
                                 SuspendState::WaitingSubgraph(body_fid);
@@ -876,10 +885,11 @@ impl<S: LockStrategy> Engine<S> {
                             // in process_frame then applies verbatim).
                             self.frames.lock().insert(child_fid, child);
                             queue.push(child_fid);
-                            self.event_waiters.lock().push((
-                                RuntimeEvent::SubgraphComplete(child_fid),
-                                fid,
-                            ));
+                            self.event_waiters
+                                .lock()
+                                .entry(RuntimeEvent::SubgraphComplete(child_fid))
+                                .or_default()
+                                .push(fid);
                             frame.state = FrameState::Suspended;
                             frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
                             frame.suspend_event =
@@ -898,10 +908,11 @@ impl<S: LockStrategy> Engine<S> {
                         continue;
                     } else {
                         queue.push(child_fid);
-                        self.event_waiters.lock().push((
-                            RuntimeEvent::SubgraphComplete(child_fid),
-                            fid,
-                        ));
+                        self.event_waiters
+                            .lock()
+                            .entry(RuntimeEvent::SubgraphComplete(child_fid))
+                            .or_default()
+                            .push(fid);
                         frame.state = FrameState::Suspended;
                         frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
                         frame.suspend_event =
@@ -1047,10 +1058,11 @@ impl<S: LockStrategy> Engine<S> {
                             let child_fid =
                                 self.start_subgraph(fid, gate_local, sg_id, &args, frame, None);
                             queue.push(child_fid);
-                            self.event_waiters.lock().push((
-                                RuntimeEvent::SubgraphComplete(child_fid),
-                                fid,
-                            ));
+                            self.event_waiters
+                                .lock()
+                                .entry(RuntimeEvent::SubgraphComplete(child_fid))
+                                .or_default()
+                                .push(fid);
                             frame.state = FrameState::Suspended;
                             frame.suspend_state =
                                 SuspendState::WaitingSubgraph(child_fid);
@@ -1087,7 +1099,11 @@ impl<S: LockStrategy> Engine<S> {
                                     }
                                     _ => continue,
                                 };
-                                self.event_waiters.lock().push((event, fid));
+                                self.event_waiters
+                                    .lock()
+                                    .entry(event)
+                                    .or_default()
+                                    .push(fid);
                             }
                             frame.state = FrameState::Suspended;
                             frame.suspend_state =
@@ -1319,7 +1335,7 @@ impl<S: LockStrategy> Engine<S> {
                         && !super::env_flag("FROND_NO_SAMEFRAME")
                         && same_frame_branch_ok(graph, frame, gate_gid, pending.target_sg)
                     {
-                        if super::env_flag("FROND_DEBUG_SF") {
+                        if super::env_flag("FROND_DEBUG_SF") && super::EngineCore::sf_trace_match(graph, frame.subgraph_id.0) {
                             eprintln!("[LIN-GATE] gate={}", gate_gid.0);
                         }
                         self.launch_same_frame_branch(
@@ -1429,7 +1445,7 @@ impl<S: LockStrategy> Engine<S> {
                         && !super::env_flag("FROND_NO_SAMEFRAME")
                         && same_frame_branch_ok(graph, frame, gate_gid, pending.target_sg)
                     {
-                        if super::env_flag("FROND_DEBUG_SF") {
+                        if super::env_flag("FROND_DEBUG_SF") && super::EngineCore::sf_trace_match(graph, frame.subgraph_id.0) {
                             eprintln!("[DRAIN-GATE] gate={}", gate_gid.0);
                         }
                         let (nbs, nbe) =
@@ -1549,13 +1565,14 @@ impl<S: LockStrategy> Engine<S> {
                     if let Some(mut frame) = fb_opt {
                     // Pending completion(s) present: consume the completion events directly.
                     if let Some(e) = event {
-                        self.event_waiters
-                            .lock()
-                            .retain(|(we, wf)| !(*we == e && *wf == fid));
+                        if let Some(bucket) = self.event_waiters.lock().get_mut(&e) {
+                            bucket.retain(|wf| *wf != fid);
+                        }
                     } else {
-                        self.event_waiters
-                            .lock()
-                            .retain(|(_, wf)| *wf != fid);
+                        let mut ew = self.event_waiters.lock();
+                        for bucket in ew.values_mut() {
+                            bucket.retain(|wf| *wf != fid);
+                        }
                     }
                     // Use frame.node_offset rather than subgraph.node_range.0 (same-function
                     // branch frame correction).
@@ -1809,9 +1826,9 @@ impl<S: LockStrategy> Engine<S> {
                     } else {
                         // sync child frame completed: clean up the waiter + write back + wake the
                         // caller.
-                        self.event_waiters.lock().retain(|(e, _)| {
-                            !matches!(e, RuntimeEvent::SubgraphComplete(c) if *c == fid)
-                        });
+                        self.event_waiters
+                            .lock()
+                            .remove(&RuntimeEvent::SubgraphComplete(fid));
                         // Frame consumed: unbox and hand to complete_and_wake_caller.
                         self.complete_and_wake_caller(*frame_box, queue);
                     }
@@ -1884,9 +1901,9 @@ impl<S: LockStrategy> Engine<S> {
                 }
                 if has_caller {
                     // Failed child frame (after cancel): clean up the waiter + wake the caller.
-                    self.event_waiters.lock().retain(|(e, _)| {
-                        !matches!(e, RuntimeEvent::SubgraphComplete(c) if *c == fid)
-                    });
+                    self.event_waiters
+                        .lock()
+                        .remove(&RuntimeEvent::SubgraphComplete(fid));
                     self.complete_and_wake_caller(*frame_box, queue);
                 } else {
                     // Top-level frame Failed: return NULL.
@@ -1933,7 +1950,7 @@ impl<S: LockStrategy> Engine<S> {
         args: &[Value],
     ) {
         let graph = frame.graph.clone();
-        if super::env_flag("FROND_DEBUG_SF") {
+        if super::env_flag("FROND_DEBUG_SF") && super::EngineCore::sf_trace_match(&graph, frame.subgraph_id.0) {
             let sg = &graph.subgraphs[target_sg.0 as usize];
             let (bs, be) = sg.node_range;
             eprintln!("[SF-LAUNCH] sg={} range=[{},{}) frame_sg={} offset={} qlen={} ret={}",

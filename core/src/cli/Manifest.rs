@@ -64,6 +64,23 @@ pub fn opt_level_from(v: Option<u8>) -> crate::pass::Optimizer::OptLevel {
     }
 }
 
+/// Searches upward from an explicit start directory for a directory containing the
+/// manifest file (up to 64 levels up). Unlike `find_project_root` this is CWD-independent:
+/// the load-dump oracle anchors manifest discovery at the entry file so both compilers
+/// (Rust `debug --stage load` and frondc `loaddeps`) see the same input.
+pub fn find_project_root_from(start_dir: &str) -> Option<String> {
+    let mut current = std::path::PathBuf::from(start_dir);
+    for _ in 0..64 {
+        if current.join(MANIFEST_NAME).exists() {
+            return Some(current.to_string_lossy().into_owned());
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
 /// Searches upward from the current directory for a directory containing the manifest file,
 /// returning the project root path (up to 64 levels up).
 pub fn find_project_root() -> Option<String> {

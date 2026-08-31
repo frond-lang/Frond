@@ -1,0 +1,33 @@
+// ParseError: error type returned when a numeric string conversion fails
+//
+// Usage:
+//   - The std.core.types parse family (I8..I128/Isize/U8..U128/Usize and
+//     F16/F32/F64/F128 .parse) returns Throw<_, ParseError>:
+//       Malformed — the input is not a valid number literal for the type
+//                   (empty, bad sign position, non-digit, trailing junk)
+//       Overflow  — syntactically a number but beyond the type's range
+//                   (floats: magnitude rounds to infinity; float underflow
+//                   is NOT an error — it rounds to 0 or a subnormal per
+//                   IEEE 754)
+//     These used to return null — an out-of-range input was indistinguish-
+//     able from a typo, and before that integers wrapped silently.
+//   - Field semantics (aligned with the error family):
+//       kind   : error category (exhaustive ADT)
+//       message: human readable description
+//       value  : the input string that triggered the error
+//
+// As a builtin error_newtype, it automatically gets the Error trait's
+// message() default implementation (reads the message field).
+// type_name() override returns "parse error" for easy identification in logs.
+type ParseError: Err = ParseError(
+    pub kind: ParseErrorKind,
+    pub message: str,
+    pub value: str,
+) {
+    override fun type_name(): str { "parse error" }
+}
+
+// Number-parse error categories (exhaustive ADT)
+type ParseErrorKind =
+    | Malformed   // not a valid number literal for the type
+    | Overflow    // value beyond the type's representable range

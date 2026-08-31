@@ -1,0 +1,305 @@
+// AstDiskCache.frond — std 解析持久化(方案②):ModuleAst 二进制快照盘缓存。
+//
+// 动机:check/load 每进程冷启动都要重解析全量 std(127 文件 ≈ 24s);parse
+// 是纯函数,AST 可经 AstCodec 编码落盘,后续进程指纹命中即免解析(预载进
+// std_cache,Loader 逻辑零改动 — std_or_parse 缓存命中路径不变)。
+//
+// 快照文件(<cwd>/.astcache/<key 中 '/'→','>.astbin,u8[] = LE i64 流):
+//   word 0..6 = [magic, version, src_size, src_mtime_ns, src_ctime_ns,
+//                parser_fp, n_words],word 7.. = AstCodec 流。
+// 指纹双保险:① 源文件 Stat(size, mtime_ns, ctime_ns);② 镜像语法四源
+// (Lex/Ast/Parse/AstCodec)stat 混合 hash — 解析器语义变更自动全量失效。
+// 原子写:tmp(<pid>) + rename;一切缓存 IO 失败均静默降级(下轮重解析),
+// 缓存只做加速器,不是正确性依赖。
+// 开关:FRONDC_NO_AST_CACHE 非空 = 禁用(完全回到冷解析行为)。
+
+import std.os.Env
+import std.os.Os
+import std.os.Proc
+import std.io.Dir
+import std.io.Fs
+import std.io.File
+import std.io.Path
+import std.core.types.Str
+import std.collections.List
+import std.collections.Map
+import std.time.Instant
+import builtin.io.Console
+import syntax.Ast
+import syntax.AstCodec
+import module.StdPaths
+
+fun snap_magic(): i64 { 5904678413261701 }
+
+fun snap_version(): i64 { 2 }
+
+// 解析器指纹的混合(i64 算术回绕语义,乘法安全)。
+fun mix(h: i64, v: i64): i64 {
+    (h ^ v) * 1099511628211
+}
+
+pub type DCache = DCache(pub dir: str, pub parser_fp: i64)
+
+// warm 的产物:预载好的 std_cache + 哪些键来自盘(回写时跳过)。
+pub type Warmed = Warmed(pub cache: Map<str, ModuleAst>, pub from_disk: Map<str, bool>)
+
+// std 盘文件路径(Loader.std_disk_path 的同式副本,避免为它放宽可见性)。
+fun disk_path(std_root: str, key: str): str {
+    if Str.starts_with(key, "builtin/") {
+        std_root + "/" + key
+    } else {
+        std_root + "/" + Str.substring(key, 4 as usize, key.len())
+    }
+}
+
+fun snap_name(key: str): str {
+    Str.replace(key, "/", ",") + ".astbin"
+}
+
+// ─── 开仓(解析缓存目录 + 解析器指纹)────────────────────────────
+// null = 禁用:显式开关 / cwd 拿不到 / 语法四源 stat 不到(不在 frondc
+// 根运行,指纹无法建立 — 保守放弃而非用过期缓存)。
+async fun parser_fingerprint(): Async<i64?> {
+    val files = [
+        "src/syntax/Lex.frond",
+        "src/syntax/Ast.frond",
+        "src/syntax/Parse.frond",
+        "src/syntax/AstCodec.frond",
+    ]
+    var h: i64 = -3784305532739700203
+    var i: usize = 0
+    while i < files.len() {
+        match File.stat_of(Path.from(files[i])).await() {
+            Error(_) => { return null }
+            Ok(st) => {
+                h = mix(h, st.size as i64)
+                h = mix(h, st.mtime_ns)
+                h = mix(h, st.ctime_ns)
+            },
+        }
+        i = i + 1
+    }
+    h
+}
+
+pub async fun open(): Async<DCache?> {
+    if Env.get("FRONDC_NO_AST_CACHE") != "" {
+        return null
+    }
+    match Os.current_dir() {
+        Error(_) => { null }
+        Ok(cwd) => {
+            match parser_fingerprint().await() {
+                null => { null }
+                fp => { DCache(Str.replace(cwd.to_str(), "\\", "/") + "/.astcache", fp) },
+            }
+        },
+    }
+}
+
+// ─── LE i64 流 ↔ u8[] ─────────────────────────────────────────────
+
+fun put_word(out: u8[], base: usize, v: i64): void {
+    out[base] = (v & 255) as u8
+    out[base + 1] = ((v >> 8) & 255) as u8
+    out[base + 2] = ((v >> 16) & 255) as u8
+    out[base + 3] = ((v >> 24) & 255) as u8
+    out[base + 4] = ((v >> 32) & 255) as u8
+    out[base + 5] = ((v >> 40) & 255) as u8
+    out[base + 6] = ((v >> 48) & 255) as u8
+    out[base + 7] = ((v >> 56) & 255) as u8
+}
+
+fun unpack_words(bytes: u8[], off: usize, n: usize): i64[] {
+    var out: i64[] = [0, ..n]
+    var base = off
+    var i: usize = 0
+    while i < n {
+        // 完全展开:内层循环 ~53 节点/词 → ~27(EXECCNT 实测 unpack 占
+        // 全程 77%,是 warm 的独热点)。
+        out[i] = (bytes[base] as i64)
+            | ((bytes[base + 1] as i64) << 8)
+            | ((bytes[base + 2] as i64) << 16)
+            | ((bytes[base + 3] as i64) << 24)
+            | ((bytes[base + 4] as i64) << 32)
+            | ((bytes[base + 5] as i64) << 40)
+            | ((bytes[base + 6] as i64) << 48)
+            | ((bytes[base + 7] as i64) << 56)
+        base = base + 8
+        i = i + 1
+    }
+    out
+}
+
+// ─── 读侧:预载 ────────────────────────────────────────────────────
+
+// 头校验通过 → 返回 payload 词数;任一不符 → null(按无效处理,不删文件
+// — 回写时会顺带覆盖)。
+fun header_words(c: DCache, bytes: u8[]): i64[]? {
+    if bytes.len() < 56 {
+        return null
+    }
+    val h = unpack_words(bytes, 0, 7)
+    if h[0] != snap_magic() || h[1] != snap_version() || h[5] != c.parser_fp {
+        return null
+    }
+    val n = h[6]
+    if n <= 0 || (bytes.len() as i64) != 56 + (n * 8) {
+        return null
+    }
+    h
+}
+
+// 快照原始读(相 1):stat + 读 + 头/指纹校验;有效 → 快照字节,无效 →
+// 空数组(相 2 以 len < 56 识别跳过)。
+async fun read_snapshot(cc: DCache, std_root: str, key: str): Async<u8[]> {
+    match File.stat_of(Path.from(disk_path(std_root, key))).await() {
+        Error(_) => { [] }
+        Ok(st) => {
+            match Fs.read_file_bytes(Path.from(cc.dir + "/" + snap_name(key))).await() {
+                Error(_) => { [] }
+                Ok(bytes) => {
+                    match header_words(cc, bytes) {
+                        null => { [] }
+                        h => {
+                            if h[2] != st.size as i64 || h[3] != st.mtime_ns || h[4] != st.ctime_ns {
+                                []
+                            } else {
+                                bytes
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// 预载全部 std 清单的有效快照。c = null(禁用)返回空表,调用方无分支。
+// 两相:相 1 全量 stat+读+校验(纯 IO);相 2 解包+解码(纯 CPU)。
+pub async fun warm(c: DCache?, std_root: str): Async<Warmed> {
+    val cache = Map.empty<str, ModuleAst>()
+    val fd = Map.empty<str, bool>()
+    match c {
+        null => { Warmed(cache, fd) }
+        cc => {
+            val keys = StdPaths.builtin_paths() ++ StdPaths.std_paths()
+            val t0 = Instant.now()
+            val raws = List.empty<u8[]>()
+            var i: usize = 0
+            while i < keys.len() {
+                raws.push(read_snapshot(cc, std_root, keys[i]).await())
+                i = i + 1
+            }
+            val t_read = Instant.now()
+            var hits: usize = 0
+            i = 0
+            while i < keys.len() {
+                val bytes = raws.get(i) ?? []
+                if bytes.len() >= 56 {
+                    // 头 7 词已在相 1 校验(magic/version/指纹/长度自洽),
+                    // 此处只取词数。
+                    val hdr = unpack_words(bytes, 0, 7)
+                    val words = unpack_words(bytes, 56, hdr[6] as usize)
+                    cache.set(keys[i], AstCodec.decode_module(words))
+                    fd.set(keys[i], true)
+                    hits = hits + 1
+                }
+                i = i + 1
+            }
+            eprintln("[ASTCACHE] warm hits={hits}/{keys.len()} read={t_read.duration_since(t0).as_millis()}ms decode={Instant.now().duration_since(t_read).as_millis()}ms")
+            Warmed(cache, fd)
+        },
+    }
+}
+
+// ─── 写侧:回写本轮真解析过的模块 ─────────────────────────────────
+
+fun pack_snapshot(c: DCache, size: i64, mtime: i64, ctime: i64, words: i64[]): u8[] {
+    val out: u8[] = [0, ..((7 + words.len()) * 8)]
+    put_word(out, 0, snap_magic())
+    put_word(out, 8, snap_version())
+    put_word(out, 16, size)
+    put_word(out, 24, mtime)
+    put_word(out, 32, ctime)
+    put_word(out, 40, c.parser_fp)
+    put_word(out, 48, words.len() as i64)
+    var base: usize = 56
+    var i: usize = 0
+    while i < words.len() {
+        put_word(out, base, words[i])
+        base = base + 8
+        i = i + 1
+    }
+    out
+}
+
+// tmp(pid 命名)写满后 rename 到位;rename 撞已有目标时删旧重试一次;
+// 全链路任何失败都只放弃本文件(下次运行重解析重写)。
+async fun write_snapshot(c: DCache, key: str, size: i64, mtime: i64, ctime: i64,
+    words: i64[]): Async<bool> {
+    val final_path = Path.from(c.dir + "/" + snap_name(key))
+    val tmp_path = Path.from(c.dir + "/" + snap_name(key) + ".{Proc.getpid()}.tmp")
+    match Fs.write_file_bytes(tmp_path, pack_snapshot(c, size, mtime, ctime, words)).await() {
+        Error(_) => { false }
+        Ok(_) => {
+            match File.rename(tmp_path, final_path).await() {
+                Ok(_) => { true }
+                Error(_) => {
+                    val _r = File.remove(final_path).await()
+                    match File.rename(tmp_path, final_path).await() {
+                        Ok(_) => { true }
+                        Error(_) => {
+                            val _r2 = File.remove(tmp_path).await()
+                            false
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// 回写:std_cache 里 from_disk 未命中的键 = 本轮真解析过的。c = null 直接
+// no-op。
+pub async fun flush(c: DCache?, std_root: str, cache: Map<str, ModuleAst>,
+    from_disk: Map<str, bool>): Async<void> {
+    match c {
+        null => {}
+        cc => {
+            // 目录惰性建(已存在则 Error,忽略);之后的写失败均按单文件降级。
+            val t0 = Instant.now()
+            val _m = Dir.create(Path.from(cc.dir)).await()
+            val keys = cache.keys()
+            var todo: usize = 0
+            var written: usize = 0
+            var i: usize = 0
+            while i < keys.len() {
+                val key = keys[i]
+                if from_disk.has(key) {
+                    i = i + 1
+                    continue
+                }
+                match cache.get(key) {
+                    null => {}
+                    m => {
+                        todo = todo + 1
+                        match File.stat_of(Path.from(disk_path(std_root, key))).await() {
+                            Error(_) => {}
+                            Ok(st) => {
+                                if write_snapshot(cc, key, st.size as i64, st.mtime_ns,
+                                    st.ctime_ns, AstCodec.encode_module(m)).await() {
+                                    written = written + 1
+                                }
+                            },
+                        }
+                    },
+                }
+                i = i + 1
+            }
+            if todo > 0 {
+                eprintln("[ASTCACHE] flush written={written}/{todo} {t0.elapsed().as_millis()}ms")
+            }
+        },
+    }
+}

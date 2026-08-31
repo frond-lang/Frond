@@ -109,6 +109,51 @@ impl<'a> IrBuilder<'a> {
         call_node
     }
 
+    /// S2 ctor-resolution consumption (NAME_RESOLUTION_PLAN): build the
+    /// construction info from sema's recorded canonical type for this call
+    /// expr, instead of re-resolving the bare name through the string tables
+    /// (first-wins under cross-module same-name types). Constructor entry by
+    /// name, with arity fallback.
+    pub(super) fn ctor_tf_info_from_resolution(
+        &self,
+        call_expr_id: crate::ast::Ast::ExprId,
+        ctor_name: &str,
+        args_len: usize,
+    ) -> Option<TypeFieldInfo> {
+        let ckey = crate::sema::Sema::module_expr_key(
+            self.expr_key_module(),
+            call_expr_id.0 as u64,
+        );
+        let &sym = self.sema.ctor_resolutions.get(&ckey)?;
+        let canonical = self.sema.symbols.resolve(sym);
+        let idx = self.sema.type_def_idx(canonical)?;
+        let def = self.sema.type_defs.get(&idx)?;
+        let ctor = def
+            .constructors
+            .iter()
+            .find(|cc| cc.name.as_ref() == ctor_name)
+            .or_else(|| {
+                def.constructors
+                    .iter()
+                    .find(|cc| cc.field_type_reprs.len() == args_len)
+            })?;
+        let kind = match def.kind {
+            crate::sema::Sema::TypeDefKind::Adt => RecordLitKind::Adt,
+            crate::sema::Sema::TypeDefKind::Record => RecordLitKind::Record,
+            crate::sema::Sema::TypeDefKind::Newtype => RecordLitKind::Newtype,
+            crate::sema::Sema::TypeDefKind::Alias => RecordLitKind::Record,
+        };
+        Some(TypeFieldInfo {
+            field_names: ctor
+                .field_names
+                .iter()
+                .map(|n| n.as_deref().unwrap_or("_").to_string())
+                .collect(),
+            type_name: ctor.type_name.to_string(),
+            kind,
+        })
+    }
+
     /// Compile a function call.
     ///
     /// If the callee is a known function name -> Call node + set_call_target.
@@ -219,9 +264,43 @@ impl<'a> IrBuilder<'a> {
         // Type constructor / ADT / Newtype constructor detection: callee is an Ident and not a known function
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
             if !self.func_subgraphs.contains_key(*name) {
-                // First look up the type name (Record or single-constructor ADT), then the constructor name of a multi-constructor ADT
-                let tf_info = self.lookup_type_field_names(name)
-                    .or_else(|| self.lookup_constructor_field_names(name));
+                // S2 (NAME_RESOLUTION_PLAN): sema already made the ONE resolution
+                // decision for this construct (recorded on the call expr as the
+                // constructed type's canonical Sym). Consume it first — the
+                // string-keyed scope lookups below (bare-name, first-wins,
+                // registration-order-sensitive) are a FALLBACK whose hits are
+                // measured via FROND_TRACE_S2; the bug classes they caused
+                // (empty field tables from variant/type name collisions, std
+                // bare-name hijacks) are bypassed entirely on the ID path.
+                let mut tf_info: Option<TypeFieldInfo> =
+                    self.ctor_tf_info_from_resolution(call_expr_id, name, args.len());
+                let s2_hit = tf_info.is_some();
+                // String-path fallback (S1-era): bare-name scope layers, then the
+                // ctor table with arity correction。测量口径:仅当字符串路径
+                // 真正产出构造条目(而非普通函数调用落空)才计回退命中。
+                let mut tf_info = match tf_info {
+                    Some(info) => Some(info),
+                    None => self
+                        .lookup_type_field_names(name)
+                        .or_else(|| self.lookup_constructor_field_names(name)),
+                };
+                if !s2_hit && tf_info.is_some() {
+                    if std::env::var("FROND_TRACE_S2").is_ok() {
+                        eprintln!(
+                            "[s2-fallback:construct] name={} mod={} arity={}",
+                            *name,
+                            self.current_module().name,
+                            args.len()
+                        );
+                    }
+                }
+                if let Some(info) = tf_info.as_ref() {
+                    if info.field_names.len() != args.len() && !args.is_empty() {
+                        if let Some(exact) = self.lookup_ctor_info_by_arity(name, args.len()) {
+                            tf_info = Some(exact);
+                        }
+                    }
+                }
                 if let Some(info) = tf_info {
                     // Compile into a construction node (compute_record_construct = 29, dispatches to HeapObj by kind)
                     let mut inputs = Vec::with_capacity(args.len());
@@ -859,6 +938,39 @@ impl<'a> IrBuilder<'a> {
         gate_node
     }
 
+    /// Arity-exact constructor lookup through sema's ctor table
+    /// (`ctor_def_index`: bare ctor name → (type_idx << 16 | ctor_idx)).
+    /// Returns the field list of the first constructor whose field count
+    /// equals `arity`, keyed by canonical type name.
+    pub(super) fn lookup_ctor_info_by_arity(&self, name: &str, arity: usize) -> Option<TypeFieldInfo> {
+        let packed_list = self.sema.ctor_def_list(name)?;
+        for &packed in packed_list.iter() {
+            let type_idx = (packed >> 16) as u16;
+            let ci = (packed & 0xffff) as usize;
+            let def = self.sema.type_defs.get(&type_idx)?;
+            let ctor = def.constructors.get(ci)?;
+            if ctor.field_type_reprs.len() == arity {
+                let field_names: Vec<String> = ctor
+                    .field_names
+                    .iter()
+                    .map(|n| n.as_deref().unwrap_or("_").to_string())
+                    .collect();
+                let kind = match def.kind {
+                    crate::sema::Sema::TypeDefKind::Adt => RecordLitKind::Adt,
+                    crate::sema::Sema::TypeDefKind::Record => RecordLitKind::Record,
+                    crate::sema::Sema::TypeDefKind::Newtype => RecordLitKind::Newtype,
+                    crate::sema::Sema::TypeDefKind::Alias => RecordLitKind::Record,
+                };
+                return Some(TypeFieldInfo {
+                    field_names,
+                    type_name: ctor.type_name.to_string(),
+                    kind,
+                });
+            }
+        }
+        None
+    }
+
     /// Look up a type declaration's field info (by type name).
     ///
     /// Uniformly searches layer by layer through type_scope_stack (top-level + nested types share the same lookup path).
@@ -889,7 +1001,7 @@ impl<'a> IrBuilder<'a> {
     ) -> Option<(String, String, Vec<Option<String>>, RecordLitKind, bool)> {
         // Module-scoped: the AST type segment resolves to its canonical key.
         let canonical = self.sema.resolve_type_key_in(self.current_module().name, type_name);
-        let &type_idx = self.sema.type_def_index.get(&canonical)?;
+        let type_idx = self.sema.type_def_idx(&canonical)?;
         let type_def = &self.sema.type_defs[&type_idx];
         let ctor = type_def
             .constructors
@@ -1350,8 +1462,51 @@ pub(super) fn compile_method_call(
                 // qualifier and falling through to the package/bare families,
                 // which trip on cross-module duplicate names (`now` exists in
                 // both SystemTime and Instant).
-                let recv_qualifier = self.dotted_qualifier_of(recv);
-                match self.resolve_func("path0_module_recv", method, mangled.as_deref(), recv_qualifier.as_deref()) {
+                //
+                // Sema's import-resolved module path (module_func_call_targets)
+                // is AUTHORITATIVE: bind DIRECTLY by the full mangled key and
+                // bypass the string-key families entirely. The short-key
+                // tripwire records HISTORICAL collisions (user `Parse.parse`
+                // vs `std.json.Parse.parse`) and would veto the call as
+                // "ambiguous" even though sema already adjudicated the target
+                // through the import binding.
+                let sema_target = self
+                    .sema
+                    .module_func_call_targets
+                    .get(&recv_key)
+                    .cloned();
+                let authoritative = sema_target.as_ref().and_then(|mp| {
+                    // Generic calls prefer the sema-chosen monomorphization.
+                    if let Some(m) = mangled.as_deref() {
+                        if let Some(&sg) = self.func_subgraphs.get(m) {
+                            return Some((mp.clone(), m.to_string(), sg));
+                        }
+                    }
+                    let full = format!("{}.{}", mp, method);
+                    self.func_subgraphs
+                        .get(full.as_str())
+                        .map(|&sg| (mp.clone(), full, sg))
+                });
+                let recv_qualifier = sema_target
+                    .map(|p| p.to_string())
+                    .or_else(|| self.dotted_qualifier_of(recv));
+                // @internal guard must cover the authoritative fast path too —
+                // resolve_func's entry check never runs when we bind directly,
+                // and the qualified form (Recv.__helper) must stay closed to
+                // user code either way (negative: internal_std_helper_qualified).
+                if authoritative.is_some() && self.internal_access_blocked(method) {
+                    self.errors.push(self.internal_access_diag(method));
+                }
+                let resolved: Option<Result<SubGraphId, String>> = match authoritative {
+                    Some((mp, key, sg)) => {
+                        self.log_call_bind("path0_sema_target", method, Some(&mp), &key, sg);
+                        Some(Ok(sg))
+                    }
+                    None => {
+                        self.resolve_func("path0_module_recv", method, mangled.as_deref(), recv_qualifier.as_deref())
+                    }
+                };
+                match resolved {
                     Some(Ok(target_sg)) => {
                         let mut inputs = Vec::with_capacity(args.len() + 1);
                         for &arg in args {
@@ -1382,7 +1537,13 @@ pub(super) fn compile_method_call(
                         // forms use. Depth-general: only the final segment
                         // matters; the qualifier chain just selects the
                         // module (already validated by sema).
-                        let tf_info = self.lookup_type_field_names(method)
+                        // S2 ID path first: sema (MethodCall Path 0a)
+                        // adjudicated the qualified ctor — consume the
+                        // canonical resolution so the bare-name ctor tables
+                        // cannot mis-pick under cross-module same-name types.
+                        let tf_info = self
+                            .ctor_tf_info_from_resolution(call_expr_id, method, args.len())
+                            .or_else(|| self.lookup_type_field_names(method))
                             .or_else(|| self.lookup_constructor_field_names(method));
                         if let Some(info) = tf_info {
                             let mut inputs = Vec::with_capacity(args.len());
@@ -1466,18 +1627,63 @@ pub(super) fn compile_method_call(
                 return call_node;
             }
 
-            // Path 2: type's own method / trait method override
-            // When recv_node_override is set (implicit-this call), the callee ExprId does not carry
-            // the receiver's type info; use current_method_type (set by the enclosing method compile).
-            // Owned so the immutable self borrow ends before the dynamic-
-            // dispatch registration below (which takes &mut self).
-            let recv_type: Option<(String, u16)> = if recv_node_override.is_some() {
+            // Path 2: type's own method / trait method override.
+            // S4: sema recorded the resolved (type_def_idx, method_idx) at
+            // check time — consume it FIRST. The name/type-id lookups below
+            // are the measured fallback (FROND_TRACE_S2).
+            let dkey = crate::sema::Sema::module_expr_key(
+                self.expr_key_module(),
+                call_expr_id.0 as u64,
+            );
+            let s4_target = self.sema.dispatch_targets.get(&dkey).copied();
+            let s4_tyname_tid = s4_target.and_then(|(tidx, _)| {
+                self.sema
+                    .type_defs
+                    .get(&tidx)
+                    .map(|d| (d.name.to_string(), crate::types::dynamic_type_id(tidx)))
+            });
+            let recv_type: Option<(String, u16)> = if let Some((tn, tid)) = s4_tyname_tid {
+                Some((tn, tid))
+            } else if recv_node_override.is_some() {
+                if std::env::var("FROND_TRACE_S2").is_ok() {
+                    eprintln!(
+                        "[s2-fallback:dispatch] method={} mod={}",
+                        method,
+                        self.current_module().name
+                    );
+                }
                 self.current_method_type.as_ref().map(|(n, id)| (n.to_string(), *id))
             } else {
+                if std::env::var("FROND_TRACE_S2").is_ok() {
+                    eprintln!(
+                        "[s2-fallback:dispatch] method={} mod={}",
+                        method,
+                        self.current_module().name
+                    );
+                }
                 self.expr_type_name(recv).map(|n| n.to_string()).zip(self.expr_type_id(recv))
             };
             if let Some((type_name, type_id)) = recv_type {
-                if let Some(method_idx) = self.sema.lookup_method_idx(type_name.as_str(), method) {
+                let method_idx = match s4_target.map(|(_, midx)| midx) {
+                    Some(midx) => Some(midx),
+                    None => self
+                        .sema
+                        .lookup_method_idx_by_type_id(type_id, method)
+                        .or_else(|| self.sema.lookup_method_idx(type_name.as_str(), method)),
+                };
+                if std::env::var("FROND_TRACE_GET").is_ok() && method == "get" {
+                    let chosen_sg = method_idx
+                        .and_then(|idx| self.method_subgraphs.get(&(type_id, idx)).copied());
+                    let sg_name = chosen_sg.map(|sg| {
+                        let fid = self.graph.subgraphs[sg.0 as usize].function_id;
+                        self.graph.sg_names.get(fid as usize).cloned().unwrap_or_default()
+                    });
+                    eprintln!(
+                        "[get-dispatch] recv_ty={} tid={} s4={:?} midx={:?} sg={:?} sg_fn={:?} call_expr={} mod={}",
+                        type_name, type_id, s4_target, method_idx, chosen_sg, sg_name, call_expr_id.0, self.current_module().name
+                    );
+                }
+                if let Some(method_idx) = method_idx {
                     if let Some(&target_sg) = self.method_subgraphs.get(&(type_id, method_idx)) {
                         // Inheritance dynamic dispatch: when any type's
                         // FIRST-base chain reaches this receiver type, a child
@@ -1549,7 +1755,7 @@ pub(super) fn compile_method_call(
                         .iter()
                         .position(|m| m.name.as_ref() == method && m.has_body)
                     {
-                        if let Some(&trait_idx) = self.sema.trait_def_index.get(trait_def.name.as_ref()) {
+                        if let Some(trait_idx) = self.sema.trait_def_idx(trait_def.name.as_ref()) {
                             if let Some(&target_sg) = self.trait_default_subgraphs.get(&(type_id, trait_idx, method_idx as u16)) {
                                 candidates.push((trait_def.name.clone(), target_sg));
                             }
@@ -1614,9 +1820,11 @@ pub(super) fn compile_method_call(
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unknown type".to_string());
                 let span = self.current_module().arena.expr(call_expr_id).span;
+                let recv_node_dbg = format!("{:?}", &self.current_module().arena.expr(recv).node);
                 self.errors.push(format!(
-                    "cannot dispatch method '{}' on receiver of {} at line {}, column {}",
-                    method, recv_desc, span.line, span.column
+                    "cannot dispatch method '{}' on receiver of {} at line {}, column {} [recv_expr={} mod={} key_mod={} inst={:?} recv_node={}]",
+                    method, recv_desc, span.line, span.column, recv.0, self.current_module().name,
+                    self.expr_key_module(), self.current_instance_id, recv_node_dbg
                 ));
             }
             call_node
@@ -1647,12 +1855,13 @@ pub(super) fn compile_method_call(
         // subgraph, receiver is the enclosing `this` (child values are
         // layout-prefix compatible with the base's field ids).
         if let Some((base_name, base_method)) = self.sema.super_base_dispatches.get(&key) {
-            let base_tid = self
-                .sema
-                .type_def_index
-                .get(base_name.as_ref())
-                .map(|&idx| crate::types::dynamic_type_id(idx));
-            let base_mi = self.sema.lookup_method_idx(base_name.as_ref(), base_method.as_ref());
+            let base_tid = self.sema.type_def_idx(base_name.as_ref())
+                .map(|idx| crate::types::dynamic_type_id(idx));
+            let base_mi = self.sema.lookup_method_idx_in(
+                self.current_module().name,
+                base_name.as_ref(),
+                base_method.as_ref(),
+            );
             if let (Some(tid), Some(mi)) = (base_tid, base_mi) {
                 if let Some(&sg) = self.method_subgraphs.get(&(tid, mi)) {
                     let recv_node = match self.lookup_var("this") {
@@ -1802,7 +2011,7 @@ pub(super) fn compile_method_call(
             // Guard: only lower as reflect intrinsic if the receiver's type does
             // NOT already define a real method of the same name (user override wins).
             let shadows = self.expr_type_name(recv)
-                .and_then(|tn| self.sema.lookup_method_idx(tn, method))
+                .and_then(|tn| self.sema.lookup_method_idx_in(self.current_module().name, tn, method))
                 .is_some();
             if !shadows {
                 return Some(kind);
@@ -1823,7 +2032,7 @@ pub(super) fn compile_method_call(
         }
         let type_name = self.expr_type_name(recv)?;
         let type_id = self.expr_type_id(recv)?;
-        let method_idx = self.sema.lookup_method_idx(type_name, method)?;
+        let method_idx = self.sema.lookup_method_idx_in(self.current_module().name, type_name, method)?;
         let sig = self.sema.get_method_sig(type_id, method_idx)?;
         sig.intrinsic
     }
@@ -1925,9 +2134,7 @@ pub(super) fn compile_method_call(
         // the last resort for undeclared implementations.
         let trait_idx_and_mpos: Option<(u16, u16)> = self
             .sema
-            .trait_def_index
-            .get(trait_name)
-            .copied()
+            .trait_def_idx(trait_name)
             .zip(
                 self.sema
                     .get_trait_def(trait_name)
@@ -2031,34 +2238,33 @@ pub(super) fn compile_method_call(
                     if let Some(inst) = self.sema.trait_default_instances.get(idx) {
                         return self
                             .sema
-                            .type_def_index
-                            .get(inst.type_name.as_ref())
-                            .map(|&idx| crate::types::dynamic_type_id(idx));
+                            .type_def_idx(inst.type_name.as_ref())
+                            .map(|idx| crate::types::dynamic_type_id(idx));
                     }
                 }
             }
         }
         let key = crate::sema::Sema::module_expr_key(self.expr_key_module(), expr.0 as u64);
         let info = self.sema.expr_types.get(&key)?;
-        // Consistent with expr_type_name: prefer type_name, fall back to Type::name()
-        // (built-in structural variants like array/nullable/str/Throw return their registered name via Type::name();
+        // Consistent with expr_type_name: prefer type_name, fall back to Type::source_name()
+        // (built-in structural variants like array/nullable/str/Throw return their registered name via source_name();
         // "unknown" only appears in degenerate paths where Adt/Record arena lookup fails).
         let type_name = info
             .type_name
             .as_deref()
-            .unwrap_or_else(|| self.type_arena.get(info.ty).name());
+            .unwrap_or_else(|| self.type_arena.get(info.ty).source_name());
         // Concrete array names ("u8[]") address the synthetic builtin "array"
         // type def. Bare legacy names resolve module-scoped.
         let key = crate::sema::Sema::SemaResult::canonical_type_name(type_name);
-        let type_idx = match self.sema.type_def_index.get(key) {
-            Some(&idx) => idx,
+        let type_idx = match self.sema.type_def_idx(key) {
+            Some(idx) => idx,
             None => {
-                let resolved = self.sema.resolve_type_key(key);
+                let resolved = self.sema.resolve_type_key_in(self.current_module().name, key);
                 if resolved == key {
                     return None;
                 }
-                match self.sema.type_def_index.get(&resolved) {
-                    Some(&idx) => idx,
+                match self.sema.type_def_idx(&resolved) {
+                    Some(idx) => idx,
                     None => return None,
                 }
             }

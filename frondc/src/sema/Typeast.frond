@@ -1,0 +1,231 @@
+// Typeast.frond — AST→类型解析(1E):Rust Inference/TypeAst.rs 的镜像。
+// 推断期的 Named 解析链:param_map → 绑定栈 → 内建标量/Lib → trait →
+// alias 展开(visiting 环检测)→ Adt(canonical)。
+
+import std.collections.List
+import std.collections.Map
+import std.core.types.Str
+import syntax.Ast
+import types.Arena
+import types.Ty
+
+import sema.Data
+import sema.Semares
+import sema.Ictx
+import sema.Populate
+
+// resolve_name_to_type:Named 解析核心(alias 展开 + 环检测)。
+pub fun resolve_name_to_type(ctx: ICtx, a: TypeArena, s: SemaRes, name: str,
+    param_map: Map<str, u32>, visiting: List<str>): u32 {
+    // 1. 类型形参映射。
+    match param_map.get(name) {
+        null => {}
+        ty => { return ty }
+    }
+    // 2. 绑定栈(generic 作用域)。
+    match Ictx.lookup_type_binding(ctx, name) {
+        null => {}
+        ty => { return ty }
+    }
+    // 3. 内建标量 + str/null/void。
+    match Populate.from_type_name_full(name) {
+        null => {}
+        t => { return Arena.make(a, t) }
+    }
+    // 3.5 不透明非泛型内建(Lib)在 from_type_name_full 已覆盖。
+    // 4. trait 定义 → Trait(canonical)。
+    if Semares.get_trait_def(s, name) != null {
+        val canonical = Semares.resolve_trait_key(s, name)
+        return Arena.make_trait(a, canonical, [])
+    }
+    val canonical = Semares.resolve_type_key(s, name)
+    if Semares.list_has_str(visiting, canonical) {
+        return Arena.make_adt(a, canonical, [])
+    }
+    visiting.push(canonical)
+    // 5. alias 展开:优先已解析 target_type,回退 target_type_name。
+    var alias_target_ty: u32? = null
+    var alias_target_name: str? = null
+    var param_count: i64 = 0
+    match Semares.get_type_def(s, canonical) {
+        null => {}
+        td => {
+            if td.kind == TAlias {
+                alias_target_ty = td.target_type
+                alias_target_name = td.target_type_name
+                param_count = td.type_params.len() as i64
+            }
+        },
+    }
+    if alias_target_ty != null || alias_target_name != null {
+        if param_count > 0 {
+            Semares.add_error(s, new_err(
+                "generic type alias '{name}' requires type arguments (e.g. '{name}<arg>)", 0, 0))
+            Semares.list_remove_str(visiting, canonical)
+            return Arena.make(a, TUnknown)
+        }
+        match alias_target_ty {
+            null => {}
+            inner => {
+                Semares.list_remove_str(visiting, canonical)
+                return inner
+            },
+        }
+        match alias_target_name {
+            null => {}
+            target => {
+                val result = resolve_name_to_type(ctx, a, s, target, param_map, visiting)
+                Semares.list_remove_str(visiting, canonical)
+                return result
+            },
+        }
+    }
+    Semares.list_remove_str(visiting, canonical)
+    // 6. 用户类型 → Adt(canonical)。
+    Arena.make_adt(a, canonical, [])
+}
+
+// type_from_ast(无 param_map 便捷形态)。
+pub fun type_from_ast(ctx: ICtx, a: TypeArena, s: SemaRes, type_ref: i64, ast: AstArena): u32 {
+    type_from_ast_with_params(ctx, a, s, type_ref, ast, Map.empty<str, u32>())
+}
+
+pub fun type_from_ast_with_params(ctx: ICtx, a: TypeArena, s: SemaRes, type_ref: i64,
+    ast: AstArena, param_map: Map<str, u32>): u32 {
+    val st = ast.ty(type_ref)
+    match st.node {
+        TNamed(name) => {
+            val visiting = List.empty<str>()
+            resolve_name_to_type(ctx, a, s, name, param_map, visiting)
+        },
+        TThis => {
+            match Ictx.current_this_type(ctx) {
+                null => {
+                    Semares.add_error(s, new_err(
+                        "This type can only be used within type or trait methods", st.span.line, st.span.column))
+                    Arena.make(a, TVoid)
+                },
+                ty => { ty },
+            }
+        },
+        TGeneric(name, args) => {
+            var new_args: u32[] = []
+            var i: usize = 0
+            while i < args.len() {
+                new_args = new_args ++ [type_from_ast_with_params(ctx, a, s, args[i], ast, param_map)]
+                i = i + 1
+            }
+            // HKT:param_map 命中(类型检查细节属推断切片,此处保持构造)。
+            match param_map.get(name) {
+                null => {}
+                param_handle => {
+                    return Arena.make_generic(a, name, new_args)
+                },
+            }
+            // 内建泛型(Throw/Async 族)构造专属变体。
+            if Ictx.is_builtin_generic_type(name) {
+                return Ictx.make_builtin_generic(a, name, new_args)
+            }
+            // trait 定义 → Trait(canonical)。
+            if Semares.get_trait_def(s, name) != null {
+                val canonical = Semares.resolve_trait_key(s, name)
+                return Arena.make_trait(a, canonical, new_args)
+            }
+            val canonical = Semares.resolve_type_key(s, name)
+            // 泛型 alias 应用:实参替换后展开。
+            match Semares.get_type_def(s, canonical) {
+                null => {}
+                td => {
+                    if td.kind == TAlias {
+                        match td.target_type {
+                            null => {}
+                            target => {
+                                if td.type_params.len() == new_args.len() {
+                                    val pairs = List.empty<PairStrH>()
+                                    var k: usize = 0
+                                    while k < td.type_params.len() {
+                                        pairs.push(PairStrH(td.type_params[k], new_args[k]))
+                                        k = k + 1
+                                    }
+                                    return subst_named_adts(a, target, pairs)
+                                }
+                                Semares.add_error(s, new_err(
+                                    "generic type alias '{name}' takes {td.type_params.len()} type argument(s), got {new_args.len()}",
+                                    st.span.line, st.span.column))
+                                return Arena.make(a, TUnknown)
+                            },
+                        }
+                    }
+                },
+            }
+            // 用户泛型 ADT。
+            var has_params = false
+            match Semares.get_type_def(s, canonical) {
+                null => {}
+                d => {
+                    if d.type_params.len() > 0 {
+                        has_params = true
+                    }
+                },
+            }
+            if has_params {
+                return Arena.make_adt(a, canonical, new_args)
+            }
+            // 回退:Generic(未定义或前向引用,后续使用处报)。
+            Arena.make_generic(a, name, new_args)
+        },
+        TNullable(inner) => {
+            // T?? 双重 nullable 拒绝(字面形态;实例化模式豁免)。
+            if ctx.inst == null {
+                match ast.ty(inner).node {
+                    TNullable(_) => {
+                        Semares.add_error(s, new_err(
+                            "double nullable 'T??' is not allowed: nullable has no Some-constructor, so nesting adds no meaning. Use a single '?', or an ADT for two-level absence (e.g. `type Hit<T> = | Missing | Found(T?)`)",
+                            st.span.line, st.span.column))
+                    },
+                    _ => {}
+                }
+            }
+            Arena.make_nullable(a, type_from_ast_with_params(ctx, a, s, inner, ast, param_map))
+        },
+        TRef(inner) => {
+            Arena.make_ref(a, type_from_ast_with_params(ctx, a, s, inner, ast, param_map), false)
+        },
+        TRawPtr(inner) => {
+            Arena.make_ref(a, type_from_ast_with_params(ctx, a, s, inner, ast, param_map), true)
+        },
+        TFunction(params, rt) => {
+            var ps: u32[] = []
+            var i: usize = 0
+            while i < params.len() {
+                ps = ps ++ [type_from_ast_with_params(ctx, a, s, params[i], ast, param_map)]
+                i = i + 1
+            }
+            Arena.make_fn(a, ps, type_from_ast_with_params(ctx, a, s, rt, ast, param_map))
+        },
+        TRecord(fields) => {
+            if fields.len() == 0 {
+                return Arena.make(a, TVoid)
+            }
+            var fs: FT[] = []
+            var i: usize = 0
+            while i < fields.len() {
+                fs = fs ++ [FT(fields[i].name, type_from_ast_with_params(ctx, a, s, fields[i].ty, ast, param_map))]
+                i = i + 1
+            }
+            Arena.make_record(a, fs, null)
+        },
+        TArray(elem, size) => {
+            Arena.make_array(a, type_from_ast_with_params(ctx, a, s, elem, ast, param_map), size)
+        },
+        TKindAnn(inner, _) => {
+            type_from_ast_with_params(ctx, a, s, inner, ast, param_map)
+        },
+    }
+}
+
+// 名键结构替换(InferContext::substitute_named_adts 的镜像;复用注册期
+// 的 subst_inner 全臂逻辑)。
+pub fun subst_named_adts(a: TypeArena, ty: u32, pairs: List<PairStrH>): u32 {
+    Populate.substitute_named_adts_free(a, ty, pairs)
+}

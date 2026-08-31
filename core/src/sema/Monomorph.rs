@@ -368,11 +368,16 @@ fn infer_type_args<'a>(
     arena: &mut TypeArena,
 ) -> Vec<TypeHandle> {
     // 1. Explicit type arguments: resolve each TypeNode directly.
+    // The hint TypeNodes are parsed at the CALL SITE — their TypeIds belong to
+    // the caller's arena (`ast`), never the callee's (`fd_ast`). Resolving
+    // them against fd_ast was a cross-module arena OOB panic (caller id ≥
+    // callee arena len) and, when the id happened to fit, a silent
+    // resolve-the-wrong-node correctness hole (BOOTSTRAP 1C).
     if let Some(hints) = type_args_hint {
         if !hints.is_empty() {
             let mut args = Vec::with_capacity(hints.len());
             for &tn in hints {
-                let h = resolve_type_node_resolved(arena, Some(tn), &[], fd_ast, sema_result)
+                let h = resolve_type_node_resolved(arena, Some(tn), &[], ast, sema_result)
                     .unwrap_or_else(|| {
                         sema_result.add_error(SemaError::new(
                             &format!("failed to resolve type argument in {}", func_name),
@@ -1886,7 +1891,7 @@ pub fn collect_trait_default_instances<'a>(
             // Module-scoped canonical key — matches registration and the
             // witness entries' trait names.
             let canonical: Box<str> = sema_result.resolve_trait_key(name).into();
-            let trait_idx = match sema_result.trait_def_index.get(canonical.as_ref()).copied() {
+            let trait_idx = match sema_result.trait_def_idx(canonical.as_ref()) {
                 Some(idx) => idx,
                 None => continue,
             };
@@ -1922,8 +1927,8 @@ pub fn collect_trait_default_instances<'a>(
                             .collect()
                     })
                     .unwrap_or_default();
-                let parent_idx = match sema_result.trait_def_index.get(pt.as_ref()) {
-                    Some(&i) => i,
+                let parent_idx = match sema_result.trait_def_idx(pt.as_ref()) {
+                    Some(i) => i,
                     None => continue,
                 };
                 for (pm_idx, pm_name_owned, pm_has_body) in parent_methods {

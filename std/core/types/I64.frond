@@ -1,25 +1,30 @@
-// I64.frond — the i64 integer type module (part of std.core)
+// I64.frond — the i64 integer type module (part of std.core.types)
 //
-// Boundary constants + decimal parse. parse returns null on malformed input
-// (empty, bad sign position, non-digit); accumulation wraps on overflow by
-// design — check ranges yourself when inputs are untrusted.
+// Boundary constants + decimal parse. parse accepts an optional leading
+// '+'/'-' and returns Throw<_, ParseError>: Malformed on bad syntax (empty,
+// bad sign position, non-digit), Overflow on values outside the i64 range —
+// the same overflow-to-error contract as the float family (F*.parse), never
+// a silent wrap.
 
 pub val MAX: i64 = 9223372036854775807
 pub val MIN: i64 = -9223372036854775808
 
-pub fun parse(s: str): i64? {
+pub fun parse(s: str): Throw<i64, ParseError> {
     val b = s.bytes()
-    if b.len() == 0 { return null }
+    if b.len() == 0 { throw ParseError(Malformed, "empty input is not a i64 literal", s) }
     var neg = false
     var i = 0 as usize
-    if b[0] == (45 as u8) { neg = true; i = 1 as usize }
-    if i >= b.len() { return null }
-    var v: i64 = 0
+    if b[0] == 43 { i = 1 as usize }
+    if b[0] == 45 { neg = true; i = 1 as usize }
+    if i >= b.len() { throw ParseError(Malformed, "sign with no digits is not a i64 literal", s) }
+    var v: u128 = 0
+    val limit: u128 = if neg { 9223372036854775808 } else { 9223372036854775807 }
     while i < b.len() {
-        val d = (b[i] as i64) - 48
-        if d < 0 || d > 9 { return null }
+        val d = (b[i] as u128) - 48
+        if d > 9 { throw ParseError(Malformed, "invalid digit in i64 literal", s) }
+        if v > (limit - d) / 10 { throw ParseError(Overflow, "value out of range for i64", s) }
         v = v * 10 + d
         i = i + 1
     }
-    if neg { 0 - v } else { v }
+    if neg { Ok((0 - (v as i128)) as i64) } else { Ok(v as i64) }
 }

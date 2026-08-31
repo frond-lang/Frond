@@ -1009,3 +1009,33 @@ fun __os_disk_space_into(path: str, buf: u8[]): i32 #{
         return 0;
     #endif
 }#
+
+// -- target platform integer limits -----------------------------------------
+//
+// The pointer-width boundary constants behind std.core.types.Usize/Isize
+// MAX/MIN. They come from the C toolchain's <stdint.h> (UINTPTR_MAX,
+// INTPTR_MAX/MIN), so they follow the *target* pointer width instead of a
+// hardcoded 64-bit decimal -- a future 32-bit target stays correct.
+// The generated signatures use size_t / int64_t (see the Gen.rs type
+// table), hence the explicit casts widening from the toolchain's range.
+
+@c_include("stdint.h")
+@internal
+@extern("C")
+fun __os_usize_max(): usize #{
+    return (size_t)UINTPTR_MAX;
+}#
+
+@c_include("stdint.h")
+@internal
+@extern("C")
+fun __os_isize_max(): isize #{
+    return (int64_t)INTPTR_MAX;
+}#
+
+@c_include("stdint.h")
+@internal
+@extern("C")
+fun __os_isize_min(): isize #{
+    return (int64_t)INTPTR_MIN;
+}#

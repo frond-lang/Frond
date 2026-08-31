@@ -89,7 +89,11 @@ pub fn dispatch(
     // 4. Assemble RetSlot according to `sig.ret`.
     Ok(match sig.ret {
         AbiType::Void => RetSlot::Void,
-        AbiType::Float32 | AbiType::Float64 => RetSlot::Float(f64::from_bits(ret_raw)),
+        // The trampoline reads the raw 64-bit xmm0 return. A C `float` result
+        // lives in the LOW 32 bits (upper bits undefined), so reinterpret those
+        // as f32 before widening; a `double` result uses all 64 bits.
+        AbiType::Float32 => RetSlot::Float(f64::from(f32::from_bits(ret_raw as u32))),
+        AbiType::Float64 => RetSlot::Float(f64::from_bits(ret_raw)),
         AbiType::Int { .. } | AbiType::Ptr => {
             // Integer / pointer return; the low 64 bits of `ret_raw` are the value.
             RetSlot::Int(ret_raw)

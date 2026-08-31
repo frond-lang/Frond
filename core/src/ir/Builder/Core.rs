@@ -30,6 +30,14 @@ pub struct IrBuilder<'a> {
     /// package (`std.math::ldexp_impl`), generic instance (`name#id`).
     /// ALL lookups go through `resolve_func` — the single resolution point.
     pub func_subgraphs: rustc_hash::FxHashMap<String, SubGraphId>,
+    /// Short-qualified index (`Module.fn` by module TAIL name), SEPARATE from
+    /// func_subgraphs: a root-level user module's own mangled key ("Parse.parse",
+    /// no directory prefix) is STRING-IDENTICAL to a std module's short key
+    /// (std.json.Parse → "Parse.parse"). Sharing one map made the preregistration
+    /// reuse logic treat the two distinct functions as one — the later-compiled
+    /// user body overwrote the std subgraph, so calls through the std full-path
+    /// key silently executed the user function (BOOTSTRAP 1C root fix).
+    pub func_short_index: rustc_hash::FxHashMap<String, SubGraphId>,
     /// Collision tripwire, all key families: key → qualified display names of
     /// the DISTINCT functions that competed for one slot during registration
     /// (bare, short-qualified, package, import alias). `resolve_func` turns
@@ -383,6 +391,7 @@ impl<'a> IrBuilder<'a> {
             builtin_analyses: Vec::new(),
             graph: DataFlowGraph::new(),
             func_subgraphs: rustc_hash::FxHashMap::default(),
+            func_short_index: rustc_hash::FxHashMap::default(),
             name_conflicts: rustc_hash::FxHashMap::default(),
             global_bare_index: rustc_hash::FxHashMap::default(),
             internal_funcs: rustc_hash::FxHashSet::default(),
@@ -658,11 +667,22 @@ impl<'a> IrBuilder<'a> {
     /// Compile a global-variable store node (`compute_global_store`, idx 271).
     /// `inputs[0]` is the value-source node; at runtime it writes to
     /// `global_var_storage[slot]`.
+    ///
+    /// `current_effect` is appended as an implicit ordering input, mirroring
+    /// `compile_global_load`: stores must not overtake prior effects, and
+    /// global stores are chained serially. Without this edge the entry-injected
+    /// module initializers are mutually unordered — a body load (which deps only
+    /// the LAST init store) could fire while an earlier call-initialized store
+    /// (e.g. a builtin C call, whose chain is 2+ hops) is still in flight and
+    /// read the unwritten slot as NULL.
     pub(super) fn compile_global_store(&mut self, val_node: NodeId, slot: u32) -> NodeId {
-        let inputs_offset = self.graph.inputs_pool.push(&[val_node]);
+        let (input_count, inputs_offset) = match self.current_effect {
+            Some(eff) => (2, self.graph.inputs_pool.push(&[val_node, eff])),
+            None => (1, self.graph.inputs_pool.push(&[val_node])),
+        };
         let node = self.graph.add_node(Node {
             kind: NodeKind::BinOp,
-            input_count: 1,
+            input_count,
             inputs_offset,
             compute_fn: CF_GLOBAL_STORE,
         });
@@ -1300,7 +1320,7 @@ impl<'a> IrBuilder<'a> {
                         info.type_name
                             .as_deref()
                             .map(|n| n)
-                            .unwrap_or_else(|| self.type_arena.get(info.ty).name()),
+                            .unwrap_or_else(|| self.type_arena.get(info.ty).source_name()),
                     );
                 }
             }
@@ -1311,7 +1331,7 @@ impl<'a> IrBuilder<'a> {
                 info.type_name
                     .as_deref()
                     .map(|n| n)
-                    .unwrap_or_else(|| self.type_arena.get(info.ty).name()),
+                    .unwrap_or_else(|| self.type_arena.get(info.ty).source_name()),
             );
         }
         None
@@ -1442,7 +1462,18 @@ impl<'a> IrBuilder<'a> {
         //    self-recursion, scheduler deadlock).
         if let Some(rn) = recv {
             let key = format!("{}.{}", rn, name);
-            if let Some(&sg) = self.func_subgraphs.get(key.as_str()) {
+            // func_subgraphs FIRST: it holds full mangled keys ("std.json.Parse.parse")
+            // AND root-level user modules' own mangled keys ("Parse.parse" — a src/-
+            // root module has no directory prefix), which is exactly what sema's
+            // import-resolved qualifier names. The tail-key index is the fallback
+            // for plain short qualifiers whose owner is a DIRECTORY-qualified module
+            // ("File" → std.io.File.remove). This order keeps both call forms
+            // binding to the module the import resolved to.
+            let hit = self
+                .func_subgraphs
+                .get(key.as_str())
+                .or_else(|| self.func_short_index.get(key.as_str()));
+            if let Some(&sg) = hit {
                 if let Some(diag) = self.conflict_diag(&key) {
                     return Some(Err(diag));
                 }
@@ -1543,7 +1574,7 @@ impl<'a> IrBuilder<'a> {
     /// Provenance for every resolution: which site asked, which key won, and
     /// which sg it bound — "who did I actually call" in one glance
     /// (FROND_DEBUG_BUILD=1).
-    fn log_call_bind(&self, site: &str, name: &str, recv: Option<&str>, key: &str, sg: SubGraphId) {
+    pub(super) fn log_call_bind(&self, site: &str, name: &str, recv: Option<&str>, key: &str, sg: SubGraphId) {
         if std::env::var("FROND_DEBUG_BUILD").is_ok() {
             eprintln!(
                 "[CALL-BIND] site={} callee={:?} recv={:?} key={:?} sg={} cur_mod={:?}",
@@ -1668,17 +1699,20 @@ impl<'a> IrBuilder<'a> {
                         self.func_subgraphs.insert(mangled, sg_id);
                         // Short qualified name (module tail segment + fn name): the call-site
                         // shape `File.remove(...)` resolves by the recv identifier.
+                        // Lives in func_short_index (NOT func_subgraphs) so a root-level
+                        // user module's own mangled key can never collide with — and be
+                        // reuse-confused with — a std module's short key.
                         // or_insert (first-wins) keeps the slot stable, but a DIFFERENT
                         // function competing for it is recorded — resolving a call through
                         // a conflicted short key is a hard error at the call site.
                         if let Some(tail) = mp.rsplit('.').next() {
                             let short = format!("{}.{}", tail, name);
-                            match self.func_subgraphs.get(&short) {
+                            match self.func_short_index.get(&short) {
                                 Some(&prev_sg) if prev_sg != sg_id => {
                                     self.record_key_conflict(&short, sg_id, prev_sg);
                                 }
                                 None => {
-                                    self.func_subgraphs.insert(short, sg_id);
+                                    self.func_short_index.insert(short, sg_id);
                                 }
                                 _ => {}
                             }
@@ -1714,7 +1748,7 @@ impl<'a> IrBuilder<'a> {
             for d in &m.declarations {
                 if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &d.node {
                     let canonical = self.sema.resolve_type_key_in(m.name, name);
-                    let type_id = self.sema.type_def_index.get(&canonical).map(|&idx| crate::types::dynamic_type_id(idx));
+                    let type_id = self.sema.type_def_idx(&canonical).map(|idx| crate::types::dynamic_type_id(idx));
                     if let Some(tid) = type_id {
                         for (method_idx, method) in methods.iter().enumerate() {
                             if method.body.is_some() {
@@ -1742,9 +1776,11 @@ impl<'a> IrBuilder<'a> {
                 // Look up the TypeDecl (top-level or local) to get method info.
                 let method_info = self.find_type_method(type_name, *method_idx);
                 if let Some((method_name, params_count, is_async)) = method_info {
-                    let canonical = self.sema.resolve_type_key(type_name.as_str());
-                    let type_id = match self.sema.type_def_index.get(&canonical) {
-                        Some(&idx) => crate::types::dynamic_type_id(idx),
+                    let canonical = self
+                        .sema
+                        .resolve_type_key_in(self.current_module().name, type_name.as_str());
+                    let type_id = match self.sema.type_def_idx(&canonical) {
+                        Some(idx) => crate::types::dynamic_type_id(idx),
                         None => continue,
                     };
                     // Skip if already registered (top-level scan covered it)
@@ -2007,7 +2043,7 @@ impl<'a> IrBuilder<'a> {
                     let merged_names: Option<Vec<String>> = if base_types.is_empty() {
                         None
                     } else {
-                        self.sema.type_def_index.get(&canonical).and_then(|&idx| {
+                        self.sema.type_def_idx(&canonical).and_then(|idx| {
                             let def = &self.sema.type_defs[&idx];
                             if def.bases.is_empty() { return None; }
                             def.constructors.first().map(|c| {
@@ -2029,18 +2065,12 @@ impl<'a> IrBuilder<'a> {
                             });
                         }
                         crate::ast::Ast::TypeDef::Adt { constructors } => {
-                            // Register the type name (nullary path used for type-name lookup; field_names is empty only when there are no field constructors)
-                            bind(&mut self, name, TypeFieldInfo {
-                                field_names: Vec::new(),
-                                type_name: canonical.clone(),
-                                kind: RecordLitKind::Adt,
-                            });
                             // Multi-ctor ADT children: the ctor set lives in
                             // sema (inherited verbatim) — bind EACH inherited
                             // ctor name to the child so expected-type-guided
                             // construction builds child values.
                             if merged_names.is_some() {
-                                if let Some(&idx) = self.sema.type_def_index.get(&canonical) {
+                                if let Some(idx) = self.sema.type_def_idx(&canonical) {
                                     let def = &self.sema.type_defs[&idx];
                                     if !def.bases.is_empty() && def.constructors.len() > 1 {
                                         for c in def.constructors.iter() {
@@ -2059,16 +2089,66 @@ impl<'a> IrBuilder<'a> {
                                     }
                                 }
                             }
-                            // Register each constructor name (mapped to the type name)
-                            for ctor in constructors {
-                                let field_names: Vec<String> = match &merged_names {
-                                    Some(names) if constructors.len() == 1 => names.clone(),
-                                    _ => ctor.fields.iter()
-                                        .map(|f| f.name.unwrap_or("_").to_string())
-                                        .collect(),
-                                };
-                                bind(&mut self, ctor.name, TypeFieldInfo {
-                                    field_names,
+                            if !is_user_module {
+                                // std/builtin: original order — the type-name
+                                // entry first, then each ctor binding OVERWRITES
+                                // it (same key for single-ctor ADTs).
+                                bind(&mut self, name, TypeFieldInfo {
+                                    field_names: Vec::new(),
+                                    type_name: canonical.clone(),
+                                    kind: RecordLitKind::Adt,
+                                });
+                                for ctor in constructors {
+                                    let field_names: Vec<String> = match &merged_names {
+                                        Some(names) if constructors.len() == 1 => names.clone(),
+                                        _ => ctor.fields.iter()
+                                            .map(|f| f.name.unwrap_or("_").to_string())
+                                            .collect(),
+                                    };
+                                    bind(&mut self, ctor.name, TypeFieldInfo {
+                                        field_names,
+                                        type_name: canonical.clone(),
+                                        kind: RecordLitKind::Adt,
+                                    });
+                                }
+                            } else {
+                                // USER modules: bind ctor entries FIRST. For
+                                // single-ctor ADTs (type name == ctor name,
+                                // the stdlib container shape) the old order
+                                // bound the empty-field TYPE entry first and
+                                // the base layer is first-wins — a cross-module
+                                // bare construct then looked up the empty entry,
+                                // built an unnamed AdtValue, and every field
+                                // read on it failed at runtime (FieldError).
+                                // Ctor entries carry the real field list; the
+                                // type-name entry fills only free keys.
+                                for ctor in constructors {
+                                    let field_names: Vec<String> = match &merged_names {
+                                        Some(names) if constructors.len() == 1 => names.clone(),
+                                        _ => ctor.fields.iter()
+                                            .map(|f| f.name.unwrap_or("_").to_string())
+                                            .collect(),
+                                    };
+                                    bind(&mut self, ctor.name, TypeFieldInfo {
+                                        field_names,
+                                        type_name: canonical.clone(),
+                                        kind: RecordLitKind::Adt,
+                                    });
+                                }
+                                let taken_module = self
+                                    .module_type_scopes
+                                    .get(m.name)
+                                    .map(|s| s.contains_key(&name.to_string()))
+                                    .unwrap_or(false);
+                                if !taken_module {
+                                    self.bind_module_type_fields(m.name, name, TypeFieldInfo {
+                                        field_names: Vec::new(),
+                                        type_name: canonical.clone(),
+                                        kind: RecordLitKind::Adt,
+                                    });
+                                }
+                                self.bind_type_fields_base_first_wins(name, TypeFieldInfo {
+                                    field_names: Vec::new(),
                                     type_name: canonical.clone(),
                                     kind: RecordLitKind::Adt,
                                 });
@@ -2129,18 +2209,23 @@ impl<'a> IrBuilder<'a> {
             self.compile_function_in(Some(*mod_idx), name);
         }
 
-        // 1b. Compile TypeDecl methods in builtin modules (indexed by method_idx)
-        let builtin_methods: Vec<(String, usize)> = self
+        // 1b. Compile TypeDecl methods in builtin modules (indexed by method_idx).
+        // Module-qualified (same rationale as 1a above): a bare type name shared
+        // by a std module and a user dep module (std.json's `Parser` vs a user
+        // `Parser`) made the bare scan compile the std twin twice and leave the
+        // user type's method subgraphs as empty placeholders (runtime panic).
+        let builtin_methods: Vec<(usize, String, usize)> = self
             .builtin_modules
             .iter()
-            .flat_map(|m| {
-                m.declarations.iter().flat_map(|d| {
+            .enumerate()
+            .flat_map(|(mod_i, m)| {
+                m.declarations.iter().flat_map(move |d| {
                     if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &d.node {
                         methods
                             .iter()
                             .enumerate()
                             .filter(|(_, mt)| mt.body.is_some())
-                            .map(|(idx, _)| (name.to_string(), idx))
+                            .map(move |(idx, _)| (mod_i, name.to_string(), idx))
                             .collect::<Vec<_>>()
                     } else {
                         Vec::new()
@@ -2148,8 +2233,8 @@ impl<'a> IrBuilder<'a> {
                 })
             })
             .collect();
-        for (type_name, method_idx) in &builtin_methods {
-            self.compile_builtin_method(type_name, *method_idx);
+        for (mod_i, type_name, method_idx) in &builtin_methods {
+            self.compile_builtin_method_in(Some(*mod_i), type_name, *method_idx);
         }
 
         // 2. Collect user module function names (skip @extern("C") functions + analyzer-flagged dead functions)
@@ -2325,7 +2410,26 @@ impl<'a> IrBuilder<'a> {
         let pool = std::mem::take(&mut self.string_pool);
         self.graph.string_pool = Arc::from(pool);
 
+        self.fill_sg_names();
         self.graph
+    }
+
+    /// Debug aid: mirror func_subgraphs (mangled → sg_id) into a vec indexed
+    /// by sg_id so FROND_DUMP_IR can name the function owning each subgraph.
+    fn fill_sg_names(&mut self) {
+        let n = self.graph.subgraphs.len();
+        self.graph.sg_names = vec![String::new(); n];
+        let entries: Vec<(String, SubGraphId)> = self
+            .func_subgraphs
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        for (name, sg) in entries {
+            let idx = sg.0 as usize;
+            if idx < n && self.graph.sg_names[idx].is_empty() {
+                self.graph.sg_names[idx] = name;
+            }
+        }
     }
 
 }

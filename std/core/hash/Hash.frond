@@ -43,13 +43,7 @@ pub fun fnv1a<T>(data: T): u64 {
 // FNV-1a 64 over raw bytes — the algorithm's native input domain, and the
 // substrate every other entry here builds on.
 pub fun fnv1a_bytes(data: u8[]): u64 {
-    var h: u64 = 14695981039346656037
-    var i: usize = 0
-    while i < data.len() {
-        h = (h ^ (data[i] as u64)) * 1099511628211
-        i = i + 1
-    }
-    h
+    __fnv1a_bytes(data)
 }
 
 // Collections generic-key hash: FNV-1a over the printed representation —
@@ -58,6 +52,12 @@ pub fun fnv1a_bytes(data: u8[]): u64 {
 // printer distinguishes them, so without normalization a key inserted as
 // -0.0 and looked up as 0.0 lands in different buckets.
 pub fun key<K>(k: K): u64 {
+    // str fast path: hash the bytes directly in one C pass (the generic
+    // format+normalize route cost ~200 interpreted nodes per Map<str>
+    // operation; str is the dominant key type in real workloads).
+    if k.type_name() == "str" {
+        return __hash_key_str(k as str)
+    }
     val s = "{k}"
     fnv1a_bytes(normalize_zero(s).bytes())
 }

@@ -23,13 +23,13 @@ impl fmt::Display for TypeDisplay<'_> {
             Type::Void => f.write_str("void"),
             Type::Never => f.write_str("!"),
             Type::Unknown => f.write_str("?"),
-            // Builtin scalars + Str/Null: emit the static name directly.
+            // Builtin scalars + Str/Null/Lib: emit the source spelling directly.
             Type::Bool | Type::Char
             | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128
             | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
             | Type::Isize | Type::Usize
             | Type::F16 | Type::F32 | Type::F64 | Type::F128
-            | Type::Str | Type::Null | Type::Lib => f.write_str(t.name()),
+            | Type::Str | Type::Null | Type::Lib => f.write_str(t.source_name()),
             Type::Fn(_) => {
                 let (params, return_type) = self.arena.fn_parts(resolved);
                 f.write_str("(")?;
@@ -118,7 +118,7 @@ impl fmt::Display for TypeDisplay<'_> {
             | Type::Sender(_)
             | Type::Receiver(_)
             | Type::Timer(_)
-            | Type::ForeignFn(_) => f.write_str(t.name()),
+            | Type::ForeignFn(_) => f.write_str(t.source_name()),
             Type::ModuleRef(_) => {
                 let (path, _) = self.arena.module_ref_parts(resolved);
                 write!(f, "module::{}", path)

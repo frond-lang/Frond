@@ -809,8 +809,20 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
 
     /// Compile a TypeDecl method in a builtin module (looked up in method_subgraphs via (type_id, method_idx)).
     pub(super) fn compile_builtin_method(&mut self, type_name: &str, method_idx: usize) {
+        self.compile_builtin_method_in(None, type_name, method_idx)
+    }
+
+    /// Module-qualified variant: `only_mod` restricts the scan to one module
+    /// index (the caller's own), so same-named types in earlier modules
+    /// (std `Parser` vs a user dep `Parser`) can't steal the compile.
+    pub(super) fn compile_builtin_method_in(&mut self, only_mod: Option<usize>, type_name: &str, method_idx: usize) {
         // Look up the method data in builtin modules (indexed directly by method_idx)
         let found = self.builtin_modules.iter().enumerate().find_map(|(mod_i, m)| {
+            if let Some(only) = only_mod {
+                if mod_i != only {
+                    return None;
+                }
+            }
             for d in &m.declarations {
                 if let crate::ast::Ast::Decl::TypeDecl { name, methods, .. } = &d.node {
                     if *name == type_name {
@@ -841,8 +853,8 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
 
         // Obtain the pre-registered sg_id from method_subgraphs (created in build() step 0a)
         let canonical_type = self.sema.resolve_type_key_in(m.name, type_name);
-        let type_id = match self.sema.type_def_index.get(&canonical_type) {
-            Some(&idx) => crate::types::dynamic_type_id(idx),
+        let type_id = match self.sema.type_def_idx(&canonical_type) {
+            Some(idx) => crate::types::dynamic_type_id(idx),
             None => return,
         };
         let sg_id = match self.method_subgraphs.get(&(type_id, method_idx as u16)) {
@@ -940,8 +952,8 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         // Obtain the pre-registered sg_id from method_subgraphs (created in build() step 0a)
         // User-module methods: the AST name resolves to the canonical key.
         let canonical_type = self.sema.resolve_type_key_in(self.module.name, type_name);
-        let type_id = match self.sema.type_def_index.get(&canonical_type) {
-            Some(&idx) => crate::types::dynamic_type_id(idx),
+        let type_id = match self.sema.type_def_idx(&canonical_type) {
+            Some(idx) => crate::types::dynamic_type_id(idx),
             None => return,
         };
         let sg_id = match self.method_subgraphs.get(&(type_id, method_idx as u16)) {
@@ -1043,12 +1055,12 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         };
 
         // Obtain the pre-registered specialized subgraph sg_id from trait_default_subgraphs
-        let trait_idx = match self.sema.trait_def_index.get(trait_name) {
-            Some(&idx) => idx,
+        let trait_idx = match self.sema.trait_def_idx(trait_name) {
+            Some(idx) => idx,
             None => return,
         };
-        let type_id = match self.sema.type_def_index.get(impl_type_name) {
-            Some(&idx) => crate::types::dynamic_type_id(idx),
+        let type_id = match self.sema.type_def_idx(impl_type_name) {
+            Some(idx) => crate::types::dynamic_type_id(idx),
             None => return,
         };
         let sg_id = match self.trait_default_subgraphs.get(&(type_id, trait_idx, method_idx as u16)) {

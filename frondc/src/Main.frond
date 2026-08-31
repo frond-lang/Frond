@@ -1,74 +1,480 @@
-// frondc — 自举编译器 CLI(Stage 1)。
+// frondc — 自举编译器 CLI(Stage 1)。薄分发层;实现按目录模块组织:
+//
+//   syntax/  前端(1A/1B):Lex / Ast / Parse / Dump(tokens/ast 呈现)
+//   module/  模块加载(1C,镜像 Rust core/src/module/):
+//            StdPaths(生成清单)/ Toml / Loader / Manifest
 //
 // 子命令:
-//   lex <file>   词法分析,输出与 `frond debug --stage tokens` 逐字节
-//                一致的 token 清单(1A 差分口径)。
+//   lex|parse|lexmany|parsemany <file>...
+//                1A/1B 差分(见 tests/scripts/diff_lex.sh / diff_ast.sh)。
+//   loaddeps|loadmany [--std <dir>] <file>...
+//                1C 差分:Root.toml 清单 + import 图,输出与
+//                `frond debug --stage load` 逐字节一致的 load-dump v1。
+//                批量形态 = loadmany(分隔行 "@@FRONDC_SPLIT_9Q7Z@@ <path>")。
 //
 // 用法(跑在 Rust 引擎上):
 //   cd Frond/frondc && frond run -- lex <abs-path-to-file.frond>
 
 import std.os.Proc
+import std.time.Instant
 import std.io.Fs
 import std.io.Path
+import std.collections.List
+import std.collections.Map
 import std.core.types.Str
+import builtin.io.Console
+import syntax.Lex
+import syntax.Ast
+import syntax.Parse
+import syntax.Dump
+import syntax.AstCodec
+import module.Loader
+import module.Manifest
+import module.Toml
+import module.StdPaths
+import module.AstDiskCache
+import types.Tyops
+import types.Arena
+import sema.Data
+import sema.Envs
+import sema.Semares
+import sema.Ictx
+import sema.Populate
+import sema.Modenv
+import sema.Check
+import sema.Sdump
 
-import Lex
+// 单入口的完整 load-dump v1(与 Rust dump_load 逐字节对齐)。
+// std_cache 跨入口共享(loadmany 场景 N 入口一份 std 解析)。
+async fun dump_load_entry(entry_raw: str, std_root: str?, std_cache: Map<str, ModuleAst>): void {
+    // 全程用规范化路径(反斜杠 → /):manifest 爬链、读文件、parse。
+    // entry_raw 只在 readfail 诊断行里原样保留。
+    val entry = Manifest.norm_path(entry_raw)
+    println("load-dump v1")
+    print(Manifest.render_manifest(entry).await())
 
-// {:>4} 的对位:右对齐补空格。
-fun pad_left(s: str, width: i64): str {
-    val n = s.len() as i64
-    if n >= width {
-        s
-    } else {
-        Str.repeat(" ", (width - n) as i32) + s
+    match Loader.read_text(entry).await() {
+        null => {
+            println("! fatal")
+            println("readfail " + entry_raw)
+        },
+        text => {
+            match Parse.parse_module_text(text, entry) {
+                Error(e) => {
+                    println("! fatal")
+                    println("parsefail {e.line}:{e.column}: {e.message}")
+                },
+                Ok(entry_module) => {
+                    val loader = Loader.new_loader(std_root, std_cache)
+                    Loader.preload_builtins(loader).await()
+                    loader.search.push(Manifest.parent_dir_of(entry))
+                    // std-first:先全量载 std(终局反正要载),兄弟回退 5b
+                    // 退化为缓存查询 — 消除 Rust"5b 试探解析 + force 重解
+                    // 析"的双重浪费;依赖图后序不受影响(算法同,只是
+                    // 步骤 3 全程缓存命中)。
+                    Loader.force_load_std(loader).await()
+                    val dep_keys = Loader.load_transitive_imports(loader, entry_module).await()
+                    // deps(后序)/modules(逻辑路径字节序)/errors(发生序):
+                    // render_graph 与 Rust dump_load 逐字节对齐。sema 归
+                    // check/checkmany(dump_sema_entry)——此处的 run_sema 试跑
+                    // 是 M2 期误接,破坏 diff_load 字节契约,已摘除。
+                    print(Loader.render_graph(loader, dep_keys))
+                },
+            }
+        },
     }
 }
 
-// {:<3}/{:<20} 的对位:左对齐补空格。
-fun pad_right(s: str, width: i64): str {
-    val n = s.len() as i64
-    if n >= width {
-        s
-    } else {
-        s + Str.repeat(" ", (width - n) as i32)
+async fun cmd_load(cmd: str, args: str[]): void {
+    var std_flag = ""
+    val entries = List.empty<str>()
+    var i: i64 = 1
+    while i < args.len() as i64 {
+        val a = args[i as usize]
+        if a == "--std" && i + 1 < args.len() as i64 {
+            std_flag = args[(i + 1) as usize]
+            i = i + 2
+        } else {
+            entries.push(a)
+            i = i + 1
+        }
+    }
+    if entries.is_empty() {
+        println("usage: frondc {cmd} [--std <dir>] <entry>...")
+        return
+    }
+    match Manifest.resolve_std_root(std_flag).await() {
+        null => {
+            println("frondc: std root not found (pass --std <dir> or set FRONDC_STD_ROOT)")
+        },
+        root => {
+            // 跨入口共享 std 解析缓存:parse 纯函数 + ModuleAst 载后只读,
+            // 一次 loadmany 全程每个 std 文件恰解析一次(超越 Rust 的
+            // 逐编译全量重解析)。盘快照(AstDiskCache)在此之上再跨进程:
+            // 预载有效快照 → 本轮只解析 miss 的 → 结束回写。
+            val dcache = AstDiskCache.open().await()
+            val warmed = AstDiskCache.warm(dcache, root).await()
+            val std_cache = warmed.cache
+            var j: usize = 0
+            while j < entries.len() {
+                val entry = entries.get(j) ?? ""
+                if cmd == "loadmany" {
+                    println("@@FRONDC_SPLIT_9Q7Z@@ " + entry)
+                }
+                dump_load_entry(entry, root, std_cache).await()
+                j = j + 1
+            }
+            AstDiskCache.flush(dcache, root, std_cache, warmed.from_disk).await()
+        },
     }
 }
 
-// 一行 token 输出:与 Rust debug_tokens 的 "{:>4}:{:<3} {:<20} {}" 对位。
-fun format_line(sb: u8[], t: Tk): str {
-    val lex = Lex.lexeme(sb, t)
-    pad_left("{t.line}", 4) + ":" + pad_right("{t.column}", 3) + " " +
-        pad_right(t.kind.repr(), 20) + " " + lex
+// ─── 1E check:sema 全管线 + sema-dump v1 ─────────────────────────
+// 镜像 Rust dump_sema(CommonPipeline::run_sema_pipeline_or_exit):
+// prepipeline(root/std 层 + 别名 + POPULATE-FIRST + predeclare 轮)→
+// check 循环(builtin → std → dep → entry)→ 有错 exit(1),无错 dump。
+
+// 键("std/io/Fs.frond")→ 逻辑路径("std.io.Fs")。
+fun key_to_logical(key: str): str {
+    var p = key
+    if Str.ends_with(p, ".frond") {
+        p = Str.substring(p, 0, p.len() - (6 as usize))
+    }
+    Str.replace(p, "/", ".")
 }
 
-fun dump_tokens(text: str): void {
-    val sb = text.bytes()
-    val toks = Lex.tokenize(text)
-    var i: i64 = 0
-    val count = toks.len() as i64
-    while i < count {
-        match toks.get(i as usize) {
-            null => {}
-            t => { println(format_line(sb, t)) }
+fun loader_module(loader: Loader, key: str): ModuleAst? {
+    match loader.modules.get(key) {
+        null => { null }
+        loaded => { loaded.module }
+    }
+}
+
+// 检查循环模块列表序:builtin → std → dep(逐 key)。
+fun check_one(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAst,
+    root_env: u32, std_env: u32, all_modules: List<ModuleAst>, use_std_env: bool): void {
+    val env0 = if use_std_env { std_env } else { root_env }
+    Check.check_module_with_env(ctx, a, s, m, env0, all_modules)
+}
+
+fun run_sema(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst): str? {
+    val a = types.Arena.new_arena()
+    val s = Semares.new_semares()
+    val ctx = Ictx.new_ictx()
+    val root_env = Envs.root(s.env)
+    Modenv.register_builtins(ctx, a, s, root_env)
+    val std_env = Envs.child(s.env, root_env)
+    s.module_envs.set("std.layer", std_env)
+    val all_keys = loader.modules.keys()
+    val logical_paths = List.empty<str>()
+    var i: usize = 0
+    while i < all_keys.len() {
+        logical_paths.push(key_to_logical(all_keys[i]))
+        i = i + 1
+    }
+    Modenv.register_module_aliases(ctx, a, s, root_env, std_env, logical_paths)
+    i = 0
+    while i < logical_paths.len() {
+        val p = logical_paths.get(i) ?? ""
+        if !(p == "std" || p.starts_with("std.") || p.starts_with("builtin.")) {
+            s.user_module_paths.push(p)
         }
         i = i + 1
+    }
+    val builtin_paths = StdPaths.builtin_paths()
+    val t_aliases = Instant.now()
+    i = 0
+    while i < builtin_paths.len() {
+        match loader_module(loader, builtin_paths[i]) {
+            null => {}
+            m => { Modenv.predeclare_declarations(ctx, a, s, m, root_env) }
+        }
+        i = i + 1
+    }
+    val t_builtin_pre = Instant.now()
+    val all_modules = List.empty<ModuleAst>()
+    i = 0
+    while i < builtin_paths.len() {
+        match loader_module(loader, builtin_paths[i]) {
+            null => {}
+            m => { all_modules.push(m) }
+        }
+        i = i + 1
+    }
+    val std_paths = StdPaths.std_paths()
+    i = 0
+    while i < std_paths.len() {
+        match loader_module(loader, std_paths[i]) {
+            null => {}
+            m => { all_modules.push(m) }
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < dep_keys.len() {
+        match loader_module(loader, dep_keys.get(i) ?? "") {
+            null => {}
+            m => { all_modules.push(m) }
+        }
+        i = i + 1
+    }
+    all_modules.push(entry_module)
+    i = 0
+    while i < all_modules.len() {
+        Populate.populate_module(a, s, all_modules.get(i) ?? entry_module, all_modules)
+        i = i + 1
+    }
+    val t_populate = Instant.now()
+    val std_paths2 = StdPaths.std_paths()
+    i = 0
+    while i < std_paths2.len() {
+        match loader_module(loader, std_paths2[i]) {
+            null => {}
+            m => {
+                Modenv.predeclare_declarations_with_origin(ctx, a, s, m, std_env, key_to_logical(std_paths2[i]))
+            },
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < dep_keys.len() {
+        match loader_module(loader, dep_keys.get(i) ?? "") {
+            null => {}
+            m => { Modenv.predeclare_declarations(ctx, a, s, m, root_env) }
+        }
+        i = i + 1
+    }
+    val t_predeclare2 = Instant.now()
+    i = 0
+    while i < builtin_paths.len() {
+        match loader_module(loader, builtin_paths[i]) {
+            null => {}
+            m => {
+                val m0 = Instant.now()
+                Check.check_module_with_env(ctx, a, s, m, root_env, all_modules)
+                eprintln("[PMOD-B] {builtin_paths[i]} {m0.elapsed().as_millis()}ms")
+            }
+        }
+        i = i + 1
+    }
+    val t_check_builtin = Instant.now()
+    i = 0
+    while i < std_paths2.len() {
+        match loader_module(loader, std_paths2[i]) {
+            null => {}
+            m => {
+                val m0 = Instant.now()
+                Check.check_module_with_env(ctx, a, s, m, std_env, all_modules)
+                eprintln("[PMOD-S] {std_paths2[i]} {m0.elapsed().as_millis()}ms")
+            }
+        }
+        i = i + 1
+    }
+    val t_check_std = Instant.now()
+    i = 0
+    while i < dep_keys.len() {
+        match loader_module(loader, dep_keys.get(i) ?? "") {
+            null => {}
+            m => { Check.check_module_with_env(ctx, a, s, m, root_env, all_modules) }
+        }
+        i = i + 1
+    }
+    Check.check_module_with_env(ctx, a, s, entry_module, root_env, all_modules)
+    val t_check_user = Instant.now()
+    if s.errors.len() > 0 {
+        // 调试出口:镜像错面(前 N 条;对齐 stderr 输出属后续项)。
+        var ei: usize = 0
+        while ei < s.errors.len() && ei < 12 {
+            val e0 = s.errors.get(ei) ?? Semares.SErr("", 0, 0, null)
+            println("[mir-err] {e0.message}")
+            ei = ei + 1
+        }
+        return null
+    }
+    val out0 = Sdump.render(a, s)
+    val t_end = Instant.now()
+    eprintln("[PROF] builtin_pre={t_builtin_pre.duration_since(t_aliases).as_millis()}ms populate={t_populate.duration_since(t_builtin_pre).as_millis()}ms predeclare2={t_predeclare2.duration_since(t_populate).as_millis()}ms check_builtin={t_check_builtin.duration_since(t_predeclare2).as_millis()}ms check_std={t_check_std.duration_since(t_check_builtin).as_millis()}ms check_user={t_check_user.duration_since(t_check_std).as_millis()}ms render={t_end.duration_since(t_check_user).as_millis()}ms")
+    out0
+}
+
+// std 文件直入时按 std 键名归类(与引擎 Dump.canonical_std_entry_name 同规):
+// 入口位于 std 根下、且键在 StdPaths 清单内 → 用键名当模块名,让
+// @internal 等 std 专属属性保持合法;否则维持原路径(用户入口)。
+// (引擎侧另做内容核对——嵌入副本与磁盘一致性;镜像的 std 就是磁盘
+// 本身,路径命中即同一文件,内容核对退化恒真。)
+fun std_entry_module_name(entry: str, std_root: str): str {
+    val prefix = std_root + "/"
+    if !Str.starts_with(entry, prefix) { return entry }
+    val b = entry.bytes()
+    val rel = (b[prefix.len() as usize..entry.len() as usize]) as str
+    val key = if Str.starts_with(rel, "builtin/") { rel } else { "std/" + rel }
+    val bp = StdPaths.builtin_paths()
+    var i = 0 as usize
+    while i < bp.len() {
+        if bp[i] == key { return key }
+        i = i + 1
+    }
+    val sp = StdPaths.std_paths()
+    var j = 0 as usize
+    while j < sp.len() {
+        if sp[j] == key { return key }
+        j = j + 1
+    }
+    entry
+}
+
+async fun dump_sema_entry(entry_raw: str, std_root: str, std_cache: Map<str, ModuleAst>): void {
+    val entry = Manifest.norm_path(entry_raw)
+    match Loader.read_text(entry).await() {
+        null => {
+            println("! fatal")
+            println("readfail " + entry_raw)
+        },
+        text => {
+            match Parse.parse_module_text(text, std_entry_module_name(entry, std_root)) {
+                Error(e) => {
+                    println("! fatal")
+                    println("parsefail {e.line}:{e.column}: {e.message}")
+                },
+                Ok(entry_module) => {
+                    val loader = Loader.new_loader(std_root, std_cache)
+                    Loader.preload_builtins(loader).await()
+                    loader.search.push(Manifest.parent_dir_of(entry))
+                    Loader.force_load_std(loader).await()
+                    val dep_keys = Loader.load_transitive_imports(loader, entry_module).await()
+                    match run_sema(loader, dep_keys, entry_module) {
+                        null => {
+                            println("[probe] run_sema null")
+                        },
+                        dump => { print(dump) },
+                    }
+                },
+            }
+        },
+    }
+}
+
+async fun cmd_check(cmd: str, args: str[]): void {
+    var std_flag = ""
+    val entries = List.empty<str>()
+    var i: i64 = 1
+    while i < args.len() as i64 {
+        val a = args[i as usize]
+        if a == "--std" && i + 1 < args.len() as i64 {
+            std_flag = args[(i + 1) as usize]
+            i = i + 2
+        } else {
+            entries.push(a)
+            i = i + 1
+        }
+    }
+    if entries.is_empty() {
+        println("usage: frondc {cmd} [--std <dir>] <entry>...")
+        return
+    }
+    match Manifest.resolve_std_root(std_flag).await() {
+        null => {
+            println("frondc: std root not found (pass --std <dir> or set FRONDC_STD_ROOT)")
+        },
+        root => {
+            // std 解析缓存三层:进程内共享(std_cache)+ 跨进程盘快照
+            // (AstDiskCache 预载/回写,FRONDC_NO_AST_CACHE 可禁用)。
+            val dcache = AstDiskCache.open().await()
+            val warmed = AstDiskCache.warm(dcache, root).await()
+            val std_cache = warmed.cache
+            var j: usize = 0
+            while j < entries.len() {
+                val entry = entries.get(j) ?? ""
+                if cmd == "checkmany" {
+                    println("@@FRONDC_SPLIT_9Q7Z@@ " + entry)
+                }
+                dump_sema_entry(entry, root, std_cache).await()
+                j = j + 1
+            }
+            AstDiskCache.flush(dcache, root, std_cache, warmed.from_disk).await()
+        },
     }
 }
 
 async fun main(): void {
     val args = Proc.args()
+    val nargs = args.len() as i64
+    if nargs >= 1 && args[0] == "tyops" {
+        print(Tyops.run())
+        return
+    }
     if args.len() < 2 {
-        println("usage: frondc lex <file>")
+        println("usage: frondc tyops|lex|parse|lexmany|parsemany|loaddeps|loadmany|check|checkmany [--std <dir>] <file>...")
         return
     }
     val cmd = args[0]
-    val path = args[1]
-    if cmd != "lex" {
+    if cmd == "loaddeps" || cmd == "loadmany" {
+        cmd_load(cmd, args).await()
+        return
+    }
+    if cmd == "check" || cmd == "checkmany" {
+        cmd_check(cmd, args).await()
+        return
+    }
+    if cmd != "lex" && cmd != "parse" && cmd != "lexmany" && cmd != "parsemany" && cmd != "astcheck" {
         println("unknown command: {cmd}")
         return
     }
+    if cmd == "lexmany" || cmd == "parsemany" {
+        // 批量模式:一次启动吃全部文件(差分脚本用,免逐文件冷启动)。
+        // 每个文件前打一行 "===== <path>" 分隔;读失败打 "!!!!! <path>"。
+        var i: i64 = 1
+        while i < args.len() as i64 {
+            val path = args[i as usize]
+            match Fs.read_file(Path.from(path)).await() {
+                Ok(text) => {
+                    println("@@FRONDC_SPLIT_9Q7Z@@ " + path)
+                    if cmd == "lexmany" {
+                        Dump.dump_tokens(text)
+                    } else {
+                        Dump.dump_ast(text)
+                    }
+                },
+                Error(e) => { println("@@FRONDC_SPLIT_9Q7Z@@ " + path + " @READFAIL@") },
+            }
+            i = i + 1
+        }
+        return
+    }
+    val path = args[1]
     match Fs.read_file(Path.from(path)).await() {
-        Ok(text) => { dump_tokens(text) },
+        Ok(text) => {
+            if cmd == "lex" {
+                Dump.dump_tokens(text)
+            } else if cmd == "astcheck" {
+                var fi: i64 = 1
+                while fi < args.len() as i64 {
+                    val fpath = args[fi as usize]
+                    match Fs.read_file(Path.from(fpath)).await() {
+                        Ok(ftext) => {
+                            match Parse.parse_module_text(ftext, fpath) {
+                                Ok(m) => {
+                                    val s1 = Ast.print_module(m)
+                                    val stream = AstCodec.encode_module(m)
+                                    val m2 = AstCodec.decode_module(stream)
+                                    val s2 = Ast.print_module(m2)
+                                    if s1 == s2 {
+                                        println("ASTCHECK OK {fpath} exprs={m.arena.exprs.len()} stream={stream.len()}")
+                                    } else {
+                                        println("ASTCHECK MISMATCH {fpath}")
+                                    }
+                                },
+                                Error(e) => { println("ASTCHECK PARSEERR {fpath} {e.line}:{e.column}") },
+                            }
+                        },
+                        Error(e) => { println("ASTCHECK READFAIL {fpath}") },
+                    }
+                    fi = fi + 1
+                }
+            } else {
+                Dump.dump_ast(text)
+            }
+        },
         Error(e) => { println("read error: {e}") },
     }
 }

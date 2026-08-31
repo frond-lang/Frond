@@ -1,0 +1,58 @@
+// Dump.frond — 前端差分呈现(1A/1B):tokens/ast 两级输出(从 Main 拆出)。
+//
+// 与 Rust 侧对位:debug_tokens 的 "{:>4}:{:<3} {:<20} {}" 行格式与
+// debug_ast 的 S 表达式打印。差分口径见 tests/scripts/diff_lex.sh 与
+// diff_ast.sh。
+
+import std.core.types.Str
+import syntax.Lex
+import syntax.Ast
+import syntax.Parse
+
+// {:>4} 的对位:右对齐补空格。
+fun pad_left(s: str, width: i64): str {
+    val n = s.len() as i64
+    if n >= width {
+        s
+    } else {
+        Str.repeat(" ", (width - n) as i32) + s
+    }
+}
+
+// {:<3}/{:<20} 的对位:左对齐补空格。
+fun pad_right(s: str, width: i64): str {
+    val n = s.len() as i64
+    if n >= width {
+        s
+    } else {
+        s + Str.repeat(" ", (width - n) as i32)
+    }
+}
+
+// 一行 token 输出:与 Rust debug_tokens 的 "{:>4}:{:<3} {:<20} {}" 对位。
+fun format_line(sb: u8[], t: Tk): str {
+    val lex = Lex.lexeme(sb, t)
+    pad_left("{t.line}", 4) + ":" + pad_right("{t.column}", 3) + " " +
+        pad_right(t.kind.repr(), 20) + " " + lex
+}
+
+fun dump_tokens(text: str): void {
+    val sb = text.bytes()
+    val toks = Lex.tokenize(text)
+    var i: i64 = 0
+    val count = toks.len() as i64
+    while i < count {
+        match toks.get(i as usize) {
+            null => {}
+            t => { println(format_line(sb, t)) }
+        }
+        i = i + 1
+    }
+}
+
+fun dump_ast(text: str): void {
+    match Parse.parse_module_text(text, "stdin") {
+        Ok(m) => { print(Ast.print_module(m)) }
+        Error(e) => { println("Parse error at {e.line}:{e.column}: {e.message}") }
+    }
+}

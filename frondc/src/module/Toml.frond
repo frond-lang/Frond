@@ -1,0 +1,368 @@
+// Toml.frond — mini-TOML 解析器(Stage 1 / 1C:Root.toml 子集)。
+//
+// 范围:表头 [name](单段裸键)/裸键 = 值/基本字符串(转义 \n \t \r \" \\)/
+// 整数(可选 +/-,拒前导零)/bool/数组(可跨行,容尾逗贝)/# 注释(含行尾)。
+// 差分口径:Rust 侧是 toml crate + serde Manifest;本解析器只对齐
+// "合法 Root.toml 解析一致 + 非法输入判 bad 一致",报错文案不对齐
+// (与 1B 报错文案后置同理)。表示为扁平 (表,键,值) 列表 — Manifest
+// 只需点查,不建嵌套表。
+//
+// 字节级扫描,风格对齐 std/json/Parse.frond。
+
+import std.collections.List
+import std.core.types.I64
+
+pub type Tv =
+    | TS(str)
+    | TI(i64)
+    | TB(bool)
+    | TArr(Tv[])
+
+pub type TKv = TKv(pub table: str, pub key: str, pub value: Tv)
+
+pub type TomlErr = TomlErr(pub message: str)
+
+// Root.toml 清单字段(默认值与 Rust cli/Manifest.rs 的 serde default 对位)。
+pub type ManifestD = ManifestD(pub name: str, pub entry: str, pub output_dir: str, pub opt_level: i64)
+
+val SP: u8 = 32 as u8
+val LF: u8 = 10 as u8
+val HASH: u8 = 35 as u8
+val LBR: u8 = 91 as u8
+val RBR: u8 = 93 as u8
+val EQ: u8 = 61 as u8
+val COMMA: u8 = 44 as u8
+val DQUOTE: u8 = 34 as u8
+val BSLASH: u8 = 92 as u8
+val MINUS: u8 = 45 as u8
+val PLUS: u8 = 43 as u8
+val UNDERSCORE: u8 = 95 as u8
+
+fun is_bare(ch: u8): bool {
+    (ch >= (48 as u8) && ch <= (57 as u8)) ||
+        (ch >= (65 as u8) && ch <= (90 as u8)) ||
+        (ch >= (97 as u8) && ch <= (122 as u8)) ||
+        ch == UNDERSCORE || ch == MINUS
+}
+
+fun is_digit(ch: u8): bool { ch >= (48 as u8) && ch <= (57 as u8) }
+
+fun is_inline_ws(ch: u8): bool { ch == SP || ch == 9 as u8 || ch == 13 as u8 }
+
+// 解析入口:成功返回扁平键值列表,失败返回 TomlErr(调用方判 bad)。
+pub fun parse(text: str): Throw<List<TKv>, TomlErr> {
+    val tc = Tc(text.bytes(), 0, "", List.empty(), List.empty())
+    tc.run()
+}
+
+type Tc = Tc(data: u8[], pos: i64, table: str, kvs: List<TKv>, tables: List<str>) {
+
+    fun n(): i64 { data.len() as i64 }
+
+    fun eof(): bool { pos >= n() }
+
+    fun cur(): u8 { data[pos as usize] }
+
+    fun fail(message: str): Throw<Tv, TomlErr> { throw TomlErr(message) }
+
+    fun fail_unit(message: str): Throw<void, TomlErr> { throw TomlErr(message) }
+
+    fun &advance(): void { pos = pos + 1 }
+
+    // 行内空白(空格/Tab/CR)。换行(LF)由调用方处理。
+    fun &skip_ws(): void {
+        while !eof() && is_inline_ws(cur()) {
+            advance()
+        }
+    }
+
+    // 换行 + 空白 + 注释全跳(数组元素之间/顶层项目之间)。
+    fun &skip_gap(): void {
+        while !eof() {
+            val c = cur()
+            if is_inline_ws(c) || c == LF {
+                advance()
+            } else if c == HASH {
+                while !eof() && cur() != LF {
+                    advance()
+                }
+            } else {
+                return
+            }
+        }
+    }
+
+    // 值/键之后的行尾:空白 +(注释)?,然后必须 LF 或 EOF。
+    fun &expect_eol(what: str): Throw<void, TomlErr> {
+        skip_ws()
+        if eof() {
+            return Ok(void)
+        }
+        if cur() == HASH {
+            while !eof() && cur() != LF {
+                advance()
+            }
+            return Ok(void)
+        }
+        if cur() == LF {
+            return Ok(void)
+        }
+        fail_unit("trailing characters after " + what)
+    }
+
+    // 裸键:[A-Za-z0-9_-]+(空 → err)。
+    fun bare_key(what: str): Throw<str, TomlErr> {
+        val start = pos
+        while !eof() && is_bare(cur()) {
+            advance()
+        }
+        if pos == start {
+            return throw TomlErr("expected bare key in " + what)
+        }
+        Ok((data[start as usize..pos as usize]) as str)
+    }
+
+    fun run(): Throw<List<TKv>, TomlErr> {
+        while true {
+            skip_gap()
+            if eof() {
+                return Ok(kvs)
+            }
+            if cur() == LBR {
+                table_header()?
+            } else {
+                kv_line()?
+            }
+        }
+        Ok(kvs)
+    }
+
+    // 表头:[name] — 单段裸键;点分表头不在 Root.toml 子集内。
+    fun &table_header(): Throw<void, TomlErr> {
+        advance()
+        skip_ws()
+        if eof() || cur() == RBR {
+            return fail_unit("empty table header")
+        }
+        val name = bare_key("table header")?
+        skip_ws()
+        if eof() || cur() != RBR {
+            return fail_unit("expected ']' after table header")
+        }
+        advance()
+        expect_eol("table header")?
+        var i: usize = 0
+        while i < tables.len() {
+            if (tables.get(i) ?? "") == name {
+                return fail_unit("duplicate table header")
+            }
+            i = i + 1
+        }
+        tables.push(name)
+        table = name
+        Ok(void)
+    }
+
+    fun &kv_line(): Throw<void, TomlErr> {
+        val key = bare_key("key")?
+        skip_ws()
+        if eof() || cur() != EQ {
+            return fail_unit("expected '=' after key")
+        }
+        advance()
+        skip_ws()
+        if eof() || cur() == LF {
+            return fail_unit("missing value")
+        }
+        val v = parse_value()?
+        expect_eol("value")?
+        var i: usize = 0
+        while i < kvs.len() {
+            val kv = kvs.get(i) ?? TKv("", "", TS(""))
+            if kv.table == table && kv.key == key {
+                return fail_unit("duplicate key")
+            }
+            i = i + 1
+        }
+        kvs.push(TKv(table, key, v))
+        Ok(void)
+    }
+
+    fun parse_value(): Throw<Tv, TomlErr> {
+        if eof() {
+            return fail("unexpected end of input")
+        }
+        val c = cur()
+        if c == DQUOTE {
+            parse_string()
+        } else if c == LBR {
+            parse_array()
+        } else if c == MINUS || c == PLUS || is_digit(c) {
+            parse_int()
+        } else if c == 116 as u8 {
+            expect_word("true", TB(true))
+        } else if c == 102 as u8 {
+            expect_word("false", TB(false))
+        } else {
+            fail("expected value")
+        }
+    }
+
+    fun expect_word(word: str, out_val: Tv): Throw<Tv, TomlErr> {
+        val w = word.bytes()
+        var i: usize = 0
+        while i < w.len() {
+            if eof() || cur() != w[i] {
+                return fail("invalid value")
+            }
+            advance()
+            i = i + 1
+        }
+        Ok(out_val)
+    }
+
+    fun parse_string(): Throw<Tv, TomlErr> {
+        advance()
+        var out: u8[] = []
+        while true {
+            if eof() {
+                return fail("unterminated string")
+            }
+            val c = cur()
+            if c == DQUOTE {
+                advance()
+                return Ok(TS((out) as str))
+            }
+            if c == LF {
+                return fail("newline in string")
+            }
+            if c == BSLASH {
+                advance()
+                if eof() {
+                    return fail("unterminated escape")
+                }
+                val e = cur()
+                advance()
+                if e == 110 as u8 {
+                    out = out ++ [10 as u8]
+                } else if e == 116 as u8 {
+                    out = out ++ [9 as u8]
+                } else if e == 114 as u8 {
+                    out = out ++ [13 as u8]
+                } else if e == DQUOTE {
+                    out = out ++ [DQUOTE]
+                } else if e == BSLASH {
+                    out = out ++ [BSLASH]
+                } else {
+                    return fail("invalid escape")
+                }
+            } else {
+                out = out ++ [c]
+                advance()
+            }
+        }
+        fail("unreachable")
+    }
+
+    fun parse_int(): Throw<Tv, TomlErr> {
+        val start = pos
+        if !eof() && (cur() == MINUS || cur() == PLUS) {
+            advance()
+        }
+        val digits_start = pos
+        while !eof() && is_digit(cur()) {
+            advance()
+        }
+        if pos == digits_start {
+            return fail("invalid integer")
+        }
+        // 前导零:tomain crate 拒绝(与 Rust 侧判 bad 一致)。
+        if pos - digits_start > 1 && data[digits_start as usize] == 48 as u8 {
+            return fail("leading zero in integer")
+        }
+        // 19 位以上直接判非法(i64 溢出防御;Rust 侧 toml 同样报错)。
+        if pos - digits_start > 19 {
+            return fail("integer too large")
+        }
+        val text = (data[start as usize..pos as usize]) as str
+        match I64.parse(text) {
+            Err(e) => fail("invalid integer")
+            Ok(v) => Ok(TI(v))
+        }
+    }
+
+    fun parse_array(): Throw<Tv, TomlErr> {
+        advance()
+        var items: Tv[] = []
+        while true {
+            skip_gap()
+            if eof() {
+                return fail("unterminated array")
+            }
+            if cur() == RBR {
+                advance()
+                return Ok(TArr(items))
+            }
+            val v = parse_value()?
+            items = items ++ [v]
+            skip_gap()
+            if eof() {
+                return fail("unterminated array")
+            }
+            if cur() == COMMA {
+                advance()
+            } else if cur() == RBR {
+                advance()
+                return Ok(TArr(items))
+            } else {
+                return fail("expected ',' or ']' in array")
+            }
+        }
+        fail("unreachable")
+    }
+}
+
+// ── Manifest 提取 ─────────────────────────────────────────────────
+
+fun find_kv(kvs: List<TKv>, table: str, key: str): Tv? {
+    var i: usize = 0
+    while i < kvs.len() {
+        val kv = kvs.get(i) ?? TKv("", "", TS(""))
+        if kv.table == table && kv.key == key {
+            return kv.value
+        }
+        i = i + 1
+    }
+    null
+}
+
+// [package].name 必填且为字符串;entry/output_dir 缺省用默认;
+// opt_level 需 0..=255(u8 口径);类型不符 → null(调用方判 bad)。
+pub fun manifest_from(kvs: List<TKv>): ManifestD? {
+    match find_kv(kvs, "package", "name") {
+        TS(name) => {
+            val entry = match find_kv(kvs, "package", "entry") {
+                TS(e) => e
+                null => "src/Main.frond"
+                _ => return null
+            }
+            val output_dir = match find_kv(kvs, "build", "output_dir") {
+                TS(o) => o
+                null => "out"
+                _ => return null
+            }
+            val opt_level = match find_kv(kvs, "build", "opt_level") {
+                TI(v) => {
+                    if v < 0 || v > 255 {
+                        return null
+                    }
+                    v
+                }
+                null => 2
+                _ => return null
+            }
+            ManifestD(name, entry, output_dir, opt_level)
+        },
+        _ => null,
+    }
+}

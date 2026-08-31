@@ -73,6 +73,11 @@ pub struct AstArena<'a> {
     pub stmts: Vec<Spanned<Stmt<'a>>>,
     pub types: Vec<Spanned<TypeNode<'a>>>,
     pub patterns: Vec<Spanned<Pattern<'a>>>,
+    /// Parser-built names that are not a single token lexeme (qualified type
+    /// paths like `A.Point`): stored owned so the `&'a str` handed to nodes
+    /// stays alive for the arena's lifetime. Dropped with the arena, so LSP
+    /// re-parses do not accumulate.
+    pub strings: Vec<Box<str>>,
 }
 
 /// Generates paired alloc + accessor methods for `AstArena`.
@@ -99,7 +104,22 @@ impl<'a> AstArena<'a> {
             stmts: Vec::new(),
             types: Vec::new(),
             patterns: Vec::new(),
+            strings: Vec::new(),
         }
+    }
+
+    /// Intern a parser-built name and lend it out at the arena's lifetime.
+    ///
+    /// SAFETY: the returned `&'a str` points into a `Box<str>` owned by this
+    /// arena and never moved out. Every node that stores it lives in this same
+    /// arena, so the borrow cannot outlive the allocation: any access to the
+    /// name goes through the arena that owns it. (`'a` itself is the source
+    /// buffer's outlives-everything lifetime used by token lexemes; the arena
+    /// is consumed before that buffer is released.)
+    pub fn intern_string(&mut self, s: String) -> &'a str {
+        self.strings.push(s.into_boxed_str());
+        let lent: &str = &self.strings[self.strings.len() - 1];
+        unsafe { std::mem::transmute::<&str, &'a str>(lent) }
     }
 
     arena_accessors!(alloc_expr, expr, ExprId, exprs, Expr<'a>);

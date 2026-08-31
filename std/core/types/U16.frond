@@ -1,24 +1,28 @@
-// U16.frond — the u16 integer type module (part of std.core)
+// U16.frond — the u16 integer type module (part of std.core.types)
 //
-// Boundary constants + decimal parse. parse returns null on malformed input
-// (empty, bad sign position, non-digit); accumulation wraps on overflow by
-// design — check ranges yourself when inputs are untrusted.
+// Boundary constant + decimal parse. parse accepts an optional leading '+'
+// (the unsigned family rejects '-') and returns Throw<_, ParseError>:
+// Malformed on bad syntax (empty, leading '-', non-digit), Overflow on
+// values above u16 MAX — the same overflow-to-error contract as the float
+// family (F*.parse), never a silent wrap.
 
 pub val MAX: u16 = 65535
 
-pub fun parse(s: str): u16? {
+pub fun parse(s: str): Throw<u16, ParseError> {
     val b = s.bytes()
-    if b.len() == 0 { return null }
-    var neg = false
+    if b.len() == 0 { throw ParseError(Malformed, "empty input is not a u16 literal", s) }
     var i = 0 as usize
-    if b[0] == (45 as u8) { neg = true; i = 1 as usize }
-    if i >= b.len() { return null }
-    var v: u16 = 0
+    if b[0] == 43 { i = 1 as usize }
+    if b[0] == 45 { throw ParseError(Malformed, "negative input is not a u16 literal", s) }
+    if i >= b.len() { throw ParseError(Malformed, "sign with no digits is not a u16 literal", s) }
+    var v: u128 = 0
+    val limit: u128 = U16.MAX as u128
     while i < b.len() {
-        val d = (b[i] as u16) - 48
-        if d < 0 || d > 9 { return null }
+        val d = (b[i] as u128) - 48
+        if d > 9 { throw ParseError(Malformed, "invalid digit in u16 literal", s) }
+        if v > (limit - d) / 10 { throw ParseError(Overflow, "value out of range for u16", s) }
         v = v * 10 + d
         i = i + 1
     }
-    if neg { 0 - v } else { v }
+    Ok(v as u16)
 }

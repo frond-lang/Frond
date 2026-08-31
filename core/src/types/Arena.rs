@@ -923,7 +923,7 @@ impl TypeArena {
     /// Recursive cases require arena access to child nodes.
     pub fn type_name(&self, ty: TypeHandle) -> Option<&str> {
         let t = self.get(ty);
-        // Builtin scalars + Str/Null/Void + builtin generic names: return the static name.
+        // Builtin scalars + Str/Null/Void + builtin generic names: return the source spelling.
         if t.is_scalar()
             || matches!(
                 t,
@@ -932,7 +932,7 @@ impl TypeArena {
                     | Type::Sender(_) | Type::Receiver(_)
             )
         {
-            return Some(t.name());
+            return Some(t.source_name());
         }
         match t {
             Type::Adt(_) => Some(self.adt_parts(ty).0),
@@ -956,7 +956,7 @@ impl TypeArena {
             let (elem, _size) = self.array_parts(ty);
             let elem_name = self
                 .type_name_concrete(elem)
-                .unwrap_or_else(|| self.get(elem).name().to_string());
+                .unwrap_or_else(|| self.get(elem).source_name().to_string());
             return Some(format!("{}[]", elem_name));
         }
         self.type_name(ty).map(|s| s.to_string())

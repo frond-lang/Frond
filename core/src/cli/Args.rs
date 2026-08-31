@@ -97,6 +97,10 @@ pub enum DebugStage {
     Check,
     /// Canonical sema dump (differential oracle; see cli/Dump.rs).
     Sema,
+    /// Canonical module-load dump (1C differential oracle; see cli/Dump.rs).
+    Load,
+    /// Canonical type-arena operations dump (1D differential oracle; see cli/Dump.rs).
+    TyOps,
     /// Extract @extern("C") functions and emit .c to stdout.
     EmitC,
     /// Full pipeline + execution statistics (default).

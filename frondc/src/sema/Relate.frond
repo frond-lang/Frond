@@ -1,0 +1,914 @@
+// Relate.frond — 类型关系判断层(1E 片4b):Rust core/src/sema/Relations.rs
+// 的镜像(推断切片消费的子集):types_equal / is_subtype 族 / peer_type 族
+// / Ty 谓词 / 子节点枚举 / type_name(_concrete) / kind 检查(check_type_node)。
+//
+// 未移植:ModuleChecker(模块结构匹配,trait 声明期已消费)、int_rank 族
+// 的裸 Type 版(can_coerce_numeric 未在 HM 推断路径使用)。
+
+import std.collections.List
+import std.core.types.Str
+import syntax.Ast
+import types.Arena
+import types.Ty
+
+import sema.Data
+import sema.Semares
+
+// ─── Ty 谓词(int/float/numeric)────────────────────────────────────
+
+pub fun ty_is_int(t: Ty): bool {
+    match t {
+        TI8 => true
+        TI16 => true
+        TI32 => true
+        TI64 => true
+        TI128 => true
+        TU8 => true
+        TU16 => true
+        TU32 => true
+        TU64 => true
+        TU128 => true
+        TIsize => true
+        TUsize => true
+        _ => false
+    }
+}
+
+pub fun ty_is_float(t: Ty): bool {
+    match t {
+        TF16 => true
+        TF32 => true
+        TF64 => true
+        TF128 => true
+        _ => false
+    }
+}
+
+pub fun ty_is_numeric(t: Ty): bool {
+    ty_is_int(t) || ty_is_float(t)
+}
+
+pub fun ty_is_signed(t: Ty): bool {
+    match t {
+        TI8 => true
+        TI16 => true
+        TI32 => true
+        TI64 => true
+        TI128 => true
+        TIsize => true
+        _ => false
+    }
+}
+
+// 整数位宽(rank 比较;非整数 = 0)。
+pub fun ty_int_bits(t: Ty): i64 {
+    match t {
+        TI8 => 8
+        TI16 => 16
+        TI32 => 32
+        TI64 => 64
+        TI128 => 128
+        TU8 => 8
+        TU16 => 16
+        TU32 => 32
+        TU64 => 64
+        TU128 => 128
+        TIsize => 64
+        TUsize => 64
+        _ => 0
+    }
+}
+
+pub fun ty_float_bits(t: Ty): i64 {
+    match t {
+        TF16 => 16
+        TF32 => 32
+        TF64 => 64
+        TF128 => 128
+        _ => 0
+    }
+}
+
+// ─── 子节点枚举(for_each_child 等价;Rust 复合类型遍历单源)────────
+
+pub fun children(a: TypeArena, h: u32): u32[] {
+    match Arena.get(a, h) {
+        TFn(id) => {
+            val f = Arena.fn_parts(a, h)
+            var out: u32[] = []
+            var i: usize = 0
+            while i < f.ps.len() {
+                out = out ++ [f.ps[i]]
+                i = i + 1
+            }
+            out = out ++ [f.ret]
+            out
+        },
+        TRecord(_) => {
+            val fs = Arena.record_fields(a, h)
+            var out: u32[] = []
+            var i: usize = 0
+            while i < fs.len() {
+                out = out ++ [fs[i].ty]
+                i = i + 1
+            }
+            out
+        },
+        TAdt(_) => {
+            val p = Arena.adt_parts(a, h)
+            p.b
+        },
+        TGeneric(_) => {
+            val p = Arena.generic_parts(a, h)
+            p.b
+        },
+        TArray(_) => {
+            val p = Arena.array_parts(a, h)
+            [p.a]
+        },
+        TThrow(_) => {
+            val p = Arena.thr_parts(a, h)
+            [p.a, p.b]
+        },
+        TNullable(_) => {
+            [Arena.nullable_inner(a, h)]
+        },
+        TRef(_) => {
+            [Arena.ref_parts(a, h).a]
+        },
+        TChannel(_) => {
+            [Arena.channel_elem(a, h)]
+        },
+        TAsync(_) => {
+            [Arena.async_value(a, h)]
+        },
+        TLazy(_) => {
+            [Arena.lazy_value(a, h)]
+        },
+        TAtomic(_) => {
+            [Arena.atomic_elem(a, h)]
+        },
+        TSender(_) => {
+            [Arena.sender_elem(a, h)]
+        },
+        TReceiver(_) => {
+            [Arena.receiver_elem(a, h)]
+        },
+        TForeignFn(_) => {
+            [Arena.foreign_fn_ret(a, h)]
+        },
+        TTrait(_) => {
+            Arena.trait_parts(a, h).b
+        },
+        _ => [],
+    }
+}
+
+// 深扫:类型内任意位置是否存活未绑 TypeVar/Unknown(Bug#103 候选门)。
+pub fun type_contains_typevar(a: TypeArena, h: u32): bool {
+    val resolved = Arena.resolve(a, h)
+    match Arena.get(a, resolved) {
+        TTypeVar(_) => { true }
+        TUnknown => { true }
+        _ => {
+            val kids = children(a, resolved)
+            var found = false
+            var i: usize = 0
+            while i < kids.len() && !found {
+                if type_contains_typevar(a, kids[i]) {
+                    found = true
+                }
+                i = i + 1
+            }
+            found
+        },
+    }
+}
+
+// fixpoint 重排队列判定:解析后是否仍含未绑 TypeVar。
+pub fun resolve_has_typevar(a: TypeArena, h: u32): bool {
+    val resolved = Arena.resolve(a, h)
+    match Arena.get(a, resolved) {
+        TTypeVar(_) => { true }
+        _ => {
+            val kids = children(a, resolved)
+            var found = false
+            var i: usize = 0
+            while i < kids.len() && !found {
+                if resolve_has_typevar(a, kids[i]) {
+                    found = true
+                }
+                i = i + 1
+            }
+            found
+        },
+    }
+}
+
+// ─── type_name / type_name_concrete(ExprInfo.type_name 语义)───────
+
+// 标量/内建泛型返静态名;adt/generic/trait/trait_object 返注册名;
+// ref/nullable 递归取内名;其余 null。
+pub fun type_name(a: TypeArena, h: u32): str? {
+    val t = Arena.get(a, h)
+    match t {
+        TBool => { "bool" }
+        TChar => { "char" }
+        TI8 => { "i8" }
+        TI16 => { "i16" }
+        TI32 => { "i32" }
+        TI64 => { "i64" }
+        TI128 => { "i128" }
+        TU8 => { "u8" }
+        TU16 => { "u16" }
+        TU32 => { "u32" }
+        TU64 => { "u64" }
+        TU128 => { "u128" }
+        TIsize => { "isize" }
+        TUsize => { "usize" }
+        TF16 => { "f16" }
+        TF32 => { "f32" }
+        TF64 => { "f64" }
+        TF128 => { "f128" }
+        TStr => { "str" }
+        TNull => { "null" }
+        TVoid => { "void" }
+        TLib => { "Lib" }
+        TThrow(_) => { "Throw" }
+        TChannel(_) => { "Channel" }
+        TAsync(_) => { "Async" }
+        TLazy(_) => { "Lazy" }
+        TAtomic(_) => { "Atomic" }
+        TSender(_) => { "Sender" }
+        TReceiver(_) => { "Receiver" }
+        TAdt(_) => { Arena.adt_parts(a, h).a }
+        TGeneric(_) => { Arena.generic_parts(a, h).a }
+        TTrait(_) => { Arena.trait_parts(a, h).a }
+        TTraitObject(_) => { Arena.trait_object_parts(a, h).a }
+        TRef(_) => { type_name(a, Arena.ref_parts(a, h).a) }
+        TNullable(_) => { type_name(a, Arena.nullable_inner(a, h)) }
+        _ => { null }
+    }
+}
+
+// 结构感知名:Array 按元素具体化("u8[]"),其余委托 type_name。
+pub fun type_name_concrete(a: TypeArena, h: u32): str? {
+    match Arena.get(a, h) {
+        TArray(_) => {
+            val p = Arena.array_parts(a, h)
+            var elem_name = ty_source_name(Arena.get(a, p.a))
+            match type_name_concrete(a, p.a) {
+                null => {}
+                n => { elem_name = n }
+            }
+            "{elem_name}[]"
+        },
+        _ => { type_name(a, h) },
+    }
+}
+
+// ─── types_equal(resolve 后的结构相等)────────────────────────────
+
+pub fun types_equal(a: TypeArena, x: u32, y: u32): bool {
+    val ra = Arena.resolve(a, x)
+    val rb = Arena.resolve(a, y)
+    if ra == rb {
+        return true
+    }
+    val ta = Arena.get(a, ra)
+    val tb = Arena.get(a, rb)
+    // 判别式不等 → false(用 ty_eq 做单元变体的相等;载荷变体按位判别)。
+    if !same_family(ta, tb) {
+        return false
+    }
+    match ta {
+        TTypeVar(ia) => {
+            match tb {
+                TTypeVar(ib) => ia == ib
+                _ => false
+            }
+        },
+        TFn(_) => {
+            val fa = Arena.fn_parts(a, ra)
+            val fb = Arena.fn_parts(a, rb)
+            if fa.ps.len() != fb.ps.len() {
+                return false
+            }
+            var i: usize = 0
+            while i < fa.ps.len() {
+                if !types_equal(a, fa.ps[i], fb.ps[i]) {
+                    return false
+                }
+                i = i + 1
+            }
+            types_equal(a, fa.ret, fb.ret)
+        },
+        TRecord(_) => {
+            val fa = Arena.record_fields(a, ra)
+            val fb = Arena.record_fields(a, rb)
+            if fa.len() != fb.len() {
+                return false
+            }
+            var i: usize = 0
+            while i < fa.len() {
+                var names_match = false
+                match fa[i].name {
+                    null => {
+                        match fb[i].name {
+                            null => { names_match = true }
+                            _ => {}
+                        }
+                    },
+                    na => {
+                        match fb[i].name {
+                            null => {}
+                            nb => { names_match = na == nb }
+                        }
+                    },
+                }
+                if !names_match || !types_equal(a, fa[i].ty, fb[i].ty) {
+                    return false
+                }
+                i = i + 1
+            }
+            true
+        },
+        TAdt(_) => {
+            named_args_equal(a, Arena.adt_parts(a, ra), Arena.adt_parts(a, rb))
+        },
+        TGeneric(_) => {
+            named_args_equal(a, Arena.generic_parts(a, ra), Arena.generic_parts(a, rb))
+        },
+        TArray(_) => {
+            val pa = Arena.array_parts(a, ra)
+            val pb = Arena.array_parts(a, rb)
+            pa.b == pb.b && types_equal(a, pa.a, pb.a)
+        },
+        TThrow(_) => {
+            val pa = Arena.thr_parts(a, ra)
+            val pb = Arena.thr_parts(a, rb)
+            types_equal(a, pa.a, pb.a) && types_equal(a, pa.b, pb.b)
+        },
+        TChannel(_) => {
+            types_equal(a, Arena.channel_elem(a, ra), Arena.channel_elem(a, rb))
+        },
+        TAsync(_) => {
+            types_equal(a, Arena.async_value(a, ra), Arena.async_value(a, rb))
+        },
+        TLazy(_) => {
+            types_equal(a, Arena.lazy_value(a, ra), Arena.lazy_value(a, rb))
+        },
+        TAtomic(_) => {
+            types_equal(a, Arena.atomic_elem(a, ra), Arena.atomic_elem(a, rb))
+        },
+        TSender(_) => {
+            types_equal(a, Arena.sender_elem(a, ra), Arena.sender_elem(a, rb))
+        },
+        TReceiver(_) => {
+            types_equal(a, Arena.receiver_elem(a, ra), Arena.receiver_elem(a, rb))
+        },
+        TForeignFn(_) => {
+            types_equal(a, Arena.foreign_fn_ret(a, ra), Arena.foreign_fn_ret(a, rb))
+        },
+        TTrait(_) => {
+            named_args_equal(a, Arena.trait_parts(a, ra), Arena.trait_parts(a, rb))
+        },
+        TTraitObject(_) => {
+            val oa = Arena.trait_object_parts(a, ra)
+            val ob = Arena.trait_object_parts(a, rb)
+            if oa.a != ob.a || oa.b.len() != ob.b.len() {
+                return false
+            }
+            var i: usize = 0
+            while i < oa.b.len() {
+                if oa.b[i].name != ob.b[i].name || oa.b[i].param_count != ob.b[i].param_count {
+                    return false
+                }
+                i = i + 1
+            }
+            true
+        },
+        TNullable(_) => {
+            types_equal(a, Arena.nullable_inner(a, ra), Arena.nullable_inner(a, rb))
+        },
+        TRef(_) => {
+            val pa = Arena.ref_parts(a, ra)
+            val pb = Arena.ref_parts(a, rb)
+            pa.b == pb.b && types_equal(a, pa.a, pb.a)
+        },
+        // 标量单元族 + Never/Unknown/Null/Void:判别式相同即相等。
+        _ => true,
+    }
+}
+
+// 判别式族比较(Rust std::mem::discriminant 等价)。
+fun same_family(x: Ty, y: Ty): bool {
+    ty_family(x) == ty_family(y)
+}
+
+fun ty_family(t: Ty): i64 {
+    match t {
+        TBool => 1
+        TChar => 2
+        TI8 => 3
+        TI16 => 4
+        TI32 => 5
+        TI64 => 6
+        TI128 => 7
+        TU8 => 8
+        TU16 => 9
+        TU32 => 10
+        TU64 => 11
+        TU128 => 12
+        TIsize => 13
+        TUsize => 14
+        TF16 => 15
+        TF32 => 16
+        TF64 => 17
+        TF128 => 18
+        TStr => 19
+        TNull => 20
+        TVoid => 21
+        TLib => 22
+        TThrow(_) => 23
+        TChannel(_) => 24
+        TAsync(_) => 25
+        TLazy(_) => 26
+        TAtomic(_) => 27
+        TSender(_) => 28
+        TReceiver(_) => 29
+        TForeignFn(_) => 30
+        TTimer(_) => 31
+        TArray(_) => 32
+        TRef(_) => 33
+        TFn(_) => 34
+        TNullable(_) => 35
+        TAdt(_) => 36
+        TRecord(_) => 37
+        TTrait(_) => 38
+        TTraitObject(_) => 39
+        TModuleRef(_) => 40
+        TGeneric(_) => 41
+        TNever => 42
+        TTypeVar(_) => 43
+        TUnknown => 44
+    }
+}
+
+fun named_args_equal(a: TypeArena, pa: SU, pb: SU): bool {
+    if pa.a != pb.a || pa.b.len() != pb.b.len() {
+        return false
+    }
+    var i: usize = 0
+    while i < pa.b.len() {
+        if !types_equal(a, pa.b[i], pb.b[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+// ─── is_subtype(规则链:自反 → null→nullable → nullable 内 →
+//     record 结构 → adt 同名 → throw 结构)──────────────────────────
+
+pub fun is_subtype(a: TypeArena, sub: u32, sup: u32): bool {
+    // 1. 自反。
+    val rs = Arena.resolve(a, sub)
+    val rp = Arena.resolve(a, sup)
+    if rs == rp || types_equal(a, rs, rp) {
+        return true
+    }
+    // 2. null 字面 <: 任意 nullable。
+    if Arena.get(a, rs) == TNull && is_nullable_ct(Arena.get(a, rp)) {
+        return true
+    }
+    // 3. sub <: Nullable(inner) ⟹ sub <: inner。
+    if is_nullable_ct(Arena.get(a, rp)) {
+        return is_subtype(a, sub, Arena.nullable_inner(a, rp))
+    }
+    // 4. record 结构子类型:sub 字段集覆盖 sup 全部字段。
+    val cs = Arena.get(a, rs)
+    val cp = Arena.get(a, rp)
+    if is_record_pair(cs, cp) {
+        return is_record_subtype(a, Arena.record_fields(a, rs), Arena.record_fields(a, rp))
+    }
+    // 5. adt 同名。
+    if is_adt_pair(cs, cp) {
+        return Arena.adt_parts(a, rs).a == Arena.adt_parts(a, rp).a
+    }
+    // 6. throw 子类型:值/错两维都满足。
+    if is_throw_pair(cs, cp) {
+        val ps = Arena.thr_parts(a, rs)
+        val pp = Arena.thr_parts(a, rp)
+        return is_subtype(a, ps.a, pp.a) && is_subtype(a, ps.b, pp.b)
+    }
+    false
+}
+
+fun is_nullable_ct(t: Ty): bool {
+    match t {
+        TNullable(_) => true
+        _ => false
+    }
+}
+
+fun is_record_pair(x: Ty, y: Ty): bool {
+    match x {
+        TRecord(_) => {
+            match y {
+                TRecord(_) => true
+                _ => false
+            }
+        },
+        _ => false
+    }
+}
+
+fun is_adt_pair(x: Ty, y: Ty): bool {
+    match x {
+        TAdt(_) => {
+            match y {
+                TAdt(_) => true
+                _ => false
+            }
+        },
+        _ => false
+    }
+}
+
+fun is_throw_pair(x: Ty, y: Ty): bool {
+    match x {
+        TThrow(_) => {
+            match y {
+                TThrow(_) => true
+                _ => false
+            }
+        },
+        _ => false
+    }
+}
+
+// sub 提供, sup 要求;按名配对后递归 is_subtype。
+pub fun is_record_subtype(a: TypeArena, sub_fields: FT[], sup_fields: FT[]): bool {
+    var i: usize = 0
+    while i < sup_fields.len() {
+        val req = sup_fields[i]
+        var found = false
+        var j: usize = 0
+        while j < sub_fields.len() && !found {
+            val prov = sub_fields[j]
+            var names_match = false
+            match prov.name {
+                null => {
+                    match req.name {
+                        null => { names_match = true }
+                        _ => {}
+                    }
+                },
+                np => {
+                    match req.name {
+                        null => {}
+                        nq => { names_match = np == nq }
+                    }
+                },
+            }
+            if names_match {
+                if !is_subtype(a, prov.ty, req.ty) {
+                    return false
+                }
+                found = true
+            }
+            j = j + 1
+        }
+        if !found {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+// ─── peer_type(N 类型公共类型/join)────────────────────────────────
+
+pub fun peer_type(a: TypeArena, types: u32[]): u32 {
+    if types.len() == 0 {
+        return Arena.make(a, TUnknown)
+    }
+    if types.len() == 1 {
+        return types[0]
+    }
+    // 过滤 Never/Void(发散/无值分支不贡献值)。
+    var non_trivial: u32[] = []
+    var has_void = false
+    var i: usize = 0
+    while i < types.len() {
+        match Arena.get(a, Arena.resolve(a, types[i])) {
+            TNever => {}
+            TVoid => { has_void = true }
+            _ => { non_trivial = non_trivial ++ [types[i]] },
+        }
+        i = i + 1
+    }
+    if non_trivial.len() == 0 {
+        // 全 Never → Never;有 Void 混入 → Void(存在贯通路径)。
+        var all_never = true
+        i = 0
+        while i < types.len() {
+            match Arena.get(a, Arena.resolve(a, types[i])) {
+                TNever => {}
+                _ => { all_never = false }
+            }
+            i = i + 1
+        }
+        if all_never {
+            return Arena.make(a, TNever)
+        }
+        return Arena.make(a, TVoid)
+    }
+    if non_trivial.len() == 1 {
+        return non_trivial[0]
+    }
+    // 全等(结构)→ 首个。
+    val first = non_trivial[0]
+    var all_same = true
+    i = 1
+    while i < non_trivial.len() && all_same {
+        if !types_equal(a, first, non_trivial[i]) {
+            all_same = false
+        }
+        i = i + 1
+    }
+    if all_same {
+        return first
+    }
+    // 全数值 → 最宽。
+    var all_numeric = true
+    i = 0
+    while i < non_trivial.len() && all_numeric {
+        val ct = Arena.get(a, Arena.resolve(a, non_trivial[i]))
+        if !ty_is_int(ct) && !ty_is_float(ct) {
+            all_numeric = false
+        }
+        i = i + 1
+    }
+    if all_numeric {
+        return peer_numeric(a, non_trivial)
+    }
+    // 全 nullable → Nullable<peer(inners)>。
+    var all_nullable = true
+    i = 0
+    while i < non_trivial.len() && all_nullable {
+        if !is_nullable_ct(Arena.get(a, Arena.resolve(a, non_trivial[i]))) {
+            all_nullable = false
+        }
+        i = i + 1
+    }
+    if all_nullable {
+        var inners: u32[] = []
+        i = 0
+        while i < non_trivial.len() {
+            inners = inners ++ [Arena.nullable_inner(a, Arena.resolve(a, non_trivial[i]))]
+            i = i + 1
+        }
+        return Arena.make_nullable(a, peer_type(a, inners))
+    }
+    // nullable + 非 nullable 混合 → Nullable<peer(全部内型)>。
+    var has_nullable = false
+    i = 0
+    while i < non_trivial.len() && !has_nullable {
+        if is_nullable_ct(Arena.get(a, Arena.resolve(a, non_trivial[i]))) {
+            has_nullable = true
+        }
+        i = i + 1
+    }
+    if has_nullable {
+        var inners: u32[] = []
+        i = 0
+        while i < non_trivial.len() {
+            val r = Arena.resolve(a, non_trivial[i])
+            match Arena.get(a, r) {
+                TNullable(_) => { inners = inners ++ [Arena.nullable_inner(a, r)] }
+                TNull => { inners = inners ++ [Arena.make(a, TUnknown)] }
+                _ => { inners = inners ++ [non_trivial[i]] },
+            }
+            i = i + 1
+        }
+        return Arena.make_nullable(a, peer_type(a, inners))
+    }
+    // 全 throw → Throw<peer(values), peer(errors)>。
+    var all_throw = true
+    i = 0
+    while i < non_trivial.len() && all_throw {
+        if !is_throw_single(Arena.get(a, Arena.resolve(a, non_trivial[i]))) {
+            all_throw = false
+        }
+        i = i + 1
+    }
+    if all_throw {
+        var vals: u32[] = []
+        var errs: u32[] = []
+        i = 0
+        while i < non_trivial.len() {
+            val p = Arena.thr_parts(a, Arena.resolve(a, non_trivial[i]))
+            vals = vals ++ [p.a]
+            errs = errs ++ [p.b]
+            i = i + 1
+        }
+        return Arena.make_throw(a, peer_type(a, vals), peer_type(a, errs))
+    }
+    // 全 array → Array<首个具体元素>(混合空字面量数组按元素 join)。
+    var all_array = true
+    i = 0
+    while i < non_trivial.len() && all_array {
+        match Arena.get(a, Arena.resolve(a, non_trivial[i])) {
+            TArray(_) => {}
+            _ => { all_array = false }
+        }
+        i = i + 1
+    }
+    if all_array {
+        var elems: u32[] = []
+        i = 0
+        while i < non_trivial.len() {
+            elems = elems ++ [Arena.array_parts(a, Arena.resolve(a, non_trivial[i])).a]
+            i = i + 1
+        }
+        var first_concrete: u32? = null
+        i = 0
+        while i < elems.len() {
+            match Arena.get(a, Arena.resolve(a, elems[i])) {
+                TTypeVar(_) => {}
+                TUnknown => {}
+                _ => {
+                    if first_concrete == null {
+                        first_concrete = if true { elems[i] } else { null }
+                    }
+                },
+            }
+            i = i + 1
+        }
+        match first_concrete {
+            null => { return Arena.make_array(a, peer_type(a, elems), null) }
+            fc => { return Arena.make_array(a, fc, null) },
+        }
+    }
+    // 不相容 → Unknown。
+    Arena.make(a, TUnknown)
+}
+
+fun is_throw_single(t: Ty): bool {
+    match t {
+        TThrow(_) => true
+        _ => false
+    }
+}
+
+// 二元 peer(字面量提升规则内联)。
+pub fun peer_type_binary(a: TypeArena, left: u32, right: u32,
+    left_is_literal: bool, right_is_literal: bool): u32 {
+    if left_is_literal && !right_is_literal {
+        return Arena.resolve(a, right)
+    }
+    if !left_is_literal && right_is_literal {
+        return Arena.resolve(a, left)
+    }
+    peer_type(a, [left, right])
+}
+
+// 数值 peer:有 float 取最宽 float;全 int 取最宽。
+fun peer_numeric(a: TypeArena, types: u32[]): u32 {
+    var has_float = false
+    var i: usize = 0
+    while i < types.len() {
+        if ty_is_float(Arena.get(a, Arena.resolve(a, types[i]))) {
+            has_float = true
+        }
+        i = i + 1
+    }
+    if has_float {
+        var widest = TF16
+        var widest_bits: i64 = 16
+        i = 0
+        while i < types.len() {
+            val ct = Arena.get(a, Arena.resolve(a, types[i]))
+            val bits = ty_float_bits(ct)
+            if bits > widest_bits {
+                widest_bits = bits
+                widest = ct
+            }
+            i = i + 1
+        }
+        return Arena.make(a, widest)
+    }
+    var widest_i = TI8
+    var widest_ibits: i64 = 8
+    i = 0
+    while i < types.len() {
+        val ct = Arena.get(a, Arena.resolve(a, types[i]))
+        val bits = ty_int_bits(ct)
+        if bits > widest_ibits {
+            widest_ibits = bits
+            widest_i = ct
+        }
+        i = i + 1
+    }
+    Arena.make(a, widest_i)
+}
+
+// ─── kind 检查(check_type_node;check 循环第 7 步)─────────────────
+
+// 内建泛型类型名的 kind 元数。
+pub fun generic_type_arity(name: str): i64? {
+    match name {
+        "Throw" => { 2 }
+        "Channel" => { 1 }
+        "Async" => { 1 }
+        "Lazy" => { 1 }
+        "Atomic" => { 1 }
+        "Sender" => { 1 }
+        "Receiver" => { 1 }
+        "ForeignFn" => { 1 }
+        _ => { null }
+    }
+}
+
+pub fun arity_of_type_name(s: SemaRes, name: str): i64 {
+    match generic_type_arity(name) {
+        null => {}
+        n => { return n }
+    }
+    match Semares.get_type_def(s, name) {
+        null => { 0 }
+        d => { d.type_params.len() as i64 }
+    }
+}
+
+fun is_type_param(name: str, tp_names: List<str>): bool {
+    Semares.list_has_str(tp_names, name)
+}
+
+// 类型注解树逐节点检查 kind 元数;错进 errors(List<SErr>,发生序)。
+pub fun check_type_node(s: SemaRes, ast: AstArena, node: i64,
+    type_param_names: List<str>, errors: List<SErr>): void {
+    val st = ast.ty(node)
+    match st.node {
+        TNamed(name) => {
+            if is_type_param(name, type_param_names) {
+                return
+            }
+            val arity = arity_of_type_name(s, name)
+            if arity > 0 {
+                errors.push(new_err(
+                    "kind mismatch: type constructor '{name}' expects {arity} type argument(s) but is used as a concrete type",
+                    st.span.line, st.span.column))
+            }
+        },
+        TThis => {},
+        TGeneric(name, args) => {
+            if !is_type_param(name, type_param_names) {
+                val arity = arity_of_type_name(s, name)
+                if arity != 0 && arity != args.len() as i64 {
+                    errors.push(new_err(
+                        "kind mismatch: type constructor '{name}' expects {arity} type argument(s) but got {args.len()}",
+                        st.span.line, st.span.column))
+                }
+            }
+            var i: usize = 0
+            while i < args.len() {
+                check_type_node(s, ast, args[i], type_param_names, errors)
+                i = i + 1
+            }
+        },
+        TNullable(inner) => {
+            check_type_node(s, ast, inner, type_param_names, errors)
+        },
+        TRef(inner) => {
+            check_type_node(s, ast, inner, type_param_names, errors)
+        },
+        TRawPtr(inner) => {
+            check_type_node(s, ast, inner, type_param_names, errors)
+        },
+        TFunction(params, rt) => {
+            var i: usize = 0
+            while i < params.len() {
+                check_type_node(s, ast, params[i], type_param_names, errors)
+                i = i + 1
+            }
+            check_type_node(s, ast, rt, type_param_names, errors)
+        },
+        TRecord(fields) => {
+            var i: usize = 0
+            while i < fields.len() {
+                check_type_node(s, ast, fields[i].ty, type_param_names, errors)
+                i = i + 1
+            }
+        },
+        TArray(elem, _) => {
+            check_type_node(s, ast, elem, type_param_names, errors)
+        },
+        TKindAnn(inner, _) => {
+            check_type_node(s, ast, inner, type_param_names, errors)
+        },
+    }
+}

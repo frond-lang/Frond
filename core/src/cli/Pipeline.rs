@@ -184,6 +184,13 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
             analysis_report.loop_analysis.unrollable.len());
     }
 
+    // TEMP (stmt-drop hunt): FROND_DUMP_PRE dumps the pre-optimizer graph so
+    // build-time vs optimizer-introduced range scatter can be distinguished.
+    if std::env::var("FROND_DUMP_PRE").is_ok() {
+        eprintln!("=== PRE-OPT DUMP ===");
+        dump_ir(&graph);
+    }
+
     // Post-IR optimization: LICM/Unroll/Inline + ConstFold/CSE/CopyProp/DCE fixed-point iteration.
     // Driven by opt_level: O0 skips, O1 fixed-point only, O2 full, O3 full + wider stall window.
     crate::pass::Optimizer::optimize_with_analysis(&mut graph, Some(&analysis_report), opt_level);
@@ -213,8 +220,9 @@ fn dump_ir(graph: &crate::ir::Ir::DataFlowGraph) {
     eprintln!("=== IR DUMP: {} nodes, {} subgraphs, entry={:?} ===",
         graph.nodes.len(), graph.subgraphs.len(), graph.entry_subgraph);
     for (si, sg) in graph.subgraphs.iter().enumerate() {
-        eprintln!("[sg {}] range={:?} params={} entry={:?} ret={:?} loop={:?} fn_id={} suspend={} conv={}",
-            si, (sg.node_range.0 .0, sg.node_range.1 .0), sg.param_count,
+        let sg_name = graph.sg_names.get(si).map(|s| s.as_str()).unwrap_or("");
+        eprintln!("[sg {}] name={:?} range={:?} params={} entry={:?} ret={:?} loop={:?} fn_id={} suspend={} conv={}",
+            si, sg_name, (sg.node_range.0 .0, sg.node_range.1 .0), sg.param_count,
             sg.entry_node.0, sg.return_node.0, format!("{:?}", sg.loop_kind), sg.function_id, sg.has_suspend, sg.converter_generated);
         for n in sg.node_range.0 .0..sg.node_range.1 .0 {
             let node = &graph.nodes[n as usize];

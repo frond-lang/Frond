@@ -732,14 +732,17 @@ pub struct SemaResult {
     /// Type name → index into `type_defs`. Keys are CANONICAL type names:
     /// user-module types are module-qualified (`src.Main.List`), std/builtin
     /// types keep their bare name (one std tree, unique by construction).
-    pub type_def_index: FxHashMap<String, u16>,
+    pub type_def_index: FxHashMap<crate::sema::Symbols::Sym, u16>,
     /// Dynamic type_id → type name (reverse index for O(1) lookup).
     /// Updated in tandem with `type_defs` (put_type_def / purge_module).
     pub type_id_to_name: FxHashMap<u16, Box<str>>,
     /// The module currently being populated/checked — the module context
     /// `resolve_type_key` resolves bare names against. Maintained by
     /// populate_module and check_module_with_env.
-    pub current_module_name: String,
+    /// 可见性收紧到 sema 子树(NAME_RESOLUTION_PLAN S3 收尾):IR/CLI
+    /// 曾经直读此字段 = 陈旧上下文 bug 族;S3 显式 `*_in` 变体落地后读者
+    /// 清零,`pub(in crate::sema)` 让子树外的再访问直接编译报错。
+    pub(in crate::sema) current_module_name: String,
     /// Import bookkeeping for module-scoped type resolution: module name →
     /// logical paths of the user modules it imports (std imports are
     /// excluded — the bare-key fallback covers them). Filled by
@@ -753,24 +756,24 @@ pub struct SemaResult {
     /// `resolve_type_key_in` resolve a field/alias/base referencing a type
     /// declared later in the same module to its canonical key before the
     /// registration lands.
-    pub pending_own_types: std::collections::HashSet<String>,
+    pub(in crate::sema) pending_own_types: std::collections::HashSet<String>,
     /// Bare trait names of the module currently being populated — the trait
     /// twin of `pending_own_types` (forward-referenced parent traits, impl
     /// bounds ahead of the trait's declaration).
-    pub pending_own_traits: std::collections::HashSet<String>,
+    pub(in crate::sema) pending_own_traits: std::collections::HashSet<String>,
     /// Trait definition table.
     pub trait_defs: FxHashMap<u16, TraitDefInfo>,
     /// u16 index allocator for `trait_defs` (never recycles).
     pub next_trait_def_id: u16,
     /// Trait name → index into `trait_defs`.
-    pub trait_def_index: FxHashMap<String, u16>,
+    pub trait_def_index: FxHashMap<crate::sema::Symbols::Sym, u16>,
     /// Function signature table.
     pub func_sigs: FxHashMap<u16, FuncSigInfo>,
     /// u16 index allocator for `func_sigs` (never recycles).
     pub next_func_sig_id: u16,
     /// Function name → index into `func_sigs` (module-qualified keys,
     /// "module\x00name").
-    pub func_sig_index: FxHashMap<String, u16>,
+    pub func_sig_index: FxHashMap<crate::sema::Symbols::Sym, u16>,
     /// Bare function name → owning modules in registration order (bare-name
     /// resolution for `get_func_sig`: unique owner wins, contested → first).
     pub func_sig_owners: FxHashMap<String, Vec<String>>,
@@ -796,7 +799,10 @@ pub struct SemaResult {
     /// Constructor name → list of (type_def_index << 16 | ctor_index).
     /// Supports multiple types having same-named constructors (e.g. `FileKind.File`
     /// and `type File`); disambiguation is done by type context or qualified names.
-    pub ctor_def_index: FxHashMap<String, Vec<u32>>,
+    /// 名称驻留表(S1):Sym ↔ 字符串唯一身份,五张 Sym 键表的登记/读取通道。
+    pub symbols: crate::sema::Symbols::Symbols,
+
+    pub ctor_def_index: FxHashMap<crate::sema::Symbols::Sym, Vec<u32>>,
     /// Import alias table: short name → alias target.
     pub import_aliases: FxHashMap<String, AliasTarget>,
     /// Monomorphization instance table.
@@ -813,6 +819,17 @@ pub struct SemaResult {
     pub dynamic_ops: DynamicOpsRegistry,
     /// Call-site → instance mapping.
     pub call_instantiations: FxHashMap<u64, u32>,
+    /// Resolved constructor calls (NAME_RESOLUTION_PLAN S2): call-expr key →
+    /// Sym of the CONSTRUCTED TYPE's canonical name. Sema's single resolution
+    /// decision; the IR construct path consumes it FIRST — the string-keyed
+    /// scope lookups (and their registration-order / same-named-variant
+    /// hazards) become a measured fallback.
+    pub ctor_resolutions: FxHashMap<u64, crate::sema::Symbols::Sym>,
+    /// Resolved method-dispatch targets (S4): call-expr key →
+    /// (type_def_idx, method_idx)。Sema's single dispatch resolution for
+    /// `recv.method(...)`; IR path-2 consumes it FIRST — the name-based
+    /// method_idx lookup becomes a measured fallback.
+    pub dispatch_targets: FxHashMap<u64, (u16, u16)>,
     /// Field-access metadata (global; key = AST `field_access` Expr handle
     /// address).
     pub field_accesses: FxHashMap<u64, FieldAccessInfo>,
@@ -825,7 +842,7 @@ pub struct SemaResult {
     /// Field ID map (key = "type_name\x00field_name" → field_id).
     /// ADT/newtype/error_newtype: `__tag=0`, fields start at 1.
     /// Record: fields in declaration order, 0..N-1.
-    pub field_id_map: FxHashMap<String, u16>,
+    pub field_id_map: FxHashMap<crate::sema::Symbols::Sym, u16>,
     /// Witness table (static dispatch table for trait implementations).
     ///
     /// Maintained by `InferContext` during sema checking and accumulated across
@@ -840,6 +857,14 @@ pub struct SemaResult {
     /// key in this set, so the IR compiler omits the recv (`Duration.from_millis(100)`
     /// → `from_millis(100)` rather than `from_millis(Duration, 100)`).
     pub module_func_recv_exprs: FxHashSet<u64>,
+    /// Module-qualified call targets (root fix for module short-name
+    /// collisions): recv expr key → the import-resolved module LOGICAL path
+    /// ("sub.Parse"). Sema's Path 0a resolves the qualifier through the
+    /// import binding (env-aware, unambiguous); IR consumes this to bind
+    /// `Parse.parse(...)` by the full mangled key instead of the contested
+    /// short key, so a user module named like a std module no longer errors
+    /// or misbinds (BOOTSTRAP 1C).
+    pub module_func_call_targets: FxHashMap<u64, Box<str>>,
     /// Module-constant-access recv ExprId key → mangled name
     /// (module_path.field).
     ///
@@ -930,6 +955,7 @@ impl SemaResult {
             type_defs: FxHashMap::default(),
             next_type_def_id: 0,
             type_def_index: FxHashMap::default(),
+            symbols: crate::sema::Symbols::Symbols::new(),
             type_id_to_name: FxHashMap::default(),
             current_module_name: String::new(),
             module_imports: FxHashMap::default(),
@@ -954,6 +980,8 @@ impl SemaResult {
             inherited_method_instances: Vec::new(),
             dynamic_ops: DynamicOpsRegistry::new(),
             call_instantiations: FxHashMap::default(),
+            ctor_resolutions: FxHashMap::default(),
+            dispatch_targets: FxHashMap::default(),
             field_accesses: FxHashMap::default(),
             method_dispatches: FxHashMap::default(),
             reflect_metas: FxHashMap::default(),
@@ -961,6 +989,7 @@ impl SemaResult {
             field_id_map: FxHashMap::default(),
             witness_table: WitnessTable::new(),
             module_func_recv_exprs: FxHashSet::default(),
+            module_func_call_targets: FxHashMap::default(),
             module_const_recv_exprs: FxHashMap::default(),
             pattern_ctor_types: FxHashMap::default(),
             captures: FxHashMap::default(),
@@ -1055,7 +1084,7 @@ impl SemaResult {
         // ANOTHER module (possible only for bare std keys — two std modules
         // declaring the same bare type) or a same-module re-registration
         // (the populate pipeline runs twice per module — idempotent no-op).
-        if let Some(&existing_idx) = self.type_def_index.get(def.name.as_ref()) {
+        if let Some(existing_idx) = self.type_def_idx(def.name.as_ref()) {
             let existing_module = self
                 .module_ownership
                 .type_def_indices
@@ -1092,12 +1121,9 @@ impl SemaResult {
         // types are appended to the multi-map entry).
         for (ci, ctor) in def.constructors.iter().enumerate() {
             let packed_idx: u32 = ((idx as u32) << 16) | (ci as u32);
-            self.ctor_def_index
-                .entry(ctor.name.to_string())
-                .or_default()
-                .push(packed_idx);
+            self.ctor_def_push(ctor.name.as_ref(), packed_idx);
         }
-        self.type_def_index.insert(def.name.to_string(), idx);
+        self.type_def_set(def.name.as_ref(), idx);
         // Record module ownership for incremental purge (type_def index).
         self.module_ownership.type_def_indices
             .entry(module_name.to_string())
@@ -1163,7 +1189,8 @@ impl SemaResult {
     /// Build the `field_id_map` key and insert it (overwrites if already present).
     fn put_field_id(&mut self, type_name: &str, field_name: &str, field_id: u16, module_name: &str) {
         let key = Self::make_field_key(type_name, field_name);
-        self.field_id_map.insert(key.clone(), field_id);
+        let ks = self.symbols.intern(&key);
+        self.field_id_map.insert(ks, field_id);
         // Record module ownership for incremental purge (field_id_map key).
         self.module_ownership.field_id_keys
             .entry(module_name.to_string())
@@ -1175,7 +1202,7 @@ impl SemaResult {
     /// Key = "type_name\x00field_name".
     pub fn lookup_field_id(&self, type_name: &str, field_name: &str) -> Option<u16> {
         let key = Self::make_field_key(type_name, field_name);
-        self.field_id_map.get(&key).copied()
+        self.symbols.find(&key).and_then(|s| self.field_id_map.get(&s).copied())
     }
 
     /// Look up a type definition by name (concrete array names map to the
@@ -1190,7 +1217,7 @@ impl SemaResult {
     pub fn get_type_def(&self, name: &str) -> Option<&TypeDefInfo> {
         let key = Self::canonical_type_name(name);
         let resolved = self.resolve_type_key(key);
-        let idx = *self.type_def_index.get(&resolved)?;
+        let idx = self.type_def_idx(&resolved)?;
         self.type_defs.get(&idx)
     }
 
@@ -1206,18 +1233,141 @@ impl SemaResult {
     ///   4. a globally unique user type with this bare name (dep-module
     ///      references written bare, the legacy flat-table visibility);
     ///   5. bare fallback (unknown/builtin scalars — error recovery paths).
+    // ── Sym 键表访问(NAME_RESOLUTION_PLAN S1)──
+    // 写入路径驻留(intern),读取路径只查(find)——语义与原 String 键
+    // 完全一致:键没登记过就是 miss。
+
+    /// Record sema's constructor-call resolution (S2). Key mirrors
+    /// expr_types/method_dispatches: instantiation-mode replays key by the
+    /// instance's declaring module.
+    // ── S3 显式上下文变体:IR 期调用 ──
+    // IR 读取 sema 的 ambient current_module_name 是陈旧值(最后检查的模块)。
+    // IR 侧一律传自己的 current_module().name。
+
+    /// get_type_def with an explicit module context (IR-time safe).
+    pub fn get_type_def_in(&self, module: &str, name: &str) -> Option<&TypeDefInfo> {
+        let key = Self::canonical_type_name(name);
+        let resolved = self.resolve_type_key_in(module, key);
+        let idx = self.type_def_idx(&resolved)?;
+        self.type_defs.get(&idx)
+    }
+
+    /// lookup_method_idx with an explicit module context (IR-time safe).
+    pub fn lookup_method_idx_in(&self, module: &str, type_name: &str, method_name: &str) -> Option<u16> {
+        let key = Self::canonical_type_name(type_name);
+        let idx = match self
+            .type_def_idx(&self.resolve_type_key_in(module, key))
+            .or_else(|| self.type_def_idx(key))
+        {
+            Some(i) => i,
+            None => return None,
+        };
+        self.type_defs
+            .get(&idx)?
+            .methods
+            .iter()
+            .position(|m| m.name.as_ref() == method_name)
+            .map(|p| p as u16)
+    }
+
+    /// get_trait_def with an explicit module context (IR-time safe).
+    pub fn get_trait_def_in(&self, module: &str, name: &str) -> Option<&TraitDefInfo> {
+        let resolved = self.resolve_trait_key_in(module, name);
+        let idx = self.trait_def_idx(&resolved)?;
+        self.trait_defs.get(&idx)
+    }
+
+    /// Record sema's method-dispatch resolution (S4). Key mirrors
+    /// expr_types/ctor_resolutions (instantiation replays key by the
+    /// instance's declaring module).
+    pub fn record_dispatch_target(&mut self, module_name: &str, expr_id: u64, type_idx: u16, method_idx: u16) {
+        self.dispatch_targets
+            .insert(crate::sema::Sema::module_expr_key(module_name, expr_id), (type_idx, method_idx));
+    }
+
+    pub fn record_ctor_resolution(&mut self, module_name: &str, expr_id: u64, canonical_type: &str) {
+        let sym = self.symbols.intern(canonical_type);
+        self.ctor_resolutions
+            .insert(crate::sema::Sema::module_expr_key(module_name, expr_id), sym);
+    }
+
+    pub fn type_def_idx(&self, name: &str) -> Option<u16> {
+        self.symbols.find(name).and_then(|s| self.type_def_index.get(&s).copied())
+    }
+    pub fn type_def_has(&self, name: &str) -> bool {
+        self.type_def_idx(name).is_some()
+    }
+    pub fn type_def_set(&mut self, name: &str, idx: u16) {
+        let s = self.symbols.intern(name);
+        self.type_def_index.insert(s, idx);
+    }
+    pub fn type_def_remove(&mut self, name: &str) {
+        if let Some(s) = self.symbols.find(name) {
+            self.type_def_index.remove(&s);
+        }
+    }
+    pub fn trait_def_has(&self, name: &str) -> bool {
+        self.symbols.find(name).map(|s| self.trait_def_index.contains_key(&s)).unwrap_or(false)
+    }
+    pub fn trait_def_idx(&self, name: &str) -> Option<u16> {
+        self.symbols.find(name).and_then(|s| self.trait_def_index.get(&s).copied())
+    }
+    pub fn trait_def_set(&mut self, name: &str, idx: u16) {
+        let s = self.symbols.intern(name);
+        self.trait_def_index.insert(s, idx);
+    }
+    pub fn func_sig_has(&self, key: &str) -> bool {
+        self.symbols.find(key).map(|s| self.func_sig_index.contains_key(&s)).unwrap_or(false)
+    }
+    pub fn func_sig_idx(&self, key: &str) -> Option<u16> {
+        self.symbols.find(key).and_then(|s| self.func_sig_index.get(&s).copied())
+    }
+    pub fn func_sig_set(&mut self, key: &str, idx: u16) {
+        let s = self.symbols.intern(key);
+        self.func_sig_index.insert(s, idx);
+    }
+    pub fn ctor_def_has(&self, name: &str) -> bool {
+        self.symbols.find(name).map(|s| self.ctor_def_index.contains_key(&s)).unwrap_or(false)
+    }
+    pub fn ctor_def_list(&self, name: &str) -> Option<&Vec<u32>> {
+        self.symbols.find(name).and_then(|s| self.ctor_def_index.get(&s))
+    }
+    pub fn ctor_def_push(&mut self, name: &str, packed: u32) {
+        let s = self.symbols.intern(name);
+        self.ctor_def_index.entry(s).or_default().push(packed);
+    }
+    /// field_id_map 键是 "type<NUL>field" 复合串;构造与查询统一走此口。
+    pub fn field_id_of(&self, type_name: &str, field: &str) -> Option<u16> {
+        let key = format!("{}\u{0}{}", type_name, field);
+        self.symbols.find(&key).and_then(|s| self.field_id_map.get(&s).copied())
+    }
+    pub fn field_id_put(&mut self, type_name: &str, field: &str, id: u16) {
+        let key = format!("{}\u{0}{}", type_name, field);
+        let s = self.symbols.intern(&key);
+        self.field_id_map.insert(s, id);
+    }
+
     pub fn resolve_type_key_in(&self, module_name: &str, bare: &str) -> String {
-        // A dotted input is already a canonical (module-qualified) name:
-        // exact hit or pass through unchanged (std keys are bare, so a dotted
-        // miss is an unknown/forward reference — bare-key behavior).
+        // A dotted input is either an internal canonical (module-qualified)
+        // name or a source-qualified path (`A.Point`): exact key first, then
+        // the source spelling mapped through its module qualifier (imports →
+        // std/builtin prefix → globally unique user module). Unmapped
+        // spellings pass through unchanged (unknown/forward reference —
+        // bare-key behavior).
         if bare.contains('.') {
+            if self.type_def_has(bare) {
+                return bare.to_string();
+            }
+            if let Some(key) = self.map_qualified_key_in(module_name, bare) {
+                return key;
+            }
             return bare.to_string();
         }
         // 1. Own module — local `type List` shadows the std type. The
         //    pending set covers forward references during populate (declared
         //    but not yet registered).
         let own = canonical_type_key(module_name, bare);
-        if self.type_def_index.contains_key(&own)
+        if self.type_def_has(&own)
             || (own != bare && self.pending_own_types.contains(bare))
         {
             return own;
@@ -1226,26 +1376,27 @@ impl SemaResult {
         if let Some(imports) = self.module_imports.get(module_name) {
             for path in imports {
                 let key = format!("{}.{}", path, bare);
-                if self.type_def_index.contains_key(&key) {
+                if self.type_def_has(&key) {
                     return key;
                 }
             }
         }
         // 3. std/builtin bare key — one std tree occupies bare names.
-        if self.type_def_index.contains_key(bare) {
+        if self.type_def_has(bare) {
             return bare.to_string();
         }
         // 4. A globally unique user type with this bare name (dep-module
         //    references written bare — the legacy flat-table visibility).
         //    Contested names fall through to the bare fallback.
-        let mut unique: Option<&String> = None;
-        for key in self.type_def_index.keys() {
+        let mut unique: Option<String> = None;
+        for (&ksym, _) in self.type_def_index.iter() {
+            let key = self.symbols.resolve(ksym);
             if key.contains('.') && key.rsplit('.').next() == Some(bare) {
                 if unique.is_some() {
                     unique = None;
                     break;
                 }
-                unique = Some(key);
+                unique = Some(key.to_string());
             }
         }
         if let Some(key) = unique {
@@ -1261,15 +1412,66 @@ impl SemaResult {
         self.resolve_type_key_in(&self.current_module_name, bare)
     }
 
+    /// Resolve a source module qualifier (`A`, `std.collections`) to its
+    /// canonical anchor: imported user modules first (declaration order,
+    /// mirroring the bare chain's import step), then std/builtin prefixes
+    /// (whose types register under bare keys — `is_std = true`), then a
+    /// globally unique user module tail match. `None` when the qualifier
+    /// names no module (contested tail matches stay unresolved too).
+    pub(in crate::sema) fn resolve_module_qualifier(&self, module_name: &str, qual: &str) -> Option<(String, bool)> {
+        if let Some(imports) = self.module_imports.get(module_name) {
+            for path in imports {
+                if path == qual || path.ends_with(&format!(".{}", qual)) {
+                    return Some((anchored_logical_path(path).to_string(), false));
+                }
+            }
+        }
+        if qual == "std" || qual.starts_with("std.")
+            || qual == "builtin" || qual.starts_with("builtin.")
+        {
+            return Some((String::new(), true));
+        }
+        let mut unique: Option<&String> = None;
+        for lp in &self.user_module_paths {
+            if lp == qual || lp.ends_with(&format!(".{}", qual)) {
+                if unique.is_some() {
+                    return None;
+                }
+                unique = Some(lp);
+            }
+        }
+        unique.map(|lp| (anchored_logical_path(lp).to_string(), false))
+    }
+
+    /// Map a source-qualified key (`A.Point`, `std.collections.List`) to its
+    /// canonical registration key: last segment = bare type/trait name,
+    /// prefix = module qualifier (`resolve_module_qualifier`).
+    fn map_qualified_key_in(&self, module_name: &str, dotted: &str) -> Option<String> {
+        let pos = dotted.rfind('.')?;
+        let (qual, tail) = (&dotted[..pos], &dotted[pos + 1..]);
+        match self.resolve_module_qualifier(module_name, qual)? {
+            (_, true) => Some(tail.to_string()),
+            (anchor, false) => Some(format!("{}.{}", anchor, tail)),
+        }
+    }
+
     /// Module-scoped bare-name → canonical TRAIT key resolution (the trait
     /// twin of `resolve_type_key_in`; own-pending covers forward-referenced
     /// parents and impl bounds).
     pub fn resolve_trait_key_in(&self, module_name: &str, bare: &str) -> String {
+        // Dotted: canonical exact hit, else source-qualified spelling mapped
+        // through its module qualifier (the `resolve_type_key_in` twin).
         if bare.contains('.') {
+            if self.trait_def_has(bare) {
+                return bare.to_string();
+            }
+            if let Some(key) = self.map_qualified_key_in(module_name, bare) {
+                return key;
+            }
             return bare.to_string();
         }
         let own = canonical_type_key(module_name, bare);
-        if self.trait_def_index.contains_key(&own)
+        if self.trait_def_has(&own)
             || (own != bare && self.pending_own_traits.contains(bare))
         {
             return own;
@@ -1277,26 +1479,27 @@ impl SemaResult {
         if let Some(imports) = self.module_imports.get(module_name) {
             for path in imports {
                 let key = format!("{}.{}", path, bare);
-                if self.trait_def_index.contains_key(&key) {
+                if self.trait_def_has(&key) {
                     return key;
                 }
             }
         }
-        if self.trait_def_index.contains_key(bare) {
+        if self.trait_def_has(bare) {
             return bare.to_string();
         }
-        let mut unique: Option<&String> = None;
-        for key in self.trait_def_index.keys() {
+        let mut unique: Option<String> = None;
+        for (&ksym, _) in self.trait_def_index.iter() {
+            let key = self.symbols.resolve(ksym);
             if key.contains('.') && key.rsplit('.').next() == Some(bare) {
                 if unique.is_some() {
                     unique = None;
                     break;
                 }
-                unique = Some(key);
+                unique = Some(key.to_string());
             }
         }
         if let Some(key) = unique {
-            return key.clone();
+            return key;
         }
         bare.to_string()
     }
@@ -1364,7 +1567,7 @@ impl SemaResult {
         // constructor shares the type's name — the ctor map is keyed by the
         // bare ctor name, so retry with the stripped tail and pick the entry
         // whose OWNING type matches the canonical name.
-        if let Some(list) = self.ctor_def_index.get(name) {
+        if let Some(list) = self.ctor_def_list(name) {
             if let Some(&packed_idx) = list.first() {
                 let type_idx = (packed_idx >> 16) as u16;
                 let ctor_idx = (packed_idx & 0xFFFF) as u16;
@@ -1378,11 +1581,25 @@ impl SemaResult {
             return None;
         }
         let bare = name.rsplit('.').next()?;
-        for &packed_idx in self.ctor_def_index.get(bare)? {
+        // Source-qualified spelling (`A.TEf`): candidates whose OWNING type
+        // lives in the qualifier's module. Canonical exact match (internal
+        // dotted names) is kept first.
+        let qual = &name[..name.len() - bare.len() - 1];
+        let mod_anchor = self.resolve_module_qualifier(&self.current_module_name, qual);
+        for &packed_idx in self.ctor_def_list(bare)? {
             let type_idx = (packed_idx >> 16) as u16;
             let ctor_idx = (packed_idx & 0xFFFF) as u16;
             if let Some(def) = self.type_defs.get(&type_idx) {
-                if def.name.as_ref() == name {
+                let dn = def.name.as_ref();
+                let in_module = match &mod_anchor {
+                    // std/builtin: owning type names are bare.
+                    Some((_, true)) => !dn.contains('.'),
+                    Some((anchor, false)) => dn
+                        .strip_prefix(anchor.as_str())
+                        .is_some_and(|r| r.starts_with('.')),
+                    None => false,
+                };
+                if dn == name || in_module {
                     return def.constructors.get(ctor_idx as usize);
                 }
             }
@@ -1395,7 +1612,7 @@ impl SemaResult {
     /// when different types share the same constructor name (e.g. `FileKind.File`
     /// and `type File`).
     pub fn get_ctor_defs(&self, name: &str) -> Vec<&CtorDefInfo> {
-        match self.ctor_def_index.get(name) {
+        match self.ctor_def_list(name) {
             Some(indices) => indices
                 .iter()
                 .filter_map(|&packed_idx| {
@@ -1437,7 +1654,7 @@ impl SemaResult {
     /// (same-module re-population lands here and is a silent no-op, exactly
     /// like the macro version).
     pub fn put_trait_def(&mut self, def: TraitDefInfo) -> bool {
-        if self.trait_def_index.contains_key(def.name.as_ref()) {
+        if self.trait_def_has(def.name.as_ref()) {
             return false;
         }
         assert!(
@@ -1446,7 +1663,7 @@ impl SemaResult {
         );
         let idx = self.next_trait_def_id;
         self.next_trait_def_id += 1;
-        self.trait_def_index.insert(def.name.to_string(), idx);
+        self.trait_def_set(def.name.as_ref(), idx);
         self.trait_defs.insert(idx, def);
         true
     }
@@ -1456,7 +1673,7 @@ impl SemaResult {
     /// std/builtin bare key, then a unique global user trait.
     pub fn get_trait_def(&self, name: &str) -> Option<&TraitDefInfo> {
         let resolved = self.resolve_trait_key(name);
-        let idx = *self.trait_def_index.get(&resolved)?;
+        let idx = self.trait_def_idx(&resolved)?;
         self.trait_defs.get(&idx)
     }
 
@@ -1484,7 +1701,7 @@ impl SemaResult {
     /// `next_func_sig_id` and never recycles.
     pub fn put_func_sig(&mut self, sig: FuncSigInfo) -> bool {
         let qualified = Self::func_sig_qualified_key(&sig.module_name, &sig.name);
-        if self.func_sig_index.contains_key(&qualified) {
+        if self.func_sig_has(&qualified) {
             return false;
         }
         assert!(
@@ -1497,7 +1714,7 @@ impl SemaResult {
             .entry(sig.name.to_string())
             .or_default()
             .push(sig.module_name.to_string());
-        self.func_sig_index.insert(qualified, idx);
+        self.func_sig_set(&qualified, idx);
         self.func_sigs.insert(idx, sig);
         true
     }
@@ -1513,9 +1730,7 @@ impl SemaResult {
             return None;
         }
         let module = owners.first()?;
-        let idx = *self
-            .func_sig_index
-            .get(&Self::func_sig_qualified_key(module, name))?;
+        let idx = self.func_sig_idx(&Self::func_sig_qualified_key(module, name))?;
         self.func_sigs.get(&idx)
     }
 
@@ -1528,9 +1743,7 @@ impl SemaResult {
             Some(owners) => owners
                 .iter()
                 .filter_map(|m| {
-                    let idx = *self
-                        .func_sig_index
-                        .get(&Self::func_sig_qualified_key(m, name))?;
+                    let idx = self.func_sig_idx(&Self::func_sig_qualified_key(m, name))?;
                     self.func_sigs.get(&idx)
                 })
                 .collect(),
@@ -1539,18 +1752,15 @@ impl SemaResult {
 
     /// Module-qualified lookup — the exact signature of `module`'s `name`.
     pub fn get_func_sig_in(&self, module: &str, name: &str) -> Option<&FuncSigInfo> {
-        let idx = *self
-            .func_sig_index
-            .get(&Self::func_sig_qualified_key(module, name))?;
+        let idx = self.func_sig_idx(&Self::func_sig_qualified_key(module, name))?;
         self.func_sigs.get(&idx)
     }
 
     /// Record that a func_sig belongs to a module (for incremental purge).
     /// Looks up the current index by (module, name); call after a successful `put_func_sig`.
     pub fn record_func_sig_owner(&mut self, name: &str, module_name: &str) {
-        if let Some(&idx) = self
-            .func_sig_index
-            .get(&Self::func_sig_qualified_key(module_name, name))
+        if let Some(idx) = self
+            .func_sig_idx(&Self::func_sig_qualified_key(module_name, name))
         {
             self.module_ownership.func_sig_indices
                 .entry(module_name.to_string())
@@ -1562,7 +1772,7 @@ impl SemaResult {
     /// Record that a trait_def belongs to a module (for incremental purge).
     /// Looks up the current index by name; call after a successful `put_trait_def`.
     pub fn record_trait_def_owner(&mut self, name: &str, module_name: &str) {
-        if let Some(&idx) = self.trait_def_index.get(name) {
+        if let Some(idx) = self.trait_def_idx(name) {
             self.module_ownership.trait_def_indices
                 .entry(module_name.to_string())
                 .or_default()
@@ -1578,20 +1788,35 @@ impl SemaResult {
     /// The IR layer uses (type_id, method_idx) to look up the subgraph in
     /// `method_subgraphs`. Returning `None` means the type has no such method
     /// (it may be a trait default method; consult the witness_table).
+    /// Method-index lookup by dynamic type_id — unambiguous (no name
+    /// resolution, no module context). The fallback for name-based lookups
+    /// when the global `current_module_name` is stale (IR-time dispatch for
+    /// a module other than the last-checked one).
+    pub fn lookup_method_idx_by_type_id(&self, type_id: u16, method_name: &str) -> Option<u16> {
+        if type_id < FIRST_DYNAMIC_TYPE_ID {
+            return None;
+        }
+        let idx = type_def_index_of(type_id);
+        self.type_defs
+            .get(&idx)?
+            .methods
+            .iter()
+            .position(|m| m.name.as_ref() == method_name)
+            .map(|p| p as u16)
+    }
+
     pub fn lookup_method_idx(&self, type_name: &str, method_name: &str) -> Option<u16> {
-        // Module-scoped: bare AST names resolve to their canonical key
-        // (exact canonical keys hit directly).
+        // Module-scoped: bare AST names resolve to their canonical key.
+        // Resolve FIRST (own module → imports → std bare → unique user): a
+        // bare key held by a STD type (e.g. std.json's `Parser`) used to win
+        // the old exact-hit fast path and hijack every same-named USER type
+        // — method dispatch then read the std twin's (empty) method table
+        // and every implicit-this sibling call failed to compile.
         let key = Self::canonical_type_name(type_name);
-        let key = match self.type_def_index.get(key) {
-            Some(&idx) => idx,
-            None => {
-                let resolved = self.resolve_type_key(key);
-                if resolved == key {
-                    return None;
-                }
-                *self.type_def_index.get(&resolved)?
-            }
-        };
+        let key = self
+            .type_def_idx(&self.resolve_type_key(key))
+            .or_else(|| self.type_def_idx(key))?;
+
         let type_def = &self.type_defs[&key];
         type_def
             .methods
@@ -1641,9 +1866,8 @@ impl SemaResult {
         method_name: &str,
     ) -> MethodBinding {
         let declared = self
-            .type_def_index
-            .get(type_name)
-            .and_then(|&idx| self.type_defs.get(&idx))
+            .type_def_idx(type_name)
+            .and_then(|idx| self.type_defs.get(&idx))
             .and_then(|td| td.methods.iter().find(|m| m.name.as_ref() == method_name));
         let mut providers: Vec<Box<str>> = Vec::new();
         for t in implemented_traits {
@@ -1725,6 +1949,7 @@ impl SemaResult {
                 self.reflect_metas.remove(k);
                 self.call_instantiations.remove(k);
                 self.module_func_recv_exprs.remove(k);
+                self.module_func_call_targets.remove(k);
                 self.module_const_recv_exprs.remove(k);
                 self.super_dispatches.remove(k);
             }
@@ -1748,16 +1973,18 @@ impl SemaResult {
         if let Some(indices) = self.module_ownership.type_def_indices.remove(module_name) {
             for idx in indices {
                 if let Some(def) = self.type_defs.remove(&idx) {
-                    self.type_def_index.remove(def.name.as_ref());
+                    self.type_def_remove(def.name.as_ref());
                     // Remove the type_id → name reverse-index entry.
                     let type_id = dynamic_type_id(idx);
                     self.type_id_to_name.remove(&type_id);
                     // Remove constructor entries from ctor_def_index
                     for ctor in &def.constructors {
-                        if let Some(vec) = self.ctor_def_index.get_mut(ctor.name.as_ref()) {
-                            vec.retain(|&packed| (packed >> 16) as u16 != idx);
-                            if vec.is_empty() {
-                                self.ctor_def_index.remove(ctor.name.as_ref());
+                        if let Some(sym) = self.symbols.find(ctor.name.as_ref()) {
+                            if let Some(vec) = self.ctor_def_index.get_mut(&sym) {
+                                vec.retain(|&packed| (packed >> 16) as u16 != idx);
+                                if vec.is_empty() {
+                                    self.ctor_def_index.remove(&sym);
+                                }
                             }
                         }
                     }
@@ -1770,9 +1997,12 @@ impl SemaResult {
             for idx in indices {
                 if let Some(sig) = self.func_sigs.remove(&idx) {
                     // Qualified key + owner-list cleanup (see put_func_sig).
-                    self.func_sig_index.remove(
-                        Self::func_sig_qualified_key(&sig.module_name, &sig.name).as_str(),
-                    );
+                    if let Some(sym) = self
+                        .symbols
+                        .find(&Self::func_sig_qualified_key(&sig.module_name, &sig.name))
+                    {
+                        self.func_sig_index.remove(&sym);
+                    }
                     if let Some(owners) = self.func_sig_owners.get_mut(sig.name.as_ref()) {
                         owners.retain(|m| m != sig.module_name.as_ref());
                         if owners.is_empty() {
@@ -1787,7 +2017,9 @@ impl SemaResult {
         if let Some(indices) = self.module_ownership.trait_def_indices.remove(module_name) {
             for idx in indices {
                 if let Some(def) = self.trait_defs.remove(&idx) {
-                    self.trait_def_index.remove(def.name.as_ref());
+                    if let Some(sym) = self.symbols.find(def.name.as_ref()) {
+                        self.trait_def_index.remove(&sym);
+                    }
                 }
             }
         }
@@ -1795,7 +2027,9 @@ impl SemaResult {
         // field_id_map
         if let Some(keys) = self.module_ownership.field_id_keys.remove(module_name) {
             for k in keys {
-                self.field_id_map.remove(&k);
+                if let Some(sym) = self.symbols.find(&k) {
+                    self.field_id_map.remove(&sym);
+                }
             }
         }
 
@@ -1924,7 +2158,7 @@ macro_rules! define_builtin_types {
                 type_params: &[&str],
                 methods: Vec<MethodSigInfo>,
             ) {
-                if sema_result.type_def_index.contains_key(type_name) {
+                if sema_result.type_def_has(type_name) {
                     return; // Already registered (e.g. user stdlib declared a same-named type block).
                 }
                 let def = TypeDefInfo {
@@ -2058,8 +2292,9 @@ fn type_handle_name_matches(arena: &TypeArena, h: TypeHandle, name: &str) -> boo
         Type::Trait(_) => arena.trait_parts(h).0 == name,
         // Other types (including built-in generics Throw/Channel/Async/Lazy/Atomic/
         // Sender/Receiver/Timer and scalars/str/void) uniformly go through
-        // `ty.name()`, the single source of truth.
-        ty => ty.name() == name,
+        // `ty.source_name()`: the name being matched is a user-written identifier,
+        // so the source spelling is the single source of truth.
+        ty => ty.source_name() == name,
     }
 }
 
@@ -2178,11 +2413,13 @@ pub fn resolve_type_node_resolved<'a>(
         }
         TypeNode::RefType { inner } => {
             let inner_name = type_name_from_node(Some(*inner), ast).unwrap_or("ref");
-            arena.make_adt(inner_name.into(), Box::new([]))
+            let canonical = sema_result.resolve_type_key(inner_name);
+            arena.make_adt(canonical.into(), Box::new([]))
         }
         TypeNode::RawPtr { inner } => {
             let inner_name = type_name_from_node(Some(*inner), ast).unwrap_or("ptr");
-            arena.make_adt(inner_name.into(), Box::new([]))
+            let canonical = sema_result.resolve_type_key(inner_name);
+            arena.make_adt(canonical.into(), Box::new([]))
         }
         TypeNode::Record { .. } => arena.make_record(Vec::<FieldType>::new().into_boxed_slice(), None),
         TypeNode::Function { .. } => {
@@ -2671,7 +2908,7 @@ fn expand_inherited_methods<'a>(
             continue;
         }
         let canonical_name: Box<str> = sema_result.resolve_type_key(name).into();
-        let Some(&child_idx) = sema_result.type_def_index.get(canonical_name.as_ref()) else {
+        let Some(child_idx) = sema_result.type_def_idx(canonical_name.as_ref()) else {
             continue;
         };
         let child_type_id = crate::types::dynamic_type_id(child_idx);
@@ -2811,7 +3048,7 @@ fn expand_inherited_methods<'a>(
                         .unwrap_or_default();
                     let pairs = inheritance_bound_repr_pairs(b, &base_sig_params, &module.arena);
                     if !pairs.is_empty() {
-                        if let Some(&child_idx2) = sema_result.type_def_index.get(canonical_name.as_ref()) {
+                        if let Some(child_idx2) = sema_result.type_def_idx(canonical_name.as_ref()) {
                             if let Some(d) = sema_result.type_defs.get_mut(&child_idx2) {
                                 if let Some(sig) = d.methods.last_mut() {
                                     let pt: Vec<TypeRepr> = sig
@@ -2859,6 +3096,15 @@ pub fn module_logical_path(name: &str) -> Option<String> {
     Some(path.replace('/', "."))
 }
 
+/// Anchor a module logical path at its last `src` segment
+/// (`F:/…/pkg/src.Main` → `src.Main`); already-anchored paths pass through.
+fn anchored_logical_path(lp: &str) -> &str {
+    match lp.rfind(".src.") {
+        Some(pos) => &lp[pos + 1..],
+        None => lp,
+    }
+}
+
 /// Canonical registration key for a type declared in `module_name`.
 ///
 /// Module-scoped type identity: user-module types are registered under a
@@ -2877,17 +3123,7 @@ pub fn canonical_type_key(module_name: &str, bare: &str) -> String {
         return bare.to_string();
     }
     match module_logical_path(module_name) {
-        Some(mp) => {
-            // Normalize the prefix to the package-relative form: the entry
-            // module's loader key may be an absolute OS path
-            // (`F:/…/pkg/src/Main.frond`); the type identity anchors at the
-            // last `src` path segment → `src.Main`.
-            let prefix = match mp.rfind(".src.") {
-                Some(pos) => mp[pos + 1..].to_string(),
-                None => mp,
-            };
-            format!("{}.{}", prefix, bare)
-        }
+        Some(mp) => format!("{}.{}", anchored_logical_path(&mp), bare),
         None => bare.to_string(),
     }
 }
@@ -3072,8 +3308,17 @@ fn ast_method_to_func_sig<'a>(
     let sig = build_method_sig_info(arena, sema_result, method, ast);
     // Module-scoped: the AST type name resolves to its canonical key.
     let canonical = sema_result.resolve_type_key(type_name);
-    if let Some(&type_idx) = sema_result.type_def_index.get(canonical.as_str()) {
+    if let Some(type_idx) = sema_result.type_def_idx(canonical.as_str()) {
         if let Some(type_def) = sema_result.type_defs.get_mut(&type_idx) {
+            // Idempotent append (S3 / R4): populate runs 2-3x per module and
+            // this used to append every time — the method table carried
+            // duplicates (dump showed ArrayIter with three `next` entries)
+            // and positions drifted off the AST method_idx alignment.
+            // Method names are unique within a type: a name match means the
+            // registration already landed.
+            if type_def.methods.iter().any(|m| m.name == sig.name) {
+                return true;
+            }
             let mut methods_vec: Vec<MethodSigInfo> = type_def.methods.to_vec();
             methods_vec.push(sig);
             type_def.methods = methods_vec.into_boxed_slice();
@@ -3239,7 +3484,7 @@ pub(crate) fn ast_type_decl_to_type_def<'a>(
     let mut base_fields: Vec<(Box<str>, TypeHandle, bool, TypeRepr)> = Vec::new();
     // Full substituted ctor sets per base (multi-ctor ADT inheritance).
     let mut base_ctor_sets: Vec<Vec<CtorDefInfo>> = Vec::new();
-    let already_registered = sema_result.type_def_index.contains_key(name.as_ref());
+    let already_registered = sema_result.type_def_has(name.as_ref());
     for b in base_types.iter().take(if already_registered { 0 } else { usize::MAX }) {
         // Base names resolve module-scoped (own module → std → unique user),
         // so an inherited base with a std-colliding name still binds to the
@@ -3741,7 +3986,15 @@ pub(crate) fn concretize_type<'a>(
                         // Bare builtin generic name written without args.
                         arena.make(ty)
                     } else {
-                        arena.make_generic((*name).into(), Box::new([]))
+                        // Source-qualified spellings canonicalize so the
+                        // signature identity matches the registered key; bare
+                        // names keep their raw spelling (status quo).
+                        let key: Box<str> = if name.contains('.') {
+                            sema_result.resolve_type_key(name).into()
+                        } else {
+                            (*name).into()
+                        };
+                        arena.make_generic(key, Box::new([]))
                     }
                 }
             }
@@ -3778,8 +4031,11 @@ pub(crate) fn concretize_type<'a>(
             arena.make_array(elem, *size)
         }
         TypeNode::ThisType => {
+            // `This` is stored as an `Adt` with the detail name "This", so the
+            // match must be detail-aware (same as `resolve_type_node_resolved`);
+            // a bare `name()` compare would never match ("adt" != "This").
             for &ta in type_args {
-                if arena.get(ta).name() == "This" {
+                if type_handle_name_matches(arena, ta, "This") {
                     return ta;
                 }
             }

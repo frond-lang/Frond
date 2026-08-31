@@ -189,6 +189,67 @@ impl<'a> IrBuilder<'a> {
             }
         }
 
+        // Module-qualified nullary constructor VALUE: Module.Ctor (e.g. A.KOne).
+        // The recv Ident names a MODULE, not a type — the Type.Ctor probe above
+        // misses it and the access compiled as a plain field_get on the
+        // ModuleRef, producing a garbage value that later panicked
+        // non-exhaustive matches. Resolve through the ctor table by def_module.
+        if let crate::ast::Ast::Expr::Ident(seg) = &self.current_module().arena.expr(recv).node {
+            if let Some(packed_list) = self.sema.ctor_def_list(field) {
+                for &packed in packed_list.iter() {
+                    let type_idx = (packed >> 16) as u16;
+                    let ci = (packed & 0xffff) as usize;
+                    if let Some(def) = self.sema.type_defs.get(&type_idx) {
+                        let ctor = match def.constructors.get(ci) {
+                            Some(c) => c,
+                            None => continue,
+                        };
+                        // Match the recv's SHORT module name against the ctor's
+                        // declaring module. Qualified imports (`import sub.L`)
+                        // give the ctor a DEEP logical path ("sub.L") while the
+                        // call site still says `L` — a full-path-only match fell
+                        // through to a garbage field_get on the ModuleRef
+                        // (at_end-style variant comparisons then never matched).
+                        // Tail-segment match keeps short-name references
+                        // resolving under both import forms.
+                        let seg_str = seg.to_string();
+                        let same_module = crate::sema::Sema::module_logical_path(ctor.def_module.as_ref())
+                            .map(|mp| {
+                                mp == seg_str || mp.rsplit('.').next() == Some(seg)
+                            })
+                            .unwrap_or(false);
+                        if same_module && ctor.field_type_reprs.is_empty() {
+                            let field_names: Vec<Option<String>> = ctor
+                                .field_names
+                                .iter()
+                                .map(|n| n.as_deref().map(String::from))
+                                .collect();
+                            let kind = match def.kind {
+                                crate::sema::Sema::TypeDefKind::Adt => RecordLitKind::Adt,
+                                crate::sema::Sema::TypeDefKind::Record => RecordLitKind::Record,
+                                crate::sema::Sema::TypeDefKind::Newtype => RecordLitKind::Newtype,
+                                crate::sema::Sema::TypeDefKind::Alias => RecordLitKind::Record,
+                            };
+                            let inputs_offset = self.graph.inputs_pool.push(&[]);
+                            let node = self.graph.add_node(Node {
+                                kind: NodeKind::BinOp,
+                                input_count: 0,
+                                inputs_offset,
+                                compute_fn: CF_RECORD_CONSTRUCT,
+                            });
+                            self.graph.set_record_lit_info(node, RecordLitInfo {
+                                type_name: ctor.type_name.to_string(),
+                                field_names,
+                                constructor: ctor.name.to_string(),
+                                kind,
+                            });
+                            return node;
+                        }
+                    }
+                }
+            }
+        }
+
         // Cross-module constant access (Math.PI): sema has recorded the recv's expr key → mangled
         // name in module_const_recv_exprs. On a hit, skip recv compilation and look up the mangled
         // name in global_var_slots to emit compile_global_load, sharing the local global var path.

@@ -1,0 +1,651 @@
+// Loader.frond — 模块加载器(Stage 1 / 1C):Rust core/src/module/Loader.rs
+// 的行为镜像 + 两项超越(可观察行为不变,差分 12/12 为门禁):
+//
+// 超越① std-first 加载序:Rust 在依赖解析期跑兄弟回退 5b(逐个试探解析
+// 未载兄弟找导出,未命中者的解析被丢弃),force_load_std 又把这些文件
+// 再解析一遍 — 双重浪费。本侧先全量加载 std(终局反正要载),5b 退化
+// 为纯缓存查询,每个 std 文件恰解析一次。
+// 超越② 共享解析缓存(std_cache):parse 是纯函数、ModuleAst 载后只读,
+// loadmany 多入口共享一份 — N 入口的 std 解析量从 127×N 降为 127。
+//
+// 镜像口径(差分 oracle = `frond debug --stage load`,见 BOOTSTRAP_PLAN 1C):
+// - resolve_and_load 六步:cache → 已失败 → std 表(本侧 = std 根目录磁盘
+//   文件;Rust 侧是编译期 include_str! 内嵌,同一 checkout 内容一致)
+//   → 文件系统搜索路径 → 目录模块(4a std 盘 / 4b 搜索路径,pack.frond
+//   声明子模块递归解析)→ 兄弟符号回退(5a 已载 / 5b 按 BUILTIN→STD
+//   清单序)→ not_found;
+// - load_transitive_imports 显式栈后序:镜像 Rust 含"后声明先展开"的
+//   入栈序(栈顶弹出的正是最后一个 import);
+// - 之后强制加载全部 STD 清单(镜像 load_all_modules_or_exit,不含其
+//   process::exit)。
+//
+// 状态模型:Loader 各字段均为引用语义容器(Map/List),跨函数共享可变;
+// std_root 构造后不变。Map<str> 查找 ~200µs/op(风险表):1C 语料量级
+// (百级模块)无感,1E 若热再换整数键。
+
+import std.collections.List
+import std.collections.Map
+import std.io.Fs
+import std.io.Path
+import std.core.types.Str
+import syntax.Ast
+import syntax.Parse
+import module.StdPaths
+
+pub type LErr =
+    | NotFound(str)
+    | ParseFail(str, i64, i64, str)
+    | Circular(str)
+
+pub type Loaded = Loaded(pub module: ModuleAst, pub exports: List<str>)
+
+pub type Loader = Loader(
+    pub modules: Map<str, Loaded>,
+    pub search: List<str>,
+    pub errors: List<LErr>,
+    pub failed: List<str>,
+    pub std_root: str?,
+    // 跨入口共享的 std 解析缓存(键 = std 盘路径键,值 = 只读 ModuleAst)。
+    // 仅 std 路径使用;用户模块不走此缓存,保持逐入口独立语义。
+    pub std_cache: Map<str, ModuleAst>,
+)
+
+// ─── 小工具 ───────────────────────────────────────────────────────
+
+fun list_has(items: List<str>, key: str): bool {
+    var i: usize = 0
+    while i < items.len() {
+        if (items.get(i) ?? "") == key {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+fun str_join(parts: str[], sep: str): str {
+    var out = ""
+    var i: usize = 0
+    while i < parts.len() {
+        if i > 0 {
+            out = out + sep
+        }
+        out = out + parts[i]
+        i = i + 1
+    }
+    out
+}
+
+// 空基目录防护:"" + "/" + rel 会得到 "/rel"(盘根),Rust PathBuf 的
+// 行为是 "".join(rel) = rel。
+pub fun join_path(base: str, rel: str): str {
+    if base == "" {
+        rel
+    } else {
+        base + "/" + rel
+    }
+}
+
+pub fun module_path_to_file(segs: str[]): str {
+    val joined = str_join(segs, "/")
+    if Str.ends_with(joined, ".frond") {
+        joined
+    } else {
+        joined + ".frond"
+    }
+}
+
+fun strip_frond(path: str): str {
+    if Str.ends_with(path, ".frond") {
+        Str.substring(path, 0 as usize, path.len() - (6 as usize))
+    } else {
+        path
+    }
+}
+
+// "std/time/TimeComponents.frond" → "TimeComponents"(无则 null)。
+fun extract_last_segment(path: str): str? {
+    val idx = Path.last_index_of(path, '/')
+    val last = if idx >= 0 {
+        Str.substring(path, (idx + 1) as usize, path.len())
+    } else {
+        path
+    }
+    if Str.ends_with(last, ".frond") {
+        Str.substring(last, 0 as usize, last.len() - (6 as usize))
+    } else {
+        null
+    }
+}
+
+// "std/time/TimeComponents.frond" → "std/time/"。
+fun parent_directory(path: str): str {
+    val idx = Path.last_index_of(path, '/')
+    if idx >= 0 {
+        Str.substring(path, 0 as usize, (idx + 1) as usize)
+    } else {
+        ""
+    }
+}
+
+// std 盘文件映射:key "builtin/x" → <root>/builtin/x;key "std/x" → <root>/x
+// (磁盘布局:Frond/std/{builtin/**, 其余顶层即 std/**})。
+fun std_disk_path(std_root: str, key: str): str {
+    if Str.starts_with(key, "builtin/") {
+        std_root + "/" + key
+    } else {
+        std_root + "/" + Str.substring(key, 4 as usize, key.len())
+    }
+}
+
+pub async fun read_text(path_str: str): Async<str?> {
+    match Fs.read_file(Path.from(path_str)).await() {
+        Ok(t) => t
+        Error(_) => null
+    }
+}
+
+// ─── 声明遍历(镜像 collect_exports / collect_pack_submodules /
+///     collect_imports)─────────────────────────────────────────────
+
+pub fun collect_exports(m: ModuleAst): List<str> {
+    val out = List.empty<str>()
+    var i: usize = 0
+    while i < m.decls.len() {
+        val d = m.decls[i]
+        match d.decl {
+            FunDeclD(vis, name, _, _, _, _, _, _, _, _) => {
+                if vis == Pub {
+                    out.push(name)
+                }
+            },
+            TypeDeclD(vis, name, _, _, _, _, _) => {
+                if vis == Pub {
+                    out.push(name)
+                }
+            },
+            _ => {}
+        }
+        i = i + 1
+    }
+    out
+}
+
+pub fun collect_pack_submodules(m: ModuleAst): List<str> {
+    val out = List.empty<str>()
+    var i: usize = 0
+    while i < m.decls.len() {
+        val d = m.decls[i]
+        match d.decl {
+            PackDeclD(vis, name) => {
+                if vis == Pub {
+                    out.push(name)
+                }
+            },
+            _ => {}
+        }
+        i = i + 1
+    }
+    out
+}
+
+pub fun collect_imports(m: ModuleAst): List<str[]> {
+    val out = List.empty<str[]>()
+    var i: usize = 0
+    while i < m.decls.len() {
+        val d = m.decls[i]
+        match d.decl {
+            ImportDeclD(path, _, _) => {
+                out.push(path)
+            },
+            _ => {}
+        }
+        i = i + 1
+    }
+    out
+}
+
+fun parse_and_collect(path_key: str, source: str): Throw<Loaded, PErr> {
+    match Parse.parse_module_text(source, path_key) {
+        Ok(m) => Ok(Loaded(m, collect_exports(m)))
+        Error(e) => throw e
+    }
+}
+
+// ─── std 共享解析缓存路径 ─────────────────────────────────────────
+
+// 把(已解析的)std 模块装入本载器:modules 键由调用方给(步骤 3/预加载
+// 用文件键,4a 目录模块用原始 path_str,5b 用兄弟键)。
+fun install_std_module(loader: Loader, modules_key: str, m: ModuleAst): Loaded {
+    val loaded = Loaded(m, collect_exports(m))
+    loader.modules.set(modules_key, loaded)
+    loaded
+}
+
+// std 源解析(带共享缓存):缓存命中零解析;未缓存则解析并双写(共享
+// 缓存 + 返回)。解析失败按 err_path 记账(4a 的错误路径是原始
+// path_str 而非 pack 键 — 对齐 Rust)。use_cache=false 走 4b(用户盘
+// pack,不污染 std 缓存)。null = 失败(已记账)。
+fun std_or_parse(loader: Loader, use_cache: bool, cache_key: str, err_path: str,
+    src: str): ModuleAst? {
+    if use_cache {
+        match loader.std_cache.get(cache_key) {
+            null => {}
+            hit => { return hit }
+        }
+    }
+    match Parse.parse_module_text(src, cache_key) {
+        Ok(m) => {
+            if use_cache {
+                loader.std_cache.set(cache_key, m)
+            }
+            m
+        },
+        Error(e) => {
+            loader.failed.push(err_path)
+            loader.errors.push(ParseFail(err_path, e.line, e.column, e.message))
+            null
+        },
+    }
+}
+
+// ─── 加载器 ───────────────────────────────────────────────────────
+
+pub fun new_loader(std_root: str?, std_cache: Map<str, ModuleAst>): Loader {
+    Loader(Map.empty(), List.empty(), List.empty(), List.empty(), std_root, std_cache)
+}
+
+// builtin 预加载(镜像 Rust ModuleLoader::new 的 preload_builtins,同序;
+// 走共享缓存,多入口零重复解析)。
+pub async fun preload_builtins(loader: Loader): void {
+    match loader.std_root {
+        null => {}
+        root => {
+            val paths = StdPaths.builtin_paths()
+            var i: usize = 0
+            while i < paths.len() {
+                val path = paths[i]
+                match loader.std_cache.get(path) {
+                    null => {}
+                    hit => { install_std_module(loader, path, hit) }
+                }
+                if !loader.modules.has(path) {
+                    match read_text(std_disk_path(root, path)).await() {
+                        null => {
+                            // Rust 侧内嵌表必有此文件;读不到 = std 根接错,
+                            // 记 not_found 让差分立刻暴露。
+                            loader.failed.push(path)
+                            loader.errors.push(NotFound(path))
+                        },
+                        src => {
+                            match std_or_parse(loader, true, path, path, src) {
+                                null => {}
+                                m => { install_std_module(loader, path, m) }
+                            }
+                        },
+                    }
+                }
+                i = i + 1
+            }
+        },
+    }
+}
+
+// 解析 → 缓存;失败记账(镜像 parse_source 的两个出口)。
+fun cache_parsed(loader: Loader, path_str: str, source: str): Loaded? {
+    match parse_and_collect(path_str, source) {
+        Ok(loaded) => {
+            loader.modules.set(path_str, loaded)
+            loaded
+        },
+        Error(e) => {
+            loader.failed.push(path_str)
+            loader.errors.push(ParseFail(path_str, e.line, e.column, e.message))
+            null
+        },
+    }
+}
+
+pub async fun resolve_and_load(loader: Loader, segs: str[]): Async<Loaded?> {
+    val path_str = module_path_to_file(segs)
+
+    // 1. cache(已成功加载)
+    match loader.modules.get(path_str) {
+        null => {}
+        hit => { return hit }
+    }
+
+    // 2. 已失败路径:不重复记账,直接 miss
+    if list_has(loader.failed, path_str) {
+        return null
+    }
+
+    // 3. std 表(std 盘 + 共享解析缓存;双未命中才落到步骤 4)
+    match loader.std_root {
+        null => {}
+        root => {
+            match loader.std_cache.get(path_str) {
+                null => {
+                    match read_text(std_disk_path(root, path_str)).await() {
+                        null => {}
+                        src => {
+                            match std_or_parse(loader, true, path_str, path_str, src) {
+                                null => { return null }
+                                m => { return install_std_module(loader, path_str, m) }
+                            }
+                        },
+                    }
+                },
+                hit => { return install_std_module(loader, path_str, hit) },
+            }
+        },
+    }
+
+    // 4. 文件系统搜索路径(用户模块)
+    var b: usize = 0
+    while b < loader.search.len() {
+        val base = loader.search.get(b) ?? ""
+        match read_text(join_path(base, path_str)).await() {
+            null => {}
+            src => { return cache_parsed(loader, path_str, src) }
+        }
+        b = b + 1
+    }
+
+    // 4a/4b. 目录模块:path 指目录(含 pack.frond),非文件
+    val dir_name = strip_frond(path_str)
+
+    // 4a. std 盘目录模块(import std.math / std.core 形态;pack 走共享缓存)
+    match loader.std_root {
+        null => {}
+        root => {
+            val pack_key = dir_name + "/pack.frond"
+            match read_text(std_disk_path(root, pack_key)).await() {
+                null => {}
+                pack_src => {
+                    return load_dir_module(loader, path_str, dir_name, pack_key, pack_src, true).await()
+                }
+            }
+        },
+    }
+
+    // 4b. 搜索路径目录模块(import Store → Store/pack.frond;用户盘不进 std 缓存)
+    var b2: usize = 0
+    while b2 < loader.search.len() {
+        val base = loader.search.get(b2) ?? ""
+        match read_text(join_path(join_path(base, dir_name), "pack.frond")).await() {
+            null => {}
+            pack_src => {
+                return load_dir_module(loader, path_str, dir_name,
+                    dir_name + "/pack.frond", pack_src, false).await()
+            }
+        }
+        b2 = b2 + 1
+    }
+
+    // 5. 兄弟符号回退:末段可能是某兄弟模块导出的类型/符号
+    //    (import std.time.TimeComponents → TimeComponents 是
+    //     SystemTime.frond 的导出)。此形态不报错,符号经已载兄弟可见。
+    match extract_last_segment(path_str) {
+        null => {}
+        sym => {
+            val parent_prefix = parent_directory(path_str)
+
+            // 5a. 已载兄弟
+            var already = false
+            val keys = loader.modules.keys()
+            var k: usize = 0
+            while k < keys.len() {
+                val mk = keys[k]
+                match loader.modules.get(mk) {
+                    null => {}
+                    lm => {
+                        if Str.starts_with(mk, parent_prefix) && list_has(lm.exports, sym) {
+                            already = true
+                        }
+                    },
+                }
+                k = k + 1
+            }
+            if already {
+                loader.failed.push(path_str)
+                return null
+            }
+
+            // 5b. 未载兄弟:按 BUILTIN→STD 清单序找首个导出者并加载。
+            // std-first 编排下兄弟几乎总在缓存/已载 — 命中即零解析;
+            // miss 分支为防御路径(对齐 Rust:未导出者不入 modules、
+            // 解析失败静默跳过)。
+            val manifest_paths = StdPaths.builtin_paths() ++ StdPaths.std_paths()
+            var s: usize = 0
+            while s < manifest_paths.len() {
+                val sib = manifest_paths[s]
+                if !Str.starts_with(sib, parent_prefix) || sib == path_str {
+                    s = s + 1
+                    continue
+                }
+                if loader.modules.has(sib) {
+                    match loader.modules.get(sib) {
+                        null => {}
+                        lm => {
+                            if list_has(lm.exports, sym) {
+                                loader.failed.push(path_str)
+                                return null
+                            }
+                        },
+                    }
+                    s = s + 1
+                    continue
+                }
+                match loader.std_root {
+                    null => {}
+                    root => {
+                        match loader.std_cache.get(sib) {
+                            null => {
+                                match read_text(std_disk_path(root, sib)).await() {
+                                    null => {}
+                                    src => {
+                                        match Parse.parse_module_text(src, sib) {
+                                            Ok(m) => {
+                                                loader.std_cache.set(sib, m)
+                                                val exports = collect_exports(m)
+                                                if list_has(exports, sym) {
+                                                    loader.modules.set(sib, Loaded(m, exports))
+                                                    loader.failed.push(path_str)
+                                                    return null
+                                                }
+                                            },
+                                            Error(_) => {},
+                                        }
+                                    },
+                                }
+                            },
+                            hit => {
+                                val exports = collect_exports(hit)
+                                if list_has(exports, sym) {
+                                    install_std_module(loader, sib, hit)
+                                    loader.failed.push(path_str)
+                                    return null
+                                }
+                            },
+                        }
+                    },
+                }
+                s = s + 1
+            }
+        },
+    }
+
+    // 6. 真未找到
+    loader.failed.push(path_str)
+    loader.errors.push(NotFound(path_str))
+    null
+}
+
+// 目录模块:加载 pack.frond,声明子模块递归解析(可为文件或嵌套目录),
+// pack 模块本身以原 path_str 入缓存(镜像 Loader.rs 4a/4b 主体)。
+// cache_pack:4a(std 盘)pack 解析走共享缓存;4b(用户盘)不走。
+async fun load_dir_module(loader: Loader, path_str: str, dir_name: str,
+    pack_key: str, pack_src: str, cache_pack: bool): Async<Loaded?> {
+    match std_or_parse(loader, cache_pack, pack_key, path_str, pack_src) {
+        null => null
+        pack_module => {
+            val subs = collect_pack_submodules(pack_module)
+            var i: usize = 0
+            while i < subs.len() {
+                val sub_name = subs.get(i) ?? ""
+                val sub_cache_key = dir_name + "/" + sub_name + ".frond"
+                if !loader.modules.has(sub_cache_key) {
+                    val segs = Str.split(dir_name + "/" + sub_name, "/")
+                    val _r = resolve_and_load(loader, segs).await()
+                }
+                i = i + 1
+            }
+            val loaded = Loaded(pack_module, collect_exports(pack_module))
+            loader.modules.set(path_str, loaded)
+            loaded
+        },
+    }
+}
+
+// ─── 传递依赖(镜像 load_transitive_imports 的显式栈后序)─────────
+
+type Frame = Frame(segs: str[], expanded: bool)
+
+// visited 判定在前:stale visiting 条目永远先被 visited 命中遮蔽,
+// 故无需镜像 Rust 的 visiting.remove(Rust 在 finalize 时同步移除)。
+pub async fun load_transitive_imports(loader: Loader, entry: ModuleAst): Async<List<str>> {
+    val order = List.empty<str>()
+    val visited = List.empty<str>()
+    val visiting = List.empty<str>()
+    val stack = List.empty<Frame>()
+
+    // 镜像 Rust:collect_imports 声明序入栈;LIFO 弹出 = 后声明先展开。
+    val imports = collect_imports(entry)
+    var i: usize = 0
+    while i < imports.len() {
+        stack.push(Frame(imports.get(i) ?? [], false))
+        i = i + 1
+    }
+
+    while !stack.is_empty() {
+        val f = stack.pop() ?? Frame([], false)
+        val key = module_path_to_file(f.segs)
+        if list_has(visited, key) {
+            continue
+        }
+        if !f.expanded {
+            if list_has(visiting, key) {
+                loader.errors.push(Circular(key))
+                continue
+            }
+            visiting.push(key)
+            val children = List.empty<str[]>()
+            match resolve_and_load(loader, f.segs).await() {
+                null => {}
+                dep => {
+                    val imps = collect_imports(dep.module)
+                    var j: usize = 0
+                    while j < imps.len() {
+                        children.push(imps.get(j) ?? [])
+                        j = j + 1
+                    }
+                    val subs = collect_pack_submodules(dep.module)
+                    var q: usize = 0
+                    while q < subs.len() {
+                        children.push(f.segs ++ [subs.get(q) ?? ""])
+                        q = q + 1
+                    }
+                },
+            }
+            // 自身标记已展开压回;子项后压(LIFO 保证子先于父 finalize)
+            stack.push(Frame(f.segs, true))
+            var w: usize = 0
+            while w < children.len() {
+                stack.push(Frame(children.get(w) ?? [], false))
+                w = w + 1
+            }
+        } else {
+            visited.push(key)
+            order.push(key)
+        }
+    }
+    order
+}
+
+// 镜像 load_all_modules_or_exit 的 std 全量强制加载(不含其退出)。
+pub async fun force_load_std(loader: Loader): void {
+    val keys = StdPaths.std_paths()
+    var i: usize = 0
+    while i < keys.len() {
+        val key = keys[i]
+        val segs = Str.split(strip_frond(key), "/")
+        val _r = resolve_and_load(loader, segs).await()
+        i = i + 1
+    }
+}
+
+// ─── load-dump v1 渲染(与 Rust cli/Dump.rs dump_load 逐字节对齐)──
+
+// 字节序 str 比较(镜像 Rust String 的 sort_unstable 语义)。
+fun str_lt(a: str, b: str): bool {
+    val ab = a.bytes()
+    val bb = b.bytes()
+    val n = if ab.len() < bb.len() { ab.len() } else { bb.len() }
+    var i: usize = 0
+    while i < n {
+        val x = ab[i]
+        val y = bb[i]
+        if x != y {
+            return x < y
+        }
+        i = i + 1
+    }
+    ab.len() < bb.len()
+}
+
+fun insert_sorted(acc: str[], s: str): str[] {
+    var i: usize = 0
+    while i < acc.len() && str_lt(acc[i], s) {
+        i = i + 1
+    }
+    acc[0..i] ++ [s] ++ acc[i..acc.len()]
+}
+
+// deps(后序)/ modules(逻辑路径集合,字节序排序)/ errors(发生序)。
+pub fun render_graph(loader: Loader, dep_keys: List<str>): str {
+    var out = "! deps {dep_keys.len()}\n"
+    var i: usize = 0
+    while i < dep_keys.len() {
+        out = out + (dep_keys.get(i) ?? "") + "\n"
+        i = i + 1
+    }
+
+    var logical: str[] = []
+    val keys = loader.modules.keys()
+    var k: usize = 0
+    while k < keys.len() {
+        val key = keys[k]
+        logical = insert_sorted(logical, Str.replace(strip_frond(key), "/", "."))
+        k = k + 1
+    }
+    out = out + "! modules {logical.len()}\n"
+    var m: usize = 0
+    while m < logical.len() {
+        out = out + logical[m] + "\n"
+        m = m + 1
+    }
+
+    out = out + "! errors {loader.errors.len()}\n"
+    var e: usize = 0
+    while e < loader.errors.len() {
+        match loader.errors.get(e) {
+            null => {}
+            NotFound(p) => { out = out + "not_found " + p + "\n" },
+            ParseFail(p, l, c, msg) => { out = out + "parsefail {p} {l}:{c}: {msg}\n" },
+            Circular(p) => { out = out + "circular " + p + "\n" },
+        }
+        e = e + 1
+    }
+    out
+}

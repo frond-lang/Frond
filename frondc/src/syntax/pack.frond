@@ -1,0 +1,9 @@
+// syntax 包声明 — 前端(1A/1B)。
+//
+// `import syntax` 一次引全:Lex(词法)/ Ast(语法树+printer)/
+// Parse(递归下降)/ Dump(tokens/ast 两级差分呈现)。
+// 包内互引用走限定文件路径(import syntax.Lex),不走包自身。
+pub pack Lex
+pub pack Ast
+pub pack Parse
+pub pack Dump

@@ -10,6 +10,7 @@
 //! Note: `Analyzer` (Sema-post static analysis) now lives in `crate::pass`.
 
 pub mod Sema;
+pub mod Symbols;
 pub mod Relations;
 pub mod Inference;
 pub mod Monomorph;

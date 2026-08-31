@@ -1809,9 +1809,18 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     depth -= 1;
                     if depth == 0 {
                         let next = i + 1;
-                        // `)` followed by a binary operator → parentheses are a sub-expression, not the entire condition
-                        return next >= self.tokens.len()
-                            || lookup_binary_op(self.tokens[next].kind).is_none();
+                        if next >= self.tokens.len() {
+                            return true;
+                        }
+                        let nk = self.tokens[next].kind;
+                        // `)` followed by a binary operator → sub-expression.
+                        if lookup_binary_op(nk).is_some() {
+                            return false;
+                        }
+                        // `)` followed by a POSTFIX continuation (field/method
+                        // access, indexing, cast) → the group is a receiver
+                        // (`if (a ?? b).expr == c`), not a condition wrapper.
+                        return !matches!(nk, TokenKind::Dot | TokenKind::LBracket | TokenKind::KwAs);
                     }
                 }
                 TokenKind::Eof => return false,
@@ -2694,8 +2703,9 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     self.advance();
                 }
                 let trait_name_tok = self.expect(TokenKind::Identifier, "expected trait name")?;
+                let trait_name = self.parse_name_path_tail(trait_name_tok, "expected trait name after '.'")?;
                 bounds.push(TraitBound {
-                    trait_name: trait_name_tok.lexeme,
+                    trait_name,
                     type_args: Vec::new(),
                 });
                 if has_paren {
@@ -2704,8 +2714,9 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                             break;
                         }
                         let next_trait = self.expect(TokenKind::Identifier, "expected trait name")?;
+                        let next_name = self.parse_name_path_tail(next_trait, "expected trait name after '.'")?;
                         bounds.push(TraitBound {
-                            trait_name: next_trait.lexeme,
+                            trait_name: next_name,
                             type_args: Vec::new(),
                         });
                     }
@@ -2775,13 +2786,14 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
 
     fn parse_trait_bound(&mut self) -> ParseResult<TraitBound<'a>> {
         let name_tok = self.expect(TokenKind::Identifier, "expected trait name")?;
+        let trait_name = self.parse_name_path_tail(name_tok, "expected trait name after '.'")?;
         let mut type_args = Vec::new();
         if self.match_token(TokenKind::Lt) {
             self.parse_type_arg_list(&mut type_args)?;
             let _ = self.expect_close_angle("expected '>'");
         }
         Ok(TraitBound {
-            trait_name: name_tok.lexeme,
+            trait_name,
             type_args,
         })
     }
@@ -2929,6 +2941,25 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
     }
 
     /// Parse a primary type: named/generic, with suffix array `[N]`
+    /// Continue a name path after `first` was consumed: `('.' Identifier)*`.
+    ///
+    /// Qualified (multi-segment) names — type annotation paths like `A.Point`,
+    /// trait bounds, constructor patterns — are joined and interned into the
+    /// AST arena; single-segment names return the token's lexeme untouched
+    /// (zero-copy fast path).
+    fn parse_name_path_tail(&mut self, first: Token<'a>, err_msg: &str) -> ParseResult<&'a str> {
+        if !self.check(TokenKind::Dot) {
+            return Ok(first.lexeme);
+        }
+        let mut joined = String::from(first.lexeme);
+        while self.match_token(TokenKind::Dot) {
+            let seg = self.expect(TokenKind::Identifier, err_msg)?;
+            joined.push('.');
+            joined.push_str(seg.lexeme);
+        }
+        Ok(self.ast.intern_string(joined))
+    }
+
     fn parse_primary_type(&mut self) -> ParseResult<TypeRef> {
         if self.check(TokenKind::LParen) {
             // Bug #68: support `(type)` parenthesized type expressions (e.g. `((i32) -> i32)[]`).
@@ -2992,6 +3023,7 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         let name_tok = self.expect(TokenKind::Identifier, "expected type name")?;
         let span = token_span(&name_tok);
+        let name = self.parse_name_path_tail(name_tok, "expected type name after '.'")?;
         let mut ty = if self.match_token(TokenKind::Lt) {
             let mut args = vec![self.parse_type()?];
             while self.match_token(TokenKind::Comma) {
@@ -3004,12 +3036,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             self.alloc_type(
                 span,
                 TypeNode::Generic {
-                    name: name_tok.lexeme,
+                    name,
                     args,
                 },
             )
         } else {
-            self.alloc_type(span, TypeNode::Named { name: name_tok.lexeme })
+            self.alloc_type(span, TypeNode::Named { name })
         };
         // Suffix array type T[N]
         while self.match_token(TokenKind::LBracket) {
@@ -3211,7 +3243,8 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         } else {
             let name_tok = self.expect(TokenKind::Identifier, "expected type name after 'as'")?;
             let span = token_span(&name_tok);
-            self.alloc_type(span, TypeNode::Named { name: name_tok.lexeme })
+            let name = self.parse_name_path_tail(name_tok, "expected type name after '.'")?;
+            self.alloc_type(span, TypeNode::Named { name })
         };
         // Interleaved suffix chain (`?` / `??` / `[]` / `[N]`), same grammar as
         // parse_nullable_type: supports `x as i32?[]`, `x as i32[]?`, `x as i32??`.
@@ -3463,7 +3496,9 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             return false;
         }
         let mut i = self.current + 1;
-        let mut depth: usize = 1;
+        // Signed depth: a nested close like `A<B<C>>` lexes as GtGt and can
+        // take depth below the Gt-only accounting in one step.
+        let mut depth: i64 = 1;
         let mut steps: usize = 0;
         while i < self.tokens.len() && steps < 256 {
             match self.tokens[i].kind {
@@ -3472,6 +3507,25 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
                     depth -= 1;
                     if depth == 0 {
                         return i + 1 < self.tokens.len() && self.tokens[i + 1].kind == TokenKind::LParen;
+                    }
+                }
+                TokenKind::GtGt => {
+                    // Virtual split `>>`: two closings in one token.
+                    depth -= 2;
+                    if depth <= 0 {
+                        return i + 1 < self.tokens.len() && self.tokens[i + 1].kind == TokenKind::LParen;
+                    }
+                }
+                TokenKind::GtEq => {
+                    depth -= 1;
+                    if depth <= 0 {
+                        return false;
+                    }
+                }
+                TokenKind::GtGtEq => {
+                    depth -= 2;
+                    if depth <= 0 {
+                        return false;
                     }
                 }
                 TokenKind::LBrace | TokenKind::RBrace | TokenKind::Eq | TokenKind::EqGt | TokenKind::Eof => {
@@ -4675,10 +4729,24 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
         }
         if self.check(TokenKind::Identifier) {
             let name_tok = self.advance();
+            let span = token_span(&name_tok);
+            if self.check(TokenKind::Dot) {
+                // Qualified constructor path `A.TEf(...)`: a dotted chain can
+                // only name a constructor (variables never carry dots) — with
+                // arguments when followed by '(', else the nullary form.
+                let name = self.parse_name_path_tail(name_tok, "expected pattern name after '.'")?;
+                if self.check(TokenKind::LParen) {
+                    return self.parse_constructor_pattern_at(name, span);
+                }
+                return Ok(self.alloc_pattern(span, Pattern::Constructor {
+                    name,
+                    patterns: Vec::new(),
+                }));
+            }
             if self.check(TokenKind::LParen) {
                 return self.parse_constructor_pattern(name_tok);
             }
-            return Ok(self.alloc_pattern(token_span(&name_tok), Pattern::Variable {
+            return Ok(self.alloc_pattern(span, Pattern::Variable {
                 name: name_tok.lexeme,
             }));
         }
@@ -4688,6 +4756,12 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
 
     /// Parse a constructor pattern
     fn parse_constructor_pattern(&mut self, name_tok: Token<'a>) -> ParseResult<PatternRef> {
+        self.parse_constructor_pattern_at(name_tok.lexeme, token_span(&name_tok))
+    }
+
+    /// Parse a constructor pattern whose (possibly qualified) name and span
+    /// are already resolved.
+    fn parse_constructor_pattern_at(&mut self, name: &'a str, span: Span) -> ParseResult<PatternRef> {
         self.advance(); // '('
         let mut patterns = Vec::new();
         if !self.check(TokenKind::RParen) {
@@ -4700,8 +4774,8 @@ impl<'a, H: ParseErrorHandler> Parser<'a, H> {
             }
         }
         let _ = self.expect(TokenKind::RParen, "expected ')'");
-        Ok(self.alloc_pattern(token_span(&name_tok), Pattern::Constructor {
-            name: name_tok.lexeme,
+        Ok(self.alloc_pattern(span, Pattern::Constructor {
+            name,
             patterns,
         }))
     }

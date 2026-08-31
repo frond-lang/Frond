@@ -9,22 +9,15 @@
 
 // Byte offset of the first occurrence of needle in hay at or after `from`;
 // -1 when absent. Empty needle matches at `from`.
+// Lexicographic byte compare: -1 (<), 0 (==), 1 (>). Zero-copy C kernel —
+// the pure-Frond scan allocated both sides' byte arrays per comparison and
+// dominated sort-heavy workloads.
+pub fun bytes_cmp(x: str, y: str): i32 {
+    __str_bytes_cmp(x, y)
+}
+
 fun find_bytes(hay: u8[], needle: u8[], from: usize): i64 {
-    val hlen = hay.len()
-    val nlen = needle.len()
-    if nlen == 0 { return from as i64 }
-    var i = from
-    while i + nlen <= hlen {
-        var matched = true
-        var j = 0 as usize
-        while matched && j < nlen {
-            if hay[i + j] != needle[j] { matched = false }
-            j = j + 1
-        }
-        if matched { return i as i64 }
-        i = i + 1
-    }
-    -1
+    __find_bytes(hay, needle, from)
 }
 
 // Byte offset of the first occurrence of sub in s, -1 when absent.

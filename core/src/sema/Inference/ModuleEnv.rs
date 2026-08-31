@@ -312,6 +312,7 @@ impl<'a> InferContext<'a> {
                     }
                 }
 
+
                 // Selective import: look up symbols in the target module env and register them
                 // into the current env.
                 if let Some(items) = items {
@@ -390,11 +391,8 @@ impl<'a> InferContext<'a> {
                 // Look up type_id (using type_def_index + FIRST_DYNAMIC_TYPE_ID offset).
                 // The AST name resolves to its module-scoped canonical key.
                 let canonical = self.sema_result.resolve_type_key(name);
-                let type_id = self
-                    .sema_result
-                    .type_def_index
-                    .get(canonical.as_str())
-                    .map(|&idx| dynamic_type_id(idx));
+                let type_id = self.sema_result.type_def_idx(canonical.as_str())
+                    .map(|idx| dynamic_type_id(idx));
 
                 if let Some(tid) = type_id {
                     // Register a witness entry for each implemented trait
@@ -441,11 +439,8 @@ impl<'a> InferContext<'a> {
             // Re-query type_id (the previous borrow has been released);
             // module-scoped canonical key.
             let canonical = self.sema_result.resolve_type_key(&type_name);
-            let type_id = self
-                .sema_result
-                .type_def_index
-                .get(canonical.as_str())
-                .map(|&idx| dynamic_type_id(idx));
+            let type_id = self.sema_result.type_def_idx(canonical.as_str())
+                .map(|idx| dynamic_type_id(idx));
             if let Some(tid) = type_id {
                 let mut slots = FxHashMap::default();
                 for (method_name, method_idx) in method_slots_vec {

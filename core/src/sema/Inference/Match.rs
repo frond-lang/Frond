@@ -25,6 +25,8 @@ impl<'a> InferContext<'a> {
         expected_ty: TypeHandle,
         ast: &AstArena<'_>,
         env: EnvId,
+        line: u32,
+        column: u32,
     ) -> bool {
         // Use field_type_reprs (self-contained TypeRepr) instead of field_type_nodes (AST references),
         // to avoid AST arena mismatch when used cross-module, which would make TypeRef indices point at the wrong type nodes.
@@ -32,9 +34,10 @@ impl<'a> InferContext<'a> {
         type CtorInfoSnapshot = (Box<str>, bool, Option<AstTypeRef>, Box<[TypeRepr]>);
         let resolved_expected = self.arena.resolve(expected_ty);
 
-        // Clone the constructor info first, to avoid the &CtorDefInfo borrow blocking later &mut self calls.
+        // find_ctor_def returns an owned snapshot (S5 diagnostics mutate
+        // mid-lookup); destructure into the local tuple shape.
         let ctor_info: Option<CtorInfoSnapshot> =
-            self.find_ctor_def(ctor_name, expected_ty).map(|c| {
+            self.find_ctor_def(ctor_name, expected_ty, line, column).map(|c| {
                 (
                     c.type_name.clone(),
                     c.is_newtype,
@@ -115,10 +118,86 @@ impl<'a> InferContext<'a> {
     /// Looks up a constructor definition by name from sema_result.
     /// When multiple types define the same constructor name, uses `expected_ty`
     /// to disambiguate (type-oriented pattern constructor resolution).
-    pub(super) fn find_ctor_def(&self, ctor_name: &str, expected_ty: TypeHandle) -> Option<&CtorDefInfo> {
+    /// S5 (zero-silence): when ≥2 candidates survive the type-oriented pass,
+    /// the historical first-candidate fallback silently misbound sub-patterns;
+    /// it is now an error (qualify the spelling: `Module.Ctor`).
+    pub(super) fn find_ctor_def(
+        &mut self,
+        ctor_name: &str,
+        expected_ty: TypeHandle,
+        line: u32,
+        column: u32,
+    ) -> Option<crate::sema::Sema::CtorDefInfo> {
+        // Owned snapshot: the S5 diagnostics mutate self mid-lookup, so a
+        // borrowed return would fight the borrow checker for no gain.
+        // Error-domain exemption: the builtin anonymous error interface
+        // (bare "Error") is an OPEN type — nested ctor patterns name
+        // implementations across types by design (throw/catch idioms:
+        // `Error(NotFound(_))` against `Throw<str, Error>`); cross-owner
+        // candidates there are the intended semantics, not ambiguity.
+        let expected_is_error_iface = {
+            let r = self.arena.resolve(expected_ty);
+            match self.arena.get(r) {
+                Type::Adt(_) => self.arena.adt_parts(r).0 == "Error",
+                _ => false,
+            }
+        };
+        // Qualified spelling `Module.Ctor`: narrow the bare-name candidates to
+        // the qualifier's module, then keep the expected-type disambiguation
+        // among same-module candidates.
+        if ctor_name.contains('.') {
+            let bare = ctor_name.rsplit('.').next().unwrap_or(ctor_name);
+            let qual = &ctor_name[..ctor_name.len() - bare.len() - 1];
+            let anchor = self
+                .sema_result
+                .resolve_module_qualifier(&self.sema_result.current_module_name, qual);
+            let candidates: Vec<&CtorDefInfo> = self
+                .sema_result
+                .get_ctor_defs(bare)
+                .into_iter()
+                .filter(|c| match &anchor {
+                    // std/builtin: owning type names are bare.
+                    Some((_, true)) => !c.type_name.contains('.'),
+                    Some((a, false)) => c
+                        .type_name
+                        .strip_prefix(a.as_str())
+                        .is_some_and(|r| r.starts_with('.')),
+                    None => false,
+                })
+                .collect();
+            if candidates.len() == 1 {
+                return Some(candidates[0].clone());
+            }
+            if candidates.len() > 1 {
+                let exp_resolved = self.arena.resolve(expected_ty);
+                if let Type::Adt(_) = self.arena.get(exp_resolved) {
+                    let (exp_type_name, _) = self.arena.adt_parts(exp_resolved);
+                    let matches: Vec<&CtorDefInfo> = candidates
+                        .iter()
+                        .copied()
+                        .filter(|c| c.type_name.as_ref() == exp_type_name)
+                        .collect();
+                    if matches.len() == 1 {
+                        return Some((*matches[0]).clone());
+                    }
+                }
+            }
+            // S5: extract the pick + owners first so the sema_result borrow
+            // ends before the diagnostic's &mut self.
+            let ambiguous = candidates.len() > 1;
+            let owners: Vec<String> = candidates
+                .iter()
+                .map(|c| c.type_name.as_ref().to_string())
+                .collect();
+            let pick = candidates.into_iter().next().cloned();
+            if ambiguous && !expected_is_error_iface {
+                self.ambiguous_pattern_error(ctor_name, &owners, line, column);
+            }
+            return pick;
+        }
         let candidates = self.sema_result.get_ctor_defs(ctor_name);
         if candidates.len() <= 1 {
-            return candidates.into_iter().next();
+            return candidates.into_iter().next().cloned();
         }
         // Type-oriented disambiguation: select by the Adt type_name of expected_ty
         let exp_resolved = self.arena.resolve(expected_ty);
@@ -128,11 +207,42 @@ impl<'a> InferContext<'a> {
                 .filter(|c| c.type_name.as_ref() == exp_type_name)
                 .collect();
             if matches.len() == 1 {
-                return Some(matches[0]);
+                return Some((*matches[0]).clone());
             }
         }
-        // Fall back to the first candidate (preserves backward compatibility)
-        candidates.into_iter().next()
+        // S5: ambiguity survives the type-oriented pass — diagnose instead
+        // of silently binding the first candidate's fields.
+        let owners: Vec<String> = candidates
+            .iter()
+            .map(|c| c.type_name.as_ref().to_string())
+            .collect();
+        let pick = candidates.into_iter().next().cloned();
+        if !expected_is_error_iface {
+            self.ambiguous_pattern_error(ctor_name, &owners, line, column);
+        }
+        pick
+    }
+
+    /// S5: report a pattern-position constructor ambiguity (owners listed;
+    /// qualified spelling is the escape hatch). Reports and continues with
+    /// the first candidate so downstream inference still has a shape.
+    fn ambiguous_pattern_error(
+        &mut self,
+        ctor_name: &str,
+        owners: &[String],
+        line: u32,
+        column: u32,
+    ) {
+        self.add_error_at(
+            &format!(
+                "ambiguous constructor pattern '{}': defined by types [{}]; use Module.{} to disambiguate",
+                ctor_name,
+                owners.join(", "),
+                ctor_name.rsplit('.').next().unwrap_or(ctor_name),
+            ),
+            line,
+            column,
+        );
     }
 
     // ── Usefulness algorithm (Maranget) for match exhaustiveness checking ──
@@ -467,7 +577,7 @@ impl<'a> InferContext<'a> {
     ) -> Option<(Box<str>, Box<[TypeRepr]>)> {
         // Module-scoped: the AST type segment resolves to its canonical key.
         let canonical = self.sema_result.resolve_type_key(type_name);
-        let &type_idx = self.sema_result.type_def_index.get(&canonical)?;
+        let type_idx = self.sema_result.type_def_idx(&canonical)?;
         let type_def = &self.sema_result.type_defs[&type_idx];
         let ctor = type_def
             .constructors
@@ -510,7 +620,7 @@ impl<'a> InferContext<'a> {
                         let implements_err = self.arena.type_name(resolved_scrutinee)
                             .and_then(|tn| {
                                 let canonical = self.sema_result.resolve_type_key(tn);
-                                self.sema_result.type_def_index.get(&canonical).copied()
+                                self.sema_result.type_def_idx(&canonical)
                             })
                             .map(|idx| self.witness_table.implements("Err", dynamic_type_id(idx)))
                             .unwrap_or(false);
@@ -649,9 +759,9 @@ impl<'a> InferContext<'a> {
                 // Upper-case leading char → zero-argument constructor.
                 if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
                     let sub_pats: Vec<PatternRef> = Vec::new();
-                    self.refine_constructor_pattern(name, &sub_pats, expected_ty, ast, env);
+                    self.refine_constructor_pattern(name, &sub_pats, expected_ty, ast, env, ast.pattern(pat).span.line, ast.pattern(pat).span.column);
                     // Store disambiguation result for the IR builder (same-named constructors).
-                    if let Some(ctor) = self.find_ctor_def(name, expected_ty) {
+                    if let Some(ctor) = self.find_ctor_def(name, expected_ty, ast.pattern(pat).span.line, ast.pattern(pat).span.column) {
                         self.sema_result.pattern_ctor_types.insert(
                             (self.current_module_name.clone(), pat.0),
                             ctor.type_name.clone(),
@@ -662,7 +772,7 @@ impl<'a> InferContext<'a> {
                 }
             }
             Pattern::Constructor { name, patterns } => {
-                if !self.refine_constructor_pattern(name, patterns, expected_ty, ast, env) {
+                if !self.refine_constructor_pattern(name, patterns, expected_ty, ast, env, ast.pattern(pat).span.line, ast.pattern(pat).span.column) {
                     // Regular constructor fallback: use field_type_reprs (self-contained TypeRepr)
                     // instead of field_type_nodes (AST reference) to avoid cross-module AST arena
                     // mismatches.
@@ -697,7 +807,7 @@ impl<'a> InferContext<'a> {
                     }
                 }
                 // Store disambiguation result for the IR builder (same-named constructors).
-                if let Some(ctor) = self.find_ctor_def(name, expected_ty) {
+                if let Some(ctor) = self.find_ctor_def(name, expected_ty, ast.pattern(pat).span.line, ast.pattern(pat).span.column) {
                     self.sema_result.pattern_ctor_types.insert(
                         (self.current_module_name.clone(), pat.0),
                         ctor.type_name.clone(),
@@ -773,7 +883,11 @@ pub(super) fn normalize_pattern(ast: &AstArena<'_>, pat: PatternRef) -> Vec<Norm
             }
         }
         Pattern::Constructor { name, patterns } => {
-            let ctor = PatCtor::Adt(name.to_string().into_boxed_str());
+            // Qualified spellings (`A.TEf`) normalize to the bare constructor
+            // name so exhaustiveness sees one constructor across spellings
+            // (runtime constructor names are bare).
+            let bare = name.rsplit('.').next().unwrap_or(name);
+            let ctor = PatCtor::Adt(bare.to_string().into_boxed_str());
             // Cartesian product of sub-pattern alternatives.
             let mut alternatives: Vec<Vec<NormPat>> = vec![Vec::new()];
             for &sub_pat in patterns.iter() {

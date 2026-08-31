@@ -1,10 +1,458 @@
-// F128.frond — the f128 (quad-precision) type module (part of std.core)
+// F128.frond — the f128 (quad-precision) type module (part of std.core.types)
 //
-// No MAX/MIN constants: the boundary values (~1.19e4932) are not writable as
-// literals (they overflow the f64 literal pipeline); use Math.inf_f128() for
-// infinities. parse goes through f64, so more than ~17 significant digits or
-// exponents beyond ±308 lose precision.
+// IEEE 754 binary128 boundary constants (hex-float literals carry the exact
+// bit patterns) + string conversion, all correctly rounded (round to
+// nearest, ties to even):
+//   * hexadecimal input (0x1.fff...p±e, optional sign) converts exactly;
+//     F128.parse("0x1.921fb54442d18469898cc51701b8p+1") is bit-identical to
+//     Math.PI_F128.
+//   * decimal input converts exactly through big-integer arithmetic (the
+//     same algorithm as the compiler's own f128 literals), so
+//     F128.parse("0.1") == 0.1f128. Beyond 40 significant digits the tail
+//     folds into a sticky bit, which still decides every rounding except a
+//     tie inside the dropped tail.
+//   * inf/infinity/nan spellings (case-insensitive) follow the float family.
+// Throws ParseError: Malformed on bad syntax, Overflow when the value
+// overflows to infinity; underflow is not an error — it rounds to ±0 or a
+// subnormal per IEEE 754.
 
-pub fun parse(s: str): f128? {
-    F64.parse(s) as f128?
+pub val MAX: f128 = 0x1.ffffffffffffffffffffffffffffp+16383f128
+pub val MIN: f128 = 0x1p-16382f128
+pub val MIN_SUBNORMAL: f128 = 0x1p-16494f128
+pub val EPSILON: f128 = 0x1p-112f128
+
+// ── little-endian u64-limb helpers (bounded: inputs past ~5000 exponent ────
+// digits are fast-pathed to 0/overflow before these ever run, so 256 limbs
+// cover the f128 decimal range with room to spare) ─────────────────────────
+
+// limbs *= m (small); returns the new limb count.
+fun bi_mul_small(a: u64[], len: usize, m: u64): usize {
+    var carry: u128 = 0
+    var i = 0 as usize
+    while i < len {
+        val prod = ((a[i] as u128) * (m as u128)) + carry
+        a[i] = prod as u64
+        carry = prod >> 64
+        i = i + 1
+    }
+    if carry != 0 {
+        a[len] = carry as u64
+        return len + 1
+    }
+    len
+}
+
+// limbs /= d (small); returns the remainder. Never grows; trim afterwards.
+fun bi_divmod_small(a: u64[], len: usize, d: u64): u64 {
+    var rem: u128 = 0
+    var i = len
+    while i > 0 {
+        i = i - 1
+        val cur = (rem << 64) | (a[i] as u128)
+        a[i] = (cur / (d as u128)) as u64
+        rem = cur % (d as u128)
+    }
+    rem as u64
+}
+
+// Drops high zero limbs; returns the trimmed limb count.
+fun bi_trim(a: u64[], len: usize): usize {
+    var n = len
+    while n > 1 && a[n - 1] == 0 { n = n - 1 }
+    n
+}
+
+// limbs <<= n; returns the new limb count.
+fun bi_shl(a: u64[], len: usize, n: usize): usize {
+    val word_shift = n >> 6
+    val bit_shift = n & 63
+    var m = len
+    if bit_shift != 0 {
+        var carry: u64 = 0
+        var i = 0 as usize
+        while i < m {
+            val v = a[i]
+            a[i] = (v << bit_shift) | carry
+            carry = v >> (64 - bit_shift)
+            i = i + 1
+        }
+        if carry != 0 {
+            a[m] = carry
+            m = m + 1
+        }
+    }
+    if word_shift != 0 {
+        var i = m
+        while i > 0 {
+            i = i - 1
+            a[i + word_shift] = a[i]
+        }
+        var j = 0 as usize
+        while j < word_shift {
+            a[j] = 0
+            j = j + 1
+        }
+        m = m + word_shift
+    }
+    m
+}
+
+// Bit length (position of the highest set bit + 1).
+fun bi_bit_len(a: u64[], len: usize): i32 {
+    var i = len
+    while i > 0 && a[i - 1] == 0 { i = i - 1 }
+    if i == 0 { return 0 }
+    val top = a[i - 1]
+    var bl = 0 as i32
+    var k = 63 as i32
+    while k >= 0 {
+        if ((top >> (k as u64)) & 1) != 0 { bl = k + 1; break }
+        k = k - 1
+    }
+    ((i - 1) * 64) as i32 + bl
+}
+
+// Bits [start, start+n) assembled MSB-first (n <= 128).
+fun bi_bits(a: u64[], len: usize, start: i64, n: i32): u128 {
+    var r: u128 = 0
+    var i = 0 as i32
+    while i < n {
+        val pos = start + (i as i64)
+        if pos >= 0 {
+            val word = (pos >> 6) as usize
+            val bit = (pos & 63) as u64
+            if word < len && ((a[word] >> bit) & 1) != 0 {
+                r = r | ((1 as u128) << (i as u64))
+            }
+        }
+        i = i + 1
+    }
+    r
+}
+
+// Whether bit `pos` is set (pos < 0 is false).
+fun bi_bit(a: u64[], len: usize, pos: i64): bool {
+    if pos < 0 { return false }
+    val word = (pos >> 6) as usize
+    val bit = (pos & 63) as u64
+    word < len && ((a[word] >> bit) & 1) != 0
+}
+
+// Whether any of the low n bits is set.
+fun bi_low_nonzero(a: u64[], len: usize, n: i64): bool {
+    if n <= 0 { return false }
+    val words = (n >> 6) as usize
+    val bits = (n & 63) as u64
+    var i = 0 as usize
+    while i < words && i < len {
+        if a[i] != 0 { return true }
+        i = i + 1
+    }
+    if bits != 0 && words < len {
+        val mask = (1 << bits) - 1
+        if (a[words] & mask) != 0 { return true }
+    }
+    false
+}
+
+// Low 128 bits as a u128.
+fun bi_to_u128(a: u64[], len: usize): u128 {
+    var r: u128 = 0
+    if len > 0 { r = a[0] as u128 }
+    if len > 1 { r = r | ((a[1] as u128) << 64) }
+    r
+}
+
+// ── exact hexadecimal-float → binary128 bit pattern ────────────────────────
+
+// True when s starts (after an optional sign) with 0x / 0X.
+fun starts_with_hex(s: str): bool {
+    val b = s.bytes()
+    var i = 0 as usize
+    if i < b.len() && (b[i] == 43 || b[i] == 45) { i = i + 1 }
+    if i + 1 >= b.len() { return false }
+    b[i] == 48 && (b[i + 1] == 120 || b[i + 1] == 88)
+}
+
+// True when s starts (after an optional sign) with i/I/n/N — the inf/infinity
+// /nan spellings handled by the f64 kernel (inf → inf, nan → nan on widen).
+fun starts_with_special(s: str): bool {
+    val b = s.bytes()
+    var i = 0 as usize
+    if i < b.len() && (b[i] == 43 || b[i] == 45) { i = i + 1 }
+    if i >= b.len() { return false }
+    val c = b[i]
+    c == 73 || c == 105 || c == 78 || c == 110
+}
+
+// Digits accumulate into a u128 significand h with invariant
+// value = h * 2^e0 (+ a sub-ulp remainder in rem/sticky at 2^-64 ulp
+// resolution). h is capped below 2^112: a further integer digit multiplies
+// by 16 (e0 += 4), a further fraction digit only refines the remainder.
+fun hex_bits(s: str): Throw<u128, ParseError> {
+    val b = s.bytes()
+    var i = 0 as usize
+    var neg = false
+    if i < b.len() && (b[i] == 43 || b[i] == 45) { neg = b[i] == 45; i = i + 1 }
+    if i + 1 >= b.len() { throw ParseError(Malformed, "not a valid hexadecimal float literal", s) }
+    if b[i] != 48 || !(b[i + 1] == 120 || b[i + 1] == 88) { throw ParseError(Malformed, "not a valid hexadecimal float literal", s) }
+    i = i + 2
+    var h: u128 = 0
+    var e0: i32 = 0
+    var rem: u128 = 0
+    var sticky = false
+    var any = false
+    var dot = false
+    while i < b.len() {
+        val c = b[i]
+        if c == 46 {
+            if dot { throw ParseError(Malformed, "multiple dots in hexadecimal float literal", s) }
+            dot = true
+            i = i + 1
+            continue
+        }
+        var d: u128 = 255
+        if c >= 48 && c <= 57 { d = (c as u128) - 48 }
+        else if c >= 97 && c <= 102 { d = (c as u128) - 87 }
+        else if c >= 65 && c <= 70 { d = (c as u128) - 55 }
+        if d == 255 { break }
+        any = true
+        if h >= ((1 as u128) << 112) {
+            if (rem & 15) != 0 { sticky = true }
+            rem = (rem >> 4) | (d << 60)
+            if !dot { e0 = e0 + 4 }
+        } else {
+            h = (h << 4) | d
+            if dot { e0 = e0 - 4 }
+        }
+        i = i + 1
+    }
+    if !any { throw ParseError(Malformed, "hexadecimal float literal has no digits", s) }
+    if i < b.len() && (b[i] == 112 || b[i] == 80) {
+        i = i + 1
+        var pneg = false
+        if i < b.len() && (b[i] == 43 || b[i] == 45) { pneg = b[i] == 45; i = i + 1 }
+        if i >= b.len() { throw ParseError(Malformed, "binary exponent has no digits", s) }
+        var pe: i32 = 0
+        while i < b.len() && b[i] >= 48 && b[i] <= 57 {
+            if pe < 100000 { pe = pe * 10 + ((b[i] as i32) - 48) }
+            i = i + 1
+        }
+        if pneg { pe = 0 - pe }
+        e0 = e0 + pe
+    }
+    if i != b.len() { throw ParseError(Malformed, "trailing characters in hexadecimal float literal", s) }
+    val sign: u128 = if neg { (1 as u128) << 127 } else { 0 as u128 }
+    if h == 0 { return Ok(sign) }
+    // normalize h into [2^112, 2^113); k absorbs the shift into the exponent
+    var k: i32 = 0
+    while h >= ((1 as u128) << 113) {
+        if (rem & 1) != 0 { sticky = true }
+        rem = (rem >> 1) | ((h & 1) << 63)
+        h = h >> 1
+        k = k + 1
+    }
+    while h < ((1 as u128) << 112) {
+        h = h << 1
+        k = k - 1
+    }
+    var e: i32 = e0 + k + 112
+    val half: u128 = (1 as u128) << 63
+    if rem > half || (rem == half && (((h & 1) == 1 || sticky))) {
+        h = h + 1
+        if h == ((1 as u128) << 113) { h = (1 as u128) << 112; e = e + 1 }
+    }
+    if e > 16383 { throw ParseError(Overflow, "value overflows f128 to infinity", s) }
+    if e >= -16382 {
+        return Ok(sign | (((e + 16383) as u128) << 112) | (h & (((1 as u128) << 112) - 1)))
+    }
+    // subnormal: value = M * 2^-16494 with a 112-bit M
+    val sh: i32 = -16382 - e
+    if sh >= 114 { return Ok(sign) }
+    val shu = sh as u128
+    val m = h >> shu
+    val r2 = h & (((1 as u128) << shu) - 1)
+    val half2 = (1 as u128) << (shu - 1)
+    if r2 > half2 || (r2 == half2 && (((m & 1) == 1 || sticky))) {
+        val m2 = m + 1
+        if m2 == ((1 as u128) << 112) { return Ok(sign | ((1 as u128) << 112)) }
+        return Ok(sign | m2)
+    }
+    Ok(sign | m)
+}
+
+// ── exact decimal → binary128 bit pattern (big-integer, RNE) ───────────────
+
+// Mirrors the compiler's own f128 literal conversion: digits -> big integer,
+// scale by exact 5^|e10| / 2^shifts, then one round-to-nearest-even step.
+fun dec_bits(s: str): Throw<u128, ParseError> {
+    val b = s.bytes()
+    var i = 0 as usize
+    var neg = false
+    if i < b.len() && (b[i] == 43 || b[i] == 45) { neg = b[i] == 45; i = i + 1 }
+    val a: u64[] = [0 as u64, ..256]
+    var len = 1 as usize
+    var ndig = 0 as i32
+    var sticky = false
+    var any = false
+    var any_nonzero = false
+    var frac_len = 0 as i32
+    var dot = false
+    var exp10 = 0 as i32
+    while i < b.len() {
+        val c = b[i]
+        if c == 46 {
+            if dot { throw ParseError(Malformed, "multiple dots in number literal", s) }
+            dot = true
+            i = i + 1
+            continue
+        }
+        if c < 48 || c > 57 { break }
+        val d = (c as i32) - 48
+        any = true
+        if d != 0 { any_nonzero = true }
+        if dot { frac_len = frac_len + 1 }
+        if ndig < 40 {
+            var carry: u128 = d as u128
+            var j = 0 as usize
+            while j < len {
+                val prod = ((a[j] as u128) * 10) + carry
+                a[j] = prod as u64
+                carry = prod >> 64
+                j = j + 1
+            }
+            if carry != 0 {
+                a[len] = carry as u64
+                len = len + 1
+            }
+            ndig = ndig + 1
+        } else {
+            if d != 0 { sticky = true }
+            if !dot { exp10 = exp10 + 1 }
+        }
+        i = i + 1
+    }
+    if !any { throw ParseError(Malformed, "number literal has no digits", s) }
+    if i < b.len() && (b[i] == 101 || b[i] == 69) {
+        i = i + 1
+        var eneg = false
+        if i < b.len() && (b[i] == 43 || b[i] == 45) { eneg = b[i] == 45; i = i + 1 }
+        if i >= b.len() { throw ParseError(Malformed, "exponent has no digits", s) }
+        var ev: i32 = 0
+        var edig = false
+        while i < b.len() && b[i] >= 48 && b[i] <= 57 {
+            edig = true
+            if ev < 100000 { ev = ev * 10 + ((b[i] as i32) - 48) }
+            i = i + 1
+        }
+        if !edig { throw ParseError(Malformed, "exponent has no digits", s) }
+        if eneg { ev = 0 - ev }
+        exp10 = exp10 + ev
+    }
+    if i != b.len() { throw ParseError(Malformed, "trailing characters in number literal", s) }
+    val sign: u128 = if neg { (1 as u128) << 127 } else { 0 as u128 }
+    if !any_nonzero { return Ok(sign) }
+    var e10 = exp10 - frac_len
+    var e2: i64 = 0
+    var div_sticky = sticky
+    // fast-path range estimate: out of [min subnormal/2, overflow] by a wide margin
+    var blen = bi_bit_len(a, len)
+    val log2_est = ((blen - 1) as f64) + ((e10 as f64) * 3.32193)
+    if log2_est > 16384.0 { throw ParseError(Overflow, "value overflows f128 to infinity", s) }
+    if log2_est < -16510.0 { return Ok(sign) }
+    if e10 > 0 {
+        var k = 0 as i32
+        while k < e10 {
+            len = bi_mul_small(a, len, 5)
+            k = k + 1
+        }
+        e2 = e10 as i64
+    } else if e10 < 0 {
+        val kk = (0 - e10) as i64
+        val p_needed = (((2.4 * (kk as f64)) as i64)) + 128
+        len = bi_shl(a, len, p_needed as usize)
+        e2 = (0 - kk) - p_needed
+        var k = 0 as i64
+        while k < kk {
+            val r = bi_divmod_small(a, len, 5)
+            if r != 0 { div_sticky = true }
+            k = k + 1
+        }
+    }
+    len = bi_trim(a, len)
+    blen = bi_bit_len(a, len)
+    val msb = (blen as i64) - 1
+    if msb < 0 { return Ok(sign) }
+    var unbiased = e2 + msb
+    var mant: u128 = 0
+    var guard = false
+    var stk = div_sticky
+    var fexp: i64 = 0
+    if unbiased >= -16382 {
+        val shift = msb - 112
+        if shift >= 0 {
+            mant = bi_bits(a, len, shift, 113)
+            guard = bi_bit(a, len, shift - 1)
+            if shift >= 2 { stk = stk || bi_low_nonzero(a, len, shift - 1) }
+            fexp = unbiased
+        } else {
+            len = bi_shl(a, len, (0 - shift) as usize)
+            mant = bi_to_u128(a, len) & (((1 as u128) << 113) - 1)
+            fexp = unbiased
+        }
+    } else {
+        val p = e2 + 16494
+        if p >= 0 {
+            len = bi_shl(a, len, p as usize)
+            mant = bi_to_u128(a, len) & (((1 as u128) << 112) - 1)
+            fexp = -16382
+        } else {
+            val ss = 0 - p
+            mant = bi_bits(a, len, ss, 112)
+            guard = bi_bit(a, len, ss - 1)
+            if ss >= 2 { stk = stk || bi_low_nonzero(a, len, ss - 1) }
+            fexp = -16382
+        }
+    }
+    var m2 = mant
+    var e3 = fexp
+    val was_sub = unbiased < -16382
+    if guard && (stk || ((m2 & 1) != 0)) {
+        m2 = m2 + 1
+    }
+    if was_sub {
+        // no carry: keep the subnormal encoding (exponent field 0); the
+        // final assembly picks it up because e3 sits below the normal range
+        if m2 >= ((1 as u128) << 112) { e3 = -16382 } else { e3 = -16383 }
+    } else if m2 >= ((1 as u128) << 113) {
+        m2 = m2 >> 1
+        e3 = e3 + 1
+    }
+    if e3 > 16383 { throw ParseError(Overflow, "value overflows f128 to infinity", s) }
+    if e3 >= -16382 {
+        return Ok(sign | (((e3 + 16383) as u128) << 112) | (m2 & (((1 as u128) << 112) - 1)))
+    }
+    Ok(sign | (m2 & (((1 as u128) << 112) - 1)))
+}
+
+// f128 values cross FFI only as bit patterns, so hand the computed halves to
+// a kernel that writes them into a one-element f128 buffer.
+fun from_bits(bits: u128): f128 {
+    val out: f128[] = [0.0f128]
+    __fp_f128_from_bits((bits >> 64) as u64, (bits & (0xFFFFFFFFFFFFFFFF as u128)) as u64, out)
+    out[0]
+}
+
+pub fun parse(s: str): Throw<f128, ParseError> {
+    if starts_with_hex(s) {
+        Ok(from_bits(hex_bits(s)?))
+    } else if starts_with_special(s) {
+        val ok: u8[] = [0 as u8]
+        val v = __fp_parse_f64(s, ok)
+        if ok[0] == 0 { throw ParseError(Malformed, "not a valid f128 literal", s) }
+        if ok[0] == 2 { throw ParseError(Overflow, "value overflows f128 to infinity", s) }
+        Ok(v as f128)
+    } else {
+        Ok(from_bits(dec_bits(s)?))
+    }
 }

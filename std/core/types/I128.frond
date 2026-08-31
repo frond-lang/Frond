@@ -1,25 +1,35 @@
-// I128.frond — the i128 integer type module (part of std.core)
+// I128.frond — the i128 integer type module (part of std.core.types)
 //
-// Boundary constants + decimal parse. parse returns null on malformed input
-// (empty, bad sign position, non-digit); accumulation wraps on overflow by
-// design — check ranges yourself when inputs are untrusted.
+// Boundary constants + decimal parse. parse accepts an optional leading
+// '+'/'-' and returns Throw<_, ParseError>: Malformed on bad syntax (empty,
+// bad sign position, non-digit), Overflow on values outside the i128 range —
+// the same overflow-to-error contract as the float family (F*.parse), never
+// a silent wrap.
 
 pub val MAX: i128 = 170141183460469231731687303715884105727
 pub val MIN: i128 = -170141183460469231731687303715884105728
 
-pub fun parse(s: str): i128? {
+pub fun parse(s: str): Throw<i128, ParseError> {
     val b = s.bytes()
-    if b.len() == 0 { return null }
+    if b.len() == 0 { throw ParseError(Malformed, "empty input is not an i128 literal", s) }
     var neg = false
     var i = 0 as usize
-    if b[0] == (45 as u8) { neg = true; i = 1 as usize }
-    if i >= b.len() { return null }
-    var v: i128 = 0
+    if b[0] == 43 { i = 1 as usize }
+    if b[0] == 45 { neg = true; i = 1 as usize }
+    if i >= b.len() { throw ParseError(Malformed, "sign with no digits is not an i128 literal", s) }
+    var v: u128 = 0
+    val limit: u128 = if neg { ((1 as u128) << 127) } else { I128.MAX as u128 }
     while i < b.len() {
-        val d = (b[i] as i128) - 48
-        if d < 0 || d > 9 { return null }
+        val d = (b[i] as u128) - 48
+        if d > 9 { throw ParseError(Malformed, "invalid digit in i128 literal", s) }
+        if v > (limit - d) / 10 { throw ParseError(Overflow, "value out of range for i128", s) }
         v = v * 10 + d
         i = i + 1
     }
-    if neg { 0 - v } else { v }
+    if neg {
+        if v == ((1 as u128) << 127) { return Ok(I128.MIN) }
+        Ok(0 - (v as i128))
+    } else {
+        Ok(v as i128)
+    }
 }

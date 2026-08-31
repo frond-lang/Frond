@@ -495,7 +495,7 @@ pub fn classify_side_effect(
                 if let Some(dot) = name.rfind('.') {
                     let type_name = &name[..dot];
                     if let Some(method_idx) = sema.lookup_method_idx(type_name, method) {
-                        let &type_idx = sema.type_def_index.get(type_name)?;
+                        let type_idx = sema.type_def_idx(type_name)?;
                         let type_def = &sema.type_defs[&type_idx];
                         let method_sig = type_def.methods.get(method_idx as usize)?;
                         if method_sig.is_async || method_sig.is_throwing {
@@ -1053,7 +1053,7 @@ fn mark_entry_reason(
         let method_name = &name[dot + 1..];
         // Use witness_table to determine if this is a trait method implementation:
         // if the type implements a trait and the method is in the witness_table's method_slots, it is a TraitMethod
-        if let Some(&type_idx) = sema.type_def_index.get(type_name) {
+        if let Some(type_idx) = sema.type_def_idx(type_name) {
             let type_id = dynamic_type_id(type_idx);
             for entry in sema.witness_table.entries() {
                 if entry.type_id == type_id && entry.method_slots.contains_key(method_name) {
@@ -4287,7 +4287,7 @@ fn analyze_single_match(
     let key = module_expr_key(module_name, scrutinee.0 as u64);
     let Some(info) = sema.expr_types.get(&key) else { return };
     let Some(type_name) = info.type_name.as_deref() else { return };
-    let Some(&type_idx) = sema.type_def_index.get(type_name) else { return };
+    let Some(type_idx) = sema.type_def_idx(type_name) else { return };
     let type_def = &sema.type_defs[&type_idx];
     // Only ADT types with multiple constructors require exhaustiveness checking
     if type_def.kind != crate::sema::Sema::TypeDefKind::Adt {

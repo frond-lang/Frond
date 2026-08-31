@@ -1,8 +1,22 @@
-// F32.frond — the f32 type module (part of std.core)
+// F32.frond — the f32 type module (part of std.core.types)
+//
+// IEEE 754 binary32 boundary constants + string conversion. parse goes
+// through the C99 strtof kernel so binary32 gets direct correct rounding
+// (round to nearest, ties to even) — never a parse-to-f64-then-narrow
+// double rounding. Accepted syntax matches F64.parse (decimal,
+// hexadecimal floats, inf/infinity/nan spellings). Throws ParseError:
+// Malformed on bad syntax, Overflow when the value overflows to infinity;
+// underflow rounds to 0.0 or a subnormal per IEEE 754.
 
-pub val MAX: f32 = 3.4028234663852886e38
-pub val MIN: f32 = 1.1754943508222875e-38
+pub val MAX: f32 = 0x1.fffffep+127f32
+pub val MIN: f32 = 0x1p-126f32
+pub val MIN_SUBNORMAL: f32 = 0x1p-149f32
+pub val EPSILON: f32 = 0x1p-23f32
 
-pub fun parse(s: str): f32? {
-    F64.parse(s) as f32?
+pub fun parse(s: str): Throw<f32, ParseError> {
+    val ok: u8[] = [0 as u8]
+    val v = __fp_parse_f32(s, ok)
+    if ok[0] == 0 { throw ParseError(Malformed, "not a valid f32 literal", s) }
+    if ok[0] == 2 { throw ParseError(Overflow, "value overflows f32 to infinity", s) }
+    Ok(v)
 }

@@ -84,7 +84,14 @@ impl<'a> IrBuilder<'a> {
                         // Parameterized constructors (non-empty `field_names`) are not handled
                         // here (they go through the `Call` path with arguments).
                         // A newtype always has an inner value, so it can never be nullary.
-                        let tf_info = self.lookup_constructor_field_names(name)
+                        // S2 ID path first (NAME_RESOLUTION_PLAN): sema's expected-type
+                        // adjudication (infer_nullary_ctor_with_expected) recorded the owning
+                        // type — the bare-name ctor tables below are first-wins and pick the
+                        // WRONG entry under cross-module same-named constructors (case #0:
+                        // nullary `TDK.TAdt` vs unary `Ty.TAdt` silently compiled to void).
+                        let tf_info = self
+                            .ctor_tf_info_from_resolution(expr_id, name, 0)
+                            .or_else(|| self.lookup_constructor_field_names(name))
                             .or_else(|| self.lookup_type_field_names(name));
                         match tf_info {
                             Some(info) if info.field_names.is_empty() && info.kind != RecordLitKind::Newtype => {
@@ -103,7 +110,31 @@ impl<'a> IrBuilder<'a> {
                                 });
                                 node
                             }
-                            _ => self.compile_const(),
+                            Some(_) => {
+                                // A constructor with fields referenced as a bare VALUE.
+                                // The old silent `compile_const()` produced a void that
+                                // surfaced as far-away non-exhaustive match panics —
+                                // report at the reference site instead. EXEMPT module
+                                // receivers (`Path.from(..)`: the Ident names a module
+                                // AND its type; Path 0 never consumes the compiled
+                                // receiver node, so the void was harmless there).
+                                let is_module_recv = {
+                                    let key = crate::sema::Sema::module_expr_key(
+                                        self.expr_key_module(),
+                                        expr_id.0 as u64,
+                                    );
+                                    self.sema.module_func_recv_exprs.contains(&key)
+                                };
+                                if !is_module_recv {
+                                    let sp = self.current_module().arena.expr(expr_id).span;
+                                    self.errors.push(format!(
+                                        "constructor '{}' requires arguments; it is not a value at {}:{} [mod={}]",
+                                        name, sp.line, sp.column, self.current_module().name
+                                    ));
+                                }
+                                self.compile_const()
+                            }
+                            None => self.compile_const(),
                         }
                     }
                 }

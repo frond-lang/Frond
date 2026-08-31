@@ -204,7 +204,9 @@ impl<S: LockStrategy> Engine<S> {
             && subgraph_id != parent_frame.subgraph_id
             && subgraph_id.0 != child_sg.function_id;
 
-        if super::env_flag("FROND_DEBUG_STALL") {
+        if super::env_flag("FROND_DEBUG_STALL")
+            && super::EngineCore::sf_trace_match(&self.graph, subgraph_id.0)
+        {
             let (cs, ce) = child_sg.node_range;
             let child_sz = ce.0 - cs.0;
             if child_sz <= 3 {
@@ -462,6 +464,7 @@ impl<S: LockStrategy> Engine<S> {
                 ControlSignal::Break | ControlSignal::Return(_) => {
                     // break/return -> loop exits.
                     let mut loop_frame = self.frames.lock().remove(&loop_fid);
+
                     if let Some(lf) = loop_frame.as_deref_mut() {
                         lf.cached_child_frame = None;
                         lf.control_signal = child_signal.clone();
@@ -512,6 +515,7 @@ impl<S: LockStrategy> Engine<S> {
                 ControlSignal::Continue => {
                     // continue -> loop reset (frame reuse).
                     let mut loop_frame_opt = self.frames.lock().remove(&loop_fid);
+
                     if let Some(loop_frame) = loop_frame_opt.as_deref_mut() {
                         let mut child = child_frame; // Take ownership to modify.
                         self.reset_loop_iteration(&mut *loop_frame, loop_fid, &mut child);
@@ -555,6 +559,7 @@ impl<S: LockStrategy> Engine<S> {
                             child_frame.subgraph_id.0, rq_len, unready.len(), &unready[..unready.len().min(10)]);
                     }
                     let loop_frame_opt = self.frames.lock().remove(&loop_fid);
+
                     match loop_frame_opt {
                         Some(mut loop_frame) => {
                             let loop_kind = self.graph.subgraphs[loop_frame.subgraph_id.0 as usize].loop_kind;
@@ -615,6 +620,7 @@ impl<S: LockStrategy> Engine<S> {
 
         if let Some((caller_fid, call_node)) = caller {
             let mut caller_frame_opt = self.frames.lock().remove(&caller_fid);
+
             if caller_frame_opt.is_none() {
                 // The parent frame has not yet been inserted back into the HashMap; store the
                 // completion info for a later retry.
@@ -719,9 +725,10 @@ impl<S: LockStrategy> Engine<S> {
                 // never be meaningful again). Scrub, or a leftover registration
                 // later fires on a frame that is mid-relaunch/cached and — even
                 // with check-then-take — burns a spurious event delivery.
-                self.event_waiters
-                    .lock()
-                    .retain(|(_, wf)| *wf != caller_fid);
+                let mut ew = self.event_waiters.lock();
+                for bucket in ew.values_mut() {
+                    bucket.retain(|wf| *wf != caller_fid);
+                }
                 self.frames.lock().insert(caller_fid, caller_frame);
                 queue.push(caller_fid);
             }

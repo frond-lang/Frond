@@ -65,7 +65,7 @@ impl<'a> InferContext<'a> {
                 // constructor with the expected type's type arguments directly.
                 if let Some(expected) = expected {
                     if let Expr::Ident(name) = &ast.expr(expr).node {
-                        if let Some(ty) = self.infer_nullary_ctor_with_expected(name, expected) {
+                        if let Some(ty) = self.infer_nullary_ctor_with_expected(expr, name, expected) {
                             return ty;
                         }
                     }
@@ -252,7 +252,10 @@ impl<'a> InferContext<'a> {
                         return narrowed_ty;
                     }
                 }
+                let saved_recv_pos = self.in_recv_position;
+                self.in_recv_position = true;
                 let recv_ty = self.infer_expr(*recv, ast, env, None);
+                self.in_recv_position = saved_recv_pos;
                 // Detect a ModuleRef receiver: cross-module constant access such as Math.PI.
                 // On hit, record recv's expr key → mangled name (module_path.field) into
                 // module_const_recv_exprs, so IR compilation skips recv and emits a global_load directly.
@@ -272,7 +275,10 @@ impl<'a> InferContext<'a> {
                 self.lookup_field_type(recv_ty, field, span.line, span.column)
             }
             Expr::SafeAccess { recv, field } => {
+                let saved_recv_pos = self.in_recv_position;
+                self.in_recv_position = true;
                 let recv_ty = self.infer_expr(*recv, ast, env, None);
+                self.in_recv_position = saved_recv_pos;
                 let resolved = self.arena.resolve(recv_ty);
                 // SafeAccess `?.` is only meaningful for Nullable/Ref; for other types it degrades to an ordinary field access.
                 let is_nullable = matches!(self.arena.get(resolved), Type::Nullable(_));
@@ -351,6 +357,20 @@ impl<'a> InferContext<'a> {
                         self.add_error(&format!("?? default value incompatible with Throw value type: {}", e));
                     }
                     value_ty
+                } else if matches!(self.arena.get(rl), Type::TypeVar(_) | Type::Unknown) {
+                    // Pending LHS (case #1): constrain it to Nullable(rhs) so the
+                    // solver binds it before the deferred-method retry pass —
+                    // returning the bare var here kept every downstream
+                    // field/method chain unresolved. Result type = rhs (the
+                    // coalesce default's type). Both-pending stays as-is.
+                    let rr = self.arena.resolve(right_ty);
+                    if matches!(self.arena.get(rr), Type::TypeVar(_) | Type::Unknown) {
+                        left_ty
+                    } else {
+                        let nullable_rhs = self.arena.make_nullable(right_ty);
+                        self.unify_or_constrain(left_ty, nullable_rhs);
+                        right_ty
+                    }
                 } else {
                     left_ty
                 }
@@ -762,6 +782,7 @@ impl<'a> InferContext<'a> {
     /// otherwise returns `None` so the caller falls back to normal identifier inference.
     pub(super) fn infer_nullary_ctor_with_expected(
         &mut self,
+        expr: ExprId,
         name: &str,
         expected: TypeHandle,
     ) -> Option<TypeHandle> {
@@ -801,9 +822,88 @@ impl<'a> InferContext<'a> {
                 }
             }
         };
+        // S2 (NAME_RESOLUTION_PLAN): record the ONE adjudication so IR's bare
+        // Ident compile consumes the ID instead of re-resolving the bare name
+        // through the first-wins ctor tables — under cross-module same-named
+        // constructors (nullary `TDK.TAdt` vs unary `Ty.TAdt`) the string
+        // path picked the unary entry and silently compiled the VALUE to
+        // void (case #0: loadmany/check non-exhaustive panics).
+        let rec_mod = self
+            .instantiation_ctx
+            .as_ref()
+            .map(|i| i.module_name.clone())
+            .unwrap_or_else(|| self.current_module_name.clone());
+        self.sema_result
+            .record_ctor_resolution(&rec_mod, expr.0 as u64, &type_name);
         // Build the concrete instantiation: OwnerType<expected_args...>.
         // exp_args is already resolved/concrete (it came from the type annotation).
         Some(self.arena.make_adt(type_name, exp_args.to_vec().into_boxed_slice()))
+    }
+
+    /// S5 ambiguity hardening (zero-silence ruling): `Ident(name)` in VALUE
+    /// position whose env resolution lands on a FIRST-WON CONSTRUCTOR while
+    /// the name has ≥2 ctor owners. Value position carries no context to
+    /// adjudicate between the owners (a nullary variant value of one type vs
+    /// the same-named ctor-as-function of another), so the historical
+    /// first-win pick was a silent misresolution (the TRecord/TAdt mirror
+    /// case: pattern position disambiguates by scrutinee type, expression
+    /// position does not). Env resolutions that are NOT ctor-shaped
+    /// (ModuleRef, locals, plain values) and single-owner names are
+    /// unaffected.
+    pub(super) fn bare_ctor_ambiguity(
+        &mut self,
+        name: &str,
+        resolved_ty: TypeHandle,
+        expr: ExprId,
+        ast: &AstArena<'_>,
+    ) -> bool {
+        // Receiver position is adjudicated loudly downstream (member-access
+        // paths error on miss); the diagnostic targets silent consumers.
+        if self.in_recv_position {
+            return false;
+        }
+        let ctors = self.sema_result.get_ctor_defs(name);
+        if ctors.len() < 2 {
+            return false;
+        }
+        // Is the winning binding a first-won ctor registration? Test the
+        // resolved shape: Adt(owner) or Fn(..) -> Adt(owner). ModuleRef and
+        // everything else resolve legitimately.
+        let owner_hit: Option<&str> = {
+            let r = self.arena.resolve(resolved_ty);
+            match self.arena.get(r) {
+                Type::Adt(_) => Some(self.arena.adt_parts(r).0),
+                Type::Fn(_) => {
+                    let (_, ret) = self.arena.fn_parts(r);
+                    let rr = self.arena.resolve(ret);
+                    match self.arena.get(rr) {
+                        Type::Adt(_) => Some(self.arena.adt_parts(rr).0),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        let Some(winner) = owner_hit else { return false };
+        if !ctors.iter().any(|c| c.type_name.as_ref() == winner) {
+            return false;
+        }
+        let owners: Vec<String> = ctors
+            .iter()
+            .map(|c| c.type_name.as_ref().to_string())
+            .collect();
+        let span = ast.expr(expr).span;
+        self.add_error_at(
+            &format!(
+                "ambiguous constructor '{}': defined by types [{}]; use Module.{} to disambiguate",
+                name,
+                owners.join(", "),
+                name,
+            ),
+            span.line,
+            span.column,
+        );
+        true
     }
 
     /// Infer an `Expr::Ident` expression (extracted from `infer_expr_inner`).
@@ -859,7 +959,14 @@ impl<'a> InferContext<'a> {
                     }
                     // 3. Full lookup (methods registered in parent env, top-level functions).
                     if let Some(scheme) = self.sema_result.env.lookup(env, name) {
-                        return self.freshen_type(scheme);
+                        let ty = self.freshen_type(scheme);
+                        // S5: the winning binding is a first-won ctor and the
+                        // name has multiple owners — value position cannot
+                        // adjudicate; diagnose instead of silent first-win.
+                        if self.bare_ctor_ambiguity(name, ty, expr, ast) {
+                            return self.arena.fresh_type_var();
+                        }
+                        return ty;
                     }
                     // 4. Trait default methods: permissive field fallback (TypeVar can't
                     //    verify field existence; deferred to monomorphization).
@@ -875,7 +982,12 @@ impl<'a> InferContext<'a> {
                 } else {
                     // Outside methods: full env lookup.
                     if let Some(scheme) = self.sema_result.env.lookup(env, name) {
-                        return self.freshen_type(scheme);
+                        let ty = self.freshen_type(scheme);
+                        // S5: same hardening as the in-method full lookup.
+                        if self.bare_ctor_ambiguity(name, ty, expr, ast) {
+                            return self.arena.fresh_type_var();
+                        }
+                        return ty;
                     }
                 }
                 // Instantiation mode: the temporary InferContext's env does not contain module-level declarations;
@@ -1080,7 +1192,19 @@ impl<'a> InferContext<'a> {
                     BinaryOp::Elvis => {
                         let rl = self.arena.resolve(left_ty);
                         if let Type::Nullable(_) = self.arena.get(rl) {
-                            return self.arena.nullable_inner(rl);
+                            let inner = self.arena.nullable_inner(rl);
+                            // Case #1 root cure: bind a PENDING inner to the
+                            // default value type. Returning the bare inner var
+                            // kept every downstream field/method chain on the
+                            // coalesce result unresolved (they then fell into
+                            // the poisoned Path-0 free-fn fallback).
+                            let rr = self.arena.resolve(right_ty);
+                            if matches!(self.arena.get(rr), Type::TypeVar(_) | Type::Unknown) {
+                                self.unify_or_constrain(inner, right_ty);
+                            } else {
+                                let _ = self.try_widen_unify(inner, right_ty);
+                            }
+                            return inner;
                         }
                         // Throw<T,E> ?? rhs → returns T (the Ok value type), symmetric with Nullable (Bug #28).
                         if let Type::Throw(_) = self.arena.get(rl) {

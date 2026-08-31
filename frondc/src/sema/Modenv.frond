@@ -1,0 +1,657 @@
+// Modenv.frond — 模块环境层(1E):Rust Inference/ModuleEnv.rs 的镜像。
+// register_builtins / ensure_module_env(逐层 env 层级)/ register_module_aliases
+// / process_import_decls(Bug#103 std 层再输出)/ predeclare_declarations(_with_origin)
+// / populate_witness_table / wrap_async_return。
+
+import std.collections.List
+import std.collections.Map
+import std.core.types.Str
+import syntax.Ast
+import types.Arena
+import types.Ty
+
+import sema.Data
+import sema.Envs
+import sema.Semares
+import sema.Ictx
+import sema.Populate
+import sema.Typeast
+
+// ─── register_builtins ────────────────────────────────────────────
+
+pub fun register_builtins(ctx: ICtx, a: TypeArena, s: SemaRes, env: u32): void {
+    // Panic: (str) -> void。
+    val str_ty = Arena.make(a, TStr)
+    val void_ty = Arena.make(a, TVoid)
+    val panic_fn = Arena.make_fn(a, [str_ty], void_ty)
+    Envs.define(s.env, env, "Panic", panic_fn)
+
+    // Ok: ∀T,E. (T) -> Throw<T, E>(rigid 形参;调用点实例化)。
+    val val_ty = Arena.fresh_rigid_var(a)
+    val err_ty = Arena.fresh_rigid_var(a)
+    val throw_ty = Arena.make_throw(a, val_ty, err_ty)
+    val ok_fn = Arena.make_fn(a, [val_ty], throw_ty)
+    Envs.define(s.env, env, "Ok", ok_fn)
+
+    // 数值 ctor:i8..f64 族,∀T. (T) -> Self。
+    val names = Ictx.numeric_builtin_names()
+    var i: usize = 0
+    while i < names.len() {
+        val param = Arena.fresh_rigid_var(a)
+        val ret_ty = Arena.make(a, Ictx.numeric_ty_of(names[i]))
+        val fn_ty = Arena.make_fn(a, [param], ret_ty)
+        Envs.define(s.env, env, names[i], fn_ty)
+        i = i + 1
+    }
+
+    // channel<T>(capacity: usize) -> Channel<T>。
+    val usize_ty = Arena.make(a, TUsize)
+    val t_var3 = Arena.fresh_rigid_var(a)
+    val chan_ret = Arena.make_channel(a, t_var3)
+    val chan_fn = Arena.make_fn(a, [usize_ty], chan_ret)
+    Envs.define(s.env, env, "channel", chan_fn)
+}
+
+// ─── 模块 env 层级 ────────────────────────────────────────────────
+
+// 逐段建层级 env("std.io.File" → std → std.io → std.io.File),父层注册
+// 子段短名 ModuleRef(不覆盖既有绑定);幂等。
+pub fun ensure_module_env(ctx: ICtx, a: TypeArena, s: SemaRes, full_path: str, root_env: u32): u32 {
+    match s.module_envs.get(full_path) {
+        null => {}
+        eid => { return eid }
+    }
+    val segments = Str.split(full_path, ".")
+    var current_path = ""
+    var parent_env = root_env
+    var i: usize = 0
+    while i < segments.len() {
+        if i > 0 {
+            current_path = current_path + "."
+        }
+        current_path = current_path + segments[i]
+        var env_id: u32 = 0
+        match s.module_envs.get(current_path) {
+            null => {
+                env_id = Envs.child(s.env, parent_env)
+                s.module_envs.set(current_path, env_id)
+            },
+            eid => { env_id = eid },
+        }
+        val mod_ref_ty = Arena.make_module_ref(a, current_path, env_id)
+        Envs.define(s.env, parent_env, segments[i], mod_ref_ty)
+        parent_env = env_id
+        i = i + 1
+    }
+    parent_env
+}
+
+// 尾短名 ModuleRef 注册(std 挂 std_env,用户模块挂 root_env;不覆盖)。
+pub fun register_module_aliases(ctx: ICtx, a: TypeArena, s: SemaRes,
+    root_env: u32, std_env: u32, module_paths: List<str>): void {
+    var i: usize = 0
+    while i < module_paths.len() {
+        val path = module_paths.get(i) ?? ""
+        if path.len() > 0 {
+            val is_std = path == "std" || Str.starts_with(path, "std.")
+            val anchor = if is_std { std_env } else { root_env }
+            val module_env = ensure_module_env(ctx, a, s, path, anchor)
+            val last_seg = Semares.tail_seg(path)
+            if last_seg.len() > 0 && Str.contains(path, ".") {
+                if Envs.lookup(s.env, anchor, last_seg) == null {
+                    val mod_ref_ty = Arena.make_module_ref(a, path, module_env)
+                    Envs.define(s.env, anchor, last_seg, mod_ref_ty)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ─── process_import_decls(Bug#103 std 层再输出)───────────────────
+
+
+fun last_dot_index(s: str): i64 {
+    Semares.find_last_sub(s, ".")
+}
+
+
+
+// ─── std origin 索引(一次预建;算法优化轮)──────────────────────
+// 语义等价:hit = origin ∈ subtree(F) ∪ direct(parent(F));排序去重不变。
+
+fun origin_index_build(s: SemaRes): void {
+    val keys = s.std_binding_origins.keys()
+    var ki: usize = 0
+    while ki < keys.len() {
+        val binding = keys[ki]
+        match s.std_binding_origins.get(binding) {
+            null => {}
+            joined => {
+                val parts = Str.split(joined, ",")
+                var pi: usize = 0
+                while pi < parts.len() {
+                    val origin = parts[pi]
+                    var acc = ""
+                    val segs = Str.split(origin, ".")
+                    var si: usize = 0
+                    while si < segs.len() {
+                        if acc.len() == 0 {
+                            acc = segs[si]
+                        } else {
+                            acc = acc + "." + segs[si]
+                        }
+                        match s.origin_subtree.get(acc) {
+                            null => {
+                                val l = List.empty<str>()
+                                l.push(origin)
+                                s.origin_subtree.set(acc, l)
+                            },
+                            l => { l.push(origin) },
+                        }
+                        si = si + 1
+                    }
+                    val odot = last_dot_index(origin)
+                    if odot >= 0 {
+                        val parent = Str.substring(origin, 0, odot as usize)
+                        match s.origin_direct.get(parent) {
+                            null => {
+                                val l = List.empty<str>()
+                                l.push(origin)
+                                s.origin_direct.set(parent, l)
+                            },
+                            l => { l.push(origin) },
+                        }
+                    }
+                    pi = pi + 1
+                }
+            },
+        }
+        ki = ki + 1
+    }
+    s.origin_index_built = true
+}
+
+fun origins_for_import(s: SemaRes, full_path: str, import_parent: str): List<str> {
+    if !s.origin_index_built {
+        origin_index_build(s)
+    }
+    val origins = List.empty<str>()
+    match s.origin_subtree.get(full_path) {
+        null => {}
+        l => {
+            var i: usize = 0
+            while i < l.len() {
+                origins.push(l.get(i) ?? "")
+                i = i + 1
+            }
+        },
+    }
+    if import_parent.len() > 0 {
+        match s.origin_direct.get(import_parent) {
+            null => {}
+            l => {
+                var i: usize = 0
+                while i < l.len() {
+                    val o = l.get(i) ?? ""
+                    if !Semares.list_has_str(origins, o) {
+                        origins.push(o)
+                    }
+                    i = i + 1
+                }
+            },
+        }
+    }
+    str_list_sort(origins)
+    origins
+}
+
+pub fun process_import_decls(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAst, env: u32): void {
+    // 本模块路径前缀(env 链自引用解析)。
+    match Semares.module_logical_path(m.name) {
+        null => {}
+        logical_path => {
+            ensure_module_env(ctx, a, s, logical_path, env)
+        },
+    }
+    var di: usize = 0
+    while di < m.decls.len() {
+        match m.decls[di].decl {
+            ImportDeclD(module_path, items, _) => {
+                if module_path.len() == 0 {
+                    di = di + 1
+                    continue
+                }
+                val full_path = Semares.str_join(module_path, ".")
+                Semares.record_module_import(s, m.name, full_path)
+                val module_env = ensure_module_env(ctx, a, s, full_path, env)
+                // ── std 层再输出(导入即显式可见性授予)──
+                val dot = last_dot_index(full_path)
+                var import_parent = ""
+                if dot >= 0 {
+                    import_parent = Str.substring(full_path, 0, dot as usize)
+                }
+                // origins:自身子树 + 同目录兄弟(Go 目录包语义)。
+                // 算法优化:一次预建索引(subtree[prefix] = 子树全部 origin;
+                // direct[parent] = 直接子 origin),查询 O(命中数)——替代
+                // 逐 import 全量扫描 + 每 origin split(语义等价:hit =
+                // origin ∈ subtree(F) ∪ direct(parent(F)),排序去重不变)。
+                val origins = origins_for_import(s, full_path, import_parent)
+                // 排序 + 去重(Rust sort+dedup 语义)。
+                str_list_sort(origins)
+                // 首段 ModuleRef(std. 限定链)再注册进导入方 env。
+                val first = Str.split(full_path, ".")[0]
+                match s.module_envs.get(first) {
+                    null => {}
+                    first_env => {
+                        if Envs.lookup(s.env, env, first) == null {
+                            val mod_ref = Arena.make_module_ref(a, first, first_env)
+                            Envs.define(s.env, env, first, mod_ref)
+                        }
+                    },
+                }
+                var ii: usize = 0
+                while ii < origins.len() {
+                    val origin = origins.get(ii) ?? ""
+                    match s.module_envs.get(origin) {
+                        null => {}
+                        origin_env => {
+                            // origin 模块 env 的全部绑定再输出(函数/ctor)。
+                            val names = Envs.snapshot_names(s.env, origin_env)
+                            str_list_sort(names)
+                            var ni: usize = 0
+                            while ni < names.len() {
+                                val name = names.get(ni) ?? ""
+                                match Envs.lookup_local(s.env, origin_env, name) {
+                                    null => {}
+                                    sym_ty => { Envs.define(s.env, env, name, sym_ty) }
+                                }
+                                ni = ni + 1
+                            }
+                            // 尾短名 ModuleRef(限定短形态)。
+                            val short = Semares.tail_seg(origin)
+                            if Envs.lookup(s.env, env, short) == null {
+                                val mod_ref_ty = Arena.make_module_ref(a, origin, origin_env)
+                                Envs.define(s.env, env, short, mod_ref_ty)
+                            }
+                        },
+                    }
+                    ii = ii + 1
+                }
+                // ── 选择导入:目标模块 env 按裸名取符号注册别名 ──
+                match items {
+                    null => {}
+                    NoItems => {}
+                    Items(iis) => {
+                        var ki: usize = 0
+                        while ki < iis.len() {
+                            val item = iis[ki]
+                            match Envs.lookup_local(s.env, module_env, item.name) {
+                                null => {}
+                                sym_ty => {
+                                    var local = item.name
+                                    match item.alias {
+                                        null => {}
+                                        al => { local = al }
+                                    }
+                                    Envs.define(s.env, env, local, sym_ty)
+                                    // import_aliases 登记在 M1 无 IR 消费者,
+                                    // 二义检查属推断切片;先跳过。
+                                },
+                            }
+                            ki = ki + 1
+                        }
+                    },
+                }
+            },
+            _ => {}
+        }
+        di = di + 1
+    }
+}
+
+// 字节序排序(镜像 Rust sort:字节级)。
+pub fun str_list_sort(items: List<str>): void {
+    var i: usize = 1
+    while i < items.len() {
+        val key = items.get(i) ?? ""
+        var j: i64 = i as i64 - 1
+        var go = true
+        while go && j >= 0 {
+            val cur = items.get(j as usize) ?? ""
+            if str_bytes_lt(key, cur) {
+                items.set((j + 1) as usize, cur)
+                j = j - 1
+            } else {
+                go = false
+            }
+        }
+        items.set((j + 1) as usize, key)
+        i = i + 1
+    }
+}
+
+pub fun str_bytes_lt(x: str, y: str): bool {
+    std.core.types.Str.bytes_cmp(x, y) < 0
+}
+
+// ─── predeclare ───────────────────────────────────────────────────
+
+// origin 前缀版:predeclare 后把新定义名字记进 std_binding_origins。
+pub fun predeclare_declarations_with_origin(ctx: ICtx, a: TypeArena, s: SemaRes,
+    m: ModuleAst, root_env: u32, origin_prefix: str?): void {
+    var module_env: u32 = root_env
+    var before = List.empty<str>()
+    var has_origin = false
+    match origin_prefix {
+        null => {}
+        lp => {
+            module_env = ensure_module_env(ctx, a, s, lp, root_env)
+            before = Envs.snapshot_names(s.env, module_env)
+            has_origin = true
+        },
+    }
+    predeclare_declarations(ctx, a, s, m, root_env)
+    if has_origin {
+        match origin_prefix {
+            null => {}
+            lp => {
+                val after = Envs.snapshot_names(s.env, module_env)
+                var i: usize = 0
+                while i < after.len() {
+                    val name = after.get(i) ?? ""
+                    if !Semares.list_has_str(before, name) {
+                        match s.std_binding_origins.get(name) {
+                            null => { s.std_binding_origins.set(name, lp) }
+                            prev => {
+                                if !Str.contains(prev, lp) {
+                                    s.std_binding_origins.set(name, prev + ",{lp}")
+                                }
+                            },
+                        }
+                    }
+                    i = i + 1
+                }
+            },
+        }
+    }
+}
+
+pub fun predeclare_declarations(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAst, root_env: u32): void {
+    // 模块上下文(镜像 populate_module:canonical 化需要)。
+    s.current_module_name = m.name
+    s.pending_own_types = Populate.collect_module_type_names(m)
+    s.pending_own_traits = Populate.collect_module_trait_names(m)
+    var di: usize = 0
+    while di < m.decls.len() {
+        match m.decls[di].decl {
+            ImportDeclD(path, _, _) => {
+                if path.len() > 0 {
+                    Semares.record_module_import(s, m.name, Semares.str_join(path, "."))
+                }
+            },
+            _ => {}
+        }
+        di = di + 1
+    }
+    val module_path = Semares.module_logical_path(m.name)
+    val module_env = match module_path {
+        null => { root_env }
+        mp => { ensure_module_env(ctx, a, s, mp, root_env) }
+    }
+    ctx.current_module_env = module_env
+    // 同模块重复函数定义(define 第一获胜,静默 → Bug#94 报错)。
+    val seen_fns = List.empty<str>()
+    di = 0
+    while di < m.decls.len() {
+        val sd = m.decls[di]
+        match sd.decl {
+            FunDeclD(_, name, tps, params, rt, _, is_async, _, _, _) => {
+                if Semares.list_has_str(seen_fns, name) {
+                    Semares.add_error(s, Data.new_err(
+                        "duplicate definition of function '{name}' in this module", sd.span.line, sd.span.column))
+                }
+                seen_fns.push(name)
+                // 顶层函数禁 this 参数(ThisType 注解判定)。
+                if params.len() > 0 && Ictx.is_this_param(params[0].ta, m.arena) {
+                    Semares.add_error(s, Data.new_err(
+                        "this parameter is not allowed in top-level function", sd.span.line, sd.span.column))
+                }
+                // 泛型函数:压绑定栈(type_from_ast 解析形参为 rigid)。
+                if tps.len() > 0 {
+                    Ictx.push_type_bindings(ctx, a, tps)
+                }
+                var param_types: u32[] = []
+                var pi: usize = 0
+                while pi < params.len() {
+                    match params[pi].ta {
+                        null => { param_types = param_types ++ [Arena.fresh_type_var(a)] }
+                        ta => { param_types = param_types ++ [Typeast.type_from_ast(ctx, a, s, ta, m.arena)] }
+                    }
+                    pi = pi + 1
+                }
+                val ret_ty_raw = match rt {
+                    null => { Arena.fresh_type_var(a) }
+                    r0 => { Typeast.type_from_ast(ctx, a, s, r0, m.arena) }
+                }
+                val ret_ty = wrap_async_return(a, ret_ty_raw, is_async)
+                val fn_ty = Arena.make_fn(a, param_types, ret_ty)
+                Envs.define(s.env, module_env, name, fn_ty)
+                Envs.define(s.env, root_env, name, fn_ty)
+                if tps.len() > 0 {
+                    Ictx.pop_frame(ctx)
+                }
+            },
+            TypeDeclD(_, name, tps, base_types, _, def, _) => {
+                // 类型 ctor 预绑定(canonical 名;泛型绑定形参)。
+                val canonical = Semares.resolve_type_key(s, name)
+                if tps.len() > 0 {
+                    Ictx.push_type_bindings(ctx, a, tps)
+                }
+                var self_ty: u32 = 0
+                if tps.len() == 0 {
+                    self_ty = Arena.make_adt(a, canonical, [])
+                } else {
+                    var type_args: u32[] = []
+                    var ti: usize = 0
+                    while ti < tps.len() {
+                        match Ictx.lookup_type_binding(ctx, tps[ti].name) {
+                            null => { type_args = type_args ++ [Arena.fresh_rigid_var(a)] }
+                            h => { type_args = type_args ++ [h] }
+                        }
+                        ti = ti + 1
+                    }
+                    self_ty = Arena.make_adt(a, canonical, type_args)
+                }
+                // 继承:env 绑定用 sema 合并视图(base 字段 + own)。
+                var merged_reprs: List<TR> = List.empty<TR>()
+                if base_types.len() > 0 {
+                    match Semares.get_type_def(s, name) {
+                        null => {}
+                        d => {
+                            if d.constructors.len() > 0 {
+                                val c = d.constructors[0]
+                                var fi: usize = 0
+                                while fi < c.field_type_reprs.len() {
+                                    merged_reprs.push(c.field_type_reprs[fi])
+                                    fi = fi + 1
+                                }
+                            }
+                        },
+                    }
+                }
+                val is_stdlib_mod = Str.starts_with(m.name, "std/") || Str.starts_with(m.name, "builtin/")
+                match def {
+                    AdtD(ctors) => {
+                        var ci: usize = 0
+                        while ci < ctors.len() {
+                            val ctor = ctors[ci]
+                            var ctor_fn_ty: u32 = 0
+                            if merged_reprs.len() > 0 {
+                                // 合并视图:(继承 + own 字段) -> Child(裸 Adt)。
+                                val child_adt = Arena.make_adt(a, canonical, [])
+                                var param_types: u32[] = []
+                                var ri: usize = 0
+                                while ri < merged_reprs.len() {
+                                param_types = param_types ++ [type_repr_to_handle(a, s, merged_reprs.get(ri) ?? TRNamed(""))]
+                                    ri = ri + 1
+                                }
+                                if param_types.len() == 0 {
+                                    ctor_fn_ty = child_adt
+                                } else {
+                                    ctor_fn_ty = Arena.make_fn(a, param_types, child_adt)
+                                }
+                            } else {
+                                var param_types: u32[] = []
+                                var fi: usize = 0
+                                while fi < ctor.fields.len() {
+                                    param_types = param_types ++ [Typeast.type_from_ast(ctx, a, s, ctor.fields[fi].ty, m.arena)]
+                                    fi = fi + 1
+                                }
+                                if param_types.len() == 0 {
+                                    ctor_fn_ty = self_ty
+                                } else {
+                                    ctor_fn_ty = Arena.make_fn(a, param_types, self_ty)
+                                }
+                            }
+                            if is_stdlib_mod {
+                                Envs.redefine(s.env, root_env, ctor.name, ctor_fn_ty)
+                            } else {
+                                Envs.define(s.env, module_env, ctor.name, ctor_fn_ty)
+                                Envs.define(s.env, root_env, ctor.name, ctor_fn_ty)
+                            }
+                            ctx.ctor_module_envs.set(ctor.name, module_env)
+                            ci = ci + 1
+                        }
+                    },
+                    NewtypeD(ctor_name, inner) => {
+                        val inner_ty = Typeast.type_from_ast(ctx, a, s, inner, m.arena)
+                        val ctor_fn_ty = Arena.make_fn(a, [inner_ty], self_ty)
+                        if is_stdlib_mod {
+                            Envs.redefine(s.env, root_env, ctor_name, ctor_fn_ty)
+                        } else {
+                            Envs.define(s.env, module_env, ctor_name, ctor_fn_ty)
+                            Envs.define(s.env, root_env, ctor_name, ctor_fn_ty)
+                        }
+                        ctx.ctor_module_envs.set(ctor_name, module_env)
+                    },
+                    _ => {}
+                }
+                if tps.len() > 0 {
+                    Ictx.pop_frame(ctx)
+                }
+            },
+            _ => {}
+        }
+        di = di + 1
+    }
+}
+
+// ─── wrap_async_return ────────────────────────────────────────────
+
+pub fun wrap_async_return(a: TypeArena, ret_ty: u32, is_async: bool): u32 {
+    if !is_async {
+        return ret_ty
+    }
+    val resolved = Arena.resolve(a, ret_ty)
+    var already = false
+    match Arena.get(a, resolved) {
+        TAsync(_) => { already = true }
+        _ => {}
+    }
+    if already {
+        ret_ty
+    } else {
+        Arena.make_async(a, ret_ty)
+    }
+}
+
+// ─── TypeRepr → TypeHandle(lookup_method_type 用)─────────────────
+
+pub fun type_repr_to_handle(a: TypeArena, s: SemaRes, r: TR): u32 {
+    match r {
+        TRNamed(n) => {
+            match Populate.from_type_name_full(n) {
+                null => { Arena.make_adt(a, Semares.resolve_type_key(s, n), []) }
+                t => { Arena.make(a, t) }
+            }
+        },
+        TRThis => { Arena.make_adt(a, "This", []) }
+        TRGeneric(n, args) => {
+            var hs: u32[] = []
+            var i: usize = 0
+            while i < args.len() {
+                hs = hs ++ [type_repr_to_handle(a, s, args[i])]
+                i = i + 1
+            }
+            if Ictx.is_builtin_generic_type(n) {
+                Ictx.make_builtin_generic(a, n, hs)
+            } else {
+                Arena.make_adt(a, Semares.resolve_type_key(s, n), hs)
+            }
+        },
+        TRNullable(i0) => { Arena.make_nullable(a, type_repr_to_handle(a, s, i0)) }
+        TRRef(i0) => { Arena.make_ref(a, type_repr_to_handle(a, s, i0), false) }
+        TRRaw(i0) => { Arena.make_ref(a, type_repr_to_handle(a, s, i0), true) }
+        TRFun(ps, r0) => {
+            var hs: u32[] = []
+            var i: usize = 0
+            while i < ps.len() {
+            hs = hs ++ [type_repr_to_handle(a, s, ps[i])]
+                i = i + 1
+            }
+            Arena.make_fn(a, hs, type_repr_to_handle(a, s, r0))
+        },
+        TRArray(e, sz) => { Arena.make_array(a, type_repr_to_handle(a, s, e), sz) }
+    }
+}
+
+// ─── populate_witness_table ───────────────────────────────────────
+
+pub fun populate_witness_table(ctx: ICtx, s: SemaRes, m: ModuleAst): void {
+    var di: usize = 0
+    while di < m.decls.len() {
+        val sd = m.decls[di]
+        match sd.decl {
+            TypeDeclD(_, name, _, _, traits, _, methods) => {
+                val canonical = Semares.resolve_type_key(s, name)
+                match Semares.type_def_idx(s, canonical) {
+                    null => {}
+                    idx => {
+                        val type_id = Semares.dynamic_type_id(idx)
+                        var ti: usize = 0
+                        while ti < traits.len() {
+                            val impl_trait = traits[ti]
+                            val trait_name = Semares.resolve_trait_key(s, impl_trait.trait_name)
+                            if Semares.get_trait_def(s, trait_name) == null {
+                                Semares.add_error(s, Data.new_err(
+                                    "type '{name}' implements unknown trait '{trait_name}' (declared before use? traits must exist)",
+                                    sd.span.line, sd.span.column))
+                                ti = ti + 1
+                                continue
+                            }
+                            val slots = Map.empty<str, i64>()
+                            var mi: usize = 0
+                            while mi < methods.len() {
+                                slots.set(methods[mi].name, mi as i64)
+                                mi = mi + 1
+                            }
+                            Semares.witness_register(s, trait_name, type_id, canonical, slots)
+                            // 传递性:实现子 trait 同时是全部传递父的见证。
+                            val closure = Semares.trait_parent_closure(s, trait_name)
+                            var ci: usize = 0
+                            while ci < closure.len() {
+                                val pt = closure.get(ci) ?? ""
+                                Semares.witness_register(s, pt, type_id, canonical, slots)
+                                ci = ci + 1
+                            }
+                            ti = ti + 1
+                        }
+                    },
+                }
+            },
+            _ => {}
+        }
+        di = di + 1
+    }
+}

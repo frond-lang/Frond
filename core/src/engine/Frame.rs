@@ -46,8 +46,16 @@ pub fn prepare_same_function_frame_sync(frame: &mut Frame, graph: &DataFlowGraph
     // the cached pending_inputs + seed list (memcpy instead of a per-node nested-range scan).
     // Loop iterations with a stable outer-ready set hit this every round.
     if let Some(cache) = frame.same_fn_prep_cache.take() {
-        let (snap_ready, snap_pending, snap_seed) = *cache;
-        let hit = snap_ready.len() == frame.value_table.ready.len()
+        let (snap_sg, snap_ready, snap_pending, snap_seed) = *cache;
+        // The snapshot is a pure function of (sg, ready bitmap, graph). A
+        // frame that changed subgraph_id (pool/hot-body/cached-child reuse)
+        // may still carry the previous sg's snapshot; a bitmap-only check can
+        // coincidentally match and replay pendings derived for a DIFFERENT
+        // branch — stamping PENDING_EXTERNAL onto this sg's OWN nodes, which
+        // notify_downstream never decrements: the node never arms and its
+        // statements are silently dropped. sg identity is part of the key.
+        let hit = snap_sg == sg_id.0
+            && snap_ready.len() == frame.value_table.ready.len()
             && snap_pending.len() == parent_node_count
             && frame.pending_inputs.len() >= parent_node_count
             && snap_ready[..] == frame.value_table.ready[..];
@@ -58,7 +66,7 @@ pub fn prepare_same_function_frame_sync(frame: &mut Frame, graph: &DataFlowGraph
                     frame.push_ready(local);
                 }
             }
-            frame.same_fn_prep_cache = Some(Box::new((snap_ready, snap_pending, snap_seed)));
+            frame.same_fn_prep_cache = Some(Box::new((snap_sg, snap_ready, snap_pending, snap_seed)));
             return;
         }
         // Miss: fall through to re-derive; the tail stores a fresh snapshot.
@@ -72,11 +80,13 @@ pub fn prepare_same_function_frame_sync(frame: &mut Frame, graph: &DataFlowGraph
         let gid = (parent_start as usize + i) as u32;
         let in_branch = gid >= branch_start && gid < branch_end;
         if !in_branch || is_nested(gid) {
+
             frame.pending_inputs[i] = PENDING_EXTERNAL;
             continue;
         }
         let node = graph.node(gid as usize);
         if node.kind == NodeKind::EventSource {
+
             frame.pending_inputs[i] = PENDING_EXTERNAL;
         } else {
             let inputs = graph.inputs(node.inputs_offset, node.input_count);
@@ -114,6 +124,7 @@ pub fn prepare_same_function_frame_sync(frame: &mut Frame, graph: &DataFlowGraph
     }
 
     frame.same_fn_prep_cache = Some(Box::new((
+        sg_id.0,
         frame.value_table.ready.clone(),
         frame.pending_inputs[..parent_node_count].to_vec(),
         seed,
@@ -348,9 +359,10 @@ impl<S: LockStrategy> Engine<S> {
         // iteration can never disturb a later one.
         {
             let body_fid = body_frame.id;
-            self.event_waiters
-                .lock()
-                .retain(|(_, wf)| *wf != loop_fid && *wf != body_fid);
+            let mut ew = self.event_waiters.lock();
+            for bucket in ew.values_mut() {
+                bucket.retain(|wf| *wf != loop_fid && *wf != body_fid);
+            }
         }
         let loop_sg_id = loop_frame.subgraph_id;
         // Borrow the plan from the graph instead of cloning: reset_plan stays immutable for the
@@ -799,6 +811,18 @@ impl<S: LockStrategy> Engine<S> {
 
         // Cross-function call: do not set frame-chain pointers.
         if caller_fn_id != frame_fn_id {
+            return;
+        }
+
+        // Self-recursion: a frame running the function BODY subgraph called
+        // from the same function has equal fn_ids but is a CROSS-FUNCTION
+        // call semantically — every level owns an independent call frame
+        // (Bug #102 family). The fn_id-only check used to send self-recursion
+        // into the root walk below, walking the ENTIRE recursion chain to the
+        // top — O(depth) per frame, O(depth²) for a deep async chain, and
+        // wiring parent/root pointers across independent call frames. Only
+        // branch-subgraph frames (sg != the function body) get chain pointers.
+        if frame.subgraph_id.0 == frame_fn_id {
             return;
         }
 

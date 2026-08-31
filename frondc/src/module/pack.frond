@@ -1,0 +1,9 @@
+// module 包声明 — 模块加载(1C),目录拓扑镜像 Rust core/src/module/。
+//
+// `import module` 一次引全:StdPaths(std 清单,生成)/ Toml(mini-TOML)/
+// Loader(六步解析+依赖图)/ Manifest(Root.toml 发现+std 根解析)。
+pub pack StdPaths
+pub pack Toml
+pub pack Loader
+pub pack Manifest
+pub pack AstDiskCache

@@ -1,0 +1,2945 @@
+// Parse.frond — frondc 递归下降语法器(Stage 1 / 1B)。
+//
+// 忠实转写 Frond/core/src/ast/Parser.rs 的 Parser(含:Pratt 优先级爬升、
+// 虚拟 > 拆分(pending_eq/gt/gt_eq)、负数字面量折叠、三路回溯
+// (分组/记录字面量/记录扩展)、字符串插值子解析(子词法+子解析+状态
+// 保存恢复)、同步错误恢复)。差分口径:AST dump 与
+// `frond debug --stage ast` 逐字节一致(见 tests/scripts/diff_ast.sh)。
+
+import std.collections.List
+import syntax.Lex
+import syntax.Ast
+
+pub type PErr = PErr(pub line: i64, pub column: i64, pub message: str)
+
+// ── 优先级与二元运算符表(与 Rust BINARY_OPS 对位)──
+
+val ELVIS_PREC: i64 = 1
+val OR_PREC: i64 = 2
+val AND_PREC: i64 = 3
+val BIT_OR_PREC: i64 = 4
+val BIT_XOR_PREC: i64 = 5
+val BIT_AND_PREC: i64 = 6
+val EQUALITY_PREC: i64 = 7
+val COMPARISON_PREC: i64 = 8
+val RANGE_PREC: i64 = 9
+val SHIFT_PREC: i64 = 10
+val ADDITION_PREC: i64 = 11
+val MULTIPLICATION_PREC: i64 = 12
+val MIN_PREC: i64 = ELVIS_PREC
+
+type OpMap = OpMap(tok: TokKind, op: BOp, prec: i64, deref_check: bool, right_assoc: bool)
+
+val BOPS: OpMap[] = [
+    OpMap(Lex.QuestionQuestion, ElvisOp, ELVIS_PREC, false, true),
+    OpMap(Lex.PipePipe, Or, OR_PREC, false, false),
+    OpMap(Lex.AmpAmp, And, AND_PREC, false, false),
+    OpMap(Lex.Pipe, BitOr, BIT_OR_PREC, false, false),
+    OpMap(Lex.Caret, BitXor, BIT_XOR_PREC, false, false),
+    OpMap(Lex.Ampersand, BitAnd, BIT_AND_PREC, false, false),
+    OpMap(Lex.LtLt, Shl, SHIFT_PREC, false, false),
+    OpMap(Lex.GtGt, Shr, SHIFT_PREC, false, false),
+    OpMap(Lex.EqEq, Eq, EQUALITY_PREC, false, false),
+    OpMap(Lex.BangEq, Neq, EQUALITY_PREC, false, false),
+    OpMap(Lex.RefEq, RefEq, EQUALITY_PREC, false, false),
+    OpMap(Lex.RefNeq, RefNeq, EQUALITY_PREC, false, false),
+    OpMap(Lex.Lt, Lt, COMPARISON_PREC, false, false),
+    OpMap(Lex.Gt, Gt, COMPARISON_PREC, false, false),
+    OpMap(Lex.LtEq, LtEq, COMPARISON_PREC, false, false),
+    OpMap(Lex.GtEq, GtEq, COMPARISON_PREC, false, false),
+    OpMap(Lex.DotDot, Range, RANGE_PREC, false, false),
+    OpMap(Lex.DotDotEq, RangeIncl, RANGE_PREC, false, false),
+    OpMap(Lex.Plus, Add, ADDITION_PREC, false, false),
+    OpMap(Lex.PlusPlus, ConcatList, ADDITION_PREC, false, false),
+    OpMap(Lex.Minus, Sub, ADDITION_PREC, false, false),
+    OpMap(Lex.Star, Mul, MULTIPLICATION_PREC, true, false),
+    OpMap(Lex.Slash, Div, MULTIPLICATION_PREC, false, false),
+    OpMap(Lex.Percent, Mod, MULTIPLICATION_PREC, false, false),
+]
+
+fun lookup_binary_op(k: TokKind): OpMap? {
+    var i: i64 = 0
+    while i < BOPS.len() as i64 {
+        if BOPS[i as usize].tok == k {
+            return BOPS[i as usize]
+        }
+        i = i + 1
+    }
+    null
+}
+
+// ── 数值/字符辅助(与 Rust 助手函数对位)──
+
+fun is_du(ch: u8): bool { (ch >= (48 as u8) && ch <= (57 as u8)) || ch == (95 as u8) }
+
+fun is_hu(ch: u8): bool {
+    is_du(ch) || (ch >= (97 as u8) && ch <= (102 as u8)) || (ch >= (65 as u8) && ch <= (70 as u8))
+}
+
+type SplitRes = SplitRes(num: str, suffix: str?)
+
+fun split_float_suffix(raw: str): SplitRes {
+    val b = raw.bytes()
+    val n = b.len() as i64
+    var i: i64 = 0
+    if n > 2 && b[0] == (48 as u8) && (b[1] == (120 as u8) || b[1] == (88 as u8)) {
+        i = 2
+        while i < n && is_hu(b[i as usize]) {
+            i = i + 1
+        }
+        if i < n && b[i as usize] == (46 as u8) {
+            i = i + 1
+            while i < n && is_hu(b[i as usize]) {
+                i = i + 1
+            }
+        }
+        if i < n && (b[i as usize] == (112 as u8) || b[i as usize] == (80 as u8)) {
+            i = i + 1
+            if i < n && (b[i as usize] == (43 as u8) || b[i as usize] == (45 as u8)) {
+                i = i + 1
+            }
+            while i < n && is_du(b[i as usize]) {
+                i = i + 1
+            }
+        }
+    } else {
+        while i < n && is_du(b[i as usize]) {
+            i = i + 1
+        }
+        if i < n && b[i as usize] == (46 as u8) {
+            i = i + 1
+            while i < n && is_du(b[i as usize]) {
+                i = i + 1
+            }
+        }
+        if i < n && (b[i as usize] == (101 as u8) || b[i as usize] == (69 as u8)) {
+            i = i + 1
+            if i < n && (b[i as usize] == (43 as u8) || b[i as usize] == (45 as u8)) {
+                i = i + 1
+            }
+            while i < n && is_du(b[i as usize]) {
+                i = i + 1
+            }
+        }
+    }
+    if i < n {
+        SplitRes((b[0 as usize..i as usize]) as str, (b[i as usize..n as usize]) as str)
+    } else {
+        SplitRes(raw, null)
+    }
+}
+
+// u64 解析:全数字才有效(Rust s.parse::<u64>())。
+fun parse_u64(s: str): i64? {
+    val b = s.bytes()
+    if b.len() == 0 {
+        return null
+    }
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < b.len() as i64 {
+        val c = b[i as usize]
+        if (c as i64) < 48 || (c as i64) > 57 {
+            return null
+        }
+        v = v * 10 + (c as i64) - 48
+        i = i + 1
+    }
+    v
+}
+
+fun hex_val(ch: u8): i64 {
+    if ch >= (48 as u8) && ch <= (57 as u8) {
+        (ch as i64) - 48
+    } else if ch >= (97 as u8) && ch <= (102 as u8) {
+        (ch as i64) - 87
+    } else {
+        (ch as i64) - 55
+    }
+}
+
+// 解码 UTF-8 首标量(b 自 pos 起);返回 (codepoint, len)。
+type U8Dec = U8Dec(cp: i64, len: i64)
+
+fun decode_utf8(b: u8[], pos: i64): U8Dec {
+    val c = b[pos as usize]
+    if c < (128 as u8) {
+        return U8Dec(c as i64, 1)
+    }
+    if c < (224 as u8) {
+        return U8Dec(((c as i64) - 192) * 64 + ((b[(pos + 1) as usize] as i64) - 128), 2)
+    }
+    if c < (240 as u8) {
+        return U8Dec(((c as i64) - 224) * 4096 + ((b[(pos + 1) as usize] as i64) - 128) * 64 + ((b[(pos + 2) as usize] as i64) - 128), 3)
+    }
+    U8Dec(((c as i64) - 240) * 262144 + ((b[(pos + 1) as usize] as i64) - 128) * 4096 + ((b[(pos + 2) as usize] as i64) - 128) * 64 + ((b[(pos + 3) as usize] as i64) - 128), 4)
+}
+
+// 标量 → UTF-8 字节(List<u8> 尾接)。
+fun push_codepoint(out: List<u8>, cp: i64): void {
+    if cp < 128 {
+        out.push((cp as u8))
+    } else if cp < 2048 {
+        out.push(((192 + cp / 64) as u8))
+        out.push(((128 + cp % 64) as u8))
+    } else if cp < 65536 {
+        out.push(((224 + cp / 4096) as u8))
+        out.push(((128 + (cp / 64) % 64) as u8))
+        out.push(((128 + cp % 64) as u8))
+    } else {
+        out.push(((240 + cp / 262144) as u8))
+        out.push(((128 + (cp / 4096) % 64) as u8))
+        out.push(((128 + (cp / 64) % 64) as u8))
+        out.push(((128 + cp % 64) as u8))
+    }
+}
+
+// 字符字面量词素 → 标量值(与 Rust parse_char_value 对位)。
+fun parse_char_value(lexeme: str): i64 {
+    val lb = lexeme.bytes()
+    if lb.len() < 3 {
+        return 0
+    }
+    val content = lb[1 as usize..(lb.len() - 1) as usize]
+    if content.len() == 0 {
+        return 0
+    }
+    val b = content
+    if b[0 as usize] == (92 as u8) {
+        if content.len() < 2 {
+            return 0
+        }
+        val e = b[1 as usize]
+        if e == (110 as u8) { return 10 }
+        if e == (116 as u8) { return 9 }
+        if e == (114 as u8) { return 13 }
+        if e == (92 as u8) { return 92 }
+        if e == (39 as u8) { return 39 }
+        if e == (48 as u8) { return 0 }
+        if e == (117 as u8) {
+            // \uXXXX 或 \u{XXXX}
+            if content.len() > 2 && b[2 as usize] == (123 as u8) {
+                var close: i64 = 3
+                while close < content.len() as i64 && b[close as usize] != (125 as u8) {
+                    close = close + 1
+                }
+                if close > 3 {
+                    var v: i64 = 0
+                    var k: i64 = 3
+                    while k < close {
+                        v = v * 16 + hex_val(b[k as usize])
+                        k = k + 1
+                    }
+                    return v
+                }
+                return 0
+            } else if content.len() >= 6 {
+                var v: i64 = 0
+                var k: i64 = 2
+                while k < 6 {
+                    v = v * 16 + hex_val(b[k as usize])
+                    k = k + 1
+                }
+                return v
+            }
+            return 0
+        }
+        if e == (120 as u8) {
+            if content.len() >= 4 {
+                return hex_val(b[2 as usize]) * 16 + hex_val(b[3 as usize])
+            }
+            return 0
+        }
+        return e as i64
+    }
+    // 非 ASCII:解完整 UTF-8 序列首标量
+    decode_utf8(b, 0).cp
+}
+
+// 原始词素是否含插值(与 Rust contains_interpolation 对位)。
+fun contains_interpolation(raw: str): bool {
+    val b = raw.bytes()
+    val n = b.len() as i64
+    if n < 2 {
+        return false
+    }
+    var i: i64 = 1
+    while i < n - 1 {
+        if b[i as usize] == (92 as u8) {
+            if i + 1 < n && b[(i + 1) as usize] == (117 as u8) {
+                i = i + 2
+                if i < n && b[i as usize] == (123 as u8) {
+                    while i < n && b[i as usize] != (125 as u8) {
+                        i = i + 1
+                    }
+                    if i < n {
+                        i = i + 1
+                    }
+                } else {
+                    i = i + 4
+                }
+                continue
+            }
+            if i + 1 < n && b[(i + 1) as usize] == (120 as u8) {
+                i = i + 4
+                continue
+            }
+            i = i + 2
+            continue
+        }
+        if b[i as usize] == (123 as u8) {
+            if i + 1 < n - 1 && b[(i + 1) as usize] == (123 as u8) {
+                i = i + 2
+                continue
+            }
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+fun int_to_key(idx: i64): str {
+    "{idx}"
+}
+
+// ── 解析器本体 ──
+
+pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, errors: List<PErr>,
+    pending_eq: bool, pending_gt: bool, pending_gt_eq: bool) {
+
+    fun n(): i64 { toks.len() as i64 }
+
+    fun tok_at(i: i64): Tk { toks[i as usize] }
+
+    fun lexeme_of(t: Tk): str {
+        (src[t.start as usize..t.end as usize]) as str
+    }
+
+    // ── token 导航 ──
+
+    fun base_token(): Tk {
+        if current > 0 {
+            tok_at(current - 1)
+        } else {
+            tok_at(0)
+        }
+    }
+
+    fun peek(): Tk {
+        if pending_eq {
+            val b = base_token()
+            return Tk(Lex.Eq, b.start, b.end, b.line, b.column + 1)
+        }
+        if pending_gt {
+            val b = base_token()
+            return Tk(Lex.Gt, b.start, b.end, b.line, b.column + 1)
+        }
+        if pending_gt_eq {
+            val b = base_token()
+            return Tk(Lex.GtEq, b.start, b.end, b.line, b.column + 1)
+        }
+        if current >= n() {
+            return tok_at(n() - 1)
+        }
+        tok_at(current)
+    }
+
+    fun previous(): Tk { tok_at(current - 1) }
+
+    fun is_at_end(): bool { peek().kind == Lex.Eof }
+
+    fun &advance(): Tk {
+        if pending_eq {
+            pending_eq = false
+            val b = base_token()
+            return Tk(Lex.Eq, b.start, b.end, b.line, b.column + 1)
+        }
+        if pending_gt {
+            pending_gt = false
+            val b = base_token()
+            return Tk(Lex.Gt, b.start, b.end, b.line, b.column + 1)
+        }
+        if pending_gt_eq {
+            pending_gt_eq = false
+            val b = base_token()
+            return Tk(Lex.GtEq, b.start, b.end, b.line, b.column + 1)
+        }
+        if !is_at_end() {
+            current = current + 1
+        }
+        tok_at(current - 1)
+    }
+
+    fun check(kind: TokKind): bool {
+        if is_at_end() {
+            return false
+        }
+        peek().kind == kind
+    }
+
+    fun &match_token(kind: TokKind): bool {
+        if check(kind) {
+            advance()
+            return true
+        }
+        false
+    }
+
+    fun &expect(kind: TokKind, message: str): Throw<Tk, PErr> {
+        if check(kind) {
+            return Ok(advance())
+        }
+        val t = peek()
+        report_error_at(t.line, t.column, message)?
+        Ok(t)
+    }
+
+    fun check_identifier(name: str): bool {
+        peek().kind == Lex.Identifier && lexeme_of(peek()) == name
+    }
+
+    fun check_close_angle(): bool {
+        if pending_gt || pending_gt_eq {
+            return true
+        }
+        if current >= n() {
+            return false
+        }
+        val k = tok_at(current).kind
+        k == Lex.Gt || k == Lex.GtEq || k == Lex.GtGt || k == Lex.GtGtEq
+    }
+
+    fun &expect_close_angle(message: str): Throw<void, PErr> {
+        if check(Lex.Gt) {
+            advance()
+            return Ok(void)
+        }
+        if pending_gt_eq {
+            pending_gt_eq = false
+            pending_eq = true
+            return Ok(void)
+        }
+        if current < n() {
+            val k = tok_at(current).kind
+            if k == Lex.GtEq {
+                current = current + 1
+                pending_eq = true
+                return Ok(void)
+            }
+            if k == Lex.GtGt {
+                current = current + 1
+                pending_gt = true
+                return Ok(void)
+            }
+            if k == Lex.GtGtEq {
+                current = current + 1
+                pending_gt_eq = true
+                return Ok(void)
+            }
+        }
+        val t = peek()
+        report_error_at(t.line, t.column, message)?
+        Ok(void)
+    }
+
+    // ── 错误处理 ──
+
+    fun &report_error_at(line: i64, column: i64, message: str): Throw<void, PErr> {
+        errors.push(PErr(line, column, message))
+        throw PErr(line, column, message)
+    }
+
+    fun &report_error(message: str): Throw<void, PErr> {
+        val t = peek()
+        report_error_at(t.line, t.column, message)?
+        Ok(void)
+    }
+
+    fun &reject_paren_condition(kw_name: str): Throw<void, PErr> {
+        if check(Lex.LParen) && paren_wraps_full_condition() {
+            report_error("parentheses are not allowed around the " + kw_name + " condition")?
+        }
+        Ok(void)
+    }
+
+    fun paren_wraps_full_condition(): bool {
+        var i: i64 = current
+        if i >= n() || tok_at(i).kind != Lex.LParen {
+            return false
+        }
+        var depth: i64 = 0
+        while i < n() {
+            val k = tok_at(i).kind
+            if k == Lex.LParen {
+                depth = depth + 1
+            } else if k == Lex.RParen {
+                depth = depth - 1
+                if depth == 0 {
+                    val next = i + 1
+                    if next >= n() {
+                        return true
+                    }
+                    val nk = tok_at(next).kind
+                    if lookup_binary_op(nk) != null {
+                        return false
+                    }
+                    // 后缀续接(字段/索引/as)=接收者分组,非条件包裹。
+                    return !(nk == Lex.Dot || nk == Lex.LBracket || nk == Lex.KwAs)
+                }
+            } else if k == Lex.Eof {
+                return false
+            }
+            i = i + 1
+        }
+        false
+    }
+
+    fun &synchronize(): void {
+        while !is_at_end() {
+            val k = peek().kind
+            if k == Lex.KwFun || k == Lex.KwType || k == Lex.KwTrait || k == Lex.KwImport
+                || k == Lex.KwPack || k == Lex.KwPub || k == Lex.KwVal || k == Lex.KwVar {
+                break
+            }
+            if k == Lex.RBrace {
+                advance()
+                break
+            }
+            advance()
+        }
+    }
+
+    // ── 模块解析 ──
+
+    pub fun &parse_module(module_name: str): Throw<ModuleAst, PErr> {
+        val decls = List.empty()
+        while !is_at_end() {
+            val k = peek().kind
+            val at_decl_kw = k == Lex.KwFun || k == Lex.KwType || k == Lex.KwTrait
+                || k == Lex.KwImport || k == Lex.KwPack || k == Lex.KwPub || k == Lex.At
+            val d = try_parse_decl()
+            match d {
+                null => {}
+                decl => {
+                    decls.push(decl)
+                    continue
+                }
+            }
+            if at_decl_kw {
+                val before_sync = current
+                synchronize()
+                if current == before_sync && !is_at_end() {
+                    advance()
+                }
+                continue
+            }
+            val before_expr = current
+            val expr = match parse_expr() {
+                Ok(e) => e
+                Error(_) => {
+                    synchronize()
+                    continue
+                }
+            }
+            if current == before_expr {
+                advance()
+                continue
+            }
+            val span = ast.expr(expr).span
+            if match_token(Lex.Eq) {
+                val value = match parse_expr() {
+                    Ok(v) => v
+                    Error(_) => {
+                        synchronize()
+                        continue
+                    }
+                }
+                val stmt = ast.alloc_stmt(span, AssignS(expr, value))
+                val void_expr = ast.alloc_expr(span, VoidLit)
+                decls.push(Sd(span, ExprDeclD(void_expr, stmt)))
+            } else {
+                decls.push(Sd(span, ExprDeclD(expr, null)))
+            }
+        }
+        if errors.len() > 0 {
+            val e0 = errors.get(0 as usize) ?? PErr(0, 0, "?")
+            throw e0
+        }
+        Ok(ModuleAst(module_name, module_name, ast, decls.as_array()))
+    }
+
+    fun &parse_attributes(): Attr[] {
+        val attrs = List.empty()
+        while check(Lex.At) {
+            advance()
+            val name_tok = match expect(Lex.Identifier, "expected attribute name") {
+                Ok(t) => t
+                Error(_) => break
+            }
+            val args = List.empty()
+            if check(Lex.LParen) {
+                advance()
+                while !check(Lex.RParen) && !is_at_end() {
+                    if check(Lex.StringLiteral) {
+                        val lex = lexeme_of(advance())
+                        if lex.len() >= 2 {
+                            args.push((lex.bytes()[1 as usize..(lex.len() - 1) as usize]) as str)
+                        } else {
+                            args.push(lex)
+                        }
+                    } else if check(Lex.Identifier) {
+                        args.push(lexeme_of(advance()))
+                    } else {
+                        advance()
+                    }
+                    if check(Lex.Comma) {
+                        advance()
+                    }
+                }
+                expect(Lex.RParen, "expected ')' after attribute args")?
+            } else if check(Lex.StringLiteral) {
+                val lex = lexeme_of(advance())
+                if lex.len() >= 2 {
+                    args.push((lex.bytes()[1 as usize..(lex.len() - 1) as usize]) as str)
+                } else {
+                    args.push(lex)
+                }
+            }
+            attrs.push(Attr(lexeme_of(name_tok), args.as_array()))
+        }
+        attrs.as_array()
+    }
+
+    fun &try_parse_decl(): Sd? {
+        val saved = current
+        val attributes = parse_attributes()
+        if attributes.len() > 0 && !check(Lex.KwPub) && !check(Lex.KwAsync) && !check(Lex.KwFun) {
+            current = saved
+            return null
+        }
+        var visibility = Priv
+        if match_token(Lex.KwPub) {
+            visibility = Pub
+        }
+        var is_async = false
+        if match_token(Lex.KwAsync) {
+            if !check(Lex.KwFun) {
+                return null
+            }
+            is_async = true
+        }
+        if check(Lex.KwFun) {
+            match parse_fun_decl(visibility, is_async, attributes) {
+                Ok(d) => return d
+                Error(_) => return null
+            }
+        }
+        if check(Lex.KwType) {
+            match parse_type_decl(visibility) {
+                Ok(d) => return d
+                Error(_) => return null
+            }
+        }
+        if check(Lex.KwTrait) {
+            match parse_trait_decl(visibility) {
+                Ok(d) => return d
+                Error(_) => return null
+            }
+        }
+        if check(Lex.KwImport) {
+            match parse_use_decl(visibility) {
+                Ok(d) => return d
+                Error(_) => return null
+            }
+        }
+        if check(Lex.KwPack) {
+            match parse_pack_decl(visibility) {
+                Ok(d) => return d
+                Error(_) => return null
+            }
+        }
+        if visibility == Pub && (check(Lex.KwVal) || check(Lex.KwVar)) {
+            match parse_stmt() {
+                Ok(stmt) => {
+                    val ss = ast.stmt(stmt)
+                    val s = match ss.node {
+                        ValDeclS(name, ta, value, _) => ValDeclS(name, ta, value, visibility)
+                        VarDeclS(name, ta, value, _) => VarDeclS(name, ta, value, visibility)
+                        other => other
+                    }
+                    val span = ss.span
+                    val stmt_ref = ast.alloc_stmt(span, s)
+                    val dummy = ast.alloc_expr(span, VoidLit)
+                    return Sd(span, ExprDeclD(dummy, stmt_ref))
+                },
+                Error(_) => return null,
+            }
+        }
+        if visibility == Pub {
+            current = saved
+        }
+        val k = peek().kind
+        if k == Lex.KwVal || k == Lex.KwVar || k == Lex.KwFor || k == Lex.KwWhile
+            || k == Lex.KwLoop || k == Lex.KwDefer || k == Lex.KwThrow || k == Lex.KwReturn {
+            match parse_stmt() {
+                Ok(stmt) => {
+                    val span = ast.stmt(stmt).span
+                    val dummy = ast.alloc_expr(span, VoidLit)
+                    return Sd(span, ExprDeclD(dummy, stmt))
+                },
+                Error(_) => return null,
+            }
+        }
+        null
+    }
+
+    // ── 声明解析 ──
+
+    fun &parse_fun_decl(visibility: Vis, is_async: bool, attributes: Attr[]): Throw<Sd, PErr> {
+        val fun_tok = advance()
+        val name_tok = expect(Lex.Identifier, "expected function name")?
+        val type_params = List.empty()
+        if match_token(Lex.Lt) {
+            parse_type_param_list(type_params)?
+            expect_close_angle("expected '>' to close type parameter list")?
+        }
+        val params = List.empty()
+        expect(Lex.LParen, "expected '(' to start parameter list")?
+        if !check(Lex.RParen) {
+            parse_param_list(params)?
+        }
+        expect(Lex.RParen, "expected ')' to close parameter list")?
+        val return_type = if match_token(Lex.Colon) {
+            parse_type()?
+        } else {
+            report_error_at(name_tok.line, name_tok.column,
+                "function declaration must explicitly annotate the return type (use ': void' for no return value)")?
+            null
+        }
+        val extern_c_body = if check(Lex.RawBlock) {
+            val tok = advance()
+            lexeme_of(tok)
+        } else {
+            null
+        }
+        val body = if extern_c_body != null {
+            ast.alloc_expr(Span(fun_tok.line, fun_tok.column), VoidLit)
+        } else {
+            parse_expr()?
+        }
+        Ok(Sd(Span(fun_tok.line, fun_tok.column),
+            FunDeclD(visibility, lexeme_of(name_tok), type_params.as_array(), params.as_array(),
+                return_type, body, is_async, lexeme_of(name_tok) == "main", attributes, extern_c_body)))
+    }
+
+    fun &parse_type_decl(visibility: Vis): Throw<Sd, PErr> {
+        val type_tok = advance()
+        val name_tok = expect(Lex.Identifier, "expected type name")?
+        val type_params = List.empty()
+        if match_token(Lex.Lt) {
+            parse_type_param_list(type_params)?
+            expect_close_angle("expected '>' to close type parameter list")?
+        }
+        val implemented_traits = List.empty()
+        val base_types = List.empty()
+        if match_token(Lex.LParen) {
+            if !check(Lex.RParen) {
+                parse_trait_bound_list(base_types)?
+            }
+            expect(Lex.RParen, "expected ')' to close base type list")?
+        }
+        if match_token(Lex.Colon) {
+            val has_paren = check(Lex.LParen)
+            if has_paren {
+                advance()
+            }
+            parse_trait_bound_list(implemented_traits)?
+            if has_paren {
+                expect(Lex.RParen, "expected ')' after trait list")?
+            }
+        }
+        expect(Lex.Eq, "expected '=' to define type body")?
+        val def = parse_type_def()?
+        val methods = List.empty()
+        if match_token(Lex.LBrace) {
+            parse_method_block(methods)?
+            expect(Lex.RBrace, "expected '}}' to close method block")?
+        }
+        Ok(Sd(Span(type_tok.line, type_tok.column),
+            TypeDeclD(visibility, lexeme_of(name_tok), type_params.as_array(),
+                base_types.as_array(), implemented_traits.as_array(), def, methods.as_array())))
+    }
+
+    fun &parse_type_def(): Throw<TypeD, PErr> {
+        if match_token(Lex.Pipe) {
+            return parse_adt_body()
+        }
+        if check(Lex.LParen) {
+            val saved = current
+            val d = try_parse_record_type_def()
+            if d != null {
+                return Ok(d)
+            }
+            current = saved
+        }
+        if check(Lex.Identifier) {
+            val saved = current
+            advance()
+            if check(Lex.LParen) {
+                advance()
+                if !check(Lex.RParen) {
+                    val saved2 = current
+                    if check(Lex.Identifier) {
+                        advance()
+                        if check(Lex.Colon) {
+                            current = saved
+                            val d = try_parse_single_ctor_adt()
+                            if d != null {
+                                return Ok(d)
+                            }
+                            current = saved
+                        }
+                        current = saved2
+                    }
+                    current = saved
+                    val d = try_parse_single_ctor_adt()
+                    if d != null {
+                        return Ok(d)
+                    }
+                    current = saved
+                } else {
+                    current = saved
+                    val d = try_parse_single_ctor_adt()
+                    if d != null {
+                        return Ok(d)
+                    }
+                    current = saved
+                }
+            }
+            current = saved
+        }
+        val target = parse_type()?
+        if check(Lex.Pipe) {
+            report_error("each variant of a sum type must be prefixed with '|', including the first; for example `type Color = | Red | Green`")?
+        }
+        Ok(AliasD(target))
+    }
+
+    fun &try_parse_single_ctor_adt(): TypeD? {
+        val name_tok = advance()
+        if !check(Lex.LParen) {
+            return null
+        }
+        advance()
+        if check(Lex.RParen) {
+            advance()
+            return AdtD([Cd(lexeme_of(name_tok), [], null)])
+        }
+        val name_idx = if check(Lex.KwPub) { current + 1 } else { current }
+        if name_idx + 1 < n()
+            && tok_at(name_idx).kind == Lex.Identifier
+            && tok_at(name_idx + 1).kind == Lex.Colon {
+            val fields = List.empty()
+            match parse_constructor_field_list(fields) {
+                Ok(_) => {}
+                Error(_) => return null
+            }
+            match expect(Lex.RParen, "expected ')'") {
+                Ok(_) => {}
+                Error(_) => return null
+            }
+            return AdtD([Cd(lexeme_of(name_tok), fields.as_array(), null)])
+        }
+        val first_type = match parse_type() {
+            Ok(t) => t
+            Error(_) => return null
+        }
+        if check(Lex.Comma) {
+            val fields = List.empty()
+            fields.push(Cfl(null, first_type, false))
+            while match_token(Lex.Comma) {
+                if check(Lex.RParen) {
+                    break
+                }
+                val ty = match parse_type() {
+                    Ok(t) => t
+                    Error(_) => return null
+                }
+                fields.push(Cfl(null, ty, false))
+            }
+            match expect(Lex.RParen, "expected ')'") {
+                Ok(_) => {}
+                Error(_) => return null
+            }
+            return AdtD([Cd(lexeme_of(name_tok), fields.as_array(), null)])
+        }
+        match expect(Lex.RParen, "expected ')'") {
+            Ok(_) => {}
+            Error(_) => return null
+        }
+        NewtypeD(lexeme_of(name_tok), first_type)
+    }
+
+    fun &try_parse_record_type_def(): TypeD? {
+        advance()
+        if check(Lex.RParen) {
+            val next_is_arrow = current + 1 < n() && tok_at(current + 1).kind == Lex.MinusGt
+            if !next_is_arrow {
+                advance()
+                return RecordD([])
+            }
+            return null
+        }
+        val k = peek().kind
+        if k == Lex.Identifier || k == Lex.KwPub {
+            val is_pub0 = match_token(Lex.KwPub)
+            val name = advance()
+            if check(Lex.Colon) {
+                advance()
+                val ty = match parse_type() {
+                    Ok(t) => t
+                    Error(_) => return null
+                }
+                val fields = List.empty()
+                fields.push(Rft(lexeme_of(name), ty, is_pub0))
+                while match_token(Lex.Comma) {
+                    if check(Lex.RParen) {
+                        break
+                    }
+                    val f_pub = match_token(Lex.KwPub)
+                    val field_name = match expect(Lex.Identifier, "expected field name") {
+                        Ok(t) => t
+                        Error(_) => return null
+                    }
+                    expect(Lex.Colon, "expected ':'")?
+                    val field_ty = match parse_type() {
+                        Ok(t) => t
+                        Error(_) => return null
+                    }
+                    fields.push(Rft(lexeme_of(field_name), field_ty, f_pub))
+                }
+                expect(Lex.RParen, "expected ')'")?
+                return RecordD(fields.as_array())
+            }
+            return null
+        }
+        null
+    }
+
+    fun &parse_adt_body(): Throw<TypeD, PErr> {
+        val ctors = List.empty()
+        ctors.push(parse_constructor_def()?)
+        while match_token(Lex.Pipe) {
+            ctors.push(parse_constructor_def()?)
+        }
+        Ok(AdtD(ctors.as_array()))
+    }
+
+    fun &parse_constructor_def(): Throw<Cd, PErr> {
+        val name_tok = expect(Lex.Identifier, "expected constructor name")?
+        val fields = List.empty()
+        if match_token(Lex.LParen) {
+            if !check(Lex.RParen) {
+                parse_constructor_field_list(fields)?
+            }
+            expect(Lex.RParen, "expected ')' to close constructor fields")?
+        }
+        val return_type = if match_token(Lex.Colon) {
+            parse_type()?
+        } else {
+            null
+        }
+        Ok(Cd(lexeme_of(name_tok), fields.as_array(), return_type))
+    }
+
+    fun &parse_constructor_field_list(fields: List<Cfl>): Throw<void, PErr> {
+        fields.push(parse_constructor_field()?)
+        while match_token(Lex.Comma) {
+            if check(Lex.RParen) {
+                break
+            }
+            fields.push(parse_constructor_field()?)
+        }
+        Ok(void)
+    }
+
+    fun &parse_constructor_field(): Throw<Cfl, PErr> {
+        val k = peek().kind
+        if k == Lex.Identifier || k == Lex.KwPub {
+            val saved = current
+            val is_pub = match_token(Lex.KwPub)
+            val name = advance()
+            if match_token(Lex.Colon) {
+                val ty = parse_type()?
+                return Ok(Cfl(lexeme_of(name), ty, is_pub))
+            }
+            current = saved
+        }
+        val ty = parse_type()?
+        Ok(Cfl(null, ty, false))
+    }
+
+    fun &parse_trait_decl(visibility: Vis): Throw<Sd, PErr> {
+        val trait_tok = advance()
+        val name_tok = expect(Lex.Identifier, "expected trait name")?
+        val type_params = List.empty()
+        if match_token(Lex.Lt) {
+            parse_type_param_list(type_params)?
+            expect_close_angle("expected '>' to close type parameter list")?
+        }
+        val parents = List.empty()
+        if match_token(Lex.LParen) {
+            if !check(Lex.RParen) {
+                parse_trait_bound_list_inner(parents)?
+            }
+            expect(Lex.RParen, "expected ')' to close parent trait list")?
+        }
+        val associated_types = List.empty()
+        val methods = List.empty()
+        expect(Lex.LBrace, "expected '{{' to start trait body")?
+        while !check(Lex.RBrace) && !is_at_end() {
+            if check(Lex.KwType) {
+                associated_types.push(parse_associated_type()?)
+            } else {
+                methods.push(parse_method_decl()?)
+            }
+        }
+        expect(Lex.RBrace, "expected '}}' to close trait body")?
+        Ok(Sd(Span(trait_tok.line, trait_tok.column),
+            TraitDeclD(visibility, lexeme_of(name_tok), type_params.as_array(),
+                parents.as_array(), associated_types.as_array(), methods.as_array())))
+    }
+
+    fun &parse_associated_type(): Throw<At, PErr> {
+        advance()
+        val name_tok = expect(Lex.Identifier, "expected associated type name")?
+        val kind = if match_token(Lex.Colon) {
+            parse_kind()?
+        } else {
+            null
+        }
+        Ok(Atd(lexeme_of(name_tok), kind))
+    }
+
+    fun &parse_method_decl(): Throw<Md, PErr> {
+        var visibility = Priv
+        if match_token(Lex.KwPub) {
+            visibility = Pub
+        }
+        val is_override = match_token(Lex.KwOverride)
+        val is_async = match_token(Lex.KwAsync)
+        expect(Lex.KwFun, "expected 'fun'")?
+        val is_ref_receiver = match_token(Lex.Ampersand)
+        val name_tok = expect(Lex.Identifier, "expected method name")?
+        val type_params = List.empty()
+        if match_token(Lex.Lt) {
+            parse_type_param_list(type_params)?
+            expect_close_angle("expected '>'")?
+        }
+        val params = List.empty()
+        expect(Lex.LParen, "expected '('")?
+        if !check(Lex.RParen) {
+            parse_param_list(params)?
+        }
+        expect(Lex.RParen, "expected ')'")?
+        val nspan = Span(name_tok.line, name_tok.column)
+        val this_type = if is_ref_receiver {
+            val this_ty = ast.alloc_type(nspan, TThis)
+            ast.alloc_type(nspan, TRef(this_ty))
+        } else {
+            ast.alloc_type(nspan, TThis)
+        }
+        // Rust 侧是 params.insert(0, this) —— this 参数在首位。
+        val params_all: Prm[] = [Prm("this", this_type)] ++ params.as_array()
+        val return_type = if match_token(Lex.Colon) {
+            parse_type()?
+        } else {
+            report_error("method declaration must explicitly annotate the return type (use ': void' for no return value)")?
+            null
+        }
+        val delegate = if match_token(Lex.Eq) {
+            val trait_tok = expect(Lex.Identifier, "expected delegate trait name")?
+            expect(Lex.Dot, "expected '.'")?
+            val method_tok = expect(Lex.Identifier, "expected delegate method name")?
+            Del(lexeme_of(trait_tok), lexeme_of(method_tok))
+        } else {
+            null
+        }
+        val body = if check(Lex.LBrace) {
+            parse_expr()?
+        } else {
+            null
+        }
+        Ok(Md(lexeme_of(name_tok), type_params.as_array(), params_all,
+            return_type, body, is_override, delegate, visibility, is_async))
+    }
+
+    fun &parse_use_decl(visibility: Vis): Throw<Sd, PErr> {
+        val use_tok = advance()
+        val first = expect(Lex.Identifier, "expected module name")?
+        val module_path = List.empty()
+        module_path.push(lexeme_of(first))
+        var dot_before_brace = false
+        while match_token(Lex.Dot) {
+            if check(Lex.LBrace) {
+                dot_before_brace = true
+                break
+            }
+            val part = expect(Lex.Identifier, "expected module path segment")?
+            module_path.push(lexeme_of(part))
+        }
+        val items = if check(Lex.LBrace) {
+            if !dot_before_brace {
+                report_error("selective import must use '.{{ }}' syntax; expected '.' before '{{'")?
+            }
+            advance()
+            val item_list = List.empty()
+            if !check(Lex.RBrace) {
+                item_list.push(parse_import_item()?)
+                while match_token(Lex.Comma) {
+                    if check(Lex.RBrace) {
+                        break
+                    }
+                    item_list.push(parse_import_item()?)
+                }
+            }
+            expect(Lex.RBrace, "expected '}}'")?
+            Items(item_list.as_array())
+        } else {
+            NoItems
+        }
+        Ok(Sd(Span(use_tok.line, use_tok.column),
+            ImportDeclD(module_path.as_array(), items, visibility)))
+    }
+
+    fun &parse_import_item(): Throw<Ii, PErr> {
+        val name = expect(Lex.Identifier, "expected import item name")?
+        val alias = if match_token(Lex.KwAs) {
+            val alias_tok = expect(Lex.Identifier, "expected alias")?
+            lexeme_of(alias_tok)
+        } else {
+            null
+        }
+        Ok(Ii(lexeme_of(name), alias))
+    }
+
+    fun &parse_pack_decl(visibility: Vis): Throw<Sd, PErr> {
+        val pack_tok = advance()
+        val name_tok = expect(Lex.Identifier, "expected pack name")?
+        Ok(Sd(Span(pack_tok.line, pack_tok.column), PackDeclD(visibility, lexeme_of(name_tok))))
+    }
+
+    // ── 类型参数/参数/约束 ──
+
+    fun &parse_type_param_list(items: List<Tp>): Throw<void, PErr> {
+        items.push(parse_type_param()?)
+        while match_token(Lex.Comma) {
+            if check_close_angle() {
+                break
+            }
+            items.push(parse_type_param()?)
+        }
+        Ok(void)
+    }
+
+    fun &parse_type_param(): Throw<Tp, PErr> {
+        val name_tok = expect(Lex.Identifier, "expected type parameter name")?
+        val bounds = List.empty()
+        val kind = if match_token(Lex.Colon) {
+            val has_paren = check(Lex.LParen)
+            if has_paren || check(Lex.Identifier) {
+                if has_paren {
+                    advance()
+                }
+                val trait_name_tok = expect(Lex.Identifier, "expected trait name")?
+                val trait_name = parse_name_path_tail(trait_name_tok, "expected trait name after '.'")?
+                bounds.push(Tb(trait_name, []))
+                if has_paren {
+                    while match_token(Lex.Comma) {
+                        if check(Lex.RParen) {
+                            break
+                        }
+                        val next_trait = expect(Lex.Identifier, "expected trait name")?
+                        val next_name = parse_name_path_tail(next_trait, "expected trait name after '.'")?
+                        bounds.push(Tb(next_name, []))
+                    }
+                    expect(Lex.RParen, "expected ')' after trait list")?
+                }
+                null
+            } else {
+                parse_kind()?
+            }
+        } else {
+            null
+        }
+        Ok(Tp(lexeme_of(name_tok), kind, bounds.as_array()))
+    }
+
+    fun &parse_kind(): Throw<Kind, PErr> {
+        parse_kind_arrow()
+    }
+
+    fun &parse_kind_arrow(): Throw<Kind, PErr> {
+        val left = parse_kind_primary()?
+        if match_token(Lex.MinusGt) {
+            val right = parse_kind_arrow()?
+            return Ok(KArrow(left, right))
+        }
+        Ok(left)
+    }
+
+    fun &parse_kind_primary(): Throw<Kind, PErr> {
+        if check(Lex.Star) {
+            advance()
+            return Ok(KStar)
+        }
+        if match_token(Lex.LParen) {
+            val kind = parse_kind_arrow()?
+            expect(Lex.RParen, "expected ')'")?
+            return Ok(kind)
+        }
+        report_error("expected kind (* or arrow kind)")?
+        Ok(KStar)
+    }
+
+    fun &parse_param_list(items: List<Prm>): Throw<void, PErr> {
+        items.push(parse_param()?)
+        while match_token(Lex.Comma) {
+            if check(Lex.RParen) {
+                break
+            }
+            items.push(parse_param()?)
+        }
+        Ok(void)
+    }
+
+    fun &parse_param(): Throw<Prm, PErr> {
+        val name_tok = expect(Lex.Identifier, "expected parameter name")?
+        val ta = if match_token(Lex.Colon) {
+            parse_type()?
+        } else {
+            null
+        }
+        Ok(Prm(lexeme_of(name_tok), ta))
+    }
+
+    fun &parse_trait_bound_list(bounds: List<Tb>): Throw<void, PErr> {
+        parse_trait_bound_list_inner(bounds)
+    }
+
+    fun &parse_trait_bound_list_inner(bounds: List<Tb>): Throw<void, PErr> {
+        bounds.push(parse_trait_bound()?)
+        while match_token(Lex.Comma) {
+            if check(Lex.RParen) {
+                break
+            }
+            bounds.push(parse_trait_bound()?)
+        }
+        Ok(void)
+    }
+
+    // 限定名路径:first 已消费,续吃 ('.' Ident)*;单段零拼接直接返回,
+    // 多段拼成 "A.Point" 形(类型注解位/trait 名位/构造器模式)。
+    fun &parse_name_path_tail(first: Tk, err_msg: str): Throw<str, PErr> {
+        if !check(Lex.Dot) {
+            return Ok(lexeme_of(first))
+        }
+        var joined = lexeme_of(first)
+        while match_token(Lex.Dot) {
+            val seg = expect(Lex.Identifier, err_msg)?
+            joined = joined + "." + lexeme_of(seg)
+        }
+        Ok(joined)
+    }
+
+    fun &parse_trait_bound(): Throw<Tb, PErr> {
+        val name_tok = expect(Lex.Identifier, "expected trait name")?
+        val name = parse_name_path_tail(name_tok, "expected trait name after '.'")?
+        val type_args = List.empty()
+        if match_token(Lex.Lt) {
+            parse_type_arg_list(type_args)?
+            expect_close_angle("expected '>'")?
+        }
+        Ok(Tb(name, type_args.as_array()))
+    }
+
+    fun &parse_method_block(methods: List<Md>): Throw<void, PErr> {
+        while !check(Lex.RBrace) && !is_at_end() {
+            methods.push(parse_method_decl()?)
+        }
+        Ok(void)
+    }
+
+    fun &parse_type_arg_list(items: List<i64>): Throw<void, PErr> {
+        items.push(parse_type()?)
+        while match_token(Lex.Comma) {
+            if check_close_angle() {
+                break
+            }
+            items.push(parse_type()?)
+        }
+        Ok(void)
+    }
+
+    // ── 类型解析 ──
+
+    fun &parse_type(): Throw<i64, PErr> {
+        if match_token(Lex.Ampersand) {
+            val prev = previous()
+            val span = Span(prev.line, prev.column)
+            val inner = parse_type()?
+            return Ok(ast.alloc_type(span, TRef(inner)))
+        }
+        if match_token(Lex.AmpAmp) {
+            val prev = previous()
+            val span = Span(prev.line, prev.column)
+            val inner = parse_type()?
+            val inner_ref = ast.alloc_type(span, TRef(inner))
+            return Ok(ast.alloc_type(span, TRef(inner_ref)))
+        }
+        if match_token(Lex.Star) {
+            val prev = previous()
+            val span = Span(prev.line, prev.column)
+            val inner = parse_type()?
+            return Ok(ast.alloc_type(span, TRawPtr(inner)))
+        }
+        parse_function_type()
+    }
+
+    fun &parse_function_type(): Throw<i64, PErr> {
+        if check(Lex.LParen) && paren_group_followed_by_arrow() {
+            val p = peek()
+            val span = Span(p.line, p.column)
+            advance()
+            val params = List.empty()
+            if !check(Lex.RParen) {
+                params.push(parse_type()?)
+                while match_token(Lex.Comma) {
+                    if check(Lex.RParen) {
+                        break
+                    }
+                    params.push(parse_type()?)
+                }
+            }
+            expect(Lex.RParen, "expected ')'")?
+            expect(Lex.MinusGt, "expected '->'")?
+            val return_type = parse_type()?
+            return Ok(ast.alloc_type(span, TFunction(params.as_array(), return_type)))
+        }
+        val left = parse_nullable_type()?
+        if match_token(Lex.MinusGt) {
+            val return_type = parse_type()?
+            val left_span = ast.ty(left).span
+            return Ok(ast.alloc_type(left_span, TFunction([left], return_type)))
+        }
+        Ok(left)
+    }
+
+    fun paren_group_followed_by_arrow(): bool {
+        var i: i64 = current
+        if i >= n() || tok_at(i).kind != Lex.LParen {
+            return false
+        }
+        var depth: i64 = 0
+        while i < n() {
+            val k = tok_at(i).kind
+            if k == Lex.LParen {
+                depth = depth + 1
+            } else if k == Lex.RParen {
+                depth = depth - 1
+                if depth == 0 {
+                    val next = i + 1
+                    return next < n() && tok_at(next).kind == Lex.MinusGt
+                }
+            } else if k == Lex.Eof {
+                return false
+            }
+            i = i + 1
+        }
+        false
+    }
+
+    fun &parse_nullable_type(): Throw<i64, PErr> {
+        var ty = parse_primary_type()?
+        while true {
+            if match_token(Lex.Question) {
+                val span = ast.ty(ty).span
+                ty = ast.alloc_type(span, TNullable(ty))
+            } else if match_token(Lex.QuestionQuestion) {
+                var span = ast.ty(ty).span
+                ty = ast.alloc_type(span, TNullable(ty))
+                span = ast.ty(ty).span
+                ty = ast.alloc_type(span, TNullable(ty))
+            } else if check(Lex.LBracket) {
+                ty = parse_array_type_suffix(ty)?
+            } else {
+                break
+            }
+        }
+        Ok(ty)
+    }
+
+    fun &parse_array_type_suffix(ty: i64): Throw<i64, PErr> {
+        val bracket = advance()
+        var size: i64? = null
+        if !check(Lex.RBracket) {
+            val size_tok = expect(Lex.IntLiteral, "expected array size")?
+            size = parse_u64(lexeme_of(size_tok))
+            if size == null {
+                report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")?
+            }
+        }
+        expect(Lex.RBracket, "expected ']'")?
+        Ok(ast.alloc_type(Span(bracket.line, bracket.column), TArray(ty, size)))
+    }
+
+    fun &parse_primary_type(): Throw<i64, PErr> {
+        if check(Lex.LParen) {
+            if is_paren_record_type() {
+                return parse_record_type()
+            }
+            val p = peek()
+            var span = Span(p.line, p.column)
+            advance()
+            val inner = parse_type()?
+            expect(Lex.RParen, "expected ')'")?
+            var ty = inner
+            while match_token(Lex.LBracket) {
+                var size: i64? = null
+                if !check(Lex.RBracket) {
+                    val size_tok = expect(Lex.IntLiteral, "expected array size")?
+                    size = parse_u64(lexeme_of(size_tok))
+                    if size == null {
+                        report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")?
+                    }
+                }
+                expect(Lex.RBracket, "expected ']'")?
+                ty = ast.alloc_type(span, TArray(ty, size))
+            }
+            return Ok(ty)
+        }
+        val is_this_type_kw = check(Lex.KwThis)
+            || (check(Lex.Identifier) && lexeme_of(peek()) == "This")
+        if is_this_type_kw {
+            val tok = advance()
+            val span = Span(tok.line, tok.column)
+            var ty = ast.alloc_type(span, TThis)
+            while match_token(Lex.LBracket) {
+                var size: i64? = null
+                if !check(Lex.RBracket) {
+                    val size_tok = expect(Lex.IntLiteral, "expected array size")?
+                    size = parse_u64(lexeme_of(size_tok))
+                    if size == null {
+                        report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")?
+                    }
+                }
+                expect(Lex.RBracket, "expected ']'")?
+                ty = ast.alloc_type(span, TArray(ty, size))
+            }
+            return Ok(ty)
+        }
+        val name_tok = expect(Lex.Identifier, "expected type name")?
+        val span = Span(name_tok.line, name_tok.column)
+        val name = parse_name_path_tail(name_tok, "expected type name after '.'")?
+        var ty = if match_token(Lex.Lt) {
+            val args = List.empty()
+            args.push(parse_type()?)
+            while match_token(Lex.Comma) {
+                if check_close_angle() {
+                    break
+                }
+                args.push(parse_type()?)
+            }
+            expect_close_angle("expected '>' to close type parameters")?
+            ast.alloc_type(span, TGeneric(name, args.as_array()))
+        } else {
+            ast.alloc_type(span, TNamed(name))
+        }
+        while match_token(Lex.LBracket) {
+            var size: i64? = null
+            if !check(Lex.RBracket) {
+                val size_tok = expect(Lex.IntLiteral, "expected array size")?
+                size = parse_u64(lexeme_of(size_tok))
+                if size == null {
+                    report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")?
+                }
+            }
+            expect(Lex.RBracket, "expected ']'")?
+            ty = ast.alloc_type(span, TArray(ty, size))
+        }
+        Ok(ty)
+    }
+
+    fun is_paren_record_type(): bool {
+        var i: i64 = current
+        if i >= n() || tok_at(i).kind != Lex.LParen {
+            return false
+        }
+        i = i + 1
+        if i >= n() || tok_at(i).kind == Lex.RParen {
+            return false
+        }
+        if tok_at(i).kind == Lex.Identifier {
+            val next = i + 1
+            if next < n() && tok_at(next).kind == Lex.Colon {
+                return true
+            }
+        }
+        false
+    }
+
+    fun &parse_record_type(): Throw<i64, PErr> {
+        val lparen = advance()
+        val span = Span(lparen.line, lparen.column)
+        val fields = List.empty()
+        if !check(Lex.RParen) {
+            val f_pub0 = match_token(Lex.KwPub)
+            val name_tok = expect(Lex.Identifier, "expected field name")?
+            expect(Lex.Colon, "expected ':'")?
+            val ty = parse_type()?
+            fields.push(Rft(lexeme_of(name_tok), ty, f_pub0))
+            while match_token(Lex.Comma) {
+                if check(Lex.RParen) {
+                    break
+                }
+                val f_pub = match_token(Lex.KwPub)
+                val field_name = expect(Lex.Identifier, "expected field name")?
+                expect(Lex.Colon, "expected ':'")?
+                val field_ty = parse_type()?
+                fields.push(Rft(lexeme_of(field_name), field_ty, f_pub))
+            }
+        }
+        expect(Lex.RParen, "expected ')'")?
+        if fields.len() == 0 {
+            return Ok(ast.alloc_type(span, TNamed("void")))
+        }
+        Ok(ast.alloc_type(span, TRecord(fields.as_array())))
+    }
+
+    // ── 表达式解析 ──
+
+    pub fun &parse_expr(): Throw<i64, PErr> {
+        parse_binary(MIN_PREC)
+    }
+
+    fun &parse_binary(min_prec: i64): Throw<i64, PErr> {
+        var left = parse_as_cast()?
+        // 块/if/match 后跟 - 或 &(:换行边界歧义)
+        val ln = ast.expr(left).node
+        val is_blocky = match ln {
+            BlockE(_, _) => true
+            IfE(_, _, _) => true
+            MatchE(_, _) => true
+            _ => false
+        }
+        val pk = peek().kind
+        if is_blocky && (pk == Lex.Minus || pk == Lex.Ampersand) {
+            return Ok(left)
+        }
+        while true {
+            val mapping = lookup_binary_op(peek().kind)
+            if mapping == null {
+                break
+            }
+            if mapping.prec < min_prec {
+                break
+            }
+            if mapping.deref_check && current > 0 {
+                val prev_tok = tok_at(current - 1)
+                if peek().line != prev_tok.line {
+                    break
+                }
+            }
+            if (peek().kind == Lex.Minus || peek().kind == Lex.Ampersand)
+                && postfix_opens_new_statement() {
+                break
+            }
+            val op_tok = advance()
+            val next_min = if mapping.right_assoc {
+                mapping.prec
+            } else {
+                mapping.prec + 1
+            }
+            val right = parse_binary(next_min)?
+            left = ast.alloc_expr(Span(op_tok.line, op_tok.column), BinaryE(mapping.op, left, right))
+        }
+        Ok(left)
+    }
+
+    fun &parse_as_cast(): Throw<i64, PErr> {
+        var left = parse_unary()?
+        while match_token(Lex.KwAs) {
+            val as_tok = previous()
+            val target = parse_cast_type()?
+            left = ast.alloc_expr(Span(as_tok.line, as_tok.column), AsCast(left, target))
+        }
+        Ok(left)
+    }
+
+    fun &parse_cast_type(): Throw<i64, PErr> {
+        if match_token(Lex.Ampersand) {
+            val prev = previous()
+            val span = Span(prev.line, prev.column)
+            val inner = parse_cast_type()?
+            return Ok(ast.alloc_type(span, TRef(inner)))
+        }
+        if match_token(Lex.AmpAmp) {
+            val prev = previous()
+            val span = Span(prev.line, prev.column)
+            val inner = parse_cast_type()?
+            val inner_ref = ast.alloc_type(span, TRef(inner))
+            return Ok(ast.alloc_type(span, TRef(inner_ref)))
+        }
+        if match_token(Lex.Star) {
+            val prev = previous()
+            val span = Span(prev.line, prev.column)
+            val inner = parse_cast_type()?
+            return Ok(ast.alloc_type(span, TRawPtr(inner)))
+        }
+        val is_this_type_kw = check(Lex.KwThis)
+            || (check(Lex.Identifier) && lexeme_of(peek()) == "This")
+        var ty = if is_this_type_kw {
+            val tok = advance()
+            ast.alloc_type(Span(tok.line, tok.column), TThis)
+        } else {
+            val name_tok = expect(Lex.Identifier, "expected type name after 'as'")?
+            val name = parse_name_path_tail(name_tok, "expected type name after '.'")?
+            ast.alloc_type(Span(name_tok.line, name_tok.column), TNamed(name))
+        }
+        while true {
+            if match_token(Lex.Question) {
+                var span = ast.ty(ty).span
+                ty = ast.alloc_type(span, TNullable(ty))
+            } else if match_token(Lex.QuestionQuestion) {
+                var span = ast.ty(ty).span
+                ty = ast.alloc_type(span, TNullable(ty))
+                span = ast.ty(ty).span
+                ty = ast.alloc_type(span, TNullable(ty))
+            } else if check(Lex.LBracket) {
+                ty = parse_array_type_suffix(ty)?
+            } else {
+                break
+            }
+        }
+        Ok(ty)
+    }
+
+    fun &parse_unary(): Throw<i64, PErr> {
+        if match_token(Lex.Bang) {
+            val op_tok = previous()
+            val operand = parse_unary()?
+            return Ok(ast.alloc_expr(Span(op_tok.line, op_tok.column), UnaryE(Not, operand)))
+        }
+        if match_token(Lex.Tilde) {
+            val op_tok = previous()
+            val operand = parse_unary()?
+            return Ok(ast.alloc_expr(Span(op_tok.line, op_tok.column), UnaryE(BitNot, operand)))
+        }
+        if match_token(Lex.Ampersand) {
+            val op_tok = previous()
+            val operand = parse_unary()?
+            return Ok(ast.alloc_expr(Span(op_tok.line, op_tok.column), RefOfE(operand)))
+        }
+        if match_token(Lex.AmpAmp) {
+            val op_tok = previous()
+            val operand = parse_unary()?
+            val inner = ast.alloc_expr(Span(op_tok.line, op_tok.column), RefOfE(operand))
+            return Ok(ast.alloc_expr(Span(op_tok.line, op_tok.column), RefOfE(inner)))
+        }
+        if match_token(Lex.Star) {
+            val op_tok = previous()
+            val operand = parse_unary()?
+            return Ok(ast.alloc_expr(Span(op_tok.line, op_tok.column), DerefE(operand)))
+        }
+        if match_token(Lex.Minus) {
+            val op_tok = previous()
+            if check(Lex.IntLiteral) {
+                val lit_tok = advance()
+                return parse_negative_int_literal(lit_tok)
+            }
+            if check(Lex.FloatLiteral) {
+                val lit_tok = advance()
+                return parse_negative_float_literal(lit_tok)
+            }
+            val operand = parse_unary()?
+            return Ok(ast.alloc_expr(Span(op_tok.line, op_tok.column), UnaryE(Neg, operand)))
+        }
+        parse_postfix()
+    }
+
+    fun postfix_opens_new_statement(): bool {
+        current > 0 && peek().line != tok_at(current - 1).line
+    }
+
+    fun is_call_node(id: i64): bool {
+        match ast.expr(id).node {
+            CallE(_, _, _) => true
+            _ => false
+        }
+    }
+
+    fun &parse_postfix(): Throw<i64, PErr> {
+        var expr = parse_primary()?
+        while true {
+            if match_token(Lex.Question) {
+                val op_tok = previous()
+                expr = ast.alloc_expr(Span(op_tok.line, op_tok.column), PropagateE(expr))
+            } else if match_token(Lex.Bang) {
+                val op_tok = previous()
+                expr = ast.alloc_expr(Span(op_tok.line, op_tok.column), NonNullAssertE(expr))
+            } else if match_token(Lex.QuestionDot) {
+                val op_tok = previous()
+                val field_tok = expect(Lex.Identifier, "expected field or method name")?
+                if check(Lex.LParen) {
+                    val r = parse_call_args()?
+                    expr = ast.alloc_expr(Span(op_tok.line, op_tok.column),
+                        SafeMethodCallE(expr, lexeme_of(field_tok), r.args, r.type_args))
+                } else {
+                    expr = ast.alloc_expr(Span(op_tok.line, op_tok.column),
+                        SafeAccessE(expr, lexeme_of(field_tok)))
+                }
+            } else if match_token(Lex.Dot) {
+                val op_tok = previous()
+                val field_tok = expect(Lex.Identifier, "expected field or method name")?
+                if check(Lex.LParen) || (check(Lex.Lt) && is_turbofish_call()) {
+                    val r = parse_call_args()?
+                    expr = ast.alloc_expr(Span(op_tok.line, op_tok.column),
+                        MethodCallE(expr, lexeme_of(field_tok), r.args, r.type_args))
+                } else {
+                    expr = ast.alloc_expr(Span(op_tok.line, op_tok.column),
+                        FieldAccessE(expr, lexeme_of(field_tok)))
+                }
+            } else if check(Lex.LParen) && !postfix_opens_new_statement() {
+                if is_call_node(expr) {
+                    report_error("chained call f(a)(b) is not allowed; use default currying: bind the partial result to a variable first")?
+                }
+                val call_tok = peek()
+                val r = parse_call_args()?
+                expr = ast.alloc_expr(Span(call_tok.line, call_tok.column),
+                    CallE(expr, r.args, r.type_args))
+            } else if check(Lex.Lt) && is_turbofish_call() {
+                advance()
+                val type_args = List.empty()
+                parse_type_arg_list(type_args)?
+                expect_close_angle("expected '>'")?
+                if is_call_node(expr) {
+                    report_error("chained call f(a)(b) is not allowed; use default currying: bind the partial result to a variable first")?
+                }
+                val call_tok = peek()
+                expect(Lex.LParen, "expected '('")?
+                val args = List.empty()
+                if !check(Lex.RParen) {
+                    args.push(parse_expr()?)
+                    while match_token(Lex.Comma) {
+                        if check(Lex.RParen) {
+                            break
+                        }
+                        args.push(parse_expr()?)
+                    }
+                }
+                expect(Lex.RParen, "expected ')'")?
+                expr = ast.alloc_expr(Span(call_tok.line, call_tok.column),
+                    CallE(expr, args.as_array(), type_args.as_array()))
+            } else if check(Lex.LBracket) && !postfix_opens_new_statement() {
+                val bracket_tok = advance()
+                val start = parse_binary(ADDITION_PREC)?
+                if match_token(Lex.DotDotEq) || match_token(Lex.DotDot) {
+                    val inclusive = previous().kind == Lex.DotDotEq
+                    val end = parse_binary(ADDITION_PREC)?
+                    expect(Lex.RBracket, "expected ']' after slice end")?
+                    expr = ast.alloc_expr(Span(bracket_tok.line, bracket_tok.column),
+                        SliceE(expr, start, end, inclusive))
+                } else {
+                    expect(Lex.RBracket, "expected ']'")?
+                    expr = ast.alloc_expr(Span(bracket_tok.line, bracket_tok.column),
+                        IndexE(expr, start))
+                }
+            } else {
+                break
+            }
+        }
+        Ok(expr)
+    }
+
+    fun is_turbofish_call(): bool {
+        if !check(Lex.Lt) {
+            return false
+        }
+        var i: i64 = current + 1
+        var depth: i64 = 1
+        var steps: i64 = 0
+        while i < n() && steps < 256 {
+            val k = tok_at(i).kind
+            if k == Lex.Lt {
+                depth = depth + 1
+            } else if k == Lex.Gt {
+                depth = depth - 1
+                if depth == 0 {
+                    return i + 1 < n() && tok_at(i + 1).kind == Lex.LParen
+                }
+            } else if k == Lex.GtGt {
+                // 虚拟拆分 >>:一个 token 两个闭合(嵌套泛型 A<B<C>>)。
+                depth = depth - 2
+                if depth <= 0 {
+                    return i + 1 < n() && tok_at(i + 1).kind == Lex.LParen
+                }
+            } else if k == Lex.GtEq {
+                depth = depth - 1
+                if depth <= 0 {
+                    return false
+                }
+            } else if k == Lex.GtGtEq {
+                depth = depth - 2
+                if depth <= 0 {
+                    return false
+                }
+            } else if k == Lex.LBrace || k == Lex.RBrace || k == Lex.Eq || k == Lex.EqGt || k == Lex.Eof {
+                return false
+            }
+            i = i + 1
+            steps = steps + 1
+        }
+        false
+    }
+
+    fun &parse_call_args(): Throw<ArgsRes, PErr> {
+        if match_token(Lex.Lt) {
+            val ta = List.empty()
+            parse_type_arg_list(ta)?
+            if match_token(Lex.Gt) {
+                expect(Lex.LParen, "expected '('")?
+                val args = List.empty()
+                if !check(Lex.RParen) {
+                    args.push(parse_expr()?)
+                    while match_token(Lex.Comma) {
+                        if check(Lex.RParen) {
+                            break
+                        }
+                        args.push(parse_expr()?)
+                    }
+                }
+                expect(Lex.RParen, "expected ')'")?
+                return Ok(ArgsRes(args.as_array(), ta.as_array()))
+            }
+            current = current - (ta.len() as i64) - 1
+        }
+        expect(Lex.LParen, "expected '('")?
+        val args = List.empty()
+        if !check(Lex.RParen) {
+            args.push(parse_expr()?)
+            while match_token(Lex.Comma) {
+                if check(Lex.RParen) {
+                    break
+                }
+                args.push(parse_expr()?)
+            }
+        }
+        expect(Lex.RParen, "expected ')'")?
+        Ok(ArgsRes(args.as_array(), []))
+    }
+
+    // ── 主表达式 ──
+
+    fun &parse_primary(): Throw<i64, PErr> {
+        if match_token(Lex.IntLiteral) {
+            val tok = previous()
+            return Ok(parse_int_literal(tok))
+        }
+        if match_token(Lex.FloatLiteral) {
+            val tok = previous()
+            return Ok(parse_float_literal(tok))
+        }
+        if match_token(Lex.TrueLiteral) {
+            val tok = previous()
+            return Ok(ast.alloc_expr(Span(tok.line, tok.column), BoolLit(true)))
+        }
+        if match_token(Lex.FalseLiteral) {
+            val tok = previous()
+            return Ok(ast.alloc_expr(Span(tok.line, tok.column), BoolLit(false)))
+        }
+        if match_token(Lex.CharLiteral) {
+            val tok = previous()
+            return Ok(ast.alloc_expr(Span(tok.line, tok.column), CharLit(parse_char_value(lexeme_of(tok)))))
+        }
+        if match_token(Lex.StringLiteral) {
+            val tok = previous()
+            return parse_string_literal(tok)
+        }
+        if match_token(Lex.NullLiteral) {
+            val tok = previous()
+            return Ok(ast.alloc_expr(Span(tok.line, tok.column), NullLit))
+        }
+        if check(Lex.KwFun) && n() > current + 1 && tok_at(current + 1).kind == Lex.LParen {
+            return parse_lambda_fun(false)
+        }
+        if check(Lex.KwAsync) && n() > current + 1 && tok_at(current + 1).kind == Lex.KwFun {
+            advance()
+            return parse_lambda_fun(true)
+        }
+        if match_token(Lex.KwIf) {
+            return parse_if_expr()
+        }
+        if match_token(Lex.KwMatch) {
+            return parse_match_expr()
+        }
+        if match_token(Lex.KwLazy) {
+            return parse_lazy_expr()
+        }
+        if match_token(Lex.KwAtomic) {
+            return parse_atomic_expr()
+        }
+        if match_token(Lex.KwSelect) {
+            return parse_select_expr()
+        }
+        if check(Lex.KwTrait) && n() > current + 1 && tok_at(current + 1).kind == Lex.LBrace {
+            return parse_inline_trait_value()
+        }
+        if match_token(Lex.LBracket) {
+            return parse_array_literal()
+        }
+        if check(Lex.LBrace) {
+            return parse_block_expr()
+        }
+        if match_token(Lex.LParen) {
+            return parse_paren_or_record_or_lambda()
+        }
+        if check(Lex.KwType) && n() > current + 1 && tok_at(current + 1).kind == Lex.LParen {
+            val tok = advance()
+            return Ok(ast.alloc_expr(Span(tok.line, tok.column), Ident(lexeme_of(tok))))
+        }
+        if check(Lex.KwThis) {
+            val tok = advance()
+            return Ok(ast.alloc_expr(Span(tok.line, tok.column), Ident("this")))
+        }
+        if check(Lex.KwSuper) {
+            val tok = advance()
+            return Ok(ast.alloc_expr(Span(tok.line, tok.column), Ident("super")))
+        }
+        val k = peek().kind
+        if k == Lex.Identifier || k == Lex.KwChannel {
+            if check(Lex.Identifier) && lexeme_of(peek()) == "void" {
+                val tok = advance()
+                return Ok(ast.alloc_expr(Span(tok.line, tok.column), VoidLit))
+            }
+            val tok = advance()
+            return Ok(ast.alloc_expr(Span(tok.line, tok.column), Ident(lexeme_of(tok))))
+        }
+        if check(Lex.Err) {
+            val lex = lexeme_of(peek())
+            var shown: str = ""
+            val lb = lex.bytes()
+            var i: i64 = 0
+            val lim = if lb.len() < 4 { lb.len() } else { 4 }
+            while i < lim as i64 {
+                val d = decode_utf8(lb, i)
+                shown = shown + (codepoint_to_str(d.cp))
+                i = i + d.len
+            }
+            report_error("unexpected character '" + shown + "'")?
+        }
+        if check(Lex.KwVal) || check(Lex.KwVar) {
+            val what = if check(Lex.KwVal) { "val" } else { "var" }
+            report_error("expected expression; '" + what + "' starts a declaration, wrap the body in {{ ... }}")?
+        }
+        report_error("expected expression")?
+        Ok(0)
+    }
+
+    // ── 字面量解析 ──
+
+    fun &parse_int_literal(tok: Tk): i64 {
+        val raw = lexeme_of(tok)
+        val b = raw.bytes()
+        val blen = b.len() as i64
+        var i: i64 = 0
+        if blen > 2 && b[0 as usize] == (48 as u8) {
+            val p = b[1 as usize]
+            if p == (120 as u8) || p == (88 as u8) || p == (111 as u8) || p == (79 as u8)
+                || p == (98 as u8) || p == (66 as u8) {
+                i = 2
+            }
+        }
+        while i < blen && is_du(b[i as usize]) {
+            i = i + 1
+        }
+        if i < blen && blen > 2 && b[0 as usize] == (48 as u8) {
+            val p = b[1 as usize]
+            if p == (120 as u8) || p == (88 as u8) {
+                while i < blen && is_hu(b[i as usize]) {
+                    i = i + 1
+                }
+            }
+        }
+        val num = (b[0 as usize..i as usize]) as str
+        val suffix = if i < blen { (b[i as usize..blen as usize]) as str } else { null }
+        ast.alloc_expr(Span(tok.line, tok.column), IntLit(num, suffix))
+    }
+
+    fun &parse_negative_int_literal(lit_tok: Tk): Throw<i64, PErr> {
+        val raw = lexeme_of(lit_tok)
+        val b = raw.bytes()
+        val blen = b.len() as i64
+        var i: i64 = 0
+        if blen > 2 && b[0 as usize] == (48 as u8) {
+            val p = b[1 as usize]
+            if p == (120 as u8) || p == (88 as u8) || p == (111 as u8) || p == (79 as u8)
+                || p == (98 as u8) || p == (66 as u8) {
+                i = 2
+            }
+        }
+        while i < blen && is_du(b[i as usize]) {
+            i = i + 1
+        }
+        if i < blen && blen > 2 && b[0 as usize] == (48 as u8) {
+            val p = b[1 as usize]
+            if p == (120 as u8) || p == (88 as u8) {
+                while i < blen && is_hu(b[i as usize]) {
+                    i = i + 1
+                }
+            }
+        }
+        val num = (b[0 as usize..i as usize]) as str
+        val suffix = if i < blen { (b[i as usize..blen as usize]) as str } else { null }
+        Ok(ast.alloc_expr(Span(lit_tok.line, lit_tok.column), IntLit("-" + num, suffix)))
+    }
+
+    fun &parse_float_literal(tok: Tk): i64 {
+        val r = split_float_suffix(lexeme_of(tok))
+        ast.alloc_expr(Span(tok.line, tok.column), FloatLit(r.num, r.suffix))
+    }
+
+    fun &parse_negative_float_literal(lit_tok: Tk): Throw<i64, PErr> {
+        val r = split_float_suffix(lexeme_of(lit_tok))
+        Ok(ast.alloc_expr(Span(lit_tok.line, lit_tok.column), FloatLit("-" + r.num, r.suffix)))
+    }
+
+    fun &parse_string_literal(tok: Tk): Throw<i64, PErr> {
+        val raw = lexeme_of(tok)
+        val rb = raw.bytes()
+        if !contains_interpolation(raw) {
+            val content = (rb[1 as usize..(rb.len() - 1) as usize]) as str
+            val value = unescape_string(content)
+            return Ok(ast.alloc_expr(Span(tok.line, tok.column), StrLit(value)))
+        }
+        val content = (rb[1 as usize..(rb.len() - 1) as usize]) as str
+        val b = content.bytes()
+        val blen = b.len() as i64
+        val parts = List.empty()
+        var i: i64 = 0
+        var literal_start: i64 = 0
+        while i < blen {
+            if b[i as usize] == (92 as u8) {
+                if i + 1 < blen && b[(i + 1) as usize] == (117 as u8) {
+                    i = i + 2
+                    if i < blen && b[i as usize] == (123 as u8) {
+                        while i < blen && b[i as usize] != (125 as u8) {
+                            i = i + 1
+                        }
+                        if i < blen {
+                            i = i + 1
+                        }
+                    } else {
+                        i = i + 4
+                    }
+                    continue
+                }
+                if i + 1 < blen && b[(i + 1) as usize] == (120 as u8) {
+                    i = i + 4
+                    continue
+                }
+                i = i + 2
+                continue
+            }
+            if b[i as usize] == (123 as u8) {
+                if i + 1 < blen && b[(i + 1) as usize] == (123 as u8) {
+                    i = i + 2
+                    continue
+                }
+                if i > literal_start {
+                    val text = unescape_string((b[literal_start as usize..i as usize]) as str)
+                    parts.push(IpLit(text))
+                }
+                i = i + 1
+                val expr_start = i
+                var brace_depth: i64 = 1
+                while i < blen && brace_depth > 0 {
+                    if b[i as usize] == (123 as u8) {
+                        brace_depth = brace_depth + 1
+                    } else if b[i as usize] == (125 as u8) {
+                        brace_depth = brace_depth - 1
+                    } else if b[i as usize] == (92 as u8) {
+                        i = i + 1
+                    } else if b[i as usize] == (34 as u8) {
+                        i = i + 1
+                        while i < blen {
+                            if b[i as usize] == (92 as u8) {
+                                i = i + 1
+                            } else if b[i as usize] == (34 as u8) {
+                                break
+                            }
+                            i = i + 1
+                        }
+                    }
+                    i = i + 1
+                }
+                val expr_text = (b[expr_start as usize..(i - 1) as usize]) as str
+                if is_trim_empty(expr_text) {
+                    throw PErr(tok.line, tok.column + i, "empty interpolation expression in string literal; use {{}} for literal braces")
+                }
+                val unescaped_expr = unescape_string(expr_text)
+                val expr = parse_interpolation_expr(unescaped_expr)?
+                parts.push(IpExpr(expr))
+                literal_start = i
+                continue
+            }
+            i = i + 1
+        }
+        if literal_start < blen {
+            val text = unescape_string((b[literal_start as usize..blen as usize]) as str)
+            parts.push(IpLit(text))
+        }
+        Ok(ast.alloc_expr(Span(tok.line, tok.column), StrInterp(parts.as_array())))
+    }
+
+    fun &parse_interpolation_expr(text: str): Throw<i64, PErr> {
+        val sub_toks = Lex.tokenize(text)
+        val sub_src = text.bytes()
+
+        val saved_src = src
+        val saved_toks = toks
+        val saved_current = current
+        val saved_pe = pending_eq
+        val saved_pg = pending_gt
+        val saved_pge = pending_gt_eq
+        val saved_errors = errors.len()
+
+        src = sub_src
+        toks = sub_toks.as_array()
+        current = 0
+        pending_eq = false
+        pending_gt = false
+        pending_gt_eq = false
+
+        val result = parse_expr()
+        src = saved_src
+        toks = saved_toks
+        current = saved_current
+        pending_eq = saved_pe
+        pending_gt = saved_pg
+        pending_gt_eq = saved_pge
+        match result {
+            Ok(_) => {}
+            Error(_) => {
+                while errors.len() > saved_errors {
+                    errors.pop()
+                }
+            }
+        }
+        result
+    }
+
+    fun unescape_string(text: str): str {
+        val b = text.bytes()
+        val blen = b.len() as i64
+        // 快路径:无转义无 {{ }}
+        var i: i64 = 0
+        var slow = false
+        while i < blen {
+            if b[i as usize] == (92 as u8) {
+                slow = true
+                break
+            }
+            if b[i as usize] == (123 as u8) && i + 1 < blen && b[(i + 1) as usize] == (123 as u8) {
+                slow = true
+                break
+            }
+            if b[i as usize] == (125 as u8) && i + 1 < blen && b[(i + 1) as usize] == (125 as u8) {
+                slow = true
+                break
+            }
+            i = i + 1
+        }
+        if !slow {
+            return text
+        }
+        // 慢路径
+        val out = List.empty()
+        var j: i64 = 0
+        while j < blen {
+            if b[j as usize] == (92 as u8) && j + 1 < blen {
+                val e = b[(j + 1) as usize]
+                if e == (110 as u8) {
+                    out.push((10 as u8))
+                    j = j + 2
+                } else if e == (116 as u8) {
+                    out.push((9 as u8))
+                    j = j + 2
+                } else if e == (114 as u8) {
+                    out.push((13 as u8))
+                    j = j + 2
+                } else if e == (92 as u8) {
+                    out.push((92 as u8))
+                    j = j + 2
+                } else if e == (34 as u8) {
+                    out.push((34 as u8))
+                    j = j + 2
+                } else if e == (123 as u8) {
+                    out.push((123 as u8))
+                    j = j + 2
+                } else if e == (125 as u8) {
+                    out.push((125 as u8))
+                    j = j + 2
+                } else if e == (48 as u8) {
+                    out.push((0 as u8))
+                    j = j + 2
+                } else if e == (117 as u8) {
+                    j = j + 2
+                    if j < blen && b[j as usize] == (123 as u8) {
+                        j = j + 1
+                        var cp: i64 = 0
+                        while j < blen && b[j as usize] != (125 as u8) {
+                            cp = cp * 16 + hex_val(b[j as usize])
+                            j = j + 1
+                        }
+                        j = j + 1
+                        push_codepoint(out, cp)
+                    } else {
+                        var cp: i64 = 0
+                        var k: i64 = 0
+                        val lim = if j + 4 < blen { j + 4 } else { blen }
+                        while j < lim && k < 4 {
+                            cp = cp * 16 + hex_val(b[j as usize])
+                            j = j + 1
+                            k = k + 1
+                        }
+                        push_codepoint(out, cp)
+                    }
+                } else if e == (120 as u8) {
+                    j = j + 2
+                    var cp: i64 = 0
+                    var k: i64 = 0
+                    val lim = if j + 2 < blen { j + 2 } else { blen }
+                    while j < lim && k < 2 {
+                        cp = cp * 16 + hex_val(b[j as usize])
+                        j = j + 1
+                        k = k + 1
+                    }
+                    push_codepoint(out, cp)
+                } else {
+                    out.push(b[j as usize])
+                    j = j + 1
+                }
+            } else if b[j as usize] == (123 as u8) && j + 1 < blen && b[(j + 1) as usize] == (123 as u8) {
+                out.push((123 as u8))
+                j = j + 2
+            } else if b[j as usize] == (125 as u8) && j + 1 < blen && b[(j + 1) as usize] == (125 as u8) {
+                out.push((125 as u8))
+                j = j + 2
+            } else {
+                // 完整 UTF-8 标量透传
+                val d = decode_utf8(b, j)
+                var k: i64 = 0
+                while k < d.len && j + k < blen {
+                    out.push(b[(j + k) as usize])
+                    k = k + 1
+                }
+                j = j + d.len
+            }
+        }
+        out.as_array() as str
+    }
+
+    // ── 特殊表达式 ──
+
+    fun &parse_lambda_fun(is_async: bool): Throw<i64, PErr> {
+        val fun_tok = advance()
+        val span = Span(fun_tok.line, fun_tok.column)
+        val params = List.empty()
+        expect(Lex.LParen, "expected '('")?
+        if !check(Lex.RParen) {
+            parse_param_list(params)?
+        }
+        expect(Lex.RParen, "expected ')'")?
+        expect(Lex.Colon, "expected ':' followed by return type in lambda")?
+        val return_type = parse_type()?
+        val body_expr = parse_expr()?
+        Ok(ast.alloc_expr(span, LambdaE(params.as_array(), LBlock(body_expr), is_async, return_type)))
+    }
+
+    fun &parse_paren_or_record_or_lambda(): Throw<i64, PErr> {
+        val lparen_tok = previous()
+        val span = Span(lparen_tok.line, lparen_tok.column)
+        if match_token(Lex.RParen) {
+            return Ok(ast.alloc_expr(span, VoidLit))
+        }
+        val saved = current
+        if peek().kind == Lex.Ellipsis {
+            advance()
+            val base_expr = parse_expr()?
+            val updates = List.empty()
+            while match_token(Lex.Comma) {
+                if check(Lex.RParen) {
+                    break
+                }
+                val field_name = expect(Lex.Identifier, "expected field name")?
+                expect(Lex.Colon, "expected ':'")?
+                val field_value = parse_expr()?
+                updates.push(Rfe(lexeme_of(field_name), field_value))
+            }
+            expect(Lex.RParen, "expected ')'")?
+            return Ok(ast.alloc_expr(span, RecordExtendE(base_expr, updates.as_array())))
+        }
+        if peek().kind == Lex.Identifier {
+            val name_tok = advance()
+            if check(Lex.Colon) {
+                advance()
+                val value = parse_expr()?
+                val fields = List.empty()
+                fields.push(Rfe(lexeme_of(name_tok), value))
+                while match_token(Lex.Comma) {
+                    if check(Lex.RParen) {
+                        break
+                    }
+                    if check(Lex.Ellipsis) {
+                        advance()
+                        val base_expr = parse_expr()?
+                        val updates = List.empty()
+                        var f: i64 = 0
+                        while f < fields.len() as i64 {
+                            updates.push(fields.get(f as usize) ?? Rfe("", 0))
+                            f = f + 1
+                        }
+                        while match_token(Lex.Comma) {
+                            if check(Lex.RParen) {
+                                break
+                            }
+                            val fname = expect(Lex.Identifier, "expected field name")?
+                            expect(Lex.Colon, "expected ':'")?
+                            val fvalue = parse_expr()?
+                            updates.push(Rfe(lexeme_of(fname), fvalue))
+                        }
+                        expect(Lex.RParen, "expected ')'")?
+                        return Ok(ast.alloc_expr(span, RecordExtendE(base_expr, updates.as_array())))
+                    }
+                    val field_name = expect(Lex.Identifier, "expected field name")?
+                    expect(Lex.Colon, "expected ':'")?
+                    val field_value = parse_expr()?
+                    fields.push(Rfe(lexeme_of(field_name), field_value))
+                }
+                expect(Lex.RParen, "expected ')'")?
+                return Ok(ast.alloc_expr(span, RecordLitE(fields.as_array())))
+            }
+            current = saved
+        }
+        val first_expr = parse_expr()?
+        if match_token(Lex.Comma) {
+            report_error_at(lparen_tok.line, lparen_tok.column,
+                "anonymous tuples are not allowed; use named record fields like (name: value, ...)")?
+            return Ok(ast.alloc_expr(Span(lparen_tok.line, lparen_tok.column), VoidLit))
+        }
+        expect(Lex.RParen, "expected ')'")?
+        Ok(first_expr)
+    }
+
+    fun &parse_if_expr(): Throw<i64, PErr> {
+        val if_tok = previous()
+        val span = Span(if_tok.line, if_tok.column)
+        reject_paren_condition("if")?
+        val cond = parse_expr()?
+        val then_branch = parse_unary()?
+        val else_branch = if match_token(Lex.KwElse) {
+            parse_unary()?
+        } else {
+            null
+        }
+        Ok(ast.alloc_expr(span, IfE(cond, then_branch, else_branch)))
+    }
+
+    fun &parse_match_expr(): Throw<i64, PErr> {
+        val match_tok = previous()
+        val span = Span(match_tok.line, match_tok.column)
+        reject_paren_condition("match")?
+        val scrutinee = parse_expr()?
+        expect(Lex.LBrace, "expected '{{'")?
+        val arms = List.empty()
+        while !check(Lex.RBrace) && !is_at_end() {
+            val arm = match parse_match_arm() {
+                Ok(a) => a
+                Error(_) => {
+                    while !check(Lex.Comma) && !check(Lex.RBrace) && !is_at_end() {
+                        advance()
+                    }
+                    if match_token(Lex.Comma) {
+                        continue
+                    }
+                    break
+                }
+            }
+            arms.push(arm)
+            match_token(Lex.Comma)
+        }
+        expect(Lex.RBrace, "expected '}}'")?
+        Ok(ast.alloc_expr(span, MatchE(scrutinee, arms.as_array())))
+    }
+
+    fun &parse_match_arm(): Throw<Marm, PErr> {
+        val pattern = parse_pattern()?
+        val guard = if match_token(Lex.KwIf) {
+            reject_paren_condition("if guard")?
+            parse_expr()?
+        } else {
+            null
+        }
+        expect(Lex.EqGt, "expected '=>'")?
+        val k = peek().kind
+        val body = if k == Lex.KwThrow || k == Lex.KwReturn || k == Lex.KwBreak || k == Lex.KwContinue {
+            val stmt_tok = peek()
+            val stmt = parse_stmt()?
+            val span = Span(stmt_tok.line, stmt_tok.column)
+            ast.alloc_expr(span, BlockE([stmt], null))
+        } else {
+            parse_expr()?
+        }
+        Ok(Marm(pattern, guard, body))
+    }
+
+    fun &parse_lazy_expr(): Throw<i64, PErr> {
+        val lazy_tok = previous()
+        val expr = parse_expr()?
+        Ok(ast.alloc_expr(Span(lazy_tok.line, lazy_tok.column), LazyE(expr)))
+    }
+
+    fun &parse_atomic_expr(): Throw<i64, PErr> {
+        val atomic_tok = previous()
+        val value = parse_primary()?
+        Ok(ast.alloc_expr(Span(atomic_tok.line, atomic_tok.column), AtomicE(value)))
+    }
+
+    fun &parse_select_expr(): Throw<i64, PErr> {
+        val select_tok = previous()
+        val span = Span(select_tok.line, select_tok.column)
+        expect(Lex.LBrace, "expected '{{'")?
+        val arms = List.empty()
+        while !check(Lex.RBrace) && !is_at_end() {
+            arms.push(parse_select_arm()?)
+            match_token(Lex.Comma)
+        }
+        expect(Lex.RBrace, "expected '}}'")?
+        Ok(ast.alloc_expr(span, SelectE(arms.as_array())))
+    }
+
+    fun &parse_select_arm(): Throw<SelArm, PErr> {
+        if check_identifier("timeout") {
+            advance()
+            expect(Lex.LParen, "expected '('")?
+            val duration = parse_expr()?
+            expect(Lex.RParen, "expected ')'")?
+            expect(Lex.EqGt, "expected '=>'")?
+            val body = parse_expr()?
+            return Ok(SelTimeout(duration, body))
+        }
+        val channel_expr = parse_expr()?
+        expect(Lex.EqGt, "expected '=>'")?
+        val binding = if check(Lex.Identifier) && current + 1 < n() && tok_at(current + 1).kind == Lex.EqGt {
+            val name_tok = advance()
+            advance()
+            lexeme_of(name_tok)
+        } else {
+            null
+        }
+        val body = parse_expr()?
+        Ok(SelRecv(channel_expr, binding, body))
+    }
+
+    fun &parse_inline_trait_value(): Throw<i64, PErr> {
+        val trait_tok = advance()
+        val span = Span(trait_tok.line, trait_tok.column)
+        expect(Lex.LBrace, "expected '{{'")?
+        val methods = List.empty()
+        while !check(Lex.RBrace) && !is_at_end() {
+            methods.push(parse_method_decl()?)
+        }
+        expect(Lex.RBrace, "expected '}}'")?
+        Ok(ast.alloc_expr(span, InlineTraitE(methods.as_array())))
+    }
+
+    fun &parse_array_literal(): Throw<i64, PErr> {
+        val bracket_tok = previous()
+        val span = Span(bracket_tok.line, bracket_tok.column)
+        val elements = List.empty()
+        if !check(Lex.RBracket) {
+            elements.push(parse_expr()?)
+            if match_token(Lex.Comma) {
+                if match_token(Lex.DotDot) {
+                    val count = parse_expr()?
+                    expect(Lex.RBracket, "expected ']' after array fill count")?
+                    val value = elements.get(0 as usize) ?? 0
+                    return Ok(ast.alloc_expr(span,
+                        ArrayLitE(elements.as_array(), value, count, true)))
+                }
+                if !check(Lex.RBracket) {
+                    elements.push(parse_expr()?)
+                    while match_token(Lex.Comma) {
+                        if check(Lex.RBracket) {
+                            break
+                        }
+                        elements.push(parse_expr()?)
+                    }
+                }
+            }
+        }
+        expect(Lex.RBracket, "expected ']'")?
+        Ok(ast.alloc_expr(span, ArrayLitE(elements.as_array(), 0, 0, false)))
+    }
+
+    fun &parse_block_expr(): Throw<i64, PErr> {
+        val brace_tok = advance()
+        val span = Span(brace_tok.line, brace_tok.column)
+        val stmts = List.empty()
+        var trailing: i64 = -1
+        while !check(Lex.RBrace) && !is_at_end() {
+            if is_stmt_start() {
+                val stmt = parse_stmt()?
+                var is_expr_stmt = false
+                var inner: i64 = 0
+                match ast.stmt(stmt).node {
+                    ExprS(e) => {
+                        is_expr_stmt = true
+                        inner = e
+                    }
+                    _ => {}
+                }
+                if is_expr_stmt && check(Lex.RBrace) {
+                    trailing = inner
+                    break
+                }
+                stmts.push(stmt)
+            } else {
+                val stmt = parse_expr_or_assignment_stmt()?
+                var is_expr_stmt = false
+                var inner: i64 = 0
+                match ast.stmt(stmt).node {
+                    ExprS(e) => {
+                        is_expr_stmt = true
+                        inner = e
+                    }
+                    _ => {}
+                }
+                if is_expr_stmt && check(Lex.RBrace) {
+                    trailing = inner
+                    break
+                }
+                stmts.push(stmt)
+            }
+        }
+        expect(Lex.RBrace, "expected '}}'")?
+        if trailing >= 0 {
+            Ok(ast.alloc_expr(span, BlockE(stmts.as_array(), trailing)))
+        } else {
+            Ok(ast.alloc_expr(span, BlockE(stmts.as_array(), null)))
+        }
+    }
+
+    // ── 语句解析 ──
+
+    fun is_stmt_start(): bool {
+        val k = peek().kind
+        k == Lex.KwVal || k == Lex.KwVar || k == Lex.KwFun || k == Lex.KwType
+            || k == Lex.KwTrait || k == Lex.KwReturn || k == Lex.KwDefer || k == Lex.KwThrow
+            || k == Lex.KwBreak || k == Lex.KwContinue || k == Lex.KwFor || k == Lex.KwWhile
+            || k == Lex.KwLoop
+    }
+
+    pub fun &parse_stmt(): Throw<i64, PErr> {
+        if match_token(Lex.KwVal) {
+            return parse_val_decl()
+        }
+        if match_token(Lex.KwVar) {
+            return parse_var_decl()
+        }
+        if match_token(Lex.KwFun) {
+            return parse_fun_stmt()
+        }
+        if check(Lex.KwType) {
+            val decl = parse_type_decl(Priv)?
+            return Ok(ast.alloc_stmt(decl.span, LocalDeclS(decl.decl)))
+        }
+        if check(Lex.KwTrait) {
+            val decl = parse_trait_decl(Priv)?
+            return Ok(ast.alloc_stmt(decl.span, LocalDeclS(decl.decl)))
+        }
+        if match_token(Lex.KwReturn) {
+            return parse_return_stmt()
+        }
+        if match_token(Lex.KwDefer) {
+            return parse_defer_stmt()
+        }
+        if match_token(Lex.KwThrow) {
+            return parse_throw_stmt()
+        }
+        if match_token(Lex.KwBreak) {
+            val tok = previous()
+            return Ok(ast.alloc_stmt(Span(tok.line, tok.column), BreakS))
+        }
+        if match_token(Lex.KwContinue) {
+            val tok = previous()
+            return Ok(ast.alloc_stmt(Span(tok.line, tok.column), ContinueS))
+        }
+        if match_token(Lex.KwFor) {
+            return parse_for_stmt()
+        }
+        if match_token(Lex.KwWhile) {
+            return parse_while_stmt()
+        }
+        if match_token(Lex.KwLoop) {
+            return parse_loop_stmt()
+        }
+        parse_expr_or_assignment_stmt()
+    }
+
+    fun &parse_fun_stmt(): Throw<i64, PErr> {
+        val fun_tok = previous()
+        val span = Span(fun_tok.line, fun_tok.column)
+        if check(Lex.Identifier) && !check_identifier("in") {
+            val name_tok = expect(Lex.Identifier, "expected function name")?
+            val type_params = List.empty()
+            if match_token(Lex.Lt) {
+                parse_type_param_list(type_params)?
+                expect_close_angle("expected '>' to close type parameter list")?
+            }
+            val params = List.empty()
+            expect(Lex.LParen, "expected '('")?
+            if !check(Lex.RParen) {
+                parse_param_list(params)?
+            }
+            expect(Lex.RParen, "expected ')'")?
+            val return_type = if match_token(Lex.Colon) {
+                parse_type()?
+            } else {
+                null
+            }
+            val body = parse_expr()?
+            val decl = FunDeclD(Priv, lexeme_of(name_tok), type_params.as_array(),
+                params.as_array(), return_type, body, false, false, [], null)
+            return Ok(ast.alloc_stmt(span, LocalDeclS(decl)))
+        }
+        val params = List.empty()
+        expect(Lex.LParen, "expected '('")?
+        if !check(Lex.RParen) {
+            parse_param_list(params)?
+        }
+        expect(Lex.RParen, "expected ')'")?
+        expect(Lex.Colon, "expected ':' followed by return type in lambda")?
+        val return_type = parse_type()?
+        val body_expr = parse_expr()?
+        val lambda = ast.alloc_expr(span, LambdaE(params.as_array(), LBlock(body_expr), false, return_type))
+        Ok(ast.alloc_stmt(span, ExprS(lambda)))
+    }
+
+    fun &parse_val_decl(): Throw<i64, PErr> {
+        val val_tok = previous()
+        val name_tok = expect(Lex.Identifier, "expected variable name")?
+        val ta = if match_token(Lex.Colon) {
+            parse_type()?
+        } else {
+            null
+        }
+        expect(Lex.Eq, "expected '='")?
+        val value = parse_expr()?
+        Ok(ast.alloc_stmt(Span(val_tok.line, val_tok.column),
+            ValDeclS(lexeme_of(name_tok), ta, value, Priv)))
+    }
+
+    fun &parse_var_decl(): Throw<i64, PErr> {
+        val var_tok = previous()
+        val name_tok = expect(Lex.Identifier, "expected variable name")?
+        val ta = if match_token(Lex.Colon) {
+            parse_type()?
+        } else {
+            null
+        }
+        expect(Lex.Eq, "expected '='")?
+        val value = parse_expr()?
+        Ok(ast.alloc_stmt(Span(var_tok.line, var_tok.column),
+            VarDeclS(lexeme_of(name_tok), ta, value, Priv)))
+    }
+
+    fun &parse_return_stmt(): Throw<i64, PErr> {
+        val return_tok = previous()
+        val value = if !check(Lex.RBrace) && !is_stmt_start() && !is_at_end() {
+            parse_expr()?
+        } else {
+            null
+        }
+        Ok(ast.alloc_stmt(Span(return_tok.line, return_tok.column), ReturnS(value)))
+    }
+
+    fun &parse_defer_stmt(): Throw<i64, PErr> {
+        val defer_tok = previous()
+        val span = Span(defer_tok.line, defer_tok.column)
+        val expr = parse_expr()?
+        if match_token(Lex.Eq) {
+            val value = parse_expr()?
+            val expr_span = ast.expr(expr).span
+            val assign_expr = ast.alloc_expr(expr_span, AssignE(expr, value))
+            return Ok(ast.alloc_stmt(span, DeferS(assign_expr)))
+        }
+        Ok(ast.alloc_stmt(span, DeferS(expr)))
+    }
+
+    fun &parse_throw_stmt(): Throw<i64, PErr> {
+        val throw_tok = previous()
+        val expr = parse_expr()?
+        Ok(ast.alloc_stmt(Span(throw_tok.line, throw_tok.column), ThrowS(expr)))
+    }
+
+    fun &parse_for_stmt(): Throw<i64, PErr> {
+        val for_tok = previous()
+        val span = Span(for_tok.line, for_tok.column)
+        val name_tok = expect(Lex.Identifier, "expected iterator variable name")?
+        expect(Lex.KwIn, "expected 'in'")?
+        reject_paren_condition("for")?
+        val iterable = parse_expr()?
+        val body = parse_unary()?
+        Ok(ast.alloc_stmt(span, ForS(lexeme_of(name_tok), iterable, body)))
+    }
+
+    fun &parse_while_stmt(): Throw<i64, PErr> {
+        val while_tok = previous()
+        val span = Span(while_tok.line, while_tok.column)
+        reject_paren_condition("while")?
+        val condition = parse_expr()?
+        val body = parse_unary()?
+        Ok(ast.alloc_stmt(span, WhileS(condition, body)))
+    }
+
+    fun &parse_loop_stmt(): Throw<i64, PErr> {
+        val loop_tok = previous()
+        val body = parse_unary()?
+        Ok(ast.alloc_stmt(Span(loop_tok.line, loop_tok.column), LoopS(body)))
+    }
+
+    fun &parse_expr_or_assignment_stmt(): Throw<i64, PErr> {
+        val expr = parse_expr()?
+        if match_token(Lex.Eq) {
+            val eq_tok = previous()
+            val value = parse_expr()?
+            val expr_span = ast.expr(expr).span
+            match ast.expr(expr).node {
+                Ident(_) => {
+                    return Ok(ast.alloc_stmt(expr_span, AssignS(expr, value)))
+                }
+                FieldAccessE(recv, field) => {
+                    return Ok(ast.alloc_stmt(Span(eq_tok.line, eq_tok.column),
+                        FieldAssignS(recv, field, value)))
+                }
+                _ => {
+                    return Ok(ast.alloc_stmt(Span(eq_tok.line, eq_tok.column),
+                        AssignS(expr, value)))
+                }
+            }
+        }
+        val cop = peek_compound_assign()
+        if cop != null {
+            advance()
+            val op_tok = previous()
+            val value = parse_expr()?
+            return Ok(ast.alloc_stmt(Span(op_tok.line, op_tok.column),
+                CompAssignS(expr, cop, value)))
+        }
+        val expr_span = ast.expr(expr).span
+        Ok(ast.alloc_stmt(expr_span, ExprS(expr)))
+    }
+
+    fun peek_compound_assign(): COp? {
+        val k = peek().kind
+        if k == Lex.PlusEq { return AddA }
+        if k == Lex.MinusEq { return SubA }
+        if k == Lex.StarEq { return MulA }
+        if k == Lex.SlashEq { return DivA }
+        if k == Lex.PercentEq { return ModA }
+        if k == Lex.AmpEq { return BitAndA }
+        if k == Lex.PipeEq { return BitOrA }
+        if k == Lex.CaretEq { return BitXorA }
+        if k == Lex.LtLtEq { return ShlA }
+        if k == Lex.GtGtEq { return ShrA }
+        null
+    }
+
+    // ── 模式解析 ──
+
+    fun &parse_pattern(): Throw<i64, PErr> {
+        parse_or_pattern()
+    }
+
+    fun &parse_or_pattern(): Throw<i64, PErr> {
+        var left = parse_primary_pattern()?
+        while match_token(Lex.Pipe) {
+            val pipe_tok = previous()
+            val right = parse_primary_pattern()?
+            left = ast.alloc_pattern(Span(pipe_tok.line, pipe_tok.column), POr(left, right))
+        }
+        Ok(left)
+    }
+
+    fun &parse_primary_pattern(): Throw<i64, PErr> {
+        if check(Lex.Identifier) && lexeme_of(peek()) == "_" {
+            val tok = advance()
+            return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PWild))
+        }
+        if match_token(Lex.NullLiteral) {
+            val tok = previous()
+            return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PLit(PLNull)))
+        }
+        if match_token(Lex.TrueLiteral) {
+            val tok = previous()
+            return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PLit(PLBool(true))))
+        }
+        if match_token(Lex.FalseLiteral) {
+            val tok = previous()
+            return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PLit(PLBool(false))))
+        }
+        if match_token(Lex.IntLiteral) {
+            val tok = previous()
+            return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PLit(PLInt(lexeme_of(tok)))))
+        }
+        if match_token(Lex.FloatLiteral) {
+            val tok = previous()
+            return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PLit(PLFloat(lexeme_of(tok)))))
+        }
+        if match_token(Lex.CharLiteral) {
+            val tok = previous()
+            return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PLit(PLChar(parse_char_value(lexeme_of(tok))))))
+        }
+        if match_token(Lex.StringLiteral) {
+            val tok = previous()
+            val lb = lexeme_of(tok).bytes()
+            val value = (lb[1 as usize..(lb.len() - 1) as usize]) as str
+            return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PLit(PLStr(value))))
+        }
+        if match_token(Lex.LParen) {
+            return parse_record_pattern()
+        }
+        if check(Lex.KwVal) || check(Lex.KwVar) {
+            val name_tok = advance()
+            if check(Lex.LParen) {
+                return parse_constructor_pattern(name_tok)
+            }
+            return Ok(ast.alloc_pattern(Span(name_tok.line, name_tok.column), PVar(lexeme_of(name_tok))))
+        }
+        if check(Lex.Identifier) {
+            val name_tok = advance()
+            if check(Lex.Dot) {
+                // 限定构造器路径 A.TEf(...):点分链只能是构造器(变量名无点)
+                // —— 带 '(' 为带参形态,否则空参形态。
+                val span = Span(name_tok.line, name_tok.column)
+                val name = parse_name_path_tail(name_tok, "expected pattern name after '.'")?
+                if check(Lex.LParen) {
+                    return parse_constructor_pattern_at(name, span)
+                }
+                return Ok(ast.alloc_pattern(span, PCtor(name, [])))
+            }
+            if check(Lex.LParen) {
+                return parse_constructor_pattern(name_tok)
+            }
+            return Ok(ast.alloc_pattern(Span(name_tok.line, name_tok.column), PVar(lexeme_of(name_tok))))
+        }
+        report_error("expected pattern")?
+        Ok(0)
+    }
+
+    fun &parse_constructor_pattern(name_tok: Tk): Throw<i64, PErr> {
+        parse_constructor_pattern_at(lexeme_of(name_tok), Span(name_tok.line, name_tok.column))
+    }
+
+    fun &parse_constructor_pattern_at(name: str, span: Span): Throw<i64, PErr> {
+        advance()
+        val patterns = List.empty()
+        if !check(Lex.RParen) {
+            patterns.push(parse_pattern()?)
+            while match_token(Lex.Comma) {
+                if check(Lex.RParen) {
+                    break
+                }
+                patterns.push(parse_pattern()?)
+            }
+        }
+        expect(Lex.RParen, "expected ')'")?
+        Ok(ast.alloc_pattern(span, PCtor(name, patterns.as_array())))
+    }
+
+    fun &parse_record_pattern(): Throw<i64, PErr> {
+        val lparen = previous()
+        val span = Span(lparen.line, lparen.column)
+        val fields = List.empty()
+        if !check(Lex.RParen) {
+            if peek().kind == Lex.Identifier {
+                val saved = current
+                val name_tok = advance()
+                if check(Lex.Colon) {
+                    advance()
+                    val pattern = parse_pattern()?
+                    fields.push(Prf(lexeme_of(name_tok), pattern))
+                    while match_token(Lex.Comma) {
+                        if check(Lex.RParen) {
+                            break
+                        }
+                        val field_name = expect(Lex.Identifier, "expected field name")?
+                        expect(Lex.Colon, "expected ':'")?
+                        val field_pattern = parse_pattern()?
+                        fields.push(Prf(lexeme_of(field_name), field_pattern))
+                    }
+                    expect(Lex.RParen, "expected ')'")?
+                    return Ok(ast.alloc_pattern(span, PRecord(fields.as_array())))
+                }
+                current = saved
+            }
+            val first = parse_pattern()?
+            fields.push(Prf(int_to_key(0), first))
+            var idx: i64 = 1
+            while match_token(Lex.Comma) {
+                if check(Lex.RParen) {
+                    break
+                }
+                val p = parse_pattern()?
+                fields.push(Prf(int_to_key(idx), p))
+                idx = idx + 1
+            }
+        }
+        expect(Lex.RParen, "expected ')'")?
+        Ok(ast.alloc_pattern(span, PRecord(fields.as_array())))
+    }
+}
+
+// 标量 → str(供 Err 词素预览等)。
+fun codepoint_to_str(cp: i64): str {
+    val out = List.empty()
+    push_codepoint(out, cp)
+    out.as_array() as str
+}
+
+// str.trim() 判空(Rust expr_text.trim().is_empty() 的对位)。
+fun is_trim_empty(s: str): bool {
+    val b = s.bytes()
+    var i: i64 = 0
+    while i < b.len() as i64 {
+        val c = b[i as usize]
+        if !(c == (32 as u8) || c == (9 as u8) || c == (10 as u8) || c == (13 as u8)) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+type ArgsRes = ArgsRes(args: i64[], type_args: i64[])
+
+// 入口:源文本 → 模块。
+pub fun parse_module_text(source: str, module_name: str): Throw<ModuleAst, PErr> {
+    val toks = Lex.tokenize(source)
+    val p = Parser(source.bytes(), toks.as_array(), 0, Ast.new_arena(),
+        List.empty(), false, false, false)
+    p.parse_module(module_name)
+}
+

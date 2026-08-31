@@ -39,7 +39,9 @@ pub const TO_C_TYPE: &[(&str, &str)] = &[
     ("u32",   "uint32_t"),
     ("u64",   "uint64_t"),
     ("u128",  "unsigned __int128"),
-    ("isize", "ssize_t"),
+    // isize → int64_t (NOT ssize_t — MSVC has no ssize_t; same width/layout
+    // on every LP64 POSIX target, and the Marshal slot is a plain 8-byte int).
+    ("isize", "int64_t"),
     ("usize", "size_t"),
     // ── floating-point ──
     ("f16",   "uint16_t"),    // IEEE 754 binary16 passed via uint16

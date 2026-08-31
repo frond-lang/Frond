@@ -1,14 +1,32 @@
 // Isize.frond — the isize type module (part of std.core.types)
 //
-// Boundary constants + decimal parse (platform width: 64-bit on all
-// supported targets). parse returns null on malformed input.
+// Boundary constants + decimal parse. MAX/MIN come from the C toolchain
+// (builtins __os_isize_max/__os_isize_min -> INTPTR_MAX/MIN), so they
+// follow the target pointer width instead of a hardcoded 64-bit decimal.
+// parse accepts an optional leading '+'/'-' and returns Throw<_, ParseError>:
+// Malformed on bad syntax, Overflow on values outside the isize range — the
+// same overflow-to-error contract as the float family (F*.parse), never a
+// silent wrap.
 
-pub val MAX: isize = 9223372036854775807
-pub val MIN: isize = -9223372036854775808
+pub val MAX: isize = __os_isize_max()
+pub val MIN: isize = __os_isize_min()
 
-pub fun parse(s: str): isize? {
-    match I64.parse(s) {
-        null => null,
-        v => v as isize,
+pub fun parse(s: str): Throw<isize, ParseError> {
+    val b = s.bytes()
+    if b.len() == 0 { throw ParseError(Malformed, "empty input is not an isize literal", s) }
+    var neg = false
+    var i = 0 as usize
+    if b[0] == 43 { i = 1 as usize }
+    if b[0] == 45 { neg = true; i = 1 as usize }
+    if i >= b.len() { throw ParseError(Malformed, "sign with no digits is not an isize literal", s) }
+    var v: u128 = 0
+    val limit: u128 = if neg { (Isize.MAX as u128) + 1 } else { Isize.MAX as u128 }
+    while i < b.len() {
+        val d = (b[i] as u128) - 48
+        if d > 9 { throw ParseError(Malformed, "invalid digit in isize literal", s) }
+        if v > (limit - d) / 10 { throw ParseError(Overflow, "value out of range for isize", s) }
+        v = v * 10 + d
+        i = i + 1
     }
+    if neg { Ok((0 - (v as i128)) as isize) } else { Ok(v as isize) }
 }

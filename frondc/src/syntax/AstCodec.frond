@@ -1,0 +1,1039 @@
+// AstCodec.frond — ModuleAst 二进制编解码(方案② std 解析持久化)。
+//
+// 格式(i64 流,LE 打包落盘):
+//   module_stream = [n_strs, (nbytes, bytes…)*, MAIN…]
+//   MAIN = [name_id, src_path(opt str id), n_exprs, Se*, n_stmts, Ss*,
+//           n_types, St*, n_pats, Spn*, n_decls, Sd*]
+// 字符串驻留(模块内);所有 id/枚举/bool 均 i64;Option 用 -1 哨兵。
+// 校验:astcheck(parse→encode→decode→双 Dump 比对,448 语料全绿)。
+
+import std.collections.List
+import std.collections.Map
+import syntax.Ast
+
+// ── writer ────────────────────────────────────────────────────────
+
+pub type OW = OW(pub out: List<i64>, pub intern: Map<str, i64>, pub strs: List<str>)
+
+pub fun new_ow(): OW {
+    OW(List.empty(), Map.empty(), List.empty())
+}
+
+fun wi(o: OW, v: i64): void { o.out.push(v) }
+
+fun wstr(o: OW, s: str): void {
+    match o.intern.get(s) {
+        null => {
+            val id = o.strs.len() as i64
+            o.strs.push(s)
+            o.intern.set(s, id)
+            wi(o, id)
+        },
+        id => { wi(o, id ?? 0) },
+    }
+}
+
+fun wopt_i(o: OW, v: i64?): void {
+    match v {
+        null => { wi(o, -1) }
+        x => { wi(o, x ?? 0) }
+    }
+}
+
+fun wopt_str(o: OW, v: str?): void {
+    match v {
+        null => { wi(o, -1) }
+        x => { wstr(o, x ?? "") }
+    }
+}
+
+fun wbool(o: OW, b: bool): void {
+    if b { wi(o, 1) } else { wi(o, 0) }
+}
+
+fun wspan(o: OW, s: Span): void {
+    // 合词:正 span 常态 (line<<20)|column 一词;列超 2^20 或负值走
+    // -1 标记 + 两词逃逸(全量词数省 ~40%)。
+    if s.column >= 0 && s.column < 1048576 && s.line >= 0 {
+        wi(o, (s.line << 20) | s.column)
+    } else {
+        wi(o, -1)
+        wi(o, s.line)
+        wi(o, s.column)
+    }
+}
+
+fun warr_i(o: OW, a: i64[]): void {
+    wi(o, a.len() as i64)
+    var i: usize = 0
+    while i < a.len() {
+        wi(o, a[i])
+        i = i + 1
+    }
+}
+
+fun warr_str(o: OW, a: str[]): void {
+    wi(o, a.len() as i64)
+    var i: usize = 0
+    while i < a.len() {
+        wstr(o, a[i])
+        i = i + 1
+    }
+}
+
+// ── reader ────────────────────────────────────────────────────────
+
+pub type OR = OR(pub data: i64[], pub strs: str[], pub pos: usize)
+
+pub fun new_or(data: i64[], strs: str[], pos: usize): OR {
+    OR(data, strs, pos)
+}
+
+fun ri(r: OR): i64 {
+    val v = r.data[r.pos]
+    r.pos = r.pos + 1
+    v
+}
+
+fun rstr(r: OR): str {
+    r.strs[ri(r) as usize]
+}
+
+fun ropt_i(r: OR): i64? {
+    val v = ri(r)
+    if v < 0 { null } else { v }
+}
+
+fun ropt_str(r: OR): str? {
+    val v = ri(r)
+    if v < 0 { null } else { r.strs[v as usize] }
+}
+
+fun rbool(r: OR): bool {
+    ri(r) != 0
+}
+
+fun rspan(r: OR): Span {
+    val w = ri(r)
+    if w >= 0 {
+        Span(w >> 20, w & 1048575)
+    } else {
+        Span(ri(r), ri(r))
+    }
+}
+
+fun rarr_i(r: OR): i64[] {
+    val n = ri(r) as usize
+    var out: i64[] = []
+    var i: usize = 0
+    while i < n {
+        out = out ++ [ri(r)]
+        i = i + 1
+    }
+    out
+}
+
+fun rarr_str(r: OR): str[] {
+    val n = ri(r) as usize
+    var out: str[] = []
+    var i: usize = 0
+    while i < n {
+        out = out ++ [rstr(r)]
+        i = i + 1
+    }
+    out
+}
+
+// ── 枚举 ─────────────────────────────────────────────────────────
+
+fun wvis(o: OW, v: Vis): void {
+    match v {
+        Priv => { wi(o, 0) }
+        Pub => { wi(o, 1) }
+    }
+}
+
+fun rvis(r: OR): Vis {
+    match ri(r) {
+        0 => { Priv }
+        _ => { Pub }
+    }
+}
+
+fun wkind(o: OW, k: Kind): void {
+    match k {
+        KStar => { wi(o, 0) }
+        KArrow(a, b) => { wi(o, 1); wkind(o, a); wkind(o, b) }
+    }
+}
+
+fun rkind(r: OR): Kind {
+    match ri(r) {
+        0 => { KStar }
+        _ => { KArrow(rkind(r), rkind(r)) }
+    }
+}
+
+fun wopt_kind(o: OW, k: Kind?): void {
+    match k {
+        null => { wi(o, -1) }
+        x => { wkind(o, x ?? KStar) }
+    }
+}
+
+fun ropt_kind(r: OR): Kind? {
+    val t = ri(r)
+    if t < 0 { null } else { rkind(r) }
+}
+
+fun wip(o: OW, v: Ip): void {
+    match v {
+        IpLit(s) => { wi(o, 0); wstr(o, s) }
+        IpExpr(e) => { wi(o, 1); wi(o, e) }
+    }
+}
+
+fun rip(r: OR): Ip {
+    match ri(r) {
+        0 => { IpLit(rstr(r)) }
+        _ => { IpExpr(ri(r)) }
+    }
+}
+
+fun wlbody(o: OW, v: LBody): void {
+    match v {
+        LBlock(b) => { wi(o, 0); wi(o, b) }
+        LExpr(e) => { wi(o, 1); wi(o, e) }
+    }
+}
+
+fun rlbody(r: OR): LBody {
+    match ri(r) {
+        0 => { LBlock(ri(r)) }
+        _ => { LExpr(ri(r)) }
+    }
+}
+
+// BOp(声明序 0..22)/UOp/COp 按序号往返。
+fun wbop(o: OW, v: BOp): void {
+    match v {
+        Add => { wi(o, 0) } Sub => { wi(o, 1) } Mul => { wi(o, 2) }
+        Div => { wi(o, 3) } Mod => { wi(o, 4) } Eq => { wi(o, 5) }
+        Neq => { wi(o, 6) } RefEq => { wi(o, 7) } RefNeq => { wi(o, 8) }
+        Lt => { wi(o, 9) } Gt => { wi(o, 10) } LtEq => { wi(o, 11) }
+        GtEq => { wi(o, 12) } And => { wi(o, 13) } Or => { wi(o, 14) }
+        BitAnd => { wi(o, 15) } BitOr => { wi(o, 16) } BitXor => { wi(o, 17) }
+        Shl => { wi(o, 18) } Shr => { wi(o, 19) } ConcatList => { wi(o, 20) }
+        Range => { wi(o, 21) } RangeIncl => { wi(o, 22) } ElvisOp => { wi(o, 23) }
+    }
+}
+
+fun rbop(r: OR): BOp {
+    match ri(r) {
+        0 => { Add } 1 => { Sub } 2 => { Mul } 3 => { Div } 4 => { Mod }
+        5 => { Eq } 6 => { Neq } 7 => { RefEq } 8 => { RefNeq } 9 => { Lt }
+        10 => { Gt } 11 => { LtEq } 12 => { GtEq } 13 => { And } 14 => { Or }
+        15 => { BitAnd } 16 => { BitOr } 17 => { BitXor } 18 => { Shl }
+        19 => { Shr } 20 => { ConcatList } 21 => { Range } 22 => { RangeIncl }
+        _ => { ElvisOp }
+    }
+}
+
+fun wuop(o: OW, v: UOp): void {
+    match v {
+        Not => { wi(o, 0) } Neg => { wi(o, 1) } _ => { wi(o, 2) }
+    }
+}
+
+fun ruop(r: OR): UOp {
+    match ri(r) {
+        0 => { Not } 1 => { Neg } _ => { BitNot }
+    }
+}
+
+fun wcop(o: OW, v: COp): void {
+    match v {
+        AddA => { wi(o, 0) } SubA => { wi(o, 1) } MulA => { wi(o, 2) }
+        DivA => { wi(o, 3) } ModA => { wi(o, 4) } BitAndA => { wi(o, 5) }
+        BitOrA => { wi(o, 6) } BitXorA => { wi(o, 7) } ShlA => { wi(o, 8) }
+        _ => { wi(o, 9) }
+    }
+}
+
+fun rcop(r: OR): COp {
+    match ri(r) {
+        0 => { AddA } 1 => { SubA } 2 => { MulA } 3 => { DivA } 4 => { ModA }
+        5 => { BitAndA } 6 => { BitOrA } 7 => { BitXorA } 8 => { ShlA }
+        _ => { ShrA }
+    }
+}
+
+fun wplit(o: OW, v: Plit): void {
+    match v {
+        PLInt(s) => { wi(o, 0); wstr(o, s) }
+        PLFloat(s) => { wi(o, 1); wstr(o, s) }
+        PLBool(b) => { wi(o, 2); wbool(o, b) }
+        PLChar(c) => { wi(o, 3); wi(o, c) }
+        PLStr(s) => { wi(o, 4); wstr(o, s) }
+        PLNull => { wi(o, 5) }
+    }
+}
+
+fun rplit(r: OR): Plit {
+    match ri(r) {
+        0 => { PLInt(rstr(r)) }
+        1 => { PLFloat(rstr(r)) }
+        2 => { PLBool(rbool(r)) }
+        3 => { PLChar(ri(r)) }
+        4 => { PLStr(rstr(r)) }
+        _ => { PLNull }
+    }
+}
+
+// ── 支撑记录 ─────────────────────────────────────────────────────
+
+fun wrfe(o: OW, v: Rfe): void { wstr(o, v.name); wi(o, v.value) }
+fun rrfe(r: OR): Rfe { Rfe(rstr(r), ri(r)) }
+
+fun wmarm(o: OW, v: Marm): void {
+    wi(o, v.pattern)
+    wopt_i(o, v.guard)
+    wi(o, v.body)
+}
+
+fun rmarm(r: OR): Marm {
+    val p = ri(r)
+    Marm(p, ropt_i(r), ri(r))
+}
+
+fun wselarm(o: OW, v: SelArm): void {
+    match v {
+        SelRecv(h, ch, b) => { wi(o, 0); wi(o, h); wopt_str(o, ch); wi(o, b) }
+        SelTimeout(d, b) => { wi(o, 1); wi(o, d); wi(o, b) }
+    }
+}
+
+fun rselarm(r: OR): SelArm {
+    match ri(r) {
+        0 => { SelRecv(ri(r), ropt_str(r), ri(r)) }
+        _ => { SelTimeout(ri(r), ri(r)) }
+    }
+}
+
+fun wrft(o: OW, v: Rft): void { wstr(o, v.name); wi(o, v.ty); wbool(o, v.is_pub) }
+fun rrft(r: OR): Rft { Rft(rstr(r), ri(r), rbool(r)) }
+
+fun wprf(o: OW, v: Prf): void { wstr(o, v.name); wi(o, v.pattern) }
+fun rprf(r: OR): Prf { Prf(rstr(r), ri(r)) }
+
+fun wattr(o: OW, v: Attr): void { wstr(o, v.name); warr_str(o, v.args) }
+fun rattr(r: OR): Attr { Attr(rstr(r), rarr_str(r)) }
+
+fun wprm(o: OW, v: Prm): void { wstr(o, v.name); wopt_i(o, v.ta) }
+fun rprm(r: OR): Prm { Prm(rstr(r), ropt_i(r)) }
+
+fun wtp(o: OW, v: Tp): void {
+    wstr(o, v.name)
+    wopt_kind(o, v.kind)
+    wi(o, v.bounds.len() as i64)
+    var i: usize = 0
+    while i < v.bounds.len() {
+        wtb(o, v.bounds[i])
+        i = i + 1
+    }
+}
+
+fun rtp(r: OR): Tp {
+    val n = Tp(rstr(r), ropt_kind(r), [])
+    val cnt = ri(r)
+    var out: Tb[] = []
+    var i: i64 = 0
+    while i < cnt {
+        out = out ++ [rtb(r)]
+        i = i + 1
+    }
+    Tp(n.name, n.kind, out)
+}
+
+fun wtb(o: OW, v: Tb): void { wstr(o, v.trait_name); warr_i(o, v.type_args) }
+fun rtb(r: OR): Tb { Tb(rstr(r), rarr_i(r)) }
+
+fun wcfl(o: OW, v: Cfl): void { wopt_str(o, v.name); wi(o, v.ty); wbool(o, v.is_pub) }
+fun rcfl(r: OR): Cfl { Cfl(ropt_str(r), ri(r), rbool(r)) }
+
+fun wcd(o: OW, v: Cd): void {
+    wstr(o, v.name)
+    wi(o, v.fields.len() as i64)
+    var i: usize = 0
+    while i < v.fields.len() {
+        wcfl(o, v.fields[i])
+        i = i + 1
+    }
+    wopt_i(o, v.return_type)
+}
+
+fun rcd(r: OR): Cd {
+    val name = rstr(r)
+    val cnt = ri(r)
+    var out: Cfl[] = []
+    var i: i64 = 0
+    while i < cnt {
+        out = out ++ [rcfl(r)]
+        i = i + 1
+    }
+    Cd(name, out, ropt_i(r))
+}
+
+fun wdel(o: OW, v: Del): void { wstr(o, v.trait_name); wstr(o, v.method_name) }
+fun rdel(r: OR): Del { Del(rstr(r), rstr(r)) }
+
+fun watd(o: OW, v: Atd): void { wstr(o, v.name); wopt_kind(o, v.kind) }
+fun ratd(r: OR): Atd { Atd(rstr(r), ropt_kind(r)) }
+
+fun wii(o: OW, v: Ii): void { wstr(o, v.name); wopt_str(o, v.alias) }
+fun rii(r: OR): Ii { Ii(rstr(r), ropt_str(r)) }
+
+fun wmd(o: OW, v: Md): void {
+    wstr(o, v.name)
+    wi(o, v.tps.len() as i64)
+    var i: usize = 0
+    while i < v.tps.len() {
+        wtp(o, v.tps[i])
+        i = i + 1
+    }
+    wi(o, v.params.len() as i64)
+    i = 0
+    while i < v.params.len() {
+        wprm(o, v.params[i])
+        i = i + 1
+    }
+    wopt_i(o, v.rt)
+    wopt_i(o, v.body)
+    wbool(o, v.is_override)
+    match v.delegate {
+        null => { wi(o, 0) }
+        d => { wi(o, 1); wdel(o, d ?? Del("", "")) }
+    }
+    wvis(o, v.vis)
+    wbool(o, v.is_async)
+}
+
+fun rmd(r: OR): Md {
+    val name = rstr(r)
+    val ntps = ri(r)
+    var tps: Tp[] = []
+    var i: i64 = 0
+    while i < ntps {
+        tps = tps ++ [rtp(r)]
+        i = i + 1
+    }
+    val nps = ri(r)
+    var ps: Prm[] = []
+    i = 0
+    while i < nps {
+        ps = ps ++ [rprm(r)]
+        i = i + 1
+    }
+    val rt = ropt_i(r)
+    val body = ropt_i(r)
+    val ov = rbool(r)
+    val del: Del? = match ri(r) {
+        0 => { null }
+        _ => { rdel(r) }
+    }
+    Md(name, tps, ps, rt, body, ov, del, rvis(r), rbool(r))
+}
+
+// ── TypeN / PatN / ExprN / StmtN / Decl ──────────────────────────
+
+fun wtypen(o: OW, v: TypeN): void {
+    match v {
+        TNamed(n) => { wi(o, 0); wstr(o, n) }
+        TThis => { wi(o, 1) }
+        TGeneric(n, args) => { wi(o, 2); wstr(o, n); warr_i(o, args) }
+        TNullable(t) => { wi(o, 3); wi(o, t) }
+        TRef(t) => { wi(o, 4); wi(o, t) }
+        TRawPtr(t) => { wi(o, 5); wi(o, t) }
+        TFunction(ps, r) => { wi(o, 6); warr_i(o, ps); wi(o, r) }
+        TRecord(fs) => { wi(o, 7); wi(o, fs.len() as i64); var i: usize = 0; while i < fs.len() { wrft(o, fs[i]); i = i + 1 } }
+        TArray(t, n) => { wi(o, 8); wi(o, t); wopt_i(o, n) }
+        TKindAnn(t, k) => { wi(o, 9); wi(o, t); wkind(o, k) }
+    }
+}
+
+fun rtypen(r: OR): TypeN {
+    match ri(r) {
+        0 => { TNamed(rstr(r)) }
+        1 => { TThis }
+        2 => { TGeneric(rstr(r), rarr_i(r)) }
+        3 => { TNullable(ri(r)) }
+        4 => { TRef(ri(r)) }
+        5 => { TRawPtr(ri(r)) }
+        6 => { val ps = rarr_i(r); TFunction(ps, ri(r)) }
+        7 => {
+            val cnt = ri(r)
+            var fs: Rft[] = []
+            var i: i64 = 0
+            while i < cnt {
+                fs = fs ++ [rrft(r)]
+                i = i + 1
+            }
+            TRecord(fs)
+        },
+        8 => { val t = ri(r); TArray(t, ropt_i(r)) }
+        _ => { val t = ri(r); TKindAnn(t, rkind(r)) }
+    }
+}
+
+fun wpatn(o: OW, v: PatN): void {
+    match v {
+        PWild => { wi(o, 0) }
+        PLit(p) => { wi(o, 1); wplit(o, p) }
+        PVar(n) => { wi(o, 2); wstr(o, n) }
+        PCtor(n, args) => { wi(o, 3); wstr(o, n); warr_i(o, args) }
+        PRecord(fs) => { wi(o, 4); wi(o, fs.len() as i64); var i: usize = 0; while i < fs.len() { wprf(o, fs[i]); i = i + 1 } }
+        POr(a, b) => { wi(o, 5); wi(o, a); wi(o, b) }
+        PGuard(p, b) => { wi(o, 6); wi(o, p); wi(o, b) }
+    }
+}
+
+fun rpatn(r: OR): PatN {
+    match ri(r) {
+        0 => { PWild }
+        1 => { PLit(rplit(r)) }
+        2 => { PVar(rstr(r)) }
+        3 => { PCtor(rstr(r), rarr_i(r)) }
+        4 => {
+            val cnt = ri(r)
+            var fs: Prf[] = []
+            var i: i64 = 0
+            while i < cnt {
+                fs = fs ++ [rprf(r)]
+                i = i + 1
+            }
+            PRecord(fs)
+        },
+        5 => { POr(ri(r), ri(r)) }
+        _ => { PGuard(ri(r), ri(r)) }
+    }
+}
+
+fun wexprn(o: OW, v: ExprN): void {
+    match v {
+        IntLit(a, b) => { wi(o, 0); wstr(o, a); wopt_str(o, b) }
+        FloatLit(a, b) => { wi(o, 1); wstr(o, a); wopt_str(o, b) }
+        BoolLit(b) => { wi(o, 2); wbool(o, b) }
+        CharLit(c) => { wi(o, 3); wi(o, c) }
+        StrLit(s) => { wi(o, 4); wstr(o, s) }
+        StrInterp(parts) => { wi(o, 5); wi(o, parts.len() as i64); var i: usize = 0; while i < parts.len() { wip(o, parts[i]); i = i + 1 } }
+        NullLit => { wi(o, 6) }
+        VoidLit => { wi(o, 7) }
+        Ident(n) => { wi(o, 8); wstr(o, n) }
+        AssignE(a, b) => { wi(o, 9); wi(o, a); wi(o, b) }
+        CompAssignE(op, t, v2) => { wi(o, 10); wcop(o, op); wi(o, t); wi(o, v2) }
+        BinaryE(op, a, b) => { wi(o, 11); wbop(o, op); wi(o, a); wi(o, b) }
+        UnaryE(op, e) => { wi(o, 12); wuop(o, op); wi(o, e) }
+        AsCast(e, t) => { wi(o, 13); wi(o, e); wi(o, t) }
+        RefOfE(e) => { wi(o, 14); wi(o, e) }
+        DerefE(e) => { wi(o, 15); wi(o, e) }
+        CallE(f, args, targs) => { wi(o, 16); wi(o, f); warr_i(o, args); warr_i(o, targs) }
+        MethodCallE(r, n, args, targs) => { wi(o, 17); wi(o, r); wstr(o, n); warr_i(o, args); warr_i(o, targs) }
+        FieldAccessE(r, n) => { wi(o, 18); wi(o, r); wstr(o, n) }
+        IndexE(r, i2) => { wi(o, 19); wi(o, r); wi(o, i2) }
+        SliceE(r, s, e, incl) => { wi(o, 20); wi(o, r); wi(o, s); wi(o, e); wbool(o, incl) }
+        SafeAccessE(r, n) => { wi(o, 21); wi(o, r); wstr(o, n) }
+        SafeMethodCallE(r, n, args, targs) => { wi(o, 22); wi(o, r); wstr(o, n); warr_i(o, args); warr_i(o, targs) }
+        PropagateE(e) => { wi(o, 23); wi(o, e) }
+        NonNullAssertE(e) => { wi(o, 24); wi(o, e) }
+        ElvisE(a, b) => { wi(o, 25); wi(o, a); wi(o, b) }
+        ArrayLitE(els, fv, fc, hf) => { wi(o, 26); warr_i(o, els); wi(o, fv); wi(o, fc); wbool(o, hf) }
+        RecordLitE(fs) => { wi(o, 27); wi(o, fs.len() as i64); var i: usize = 0; while i < fs.len() { wrfe(o, fs[i]); i = i + 1 } }
+        RecordExtendE(b, fs) => { wi(o, 28); wi(o, b); wi(o, fs.len() as i64); var i: usize = 0; while i < fs.len() { wrfe(o, fs[i]); i = i + 1 } }
+        LambdaE(ps, b, cap, rt) => { wi(o, 29); wi(o, ps.len() as i64); var i: usize = 0; while i < ps.len() { wprm(o, ps[i]); i = i + 1 }; wlbody(o, b); wbool(o, cap); wopt_i(o, rt) }
+        IfE(c, t, e) => { wi(o, 30); wi(o, c); wi(o, t); wopt_i(o, e) }
+        BlockE(stmts, tail) => { wi(o, 31); warr_i(o, stmts); wopt_i(o, tail) }
+        MatchE(s, arms) => { wi(o, 32); wi(o, s); wi(o, arms.len() as i64); var i: usize = 0; while i < arms.len() { wmarm(o, arms[i]); i = i + 1 } }
+        AtomicE(e) => { wi(o, 33); wi(o, e) }
+        LazyE(e) => { wi(o, 34); wi(o, e) }
+        SelectE(arms) => { wi(o, 35); wi(o, arms.len() as i64); var i: usize = 0; while i < arms.len() { wselarm(o, arms[i]); i = i + 1 } }
+        InlineTraitE(mds) => { wi(o, 36); wi(o, mds.len() as i64); var i: usize = 0; while i < mds.len() { wmd(o, mds[i]); i = i + 1 } }
+    }
+}
+
+fun rexprn(r: OR): ExprN {
+    match ri(r) {
+        0 => { val a = rstr(r); IntLit(a, ropt_str(r)) }
+        1 => { val a = rstr(r); FloatLit(a, ropt_str(r)) }
+        2 => { BoolLit(rbool(r)) }
+        3 => { CharLit(ri(r)) }
+        4 => { StrLit(rstr(r)) }
+        5 => {
+            val cnt = ri(r)
+            var out: Ip[] = []
+            var i: i64 = 0
+            while i < cnt {
+                out = out ++ [rip(r)]
+                i = i + 1
+            }
+            StrInterp(out)
+        },
+        6 => { NullLit }
+        7 => { VoidLit }
+        8 => { Ident(rstr(r)) }
+        9 => { AssignE(ri(r), ri(r)) }
+        10 => { val op = rcop(r); CompAssignE(op, ri(r), ri(r)) }
+        11 => { val op = rbop(r); BinaryE(op, ri(r), ri(r)) }
+        12 => { val op = ruop(r); UnaryE(op, ri(r)) }
+        13 => { AsCast(ri(r), ri(r)) }
+        14 => { RefOfE(ri(r)) }
+        15 => { DerefE(ri(r)) }
+        16 => { val f = ri(r); val args = rarr_i(r); CallE(f, args, rarr_i(r)) }
+        17 => { val rc = ri(r); val n = rstr(r); val args = rarr_i(r); MethodCallE(rc, n, args, rarr_i(r)) }
+        18 => { FieldAccessE(ri(r), rstr(r)) }
+        19 => { IndexE(ri(r), ri(r)) }
+        20 => { val a = ri(r); val b = ri(r); SliceE(a, b, ri(r), rbool(r)) }
+        21 => { SafeAccessE(ri(r), rstr(r)) }
+        22 => { val rc = ri(r); val n = rstr(r); val args = rarr_i(r); SafeMethodCallE(rc, n, args, rarr_i(r)) }
+        23 => { PropagateE(ri(r)) }
+        24 => { NonNullAssertE(ri(r)) }
+        25 => { ElvisE(ri(r), ri(r)) }
+        26 => { val els = rarr_i(r); val fv = ri(r); ArrayLitE(els, fv, ri(r), rbool(r)) }
+        27 => {
+            val cnt = ri(r)
+            var out: Rfe[] = []
+            var i: i64 = 0
+            while i < cnt {
+                out = out ++ [rrfe(r)]
+                i = i + 1
+            }
+            RecordLitE(out)
+        },
+        28 => {
+            val b = ri(r)
+            val cnt = ri(r)
+            var out: Rfe[] = []
+            var i: i64 = 0
+            while i < cnt {
+                out = out ++ [rrfe(r)]
+                i = i + 1
+            }
+            RecordExtendE(b, out)
+        },
+        29 => {
+            val cnt = ri(r)
+            var ps: Prm[] = []
+            var i: i64 = 0
+            while i < cnt {
+                ps = ps ++ [rprm(r)]
+                i = i + 1
+            }
+            val b = rlbody(r)
+            val cap = rbool(r)
+            LambdaE(ps, b, cap, ropt_i(r))
+        },
+        30 => { val c = ri(r); val t = ri(r); IfE(c, t, ropt_i(r)) }
+        31 => { val ss = rarr_i(r); BlockE(ss, ropt_i(r)) }
+        32 => {
+            val s = ri(r)
+            val cnt = ri(r)
+            var out: Marm[] = []
+            var i: i64 = 0
+            while i < cnt {
+                out = out ++ [rmarm(r)]
+                i = i + 1
+            }
+            MatchE(s, out)
+        },
+        33 => { AtomicE(ri(r)) }
+        34 => { LazyE(ri(r)) }
+        35 => {
+            val cnt = ri(r)
+            var out: SelArm[] = []
+            var i: i64 = 0
+            while i < cnt {
+                out = out ++ [rselarm(r)]
+                i = i + 1
+            }
+            SelectE(out)
+        },
+        _ => {
+            val cnt = ri(r)
+            var out: Md[] = []
+            var i: i64 = 0
+            while i < cnt {
+                out = out ++ [rmd(r)]
+                i = i + 1
+            }
+            InlineTraitE(out)
+        },
+    }
+}
+
+fun wtyped(o: OW, v: TypeD): void {
+    match v {
+        AdtD(ctors) => { wi(o, 0); wi(o, ctors.len() as i64); var i: usize = 0; while i < ctors.len() { wcd(o, ctors[i]); i = i + 1 } }
+        RecordD(fs) => { wi(o, 1); wi(o, fs.len() as i64); var i: usize = 0; while i < fs.len() { wrft(o, fs[i]); i = i + 1 } }
+        AliasD(t) => { wi(o, 2); wi(o, t) }
+        NewtypeD(n, t) => { wi(o, 3); wstr(o, n); wi(o, t) }
+    }
+}
+
+fun rtyped(r: OR): TypeD {
+    match ri(r) {
+        0 => {
+            val cnt = ri(r)
+            var out: Cd[] = []
+            var i: i64 = 0
+            while i < cnt {
+                out = out ++ [rcd(r)]
+                i = i + 1
+            }
+            AdtD(out)
+        },
+        1 => {
+            val cnt = ri(r)
+            var out: Rft[] = []
+            var i: i64 = 0
+            while i < cnt {
+                out = out ++ [rrft(r)]
+                i = i + 1
+            }
+            RecordD(out)
+        },
+        2 => { AliasD(ri(r)) }
+        _ => { NewtypeD(rstr(r), ri(r)) }
+    }
+}
+
+fun witemsk(o: OW, v: ItemsK): void {
+    match v {
+        NoItems => { wi(o, 0) }
+        Items(list) => { wi(o, 1); wi(o, list.len() as i64); var i: usize = 0; while i < list.len() { wii(o, list[i]); i = i + 1 } }
+    }
+}
+
+fun ritemsk(r: OR): ItemsK {
+    match ri(r) {
+        0 => { NoItems }
+        _ => {
+            val cnt = ri(r)
+            var out: Ii[] = []
+            var i: i64 = 0
+            while i < cnt {
+                out = out ++ [rii(r)]
+                i = i + 1
+            }
+            Items(out)
+        },
+    }
+}
+
+fun wdecl(o: OW, v: Decl): void {
+    match v {
+        FunDeclD(vis, name, tps, params, rt, body, is_async, throws, attrs, sema_mod) => {
+            wi(o, 0); wvis(o, vis); wstr(o, name)
+            wi(o, tps.len() as i64); var i: usize = 0; while i < tps.len() { wtp(o, tps[i]); i = i + 1 }
+            wi(o, params.len() as i64); i = 0; while i < params.len() { wprm(o, params[i]); i = i + 1 }
+            wopt_i(o, rt); wi(o, body); wbool(o, is_async); wbool(o, throws)
+            wi(o, attrs.len() as i64); i = 0; while i < attrs.len() { wattr(o, attrs[i]); i = i + 1 }
+            wopt_str(o, sema_mod)
+        },
+        TypeDeclD(vis, name, tps, bases, own_bases, td, methods) => {
+            wi(o, 1); wvis(o, vis); wstr(o, name)
+            wi(o, tps.len() as i64); var i: usize = 0; while i < tps.len() { wtp(o, tps[i]); i = i + 1 }
+            wi(o, bases.len() as i64); i = 0; while i < bases.len() { wtb(o, bases[i]); i = i + 1 }
+            wi(o, own_bases.len() as i64); i = 0; while i < own_bases.len() { wtb(o, own_bases[i]); i = i + 1 }
+            wtyped(o, td)
+            wi(o, methods.len() as i64); i = 0; while i < methods.len() { wmd(o, methods[i]); i = i + 1 }
+        },
+        TraitDeclD(vis, name, tps, bases, atds, methods) => {
+            wi(o, 2); wvis(o, vis); wstr(o, name)
+            wi(o, tps.len() as i64); var i: usize = 0; while i < tps.len() { wtp(o, tps[i]); i = i + 1 }
+            wi(o, bases.len() as i64); i = 0; while i < bases.len() { wtb(o, bases[i]); i = i + 1 }
+            wi(o, atds.len() as i64); i = 0; while i < atds.len() { watd(o, atds[i]); i = i + 1 }
+            wi(o, methods.len() as i64); i = 0; while i < methods.len() { wmd(o, methods[i]); i = i + 1 }
+        },
+        ImportDeclD(path, items, vis) => { wi(o, 3); warr_str(o, path); witemsk(o, items); wvis(o, vis) }
+        PackDeclD(vis, name) => { wi(o, 4); wvis(o, vis); wstr(o, name) }
+        ExprDeclD(expr, stmt) => { wi(o, 5); wi(o, expr); wopt_i(o, stmt) }
+    }
+}
+
+fun rdecl(r: OR): Decl {
+    match ri(r) {
+        0 => {
+            val vis = rvis(r)
+            val name = rstr(r)
+            val ntps = ri(r)
+            var tps: Tp[] = []
+            var i: i64 = 0
+            while i < ntps {
+                tps = tps ++ [rtp(r)]
+                i = i + 1
+            }
+            val nps = ri(r)
+            var ps: Prm[] = []
+            i = 0
+            while i < nps {
+                ps = ps ++ [rprm(r)]
+                i = i + 1
+            }
+            val rt = ropt_i(r)
+            val body = ri(r)
+            val is_async = rbool(r)
+            val throws = rbool(r)
+            val na = ri(r)
+            var ats: Attr[] = []
+            i = 0
+            while i < na {
+                ats = ats ++ [rattr(r)]
+                i = i + 1
+            }
+            FunDeclD(vis, name, tps, ps, rt, body, is_async, throws, ats, ropt_str(r))
+        },
+        1 => {
+            val vis = rvis(r)
+            val name = rstr(r)
+            val ntps = ri(r)
+            var tps: Tp[] = []
+            var i: i64 = 0
+            while i < ntps {
+                tps = tps ++ [rtp(r)]
+                i = i + 1
+            }
+            val nb = ri(r)
+            var bases: Tb[] = []
+            i = 0
+            while i < nb {
+                bases = bases ++ [rtb(r)]
+                i = i + 1
+            }
+            val nob = ri(r)
+            var obases: Tb[] = []
+            i = 0
+            while i < nob {
+                obases = obases ++ [rtb(r)]
+                i = i + 1
+            }
+            val td = rtyped(r)
+            val nm = ri(r)
+            var mds: Md[] = []
+            i = 0
+            while i < nm {
+                mds = mds ++ [rmd(r)]
+                i = i + 1
+            }
+            TypeDeclD(vis, name, tps, bases, obases, td, mds)
+        },
+        2 => {
+            val vis = rvis(r)
+            val name = rstr(r)
+            val ntps = ri(r)
+            var tps: Tp[] = []
+            var i: i64 = 0
+            while i < ntps {
+                tps = tps ++ [rtp(r)]
+                i = i + 1
+            }
+            val nb = ri(r)
+            var bases: Tb[] = []
+            i = 0
+            while i < nb {
+                bases = bases ++ [rtb(r)]
+                i = i + 1
+            }
+            val na = ri(r)
+            var ats: Atd[] = []
+            i = 0
+            while i < na {
+                ats = ats ++ [ratd(r)]
+                i = i + 1
+            }
+            val nm = ri(r)
+            var mds: Md[] = []
+            i = 0
+            while i < nm {
+                mds = mds ++ [rmd(r)]
+                i = i + 1
+            }
+            TraitDeclD(vis, name, tps, bases, ats, mds)
+        },
+        3 => { val p = rarr_str(r); val items = ritemsk(r); ImportDeclD(p, items, rvis(r)) }
+        4 => { PackDeclD(rvis(r), rstr(r)) }
+        _ => { ExprDeclD(ri(r), ropt_i(r)) }
+    }
+}
+
+fun wstmtn(o: OW, v: StmtN): void {
+    match v {
+        ValDeclS(n, ta, init, vis) => { wi(o, 0); wstr(o, n); wopt_i(o, ta); wi(o, init); wvis(o, vis) }
+        VarDeclS(n, ta, init, vis) => { wi(o, 1); wstr(o, n); wopt_i(o, ta); wi(o, init); wvis(o, vis) }
+        AssignS(t, v2) => { wi(o, 2); wi(o, t); wi(o, v2) }
+        FieldAssignS(t, f, v2) => { wi(o, 3); wi(o, t); wstr(o, f); wi(o, v2) }
+        CompAssignS(t, op, v2) => { wi(o, 4); wi(o, t); wcop(o, op); wi(o, v2) }
+        ExprS(e) => { wi(o, 5); wi(o, e) }
+        ReturnS(e) => { wi(o, 6); wopt_i(o, e) }
+        DeferS(b) => { wi(o, 7); wi(o, b) }
+        ThrowS(e) => { wi(o, 8); wi(o, e) }
+        BreakS => { wi(o, 9) }
+        ContinueS => { wi(o, 10) }
+        ForS(n, it, b) => { wi(o, 11); wstr(o, n); wi(o, it); wi(o, b) }
+        WhileS(c, b) => { wi(o, 12); wi(o, c); wi(o, b) }
+        LoopS(b) => { wi(o, 13); wi(o, b) }
+        LocalDeclS(d) => { wi(o, 14); wdecl(o, d) }
+    }
+}
+
+fun rstmtn(r: OR): StmtN {
+    match ri(r) {
+        0 => { val n = rstr(r); val ta = ropt_i(r); ValDeclS(n, ta, ri(r), rvis(r)) }
+        1 => { val n = rstr(r); val ta = ropt_i(r); VarDeclS(n, ta, ri(r), rvis(r)) }
+        2 => { AssignS(ri(r), ri(r)) }
+        3 => { val t = ri(r); val f = rstr(r); FieldAssignS(t, f, ri(r)) }
+        4 => { val t = ri(r); val op = rcop(r); CompAssignS(t, op, ri(r)) }
+        5 => { ExprS(ri(r)) }
+        6 => { ReturnS(ropt_i(r)) }
+        7 => { DeferS(ri(r)) }
+        8 => { ThrowS(ri(r)) }
+        9 => { BreakS }
+        10 => { ContinueS }
+        11 => { val n = rstr(r); ForS(n, ri(r), ri(r)) }
+        12 => { WhileS(ri(r), ri(r)) }
+        13 => { LoopS(ri(r)) }
+        _ => { LocalDeclS(rdecl(r)) }
+    }
+}
+
+// ── 模块级 ───────────────────────────────────────────────────────
+
+// 编码:返回完整流(含字符串表前缀)。n2 = strs 起点位移。
+pub fun encode_module(m: ModuleAst): i64[] {
+    val o = new_ow()
+    wstr(o, m.name)
+    wopt_str(o, m.source_path)
+    wi(o, m.arena.exprs.len() as i64)
+    var i: usize = 0
+    while i < m.arena.exprs.len() {
+        val e = m.arena.exprs.get(i) ?? Se(Span(0, 0), VoidLit)
+        wspan(o, e.span)
+        wexprn(o, e.node)
+        i = i + 1
+    }
+    wi(o, m.arena.stmts.len() as i64)
+    i = 0
+    while i < m.arena.stmts.len() {
+        val s = m.arena.stmts.get(i) ?? Ss(Span(0, 0), BreakS)
+        wspan(o, s.span)
+        wstmtn(o, s.node)
+        i = i + 1
+    }
+    wi(o, m.arena.types.len() as i64)
+    i = 0
+    while i < m.arena.types.len() {
+        val t = m.arena.types.get(i) ?? St(Span(0, 0), TThis)
+        wspan(o, t.span)
+        wtypen(o, t.node)
+        i = i + 1
+    }
+    wi(o, m.arena.patterns.len() as i64)
+    i = 0
+    while i < m.arena.patterns.len() {
+        val p = m.arena.patterns.get(i) ?? Spn(Span(0, 0), PWild)
+        wspan(o, p.span)
+        wpatn(o, p.node)
+        i = i + 1
+    }
+    wi(o, m.decls.len() as i64)
+    i = 0
+    while i < m.decls.len() {
+        wspan(o, m.decls[i].span)
+        wdecl(o, m.decls[i].decl)
+        i = i + 1
+    }
+    // 流合成(List 累积 O(n);++ 拼接是 O(n²),流达百万级)。
+    val sink = List.empty<i64>()
+    sink.push(o.strs.len() as i64)
+    var si: usize = 0
+    while si < o.strs.len() {
+        val s = o.strs.get(si) ?? ""
+        val b = s.bytes()
+        sink.push(b.len() as i64)
+        var bi: usize = 0
+        while bi < b.len() {
+            sink.push(b[bi] as i64)
+            bi = bi + 1
+        }
+        si = si + 1
+    }
+    var oi: usize = 0
+    while oi < o.out.len() {
+        sink.push(o.out.get(oi) ?? 0)
+        oi = oi + 1
+    }
+    sink.as_array()
+}
+
+pub fun decode_module(stream: i64[]): ModuleAst {
+    // 1. 字符串表(List 累积 — `++` 拼接对千级字符串是 O(n²))。
+    var pos: usize = 0
+    val n_strs = stream[pos] as usize
+    pos = pos + 1
+    val strsink = List.empty<str>()
+    var si: i64 = 0
+    while si < n_strs as i64 {
+        val n = stream[pos] as usize
+        pos = pos + 1
+        var bytes: u8[] = [0, ..n]
+        var bi: usize = 0
+        while bi < n {
+            bytes[bi] = stream[pos] as u8
+            pos = pos + 1
+            bi = bi + 1
+        }
+        strsink.push((bytes[0..n]) as str)
+        si = si + 1
+    }
+    val strs = strsink.as_array()
+    // 2. 主体(从 stream 的 pos 处续读)。
+    val r = new_or(stream, strs, pos)
+    val name = rstr(r)
+    val source_path = ropt_str(r)
+    val arena = Ast.new_arena()
+    val n_exprs = ri(r)
+    var i: i64 = 0
+    while i < n_exprs {
+        val sp = rspan(r)
+        arena.exprs.push(Se(sp, rexprn(r)))
+        i = i + 1
+    }
+    val n_stmts = ri(r)
+    i = 0
+    while i < n_stmts {
+        val sp = rspan(r)
+        arena.stmts.push(Ss(sp, rstmtn(r)))
+        i = i + 1
+    }
+    val n_types = ri(r)
+    i = 0
+    while i < n_types {
+        val sp = rspan(r)
+        arena.types.push(St(sp, rtypen(r)))
+        i = i + 1
+    }
+    val n_pats = ri(r)
+    i = 0
+    while i < n_pats {
+        val sp = rspan(r)
+        arena.patterns.push(Spn(sp, rpatn(r)))
+        i = i + 1
+    }
+    val n_decls = ri(r)
+    var decls: Sd[] = []
+    i = 0
+    while i < n_decls {
+        val sp = rspan(r)
+        decls = decls ++ [Sd(sp, rdecl(r))]
+        i = i + 1
+    }
+    ModuleAst(name, source_path, arena, decls)
+}

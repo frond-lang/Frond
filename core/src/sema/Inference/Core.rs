@@ -76,6 +76,19 @@ pub struct InferContext<'a> {
     /// resolution: super statically targets the bound trait-default layer of the
     /// enclosing type (explicit delegate or unique provider).
     pub current_type_decl_traits: Option<Vec<Box<str>>>,
+    /// S5 (ambiguity hardening): true while inferring the RECEIVER of a
+    /// member access (recv.method / recv.field / field-assign target).
+    /// Receiver position is adjudicated loudly downstream (path 0a/0b,
+    /// lookup_method_type / lookup_field_type all error on miss), so the
+    /// bare-ctor ambiguity diagnostic is suppressed there — it targets the
+    /// SILENT consumers (comparisons, plain value flows) instead.
+    pub in_recv_position: bool,
+    /// Deferred method dispatch (case #1 root cure): method calls whose receiver
+    /// was a bare TypeVar/Unknown at inference time. Path-0's free-function
+    /// fallback must not eagerly bind those (first-wins hijack); the calls are
+    /// re-inferred after constraint solving, when the receivers are typically
+    /// bound (see check_module_with_env step 9.2).
+    pub deferred_method_calls: Vec<(crate::ast::Ast::ExprId, EnvId)>,
 }
 
 /// Checks whether a type references any unresolved TypeVar (in unresolved_set).
@@ -98,6 +111,8 @@ impl<'a> InferContext<'a> {
             current_module_name: String::new(),
             type_trace: Vec::new(),
             ctor_module_envs: FxHashMap::default(),
+            in_recv_position: false,
+            deferred_method_calls: Vec::new(),
             instantiation_ctx: None,
             local_mutability: FxHashMap::default(),
             current_trait_name: None,
@@ -131,10 +146,12 @@ impl<'a> InferContext<'a> {
             current_module_name: String::new(),
             type_trace: Vec::new(),
             ctor_module_envs: FxHashMap::default(),
+            in_recv_position: false,
             instantiation_ctx: None,
             local_mutability: FxHashMap::default(),
             current_trait_name: None,
             current_type_decl_traits: None,
+            deferred_method_calls: Vec::new(),
         }
     }
 
@@ -480,6 +497,9 @@ impl<'a> InferContext<'a> {
 
         // 9. Solve deferred constraints (with witness table support for trait bound solving).
         // Split borrows of self's different fields: arena as mutable borrow, witness_table as shared borrow.
+        // Scoped so the borrows end before the 9.2 retry pass, which needs the
+        // whole InferContext (re-inference).
+        {
         let InferContext { arena, solver, witness_table, type_trace, .. } = self;
         solver.solve_with_witness(arena, Some(witness_table));
 
@@ -513,6 +533,38 @@ impl<'a> InferContext<'a> {
                 ));
             }
         }
+
+        }
+
+        // 9.2 Deferred method dispatch retry (case #1 root cure): method
+        // calls whose receiver was a bare TypeVar/Unknown at inference time
+        // were recorded instead of being eagerly bound by the Path-0
+        // free-function fallback (first-wins hijack: a pending
+        // w.method_slots chain bound to types.Arena.get(a, h) and poisoned
+        // every downstream use). Constraint solving (9) has now bound those
+        // receivers; re-infer the deferred calls so they take the
+        // type-driven path and their ExprInfos (and the re-inferred
+        // receiver chains) get the REAL types. Still-pending calls
+        // re-record themselves; the loop stops when nothing resolves or the
+        // round cap is hit (they then keep the fresh-var fallback and are
+        // defaulted below, matching the pre-fix end state for genuinely
+        // unresolvable receivers).
+        {
+            let mut rounds: usize = 0;
+            loop {
+                if self.deferred_method_calls.is_empty() || rounds >= 8 {
+                    break;
+                }
+                rounds += 1;
+                let deferred = std::mem::take(&mut self.deferred_method_calls);
+                for (dexpr, denv) in deferred {
+                    let _ = self.infer_expr(dexpr, &module.arena, denv, None);
+                }
+            }
+            self.deferred_method_calls.clear();
+        }
+
+        let InferContext { arena, type_trace, witness_table, .. } = self;
 
         // 9.4 Default unbound non-rigid TypeVars to void (root cause F).
         //

@@ -1354,7 +1354,7 @@ pub struct Frame {
     /// When the copied-in ready bitmap matches the snapshot, the derivation is skipped and the
     /// cached pending/seed reused (memcpy). Cleared on frame reuse / subgraph switch; length
     /// mismatches (resize) also invalidate via the comparison.
-    pub same_fn_prep_cache: Option<Box<(Vec<u8>, Vec<u16>, Vec<NodeId>)>>,
+    pub same_fn_prep_cache: Option<Box<(u32, Vec<u8>, Vec<u16>, Vec<NodeId>)>>,
     /// E5: set by prepare paths when the frame starts fresh (all own slots unready except
     /// injected params). One-shot: the dispatch wrapper consumes it to enter run_linear once;
     /// a bail or resume falls back to the dataflow engine permanently for this frame.
@@ -1409,6 +1409,7 @@ impl Frame {
             construct_cache: Vec::new(),
         }
     }
+
 
     /// Sets a node's output value (local NodeId).
     pub fn set_value(&mut self, node: NodeId, value: Value, consumer_count: u16) {
@@ -2788,6 +2789,9 @@ pub struct DataFlowGraph {
     pub dyn_ffi_infos: Vec<Option<DynFfiInfo>>,
     /// Field assignment info (indexed by NodeId; stores field name; used by compute_record_field_set).
     pub field_set_names: Vec<Option<String>>,
+    /// Subgraph id → function mangled name (debug dumps; empty for
+    /// non-function subgraphs). Filled by IrBuilder::build from func_subgraphs.
+    pub sg_names: Vec<String>,
     /// Method idx for vtable dynamic dispatch Call nodes (indexed by NodeId; None = static call).
     /// method_idx = position of the method in TraitDefInfo.methods (consistent with TraitValue.method_values index).
     pub vtable_call_methods: Vec<Option<u16>>,
@@ -2926,6 +2930,7 @@ impl Clone for DataFlowGraph {
             nodes: self.nodes.clone(),
             inputs_pool: self.inputs_pool.clone(),
             subgraphs: self.subgraphs.clone(),
+            sg_names: self.sg_names.clone(),
             entry_subgraph: self.entry_subgraph,
             compute_fns: self.compute_fns.clone(),
             downstreams: self.downstreams.clone(),
@@ -3020,6 +3025,7 @@ impl DataFlowGraph {
             ffi_call_names: Vec::new(),
             dyn_ffi_infos: Vec::new(),
             field_set_names: Vec::new(),
+            sg_names: Vec::new(),
             vtable_call_methods: Vec::new(),
             await_event_sources: Vec::new(),
             closure_infos: Vec::new(),
@@ -3594,11 +3600,6 @@ impl DataFlowGraph {
         redirect: &rustc_hash::FxHashMap<NodeId, NodeId>,
         dead_sgs: &rustc_hash::FxHashSet<SubGraphId>,
     ) -> Vec<Option<NodeId>> {
-        // Test hook for the optimizer stability policy (run_guarded snapshot
-        // rollback): simulates an invariant violation inside rebuild.
-        if std::env::var("FROND_TEST_INJECT_REBUILD_FAIL").is_ok() {
-            panic!("rebuild: injected invariant failure (FROND_TEST_INJECT_REBUILD_FAIL)");
-        }
         // ── Recursively resolve redirects ──
         let resolve = |id: NodeId| -> NodeId {
             let mut cur = id;
@@ -3648,22 +3649,25 @@ impl DataFlowGraph {
                 node_owner[idx] = sg.id.0;
             }
         }
-        // Ownership of hoisted nodes (not inside any node_range; determined via hoisted_owners).
-        // IMPORTANT: hoisted_owners may point to a branch subgraph (id != function_id).
-        // Hoisted nodes must be attributed to the function-level subgraph, otherwise
-        // the branch subgraph's node_range (recomputed in step 5) would extend to
-        // cover the hoisted nodes' new positions, accidentally encompassing the Gate
-        // node that sits between the branch's native nodes and the hoisted nodes,
-        // causing infinite recursion at runtime (Gate launches a subgraph containing itself).
+        // Ownership of hoisted nodes (not inside any node_range; determined via
+        // hoisted_owners). Branch-owned hoisted nodes (Inline's cloned bodies —
+        // hoisted_owners points at the INNERMOST sg containing the inlined call
+        // site) KEEP their branch owner: step 1c places them immediately after
+        // that branch's native nodes, so the branch's recomputed range covers
+        // them while the dispatching Gate (outside the branch's old range in id
+        // order) stays outside — the recursion hazard the old function-level
+        // flattening guarded against cannot occur, and check_gate_in_branch
+        // verifies it after every rebuild. Out-of-range owners still fall back
+        // sanely below.
         for idx in 0..total {
             if self.hoisted_node[idx] && node_owner[idx] == u32::MAX {
                 let raw_owner = self.hoisted_owners[idx].0 as usize;
-                let func_owner = if raw_owner < self.subgraphs.len() {
-                    self.subgraphs[raw_owner].function_id
+                let owner = if raw_owner < self.subgraphs.len() {
+                    self.subgraphs[raw_owner].id.0
                 } else {
                     self.hoisted_owners[idx].0
                 };
-                node_owner[idx] = func_owner;
+                node_owner[idx] = owner;
             }
         }
         // Save a copy of node_owner indexed by old indices (step 5 still needs
@@ -3680,35 +3684,104 @@ impl DataFlowGraph {
             .collect();
         func_sgs.sort_by_key(|&sg_id| self.subgraphs[sg_id as usize].node_range.0);
 
-        // 1c. Assign new_id in function-level subgraph order.
-        for &sg_id in &func_sgs {
-            let sg = &self.subgraphs[sg_id as usize];
-            let start = sg.node_range.0.0 as usize;
-            let end = (sg.node_range.1.0 as usize).min(total);
-
-            // Native live nodes (including nested subgraph nodes; skip hoisted).
-            for old_idx in start..end {
-                if self.hoisted_node[old_idx] {
-                    continue;
+        // Branch-span flush points: every non-function sg's OLD exclusive end
+        // boundary -> its owned hoisted nodes. Step 1c emits a branch's hoisted
+        // nodes right after that branch's native span (innermost ends first —
+        // nested spans end earlier in id order), keeping them INSIDE the
+        // branch's recomputed range so branch frames execute them, while the
+        // dispatching Gate (later in id order) stays outside the range.
+        let mut branch_hoisted: rustc_hash::FxHashMap<u32, Vec<usize>> =
+            rustc_hash::FxHashMap::default();
+        for idx in 0..total {
+            if !self.hoisted_node[idx] {
+                continue;
+            }
+            let owner = node_owner[idx] as usize;
+            if owner < self.subgraphs.len()
+                && self.subgraphs[owner].id.0 != self.subgraphs[owner].function_id
+            {
+                // Stable anchor: the branch's LAST NATIVE (non-hoisted) slot.
+                // Anchoring at the branch's CURRENT range end would drift —
+                // each flush extends the range, the next rebuild flushes at the
+                // extended end, and ranges grow monotonically until every
+                // wrapper swallows the rest of the function (observed: round-2
+                // rebuild pulled all wrapper ends to the function end, collapsing
+                // the nesting tree). hoisted flags persist across rebuilds, so
+                // the native anchor is idempotent.
+                let (bs, be) = self.subgraphs[owner].node_range;
+                let mut anchor = be.0 - 1;
+                while anchor >= bs.0 && self.hoisted_node[anchor as usize] {
+                    anchor -= 1;
                 }
-                let old_id = NodeId(old_idx as u32);
+                branch_hoisted.entry(anchor + 1).or_default().push(idx);
+            }
+        }
+        fn flush_hoisted(
+            h_ids: &[usize],
+            dead: &rustc_hash::FxHashSet<NodeId>,
+            redirect: &rustc_hash::FxHashMap<NodeId, NodeId>,
+            old_to_new: &mut Vec<Option<NodeId>>,
+            new_to_old: &mut Vec<usize>,
+            new_nodes: &mut Vec<Node>,
+            src_nodes: &[Node],
+        ) {
+            for &h_idx in h_ids {
+                let old_id = NodeId(h_idx as u32);
                 if dead.contains(&old_id) || redirect.contains_key(&old_id) {
                     continue;
                 }
-                // De-duplicate: if the node was already assigned in another
-                // subgraph iteration (overlapping node_range), skip.
-                if old_to_new[old_idx].is_some() {
+                if old_to_new[h_idx].is_some() {
                     continue;
                 }
                 let new_id = NodeId(new_nodes.len() as u32);
-                old_to_new[old_idx] = Some(new_id);
-                new_to_old.push(old_idx);
-                new_nodes.push(self.nodes[old_idx]);
+                old_to_new[h_idx] = Some(new_id);
+                new_to_old.push(h_idx);
+                new_nodes.push(src_nodes[h_idx]);
+            }
+        }
+
+        // 1c. Assign new_id in function-level subgraph order.
+        for &sg_id in &func_sgs {
+            let sg = &self.subgraphs[sg_id as usize];
+            let start = sg.node_range.0 .0 as usize;
+            let end = (sg.node_range.1 .0 as usize).min(total);
+
+            // Native live nodes (including nested subgraph nodes; skip hoisted).
+            for old_idx in start..end {
+                if !self.hoisted_node[old_idx] {
+                    let old_id = NodeId(old_idx as u32);
+                    if !dead.contains(&old_id) && !redirect.contains_key(&old_id) {
+                        // De-duplicate: if the node was already assigned in another
+                        // subgraph iteration (overlapping node_range), skip.
+                        if old_to_new[old_idx].is_none() {
+                            let new_id = NodeId(new_nodes.len() as u32);
+                            old_to_new[old_idx] = Some(new_id);
+                            new_to_old.push(old_idx);
+                            new_nodes.push(self.nodes[old_idx]);
+                        }
+                    }
+                }
+                // Branch-span boundary: flush that branch's hoisted nodes now —
+                // after its last native id, before whatever follows.
+                if let Some(q) = branch_hoisted.remove(&((old_idx + 1) as u32)) {
+                    flush_hoisted(&q, dead, redirect, &mut old_to_new, &mut new_to_old, &mut new_nodes, &self.nodes);
+                }
+            }
+            // Boundaries the id scan never crossed (a branch ending exactly at
+            // `end`, or a fully-skipped span): sweep remaining boundaries that
+            // fall inside this function's span, in order.
+            let mut boundaries: Vec<u32> = branch_hoisted.keys().copied().collect();
+            boundaries.sort_unstable();
+            for b in boundaries {
+                if (b as usize) <= end {
+                    if let Some(q) = branch_hoisted.remove(&b) {
+                        flush_hoisted(&q, dead, redirect, &mut old_to_new, &mut new_to_old, &mut new_nodes, &self.nodes);
+                    }
+                }
             }
 
-            // Hoisted live nodes (owner == sg_id). Use node_owner (resolved to
-            // function-level subgraph) instead of raw hoisted_owners, so hoisted
-            // nodes are placed after the function-level subgraph's native nodes.
+            // Hoisted live nodes (owner == this FUNCTION sg): still placed
+            // after the function's native nodes (LICM loop-preheader hoists).
             for old_idx in 0..total {
                 if !self.hoisted_node[old_idx] {
                     continue;
@@ -3727,6 +3800,15 @@ impl DataFlowGraph {
                 old_to_new[old_idx] = Some(new_id);
                 new_to_old.push(old_idx);
                 new_nodes.push(self.nodes[old_idx]);
+            }
+        }
+        // Leftover branch-hoisted nodes (boundary outside every function span —
+        // should not happen): place at the end for safety.
+        let mut keys: Vec<u32> = branch_hoisted.keys().copied().collect();
+        keys.sort_unstable();
+        for k in keys {
+            if let Some(q) = branch_hoisted.remove(&k) {
+                flush_hoisted(&q, dead, redirect, &mut old_to_new, &mut new_to_old, &mut new_nodes, &self.nodes);
             }
         }
 
@@ -4151,6 +4233,21 @@ impl DataFlowGraph {
                     }
                     self.sg_debug_names = new_names;
                 }
+                // sg_names (FROND_DUMP_IR / SF-trace sidecar, filled by
+                // fill_sg_names from func_subgraphs at build end) must follow
+                // the same compaction — skipping it left every name attached
+                // to whichever sg landed on the old index after any
+                // sg-removing pass (misleading dumps and name-keyed tracing).
+                if !self.sg_names.is_empty() {
+                    let mut new_names: Vec<String> = Vec::with_capacity(new_sgs.len());
+                    for (i, keep) in remove_sg.iter().enumerate() {
+                        if *keep {
+                            continue;
+                        }
+                        new_names.push(self.sg_names.get(i).cloned().unwrap_or_default());
+                    }
+                    self.sg_names = new_names;
+                }
                 self.subgraphs = new_sgs;
                 if let Some(e) = self.entry_subgraph {
                     self.entry_subgraph = Some(map_sg(e));
@@ -4312,6 +4409,19 @@ impl DataFlowGraph {
                     }
                 }
             }
+        }
+
+        // Hoist flags are single-rebuild routing state: once this rebuild has
+        // placed the hoisted nodes inside their owning sg's range, they are
+        // ordinary members of that range. Keeping the flags set made the NEXT
+        // rebuild's native scan skip them and re-route them through the flush
+        // machinery keyed at a (now moved) boundary — placement drifted every
+        // round (observed: wrapper ranges growing monotonically to the
+        // function end, collapsing the nesting tree and orphaning arm nodes).
+        // LICM/Inline re-mark their NEW hoists after this rebuild, before the
+        // next one.
+        for f in self.hoisted_node.iter_mut() {
+            *f = false;
         }
 
         old_to_new

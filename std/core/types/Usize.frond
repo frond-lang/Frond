@@ -1,22 +1,30 @@
 // Usize.frond — the usize type module (part of std.core.types)
 //
-// Boundary constants + decimal parse (platform width: 64-bit on all
-// supported targets). parse returns null on malformed input; accumulation
-// wraps on overflow by design.
+// Boundary constant + decimal parse. MAX comes from the C toolchain
+// (builtin __os_usize_max -> UINTPTR_MAX), so it follows the target
+// pointer width instead of a hardcoded 64-bit decimal. parse accepts an
+// optional leading '+' (the unsigned family rejects '-') and returns
+// Throw<_, ParseError>: Malformed on bad syntax, Overflow on values above
+// usize MAX — the same overflow-to-error contract as the float family
+// (F*.parse), never a silent wrap.
 
-pub val MAX: usize = 18446744073709551615
+pub val MAX: usize = __os_usize_max()
 
-pub fun parse(s: str): usize? {
+pub fun parse(s: str): Throw<usize, ParseError> {
     val b = s.bytes()
-    if b.len() == 0 { return null }
+    if b.len() == 0 { throw ParseError(Malformed, "empty input is not a usize literal", s) }
     var i = 0 as usize
-    if b[0] == (45 as u8) { return null }
-    var v: usize = 0
+    if b[0] == 43 { i = 1 as usize }
+    if b[0] == 45 { throw ParseError(Malformed, "negative input is not a usize literal", s) }
+    if i >= b.len() { throw ParseError(Malformed, "sign with no digits is not a usize literal", s) }
+    var v: u128 = 0
+    val limit: u128 = Usize.MAX as u128
     while i < b.len() {
-        val d = (b[i] as usize) - 48
-        if d < 0 || d > 9 { return null }
+        val d = (b[i] as u128) - 48
+        if d > 9 { throw ParseError(Malformed, "invalid digit in usize literal", s) }
+        if v > (limit - d) / 10 { throw ParseError(Overflow, "value out of range for usize", s) }
         v = v * 10 + d
         i = i + 1
     }
-    v
+    Ok(v as usize)
 }

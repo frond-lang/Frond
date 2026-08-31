@@ -1267,6 +1267,7 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
 
     let mut graph = DataFlowGraph {
         const_cache: Vec::new(),
+        sg_names: Vec::new(),
         sg_initial_pending: Vec::new(),
         sg_initial_seed: Vec::new(),
         downstream_counts: Vec::new(),
@@ -1672,6 +1673,7 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
 
     let mut graph = DataFlowGraph {
         const_cache: Vec::new(),
+        sg_names: Vec::new(),
         sg_initial_pending: Vec::new(),
         sg_initial_seed: Vec::new(),
         downstream_counts: Vec::new(),

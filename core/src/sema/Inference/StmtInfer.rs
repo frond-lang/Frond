@@ -166,7 +166,10 @@ impl<'a> InferContext<'a> {
                 None
             }
             Stmt::FieldAssignment { object, value, .. } => {
+                let saved_recv_pos = self.in_recv_position;
+                self.in_recv_position = true;
                 let _ = self.infer_expr(*object, ast, env, None);
+                self.in_recv_position = saved_recv_pos;
                 let _ = self.infer_expr(*value, ast, env, None);
                 None
             }
@@ -321,7 +324,7 @@ impl<'a> InferContext<'a> {
                                 .arena
                                 .type_name_concrete(resolved)
                                 .unwrap_or_else(|| "array".to_string()),
-                            _ => ct.name().to_string(),
+                            _ => ct.source_name().to_string(),
                         };
                         self.add_error_at(
                             &format!(

@@ -1,5 +1,9 @@
 # frondc — 自举 Stage 1(自托管编译器)
 
+> **计划源:[BOOTSTRAP_PLAN.md](BOOTSTRAP_PLAN.md)**(梯子/里程碑/验收/
+> Stage 2 裁决/风险)。本文只保留状态快照与操作备忘。
+
+
 用 Frond 写的 Frond 编译器。Stage 1 目标:`fronc check` —— 词法 + 语法 +
 全套 sema(含 monomorph),跑在 Rust 引擎上,与 Rust 编译器(`Frond/core`)
 差分对齐。不移植 ir/、engine/、pass/、solidify/(解释器路径专属,自举走
@@ -7,12 +11,37 @@ AST→LLVM 直下,见 Stage 2)。
 
 ## 里程碑状态
 
-- **1A 词法器:完成(2026-08-27)。** `src/Lex.frond`(忠实转写 Rust
-  Lexer,字节级状态机含全部怪癖:列按字节计/非 ASCII 特判/#{...}# 原始块/
-  插值嵌套串)。`frond run -- lex <file>` 输出与 `frond debug --stage
-  tokens` 逐字节一致。差分验收:`tests/scripts/diff_lex.sh`,语料
-  std+libs+frondc+tests+apps 共 406 文件全对齐。
-- 下一步 1B:语法器(AST 定义 + 递归下降),对 `debug --stage ast` 差分。
+- **1A 词法器:完成(2026-08-27)。** `src/Lex.frond`;`frond run -- lex <file>`
+  与 `frond debug --stage tokens` 逐字节一致;`tests/scripts/diff_lex.sh`
+  语料 408 文件全对齐。
+- **1B 语法器:完成(2026-08-28)。** AST 差分全量绿:
+  `tests/scripts/diff_ast.sh` 语料 411 文件 = 401 逐字节一致 +
+  10 负向文件双侧拒绝对齐(skip 计数;报错文案对齐是后续项)。
+  收尾三修:printer AdtD ctor 循环漏增量(死循环)/trailing 哨兵转换被
+  批量编辑冲掉(-1 落到 arena 兜底打出 void_lit)/隐式 this 参数
+  push 尾插应为 insert(0)(数组拼接修)。
+
+  `src/Ast.frond`(节点定义 + S 表达式 printer,~1500 行)+
+  `src/Parse.frond`(递归下降 + Pratt + 虚拟>拆分 + 三路回溯 + 插值
+  子解析,~2900 行)+ CLI `parse` 子命令。sema/IR 全部编译通过,
+  运行期输出为空模块——**阻塞点:大记录(Arena/Mod 组合)经方法
+  返回/Throw 传递后字段全空**(FieldError/arena=null;简单形态
+  Throw<Holder> 复现不出,需收窄:方法返回 + 嵌套 List 字段 +
+  多模块大文件的组合)。下一轮从 `run -- parse /tmp/mini.frond`
+  输出 `(module "" ...)` 处继续。
+- **本轮引擎修复(全部 89+62+408 回归)**:
+  1. pipeline 重排:std/dep 先 populate 再 predeclare(predeclare 时
+     构造器值绑定的字段类型不再解析成裸占位符;builtin 保持原序,
+     否则负向 for_in_nullable_elems 失守);
+  2. lookup_method_idx 上下文解析优先 + 新增按 type_id 的无歧义查找,
+     IR dispatch 以 type_id 优先(std 裸名劫持用户同名类型双向修复:
+     std.json.Parser 劫持 frondc Parser / 用户 List 遮蔽 std List);
+  3. compile_builtin_method_in 模块限定(同名类型跨模块只编 std 赢家、
+     用户方法体空占位引发运行期 panic);
+  4. 单构造器 ADT 注册顺序:ctor 条目先绑(跨模块裸构造曾拿到空字段
+     表,AdtValue 无名,字段读 FieldError);
+  5. Module.Ctor 限定零参构造器值(A.KOne 曾编译成 ModuleRef 上的
+     field_get,下游非穷尽 match panic)。
 
 ## 布局(为什么在 Frond/ 而不是 apps/)
 

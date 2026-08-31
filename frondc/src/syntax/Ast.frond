@@ -1,0 +1,1842 @@
+// Ast.frond — frondc 语法树 + canonical S 表达式 printer(Stage 1 / 1B)。
+//
+// 忠实转写 Frond/core/src/ast/Ast.rs:AstArena + NodeId(u32 → i64)的 DOD
+// 风格;节点为位置参数 ADT(Rust enum 的 struct 变体按字段序拍平)。
+// Printer 输出与 Rust `Ast::Printer`(debug --stage ast)逐字节一致:
+// 一节点一行 `(node field1 ...)`,嵌套缩进 2 空格,字符串带引号并
+// 转义 " \ \n \t \r 与 <0x20 控制字符(\u{x}),空表打 `(label ())`,
+// 缺失可选项打 `(none)`。
+//
+// 已知坍缩(输出等价):Call/MethodCall 的 type_args Option<Vec> 与
+// 空表在 Rust printer 下输出相同,统一为 i64[](None ≡ [])。
+
+import std.collections.List
+import std.core.types.Str
+
+// ── 基础 ──
+
+pub type Span = Span(pub line: i64, pub column: i64)
+
+pub type Vis = | Priv | Pub
+
+pub type Kind = | KStar | KArrow(Kind, Kind)
+
+// ── 表达式节点(位置 = Rust Expr 字段序)──
+
+pub type Ip = | IpLit(str) | IpExpr(i64)
+
+pub type LBody = | LBlock(i64) | LExpr(i64)
+
+pub type BOp =
+    | Add | Sub | Mul | Div | Mod | Eq | Neq | RefEq | RefNeq | Lt | Gt | LtEq
+    | GtEq | And | Or | BitAnd | BitOr | BitXor | Shl | Shr | ConcatList | Range
+    | RangeIncl | ElvisOp
+
+pub type UOp = | Not | Neg | BitNot
+
+pub type COp =
+    | AddA | SubA | MulA | DivA | ModA | BitAndA | BitOrA | BitXorA | ShlA | ShrA
+
+pub type ExprN =
+    | IntLit(str, str?)
+    | FloatLit(str, str?)
+    | BoolLit(bool)
+    | CharLit(i64)
+    | StrLit(str)
+    | StrInterp(Ip[])
+    | NullLit
+    | VoidLit
+    | Ident(str)
+    | AssignE(i64, i64)
+    | CompAssignE(COp, i64, i64)
+    | BinaryE(BOp, i64, i64)
+    | UnaryE(UOp, i64)
+    | AsCast(i64, i64)
+    | RefOfE(i64)
+    | DerefE(i64)
+    | CallE(i64, i64[], i64[])
+    | MethodCallE(i64, str, i64[], i64[])
+    | FieldAccessE(i64, str)
+    | IndexE(i64, i64)
+    | SliceE(i64, i64, i64, bool)
+    | SafeAccessE(i64, str)
+    | SafeMethodCallE(i64, str, i64[], i64[])
+    | PropagateE(i64)
+    | NonNullAssertE(i64)
+    | ElvisE(i64, i64)
+    | ArrayLitE(i64[], i64, i64, bool)
+    | RecordLitE(Rfe[])
+    | RecordExtendE(i64, Rfe[])
+    | LambdaE(Prm[], LBody, bool, i64?)
+    | IfE(i64, i64, i64?)
+    | BlockE(i64[], i64?)
+    | MatchE(i64, Marm[])
+    | AtomicE(i64)
+    | LazyE(i64)
+    | SelectE(SelArm[])
+    | InlineTraitE(Md[])
+
+// ArrayLitE(elements, fill_value, fill_count, has_fill):Option<(v, c)> 拍平。
+
+pub type Rfe = Rfe(pub name: str, pub value: i64)
+pub type Marm = Marm(pub pattern: i64, pub guard: i64?, pub body: i64)
+pub type SelArm = | SelRecv(i64, str?, i64) | SelTimeout(i64, i64)
+
+// ── 语句节点 ──
+
+pub type StmtN =
+    | ValDeclS(str, i64?, i64, Vis)
+    | VarDeclS(str, i64?, i64, Vis)
+    | AssignS(i64, i64)
+    | FieldAssignS(i64, str, i64)
+    | CompAssignS(i64, COp, i64)
+    | ExprS(i64)
+    | ReturnS(i64?)
+    | DeferS(i64)
+    | ThrowS(i64)
+    | BreakS
+    | ContinueS
+    | ForS(str, i64, i64)
+    | WhileS(i64, i64)
+    | LoopS(i64)
+    | LocalDeclS(Decl)
+
+// ── 类型节点 ──
+
+pub type Rft = Rft(pub name: str, pub ty: i64, pub is_pub: bool)
+
+pub type TypeN =
+    | TNamed(str)
+    | TThis
+    | TGeneric(str, i64[])
+    | TNullable(i64)
+    | TRef(i64)
+    | TRawPtr(i64)
+    | TFunction(i64[], i64)
+    | TRecord(Rft[])
+    | TArray(i64, i64?)
+    | TKindAnn(i64, Kind)
+
+// ── 模式节点 ──
+
+pub type Plit =
+    | PLInt(str) | PLFloat(str) | PLBool(bool) | PLChar(i64) | PLStr(str) | PLNull
+
+pub type Prf = Prf(pub name: str, pub pattern: i64)
+
+pub type PatN =
+    | PWild
+    | PLit(Plit)
+    | PVar(str)
+    | PCtor(str, i64[])
+    | PRecord(Prf[])
+    | POr(i64, i64)
+    | PGuard(i64, i64)
+
+// ── 声明节点 ──
+
+pub type Attr = Attr(pub name: str, pub args: str[])
+pub type Prm = Prm(pub name: str, pub ta: i64?)
+pub type Tp = Tp(pub name: str, pub kind: Kind?, pub bounds: Tb[])
+pub type Tb = Tb(pub trait_name: str, pub type_args: i64[])
+pub type Cfl = Cfl(pub name: str?, pub ty: i64, pub is_pub: bool)
+pub type Cd = Cd(pub name: str, pub fields: Cfl[], pub return_type: i64?)
+pub type Del = Del(pub trait_name: str, pub method_name: str)
+pub type Atd = Atd(pub name: str, pub kind: Kind?)
+pub type Ii = Ii(pub name: str, pub alias: str?)
+
+pub type Md = Md(pub name: str, pub tps: Tp[], pub params: Prm[], pub rt: i64?, pub body: i64?,
+    pub is_override: bool, pub delegate: Del?, pub vis: Vis, pub is_async: bool)
+
+pub type TypeD = | AdtD(Cd[]) | RecordD(Rft[]) | AliasD(i64) | NewtypeD(str, i64)
+
+pub type ItemsK = | NoItems | Items(Ii[])
+
+pub type Decl =
+    | FunDeclD(Vis, str, Tp[], Prm[], i64?, i64, bool, bool, Attr[], str?)
+    | TypeDeclD(Vis, str, Tp[], Tb[], Tb[], TypeD, Md[])
+    | TraitDeclD(Vis, str, Tp[], Tb[], Atd[], Md[])
+    | ImportDeclD(str[], ItemsK, Vis)
+    | PackDeclD(Vis, str)
+    | ExprDeclD(i64, i64?)
+
+pub type Sd = Sd(pub span: Span, pub decl: Decl)
+
+// ── AstArena(Module 内嵌)──
+
+pub type Se = Se(pub span: Span, pub node: ExprN)
+pub type Ss = Ss(pub span: Span, pub node: StmtN)
+pub type St = St(pub span: Span, pub node: TypeN)
+pub type Spn = Spn(pub span: Span, pub node: PatN)
+
+pub type AstArena = AstArena(pub exprs: List<Se>, pub stmts: List<Ss>, pub types: List<St>, pub patterns: List<Spn>) {
+    pub fun &alloc_expr(span: Span, node: ExprN): i64 {
+        val id = exprs.len() as i64
+        exprs.push(Se(span, node))
+        id
+    }
+    pub fun &alloc_stmt(span: Span, node: StmtN): i64 {
+        val id = stmts.len() as i64
+        stmts.push(Ss(span, node))
+        id
+    }
+    pub fun &alloc_type(span: Span, node: TypeN): i64 {
+        val id = types.len() as i64
+        types.push(St(span, node))
+        id
+    }
+    pub fun &alloc_pattern(span: Span, node: PatN): i64 {
+        val id = patterns.len() as i64
+        patterns.push(Spn(span, node))
+        id
+    }
+    pub fun expr(id: i64): Se { exprs.get(id as usize) ?? Se(Span(0, 0), VoidLit) }
+    pub fun stmt(id: i64): Ss { stmts.get(id as usize) ?? Ss(Span(0, 0), BreakS) }
+    pub fun ty(id: i64): St { types.get(id as usize) ?? St(Span(0, 0), TThis) }
+    pub fun pat(id: i64): Spn { patterns.get(id as usize) ?? Spn(Span(0, 0), PWild) }
+}
+
+pub fun new_arena(): AstArena {
+    AstArena(List.empty(), List.empty(), List.empty(), List.empty())
+}
+
+pub type ModuleAst = ModuleAst(pub name: str, pub source_path: str?, pub arena: AstArena, pub decls: Sd[])
+
+val CB_BS: u8 = 92 as u8
+val CB_DQ: u8 = 34 as u8
+val CB_N: u8 = 110 as u8
+val CB_T: u8 = 116 as u8
+val CB_R: u8 = 114 as u8
+val CB_U: u8 = 117 as u8
+val CB_LBR: u8 = 123 as u8
+val CB_RBR: u8 = 125 as u8
+val CB_SQ: u8 = 39 as u8
+
+// ── 运算符字符串(与 Rust binary_op_str 等对位)──
+
+fun bop_str(op: BOp): str {
+    match op {
+        Add => "add"
+        Sub => "sub"
+        Mul => "mul"
+        Div => "div"
+        Mod => "mod"
+        Eq => "eq"
+        Neq => "neq"
+        RefEq => "ref_eq"
+        RefNeq => "ref_neq"
+        Lt => "lt"
+        Gt => "gt"
+        LtEq => "lt_eq"
+        GtEq => "gt_eq"
+        And => "and"
+        Or => "or"
+        BitAnd => "bit_and"
+        BitOr => "bit_or"
+        BitXor => "bit_xor"
+        Shl => "shl"
+        Shr => "shr"
+        ConcatList => "concat_list"
+        Range => "range"
+        RangeIncl => "range_inclusive"
+        ElvisOp => "elvis"
+    }
+}
+
+fun uop_str(op: UOp): str {
+    match op {
+        Not => "not"
+        Neg => "neg"
+        BitNot => "bit_not"
+    }
+}
+
+fun cop_str(op: COp): str {
+    match op {
+        AddA => "add_assign"
+        SubA => "sub_assign"
+        MulA => "mul_assign"
+        DivA => "div_assign"
+        ModA => "mod_assign"
+        BitAndA => "bit_and_assign"
+        BitOrA => "bit_or_assign"
+        BitXorA => "bit_xor_assign"
+        ShlA => "shl_assign"
+        ShrA => "shr_assign"
+    }
+}
+
+fun bool_str(b: bool): str {
+    if b { "true" } else { "false" }
+}
+
+fun hex_digit(v: i64): str {
+    if v < 10 {
+        "{v}"
+    } else if v == 10 { "a" } else if v == 11 { "b" } else if v == 12 { "c" }
+    else if v == 13 { "d" } else if v == 14 { "e" } else { "f" }
+}
+
+// 小写十六进制(无填充),与 Rust {:x} 对位。
+fun hex_str(v: i64): str {
+    if v < 16 {
+        hex_digit(v)
+    } else {
+        hex_str(v / 16) + hex_digit(v % 16)
+    }
+}
+
+// escape_str:按字符走;ASCII 转义 " \ \n \t \r,<0x20 打 \u{x};
+// 非 ASCII 字节序列原样透传(其标量恒 >= 0x80,不进控制字符分支)。
+fun escape_str(s: str): str {
+    val b = s.bytes()
+    val out = List.empty()
+    var i: i64 = 0
+    val n = b.len() as i64
+    while i < n {
+        val c = b[i as usize]
+        if c == (34 as u8) {
+            out.push(CB_BS)
+            out.push(CB_DQ)
+            i = i + 1
+        } else if c == (92 as u8) {
+            out.push(CB_BS)
+            out.push(CB_BS)
+            i = i + 1
+        } else if c == (10 as u8) {
+            out.push(CB_BS)
+            out.push(CB_N)
+            i = i + 1
+        } else if c == (9 as u8) {
+            out.push(CB_BS)
+            out.push(CB_T)
+            i = i + 1
+        } else if c == (13 as u8) {
+            out.push(CB_BS)
+            out.push(CB_R)
+            i = i + 1
+        } else if c < (32 as u8) {
+            // \u{x}
+            out.push(CB_BS)
+            out.push(CB_U)
+            out.push(CB_LBR)
+            val hs = hex_str(c as i64)
+            val hb = hs.bytes()
+            var k: i64 = 0
+            while k < hb.len() as i64 {
+                out.push(hb[k as usize])
+                k = k + 1
+            }
+            out.push(CB_RBR)
+            i = i + 1
+        } else {
+            out.push(c)
+            i = i + 1
+        }
+    }
+    out.as_array() as str
+}
+
+// Rust str::escape_default 对位(C 体内文打印用):
+// 可打印 ASCII 直通;" \ ' 转义;\n \t \r 转义;其余(含非 ASCII 标量)打 \u{...}。
+fun escape_default_str(s: str): str {
+    val b = s.bytes()
+    val out = List.empty()
+    var i: i64 = 0
+    val n = b.len() as i64
+    while i < n {
+        val c = b[i as usize]
+        if c == (34 as u8) {
+            out.push(CB_BS)
+            out.push(CB_DQ)
+            i = i + 1
+        } else if c == (92 as u8) {
+            out.push(CB_BS)
+            out.push(CB_BS)
+            i = i + 1
+        } else if c == (39 as u8) {
+            out.push(CB_BS)
+            out.push(CB_SQ)
+            i = i + 1
+        } else if c == (10 as u8) {
+            out.push(CB_BS)
+            out.push(CB_N)
+            i = i + 1
+        } else if c == (9 as u8) {
+            out.push(CB_BS)
+            out.push(CB_T)
+            i = i + 1
+        } else if c == (13 as u8) {
+            out.push(CB_BS)
+            out.push(CB_R)
+            i = i + 1
+        } else if c >= (32 as u8) && c < (127 as u8) {
+            out.push(c)
+            i = i + 1
+        } else {
+            // ASCII 控制字符或非 ASCII:解出标量再打 \u{...}
+            var cp: i64 = 0
+            var len: i64 = 1
+            if c < (128 as u8) {
+                cp = c as i64
+            } else if c < (224 as u8) {
+                cp = (c as i64) - 192
+                len = 2
+            } else if c < (240 as u8) {
+                cp = (c as i64) - 224
+                len = 3
+            } else {
+                cp = (c as i64) - 240
+                len = 4
+            }
+            var k: i64 = 1
+            while k < len && i + k < n {
+                cp = cp * 64 + ((b[(i + k) as usize] as i64) - 128)
+                k = k + 1
+            }
+            out.push(CB_BS)
+            out.push(CB_U)
+            out.push(CB_LBR)
+            val hs = hex_str(cp)
+            val hb = hs.bytes()
+            var j: i64 = 0
+            while j < hb.len() as i64 {
+                out.push(hb[j as usize])
+                j = j + 1
+            }
+            out.push(CB_RBR)
+            i = i + len
+        }
+    }
+    out.as_array() as str
+}
+
+// ── Printer ──
+
+pub type Pr = Pr(pub buf: str, pub indent: i64, pub arena: AstArena ) {
+
+    fun &wl(text: str): void {
+        buf = buf + Str.repeat("  ", indent as i32) + text + "\n"
+    }
+    fun &ind(): void { indent = indent + 1 }
+    fun &ded(): void { if indent > 0 { indent = indent - 1 } }
+
+    fun &ve(id: i64): void { visit_expr(id) }
+    fun &vt(id: i64): void { visit_type(id) }
+    fun &vs(id: i64): void { visit_stmt(id) }
+    fun &vp(id: i64): void { visit_pattern(id) }
+
+    fun &expr_list(label: str, items: i64[]): void {
+        if items.len() == 0 {
+            wl("(" + label + " ())")
+            return
+        }
+        wl("(" + label)
+        ind()
+        var i: i64 = 0
+        while i < items.len() as i64 {
+            ve(items[i as usize])
+            i = i + 1
+        }
+        ded()
+        wl(")")
+    }
+
+    fun &type_list(label: str, items: i64[]): void {
+        if items.len() == 0 {
+            wl("(" + label + " ())")
+            return
+        }
+        wl("(" + label)
+        ind()
+        var i: i64 = 0
+        while i < items.len() as i64 {
+            vt(items[i as usize])
+            i = i + 1
+        }
+        ded()
+        wl(")")
+    }
+
+    fun &type_args_opt(args: i64[]): void {
+        if args.len() > 0 {
+            type_list("type_args", args)
+        } else {
+            wl("(type_args ())")
+        }
+    }
+
+    pub fun &print_module(m: ModuleAst): str {
+        wl("(module \"" + escape_str(m.name) + "\"")
+        ind()
+        match m.source_path {
+            null => {}
+            p => { wl("(source_path \"" + escape_str(p) + "\")") }
+        }
+        var i: i64 = 0
+        while i < m.decls.len() as i64 {
+            visit_decl(m.decls[i as usize])
+            i = i + 1
+        }
+        ded()
+        wl(")")
+        buf
+    }
+
+    fun &visit_decl(d: Sd): void {
+        match d.decl {
+            FunDeclD(vis, name, tps, params, rt, body, is_async, is_entry, attrs, extern_c) => {
+                wl("(fun_decl \"" + name + "\"")
+                ind()
+                var a: i64 = 0
+                while a < attrs.len() as i64 {
+                    val at = attrs[a as usize]
+                    if at.args.len() == 0 {
+                        wl("(attribute \"" + at.name + "\")")
+                    } else {
+                        var s: str = ""
+                        var k: i64 = 0
+                        while k < at.args.len() as i64 {
+                            if k > 0 { s = s + " " }
+                            s = s + "\"" + at.args[k as usize] + "\""
+                            k = k + 1
+                        }
+                        wl("(attribute \"" + at.name + "\" (args " + s + "))")
+                    }
+                    a = a + 1
+                }
+                print_vis(vis)
+                print_tps(tps)
+                print_prms(params)
+                print_rt(rt)
+                wl("(is_async " + bool_str(is_async) + ")(is_entry " + bool_str(is_entry) + ")")
+                wl("(body")
+                ind()
+                ve(body)
+                ded()
+                wl(")")
+                match extern_c {
+                    null => {}
+                    c => {
+                        wl("(extern_c_body")
+                        ind()
+                        wl("\"" + escape_default_str(c) + "\"")
+                        ded()
+                        wl(")")
+                    }
+                }
+                ded()
+                wl(")")
+            }
+            TypeDeclD(vis, name, tps, bases, itraits, def, methods) => {
+                wl("(type_decl \"" + name + "\"")
+                ind()
+                print_vis(vis)
+                print_tps(tps)
+                if bases.len() > 0 {
+                    wl("(base_types")
+                    ind()
+                    var b: i64 = 0
+                    while b < bases.len() as i64 {
+                        wl("\"" + bases[b as usize].trait_name + "\"")
+                        b = b + 1
+                    }
+                    ded()
+                    wl(")")
+                }
+                print_bounds(itraits)
+                visit_type_def(def)
+                print_mds(methods)
+                ded()
+                wl(")")
+            }
+            TraitDeclD(vis, name, tps, parents, assoc, methods) => {
+                wl("(trait_decl \"" + name + "\"")
+                ind()
+                print_vis(vis)
+                print_tps(tps)
+                print_bounds(parents)
+                print_assoc(assoc)
+                print_mds(methods)
+                ded()
+                wl(")")
+            }
+            ImportDeclD(path, items, vis) => {
+                var ps: str = ""
+                var i: i64 = 0
+                while i < path.len() as i64 {
+                    if i > 0 { ps = ps + "." }
+                    ps = ps + path[i as usize]
+                    i = i + 1
+                }
+                wl("(import_decl \"" + ps + "\"")
+                ind()
+                print_vis(vis)
+                match items {
+                    NoItems => { wl("(items (none))") }
+                    Items(list) => {
+                        wl("(items")
+                        ind()
+                        var k: i64 = 0
+                        while k < list.len() as i64 {
+                            val it = list[k as usize]
+                            match it.alias {
+                                null => { wl("(item \"" + it.name + "\")") }
+                                al => { wl("(item \"" + it.name + "\" (alias \"" + al + "\"))") }
+                            }
+                            k = k + 1
+                        }
+                        ded()
+                        wl(")")
+                    }
+                }
+                ded()
+                wl(")")
+            }
+            PackDeclD(vis, name) => {
+                wl("(pack_decl \"" + name + "\"")
+                ind()
+                print_vis(vis)
+                ded()
+                wl(")")
+            }
+            ExprDeclD(expr, stmt) => {
+                wl("(expr_decl")
+                ind()
+                ve(expr)
+                match stmt {
+                    null => { wl("(stmt (none))") }
+                    s => {
+                        wl("(stmt")
+                        ind()
+                        vs(s)
+                        ded()
+                        wl(")")
+                    }
+                }
+                ded()
+                wl(")")
+            }
+        }
+    }
+
+    fun &visit_type_def(def: TypeD): void {
+        match def {
+            AdtD(ctors) => {
+                wl("(adt")
+                ind()
+                var i: i64 = 0
+                while i < ctors.len() as i64 {
+                    val c = ctors[i as usize]
+                    wl("(constructor \"" + c.name + "\"")
+                    ind()
+                    if c.fields.len() == 0 {
+                        wl("(fields ())")
+                    } else {
+                        wl("(fields")
+                        ind()
+                        var k: i64 = 0
+                        while k < c.fields.len() as i64 {
+                            val f = c.fields[k as usize]
+                            match f.name {
+                                null => {
+                                    wl("(positional_field")
+                                    ind()
+                                    vt(f.ty)
+                                    ded()
+                                    wl(")")
+                                }
+                                fname => {
+                                    wl("(field \"" + fname + "\"")
+                                    ind()
+                                    vt(f.ty)
+                                    ded()
+                                    wl(")")
+                                }
+                            }
+                            k = k + 1
+                        }
+                        ded()
+                        wl(")")
+                    }
+                    match c.return_type {
+                        null => { wl("(return_type (none))") }
+                        rt => {
+                            wl("(return_type")
+                            ind()
+                            vt(rt)
+                            ded()
+                            wl(")")
+                        }
+                    }
+                    ded()
+                    wl(")")
+                    i = i + 1
+                }
+                ded()
+                wl(")")
+            }
+            RecordD(fields) => {
+                    wl("(record")
+                ind()
+                if fields.len() == 0 {
+                    wl("(fields ())")
+                } else {
+                    wl("(fields")
+                    ind()
+                    var k: i64 = 0
+                    while k < fields.len() as i64 {
+                        val f = fields[k as usize]
+                        wl("(field \"" + f.name + "\"")
+                        ind()
+                        vt(f.ty)
+                        ded()
+                        wl(")")
+                        k = k + 1
+                    }
+                    ded()
+                    wl(")")
+                }
+                ded()
+                wl(")")
+            }
+            AliasD(target) => {
+                wl("(alias")
+                ind()
+                vt(target)
+                ded()
+                wl(")")
+            }
+            NewtypeD(name, inner) => {
+                wl("(newtype \"" + name + "\"")
+                ind()
+                vt(inner)
+                ded()
+                wl(")")
+            }
+        }
+    }
+
+    fun &visit_type(id: i64): void {
+        match arena.ty(id).node {
+            TNamed(name) => { wl("(type_named \"" + name + "\")") }
+            TThis => { wl("(type_self)") }
+            TGeneric(name, args) => {
+                wl("(type_generic \"" + name + "\"")
+                ind()
+                type_list("type_args", args)
+                ded()
+                wl(")")
+            }
+            TNullable(inner) => {
+                wl("(type_nullable")
+                ind()
+                vt(inner)
+                ded()
+                wl(")")
+            }
+            TRef(inner) => {
+                wl("(type_ref")
+                ind()
+                vt(inner)
+                ded()
+                wl(")")
+            }
+            TRawPtr(inner) => {
+                wl("(type_raw_ptr")
+                ind()
+                vt(inner)
+                ded()
+                wl(")")
+            }
+            TFunction(params, rt) => {
+                wl("(type_function")
+                ind()
+                type_list("params", params)
+                wl("(return_type")
+                ind()
+                vt(rt)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            TRecord(fields) => {
+                wl("(type_record")
+                ind()
+                if fields.len() == 0 {
+                    wl("(fields ())")
+                } else {
+                    wl("(fields")
+                    ind()
+                    var k: i64 = 0
+                    while k < fields.len() as i64 {
+                        val f = fields[k as usize]
+                        wl("(field \"" + f.name + "\"")
+                        ind()
+                        vt(f.ty)
+                        ded()
+                        wl(")")
+                        k = k + 1
+                    }
+                    ded()
+                    wl(")")
+                }
+                ded()
+                wl(")")
+            }
+            TArray(elem, size) => {
+                wl("(type_array")
+                ind()
+                wl("(element_type")
+                ind()
+                vt(elem)
+                ded()
+                wl(")")
+                match size {
+                    null => { wl("(size (none))") }
+                    s => { wl("(size " + "{s}" + ")") }
+                }
+                ded()
+                wl(")")
+            }
+            TKindAnn(inner, kind) => {
+                wl("(type_kind_annotated")
+                ind()
+                vt(inner)
+                wl("(kind")
+                ind()
+                visit_kind(kind)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+        }
+    }
+
+    fun &visit_kind(kind: Kind): void {
+        match kind {
+            KStar => { wl("(kind_star)") }
+            KArrow(p, r) => {
+                wl("(kind_arrow")
+                ind()
+                wl("(param")
+                ind()
+                visit_kind(p)
+                ded()
+                wl(")")
+                wl("(result")
+                ind()
+                visit_kind(r)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+        }
+    }
+
+    fun &visit_expr(id: i64): void {
+        match arena.expr(id).node {
+            IntLit(raw, suffix) => {
+                match suffix {
+                    null => { wl("(int_lit \"" + raw + "\" (suffix (none)))") }
+                    s => { wl("(int_lit \"" + raw + "\" (suffix \"" + s + "\"))") }
+                }
+            }
+            FloatLit(raw, suffix) => {
+                match suffix {
+                    null => { wl("(float_lit \"" + raw + "\" (suffix (none)))") }
+                    s => { wl("(float_lit \"" + raw + "\" (suffix \"" + s + "\"))") }
+                }
+            }
+            BoolLit(b) => { wl("(bool_lit " + bool_str(b) + ")") }
+            CharLit(c) => { wl("(char_lit " + "{c}" + ")") }
+            StrLit(s) => { wl("(str_lit \"" + escape_str(s) + "\")") }
+            StrInterp(parts) => {
+                wl("(str_interp")
+                ind()
+                var i: i64 = 0
+                while i < parts.len() as i64 {
+                    match parts[i as usize] {
+                        IpLit(text) => { wl("(literal \"" + escape_str(text) + "\")") }
+                        IpExpr(e) => {
+                            wl("(expression")
+                            ind()
+                            ve(e)
+                            ded()
+                            wl(")")
+                        }
+                    }
+                    i = i + 1
+                }
+                ded()
+                wl(")")
+            }
+            NullLit => { wl("(null_lit)") }
+            VoidLit => { wl("(void_lit)") }
+            Ident(name) => { wl("(ident \"" + name + "\")") }
+            AssignE(target, value) => {
+                wl("(assign")
+                ind()
+                wl("(target")
+                ind()
+                ve(target)
+                ded()
+                wl(")")
+                wl("(value")
+                ind()
+                ve(value)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            CompAssignE(op, target, value) => {
+                wl("(compound_assign")
+                ind()
+                wl("(op " + cop_str(op) + ")")
+                wl("(target")
+                ind()
+                ve(target)
+                ded()
+                wl(")")
+                wl("(value")
+                ind()
+                ve(value)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            BinaryE(op, lhs, rhs) => {
+                wl("(binary")
+                ind()
+                wl("(op " + bop_str(op) + ")")
+                wl("(lhs")
+                ind()
+                ve(lhs)
+                ded()
+                wl(")")
+                wl("(rhs")
+                ind()
+                ve(rhs)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            UnaryE(op, operand) => {
+                wl("(unary")
+                ind()
+                wl("(op " + uop_str(op) + ")")
+                wl("(operand")
+                ind()
+                ve(operand)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            AsCast(expr, target) => {
+                wl("(as")
+                ind()
+                ve(expr)
+                wl("(target")
+                ind()
+                vt(target)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            RefOfE(inner) => {
+                wl("(ref_of")
+                ind()
+                ve(inner)
+                ded()
+                wl(")")
+            }
+            DerefE(inner) => {
+                wl("(deref")
+                ind()
+                ve(inner)
+                ded()
+                wl(")")
+            }
+            CallE(callee, args, type_args) => {
+                wl("(call")
+                ind()
+                wl("(callee")
+                ind()
+                ve(callee)
+                ded()
+                wl(")")
+                type_args_opt(type_args)
+                expr_list("args", args)
+                ded()
+                wl(")")
+            }
+            MethodCallE(recv, method, args, type_args) => {
+                wl("(method_call \"" + method + "\"")
+                ind()
+                wl("(recv")
+                ind()
+                ve(recv)
+                ded()
+                wl(")")
+                type_args_opt(type_args)
+                expr_list("args", args)
+                ded()
+                wl(")")
+            }
+            FieldAccessE(recv, field) => {
+                wl("(field_access \"" + field + "\"")
+                ind()
+                ve(recv)
+                ded()
+                wl(")")
+            }
+            IndexE(recv, index) => {
+                wl("(index")
+                ind()
+                wl("(recv")
+                ind()
+                ve(recv)
+                ded()
+                wl(")")
+                wl("(index")
+                ind()
+                ve(index)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            SliceE(recv, start, end, inclusive) => {
+                wl("(slice (inclusive " + bool_str(inclusive) + ")")
+                ind()
+                wl("(recv")
+                ind()
+                ve(recv)
+                ded()
+                wl(")")
+                wl("(start")
+                ind()
+                ve(start)
+                ded()
+                wl(")")
+                wl("(end")
+                ind()
+                ve(end)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            SafeAccessE(recv, field) => {
+                wl("(safe_access \"" + field + "\"")
+                ind()
+                ve(recv)
+                ded()
+                wl(")")
+            }
+            SafeMethodCallE(recv, method, args, type_args) => {
+                wl("(safe_method_call \"" + method + "\"")
+                ind()
+                wl("(recv")
+                ind()
+                ve(recv)
+                ded()
+                wl(")")
+                type_args_opt(type_args)
+                expr_list("args", args)
+                ded()
+                wl(")")
+            }
+            PropagateE(inner) => {
+                wl("(propagate")
+                ind()
+                ve(inner)
+                ded()
+                wl(")")
+            }
+            NonNullAssertE(inner) => {
+                wl("(non_null_assert")
+                ind()
+                ve(inner)
+                ded()
+                wl(")")
+            }
+            ElvisE(lhs, rhs) => {
+                wl("(elvis")
+                ind()
+                wl("(lhs")
+                ind()
+                ve(lhs)
+                ded()
+                wl(")")
+                wl("(rhs")
+                ind()
+                ve(rhs)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            ArrayLitE(elements, fv, fc, has_fill) => {
+                wl("(array_lit")
+                ind()
+                expr_list("elements", elements)
+                if has_fill {
+                    wl("(fill")
+                    ind()
+                    wl("(value")
+                    ind()
+                    ve(fv)
+                    ded()
+                    wl(")")
+                    wl("(count")
+                    ind()
+                    ve(fc)
+                    ded()
+                    wl(")")
+                    ded()
+                    wl(")")
+                } else {
+                    wl("(fill (none))")
+                }
+                ded()
+                wl(")")
+            }
+            RecordLitE(fields) => {
+                wl("(record_lit")
+                ind()
+                if fields.len() == 0 {
+                    wl("(fields ())")
+                } else {
+                    wl("(fields")
+                    ind()
+                    var k: i64 = 0
+                    while k < fields.len() as i64 {
+                        val f = fields[k as usize]
+                        wl("(field \"" + f.name + "\"")
+                        ind()
+                        ve(f.value)
+                        ded()
+                        wl(")")
+                        k = k + 1
+                    }
+                    ded()
+                    wl(")")
+                }
+                ded()
+                wl(")")
+            }
+            RecordExtendE(base, updates) => {
+                wl("(record_extend")
+                ind()
+                wl("(base")
+                ind()
+                ve(base)
+                ded()
+                wl(")")
+                if updates.len() == 0 {
+                    wl("(updates ())")
+                } else {
+                    wl("(updates")
+                    ind()
+                    var k: i64 = 0
+                    while k < updates.len() as i64 {
+                        val f = updates[k as usize]
+                        wl("(field \"" + f.name + "\"")
+                        ind()
+                        ve(f.value)
+                        ded()
+                        wl(")")
+                        k = k + 1
+                    }
+                    ded()
+                    wl(")")
+                }
+                ded()
+                wl(")")
+            }
+            LambdaE(params, body, is_async, rt) => {
+                wl("(lambda (is_async " + bool_str(is_async) + ")")
+                ind()
+                print_prms(params)
+                print_rt(rt)
+                match body {
+                    LBlock(b) => {
+                        wl("(body_block")
+                        ind()
+                        ve(b)
+                        ded()
+                        wl(")")
+                    }
+                    LExpr(b) => {
+                        wl("(body_expr")
+                        ind()
+                        ve(b)
+                        ded()
+                        wl(")")
+                    }
+                }
+                ded()
+                wl(")")
+            }
+            IfE(cond, then_b, else_b) => {
+                wl("(if")
+                ind()
+                wl("(cond")
+                ind()
+                ve(cond)
+                ded()
+                wl(")")
+                wl("(then")
+                ind()
+                ve(then_b)
+                ded()
+                wl(")")
+                match else_b {
+                    null => { wl("(else (none))") }
+                    e => {
+                        wl("(else")
+                        ind()
+                        ve(e)
+                        ded()
+                        wl(")")
+                    }
+                }
+                ded()
+                wl(")")
+            }
+            BlockE(stmts, trailing) => {
+                wl("(block")
+                ind()
+                if stmts.len() == 0 {
+                    wl("(stmts ())")
+                } else {
+                    wl("(stmts")
+                    ind()
+                    var k: i64 = 0
+                    while k < stmts.len() as i64 {
+                        vs(stmts[k as usize])
+                        k = k + 1
+                    }
+                    ded()
+                    wl(")")
+                }
+                match trailing {
+                    null => { wl("(trailing (none))") }
+                    e => {
+                        wl("(trailing")
+                        ind()
+                        ve(e)
+                        ded()
+                        wl(")")
+                    }
+                }
+                ded()
+                wl(")")
+            }
+            MatchE(scrutinee, arms) => {
+                wl("(match")
+                ind()
+                wl("(scrutinee")
+                ind()
+                ve(scrutinee)
+                ded()
+                wl(")")
+                if arms.len() == 0 {
+                    wl("(arms ())")
+                } else {
+                    wl("(arms")
+                    ind()
+                    var k: i64 = 0
+                    while k < arms.len() as i64 {
+                        val arm = arms[k as usize]
+                        wl("(arm")
+                        ind()
+                        wl("(pattern")
+                        ind()
+                        vp(arm.pattern)
+                        ded()
+                        wl(")")
+                        match arm.guard {
+                            null => { wl("(guard (none))") }
+                            g => {
+                                wl("(guard")
+                                ind()
+                                ve(g)
+                                ded()
+                                wl(")")
+                            }
+                        }
+                        wl("(body")
+                        ind()
+                        ve(arm.body)
+                        ded()
+                        wl(")")
+                        ded()
+                        wl(")")
+                        k = k + 1
+                    }
+                    ded()
+                    wl(")")
+                }
+                ded()
+                wl(")")
+            }
+            AtomicE(inner) => {
+                wl("(atomic")
+                ind()
+                ve(inner)
+                ded()
+                wl(")")
+            }
+            LazyE(inner) => {
+                wl("(lazy")
+                ind()
+                ve(inner)
+                ded()
+                wl(")")
+            }
+            SelectE(arms) => {
+                wl("(select")
+                ind()
+                if arms.len() == 0 {
+                    wl("(arms ())")
+                } else {
+                    wl("(arms")
+                    ind()
+                    var k: i64 = 0
+                    while k < arms.len() as i64 {
+                        match arms[k as usize] {
+                            SelRecv(ch, binding, body) => {
+                                wl("(receive")
+                                ind()
+                                wl("(channel")
+                                ind()
+                                ve(ch)
+                                ded()
+                                wl(")")
+                                match binding {
+                                    null => { wl("(binding (none))") }
+                                    b => { wl("(binding \"" + b + "\")") }
+                                }
+                                wl("(body")
+                                ind()
+                                ve(body)
+                                ded()
+                                wl(")")
+                                ded()
+                                wl(")")
+                            }
+                            SelTimeout(duration, body) => {
+                                wl("(timeout")
+                                ind()
+                                wl("(duration")
+                                ind()
+                                ve(duration)
+                                ded()
+                                wl(")")
+                                wl("(body")
+                                ind()
+                                ve(body)
+                                ded()
+                                wl(")")
+                                ded()
+                                wl(")")
+                            }
+                        }
+                        k = k + 1
+                    }
+                    ded()
+                    wl(")")
+                }
+                ded()
+                wl(")")
+            }
+            InlineTraitE(methods) => {
+                wl("(inline_trait")
+                ind()
+                print_mds(methods)
+                ded()
+                wl(")")
+            }
+        }
+    }
+
+    fun &visit_stmt(id: i64): void {
+        match arena.stmt(id).node {
+            ValDeclS(name, ta, value, vis) => {
+                wl("(val_decl \"" + name + "\"")
+                ind()
+                print_vis(vis)
+                match ta {
+                    null => { wl("(type (none))") }
+                    t => {
+                        wl("(type")
+                        ind()
+                        vt(t)
+                        ded()
+                        wl(")")
+                    }
+                }
+                wl("(value")
+                ind()
+                ve(value)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            VarDeclS(name, ta, value, vis) => {
+                wl("(var_decl \"" + name + "\"")
+                ind()
+                print_vis(vis)
+                match ta {
+                    null => { wl("(type (none))") }
+                    t => {
+                        wl("(type")
+                        ind()
+                        vt(t)
+                        ded()
+                        wl(")")
+                    }
+                }
+                wl("(value")
+                ind()
+                ve(value)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            AssignS(target, value) => {
+                wl("(assignment")
+                ind()
+                wl("(target")
+                ind()
+                ve(target)
+                ded()
+                wl(")")
+                wl("(value")
+                ind()
+                ve(value)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            FieldAssignS(object, field, value) => {
+                wl("(field_assignment \"" + field + "\"")
+                ind()
+                wl("(object")
+                ind()
+                ve(object)
+                ded()
+                wl(")")
+                wl("(value")
+                ind()
+                ve(value)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            CompAssignS(target, op, value) => {
+                wl("(compound_assignment")
+                ind()
+                wl("(op " + cop_str(op) + ")")
+                wl("(target")
+                ind()
+                ve(target)
+                ded()
+                wl(")")
+                wl("(value")
+                ind()
+                ve(value)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            ExprS(expr) => {
+                wl("(expression_stmt")
+                ind()
+                ve(expr)
+                ded()
+                wl(")")
+            }
+            ReturnS(value) => {
+                match value {
+                    null => { wl("(return (none))") }
+                    e => {
+                        wl("(return")
+                        ind()
+                        ve(e)
+                        ded()
+                        wl(")")
+                    }
+                }
+            }
+            DeferS(expr) => {
+                wl("(defer")
+                ind()
+                ve(expr)
+                ded()
+                wl(")")
+            }
+            ThrowS(expr) => {
+                wl("(throw")
+                ind()
+                ve(expr)
+                ded()
+                wl(")")
+            }
+            BreakS => { wl("(break)") }
+            ContinueS => { wl("(continue)") }
+            ForS(name, iterable, body) => {
+                wl("(for \"" + name + "\"")
+                ind()
+                wl("(iterable")
+                ind()
+                ve(iterable)
+                ded()
+                wl(")")
+                wl("(body")
+                ind()
+                ve(body)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            WhileS(condition, body) => {
+                wl("(while")
+                ind()
+                wl("(cond")
+                ind()
+                ve(condition)
+                ded()
+                wl(")")
+                wl("(body")
+                ind()
+                ve(body)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            LoopS(body) => {
+                wl("(loop")
+                ind()
+                wl("(body")
+                ind()
+                ve(body)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            LocalDeclS(decl) => {
+                wl("(local-decl")
+                ind()
+                match decl {
+                    FunDeclD(_, name, _, _, _, body, _, _, _, _) => {
+                        wl("(fun " + name + ")")
+                        ve(body)
+                    }
+                    TypeDeclD(_, name, _, _, _, _, _) => {
+                        wl("(type " + name + ")")
+                    }
+                    TraitDeclD(_, name, _, _, _, _) => {
+                        wl("(trait " + name + ")")
+                    }
+                    _ => { wl("(unknown)") }
+                }
+                ded()
+                wl(")")
+            }
+        }
+    }
+
+    fun &visit_pattern(id: i64): void {
+        match arena.pat(id).node {
+            PWild => { wl("(wildcard)") }
+            PLit(lit) => {
+                wl("(pattern_literal")
+                ind()
+                match lit {
+                    PLInt(s) => { wl("(int \"" + s + "\")") }
+                    PLFloat(s) => { wl("(float \"" + s + "\")") }
+                    PLBool(b) => { wl("(bool " + bool_str(b) + ")") }
+                    PLChar(c) => { wl("(char " + "{c}" + ")") }
+                    PLStr(s) => { wl("(string \"" + escape_str(s) + "\")") }
+                    PLNull => { wl("(null)") }
+                }
+                ded()
+                wl(")")
+            }
+            PVar(name) => { wl("(pattern_var \"" + name + "\")") }
+            PCtor(name, pats) => {
+                wl("(pattern_constructor \"" + name + "\"")
+                ind()
+                if pats.len() == 0 {
+                    wl("(patterns ())")
+                } else {
+                    wl("(patterns")
+                    ind()
+                    var k: i64 = 0
+                    while k < pats.len() as i64 {
+                        vp(pats[k as usize])
+                        k = k + 1
+                    }
+                    ded()
+                    wl(")")
+                }
+                ded()
+                wl(")")
+            }
+            PRecord(fields) => {
+                wl("(pattern_record")
+                ind()
+                if fields.len() == 0 {
+                    wl("(fields ())")
+                } else {
+                    wl("(fields")
+                    ind()
+                    var k: i64 = 0
+                    while k < fields.len() as i64 {
+                        val f = fields[k as usize]
+                        wl("(field \"" + f.name + "\"")
+                        ind()
+                        vp(f.pattern)
+                        ded()
+                        wl(")")
+                        k = k + 1
+                    }
+                    ded()
+                    wl(")")
+                }
+                ded()
+                wl(")")
+            }
+            POr(left, right) => {
+                wl("(or_pattern")
+                ind()
+                wl("(left")
+                ind()
+                vp(left)
+                ded()
+                wl(")")
+                wl("(right")
+                ind()
+                vp(right)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+            PGuard(pattern, condition) => {
+                wl("(guard_pattern")
+                ind()
+                wl("(pattern")
+                ind()
+                vp(pattern)
+                ded()
+                wl(")")
+                wl("(condition")
+                ind()
+                ve(condition)
+                ded()
+                wl(")")
+                ded()
+                wl(")")
+            }
+        }
+    }
+
+    fun &print_mds(methods: Md[]): void {
+        if methods.len() == 0 {
+            wl("(methods ())")
+            return
+        }
+        wl("(methods")
+        ind()
+        var i: i64 = 0
+        while i < methods.len() as i64 {
+            print_md(methods[i as usize])
+            i = i + 1
+        }
+        ded()
+        wl(")")
+    }
+
+    fun &print_md(m: Md): void {
+        wl("(method \"" + m.name + "\"")
+        ind()
+        print_vis(m.vis)
+        wl("(is_async " + bool_str(m.is_async) + ")(is_override " + bool_str(m.is_override) + ")")
+        print_tps(m.tps)
+        print_prms(m.params)
+        print_rt(m.rt)
+        match m.delegate {
+            null => { wl("(delegate (none))") }
+            d => { wl("(delegate (trait \"" + d.trait_name + "\") (method \"" + d.method_name + "\"))") }
+        }
+        match m.body {
+            null => { wl("(body (none))") }
+            b => {
+                wl("(body")
+                ind()
+                ve(b)
+                ded()
+                wl(")")
+            }
+        }
+        ded()
+        wl(")")
+    }
+
+    fun &print_assoc(assoc: Atd[]): void {
+        if assoc.len() == 0 {
+            wl("(associated_types ())")
+            return
+        }
+        wl("(associated_types")
+        ind()
+        var i: i64 = 0
+        while i < assoc.len() as i64 {
+            val a = assoc[i as usize]
+            wl("(associated_type \"" + a.name + "\"")
+            ind()
+            match a.kind {
+                null => { wl("(kind (none))") }
+                k => {
+                    wl("(kind")
+                    ind()
+                    visit_kind(k)
+                    ded()
+                    wl(")")
+                }
+            }
+            ded()
+            wl(")")
+            i = i + 1
+        }
+        ded()
+        wl(")")
+    }
+
+    fun &print_vis(vis: Vis): void {
+        match vis {
+            Priv => { wl("(visibility private)") }
+            Pub => { wl("(visibility public)") }
+        }
+    }
+
+    fun &print_tps(params: Tp[]): void {
+        if params.len() == 0 {
+            wl("(type_params ())")
+            return
+        }
+        wl("(type_params")
+        ind()
+        var i: i64 = 0
+        while i < params.len() as i64 {
+            val tp = params[i as usize]
+            wl("(type_param \"" + tp.name + "\"")
+            ind()
+            match tp.kind {
+                null => { wl("(kind (none))") }
+                k => {
+                    wl("(kind")
+                    ind()
+                    visit_kind(k)
+                    ded()
+                    wl(")")
+                }
+            }
+            print_bounds(tp.bounds)
+            ded()
+            wl(")")
+            i = i + 1
+        }
+        ded()
+        wl(")")
+    }
+
+    fun &print_prms(params: Prm[]): void {
+        if params.len() == 0 {
+            wl("(params ())")
+            return
+        }
+        wl("(params")
+        ind()
+        var i: i64 = 0
+        while i < params.len() as i64 {
+            val p = params[i as usize]
+            wl("(param \"" + p.name + "\"")
+            ind()
+            match p.ta {
+                null => { wl("(type (none))") }
+                t => {
+                    wl("(type")
+                    ind()
+                    vt(t)
+                    ded()
+                    wl(")")
+                }
+            }
+            ded()
+            wl(")")
+            i = i + 1
+        }
+        ded()
+        wl(")")
+    }
+
+    fun &print_bounds(bounds: Tb[]): void {
+        if bounds.len() == 0 {
+            wl("(bounds ())")
+            return
+        }
+        wl("(bounds")
+        ind()
+        var i: i64 = 0
+        while i < bounds.len() as i64 {
+            val b = bounds[i as usize]
+            wl("(trait_bound \"" + b.trait_name + "\"")
+            ind()
+            type_list("type_args", b.type_args)
+            ded()
+            wl(")")
+            i = i + 1
+        }
+        ded()
+        wl(")")
+    }
+
+    fun &print_rt(rt: i64?): void {
+        match rt {
+            null => { wl("(return_type (none))") }
+            t => {
+                wl("(return_type")
+                ind()
+                vt(t)
+                ded()
+                wl(")")
+            }
+        }
+    }
+}
+
+pub fun print_module(m: ModuleAst): str {
+    val p = Pr("", 0, m.arena)
+    p.print_module(m)
+}

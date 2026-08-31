@@ -232,9 +232,46 @@ impl<'a> IrBuilder<'a> {
         sg_id
     }
 
+    /// Short description of a match's arm patterns (panic-fallback label).
+    fn match_arms_label(&self, arms: &[crate::ast::Ast::MatchArm]) -> String {
+        let arena = &self.current_module().arena;
+        let module = &self.current_module().name;
+        let parts: Vec<String> = arms
+            .iter()
+            .map(|a| self.pattern_desc(a.pattern, arena))
+            .collect();
+        format!("{}: match arms [{}]", module, parts.join(" | "))
+    }
+
+    fn pattern_desc(
+        &self,
+        pat: crate::ast::Ast::PatternId,
+        arena: &crate::ast::Ast::AstArena<'_>,
+    ) -> String {
+        use crate::ast::Ast::Pattern as P;
+        match &arena.pattern(pat).node {
+            P::Wildcard => "_".into(),
+            P::Variable { name } => (*name).into(),
+            P::Literal(_) => "<lit>".into(),
+            P::Constructor { name, .. } => (*name).into(),
+            P::Record { .. } => "{..}".into(),
+            P::OrPattern { left, right } => {
+                format!("{}|{}", self.pattern_desc(*left, arena), self.pattern_desc(*right, arena))
+            }
+            P::Guard { pattern, .. } => format!("{} if", self.pattern_desc(*pattern, arena)),
+        }
+    }
+
     /// Compile a panic subgraph (used as match fallback when no arm matches).
     /// The single node uses CF_MATCH_FALLBACK which panics at runtime.
     pub(super) fn compile_panic_subgraph(&mut self) -> SubGraphId {
+        self.compile_panic_subgraph_labeled(String::new())
+    }
+
+    /// `compile_panic_subgraph` with a match-arm label: carried on the panic
+    /// node via `pattern_ctor_names` and printed by `compute_match_fallback`
+    /// — identifies WHICH source match tripped at runtime.
+    pub(super) fn compile_panic_subgraph_labeled(&mut self, label: String) -> SubGraphId {
         let inputs_offset = self.graph.inputs_pool.push(&[]);
         let node = self.graph.add_node(Node {
             kind: NodeKind::BinOp,
@@ -242,6 +279,9 @@ impl<'a> IrBuilder<'a> {
             inputs_offset,
             compute_fn: CF_MATCH_FALLBACK,
         });
+        if !label.is_empty() {
+            self.graph.set_pattern_ctor_name(node, label);
+        }
         let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
         self.graph.add_subgraph(SubGraph {
             converter_generated: false,
@@ -381,7 +421,7 @@ impl<'a> IrBuilder<'a> {
             // If there is no else (non-exhaustive match), use a panic subgraph as runtime safety net.
             let (false_sg, false_inputs) = match pending_else_sg {
                 Some(else_sg) => (else_sg, vec![ad.scrutinee_in_frame]),
-                None => (self.compile_panic_subgraph(), Vec::new()),
+                None => (self.compile_panic_subgraph_labeled(self.match_arms_label(arms)), Vec::new()),
             };
 
             // The Gate depends on pattern_node (the condition value) and the effect before this arm was compiled (prior side effects).
@@ -465,7 +505,7 @@ impl<'a> IrBuilder<'a> {
             crate::ast::Ast::Pattern::Variable { name } => {
                 // Nullary ADT constructors (e.g. JNull, Nil) cannot be distinguished from variables at parse time;
                 // disambiguate via sema's ctor_def_index: if it is a known constructor, compile as Constructor
-                if self.sema.ctor_def_index.contains_key(*name) {
+                if self.sema.ctor_def_has(name) {
                     let type_name = self.sema.pattern_ctor_types
                         .get(&(module_name.clone(), pattern_id.0))
                         .map(|s| s.as_ref());
@@ -661,7 +701,11 @@ impl<'a> IrBuilder<'a> {
             inputs_offset: ctor_match_off,
             compute_fn: CF_PATTERN_CTOR_MATCH, // pattern_ctor_match
         });
-        self.graph.set_pattern_ctor_name(ctor_match_node, name.to_string());
+        // Qualified pattern spellings (`A.TEf`) store the bare constructor
+        // name: runtime AdtValue constructor names are bare — the module
+        // prefix only disambiguated the sema lookup.
+        let bare_ctor_name = name.rsplit('.').next().unwrap_or(name);
+        self.graph.set_pattern_ctor_name(ctor_match_node, bare_ctor_name.to_string());
         // Record the constructor's owning type name for runtime disambiguation
         // (same-named constructors across different types, e.g. FileKind.File vs File).
         // Prefer the sema-disambiguated type_name; fall back to get_ctor_def.

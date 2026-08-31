@@ -1,0 +1,171 @@
+// Data.frond — sema 数据结构(Stage 1 / 1E):Rust core/src/sema/Sema.rs
+// 结构族的镜像(只保留 dump/正确性承重的字段)。
+//
+// 表示映射(超越镜像原则:差分锁 oracle 输出,不锁内部算法):
+// - Rust FxHashMap<u16, T> + Sym 键索引 → List<T>(idx 即分配序)+ Map<str, i64>;
+// - TypeHandle = u32(1D 口径);span/行号 = i64;
+// - TypeRepr 加 TR 前缀;TypeDefKind 加 TDK;IntrinsicKind 加 IK
+//   (跨模块 ADT 构造器撞名教训,SemaKind.KArrow 先例);
+// - ExprInfo 族(地址键,只进 stats)暂不落地,推断切片再补。
+//
+// 未移植(Stage 2 / IR 域):ChanLayout/CaptureInfo/CoroutineMeta/ReflectMeta/
+// ModuleOwnership(incremental purge 专用)/dynamic_ops。
+
+import std.collections.List
+import std.collections.Map
+import syntax.Ast
+import types.Ty
+
+// ─── 类型定义族 ───────────────────────────────────────────────────
+
+pub type TDK = | TAdt | TRecord | TAlias | TNewtype
+
+// Rust Debug 形态(差分契约:kind={:?})。
+pub fun tdk_debug(k: TDK): str {
+    match k {
+        TAdt => "Adt"
+        TRecord => "Record"
+        TAlias => "Alias"
+        TNewtype => "Newtype"
+    }
+}
+
+// 自包含类型表示(跨模块方法签名恢复;镜像 TypeRepr)。
+pub type TR =
+    | TRNamed(str)
+    | TRThis
+    | TRGeneric(str, TR[])
+    | TRNullable(TR)
+    | TRRef(TR)
+    | TRRaw(TR)
+    | TRFun(TR[], TR)
+    | TRArray(TR, i64?)
+
+// 内建方法降低策略(镜像 IntrinsicKind)。
+pub type IK =
+    | IKUnOp(i64)
+    | IKAwait
+    | IKChannelAwait
+    | IKBinOp(i64)
+    | IKTriOp(i64)
+
+pub fun ik_debug(k: IK?): str {
+    match k {
+        null => ""
+        IKUnOp(n) => "UnOp({n})"
+        IKAwait => "Await"
+        IKChannelAwait => "ChannelAwait"
+        IKBinOp(n) => "BinOp({n})"
+        IKTriOp(n) => "TriOp({n})"
+    }
+}
+
+// 构造器定义(name 为 null 的位置字段;field_types 与 field_names 对齐)。
+pub type Ctor = Ctor(pub name: str, pub type_name: str, pub field_names: str?[], pub field_types: u32[],
+    pub field_is_pub: bool[], pub is_newtype: bool, pub return_type_name: str?, pub return_type_node: i64?,
+    pub field_type_reprs: TR[], pub def_span: Span, pub def_module: str)
+
+// 方法签名(按 method_idx 编入 TDef.methods)。
+pub type MSig = MSig(pub name: str, pub param_is_ref: bool[], pub return_is_ref: bool, pub is_async: bool,
+    pub is_throwing: bool, pub param_type_reprs: TR[], pub return_type_repr: TR?, pub intrinsic: IK?,
+    pub has_body: bool, pub delegate_trait: str?, pub is_pub: bool)
+
+// 类型定义(record 的字段在 constructors[0];alias 无构造器)。
+pub type TDef = TDef(pub name: str, pub kind: TDK, pub constructors: Ctor[], pub type_params: str[],
+    pub target_type_name: str?, pub target_type: u32?, pub methods: MSig[], pub bases: str[])
+
+// trait 定义(methods 复用 1D 的 TMS 形态)。
+pub type TTDef = TTDef(pub name: str, pub parents: str[], pub methods: TMS[])
+
+// 函数签名(顶层 fun;键 = "module\0name")。
+pub type FSig = FSig(pub name: str, pub module_name: str, pub type_params: str[], pub return_type: u32,
+    pub param_is_ref: bool[], pub return_is_ref: bool, pub is_async: bool, pub is_throwing: bool)
+
+// ─── 见证表(镜像 WitnessTable:条目 + (trait,type_id) 索引)──────────
+
+pub type WEnt = WEnt(pub trait_name: str, pub type_id: i64, pub method_slots: Map<str, i64>, pub type_name: str)
+
+// ─── monomorph / trait-default / inherited 实例 ───────────────────
+
+pub type Mono = Mono(pub instance_id: i64, pub func_name: str, pub module_name: str, pub type_args: u32[],
+    pub return_type: u32, pub is_async: bool, pub local_count: i64)
+
+pub type TDefI = TDefI(pub type_id: i64, pub type_name: str, pub trait_idx: i64, pub trait_name: str, pub method_idx: i64)
+
+pub type InhI = InhI(pub type_id: i64, pub type_name: str, pub method_idx: i64, pub base_module: str,
+    pub base_type_name: str, pub base_method_idx: i64)
+
+// ─── 诊断 ─────────────────────────────────────────────────────────
+
+pub type SErr = SErr(pub message: str, pub line: i64, pub column: i64, pub file_path: str?)
+
+pub fun new_err(message: str, line: i64, column: i64): SErr {
+    SErr(message, line, column, "")
+}
+
+pub fun new_err_path(message: str, file_path: str, line: i64, column: i64): SErr {
+    SErr(message, line, column, file_path)
+}
+
+// ─── 推断期状态(片4b;行为在 Infer.frond,类型居低层供 Ictx 引用)──
+
+// 等式约束(t1 = t2)。
+pub type CEq = CEq(pub t1: u32, pub t2: u32)
+
+// 求解错误(reason 含 "ambiguous" 时 9.1 步上报)。
+pub type CErr = CErr(pub t1: u32, pub t2: u32, pub reason: str)
+
+// 约束求解器:等式队列 + 候选多值记录(键 = "{var_idx}")。
+pub type SolverRec = SolverRec(
+    pub pending: List<CEq>,
+    pub cands: Map<str, List<u32>>,
+    pub errors: List<CErr>,
+)
+
+pub fun new_solver(): SolverRec {
+    SolverRec(List.empty<CEq>(), Map.empty<str, List<u32>>(), List.empty<CErr>())
+}
+
+// 流窄化事实种类。
+pub type NK =
+    | NKNonNull
+    | NKIsCheck(u32)
+    | NKCtorMatch(str, str[])
+
+// 流事实:path(如 "u"、"obj.field")→ 窄化类型 + 种类。
+pub type FFact = FFact(pub path: str, pub narrowed_ty: u32, pub kind: NK)
+
+// 作用域内事实表:列表 + path 索引(值为 facts 下标)。
+pub type FlowScope = FlowScope(pub facts: List<FFact>, pub by_path: Map<str, List<i64>>)
+
+// 流上下文:作用域栈(内层遮蔽外层;至少保留根作用域)。
+pub type FlowCtx = FlowCtx(pub scopes: List<FlowScope>)
+
+pub fun new_flow(): FlowCtx {
+    val scopes = List.empty<FlowScope>()
+    scopes.push(FlowScope(List.empty<FFact>(), Map.empty<str, List<i64>>()))
+    FlowCtx(scopes)
+}
+
+// 挂起方法调用(裸 TypeVar 接收者;求解后 9.2 重试轮)。
+pub type DCall = DCall(pub expr: i64, pub env: u32)
+
+// ─── 实例化模式上下文(片5;行为在 Mono.frond,类型居低层)─────────
+// local_expr_types:实例内暂存表达式类型——(expr id, type) 对表,append
+// O(1);module_expr_key 串只在 Step1 合并时构造一次(此前每 expr 一次串
+// 构造+一次 Map<str> set,是 Map.set 风暴主源)。in_progress:cache_key →
+// instance_id(环检测/前向引用,跨嵌套实例共享同一记录)。
+pub type ETMap = ETMap(pub expr: i64, pub ty: u32)
+
+pub type InstCtx = InstCtx(
+    pub func_name: str,
+    pub type_args: u32[],
+    pub module_name: str,
+    pub local_expr_types: List<ETMap>,
+    pub in_progress: Map<str, i64>,
+)
+
+pub fun new_inst_ctx(func_name: str, type_args: u32[], module_name: str,
+    in_progress: Map<str, i64>): InstCtx {
+    InstCtx(func_name, type_args, module_name, List.empty<ETMap>(), in_progress)
+}

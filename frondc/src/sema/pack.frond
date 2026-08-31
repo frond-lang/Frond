@@ -1,0 +1,19 @@
+// sema 包声明 — 语义分析(1E),目录拓扑镜像 Rust core/src/sema/。
+//
+// `import sema` 一次引全:Data(ADT)/ Envs(env 竞技场)/ Semares(SemaResult
+// 注册表)/ Ictx(推断上下文+绑定栈)/ Relate(类型关系层)/ Populate
+// (声明层填充)/ Typeast(type_from_ast 族)/ Modenv(模块环境层)/
+// Infer(体推断主体,片4b)/ Check(模块检查编排)/ Sdump(sema-dump v1
+// render)。
+pub pack Data
+pub pack Envs
+pub pack Semares
+pub pack Ictx
+pub pack Relate
+pub pack Populate
+pub pack Typeast
+pub pack Modenv
+pub pack Infer
+pub pack Mono
+pub pack Check
+pub pack Sdump

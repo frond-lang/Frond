@@ -1,0 +1,1057 @@
+// Arena.frond — 类型竞技场(Stage 1 / 1D):Rust core/src/types/Arena.rs
+// + Display.rs 的忠实镜像。
+//
+// 镜像要点:
+// - types/details/tvars/kvars 全序贯分配(handle 序号确定性 — 差分锚);
+// - resolve_mut 带路径压缩;unify 的 never/unknown 走**原槽覆写**
+//   (display(原 handle) 会看到吸收后的类型 — battery 验证点);
+// - make_nullable 的 T?? 塌缩(返回原 handle);
+// - unify 全分支:rigid 双侧 / occurs / kind 门 / 结构族逐对递归
+//   / Trait~TraitObject 同名互通。
+// - kvars 用 KVRec(bool 是否已绑)存 SemKind?,避免泛型装 nullable。
+
+import std.collections.List
+import types.Ty
+
+pub type TypeArena = TypeArena(
+    pub types: List<Ty>,
+    pub details: List<Detail>,
+    pub tvars: List<TV>,
+    pub kvars: List<KVRec>,
+)
+
+pub type KVRec = KVRec(pub bound: bool, pub target: SemKind)
+
+pub fun new_arena(): TypeArena {
+    TypeArena(List.empty(), List.empty(), List.empty(), List.empty())
+}
+
+// ─── 基础访问 ─────────────────────────────────────────────────────
+
+pub fun get(a: TypeArena, h: u32): Ty {
+    a.types.get(h as usize) ?? TUnknown
+}
+
+pub fun make(a: TypeArena, t: Ty): u32 {
+    val h = a.types.len() as u32
+    a.types.push(t)
+    h
+}
+
+fun make_detail(a: TypeArena, d: Detail): u32 {
+    val id = a.details.len() as u32
+    a.details.push(d)
+    id
+}
+
+pub fun detail_of(a: TypeArena, id: u32): Detail {
+    a.details.get(id as usize) ?? DNullable(0)
+}
+
+// ─── 构造族 ───────────────────────────────────────────────────────
+
+pub fun make_throw(a: TypeArena, value: u32, error: u32): u32 {
+    val id = make_detail(a, DThrow(value, error))
+    make(a, TThrow(id))
+}
+
+pub fun make_channel(a: TypeArena, elem: u32): u32 {
+    val id = make_detail(a, DChannel(elem))
+    make(a, TChannel(id))
+}
+
+pub fun make_async(a: TypeArena, value: u32): u32 {
+    val id = make_detail(a, DAsync(value))
+    make(a, TAsync(id))
+}
+
+pub fun make_lazy(a: TypeArena, value: u32): u32 {
+    val id = make_detail(a, DLazy(value))
+    make(a, TLazy(id))
+}
+
+pub fun make_atomic(a: TypeArena, elem: u32): u32 {
+    val id = make_detail(a, DAtomic(elem))
+    make(a, TAtomic(id))
+}
+
+pub fun make_sender(a: TypeArena, elem: u32): u32 {
+    val id = make_detail(a, DSender(elem))
+    make(a, TSender(id))
+}
+
+pub fun make_receiver(a: TypeArena, elem: u32): u32 {
+    val id = make_detail(a, DReceiver(elem))
+    make(a, TReceiver(id))
+}
+
+pub fun make_foreign_fn(a: TypeArena, ret: u32): u32 {
+    val id = make_detail(a, DForeignFn(ret))
+    make(a, TForeignFn(id))
+}
+
+pub fun make_array(a: TypeArena, elem: u32, size: i64?): u32 {
+    val id = make_detail(a, DArray(elem, size))
+    make(a, TArray(id))
+}
+
+pub fun make_ref(a: TypeArena, inner: u32, is_raw: bool): u32 {
+    val id = make_detail(a, DRef(inner, is_raw))
+    make(a, TRef(id))
+}
+
+pub fun make_fn(a: TypeArena, params: u32[], return_type: u32): u32 {
+    val id = make_detail(a, DFn(params, return_type))
+    make(a, TFn(id))
+}
+
+// T?? 塌缩为 T?:Frond 的 nullable 无 Some 构造,包一层 null 不可表示。
+pub fun make_nullable(a: TypeArena, inner: u32): u32 {
+    val resolved = resolve(a, inner)
+    match get(a, resolved) {
+        TNullable(_) => resolved
+        _ => {
+            val id = make_detail(a, DNullable(resolved))
+            make(a, TNullable(id))
+        }
+    }
+}
+
+pub fun make_adt(a: TypeArena, name: str, type_args: u32[]): u32 {
+    val id = make_detail(a, DAdt(name, type_args))
+    make(a, TAdt(id))
+}
+
+pub fun make_record(a: TypeArena, fields: FT[], name: str?): u32 {
+    val id = make_detail(a, DRecord(fields, name))
+    make(a, TRecord(id))
+}
+
+pub fun make_trait(a: TypeArena, name: str, type_args: u32[]): u32 {
+    val id = make_detail(a, DTrait(name, type_args))
+    make(a, TTrait(id))
+}
+
+pub fun make_trait_object(a: TypeArena, trait_name: str, method_sigs: TMS[]): u32 {
+    val id = make_detail(a, DTraitObject(trait_name, method_sigs))
+    make(a, TTraitObject(id))
+}
+
+pub fun make_module_ref(a: TypeArena, path: str, env: u32): u32 {
+    val id = make_detail(a, DModuleRef(path, env))
+    make(a, TModuleRef(id))
+}
+
+pub fun make_generic(a: TypeArena, name: str, args: u32[]): u32 {
+    val id = make_detail(a, DGeneric(name, args))
+    make(a, TGeneric(id))
+}
+
+pub fun from_scalar_name(a: TypeArena, name: str): u32 {
+    make(a, from_type_name(name))
+}
+
+// ─── 结构访问族(parts)────────────────────────────────────────────
+
+fun detail_id_of(t: Ty): u32 {
+    match t {
+        TThrow(id) => id
+        TChannel(id) => id
+        TAsync(id) => id
+        TLazy(id) => id
+        TAtomic(id) => id
+        TSender(id) => id
+        TReceiver(id) => id
+        TForeignFn(id) => id
+        TArray(id) => id
+        TRef(id) => id
+        TFn(id) => id
+        TNullable(id) => id
+        TAdt(id) => id
+        TRecord(id) => id
+        TTrait(id) => id
+        TTraitObject(id) => id
+        TModuleRef(id) => id
+        TGeneric(id) => id
+        _ => 0
+    }
+}
+
+pub fun thr_parts(a: TypeArena, h: u32): U2 {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DThrow(v, e) => U2(v, e)
+        _ => U2(0, 0)
+    }
+}
+
+pub fun channel_elem(a: TypeArena, h: u32): u32 {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DChannel(e) => e
+        _ => 0
+    }
+}
+
+pub fun async_value(a: TypeArena, h: u32): u32 {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DAsync(v) => v
+        _ => 0
+    }
+}
+
+pub fun lazy_value(a: TypeArena, h: u32): u32 {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DLazy(v) => v
+        _ => 0
+    }
+}
+
+pub fun atomic_elem(a: TypeArena, h: u32): u32 {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DAtomic(e) => e
+        _ => 0
+    }
+}
+
+pub fun sender_elem(a: TypeArena, h: u32): u32 {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DSender(e) => e
+        _ => 0
+    }
+}
+
+pub fun receiver_elem(a: TypeArena, h: u32): u32 {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DReceiver(e) => e
+        _ => 0
+    }
+}
+
+pub fun foreign_fn_ret(a: TypeArena, h: u32): u32 {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DForeignFn(r) => r
+        _ => 0
+    }
+}
+
+pub fun array_parts(a: TypeArena, h: u32): U2O {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DArray(e, s) => U2O(e, s)
+        _ => U2O(0, null)
+    }
+}
+
+pub fun ref_parts(a: TypeArena, h: u32): U2B {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DRef(i, r) => U2B(i, r)
+        _ => U2B(0, false)
+    }
+}
+
+pub fun fn_parts(a: TypeArena, h: u32): FU {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DFn(ps, r) => FU(ps, r)
+        _ => FU([], 0)
+    }
+}
+
+pub fun nullable_inner(a: TypeArena, h: u32): u32 {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DNullable(i) => i
+        _ => 0
+    }
+}
+
+pub fun adt_parts(a: TypeArena, h: u32): SU {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DAdt(n, args) => SU(n, args)
+        _ => SU("", [])
+    }
+}
+
+pub fun record_fields(a: TypeArena, h: u32): FT[] {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DRecord(fs, _) => fs
+        _ => []
+    }
+}
+
+pub fun trait_parts(a: TypeArena, h: u32): SU {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DTrait(n, args) => SU(n, args)
+        _ => SU("", [])
+    }
+}
+
+pub fun trait_object_parts(a: TypeArena, h: u32): SM {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DTraitObject(n, ms) => SM(n, ms)
+        _ => SM("", [])
+    }
+}
+
+pub fun module_ref_parts(a: TypeArena, h: u32): SB {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DModuleRef(p, e) => SB(p, e)
+        _ => SB("", 0)
+    }
+}
+
+pub fun generic_parts(a: TypeArena, h: u32): SU {
+    match detail_of(a, detail_id_of(get(a, h))) {
+        DGeneric(n, args) => SU(n, args)
+        _ => SU("", [])
+    }
+}
+
+// ─── 类型变量 / kind ──────────────────────────────────────────────
+
+pub fun fresh_type_var(a: TypeArena): u32 {
+    val idx = a.tvars.len() as u32
+    a.tvars.push(TV(null, false, SKStar))
+    make(a, TTypeVar(idx))
+}
+
+pub fun fresh_type_var_with_kind(a: TypeArena, kind: SemKind): u32 {
+    val idx = a.tvars.len() as u32
+    a.tvars.push(TV(null, false, kind))
+    make(a, TTypeVar(idx))
+}
+
+pub fun fresh_rigid_var(a: TypeArena): u32 {
+    val idx = a.tvars.len() as u32
+    a.tvars.push(TV(null, true, SKStar))
+    make(a, TTypeVar(idx))
+}
+
+pub fun fresh_kind_var(a: TypeArena): SemKind {
+    val idx = a.kvars.len() as u32
+    a.kvars.push(KVRec(false, SKStar))
+    SKVar(idx)
+}
+
+pub fun kind_of(a: TypeArena, ty: u32): SemKind {
+    match get(a, ty) {
+        TTypeVar(idx) => {
+            match a.tvars.get(idx as usize) {
+                null => SKStar
+                tv => tv.kind
+            }
+        },
+        _ => SKStar
+    }
+}
+
+// kind 变量解析(沿绑定链;递归形态 — 循环形态会被 match 窄化卡住)。
+pub fun resolve_kind(a: TypeArena, kind: SemKind): SemKind {
+    match kind {
+        SKVar(idx) => {
+            match a.kvars.get(idx as usize) {
+                null => kind
+                rec => {
+                    if rec.bound {
+                        resolve_kind(a, rec.target)
+                    } else {
+                        kind
+                    }
+                },
+            }
+        },
+        _ => kind
+    }
+}
+
+// kind 合一:成功则绑定 kind 变量。
+// Rust Result<(),()> 的 bool 镜像(true=Ok)。void 载荷的 Throw 在引擎
+// 上有运行期风险,不用。
+pub fun unify_kind(a: TypeArena, k1: SemKind, k2: SemKind): bool {
+    val r1 = resolve_kind(a, k1)
+    val r2 = resolve_kind(a, k2)
+    if kind_eq(r1, r2) {
+        return true
+    }
+    match r1 {
+        SKVar(i) => {
+            bind_kind(a, i, r2)
+            true
+        },
+        _ => {
+            match r2 {
+                SKVar(j) => {
+                    bind_kind(a, j, r1)
+                    true
+                },
+                _ => {
+                    match r1 {
+                        SKArrow(p1, rr1) => {
+                            match r2 {
+                                SKArrow(p2, rr2) => {
+                                    unify_kind(a, p1, p2) && unify_kind(a, rr1, rr2)
+                                },
+                                _ => false
+                            }
+                        },
+                        _ => false
+                    }
+                },
+            }
+        },
+    }
+}
+
+fun bind_kind(a: TypeArena, idx: u32, target: SemKind): void {
+    if (idx as usize) < a.kvars.len() {
+        a.kvars.set(idx as usize, KVRec(true, target))
+    } else {
+        a.kvars.push(KVRec(true, target))
+    }
+}
+
+// ─── resolve / occurs / unify ─────────────────────────────────────
+
+// ── tvar 直访(片4b:求解器候选写回 + 9.4 默认绑定)──
+
+pub fun tvars_len(a: TypeArena): usize {
+    a.tvars.len()
+}
+
+pub fun tvar_bound_of(a: TypeArena, idx: u32): u32? {
+    match a.tvars.get(idx as usize) {
+        null => null
+        tv => tv.bound
+    }
+}
+
+pub fun tvar_is_rigid(a: TypeArena, idx: u32): bool {
+    match a.tvars.get(idx as usize) {
+        null => false
+        tv => tv.is_rigid
+    }
+}
+
+// 原槽绑定(覆盖 bound;保 is_rigid/kind)。
+pub fun bind_var(a: TypeArena, idx: u32, target: u32): void {
+    // Direct indexed set: the ported linear scan made every bind O(tvars) —
+    // 21% of ALL node executions in std checking.
+    if (idx as usize) < a.tvars.len() {
+        match a.tvars.get(idx as usize) {
+            null => {}
+            tv => { a.tvars.set(idx as usize, TV(target, tv.is_rigid, tv.kind)) }
+        }
+    }
+}
+
+pub fun resolve(a: TypeArena, h: u32): u32 {
+    var cur = h
+    var guard: i64 = 0
+    while guard < 100000 {
+        match get(a, cur) {
+            TTypeVar(idx) => {
+                match a.tvars.get(idx as usize) {
+                    null => { return cur }
+                    tv => {
+                        match tv.bound {
+                            null => { return cur }
+                            bound => {
+                                if bound != cur {
+                                    cur = bound
+                                } else {
+                                    return cur
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+            _ => { return cur }
+        }
+        guard = guard + 1
+    }
+    cur
+}
+
+// 带路径压缩的 resolve(中间变量直指根)。
+pub fun resolve_mut(a: TypeArena, h: u32): u32 {
+    val root = resolve(a, h)
+    if root == h {
+        return root
+    }
+    var cur = h
+    var guard: i64 = 0
+    while guard < 100000 {
+        match get(a, cur) {
+            TTypeVar(idx) => {
+                match a.tvars.get(idx as usize) {
+                    null => { return root }
+                    tv => {
+                        match tv.bound {
+                            null => { return root }
+                            b => {
+                                if b != root && b != cur {
+                                    set_var_bound(a, idx, root)
+                                    cur = b
+                                } else {
+                                    return root
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+            _ => { return root }
+        }
+        guard = guard + 1
+    }
+    root
+}
+
+fun set_var_bound(a: TypeArena, idx: u32, target: u32): void {
+    if (idx as usize) < a.tvars.len() {
+        match a.tvars.get(idx as usize) {
+            null => {}
+            tv => {
+                a.tvars.set(idx as usize, TV(target, tv.is_rigid, tv.kind))
+            },
+        }
+    }
+}
+
+fun var_bound(a: TypeArena, idx: u32): u32? {
+    match a.tvars.get(idx as usize) {
+        null => null
+        tv => tv.bound
+    }
+}
+
+fun var_is_rigid(a: TypeArena, idx: u32): bool {
+    match a.tvars.get(idx as usize) {
+        null => false
+        tv => tv.is_rigid
+    }
+}
+
+fun var_kind(a: TypeArena, idx: u32): SemKind {
+    match a.tvars.get(idx as usize) {
+        null => SKStar
+        tv => tv.kind
+    }
+}
+
+// occurs 检查:类型变量是否出现在类型内(防无限类型)。
+pub fun occurs(a: TypeArena, var_idx: u32, ty: u32): bool {
+    match get(a, ty) {
+        TTypeVar(idx) => idx == var_idx
+        TFn(_) => {
+            val ps = fn_parts(a, ty)
+            var found = false
+            var i: usize = 0
+            while i < ps.ps.len() {
+                if occurs(a, var_idx, ps.ps[i]) {
+                    found = true
+                }
+                i = i + 1
+            }
+            found || occurs(a, var_idx, ps.ret)
+        },
+        TRecord(_) => {
+            val fs = record_fields(a, ty)
+            var found = false
+            var i: usize = 0
+            while i < fs.len() {
+                if occurs(a, var_idx, fs[i].ty) {
+                    found = true
+                }
+                i = i + 1
+            }
+            found
+        },
+        TNullable(_) => occurs(a, var_idx, nullable_inner(a, ty))
+        TRef(_) => {
+            val p = ref_parts(a, ty)
+            occurs(a, var_idx, p.a)
+        },
+        TAdt(_) => {
+            val p = adt_parts(a, ty)
+            var found = false
+            var i: usize = 0
+            while i < p.b.len() {
+                if occurs(a, var_idx, p.b[i]) {
+                    found = true
+                }
+                i = i + 1
+            }
+            found
+        },
+        TThrow(_) => {
+            val p = thr_parts(a, ty)
+            occurs(a, var_idx, p.a) || occurs(a, var_idx, p.b)
+        },
+        TChannel(_) => occurs(a, var_idx, channel_elem(a, ty))
+        TAsync(_) => occurs(a, var_idx, async_value(a, ty))
+        TLazy(_) => occurs(a, var_idx, lazy_value(a, ty))
+        TAtomic(_) => occurs(a, var_idx, atomic_elem(a, ty))
+        TSender(_) => occurs(a, var_idx, sender_elem(a, ty))
+        TReceiver(_) => occurs(a, var_idx, receiver_elem(a, ty))
+        TForeignFn(_) => occurs(a, var_idx, foreign_fn_ret(a, ty))
+        TGeneric(_) => {
+            val p = generic_parts(a, ty)
+            var found = false
+            var i: usize = 0
+            while i < p.b.len() {
+                if occurs(a, var_idx, p.b[i]) {
+                    found = true
+                }
+                i = i + 1
+            }
+            found
+        },
+        TTrait(_) => {
+            val p = trait_parts(a, ty)
+            var found = false
+            var i: usize = 0
+            while i < p.b.len() {
+                if occurs(a, var_idx, p.b[i]) {
+                    found = true
+                }
+                i = i + 1
+            }
+            found
+        },
+        TArray(_) => {
+            val p = array_parts(a, ty)
+            occurs(a, var_idx, p.a)
+        },
+        _ => false
+    }
+}
+
+// ─── unify(镜像 Arena.rs unify 全分支)────────────────────────────
+
+pub fun unify(a: TypeArena, t1: u32, t2: u32): Throw<void, UnifyErr> {
+    val x = resolve_mut(a, t1)
+    val y = resolve_mut(a, t2)
+    if x == y {
+        return Ok(void)
+    }
+
+    val a_ty = get(a, x)
+    val b_ty = get(a, y)
+
+    // -- 类型变量绑定(a 侧)--
+    match a_ty {
+        TTypeVar(idx) => {
+            if var_is_rigid(a, idx) {
+                match b_ty {
+                    TTypeVar(bidx) => {
+                        if bidx == idx {
+                            return Ok(void)
+                        }
+                        // b 侧非刚性:绑到刚性 a
+                        if !var_is_rigid(a, bidx) {
+                            if occurs(a, bidx, x) {
+                                throw OccursCheckFailed
+                            }
+                            val b_kind = var_kind(a, bidx)
+                            val a_kind = kind_of(a, x)
+                            if !unify_kind(a, b_kind, a_kind) {
+                                throw TypeMismatch
+                            }
+                            set_var_bound(a, bidx, x)
+                            return Ok(void)
+                        }
+                    },
+                    _ => {}
+                }
+                throw TypeMismatch
+            }
+            if occurs(a, idx, y) {
+                throw OccursCheckFailed
+            }
+            val var_kind0 = var_kind(a, idx)
+            val target_kind = kind_of(a, y)
+            if !unify_kind(a, var_kind0, target_kind) {
+                throw TypeMismatch
+            }
+            set_var_bound(a, idx, y)
+            return Ok(void)
+        },
+        _ => {}
+    }
+
+    // -- 类型变量绑定(b 侧)--
+    match b_ty {
+        TTypeVar(idx) => {
+            if var_is_rigid(a, idx) {
+                throw TypeMismatch
+            }
+            if occurs(a, idx, x) {
+                throw OccursCheckFailed
+            }
+            val var_kind0 = var_kind(a, idx)
+            val target_kind = kind_of(a, x)
+            if !unify_kind(a, var_kind0, target_kind) {
+                throw TypeMismatch
+            }
+            set_var_bound(a, idx, x)
+            return Ok(void)
+        },
+        _ => {}
+    }
+
+    // -- never / unknown 吸收(原槽就地覆写)--
+    match a_ty {
+        TNever => {
+            a.types.set(t1 as usize, b_ty)
+            return Ok(void)
+        },
+        TUnknown => {
+            a.types.set(t1 as usize, b_ty)
+            return Ok(void)
+        },
+        _ => {}
+    }
+    match b_ty {
+        TNever => {
+            a.types.set(t2 as usize, a_ty)
+            return Ok(void)
+        },
+        TUnknown => {
+            a.types.set(t2 as usize, a_ty)
+            return Ok(void)
+        },
+        _ => {}
+    }
+
+    // -- 结构合一 --
+    // 无载荷单元族:== 即等价。
+    if is_atomic_unit(a_ty) && ty_eq(a_ty, b_ty) {
+        return Ok(void)
+    }
+
+    match a_ty {
+        TFn(_) => {
+            match b_ty {
+                TFn(_) => {
+                    val pa = fn_parts(a, x)
+                    val pb = fn_parts(a, y)
+                    if pa.ps.len() != pb.ps.len() {
+                        throw TypeMismatch
+                    }
+                    var i: usize = 0
+                    while i < pa.ps.len() {
+                        unify(a, pa.ps[i], pb.ps[i])?
+                        i = i + 1
+                    }
+                    unify(a, pa.ret, pb.ret)
+                },
+                _ => throw TypeMismatch
+            }
+        },
+        TRecord(_) => {
+            match b_ty {
+                TRecord(_) => {
+                    val fa = record_fields(a, x)
+                    val fb = record_fields(a, y)
+                    if fa.len() != fb.len() {
+                        throw TypeMismatch
+                    }
+                    var i: usize = 0
+                    while i < fa.len() {
+                        unify(a, fa[i].ty, fb[i].ty)?
+                        i = i + 1
+                    }
+                    Ok(void)
+                },
+                _ => throw TypeMismatch
+            }
+        },
+        TNullable(_) => {
+            match b_ty {
+                TNullable(_) => unify(a, nullable_inner(a, x), nullable_inner(a, y))
+                _ => throw TypeMismatch
+            }
+        },
+        TRef(_) => {
+            match b_ty {
+                TRef(_) => {
+                    val ia = ref_parts(a, x)
+                    val ib = ref_parts(a, y)
+                    if ia.b != ib.b {
+                        throw TypeMismatch
+                    }
+                    unify(a, ia.a, ib.a)
+                },
+                _ => throw TypeMismatch
+            }
+        },
+        TAdt(_) => unify_named_args(a, x, y, "adt"),
+        TGeneric(_) => unify_named_args(a, x, y, "generic"),
+        TTrait(_) => {
+            match b_ty {
+                TTrait(_) => unify_named_args(a, x, y, "trait"),
+                TTraitObject(_) => {
+                    // Trait 与同名 TraitObject 可合一。
+                    val na = trait_parts(a, x).a
+                    val nb = trait_object_parts(a, y).a
+                    if na == nb {
+                        Ok(void)
+                    } else {
+                        throw TypeMismatch
+                    }
+                },
+                _ => throw TypeMismatch
+            }
+        },
+        TTraitObject(_) => {
+            match b_ty {
+                TTraitObject(_) => {
+                    val pa = trait_object_parts(a, x)
+                    val pb = trait_object_parts(a, y)
+                    if pa.a != pb.a || pa.b.len() != pb.b.len() {
+                        throw TypeMismatch
+                    }
+                    var i: usize = 0
+                    while i < pa.b.len() {
+                        if !tms_eq(pa.b[i], pb.b[i]) {
+                            throw TypeMismatch
+                        }
+                        i = i + 1
+                    }
+                    Ok(void)
+                },
+                TTrait(_) => {
+                    val na = trait_object_parts(a, x).a
+                    val nb = trait_parts(a, y).a
+                    if na == nb {
+                        Ok(void)
+                    } else {
+                        throw TypeMismatch
+                    }
+                },
+                _ => throw TypeMismatch
+            }
+        },
+        TArray(_) => {
+            match b_ty {
+                TArray(_) => {
+                    val ea = array_parts(a, x).a
+                    val eb = array_parts(a, y).a
+                    unify(a, ea, eb)
+                },
+                _ => throw TypeMismatch
+            }
+        },
+        TThrow(_) => {
+            match b_ty {
+                TThrow(_) => {
+                    val pa = thr_parts(a, x)
+                    val pb = thr_parts(a, y)
+                    unify(a, pa.a, pb.a)?
+                    unify(a, pa.b, pb.b)
+                },
+                _ => throw TypeMismatch
+            }
+        },
+        TChannel(_) => {
+            match b_ty {
+                TChannel(_) => unify(a, channel_elem(a, x), channel_elem(a, y))
+                _ => throw TypeMismatch
+            }
+        },
+        TAsync(_) => {
+            match b_ty {
+                TAsync(_) => unify(a, async_value(a, x), async_value(a, y))
+                _ => throw TypeMismatch
+            }
+        },
+        TLazy(_) => {
+            match b_ty {
+                TLazy(_) => unify(a, lazy_value(a, x), lazy_value(a, y))
+                _ => throw TypeMismatch
+            }
+        },
+        TAtomic(_) => {
+            match b_ty {
+                TAtomic(_) => unify(a, atomic_elem(a, x), atomic_elem(a, y))
+                _ => throw TypeMismatch
+            }
+        },
+        TSender(_) => {
+            match b_ty {
+                TSender(_) => unify(a, sender_elem(a, x), sender_elem(a, y))
+                _ => throw TypeMismatch
+            }
+        },
+        TReceiver(_) => {
+            match b_ty {
+                TReceiver(_) => unify(a, receiver_elem(a, x), receiver_elem(a, y))
+                _ => throw TypeMismatch
+            }
+        },
+        TForeignFn(_) => {
+            match b_ty {
+                TForeignFn(_) => unify(a, foreign_fn_ret(a, x), foreign_fn_ret(a, y))
+                _ => throw TypeMismatch
+            }
+        },
+        _ => throw TypeMismatch
+    }
+}
+
+fun tms_eq(x: TMS, y: TMS): bool {
+    x.name == y.name && x.param_count == y.param_count && x.return_type == y.return_type
+        && x.is_async == y.is_async && x.has_body == y.has_body
+}
+
+// Adt/Generic/Trait 的名+参数合一(共享形态)。
+fun unify_named_args(a: TypeArena, x: u32, y: u32, which: str): Throw<void, UnifyErr> {
+    val pa = named_parts(a, x, which)
+    val pb = named_parts(a, y, which)
+    if pa.a != pb.a || pa.b.len() != pb.b.len() {
+        throw TypeMismatch
+    }
+    var i: usize = 0
+    while i < pa.b.len() {
+        unify(a, pa.b[i], pb.b[i])?
+        i = i + 1
+    }
+    Ok(void)
+}
+
+fun named_parts(a: TypeArena, h: u32, which: str): SU {
+    if which == "adt" {
+        adt_parts(a, h)
+    } else if which == "generic" {
+        generic_parts(a, h)
+    } else {
+        trait_parts(a, h)
+    }
+}
+
+// ─── display(Display.rs 镜像)─────────────────────────────────────
+
+pub fun display(a: TypeArena, h: u32): str {
+    val resolved = resolve(a, h)
+    val t = get(a, resolved)
+    match t {
+        TTypeVar(_) => "'_"
+        TVoid => "void"
+        TNever => "!"
+        TUnknown => "?"
+        TFn(_) => {
+            val p = fn_parts(a, resolved)
+            "(" + join_display(a, p.ps, ", ") + ") -> " + display(a, p.ret)
+        },
+        TRecord(_) => {
+            val fs = record_fields(a, resolved)
+            var out = "("
+            var i: usize = 0
+            while i < fs.len() {
+                if i > 0 {
+                    out = out + ", "
+                }
+                match fs[i].name {
+                    null => {}
+                    name => { out = out + name + ": " }
+                }
+                out = out + display(a, fs[i].ty)
+                i = i + 1
+            }
+            out + ")"
+        },
+        TAdt(_) => {
+            val p = adt_parts(a, resolved)
+            p.a + fmt_type_args(a, p.b)
+        },
+        TNullable(_) => display(a, nullable_inner(a, resolved)) + "?"
+        TRef(_) => {
+            val p = ref_parts(a, resolved)
+            val prefix = if p.b {
+                "*"
+            } else {
+                "&"
+            }
+            prefix + display(a, p.a)
+        },
+        TGeneric(_) => {
+            val p = generic_parts(a, resolved)
+            p.a + fmt_type_args(a, p.b)
+        },
+        TArray(_) => {
+            val p = array_parts(a, resolved)
+            var out = display(a, p.a) + "["
+            match p.b {
+                null => {}
+                s => { out = out + "{s}" }
+            }
+            out + "]"
+        },
+        TThrow(_) => {
+            val p = thr_parts(a, resolved)
+            "Throw<" + display(a, p.a) + ", " + display(a, p.b) + ">"
+        },
+        TTrait(_) => {
+            val p = trait_parts(a, resolved)
+            p.a + fmt_type_args(a, p.b)
+        },
+        TTraitObject(_) => {
+            val p = trait_object_parts(a, resolved)
+            var out = "dyn " + p.a
+            if p.b.len() == 0 {
+                return out
+            }
+            out = out + " \{ "
+            var i: usize = 0
+            while i < p.b.len() {
+                if i > 0 {
+                    out = out + ", "
+                }
+                out = out + p.b[i].name + "(/" + "{p.b[i].param_count}" + ")"
+                i = i + 1
+            }
+            out + " \}"
+        },
+        TLib => "Lib",
+        TChannel(_) => "Channel",
+        TAsync(_) => "Async",
+        TLazy(_) => "Lazy",
+        TAtomic(_) => "Atomic",
+        TSender(_) => "Sender",
+        TReceiver(_) => "Receiver",
+        TTimer(_) => "Timer",
+        TForeignFn(_) => "ForeignFn",
+        TModuleRef(_) => {
+            val p = module_ref_parts(a, resolved)
+            "module::" + p.a
+        },
+        _ => ty_name(t)
+    }
+}
+
+fun join_display(a: TypeArena, hs: u32[], sep: str): str {
+    var out = ""
+    var i: usize = 0
+    while i < hs.len() {
+        if i > 0 {
+            out = out + sep
+        }
+        out = out + display(a, hs[i])
+        i = i + 1
+    }
+    out
+}
+
+fun fmt_type_args(a: TypeArena, args: u32[]): str {
+    if args.len() == 0 {
+        return ""
+    }
+    var out = "<"
+    var i: usize = 0
+    while i < args.len() {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + display(a, args[i])
+        i = i + 1
+    }
+    out + ">"
+}

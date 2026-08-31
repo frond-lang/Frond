@@ -1,8 +1,52 @@
-// F16.frond — the f16 (half-precision) type module (part of std.core)
+// F16.frond — the f16 (half-precision) type module (part of std.core.types)
+//
+// IEEE 754 binary16 boundary constants + string conversion. parse parses
+// with the correctly-rounded strtod kernel and then narrows to binary16 with
+// one round-to-nearest-even step. Accepted syntax matches F64.parse
+// (decimal, hexadecimal floats, inf/infinity/nan spellings). Throws
+// ParseError: Malformed on bad syntax, Overflow when the value overflows
+// binary16 (including values that round up to infinity); underflow rounds
+// to 0.0 or a subnormal per IEEE 754.
 
-pub val MAX: f16 = 65504.0
-pub val MIN: f16 = 0.000059604644775390625
+pub val MAX: f16 = 0x1.ffcp+15f16
+pub val MIN: f16 = 0x1p-14f16
+pub val MIN_SUBNORMAL: f16 = 0x1p-24f16
+pub val EPSILON: f16 = 0x1p-10f16
 
-pub fun parse(s: str): f16? {
-    F64.parse(s) as f16?
+// Rebuilds the f16 value from its bit pattern. Every binary16 value is
+// exactly representable in f64, so the reconstruction (and the final f64 →
+// f16 cast) is exact — this is pure bit unpacking, not another rounding.
+fun from_bits(bits: u16): f16 {
+    var sign: f64 = 1.0
+    if bits >= 32768 {
+        sign = 0.0 - 1.0
+    }
+    val mag = bits & 32767
+    val exp = ((mag >> 10) as i32)
+    val frac = ((mag & 1023) as i32)
+    if exp == 31 {
+        if frac == 0 { return (sign * (1.0 / 0.0)) as f16 }
+        return (0.0 / 0.0) as f16
+    }
+    if exp == 0 {
+        if frac == 0 { return (sign * 0.0) as f16 }
+        // subnormal: frac * 2^-24, built by repeated halving (exact)
+        var v = (frac as f64)
+        var k = 0
+        while k < 24 { v = v / 2.0; k = k + 1 }
+        return (sign * v) as f16
+    }
+    var v = 1.0 + ((frac as f64) / 1024.0)
+    var e = exp - 15
+    while e > 0 { v = v * 2.0; e = e - 1 }
+    while e < 0 { v = v / 2.0; e = e + 1 }
+    (sign * v) as f16
+}
+
+pub fun parse(s: str): Throw<f16, ParseError> {
+    val ok: u8[] = [0 as u8]
+    val bits = __fp_parse_f16(s, ok)
+    if ok[0] == 0 { throw ParseError(Malformed, "not a valid f16 literal", s) }
+    if ok[0] == 2 { throw ParseError(Overflow, "value overflows f16 to infinity", s) }
+    Ok(from_bits(bits))
 }

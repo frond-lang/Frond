@@ -1,0 +1,451 @@
+// Sdump.frond — sema-dump v1 render(1E):Rust cli/Dump.rs render 的镜像。
+// 全节确定性排序(名字字节序);地址键表只进 stats(推断切片前为 0)。
+
+import std.collections.List
+import std.collections.Map
+import std.core.types.Str
+import types.Arena
+
+import module.Loader
+import sema.Data
+import sema.Semares
+import sema.Modenv
+
+fun ty_str(a: TypeArena, h: u32): str {
+    Arena.display(a, h)
+}
+
+fun bool_str(b: bool): str {
+    if b { "true" } else { "false" }
+}
+
+pub fun repr_str(r: TR): str {
+    match r {
+        TRNamed(n) => { n }
+        TRThis => { "This" }
+        TRGeneric(n, args) => {
+            var parts: str[] = []
+            var i: usize = 0
+            while i < args.len() {
+                parts = parts ++ [repr_str(args[i])]
+                i = i + 1
+            }
+            "{n}<{Semares.str_join(parts, ",")}>"
+        },
+        TRNullable(t) => { "{repr_str(t)}?" }
+        TRRef(t) => { "&{repr_str(t)}" }
+        TRRaw(t) => { "*{repr_str(t)}" }
+        TRFun(ps, r0) => {
+            var parts: str[] = []
+            var i: usize = 0
+            while i < ps.len() {
+                parts = parts ++ [repr_str(ps[i])]
+                i = i + 1
+            }
+            "fn({Semares.str_join(parts, ",")}) {repr_str(r0)}"
+        },
+        TRArray(t, null) => { "{repr_str(t)}[]" }
+        TRArray(t, sz) => { "{repr_str(t)}[{sz}]" }
+    }
+}
+
+fun err_file(e: SErr): str {
+    match e.file_path {
+        null => { "-" }
+        fp => {
+            if fp.len() == 0 { "-" } else { fp }
+        },
+    }
+}
+
+fun diag_line(e: SErr): str {
+    "{err_file(e)}:{e.line}:{e.column}: {e.message}"
+}
+
+// 诊断排序:(file, line, column, message)。
+fun diag_lt(x: SErr, y: SErr): bool {
+    val xf = err_file(x)
+    val yf = err_file(y)
+    if xf != yf {
+        return Modenv.str_bytes_lt(xf, yf)
+    }
+    if x.line != y.line {
+        return x.line < y.line
+    }
+    if x.column != y.column {
+        return x.column < y.column
+    }
+    return Modenv.str_bytes_lt(x.message, y.message)
+}
+
+fun sort_errors(errs: List<SErr>): void {
+    var i: usize = 1
+    while i < errs.len() {
+        val key = errs.get(i) ?? SErr("", 0, 0, "")
+        var j: i64 = i as i64 - 1
+        var go = true
+        while go && j >= 0 {
+            val cur = errs.get(j as usize) ?? SErr("", 0, 0, "")
+            if diag_lt(key, cur) {
+                errs.set((j + 1) as usize, cur)
+                j = j - 1
+            } else {
+                go = false
+            }
+        }
+        errs.set((j + 1) as usize, key)
+        i = i + 1
+    }
+}
+
+pub fun render(ar: TypeArena, s: SemaRes): str {
+    val outl = List.empty<str>()
+    outl.push("sema-dump v1\n")
+
+    // ── modules ──
+    val mods = List.empty<str>()
+    var i: usize = 0
+    while i < s.user_module_paths.len() {
+        mods.push(s.user_module_paths.get(i) ?? "")
+        i = i + 1
+    }
+    Modenv.str_list_sort(mods)
+    outl.push("! modules {mods.len()}\n")
+    i = 0
+    while i < mods.len() {
+        outl.push("mod {mods.get(i)}\n")
+        i = i + 1
+    }
+
+    // ── types ──
+    val type_names = List.empty<str>()
+    val keys = s.type_def_index.keys()
+    i = 0
+    while i < keys.len() {
+        type_names.push(keys[i])
+        i = i + 1
+    }
+    Modenv.str_list_sort(type_names)
+    outl.push("! types {type_names.len()}\n")
+    i = 0
+    while i < type_names.len() {
+        val name = type_names.get(i) ?? ""
+        val idx = Semares.type_def_idx(s, name) ?? 0
+        val td = s.type_defs.get(idx as usize) ?? TDef("", TAlias, [], [], null, null, [], [])
+        val params = Semares.str_join(td.type_params, ",")
+        val bases = Semares.str_join(td.bases, ",")
+        outl.push("type {name} kind={tdk_debug(td.kind)} params=[{params}] bases=[{bases}]\n")
+        match td.target_type_name {
+            null => {}
+            target => {
+                var rendered = "-"
+                match td.target_type {
+                    null => {}
+                    h => { rendered = ty_str(ar, h) }
+                }
+                outl.push("  alias-target {target} : {rendered}\n")
+            },
+        }
+        var ci: usize = 0
+        while ci < td.constructors.len() {
+            val ctor = td.constructors[ci]
+            var fields: str[] = []
+            var fi: usize = 0
+            while fi < ctor.field_names.len() {
+                var fname = "#{fi}"
+                match ctor.field_names[fi] {
+                    null => {}
+                    n => { fname = n }
+                }
+                fields = fields ++ ["{fname}: {ty_str(ar, ctor.field_types[fi])}"]
+                fi = fi + 1
+            }
+            outl.push("  ctor {ctor.name} ({Semares.str_join(fields, ", ")})\n")
+            ci = ci + 1
+        }
+        var mi: usize = 0
+        while mi < td.methods.len() {
+            val m = td.methods[mi]
+            var preprs: str[] = []
+            var pi: usize = 0
+            while pi < m.param_type_reprs.len() {
+                preprs = preprs ++ [repr_str(m.param_type_reprs[pi])]
+                pi = pi + 1
+            }
+            var ret = "-"
+            match m.return_type_repr {
+                null => {}
+                r0 => { ret = repr_str(r0) }
+            }
+            var line = "  method {mi} {m.name} pub={bool_str(m.is_pub)} body={bool_str(m.has_body)} async={bool_str(m.is_async)} throws={bool_str(m.is_throwing)} retref={bool_str(m.return_is_ref)} params=[{Semares.str_join(preprs, ",")}] ret={ret}"
+            match m.intrinsic {
+                null => {}
+                k => { line = line + " intrinsic={ik_debug(k)}" }
+            }
+            match m.delegate_trait {
+                null => {}
+                d => { line = line + " delegate={d}" }
+            }
+            outl.push(line + "\n")
+            mi = mi + 1
+        }
+        i = i + 1
+    }
+
+    // ── traits ──
+    val trait_names = List.empty<str>()
+    val tkeys = s.trait_def_index.keys()
+    i = 0
+    while i < tkeys.len() {
+        trait_names.push(tkeys[i])
+        i = i + 1
+    }
+    Modenv.str_list_sort(trait_names)
+    outl.push("! traits {trait_names.len()}\n")
+    i = 0
+    while i < trait_names.len() {
+        val name = trait_names.get(i) ?? ""
+        val idx = Semares.trait_def_idx(s, name) ?? 0
+        val td = s.trait_defs.get(idx as usize) ?? TTDef("", [], [])
+        outl.push("trait {name} parents=[{Semares.str_join(td.parents, ",")}]\n")
+        var mi: usize = 0
+        while mi < td.methods.len() {
+            val m = td.methods[mi]
+            outl.push("  method {m.name} params={m.param_count} ret={ty_str(ar, m.return_type)} async={bool_str(m.is_async)} body={bool_str(m.has_body)}\n")
+            mi = mi + 1
+        }
+        i = i + 1
+    }
+
+    // ── funcs(键 = "module\0name" 字节序)──
+    val func_keys = List.empty<str>()
+    val fkeys = s.func_sig_index.keys()
+    i = 0
+    while i < fkeys.len() {
+        func_keys.push(fkeys[i])
+        i = i + 1
+    }
+    Modenv.str_list_sort(func_keys)
+    outl.push("! funcs {func_keys.len()}\n")
+    i = 0
+    while i < func_keys.len() {
+        val key = func_keys.get(i) ?? ""
+        val idx = s.func_sig_index.get(key) ?? 0
+        val f = s.func_sigs.get(idx as usize) ?? FSig("", "", [], 0, [], false, false, false)
+        // NUL 切分:module \0 name。
+        val nul = Str.index_of(key, "\u{0}")
+        var module = "-"
+        var fname = key
+        if nul >= 0 {
+            module = Str.substring(key, 0, nul as usize)
+            fname = Str.substring(key, (nul + 1) as usize, key.len())
+        }
+        var pir: str[] = []
+        var k: usize = 0
+        while k < f.param_is_ref.len() {
+            pir = pir ++ [bool_str(f.param_is_ref[k])]
+            k = k + 1
+        }
+        outl.push("func {module}::{fname} params=[{Semares.str_join(f.type_params, ",")}] ret={ty_str(ar, f.return_type)} async={bool_str(f.is_async)} throws={bool_str(f.is_throwing)} refs=[{Semares.str_join(pir, ",")}] retref={bool_str(f.return_is_ref)}\n")
+        i = i + 1
+    }
+
+    // ── monomorph instances(instance_id 序)──
+    outl.push("! monomorph {s.monomorph_instances.len()}\n")
+    i = 0
+    while i < s.monomorph_instances.len() {
+        val m = s.monomorph_instances.get(i) ?? Mono(0, "", "", [], 0, false, 0)
+        var args: str[] = []
+        var k: usize = 0
+        while k < m.type_args.len() {
+            args = args ++ [ty_str(ar, m.type_args[k])]
+            k = k + 1
+        }
+        outl.push("mono {m.instance_id} {m.module_name}::{m.func_name} args=[{Semares.str_join(args, ",")}] ret={ty_str(ar, m.return_type)} async={bool_str(m.is_async)}\n")
+        i = i + 1
+    }
+
+    // ── trait-defaults(type, trait, method_idx 序)──
+    sort_tdefis(s.trait_default_instances)
+    outl.push("! trait-defaults {s.trait_default_instances.len()}\n")
+    i = 0
+    while i < s.trait_default_instances.len() {
+        val t = s.trait_default_instances.get(i) ?? TDefI(0, "", 0, "", 0)
+        outl.push("tdef {t.type_name} : {t.trait_name}.{t.method_idx}\n")
+        i = i + 1
+    }
+
+    // ── inherited(type_name, method_idx 序)──
+    sort_inhis(s.inherited_method_instances)
+    outl.push("! inherited {s.inherited_method_instances.len()}\n")
+    i = 0
+    while i < s.inherited_method_instances.len() {
+        val inh = s.inherited_method_instances.get(i) ?? InhI(0, "", 0, "", "", 0)
+        outl.push("inh {inh.type_name}#{inh.method_idx} <- {inh.base_module}::{inh.base_type_name}#{inh.base_method_idx}\n")
+        i = i + 1
+    }
+
+    // ── witness(trait_name, type_name 序)──
+    val wits = List.empty<WEnt>()
+    i = 0
+    while i < s.witness_entries.len() {
+        wits.push(s.witness_entries.get(i) ?? WEnt("", 0, Map.empty<str, i64>(), ""))
+        i = i + 1
+    }
+    sort_wits(wits)
+    outl.push("! witness {wits.len()}\n")
+    i = 0
+    while i < wits.len() {
+        // slots 明细(键字节序,name=#N):1 号案根修(延迟方法分派 +
+        // Elvis pending 绑定 + this 参统一)后恢复直接形态。
+        val w = wits.get(i) ?? WEnt("", 0, Map.empty<str, i64>(), "")
+        val slot_keys = List.empty<str>()
+        val mk = w.method_slots.keys()
+        var si: usize = 0
+        while si < mk.len() {
+            slot_keys.push(mk[si])
+            si = si + 1
+        }
+        Modenv.str_list_sort(slot_keys)
+        var slots_str = ""
+        si = 0
+        while si < slot_keys.len() {
+            val k2 = slot_keys.get(si) ?? ""
+            if si > 0 {
+                slots_str = slots_str + " "
+            }
+            slots_str = slots_str + k2 + "=#" + ((w.method_slots.get(k2) ?? 0) as str)
+            si = si + 1
+        }
+        outl.push("wit {w.trait_name} for {w.type_name} : {slots_str}\n")
+        i = i + 1
+    }
+
+    // ── field-ids(键字节序)──
+    val fids = List.empty<str>()
+    val fid_keys = s.field_id_map.keys()
+    i = 0
+    while i < fid_keys.len() {
+        fids.push(fid_keys[i])
+        i = i + 1
+    }
+    Modenv.str_list_sort(fids)
+    outl.push("! field-ids {fids.len()}\n")
+    i = 0
+    while i < fids.len() {
+        val key = fids.get(i) ?? ""
+        val display = Str.replace(key, "\u{0}", ".")
+        outl.push("fid {display} = {s.field_id_map.get(key) ?? 0}\n")
+        i = i + 1
+    }
+
+    // ── diagnostics ──
+    sort_errors(s.errors)
+    outl.push("! errors {s.errors.len()}\n")
+    i = 0
+    while i < s.errors.len() {
+        outl.push("err {diag_line(s.errors.get(i) ?? SErr("", 0, 0, ""))}\n")
+        i = i + 1
+    }
+    sort_errors(s.warnings)
+    outl.push("! warnings {s.warnings.len()}\n")
+    i = 0
+    while i < s.warnings.len() {
+        outl.push("warn {diag_line(s.warnings.get(i) ?? SErr("", 0, 0, ""))}\n")
+        i = i + 1
+    }
+
+    // ── stats(地址键表:仅 size;七计数全真实)──
+    outl.push("! stats\n")
+    var mono_local: i64 = 0
+    var xi: usize = 0
+    while xi < s.monomorph_instances.len() {
+        mono_local = mono_local + (s.monomorph_instances.get(xi) ?? Mono(0, "", "", [], 0, false, 0)).local_count
+        xi = xi + 1
+    }
+    outl.push("expr_types={s.expr_types.keys().len()} resolved_types={s.resolved_types.keys().len()} call_instantiations={s.call_instantiations.keys().len()} field_accesses=0 method_dispatches={s.method_dispatches.keys().len()} mono_local_expr_types={mono_local} coroutines=0\n")
+    module.Loader.str_join(outl.as_array(), "")
+}
+
+// (type_name, trait_name, method_idx) 三键排序。
+fun sort_tdefis(items: List<TDefI>): void {
+    var i: usize = 1
+    while i < items.len() {
+        val key = items.get(i) ?? TDefI(0, "", 0, "", 0)
+        var j: i64 = i as i64 - 1
+        var go = true
+        while go && j >= 0 {
+            val cur = items.get(j as usize) ?? TDefI(0, "", 0, "", 0)
+            var lt = false
+            if key.type_name != cur.type_name {
+                lt = Modenv.str_bytes_lt(key.type_name, cur.type_name)
+            } else if key.trait_name != cur.trait_name {
+                lt = Modenv.str_bytes_lt(key.trait_name, cur.trait_name)
+            } else {
+                lt = key.method_idx < cur.method_idx
+            }
+            if lt {
+                items.set((j + 1) as usize, cur)
+                j = j - 1
+            } else {
+                go = false
+            }
+        }
+        items.set((j + 1) as usize, key)
+        i = i + 1
+    }
+}
+
+// (type_name, method_idx) 排序。
+fun sort_inhis(items: List<InhI>): void {
+    var i: usize = 1
+    while i < items.len() {
+        val key = items.get(i) ?? InhI(0, "", 0, "", "", 0)
+        var j: i64 = i as i64 - 1
+        var go = true
+        while go && j >= 0 {
+            val cur = items.get(j as usize) ?? InhI(0, "", 0, "", "", 0)
+            var lt = false
+            if key.type_name != cur.type_name {
+                lt = Modenv.str_bytes_lt(key.type_name, cur.type_name)
+            } else {
+                lt = key.method_idx < cur.method_idx
+            }
+            if lt {
+                items.set((j + 1) as usize, cur)
+                j = j - 1
+            } else {
+                go = false
+            }
+        }
+        items.set((j + 1) as usize, key)
+        i = i + 1
+    }
+}
+
+// (trait_name, type_name) 排序。
+fun sort_wits(items: List<WEnt>): void {
+    var i: usize = 1
+    while i < items.len() {
+        val key = items.get(i) ?? WEnt("", 0, Map.empty<str, i64>(), "")
+        var j: i64 = i as i64 - 1
+        var go = true
+        while go && j >= 0 {
+            val cur = items.get(j as usize) ?? WEnt("", 0, Map.empty<str, i64>(), "")
+            var lt = false
+            if key.trait_name != cur.trait_name {
+                lt = Modenv.str_bytes_lt(key.trait_name, cur.trait_name)
+            } else {
+                lt = Modenv.str_bytes_lt(key.type_name, cur.type_name)
+            }
+            if lt {
+                items.set((j + 1) as usize, cur)
+                j = j - 1
+            } else {
+                go = false
+            }
+        }
+        items.set((j + 1) as usize, key)
+        i = i + 1
+    }
+}

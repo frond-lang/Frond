@@ -1,72 +1,23 @@
-// F64.frond — the f64 type module (part of std.core)
+// F64.frond — the f64 type module (part of std.core.types)
 //
-// Boundary constants + decimal parse. parse accepts [+-]?digits[.digits]
-// with an optional [eE][+-]?digits exponent; it returns null on malformed
-// input or when the value overflows the f64 range.
+// IEEE 754 binary64 boundary constants + string conversion. parse is
+// correctly rounded (round to nearest, ties to even — the IEEE 754 default
+// rounding attribute) via the C99 strtod kernel; it accepts decimal
+// [+-]?(digits[.digits]?|.digits)([eE][+-]?digits)?, hexadecimal floats
+// (0x1.8p3), and the inf/infinity/nan spellings (case-insensitive).
+// Throws ParseError: Malformed on bad syntax, Overflow when the value
+// overflows to infinity; underflow is not an error — it rounds to 0.0 or a
+// subnormal per IEEE 754.
 
-pub val MAX: f64 = 1.7976931348623157e308
-pub val MIN: f64 = 2.2250738585072014e-308
+pub val MAX: f64 = 0x1.fffffffffffffp+1023
+pub val MIN: f64 = 0x1p-1022
+pub val MIN_SUBNORMAL: f64 = 0x1p-1074
+pub val EPSILON: f64 = 0x1p-52
 
-pub fun parse(s: str): f64? {
-    val b = s.bytes()
-    var i = 0 as usize
-    // optional sign
-    var neg = false
-    if i < b.len() && (b[i] == (43 as u8) || b[i] == (45 as u8)) {
-        neg = b[i] == (45 as u8)
-        i = i + 1
-    }
-    // integer part
-    var int_part: f64 = 0.0
-    while i < b.len() && b[i] >= (48 as u8) && b[i] <= (57 as u8) {
-        int_part = int_part * 10.0 + ((b[i] as f64) - 48.0)
-        i = i + 1
-    }
-    // fractional part (at least one digit must exist overall)
-    var frac_part: f64 = 0.0
-    var frac_scale: f64 = 1.0
-    var has_digits = int_part > 0.0
-    if i < b.len() && b[i] == (46 as u8) {
-        i = i + 1
-        while i < b.len() && b[i] >= (48 as u8) && b[i] <= (57 as u8) {
-            frac_scale = frac_scale / 10.0
-            frac_part = frac_part + (((b[i] as f64) - 48.0) * frac_scale)
-            has_digits = true
-            i = i + 1
-        }
-    }
-    if !has_digits { return null }
-    // optional exponent
-    var exp: i32 = 0
-    if i < b.len() && (b[i] == (101 as u8) || b[i] == (69 as u8)) {
-        i = i + 1
-        var exp_neg = false
-        if i < b.len() && (b[i] == (43 as u8) || b[i] == (45 as u8)) {
-            exp_neg = b[i] == (45 as u8)
-            i = i + 1
-        }
-        if i >= b.len() { return null }
-        while i < b.len() && b[i] >= (48 as u8) && b[i] <= (57 as u8) {
-            exp = exp * 10 + ((b[i] as i32) - 48)
-            i = i + 1
-        }
-        if exp_neg { exp = 0 - exp }
-    }
-    if i != b.len() { return null }
-    var v = int_part + frac_part
-    // Apply the exponent by repeated multiply/divide. |exp| beyond ±330 can
-    // only overflow to infinity or underflow to 0 — both rejected below.
-    var steps = exp
-    if steps < 0 { steps = 0 - steps }
-    if steps > 330 { return null }
-    var k = 0
-    while k < steps {
-        if exp >= 0 { v = v * 10.0 } else { v = v / 10.0 }
-        k = k + 1
-    }
-    if v != v { return null }  // NaN
-    if v == (1.0 / 0.0) || v == (0.0 - 1.0 / 0.0) {
-        return null  // overflowed to infinity
-    }
-    if neg { 0.0 - v } else { v }
+pub fun parse(s: str): Throw<f64, ParseError> {
+    val ok: u8[] = [0 as u8]
+    val v = __fp_parse_f64(s, ok)
+    if ok[0] == 0 { throw ParseError(Malformed, "not a valid f64 literal", s) }
+    if ok[0] == 2 { throw ParseError(Overflow, "value overflows f64 to infinity", s) }
+    Ok(v)
 }

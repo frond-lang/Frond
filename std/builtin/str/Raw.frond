@@ -150,3 +150,242 @@ fun __str_array_join(arr: str[], sep: str): str {
     // need == 0: every piece is empty, the join result is ""
     return ""
 }
+
+// ── Hot-path hash/scan kernels (std.core.hash / std.core.types.Str) ──
+//
+// The pure-Frond per-byte loops dominated real interpreter workloads
+// (frondc sema: key hashing + byte search were 44% of all node
+// executions). These C versions keep byte-identical semantics.
+
+@c_include("stddef.h")
+
+// FNV-1a 64 over the normalize_zero FORM of s (Hash.key(str) without
+// materializing the normalized copy): a '-' followed by '0' and then a
+// non-digit non-'.' byte hashes as '0' (the IEEE -0.0 == 0.0 rule for
+// printed keys). Equal keys hash equal; bucket placement may differ from
+// the Frond path only for keys containing "-0" tokens, which `==`
+// disambiguates anyway.
+@internal
+@extern("C")
+fun __hash_key_str(s: str): u64 #{
+    unsigned long long h = 14695981039346656037ULL;
+    size_t i = 0;
+    while (i < s_len) {
+        unsigned char c = (unsigned char)s_data[i];
+        if (c == '-' && i + 1 < s_len && (unsigned char)s_data[i + 1] == '0') {
+            unsigned char next = (i + 2 < s_len) ? (unsigned char)s_data[i + 2] : 0;
+            int is_digit = (next >= '0' && next <= '9');
+            if (!is_digit && next != '.') {
+                h = (h ^ (unsigned long long)'0') * 1099511628211ULL;
+                i += 2;
+                continue;
+            }
+        }
+        h = (h ^ (unsigned long long)c) * 1099511628211ULL;
+        i += 1;
+    }
+    return (uint64_t)h;
+}#
+
+// FNV-1a 64 over a byte buffer (C twin of Hash.fnv1a_bytes).
+@internal
+@extern("C")
+fun __fnv1a_bytes(data: u8[]): u64 #{
+    unsigned long long h = 14695981039346656037ULL;
+    for (size_t i = 0; i < data_len; i++) {
+        h = (h ^ (unsigned long long)data_data[i]) * 1099511628211ULL;
+    }
+    return (uint64_t)h;
+}#
+
+// Byte offset of the first occurrence of needle in hay at or after from;
+// -1 when absent. Empty needle matches at from (Str.find_bytes twin).
+@internal
+@extern("C")
+fun __find_bytes(hay: u8[], needle: u8[], from: usize): i64 #{
+    if (needle_len == 0) return (int64_t)from;
+    if (hay_len < needle_len) return -1;
+    size_t last = hay_len - needle_len;
+    if (from > last) return -1;
+    for (size_t i = from; i <= last; i++) {
+        size_t j = 0;
+        while (j < needle_len && hay_data[i + j] == needle_data[j]) j++;
+        if (j == needle_len) return (int64_t)i;
+    }
+    return -1;
+}#
+
+// Lexicographic byte compare (mirror sort key; -1 / 0 / 1). Zero-copy views.
+@internal
+@extern("C")
+fun __str_bytes_cmp(x: str, y: str): i32 #{
+    size_t n = (x_len < y_len) ? x_len : y_len;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char a = (unsigned char)x_data[i];
+        unsigned char b = (unsigned char)y_data[i];
+        if (a != b) return (a < b) ? -1 : 1;
+    }
+    if (x_len == y_len) return 0;
+    return (x_len < y_len) ? -1 : 1;
+}#
+
+// ── IEEE 754 string→float kernels ──────────────────────────────────────────
+//
+// strtod/strtof are the C99 correctly-rounded decimal converters (round to
+// nearest, ties to even -- the IEEE 754 default rounding attribute), and they
+// also accept the C99 hexadecimal float form (0x1.8p3) plus the inf/infinity/
+// nan spellings (case-insensitive) recommended by IEEE 754-2019 exchange
+// format. ok[0]: 0 = malformed / trailing junk / leading whitespace,
+// 1 = ok, 2 = syntactically finite but overflows the width to infinity.
+// Underflow is NOT an error: it rounds to 0.0 or a subnormal per IEEE 754.
+
+@c_include("stdlib.h")
+@internal
+@extern("C")
+fun __fp_parse_f64(s: str, ok: u8[]): f64 #{
+    ok_data[0] = 0;
+    if (s_len == 0) return 0.0;
+    unsigned char c0 = (unsigned char)s_data[0];
+    if (c0 == 32 || (c0 >= 9 && c0 <= 13)) return 0.0;
+    char* end = 0;
+    double v = strtod((const char*)s_data, &end);
+    if (end == (char*)s_data) return 0.0;
+    if ((size_t)(end - (char*)s_data) != s_len) return 0.0;
+    if (v == v * 2.0 && v != 0.0) {
+        size_t k = 0;
+        if (s_data[k] == 43 || s_data[k] == 45) k++;
+        char c1 = (char)s_data[k];
+        if (c1 == 73 || c1 == 105 || c1 == 78 || c1 == 110) {
+            ok_data[0] = 1;  /* inf/infinity/nan spelling */
+        } else {
+            ok_data[0] = 2;  /* decimal overflow past MAX */
+        }
+        return v;
+    }
+    ok_data[0] = 1;
+    return v;
+}#
+
+// Same contract via strtof, so binary32 gets direct correct rounding (never
+// a parse-to-f64-then-narrow double rounding).
+@c_include("stdlib.h")
+@internal
+@extern("C")
+fun __fp_parse_f32(s: str, ok: u8[]): f32 #{
+    ok_data[0] = 0;
+    if (s_len == 0) return 0.0f;
+    unsigned char c0 = (unsigned char)s_data[0];
+    if (c0 == 32 || (c0 >= 9 && c0 <= 13)) return 0.0f;
+    char* end = 0;
+    float v = strtof((const char*)s_data, &end);
+    if (end == (char*)s_data) return 0.0f;
+    if ((size_t)(end - (char*)s_data) != s_len) return 0.0f;
+    if (v == v * 2.0f && v != 0.0f) {
+        size_t k = 0;
+        if (s_data[k] == 43 || s_data[k] == 45) k++;
+        char c1 = (char)s_data[k];
+        if (c1 == 73 || c1 == 105 || c1 == 78 || c1 == 110) {
+            ok_data[0] = 1;
+        } else {
+            ok_data[0] = 2;
+        }
+        return v;
+    }
+    ok_data[0] = 1;
+    return v;
+}#
+
+// binary16: strtod for the correctly-rounded binary64 value, then one exact
+// round-to-nearest-even narrowing into binary16 bits, returned as the raw u16
+// bit pattern (f16 values cannot cross the builtin return path; the F16
+// wrapper reconstructs the value exactly in f64 arithmetic). A value that
+// overflows binary16 to infinity without the input spelling inf reports
+// ok[0] == 2.
+@c_include("stdlib.h")
+@internal
+@extern("C")
+fun __fp_parse_f16(s: str, ok: u8[]): u16 #{
+    ok_data[0] = 0;
+    if (s_len == 0) return 0;
+    unsigned char c0 = (unsigned char)s_data[0];
+    if (c0 == 32 || (c0 >= 9 && c0 <= 13)) return 0;
+    char* end = 0;
+    double v = strtod((const char*)s_data, &end);
+    if (end == (char*)s_data) return 0;
+    if ((size_t)(end - (char*)s_data) != s_len) return 0;
+    int spelled_inf = 0;
+    if (v == v * 2.0 && v != 0.0) {
+        size_t k = 0;
+        if (s_data[k] == 43 || s_data[k] == 45) k++;
+        char c1 = (char)s_data[k];
+        if (c1 == 73 || c1 == 105 || c1 == 78 || c1 == 110) {
+            spelled_inf = 1;
+            ok_data[0] = 1;
+        } else {
+            ok_data[0] = 2;
+            return 0;
+        }
+    } else {
+        ok_data[0] = 1;
+    }
+    union { double d; uint64_t u; } cvt;
+    cvt.d = v;
+    uint64_t b = cvt.u;
+    uint32_t sign = (uint32_t)(b >> 63) << 15;
+    uint32_t be = (uint32_t)((b >> 52) & 0x7FF);
+    uint64_t frac = b & 0xFFFFFFFFFFFFFULL;
+    uint32_t h;
+    if (be == 0x7FF) {
+        h = (frac == 0) ? 0x7C00u : 0x7E00u;
+    } else if (be == 0 && frac == 0) {
+        h = 0;
+    } else {
+        int32_t e2;
+        if (be == 0) {
+            e2 = -1022;
+            while (!(frac & (1ULL << 52))) { frac <<= 1; e2--; }
+        } else {
+            frac |= (1ULL << 52);
+            e2 = be - 1023;
+        }
+        if (e2 >= -14) {
+            uint64_t m = frac >> 42;
+            uint64_t rem = frac & ((1ULL << 42) - 1);
+            uint64_t half = 1ULL << 41;
+            if (rem > half || (rem == half && (m & 1))) m++;
+            if (m == (1ULL << 11)) { m >>= 1; e2++; }
+            if (e2 > 15) {
+                h = 0x7C00u;
+            } else {
+                h = ((uint32_t)(e2 + 15) << 10) | (uint32_t)(m & 0x3FF);
+            }
+        } else {
+            int32_t sh = 28 - e2;
+            if (sh > 63) {
+                h = 0;
+            } else {
+                uint64_t m = frac >> sh;
+                uint64_t rem = frac & ((1ULL << sh) - 1);
+                uint64_t half = 1ULL << (sh - 1);
+                if (rem > half || (rem == half && (m & 1))) m++;
+                h = (uint32_t)m;
+            }
+        }
+    }
+    if (h == 0x7C00u && !spelled_inf) {
+        ok_data[0] = 2;  /* overflowed binary16 to infinity */
+        return 0;
+    }
+    return sign | h;
+}#
+
+// Reassembles a binary128 from its little-endian 64-bit halves (out_data[0]
+// = low, out_data[1] = high). f128 values cross FFI only as bit patterns, so
+// F128.parse computes exact hex-float bits in Frond and hands them here.
+@c_include("stdint.h")
+@internal
+@extern("C")
+fun __fp_f128_from_bits(hi: u64, lo: u64, out: f128[]): void #{
+    out_data[0] = lo;
+    out_data[1] = hi;
+}#

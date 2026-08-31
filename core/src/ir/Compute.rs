@@ -2068,6 +2068,11 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId, ctx: &EvalCon
     };
     let ctor_name = graph.pattern_ctor_name(node.0 as usize)
         .expect("pattern ctor match node has no ctor name");
+    if val.is_null() {
+        let tn = graph.pattern_type_name(node.0 as usize);
+        eprintln!("[ctor-match-null] node={:?} local={:?} ctor={} type={:?}",
+            node, node.0 - frame.node_offset, ctor_name, tn);
+    }
     let type_name = graph.pattern_type_name(node.0 as usize);
     let matched = match val.heap_obj() {
         // ADT: check both constructor name and owning type name (when available) to
@@ -3087,12 +3092,6 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
             node, cond_raw, cond, frame.subgraph_id.0, frame.node_offset,
             sg.node_range.0 .0, sg.node_range.1 .0,
             branches.branches.iter().map(|(c, sg, _)| (*c, sg.0)).collect::<Vec<_>>());
-        if node.0 == 27947 && std::env::var("FROND_DBG_PHI").is_ok() {
-            let l36 = frame.get_value_by_global(NodeId(27936));
-            let p32 = frame.get_value_by_global(NodeId(27932));
-            let a35 = frame.get_value_by_global(NodeId(27935));
-            eprintln!("[PHI] gate27947 ctx: lt={:?} param_si={:?} assert={:?}", l36, p32, a35);
-        }
     }
 
     // Select a branch (borrowed — no branch-inputs clone per Gate execution).
@@ -3111,7 +3110,9 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
         .map(|&n| frame.get_value_by_global(n))
         .collect();
 
-    if env_flag("FROND_DEBUG_STALL") {
+    if env_flag("FROND_DEBUG_STALL")
+        && crate::engine::EngineCore::sf_trace_match(graph, frame.subgraph_id.0)
+    {
         let (ns, ne) = graph.subgraphs[target_sg.0 as usize].node_range;
         eprintln!("[GATE] node={} cond={} target_sg={} sg_range=[{},{}) params={} branch_inputs={:?} args={}",
             node.0, cond, target_sg.0, ns.0, ne.0, param_count, branch_inputs, args.len());
@@ -4043,8 +4044,49 @@ fn type_inherits(graph: &crate::ir::Ir::DataFlowGraph, child: &str, ancestor: &s
 /// This is a runtime safety net; sema's exhaustiveness check should prevent
 /// reaching this node for ADT matches. For non-ADT matches without a catch-all,
 /// this serves as the unconditional panic.
-pub fn compute_match_fallback(_frame: &mut Frame, _node: NodeId, _ctx: &EvalContext) -> NodeResult {
-    panic!("non-exhaustive match: no arm matched at runtime");
+pub fn compute_match_fallback(frame: &mut Frame, node: NodeId, _ctx: &EvalContext) -> NodeResult {
+    let sg = &frame.graph.subgraphs[frame.subgraph_id.0 as usize];
+    let fn_name = frame
+        .graph
+        .sg_names
+        .get(sg.function_id as usize)
+        .cloned()
+        .unwrap_or_default();
+    // Debug: dump nearby values (inputs of the dispatch comparator).
+    let mut nearby = String::new();
+    let local = (node.0 - frame.node_offset) as usize;
+    if local >= 3 {
+        for probe in [local - 3, local - 2, local - 1] {
+            let v = frame.value_table.get_value(probe);
+            nearby.push_str(&format!(" v{}={:?}", probe, v));
+        }
+    }
+    // Caller chain: frame → caller frames (names via sg_names of each fn_id).
+    let mut chain = format!("{}", fn_name);
+    let mut caller = frame.caller;
+    let mut hops = 0;
+    while let Some((fid, _cn)) = caller {
+        if hops > 12 {
+            break;
+        }
+        // Look up the caller frame's name through the engine's frame table —
+        // not directly accessible here; approximate with sg id only.
+        chain.push_str(&format!(" <- frame{}", fid.0));
+        caller = None;
+        hops += 1;
+    }
+    // Match-arm label (compile-time diagnosis aid): identifies which source
+    // match tripped.
+    let arms_label = frame
+        .graph
+        .pattern_ctor_names
+        .get(node.0 as usize)
+        .and_then(|s| s.clone())
+        .unwrap_or_default();
+    panic!(
+        "non-exhaustive match: no arm matched at runtime [fn={} sg={} node={:?} local={:?} arms=[{}] near={} chain={}]",
+        fn_name, frame.subgraph_id.0, node, node.0 - frame.node_offset, arms_label, nearby, chain
+    );
 }
 
 /// compute_fn (idx 47): sequence node — waits for all inputs to be ready, then returns

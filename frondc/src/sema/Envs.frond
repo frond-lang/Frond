@@ -1,0 +1,89 @@
+// Envs.frond — 类型环境竞技场(1E):Rust Sema.rs EnvArena 的镜像。
+// 节点只增不删;EnvId = u32。绑定表为 str 键(第一获胜定义语义与 Rust 一致)。
+
+import std.collections.List
+import std.collections.Map
+
+pub type ENode = ENode(pub bindings: Map<str, u32>, pub parent: u32?)
+
+pub type EnvA = EnvA(pub envs: List<ENode>, pub root_id: u32?)
+
+pub fun new_enva(): EnvA {
+    EnvA(List.empty<ENode>(), null)
+}
+
+// 顶层环境(get-or-create:跨 pass 共享一个 root)。
+pub fun root(e: EnvA): u32 {
+    match e.root_id {
+        null => {
+            val id = e.envs.len() as u32
+            e.envs.push(ENode(Map.empty<str, u32>(), null))
+            e.root_id = id
+            id
+        },
+        id => { id },
+    }
+}
+
+// 创建 parent 的子环境。
+pub fun child(e: EnvA, parent: u32): u32 {
+    val id = e.envs.len() as u32
+    e.envs.push(ENode(Map.empty<str, u32>(), parent))
+    id
+}
+
+fun node_of(e: EnvA, env: u32): ENode {
+    e.envs.get(env as usize) ?? ENode(Map.empty<str, u32>(), null)
+}
+
+// 定义绑定;同名已存在时返回 false(第一获胜)。
+pub fun define(e: EnvA, env: u32, name: str, ty: u32): bool {
+    val node = node_of(e, env)
+    if node.bindings.has(name) {
+        return false
+    }
+    node.bindings.set(name, ty)
+    true
+}
+
+// 强制定义(覆盖同名;构造器注册压制模块别名用)。
+pub fun redefine(e: EnvA, env: u32, name: str, ty: u32): void {
+    node_of(e, env).bindings.set(name, ty)
+}
+
+// 从 env 沿父链查找。
+pub fun lookup(e: EnvA, env: u32, name: str): u32? {
+    var cur = env
+    var guard: i64 = 0
+    while guard < 1000000 {
+        val node = node_of(e, cur)
+        match node.bindings.get(name) {
+            null => {}
+            ty => { return ty }
+        }
+        match node.parent {
+            null => { return null }
+            p => { cur = p }
+        }
+        guard = guard + 1
+    }
+    null
+}
+
+// 只查本层(模块限定访问:防 std.io.File.println 落到全局 println)。
+pub fun lookup_local(e: EnvA, env: u32, name: str): u32? {
+    node_of(e, env).bindings.get(name)
+}
+
+// 本层已定义的名字集合(快照;predeclare origin 清单用)。
+pub fun snapshot_names(e: EnvA, env: u32): List<str> {
+    val out = List.empty<str>()
+    val node = node_of(e, env)
+    val keys = node.bindings.keys()
+    var i: usize = 0
+    while i < keys.len() {
+        out.push(keys[i])
+        i = i + 1
+    }
+    out
+}

@@ -12,7 +12,7 @@ impl<'a> InferContext<'a> {
         expected: Option<TypeHandle>,
     ) -> TypeHandle {
         match &ast.expr(expr).node {
-            Expr::Call { callee, args, .. } => {
+            Expr::Call { callee, args, type_args } => {
                 // Scalar type name used as a constructor call (e.g. `u64(x)`): scalar types
                 // have no constructors — the correct spelling is a cast. This must run
                 // FIRST: a scalar type name otherwise infers as a builtin conversion
@@ -45,7 +45,14 @@ impl<'a> InferContext<'a> {
                 //   2. Arity: when type-oriented disambiguation fails (expected is a TypeVar or not provided),
                 //      select the unique constructor matching by arity
                 let callee_ty = if let Expr::Ident(name) = &ast.expr(*callee).node {
-                    let ctors = self.sema_result.get_ctor_defs(name);
+                    // owned 克隆:S2 的 Some 臂需要 &mut sema_result 记录裁决,
+                    // 借用必须在本语句后终止(引用版本活到整条 if-let 链尾)。
+                    let ctors: Vec<crate::sema::Sema::CtorDefInfo> = self
+                        .sema_result
+                        .get_ctor_defs(name)
+                        .into_iter()
+                        .cloned()
+                        .collect();
                     // Privacy gate for BARE constructor calls (same-module calls
                     // pass naturally inside ctor_privacy_error): cross-module
                     // construction through a constructor with any private field
@@ -87,8 +94,21 @@ impl<'a> InferContext<'a> {
                             }
                             found.map(|c| (c.type_name.clone(), c.field_type_reprs.clone()))
                         };
+                        // 预收集错误文案(owned),让 `ctors` 的不可变借用在本行
+                        // 之后结束——Some 臂里的 S2 记录需要 &mut sema_result。
+                        let ctor_type_names: Vec<String> = ctors
+                            .iter()
+                            .map(|c| c.type_name.as_ref().to_string())
+                            .collect();
                         match selected {
                             Some((type_name, field_type_reprs)) => {
+                                let rec_mod = self
+                                    .instantiation_ctx
+                                    .as_ref()
+                                    .map(|i| i.module_name.clone())
+                                    .unwrap_or_else(|| self.current_module_name.clone());
+                                self.sema_result
+                                    .record_ctor_resolution(&rec_mod, expr.0 as u64, &type_name);
                                 // Privacy gate: ambiguous mapping resolved to a
                                 // cross-module constructor with private fields.
                                 if let Some(msg) = self.ctor_privacy_error(&type_name, name) {
@@ -109,8 +129,9 @@ impl<'a> InferContext<'a> {
                             }
                             None => {
                                 let span = ast.expr(expr).span;
-                                let type_names: Vec<&str> = ctors.iter()
-                                    .map(|c| c.type_name.as_ref())
+                                let type_names: Vec<&str> = ctor_type_names
+                                    .iter()
+                                    .map(|s| s.as_str())
                                     .collect();
                                 self.add_error_at(
                                     &format!(
@@ -132,6 +153,16 @@ impl<'a> InferContext<'a> {
                         // Bug #69: Zero-arg constructor called with `()` syntax.
                         // Zero-arg constructors are registered as values (ADT type), not
                         // function types, so `Unit()` is equivalent to the bare value `Unit`.
+                        let rec_mod = self
+                            .instantiation_ctx
+                            .as_ref()
+                            .map(|i| i.module_name.clone())
+                            .unwrap_or_else(|| self.current_module_name.clone());
+                        self.sema_result.record_ctor_resolution(
+                            &rec_mod,
+                            expr.0 as u64,
+                            ctors[0].type_name.as_ref(),
+                        );
                         let ret_ty = self.arena.make_adt(
                             ctors[0].type_name.clone(),
                             Box::new([]),
@@ -166,11 +197,100 @@ impl<'a> InferContext<'a> {
                                         *callee,
                                         crate::sema::Sema::ImplicitThisAccess::Method((*name).to_string().into_boxed_str()),
                                     ));
+                                    // S2: implicit-this 捕获分支也会吃掉"构造器名"的
+                                    // 裸调用(lookup_method_type 对 ctor 的 predeclared
+                                    // 绑定回退命中)——同名构造在此提前 return,后面
+                                    // 的记录点走不到。返回类型落在用户 Adt 时同样记录。
+                                    if self.sema_result.ctor_def_has(name) {
+                                        let rr = self.arena.resolve(return_type);
+                                        if let Type::Adt(_) = self.arena.get(rr) {
+                                            let adt_name = self.arena.adt_parts(rr).0;
+                                            let rec_mod = self
+                                                .instantiation_ctx
+                                                .as_ref()
+                                                .map(|i| i.module_name.clone())
+                                                .unwrap_or_else(|| self.current_module_name.clone());
+                                            self.sema_result
+                                                .record_ctor_resolution(&rec_mod, expr.0 as u64, adt_name);
+                                        }
+                                    }
+                                    // S4: 隐式 this 兄弟方法调用——this_ty 的
+                                    // (type_def_idx, method_idx) 即分派裁决。
+                                    if let Type::Adt(_) = self.arena.get(self.arena.resolve(this_ty)) {
+                                        let (tn, _) = self.arena.adt_parts(self.arena.resolve(this_ty));
+                                        if let Some(tidx) = self.sema_result.type_def_idx(tn) {
+                                            if let Some(def) = self.sema_result.type_defs.get(&tidx) {
+                                                if let Some(midx) = def
+                                                    .methods
+                                                    .iter()
+                                                    .position(|m| m.name.as_ref() == *name)
+                                                {
+                                                    let rec_mod = self
+                                                        .instantiation_ctx
+                                                        .as_ref()
+                                                        .map(|i| i.module_name.clone())
+                                                        .unwrap_or_else(|| self.current_module_name.clone());
+                                                    self.sema_result.record_dispatch_target(
+                                                        &rec_mod,
+                                                        expr.0 as u64,
+                                                        tidx,
+                                                        midx as u16,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                     return return_type;
                                 }
                             }
                         }
                         let t = self.infer_expr(*callee, ast, env, None);
+                        // S2: 单构造器带参调用经 predeclared 绑定推理——callee 类型
+                        // 是 Fn(参)->Adt(或零字段值绑定直接是 Adt);名字确是
+                        // 构造器时,取其 Adt 目标记录规范类型名(唯一裁决点)。
+                        if self.sema_result.ctor_def_has(name) {
+                            let resolved_callee = self.arena.resolve(t);
+                            let adt_name: Option<String> = match self.arena.get(resolved_callee) {
+                                Type::Adt(_) => {
+                                    Some(self.arena.adt_parts(resolved_callee).0.to_string())
+                                }
+                                Type::Fn(_) => {
+                                    let (_, ret) = self.arena.fn_parts(resolved_callee);
+                                    let ret_resolved = self.arena.resolve(ret);
+                                    if let Type::Adt(_) = self.arena.get(ret_resolved) {
+                                        Some(self.arena.adt_parts(ret_resolved).0.to_string())
+                                    } else {
+                                        None
+                                    }
+                                }
+                                // 裸"模块别名(...)"形态(std 兄弟模块的 Module.Ctor 调用):
+                                // callee 解析为 ModuleRef——构造器表唯一条目即裁决。
+                                Type::ModuleRef(_) => self
+                                    .sema_result
+                                    .ctor_def_list(name)
+                                    .and_then(|l| l.first().map(|&packed| {
+                                        let tidx = (packed >> 16) as u16;
+                                        let cidx = (packed & 0xFFFF) as usize;
+                                        self.sema_result
+                                            .type_defs
+                                            .get(&tidx)
+                                            .and_then(|d| d.constructors.get(cidx))
+                                            .map(|cc| cc.type_name.to_string())
+                                            .unwrap_or_default()
+                                    }))
+                                    .filter(|s| !s.is_empty()),
+                                _ => None,
+                            };
+                            if let Some(adt_name) = adt_name.as_deref() {
+                                let rec_mod = self
+                                    .instantiation_ctx
+                                    .as_ref()
+                                    .map(|i| i.module_name.clone())
+                                    .unwrap_or_else(|| self.current_module_name.clone());
+                                self.sema_result
+                                    .record_ctor_resolution(&rec_mod, expr.0 as u64, adt_name);
+                            }
+                        }
                         if std::env::var("FROND_TRACE_CTOR").is_ok() {
                             if let Expr::Ident(n) = &ast.expr(*callee).node {
                                 eprintln!("[ctor-infer] callee {} -> {:?}", n, self.arena.get(self.arena.resolve(t)));
@@ -268,7 +388,15 @@ impl<'a> InferContext<'a> {
 
                 // Instantiate the polymorphic function type (replace rigid vars / unbound TypeVars with fresh non-rigid vars)
                 // so each call has its own type variables, avoiding type-constraint clashes across calls.
-                let inst_callee = self.instantiate_fn_type(resolved_callee);
+                // Turbofish: explicit type args bind the first unbound vars
+                // positionally (silent-void locals case — see
+                // instantiate_fn_type_with_hints).
+                let call_hints: &[AstTypeRef] = type_args.as_deref().unwrap_or(&[]);
+                let inst_callee = if call_hints.is_empty() {
+                    self.instantiate_fn_type(resolved_callee)
+                } else {
+                    self.instantiate_fn_type_with_hints(resolved_callee, call_hints, ast)
+                };
                 if let Type::Fn(_) = self.arena.get(inst_callee) {
                     let (params, return_type) = self.arena.fn_parts(inst_callee);
                     let params: Vec<TypeHandle> = params.to_vec();
@@ -316,8 +444,8 @@ impl<'a> InferContext<'a> {
         expected: Option<TypeHandle>,
     ) -> TypeHandle {
         match &ast.expr(expr).node {
-            Expr::MethodCall { recv, method, args, .. }
-            | Expr::SafeMethodCall { recv, method, args, .. } => {
+            Expr::MethodCall { recv, method, args, type_args }
+            | Expr::SafeMethodCall { recv, method, args, type_args } => {
                 // super.method(args): static dispatch to the bound trait-default
                 // layer of the enclosing type. Must be handled before anything
                 // that infers the receiver (`super` is not a value and resolves
@@ -415,7 +543,26 @@ impl<'a> InferContext<'a> {
                     }
                 }
 
+                let saved_recv_pos = self.in_recv_position;
+                self.in_recv_position = true;
                 let recv_ty = self.infer_expr(*recv, ast, env, None);
+                self.in_recv_position = saved_recv_pos;
+                // Case #1 root cure (deferred method dispatch): a bare
+                // TypeVar/Unknown receiver supports no type-driven dispatch,
+                // and the Path-0 free-fn fallback below MUST NOT eagerly unify
+                // it with the first same-named candidate (a pending
+                // w.method_slots chain got hijacked by types.Arena.get(a, h)
+                // this way). Record the call; the post-solver retry pass
+                // (check_module_with_env step 9.2) re-infers it once the
+                // receiver is bound.
+                let bare_var_recv = self.instantiation_ctx.is_none()
+                    && matches!(
+                        self.arena.get(self.arena.resolve(recv_ty)),
+                        Type::TypeVar(_) | Type::Unknown
+                    );
+                if bare_var_recv {
+                    self.deferred_method_calls.push((expr, env));
+                }
                 if std::env::var("FROND_TRACE_CTOR").is_ok() && *method == "empty" {
                     if let crate::ast::Ast::Expr::Ident(rn) = &ast.expr(*recv).node {
                         eprintln!(
@@ -432,6 +579,10 @@ impl<'a> InferContext<'a> {
                 let recv_resolved_0a = self.arena.resolve(recv_ty);
                 if let Type::ModuleRef(_) = self.arena.get(recv_resolved_0a) {
                     let (mod_path, module_env) = self.arena.module_ref_parts(recv_resolved_0a);
+                    // Own the path up front: the module_func_call_targets
+                    // insert below outlives the mutable calls (instantiate/
+                    // infer) that end the arena borrow.
+                    let mod_path_owned: Box<str> = mod_path.into();
                     let found = self.sema_result.env.lookup_local(module_env, method);
                     // Directory-module semantics: when lookup_local misses in the current module env,
                     // search sibling modules in the same directory (e.g. Math.sqrt where sqrt lives in Power.frond,
@@ -440,7 +591,7 @@ impl<'a> InferContext<'a> {
                         self.lookup_sibling_module_fn(mod_path, module_env, method)
                     });
                     if let Some(fn_ty) = found {
-                        let inst_fn = self.instantiate_fn_type(fn_ty);
+                        let inst_fn = self.consume_turbofish_hints(fn_ty, type_args, ast);
                         if let Type::Fn(_) = self.arena.get(inst_fn) {
                             let (params, return_type) = self.arena.fn_parts(inst_fn);
                             let params: Vec<TypeHandle> = params.to_vec();
@@ -450,6 +601,33 @@ impl<'a> InferContext<'a> {
                                 let sp = ast.expr(args[i]).span;
                                 self.unify_call_arg(params[i], arg_ty, sp.line, sp.column, matches!(&ast.expr(args[i]).node, crate::ast::Ast::Expr::NullLit));
                             }
+                            // Qualified-constructor adjudication (S2 doctrine):
+                            // when the module binding is the constructor Fn
+                            // (its return Adt owns a constructor of this name),
+                            // record the canonical type so IR's ID path builds
+                            // the right record — the bare-name string fallback
+                            // there mis-picks when several modules declare
+                            // same-named types.
+                            let ret_resolved = self.arena.resolve(return_type);
+                            if let Type::Adt(_) = self.arena.get(ret_resolved) {
+                                let (adt_name, _) = self.arena.adt_parts(ret_resolved);
+                                let is_module_ctor = self
+                                    .sema_result
+                                    .get_ctor_defs(method)
+                                    .iter()
+                                    .any(|c| c.type_name.as_ref() == adt_name);
+                                if is_module_ctor {
+                                    let rec_mod = self
+                                        .instantiation_ctx
+                                        .as_ref()
+                                        .map(|i| i.module_name.clone())
+                                        .unwrap_or_else(|| self.current_module_name.clone());
+                                    let call_expr = expr.0 as u64;
+                                    let adt_owned = adt_name.to_string();
+                                    self.sema_result
+                                        .record_ctor_resolution(&rec_mod, call_expr, &adt_owned);
+                                }
+                            }
                             // Mark recv as a module-function-call receiver so IR compilation does not pass recv.
                             // (Consistent with path 0b: ModuleRef recv has Module.fun(args) semantics.)
                             let recv_key = module_expr_key(
@@ -457,7 +635,50 @@ impl<'a> InferContext<'a> {
                                 recv.0 as u64,
                             );
                             self.sema_result.module_func_recv_exprs.insert(recv_key);
+                            // Root fix for module short-name collisions: record
+                            // the import-resolved module path so IR binds this
+                            // call by the full mangled key ("sub.Parse.parse")
+                            // instead of the contested short key ("Parse.parse"
+                            // vs "std.json.Parse.parse").
+                            self.sema_result
+                                .module_func_call_targets
+                                .insert(recv_key, mod_path_owned.clone());
                             return return_type;
+                        }
+                    }
+                    // Zero-arg constructor with '()' syntax (`A.TEf()`): the
+                    // module binding is the constructor VALUE (Adt), not a
+                    // Fn — mirror the bare `Unit()` form (Bug #69 family).
+                    // Record the ctor resolution so IR builds the nullary
+                    // record-construct on the ID path.
+                    if let Some(binding) = found {
+                        if args.is_empty() {
+                            let v_resolved = self.arena.resolve(binding);
+                            if let Type::Adt(_) = self.arena.get(v_resolved) {
+                                let (adt_name, _) = self.arena.adt_parts(v_resolved);
+                                let is_module_ctor = self
+                                    .sema_result
+                                    .get_ctor_defs(method)
+                                    .iter()
+                                    .any(|c| c.type_name.as_ref() == adt_name);
+                                if is_module_ctor {
+                                    let rec_mod = self
+                                        .instantiation_ctx
+                                        .as_ref()
+                                        .map(|i| i.module_name.clone())
+                                        .unwrap_or_else(|| self.current_module_name.clone());
+                                    let call_expr = expr.0 as u64;
+                                    let adt_owned = adt_name.to_string();
+                                    self.sema_result
+                                        .record_ctor_resolution(&rec_mod, call_expr, &adt_owned);
+                                    let recv_key = module_expr_key(
+                                        &self.current_module_name,
+                                        recv.0 as u64,
+                                    );
+                                    self.sema_result.module_func_recv_exprs.insert(recv_key);
+                                    return binding;
+                                }
+                            }
                         }
                     }
                 }
@@ -468,6 +689,9 @@ impl<'a> InferContext<'a> {
                 // Typical scenario: after `import std.time.Duration`, Duration.from_millis(100),
                 // where Duration is both a type and a module (file with the same name; predefine redefine overwrote the ModuleRef).
                 if let Type::Fn(_) = self.arena.get(recv_resolved_0a) {
+                    // Turbofish on the ctor-fn recv () binds the
+                    // CTOR's own params; the callee below gets its own hint
+                    // consumption (see inst_fn below).
                     let (_, ret_ty) = self.arena.fn_parts(recv_resolved_0a);
                     let ret_resolved = self.arena.resolve(ret_ty);
                     if let Type::Adt(_) = self.arena.get(ret_resolved) {
@@ -507,7 +731,7 @@ impl<'a> InferContext<'a> {
                                     );
                                     return self.arena.fresh_type_var();
                                 }
-                                let inst_fn = self.instantiate_fn_type(fn_ty);
+                                let inst_fn = self.consume_turbofish_hints(fn_ty, type_args, ast);
                                 if let Type::Fn(_) = self.arena.get(inst_fn) {
                                     let (params, return_type) = self.arena.fn_parts(inst_fn);
                                     let params: Vec<TypeHandle> = params.to_vec();
@@ -574,8 +798,45 @@ impl<'a> InferContext<'a> {
                 if let Some(fn_ty) = method_fn_ty {
                     let inst_fn = self.instantiate_fn_type(fn_ty);
                     if let Type::Fn(_) = self.arena.get(inst_fn) {
+                        // S4: record the resolved dispatch target — the recv's
+                        // Adt name → type_def_idx, then the method's position
+                        // in its method table. IR path-2 consumes this first.
+                        let recv_resolved = self.arena.resolve(recv_ty);
+                        if let Type::Adt(_) = self.arena.get(recv_resolved) {
+                            let (recv_type_name, _) = self.arena.adt_parts(recv_resolved);
+                            if let Some(tidx) = self.sema_result.type_def_idx(recv_type_name) {
+                                if let Some(def) = self.sema_result.type_defs.get(&tidx) {
+                                    if let Some(midx) = def
+                                        .methods
+                                        .iter()
+                                        .position(|m| m.name.as_ref() == *method)
+                                    {
+                                        let rec_mod = self
+                                            .instantiation_ctx
+                                            .as_ref()
+                                            .map(|i| i.module_name.clone())
+                                            .unwrap_or_else(|| self.current_module_name.clone());
+                                        self.sema_result.record_dispatch_target(
+                                            &rec_mod,
+                                            expr.0 as u64,
+                                            tidx,
+                                            midx as u16,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         let (params, return_type) = self.arena.fn_parts(inst_fn);
                         let params: Vec<TypeHandle> = params.to_vec();
+                        // Bind the signature's type parameters from the RECEIVER
+                        // (this occupies param slot 0). Without this, wits.get(i)
+                        // on List<WEnt> left T pending (the args pin nothing about
+                        // it), coalesce/field chains kept pending vars alive, and
+                        // downstream method calls on them fell into the poisoned
+                        // Path-0 free-fn fallback (case #1).
+                        if !params.is_empty() {
+                            let _ = self.arena.unify(params[0], recv_ty);
+                        }
                         // The first parameter is self; skip it.
                         let n = params.len().min(args.len() + 1);
                         for i in 1..n {
@@ -590,11 +851,15 @@ impl<'a> InferContext<'a> {
                 // Path 0 (fallback): look up a binding named after the method as an Fn type in env (free function with a self parameter).
                 // Use lookup_with_pred to skip same-named non-function bindings (e.g. a local variable shadowing a free function).
                 // In Frond `recv.method(args)` is sugar for `method(recv, args)`.
+                // SKIPPED for bare-var receivers (case #1): the eager
+                // unify(params[0], var) below is the hijack vector; the
+                // deferred retry pass resolves these after solving.
+                if !bare_var_recv {
                 if let Some(fn_ty) = self.sema_result.env.lookup_with_pred(env, method, |ty| {
                     let r = self.arena.resolve(ty);
                     matches!(self.arena.get(r), Type::Fn(_))
                 }) {
-                    let inst_fn = self.instantiate_fn_type(fn_ty);
+                    let inst_fn = self.consume_turbofish_hints(fn_ty, type_args, ast);
                     if let Type::Fn(_) = self.arena.get(inst_fn) {
                         let (params, return_type) = self.arena.fn_parts(inst_fn);
                         let params: Vec<TypeHandle> = params.to_vec();
@@ -650,6 +915,7 @@ impl<'a> InferContext<'a> {
                         }
                         // Not a candidate: fall through to the paths below.
                     }
+                }
                 }
 
                 // await is a general suspend semantic: it produces no value; it only suspends the frame waiting for an event.
@@ -739,6 +1005,23 @@ impl<'a> InferContext<'a> {
             }
             _ => unreachable!("infer_method_call_expr called on non-MethodCall expression"),
         }
+    }
+
+
+    /// HM turbofish consumption for method-sugar calls (instantiation-time
+    /// binding; see instantiate_fn_type_with_hints). Returns the instantiated
+    /// signature: plain when no hints, hint-bound otherwise.
+    pub(super) fn consume_turbofish_hints(
+        &mut self,
+        fn_ty: TypeHandle,
+        type_args: &Option<std::vec::Vec<AstTypeRef>>,
+        ast: &AstArena<'_>,
+    ) -> TypeHandle {
+        let hints: &[AstTypeRef] = type_args.as_deref().unwrap_or(&[]);
+        if hints.is_empty() {
+            return self.instantiate_fn_type(fn_ty);
+        }
+        self.instantiate_fn_type_with_hints(fn_ty, hints, ast)
     }
 
     /// Builds a Type::Fn type from the owned data of a MethodSigInfo.
@@ -1020,11 +1303,7 @@ impl<'a> InferContext<'a> {
                         );
                         return self.arena.fresh_type_var();
                     }
-                    let trait_idx = self
-                        .sema_result
-                        .trait_def_index
-                        .get(parent.as_ref())
-                        .copied();
+                    let trait_idx = self.sema_result.trait_def_idx(parent.as_ref());
                     let Some(trait_idx) = trait_idx else {
                         self.add_error_at(
                             &format!("super: parent trait '{parent}' index missing"),
@@ -1117,7 +1396,7 @@ impl<'a> InferContext<'a> {
         };
 
         // Trait method signature (position + shape) for type-checking the call.
-        let trait_idx = self.sema_result.trait_def_index.get(trait_name.as_ref()).copied();
+        let trait_idx = self.sema_result.trait_def_idx(trait_name.as_ref());
         let sig = self.sema_result.get_trait_def(trait_name.as_ref()).and_then(|td| {
             td.methods
                 .iter()
@@ -1232,9 +1511,8 @@ impl<'a> InferContext<'a> {
                     self.sema_result.get_type_def(tn)
                 } else {
                     self.sema_result
-                        .type_def_index
-                        .get(tn)
-                        .and_then(|&i| self.sema_result.type_defs.get(&i))
+                        .type_def_idx(tn)
+                        .and_then(|i| self.sema_result.type_defs.get(&i))
                 };
                 def.and_then(|d| d.constructors.first().map(|c| c.def_module.clone()))
             });
@@ -1394,11 +1672,8 @@ impl<'a> InferContext<'a> {
 
         // v2 convergence: path 1 — query witness_table (trait method dispatch, indexed by type_id).
         if let Some(ref name) = type_name {
-            let type_id = self
-                .sema_result
-                .type_def_index
-                .get(name.as_str())
-                .map(|&idx| dynamic_type_id(idx));
+            let type_id = self.sema_result.type_def_idx(name.as_str())
+                .map(|idx| dynamic_type_id(idx));
             if let Some(tid) = type_id {
                 for entry in self.witness_table.entries() {
                     if entry.type_id != tid {
@@ -1407,7 +1682,7 @@ impl<'a> InferContext<'a> {
                     // Get the signature from TypeDefInfo.methods (looked up by method_name).
                     // Extract owned data to release the sema_result borrow.
                     let sig_data: Option<(Vec<TypeRepr>, Option<TypeRepr>)> =
-                        if let Some(&type_idx) = self.sema_result.type_def_index.get(name.as_str()) {
+                        if let Some(type_idx) = self.sema_result.type_def_idx(name.as_str()) {
                             self.sema_result.type_defs[&type_idx]
                                 .methods
                                 .iter()
@@ -1469,7 +1744,7 @@ impl<'a> InferContext<'a> {
         // v2 convergence: path 2 — query TypeDefInfo.methods (the type's own methods, indexed by method_idx).
         if let Some(ref name) = type_name {
             let sig_data: Option<(Vec<TypeRepr>, Option<TypeRepr>)> =
-                if let Some(&type_idx) = self.sema_result.type_def_index.get(name.as_str()) {
+                if let Some(type_idx) = self.sema_result.type_def_idx(name.as_str()) {
                     self.sema_result.type_defs[&type_idx]
                         .methods
                         .iter()

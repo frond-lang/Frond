@@ -317,11 +317,14 @@ fun __read_i32_le(buf: u8[], offset: usize): i32 {
 
 @internal
 fun __kind_from_int(kind_int: i32): FileKind {
-    match kind_int {
-        0 => FileKind.File,
-        1 => FileKind.Directory,
-        2 => FileKind.Symlink,
-        _ => FileKind.Other,
+    if kind_int == 0 {
+        FileKind.File
+    } else if kind_int == 1 {
+        FileKind.Directory
+    } else if kind_int == 2 {
+        FileKind.Symlink
+    } else {
+        FileKind.Other
     }
 }
 

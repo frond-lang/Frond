@@ -3,6 +3,101 @@
 use super::*;
 
 impl<'a> InferContext<'a> {
+    /// Ordered distinct unbound TypeVar idxs (traversal: Fn params in order,
+    /// then return type; children left-to-right). This is the positional
+    /// order predeclare used when binding generic params, so hint[i] of a
+    /// turbofish call maps to var[i].
+    pub(super) fn collect_unbound_vars_ordered(&self, ty: TypeHandle, out: &mut Vec<u32>) {
+        let resolved = self.arena.resolve(ty);
+        match self.arena.get(resolved) {
+            Type::TypeVar(idx) => {
+                if !out.contains(&idx) {
+                    out.push(idx);
+                }
+            }
+            _ => {
+                let mut children: Vec<TypeHandle> = Vec::new();
+                self.arena.for_each_child(resolved, |c| children.push(c));
+                for c in children {
+                    self.collect_unbound_vars_ordered(c, out);
+                }
+            }
+        }
+    }
+
+    /// Turbofish instantiation: like `instantiate_fn_type`, but the first
+    /// `hints.len()` unbound vars (declaration order) bind to the EXPLICIT
+    /// type args instead of fresh vars. Rationale (silent-void case):
+    /// `List.empty<str>()` used to leave T unbound in HM — the 9.4 default
+    /// pass turned it into void and downstream binders degraded silently.
+    /// Rigid vars refuse unify by design, so binding happens here, on the
+    /// fresh substitution, not by mutating the shared env signature.
+    pub(super) fn instantiate_fn_type_with_hints(
+        &mut self,
+        fn_ty: TypeHandle,
+        hints: &[AstTypeRef],
+        ast: &AstArena<'_>,
+    ) -> TypeHandle {
+        let resolved = self.arena.resolve(fn_ty);
+        if !matches!(self.arena.get(resolved), Type::Fn(_)) {
+            return resolved;
+        }
+        let mut vars: Vec<u32> = Vec::new();
+        {
+            let (params, return_type) = self.arena.fn_parts(resolved);
+            for &p in params.iter() {
+                self.collect_unbound_vars_ordered(p, &mut vars);
+            }
+            self.collect_unbound_vars_ordered(return_type, &mut vars);
+        }
+        if vars.is_empty() {
+            return resolved;
+        }
+        let mut hint_handles: Vec<TypeHandle> = Vec::with_capacity(hints.len());
+        for &tn in hints.iter() {
+            hint_handles.push(self.type_from_ast(tn, ast));
+        }
+        let mut subst: FxHashMap<u32, TypeHandle> = FxHashMap::default();
+        for (i, idx) in vars.iter().enumerate() {
+            let h = if i < hint_handles.len() {
+                hint_handles[i]
+            } else {
+                self.arena.fresh_type_var()
+            };
+            subst.insert(*idx, h);
+        }
+        self.substitute_type(resolved, &subst)
+    }
+
+    /// Collects the FIRST-occurrence handles of every unbound RIGID TypeVar
+    /// in traversal order (function params, then return type; then children
+    /// left-to-right). Drives HM turbofish consumption: hint[i] binds the
+    /// callee's i-th declared type parameter (predeclare registers rigids in
+    /// declaration order, and this traversal visits them positionally).
+    pub(super) fn collect_rigid_occurrences(&self, ty: TypeHandle, out: &mut Vec<TypeHandle>) {
+        let resolved = self.arena.resolve(ty);
+        match self.arena.get(resolved) {
+            Type::TypeVar(idx) => {
+                if self.arena.type_var(idx).is_rigid
+                    && !out.iter().any(|&h| {
+                        matches!(self.arena.get(h), Type::TypeVar(j) if j == idx)
+                    })
+                {
+                    out.push(resolved);
+                }
+            }
+            _ => {
+                // for_each_child yields Fn params in order followed by the
+                // return type — the positional order predeclare used.
+                let mut children: Vec<TypeHandle> = Vec::new();
+                self.arena.for_each_child(resolved, |c| children.push(c));
+                for c in children {
+                    self.collect_rigid_occurrences(c, out);
+                }
+            }
+        }
+    }
+
     /// Recursively collects every TypeVar idx in a type, inserting it into subst (with a placeholder value TypeHandle(0); only the key matters).
     pub(super) fn collect_type_vars(&self, ty: TypeHandle, subst: &mut FxHashMap<u32, TypeHandle>) {
         let resolved = self.arena.resolve(ty);

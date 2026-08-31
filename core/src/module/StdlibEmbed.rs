@@ -43,6 +43,7 @@ pub const BUILTIN_FILES: &[StdlibFile] = &[
     ("builtin/error/FfiError.frond", include_str!("../../../std/builtin/error/FfiError.frond")),
     ("builtin/error/JsonError.frond", include_str!("../../../std/builtin/error/JsonError.frond")),
     ("builtin/error/FmtError.frond", include_str!("../../../std/builtin/error/FmtError.frond")),
+    ("builtin/error/ParseError.frond", include_str!("../../../std/builtin/error/ParseError.frond")),
     // reflect module (runtime reflection, Raw.frond primitives + Reflect.frond wrapper)
     ("builtin/reflect/pack.frond", include_str!("../../../std/builtin/reflect/pack.frond")),
     ("builtin/reflect/Raw.frond", include_str!("../../../std/builtin/reflect/Raw.frond")),

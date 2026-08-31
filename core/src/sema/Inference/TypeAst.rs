@@ -94,6 +94,24 @@ impl<'a> InferContext<'a> {
         self.arena.make_adt(canonical.into(), Box::new([]))
     }
 
+    /// Whether a source-qualified type spelling resolves to something known:
+    /// a registered type/trait (after module-qualifier mapping) or a builtin
+    /// generic/scalar reachable through the path (`std.Async` style).
+    fn known_qualified(&self, name: &str) -> bool {
+        if self
+            .sema_result
+            .get_type_def(&self.sema_result.resolve_type_key(name))
+            .is_some()
+        {
+            return true;
+        }
+        if self.sema_result.get_trait_def(name).is_some() {
+            return true;
+        }
+        let tail = name.rsplit('.').next().unwrap_or(name);
+        is_builtin_generic_type(tail) || name_to_concrete(tail).is_some()
+    }
+
     /// Resolves an AST TypeNode to a TypeHandle (full version, with a type-parameter map).
     ///
     /// Handles all TypeNode variants: Named, ThisType, Generic, Nullable, RefType, RawPtr,
@@ -109,6 +127,22 @@ impl<'a> InferContext<'a> {
         let tn = &ast.ty(type_ref).node;
         match tn {
             TypeNode::Named { name } => {
+                // Qualified spelling sanity gate: unlike bare names (which
+                // fall through to an Adt for forward-reference recovery), a
+                // dotted path that maps to no module and no definition is
+                // always a real error — fail loudly with the spelling.
+                if name.contains('.') && !self.known_qualified(name) {
+                    let span = ast.ty(type_ref).span;
+                    self.add_error_at(
+                        &format!(
+                            "unknown type '{}': no module of that name is imported or loaded",
+                            name
+                        ),
+                        span.line,
+                        span.column,
+                    );
+                    return self.arena.make(Type::Unknown);
+                }
                 // Delegate to resolve_name_to_type: builtin scalar → trait → alias unfolding → Adt.
                 let mut visiting = FxHashSet::default();
                 self.resolve_name_to_type(name, type_param_map, &mut visiting)
@@ -128,6 +162,20 @@ impl<'a> InferContext<'a> {
                     .map(|&a| self.type_from_ast_with_params(a, ast, type_param_map))
                     .collect();
                 let args_box: Box<[TypeHandle]> = new_args.into_boxed_slice();
+
+                // Qualified spelling sanity gate (see the Named arm).
+                if name.contains('.') && !self.known_qualified(name) {
+                    let span = ast.ty(type_ref).span;
+                    self.add_error_at(
+                        &format!(
+                            "unknown type '{}': no module of that name is imported or loaded",
+                            name
+                        ),
+                        span.line,
+                        span.column,
+                    );
+                    return self.arena.make(Type::Unknown);
+                }
 
                 // Higher-kinded type (HKT) in the type-parameter map: F<T> where F is a type parameter.
                 if let Some(&param_handle) = type_param_map.get(*name) {

@@ -1,0 +1,422 @@
+// Ty.frond — 类型系统核心 ADT(Stage 1 / 1D):Rust core/src/types/Ty.rs
+// + Tag.rs 的忠实镜像。
+//
+// 差分口径:`frond debug --stage ty-ops` vs frondc `tyops`(逐字节)。
+// 表示映射:TypeHandle/DetailId/EnvId = u32;Type 变体加 T 前缀
+// (避开 Frond 内建类型名);Option<u64> 尺寸用 i64?。
+//
+// 未移植(1E 后期再议):TypeFamily 完整分类(1E sema 才消费)、
+// bit_width/type_id 族(IR/reflect 域)、Timer detail(Rust 侧为占位)。
+
+import std.collections.List
+
+// ─── 句柄与基础结构(Tag.rs)────────────────────────────────────────
+// TypeHandle/DetailId/EnvId 均为 u32 索引(裸用,不另建包装)。
+
+// 记录字段:name 为 null 表示位置字段。
+pub type FT = FT(pub name: str?, pub ty: u32)
+
+// trait 方法签名(flat)。
+pub type TMS = TMS(pub name: str, pub param_count: i64, pub return_type: u32,
+    pub is_async: bool, pub has_body: bool)
+
+// ─── 类型枚举(Ty.rs)───────────────────────────────────────────────
+// DetailId 承载变体 = u32;TypeVar 变体的载荷是 tvars 表索引。
+pub type Ty =
+    | TBool | TChar
+    | TI8 | TI16 | TI32 | TI64 | TI128
+    | TU8 | TU16 | TU32 | TU64 | TU128
+    | TIsize | TUsize
+    | TF16 | TF32 | TF64 | TF128
+    | TStr
+    | TNull
+    | TVoid
+    | TLib
+    | TThrow(u32)
+    | TChannel(u32)
+    | TAsync(u32)
+    | TLazy(u32)
+    | TAtomic(u32)
+    | TSender(u32)
+    | TReceiver(u32)
+    | TForeignFn(u32)
+    | TTimer(u32)
+    | TArray(u32)
+    | TRef(u32)
+    | TFn(u32)
+    | TNullable(u32)
+    | TAdt(u32)
+    | TRecord(u32)
+    | TTrait(u32)
+    | TTraitObject(u32)
+    | TModuleRef(u32)
+    | TGeneric(u32)
+    | TNever
+    | TTypeVar(u32)
+    | TUnknown
+
+// ─── 结构详情表(TypeDetail)───────────────────────────────────────
+pub type Detail =
+    | DThrow(u32, u32)
+    | DChannel(u32)
+    | DAsync(u32)
+    | DLazy(u32)
+    | DAtomic(u32)
+    | DSender(u32)
+    | DReceiver(u32)
+    | DForeignFn(u32)
+    | DArray(u32, i64?)
+    | DRef(u32, bool)
+    | DFn(u32[], u32)
+    | DNullable(u32)
+    | DAdt(str, u32[])
+    | DRecord(FT[], str?)
+    | DTrait(str, u32[])
+    | DTraitObject(str, TMS[])
+    | DModuleRef(str, u32)
+    | DGeneric(str, u32[])
+
+// ─── SemKind / TypeVar / UnifyError ───────────────────────────────
+
+pub type SemKind =
+    | SKStar
+    | SKArrow(SemKind, SemKind)
+    | SKVar(u32)
+
+// Rust Debug 输出形态(差分契约:resolve={:?})。
+pub fun kind_debug(k: SemKind): str {
+    match k {
+        SKStar => "Star"
+        SKArrow(p, r) => "Arrow \{ param: " + kind_debug(p) + ", result: " + kind_debug(r) + " \}"
+        SKVar(i) => "Var({i})"
+    }
+}
+
+pub fun kind_eq(a: SemKind, b: SemKind): bool {
+    match a {
+        SKStar => {
+            match b {
+                SKStar => true
+                _ => false
+            }
+        },
+        SKArrow(ap, ar) => {
+            match b {
+                SKArrow(bp, br) => kind_eq(ap, bp) && kind_eq(ar, br)
+                _ => false
+            }
+        },
+        SKVar(i) => {
+            match b {
+                SKVar(j) => i == j
+                _ => false
+            }
+        },
+    }
+}
+
+pub type TV = TV(pub bound: u32?, pub is_rigid: bool, pub kind: SemKind)
+
+pub type UnifyErr =
+    | TypeMismatch
+    | OccursCheckFailed
+
+pub fun unify_err_str(e: UnifyErr): str {
+    match e {
+        TypeMismatch => "type mismatch"
+        OccursCheckFailed => "occurs check failed (recursive type)"
+    }
+}
+
+// ─── 静态名字表(Ty.rs name / source_name / from_type_name)─────────────────────
+// ty_name = 构造子类别标签(统一小写 snake_case):供分类/诊断兜底/身份哈希;
+// 禁止与用户书写名比较、禁止当源码拼写显示——两者都走 ty_source_name。
+
+pub fun ty_name(t: Ty): str {
+    match t {
+        TI8 => "i8"
+        TI16 => "i16"
+        TI32 => "i32"
+        TI64 => "i64"
+        TI128 => "i128"
+        TU8 => "u8"
+        TU16 => "u16"
+        TU32 => "u32"
+        TU64 => "u64"
+        TU128 => "u128"
+        TIsize => "isize"
+        TUsize => "usize"
+        TF16 => "f16"
+        TF32 => "f32"
+        TF64 => "f64"
+        TF128 => "f128"
+        TBool => "bool"
+        TChar => "char"
+        TStr => "str"
+        TNull => "null"
+        TVoid => "void"
+        TLib => "lib"
+        TThrow(_) => "throw"
+        TChannel(_) => "channel"
+        TAsync(_) => "async"
+        TLazy(_) => "lazy"
+        TAtomic(_) => "atomic"
+        TSender(_) => "sender"
+        TReceiver(_) => "receiver"
+        TForeignFn(_) => "foreign_fn"
+        TTimer(_) => "timer"
+        TArray(_) => "array"
+        TRef(_) => "ref"
+        TFn(_) => "fn"
+        TNullable(_) => "nullable"
+        TAdt(_) => "adt"
+        TRecord(_) => "record"
+        TTrait(_) => "trait"
+        TTraitObject(_) => "trait_object"
+        TModuleRef(_) => "module_ref"
+        TGeneric(_) => "generic"
+        TNever => "never"
+        TTypeVar(_) => "type_var"
+        TUnknown => "unknown"
+    }
+}
+
+// 源码拼写:用户代码里怎么写。内置泛型与 Lib 保持 PascalCase(Channel/ForeignFn/…),
+// TypeVar 是 `_` 占位符,其余委托 ty_name(标量本就与源码一致)。
+// 供 display 与对用户名的匹配使用(镜像 Ty.rs source_name)。
+pub fun ty_source_name(t: Ty): str {
+    match t {
+        TLib => "Lib"
+        TThrow(_) => "Throw"
+        TChannel(_) => "Channel"
+        TAsync(_) => "Async"
+        TLazy(_) => "Lazy"
+        TAtomic(_) => "Atomic"
+        TSender(_) => "Sender"
+        TReceiver(_) => "Receiver"
+        TForeignFn(_) => "ForeignFn"
+        TTimer(_) => "Timer"
+        TTypeVar(_) => "_"
+        _ => { ty_name(t) }
+    }
+}
+
+// 无载荷的单元变体族(标量 + Str/Null/Void/Lib + Never/Unknown):
+// unify 的 == 即等价路径。
+pub fun is_atomic_unit(t: Ty): bool {
+    match t {
+        TBool => true
+        TChar => true
+        TI8 => true
+        TI16 => true
+        TI32 => true
+        TI64 => true
+        TI128 => true
+        TU8 => true
+        TU16 => true
+        TU32 => true
+        TU64 => true
+        TU128 => true
+        TIsize => true
+        TUsize => true
+        TF16 => true
+        TF32 => true
+        TF64 => true
+        TF128 => true
+        TStr => true
+        TNull => true
+        TVoid => true
+        TLib => true
+        TNever => true
+        TUnknown => true
+        _ => false
+    }
+}
+
+pub fun ty_eq(a: Ty, b: Ty): bool {
+    match a {
+        TBool => b == TBool
+        TChar => b == TChar
+        TI8 => b == TI8
+        TI16 => b == TI16
+        TI32 => b == TI32
+        TI64 => b == TI64
+        TI128 => b == TI128
+        TU8 => b == TU8
+        TU16 => b == TU16
+        TU32 => b == TU32
+        TU64 => b == TU64
+        TU128 => b == TU128
+        TIsize => b == TIsize
+        TUsize => b == TUsize
+        TF16 => b == TF16
+        TF32 => b == TF32
+        TF64 => b == TF64
+        TF128 => b == TF128
+        TStr => b == TStr
+        TNull => b == TNull
+        TVoid => b == TVoid
+        TLib => b == TLib
+        TThrow(x) => {
+            match b {
+                TThrow(y) => x == y
+                _ => false
+            }
+        },
+        TChannel(x) => {
+            match b {
+                TChannel(y) => x == y
+                _ => false
+            }
+        },
+        TAsync(x) => {
+            match b {
+                TAsync(y) => x == y
+                _ => false
+            }
+        },
+        TLazy(x) => {
+            match b {
+                TLazy(y) => x == y
+                _ => false
+            }
+        },
+        TAtomic(x) => {
+            match b {
+                TAtomic(y) => x == y
+                _ => false
+            }
+        },
+        TSender(x) => {
+            match b {
+                TSender(y) => x == y
+                _ => false
+            }
+        },
+        TReceiver(x) => {
+            match b {
+                TReceiver(y) => x == y
+                _ => false
+            }
+        },
+        TForeignFn(x) => {
+            match b {
+                TForeignFn(y) => x == y
+                _ => false
+            }
+        },
+        TTimer(x) => {
+            match b {
+                TTimer(y) => x == y
+                _ => false
+            }
+        },
+        TArray(x) => {
+            match b {
+                TArray(y) => x == y
+                _ => false
+            }
+        },
+        TRef(x) => {
+            match b {
+                TRef(y) => x == y
+                _ => false
+            }
+        },
+        TFn(x) => {
+            match b {
+                TFn(y) => x == y
+                _ => false
+            }
+        },
+        TNullable(x) => {
+            match b {
+                TNullable(y) => x == y
+                _ => false
+            }
+        },
+        TAdt(x) => {
+            match b {
+                TAdt(y) => x == y
+                _ => false
+            }
+        },
+        TRecord(x) => {
+            match b {
+                TRecord(y) => x == y
+                _ => false
+            }
+        },
+        TTrait(x) => {
+            match b {
+                TTrait(y) => x == y
+                _ => false
+            }
+        },
+        TTraitObject(x) => {
+            match b {
+                TTraitObject(y) => x == y
+                _ => false
+            }
+        },
+        TModuleRef(x) => {
+            match b {
+                TModuleRef(y) => x == y
+                _ => false
+            }
+        },
+        TGeneric(x) => {
+            match b {
+                TGeneric(y) => x == y
+                _ => false
+            }
+        },
+        TNever => b == TNever
+        TTypeVar(x) => {
+            match b {
+                TTypeVar(y) => x == y
+                _ => false
+            }
+        },
+        TUnknown => b == TUnknown
+    }
+}
+
+// from_type_name:名字 → 单元变体;未知名 → TUnknown。
+pub fun from_type_name(name: str): Ty {
+    match name {
+        "bool" => TBool
+        "char" => TChar
+        "i8" => TI8
+        "i16" => TI16
+        "i32" => TI32
+        "i64" => TI64
+        "i128" => TI128
+        "u8" => TU8
+        "u16" => TU16
+        "u32" => TU32
+        "u64" => TU64
+        "u128" => TU128
+        "isize" => TIsize
+        "usize" => TUsize
+        "f16" => TF16
+        "f32" => TF32
+        "f64" => TF64
+        "f128" => TF128
+        "str" => TStr
+        "null" => TNull
+        "void" => TVoid
+        "Lib" => TLib
+        _ => TUnknown
+    }
+}
+
+
+// ─── parts 族返回记录(Frond 无元组)────────────────────────────────
+pub type U2 = U2(pub a: u32, pub b: u32)
+pub type U2O = U2O(pub a: u32, pub b: i64?)
+pub type U2B = U2B(pub a: u32, pub b: bool)
+pub type FU = FU(pub ps: u32[], pub ret: u32)
+pub type SU = SU(pub a: str, pub b: u32[])
+pub type SM = SM(pub a: str, pub b: TMS[])
+pub type SB = SB(pub a: str, pub b: u32)

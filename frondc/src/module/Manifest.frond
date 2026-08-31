@@ -1,0 +1,106 @@
+// Manifest.frond — Root.toml 清单发现/渲染 + std 根解析(从 Main 拆出;
+// 目录拓扑对位 Rust core/src/cli/Manifest.rs)。
+//
+// manifest 发现锚定入口父链(非 CWD),保证与 Rust oracle
+// (find_project_root_from)同输入;到盘符即止 — Rust PathBuf::pop 在
+// 盘符根上返回 false,不退化成相对 CWD 的空基目录。
+
+import std.os.Env
+import std.os.Os
+import std.io.Fs
+import std.io.Path
+import std.core.types.Str
+import module.Loader
+import module.Toml
+
+fun norm_path(p: str): str { Str.replace(p, "\\", "/") }
+
+fun parent_dir_of(p: str): str {
+    val idx = Path.last_index_of(p, '/')
+    if idx <= 0 {
+        ""
+    } else {
+        Str.substring(p, 0 as usize, idx as usize)
+    }
+}
+
+// 从入口父链向上找 Root.toml(至多 64 级,镜像 find_project_root_from)。
+async fun find_root_toml(entry: str): Async<str?> {
+    var dir = parent_dir_of(entry)
+    var hops: i64 = 0
+    while hops < 64 {
+        if dir == "" {
+            return null
+        }
+        match Loader.read_text(Loader.join_path(dir, "Root.toml")).await() {
+            null => {}
+            content => { return content }
+        }
+        val next = parent_dir_of(dir)
+        if next == dir {
+            return null
+        }
+        dir = next
+        hops = hops + 1
+    }
+    null
+}
+
+// "! manifest" 节:root=no / root=bad / root=yes + 四字段。
+async fun render_manifest(entry: str): Async<str> {
+    val header = "! manifest\n"
+    match find_root_toml(entry).await() {
+        null => { header + "root=no\n" }
+        content => {
+            match Toml.parse(content) {
+                Error(_) => { header + "root=bad\n" },
+                Ok(kvs) => {
+                    match Toml.manifest_from(kvs) {
+                        null => { header + "root=bad\n" },
+                        m => {
+                            header + "root=yes name={m.name} entry={m.entry}"
+                                + " output_dir={m.output_dir} opt_level={m.opt_level}\n"
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// std 根解析:--std 旗标 > FRONDC_STD_ROOT 环境变量 > 从 CWD 向上
+// 探 <dir>/std/builtin/io/Raw.frond(至多 8 级)。空串 = 未提供(Env.get
+// 约定)。
+async fun resolve_std_root(flag: str): Async<str?> {
+    if flag != "" {
+        return flag
+    }
+    val env = Env.get("FRONDC_STD_ROOT")
+    if env != "" {
+        return env
+    }
+    match Os.current_dir() {
+        Error(_) => { null }
+        Ok(cwd) => {
+            var dir = norm_path(cwd.to_str())
+            var hops: i64 = 0
+            while hops < 8 {
+                if dir == "" {
+                    return null
+                }
+                val probe = Loader.join_path(dir, "std/builtin/io/Raw.frond")
+                match Fs.exists(Path.from(probe)).await() {
+                    Ok(true) => { return Loader.join_path(dir, "std") }
+                    _ => {}
+                }
+                val next = parent_dir_of(dir)
+                if next == dir {
+                    return null
+                }
+                dir = next
+                hops = hops + 1
+            }
+            null
+        },
+    }
+}

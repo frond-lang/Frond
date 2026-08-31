@@ -1,0 +1,186 @@
+// Ictx.frond — 推断上下文(1E):Rust Inference/Core.rs InferContext 的
+// 状态子集 + 类型绑定栈/this 栈操作 + 内建泛型工具。
+// 独立底层文件(Typeast 与 Modenv 都消费,避免环)。
+
+import std.collections.List
+import std.collections.Map
+import syntax.Ast
+import types.Arena
+import types.Ty
+
+import sema.Data
+
+pub type ICtx = ICtx(
+    // 泛型作用域类型绑定栈(帧栈,内层优先)。
+    pub tb_frames: List<Map<str, u32>>,
+    // type/trait 块的 this 绑定栈。
+    pub this_stack: List<u32>,
+    // 当前模块 EnvId(check/predeclare 期)。
+    pub current_module_env: u32?,
+    // 构造器短名 → 定义模块 env(Zig @This 语义)。
+    pub ctor_module_envs: Map<str, u32>,
+    // 实例化模式上下文(片5 monomorph;null = HM 模式)。
+    pub inst: InstCtx?,
+    // 当前逻辑路径(check 期注册 mangled 名用)。
+    pub current_module_logical_path: str?,
+    // 当前 trait 名(trait 默认方法体内裸方法调用解析)。
+    pub current_trait_name: str?,
+    // ── 片4b:体推断状态 ──
+    // 期望返回类型(throw 表达式逆向推断)。
+    pub expected_return: u32?,
+    // 约束求解器(等式定点 + 候选/歧义)。
+    pub solver: SolverRec,
+    // 流窄化上下文(path 敏感)。
+    pub flow: FlowCtx,
+    // 当前模块名(expr_types 复合键成分)。
+    pub current_module_name: str,
+    // 当前类型声明的实现 trait 闭包(super 解析;块外 null)。
+    pub current_type_decl_traits: List<str>?,
+    // 挂起方法调用(裸 TypeVar 接收者;9.2 重试)。
+    pub deferred_calls: List<DCall>,
+    // 局部绑定可变性(键 = "{env}\x00{name}";Bug#76 遮蔽检测)。
+    pub local_mutability: Map<str, bool>,
+)
+
+pub fun new_ictx(): ICtx {
+    ICtx(List.empty<Map<str, u32>>(), List.empty<u32>(), null, Map.empty<str, u32>(), null, null, "",
+        null, Data.new_solver(), Data.new_flow(), "", null, List.empty<DCall>(), Map.empty<str, bool>())
+}
+
+// reset_state(引擎 Core.rs:期望返回/绑定栈/solver/flow;env 不动)。
+pub fun reset_state(ctx: ICtx): void {
+    ctx.expected_return = null
+    ctx.tb_frames = List.empty<Map<str, u32>>()
+    ctx.this_stack = List.empty<u32>()
+    ctx.solver = Data.new_solver()
+    ctx.flow = Data.new_flow()
+}
+
+// ─── 绑定栈 ───────────────────────────────────────────────────────
+
+// 进入泛型作用域:每个类型形参分配 rigid var 压栈(无 kind 声明 = Star)。
+pub fun push_type_bindings(ctx: ICtx, a: TypeArena, tps: Tp[]): void {
+    ctx.tb_frames.push(Map.empty<str, u32>())
+    var i: usize = 0
+    while i < tps.len() {
+        val tp = tps[i]
+        val var_h = Arena.fresh_rigid_var(a)
+        insert_top(ctx, tp.name, var_h)
+        i = i + 1
+    }
+}
+
+pub fun push_frame(ctx: ICtx): void {
+    ctx.tb_frames.push(Map.empty<str, u32>())
+}
+
+pub fun pop_frame(ctx: ICtx): void {
+    val dropped = ctx.tb_frames.pop()
+}
+
+pub fun insert_top(ctx: ICtx, name: str, ty: u32): void {
+    var i: i64 = ctx.tb_frames.len() as i64 - 1
+    if i >= 0 {
+        match ctx.tb_frames.get(i as usize) {
+            null => {}
+            frame => { frame.set(name, ty) }
+        }
+    }
+}
+
+pub fun lookup_type_binding(ctx: ICtx, name: str): u32? {
+    var i: i64 = ctx.tb_frames.len() as i64 - 1
+    while i >= 0 {
+        match ctx.tb_frames.get(i as usize) {
+            null => {}
+            frame => {
+                match frame.get(name) {
+                    null => {}
+                    ty => { return ty }
+                }
+            },
+        }
+        i = i - 1
+    }
+    null
+}
+
+// ─── this 栈 ──────────────────────────────────────────────────────
+
+pub fun push_this_type(ctx: ICtx, ty: u32): void {
+    ctx.this_stack.push(ty)
+}
+
+pub fun pop_this_type(ctx: ICtx): void {
+    val dropped = ctx.this_stack.pop()
+}
+
+pub fun current_this_type(ctx: ICtx): u32? {
+    var i: i64 = ctx.this_stack.len() as i64 - 1
+    if i >= 0 {
+        return ctx.this_stack.get(i as usize)
+    }
+    null
+}
+
+// ─── 内建泛型工具 ─────────────────────────────────────────────────
+
+// BUILTIN_GENERIC_TYPES 名单(generic 组)。
+pub fun is_builtin_generic_type(name: str): bool {
+    match name {
+        "Throw" => { true }
+        "Channel" => { true }
+        "Async" => { true }
+        "Lazy" => { true }
+        "Atomic" => { true }
+        "Sender" => { true }
+        "Receiver" => { true }
+        "ForeignFn" => { true }
+        _ => { false }
+    }
+}
+
+// 构造专属变体;元数不符回退 Generic(容错)。
+pub fun make_builtin_generic(a: TypeArena, name: str, args: u32[]): u32 {
+    if name == "Throw" && args.len() == 2 {
+        Arena.make_throw(a, args[0], args[1])
+    } else if name == "Channel" && args.len() == 1 {
+        Arena.make_channel(a, args[0])
+    } else if name == "Async" && args.len() == 1 {
+        Arena.make_async(a, args[0])
+    } else if name == "Lazy" && args.len() == 1 {
+        Arena.make_lazy(a, args[0])
+    } else if name == "Atomic" && args.len() == 1 {
+        Arena.make_atomic(a, args[0])
+    } else if name == "Sender" && args.len() == 1 {
+        Arena.make_sender(a, args[0])
+    } else if name == "Receiver" && args.len() == 1 {
+        Arena.make_receiver(a, args[0])
+    } else if name == "ForeignFn" && args.len() == 1 {
+        Arena.make_foreign_fn(a, args[0])
+    } else {
+        Arena.make_generic(a, name, args)
+    }
+}
+
+// this 参数判定(params[0] 的类型注解是 ThisType)。
+pub fun is_this_param(ta: i64?, ast: AstArena): bool {
+    match ta {
+        null => { false }
+        tr => {
+            match ast.ty(tr).node {
+                TThis => { true }
+                _ => { false }
+            }
+        },
+    }
+}
+
+// 数值 ctor 名单(BUILTIN_TABLE 过滤 Ref/Null/Void 标签;含 bool/char)。
+pub fun numeric_builtin_names(): str[] {
+    ["bool", "char", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "isize", "usize", "f16", "f32", "f64", "f128"]
+}
+
+pub fun numeric_ty_of(name: str): Ty {
+    from_type_name(name)
+}

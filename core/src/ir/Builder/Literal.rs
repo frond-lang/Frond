@@ -496,14 +496,22 @@ pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
     // 6. Round to nearest even
     let mut mant = bits113;
     let mut exp = final_exp;
-    let was_subnormal = final_exp < -16382;
+    // `final_exp` is clamped to -16382 inside the subnormal branch, so the
+    // subnormal test must use the pre-clamp unbiased exponent.
+    let was_subnormal = unbiased_exp < -16382;
     if guard && (sticky || (mant & 1) != 0) {
         mant += 1;
     }
     if was_subnormal {
-        // Subnormal rounding may carry up to the smallest normal (mant reaches 2^112)
+        // Subnormal rounding may carry up to the smallest normal (mant reaches 2^112).
+        // Without the carry the exponent field must stay 0 (pure subnormal
+        // encoding), so park exp below the normal threshold — otherwise the
+        // normal assembly below would emit exponent field 1 and inflate every
+        // subnormal literal to the 2^-16382 binade.
         if mant >= (1u128 << 112) {
             exp = -16382;
+        } else {
+            exp = -16383;
         }
     } else if mant >= (1u128 << 113) {
         // Normal number rounding carry
@@ -512,7 +520,7 @@ pub(crate) fn parse_decimal_f128(s: &str) -> Option<[u8; 16]> {
     }
 
     // 7. Assemble binary128
-    if exp >= 16383 {
+    if exp > 16383 {
         let bits: u128 = (if sign { 1u128 << 127 } else { 0 }) | (0x7FFFu128 << 112);
         return Some(bits.to_le_bytes());
     }

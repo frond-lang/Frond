@@ -21,6 +21,32 @@ use std::sync::Arc;
 /// Caches boolean environment-variable flags to avoid calling `std::env::var` on every hot-path
 /// invocation. All known engine-side flag names are probed once (first call) and served from the
 /// map afterwards; unknown names fall back to an uncached probe (and are not memoized).
+/// TEMP DEBUG (stmt-drop hunt): FROND_SF_TRACE=<needle> restricts SF debug
+/// prints to frames whose owning function name contains the needle.
+pub(crate) fn sf_trace_match(graph: &crate::ir::Ir::DataFlowGraph, sg: u32) -> bool {
+    static NEEDLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let n = NEEDLE.get_or_init(|| std::env::var("FROND_SF_TRACE").ok());
+    match n.as_deref() {
+        None | Some("") => true,
+        // Resolve through function_id: arm/loop-body frames run NAMELESS
+        // subgraphs (only function-entry sgs carry names) — filtering on the
+        // frame's own sg name never matches them. Match the owning function
+        // instead so every frame of the traced function qualifies.
+        Some(needle) => {
+            let fn_id = graph
+                .subgraphs
+                .get(sg as usize)
+                .map(|s| s.function_id)
+                .unwrap_or(u32::MAX);
+            graph
+                .sg_names
+                .get(fn_id as usize)
+                .map(|nm| nm.contains(needle))
+                .unwrap_or(false)
+        }
+    }
+}
+
 pub(super) fn env_flag(name: &str) -> bool {
     static FLAGS: OnceLock<hashbrown::HashMap<&'static str, bool>> = OnceLock::new();
     const KNOWN_FLAGS: &[&str] = &[
@@ -69,6 +95,73 @@ static EXEC_COV: OnceLock<Vec<std::sync::atomic::AtomicU32>> = OnceLock::new();
 
 /// Bumps the execution counter for `sg`; initializes the counter table on
 /// first use (sized to the graph). No-op unless FROND_EXEC_COVERAGE is set.
+/// TEMP (perf profile): FROND_EXEC_COUNTS=1 — per-FUNCTION node-execution
+/// counters (function_id keyed; frame's sg resolves through subgraphs).
+/// Reported at exit keyed by sg_names. Statistical cost: one relaxed atomic
+/// fetch_add per compute under the flag, zero otherwise.
+static EXEC_COUNTS: OnceLock<Vec<std::sync::atomic::AtomicU64>> = OnceLock::new();
+
+pub(super) fn exec_count_bump(graph: &crate::ir::Ir::DataFlowGraph, sg: crate::ir::Ir::SubGraphId) {
+    // 0 = unresolved, 1 = off, 2 = on. One relaxed load on the hot path.
+    static STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    use std::sync::atomic::Ordering::Relaxed;
+    let st = STATE.load(Relaxed);
+    if st == 0 {
+        let on = env_flag("FROND_EXEC_COUNTS");
+        STATE.store(if on { 2 } else { 1 }, Relaxed);
+        if !on {
+            return;
+        }
+    } else if st == 1 {
+        return;
+    }
+    let counts = EXEC_COUNTS.get_or_init(|| {
+        (0..graph.subgraphs.len())
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect::<Vec<_>>()
+    });
+    if let Some(slot) = counts.get(sg.0 as usize) {
+        slot.fetch_add(1, Relaxed);
+    }
+}
+
+/// Exit report for FROND_EXEC_COUNTS: per function-entry sg, aggregate over
+/// its function's sgs.
+pub fn exec_counts_dump(graph: &crate::ir::Ir::DataFlowGraph) {
+    if !env_flag("FROND_EXEC_COUNTS") {
+        return;
+    }
+    let Some(counts) = EXEC_COUNTS.get() else { return };
+    // aggregate per function_id
+    let mut by_fn: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    for (idx, c) in counts.iter().enumerate() {
+        let v = c.load(std::sync::atomic::Ordering::Relaxed);
+        if v > 0 {
+            if let Some(sg) = graph.subgraphs.get(idx) {
+                *by_fn.entry(sg.function_id).or_insert(0) += v;
+            }
+        }
+    }
+    let mut rows: Vec<(u64, &str, u32)> = by_fn
+        .into_iter()
+        .map(|(f, v)| {
+            let name = graph
+                .sg_names
+                .get(f as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("?");
+            (v, name, f)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    let total: u64 = rows.iter().map(|r| r.0).sum();
+    eprintln!("EXECCNT-TOTAL {total}");
+    for (v, name, f) in rows.into_iter().take(40) {
+        let pct = if total > 0 { v as f64 / total as f64 * 100.0 } else { 0.0 };
+        eprintln!("EXECCNT-FN {name} fn={f} count={v} pct={pct:.1}%");
+    }
+}
+
 pub(super) fn exec_cov_bump(sg: crate::ir::Ir::SubGraphId, total_sgs: usize) {
     if !env_flag("FROND_EXEC_COVERAGE") {
         return;
@@ -108,6 +201,38 @@ pub fn exec_cov_dump(graph: &crate::ir::Ir::DataFlowGraph) {
         }
     }
     eprintln!("EXECCOV-SUMMARY std_inv={inv} std_ran={ran}");
+    // TEMP (stmt-drop hunt): per-FUNCTION aggregate over ALL sgs (arms and
+    // loop sgs are nameless — attribute them via function_id). One line per
+    // function entry sg: name, fn_id, number of sgs, total frame starts,
+    // and the per-sg nonzero counts (sg_id:count) for drilling into arms.
+    let mut fn_name: std::collections::HashMap<u32, &str> = std::collections::HashMap::new();
+    for (idx, name) in graph.sg_debug_names.iter().enumerate() {
+        if let Some(name) = name {
+            if let Some(sg) = graph.subgraphs.get(idx) {
+                if sg.id.0 == sg.function_id {
+                    fn_name.entry(sg.function_id).or_insert(name);
+                }
+            }
+        }
+    }
+    let mut by_fn: std::collections::HashMap<u32, Vec<(u32, u32)>> = std::collections::HashMap::new();
+    for (idx, sg) in graph.subgraphs.iter().enumerate() {
+        let c = cov
+            .get(idx)
+            .map_or(0, |c| c.load(std::sync::atomic::Ordering::Relaxed));
+        if c > 0 {
+            by_fn.entry(sg.function_id).or_default().push((sg.id.0, c));
+        }
+    }
+    let mut fns: Vec<u32> = by_fn.keys().copied().collect();
+    fns.sort_unstable();
+    for f in fns {
+        let list = &by_fn[&f];
+        let total: u32 = list.iter().map(|(_, c)| c).sum();
+        let name = fn_name.get(&f).copied().unwrap_or("?");
+        let detail: Vec<String> = list.iter().map(|(s, c)| format!("{s}:{c}")).collect();
+        eprintln!("EXECCOV-FN {name} fn={f} sgs={} total={total} [{}]", list.len(), detail.join(","));
+    }
 }
 
 // =========================================================================
@@ -117,6 +242,7 @@ pub fn exec_cov_dump(graph: &crate::ir::Ir::DataFlowGraph) {
 /// Sentinel for a `pending_inputs` slot marking it as "never ready / external source" (the actual
 /// in-degree must stay below 65535).
 pub(super) const PENDING_EXTERNAL: u16 = u16::MAX;
+
 /// splitmix64 golden-ratio hash constant (ensures each worker steals in a distinct order).
 pub(super) const GOLDEN_RATIO_64: u64 = 0x9E3779B97F4A7C15;
 
@@ -134,7 +260,13 @@ pub struct Engine<S: LockStrategy> {
     pub arena: S::Mutex<ValueArena>,
     pub timer_runtime: S::Mutex<TimerRuntime>,
     pub async_join_runtime: S::Mutex<AsyncJoinRuntime>,
-    pub event_waiters: S::Mutex<Vec<(crate::ir::Ir::RuntimeEvent, FrameId)>>,
+    /// Event-keyed waiter index: event → frames registered for it (registration
+    /// order preserved within a bucket). The old Vec<(event, fid)> form scanned
+    /// the WHOLE table on every event arrival / await-repoll cleanup / frame
+    /// release — O(waiters) each, quadratic on deep async recursion chains
+    /// (n suspended frames → n linear sweeps during unwind). Keyed buckets
+    /// make arrival O(this event's waiters) and recursion linear.
+    pub event_waiters: S::Mutex<std::collections::HashMap<crate::ir::Ir::RuntimeEvent, Vec<FrameId>>>,
     pub pending_completions:
         S::Mutex<HashMap<FrameId, Vec<(crate::ir::Ir::NodeId, Value, crate::ir::Ir::ControlSignal)>>>,
     /// Fallback for event-delivery races: when an event arrives while a frame is being processed by
@@ -552,6 +684,7 @@ impl EngineRef {
             Self::Multi(e) => Engine::<Multi>::run_multi(e),
         };
         exec_cov_dump(&graph);
+        exec_counts_dump(&graph);
         // Teardown cycle sweep: releases any cyclic garbage still registered
         // (roots empty — nothing runs after this).
         let _ = crate::value::Registry::collect_cycles(&[]);

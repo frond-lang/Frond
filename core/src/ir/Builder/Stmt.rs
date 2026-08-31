@@ -783,7 +783,9 @@ impl<'a> IrBuilder<'a> {
                         // Register nested type fields into the current scope (unified with top-level types via type_scope_stack lookup).
                         // Canonical type name (module-qualified for user modules) —
                         // matches registration and the runtime identity.
-                        let canonical: String = self.sema.resolve_type_key(name);
+                        let canonical: String = self
+                            .sema
+                            .resolve_type_key_in(self.current_module().name, name);
                         match def {
                             crate::ast::Ast::TypeDef::Record { fields } => {
                                 let field_names: Vec<String> = fields.iter().map(|f| f.name.to_string()).collect();

@@ -1,0 +1,230 @@
+// Tyops.frond — 1D 差分 battery(与 Rust cli/Dump.rs dump_tyops 逐字节
+// 对齐)。操作序列与 Rust 侧完全同序 — handle 编号是差分锚。
+
+import std.collections.List
+import types.Ty
+import types.Arena
+
+var out: str = ""
+var n: i64 = 0
+
+fun line(s: str): void {
+    n = n + 1
+    out = out + "{n} " + s + "\n"
+}
+
+fun run_unify(a: TypeArena, t1: u32, t2: u32, label: str): void {
+    match unify(a, t1, t2) {
+        Ok(_) => { line(label + " -> ok") }
+        Error(e) => { line(label + " -> err " + unify_err_str(e)) }
+    }
+}
+
+fun run_unify_resolve(a: TypeArena, t1: u32, t2: u32, label: str): void {
+    match unify(a, t1, t2) {
+        Ok(_) => {
+            val r = resolve(a, t1)
+            line(label + " -> ok resolve=" + display(a, r))
+        },
+        Error(e) => { line(label + " -> err " + unify_err_str(e)) }
+    }
+}
+
+fun run_kind(a: TypeArena, k1: SemKind, k2: SemKind, label: str): void {
+    if unify_kind(a, k1, k2) {
+        line(label + " -> ok")
+    } else {
+        line(label + " -> err")
+    }
+}
+
+fun run_kind_resolve(a: TypeArena, k1: SemKind, k2: SemKind, label: str): void {
+    if unify_kind(a, k1, k2) {
+        line(label + " -> ok resolve=" + kind_debug(resolve_kind(a, k1)))
+    } else {
+        line(label + " -> err")
+    }
+}
+
+pub fun run(): str {
+    out = ""
+    n = 0
+    val a = Arena.new_arena()
+
+    // §1 标量构造:name + display 往返。
+    val names = ["bool", "char", "i8", "i16", "i32", "i64", "i128", "u8", "u16",
+        "u32", "u64", "u128", "isize", "usize", "f16", "f32", "f64", "f128",
+        "str", "null", "void", "Lib"]
+    var ni: usize = 0
+    while ni < names.len() {
+        val nm = names[ni]
+        val h = from_scalar_name(a, nm)
+        line("scalar " + nm + " -> " + display(a, h) + " {h}")
+        ni = ni + 1
+    }
+    val unknown = from_scalar_name(a, "not_a_type")
+    line("scalar_unknown -> " + display(a, unknown))
+
+    // §2 类型变量:fresh + display + unify + resolve。
+    val v0 = fresh_type_var(a)
+    val i32h = from_scalar_name(a, "i32")
+    line("var fresh v0 -> " + display(a, v0))
+    run_unify_resolve(a, v0, i32h, "unify v0 i32")
+    val v1 = fresh_type_var(a)
+    run_unify_resolve(a, v1, v0, "unify v1 v0")
+
+    // §3 occurs:v ~ array(v) 必须拒绝。
+    val v2 = fresh_type_var(a)
+    val arr2 = make_array(a, v2, null)
+    run_unify(a, v2, arr2, "unify v2 arr(v2)")
+
+    // §4 刚性变量拒绝绑定。
+    val r0 = fresh_rigid_var(a)
+    run_unify(a, r0, i32h, "unify rigid i32")
+
+    // §5 never/unknown 吸收(原槽覆写 — display 原句柄)。
+    val never = make(a, TNever)
+    match unify(a, never, i32h) {
+        Ok(_) => { line("unify never i32 -> ok display(never-slot)=" + display(a, never)) }
+        Error(e) => { line("unify never i32 -> err " + unify_err_str(e)) }
+    }
+    val uk2 = make(a, TUnknown)
+    match unify(a, i32h, uk2) {
+        Ok(_) => { line("unify i32 unknown -> ok display(unknown-slot)=" + display(a, uk2)) }
+        Error(e) => { line("unify i32 unknown -> err " + unify_err_str(e)) }
+    }
+
+    // §6 标量合一。
+    val i64h = from_scalar_name(a, "i64")
+    run_unify(a, i32h, i64h, "unify i32 i64")
+    val i32b = from_scalar_name(a, "i32")
+    run_unify(a, i32h, i32b, "unify i32 i32")
+
+    // §7 函数:同形 ok / 元数 err / 参数 err / display。
+    val strh = from_scalar_name(a, "str")
+    val f1 = make_fn(a, [i32h, i64h], strh)
+    val f2 = make_fn(a, [i32h, i64h], strh)
+    line("fn display -> " + display(a, f1))
+    run_unify(a, f1, f2, "unify fn fn")
+    val f3 = make_fn(a, [i32h], strh)
+    run_unify(a, f1, f3, "unify fn fn1")
+    val f4 = make_fn(a, [i32h, strh], strh)
+    run_unify(a, f1, f4, "unify fn fn_param")
+
+    // §8 记录:同构 ok / 字段数 err / display。
+    val rec1 = make_record(a, [FT("x", i32h), FT(null, strh)], "Pt")
+    val rec2 = make_record(a, [FT("x", i32h), FT(null, strh)], null)
+    line("record display -> " + display(a, rec1))
+    run_unify(a, rec1, rec2, "unify rec rec")
+    val rec3 = make_record(a, [FT("x", i32h)], null)
+    run_unify(a, rec1, rec3, "unify rec rec1")
+
+    // §9 nullable:ok + T?? 塌缩。
+    val n1 = make_nullable(a, i32h)
+    val n2 = make_nullable(a, i32h)
+    run_unify(a, n1, n2, "unify nullable")
+    val nn = make_nullable(a, n1)
+    line("nullable collapse -> " + display(a, nn) + " {nn}")
+
+    // §10 引用:同形 ok / raw 差 err / display。
+    val rf1 = make_ref(a, i32h, false)
+    val rf2 = make_ref(a, i32h, false)
+    line("ref display -> " + display(a, rf1))
+    run_unify(a, rf1, rf2, "unify ref ref")
+    val rf3 = make_ref(a, i32h, true)
+    run_unify(a, rf1, rf3, "unify ref raw")
+
+    // §11 adt/generic/trait:名+参数合一。
+    val adt1 = make_adt(a, "Option", [i32h])
+    val adt2 = make_adt(a, "Option", [i32h])
+    line("adt display -> " + display(a, adt1))
+    run_unify(a, adt1, adt2, "unify adt adt")
+    val adt3 = make_adt(a, "Optio2", [i32h])
+    run_unify(a, adt1, adt3, "unify adt name")
+    val adt4 = make_adt(a, "Option", [i64h])
+    run_unify(a, adt1, adt4, "unify adt args")
+    val g1 = make_generic(a, "List", [i32h])
+    val g2 = make_generic(a, "List", [i32h])
+    run_unify(a, g1, g2, "unify generic")
+    val t1 = make_trait(a, "Ord", [i32h])
+    val t2 = make_trait(a, "Ord", [i32h])
+    line("trait display -> " + display(a, t1))
+    run_unify(a, t1, t2, "unify trait")
+
+    // §12 数组:切片 + 定长 display + 合一。
+    val as1 = make_array(a, i32h, null)
+    val as2 = make_array(a, i32h, 4 as i64)
+    line("array display -> " + display(a, as1) + " " + display(a, as2))
+    val as3 = make_array(a, i32h, null)
+    run_unify(a, as1, as3, "unify array")
+
+    // §13 throw:双参合一 / display。
+    val th1 = make_throw(a, i32h, strh)
+    line("throw display -> " + display(a, th1))
+    val th2 = make_throw(a, i32h, strh)
+    run_unify(a, th1, th2, "unify throw")
+    val th3 = make_throw(a, strh, strh)
+    run_unify(a, th1, th3, "unify throw value")
+
+    // §14 单参内建泛型:构造 + display + 合一。
+    val ch1 = make_channel(a, i32h)
+    val asy1 = make_async(a, strh)
+    val lz1 = make_lazy(a, i32h)
+    val at1 = make_atomic(a, i32h)
+    val sd1 = make_sender(a, i32h)
+    val rc1 = make_receiver(a, i32h)
+    val ff1 = make_foreign_fn(a, i32h)
+    line("generics display -> " + display(a, ch1) + " " + display(a, asy1) + " "
+        + display(a, lz1) + " " + display(a, at1) + " " + display(a, sd1) + " "
+        + display(a, rc1) + " " + display(a, ff1))
+    val ch2 = make_channel(a, i32h)
+    run_unify(a, ch1, ch2, "unify channel")
+    val asy2 = make_async(a, strh)
+    run_unify(a, asy1, asy2, "unify async")
+    val asy3 = make_async(a, i64h)
+    run_unify(a, asy1, asy3, "unify async value")
+    val lz2 = make_lazy(a, i32h)
+    run_unify(a, lz1, lz2, "unify lazy")
+    val at2 = make_atomic(a, i32h)
+    run_unify(a, at1, at2, "unify atomic")
+    val sd2 = make_sender(a, i32h)
+    run_unify(a, sd1, sd2, "unify sender")
+    val rc2 = make_receiver(a, i32h)
+    run_unify(a, rc1, rc2, "unify receiver")
+    val ff2 = make_foreign_fn(a, i32h)
+    run_unify(a, ff1, ff2, "unify foreignfn")
+
+    // §15 trait object:display + Trait~TraitObject 同名合一 + 名差。
+    val to1 = make_trait_object(a, "Ord", [
+        TMS("lt", 1, i32h, false, true),
+        TMS("cmp", 2, i32h, true, false),
+    ])
+    line("traitobject display -> " + display(a, to1))
+    run_unify(a, t1, to1, "unify trait traitobject")
+    val t3 = make_trait(a, "Eq", [])
+    run_unify(a, t3, to1, "unify trait traitobject_name")
+
+    // §16 module ref display。
+    val mr = make_module_ref(a, "std.io.File", 0)
+    line("moduleref display -> " + display(a, mr))
+
+    // §17 kind:变量 + 合一 + kind_of + arrow + mismatch。
+    val kv = fresh_kind_var(a)
+    run_kind_resolve(a, kv, SKStar, "unify_kind var star")
+    val vk = fresh_type_var_with_kind(a, SKArrow(SKStar, SKStar))
+    line("kind_of arrowvar -> " + kind_debug(kind_of(a, vk)))
+    val k1 = SKArrow(SKStar, SKStar)
+    val k2 = SKArrow(SKStar, SKStar)
+    run_kind(a, k1, k2, "unify_kind arrow arrow")
+    val k3 = SKStar
+    run_kind(a, k1, k3, "unify_kind arrow star")
+    val kv2 = fresh_kind_var(a)
+    run_kind_resolve(a, kv2, k1, "unify_kind var arrow")
+
+    // §18 kind 门:普通 var 与 arrow-kind var 合一失败。
+    val vstar = fresh_type_var(a)
+    val varrow = fresh_type_var_with_kind(a, SKArrow(SKStar, SKStar))
+    run_unify(a, vstar, varrow, "unify vstar varrow")
+
+    out + "! stats\nops={n} types={a.types.len()} details={a.details.len()} type_vars={a.tvars.len()}\n"
+}

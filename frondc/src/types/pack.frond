@@ -1,0 +1,7 @@
+// types 包声明 — 类型系统(1D),目录拓扑镜像 Rust core/src/types/。
+//
+// `import types` 一次引全:Ty(ADT+名字表)/ Arena(竞技场+unify)。
+// Tyops 是 1D 差分 battery(与 `frond debug --stage ty-ops` 逐字节对齐)。
+pub pack Ty
+pub pack Arena
+pub pack Tyops
