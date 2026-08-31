@@ -49,6 +49,8 @@ pub fun link_args(tc: str, os: str, arch: str, obj: str, exe: str): str[] {
             tc + "/linkview/crti.o",
             tc + "/linkview/crtn.o",
             tc + "/linkview/libc.so.6",
+            tc + "/linkview/libc_nonshared.a",
+            "-pie",
             "-dynamic-linker", loader,
             "-o", exe]
 }
