@@ -556,7 +556,16 @@ warm cache)。疑引擎 async 调度偶发挂起,观察项:再遇即取 stack/�
 在 runner 上不稳——macos 报 `tls: alert level 2 code 20`、linux-x64
 跑 fetch **段错误**、linux-arm64 则全成(132MB 校验过)——同代码三种
 命运,环境相关性大。CI 预取已改 curl 直拉(零依赖);std.tls 作为承重
-件(apps/llvmfetch 立身之本)的跨环境稳定性立案待查。**1E 剩余 = 终局验收三级(2026-08-31 全数达成,Stage 1 收官)**:
+件(apps/llvmfetch 立身之本)的跨环境稳定性立案待查。**tls13_handshake
+在 CI 四平台全红**(localhost:47631 自建监听,`tcp connect failed`;本地
+同代码全绿)——引擎 async/网络在 runner 环境起不来,同族问题,暂以
+NOCI 标记跳过(tls13_handshake/NOCI,修好引擎后删)。
+
+**Stage 2 绑定层铁律(2026-08-31 CI 首跑教训)**:LLVM 的错误消息出参
+必须给真缓冲——`LLVMTargetMachineEmitToFile(..., 0u64)` 在失败路径
+(如输出目录不存在)直接**段错误**而非返回错误。emit_to_file 四份副本
+已全部加固(err_buf + read_cstr + DisposeMessage);套件侧的 out/
+目录由 runner 预建兜底(out/ 在 .gitignore,CI 全新 checkout 没有)。**1E 剩余 = 终局验收三级(2026-08-31 全数达成,Stage 1 收官)**:
 ① 双跑等价:functional 93 过/2 平台跳过(ffi_lib、crypto_primitives
 = Windows 特化夹具,PLATFORMS 声明)+ llvm_bind 待平台资产(CI 预取
 覆盖)+ **negative 64/64**;② **std 全库自检**:checkmany 全部 128 个

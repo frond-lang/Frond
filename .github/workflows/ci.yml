@@ -105,6 +105,9 @@ jobs:
           tar -xzf "$tmp/tc.tar.gz" -C "$tmp"
           root="$(find "$tmp" -maxdepth 2 -type d -name "llvm-static-$triple" | head -1)"
           test -n "$root"
+          # crypto_primitives 读 <workspace>/.llvm-dist/llvm-static-<triple>.tar.gz
+          mkdir -p .llvm-dist
+          cp "$tmp/tc.tar.gz" ".llvm-dist/llvm-static-$triple.tar.gz"
           lib="$(find "$root/lib" -maxdepth 1 -name 'llvm.*' ! -name '*.lib' | head -1)"
           test -n "$lib"
           cp "$lib" tests/functional/llvm_bind/src/assets/llvm-native.bin

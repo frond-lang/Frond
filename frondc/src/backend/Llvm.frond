@@ -293,9 +293,27 @@ pub fun dispose_target_machine(lib: Lib, tm: u64): void {
 pub fun emit_to_file(lib: Lib, tm: u64, module: u64, path: str, object_file: bool): Throw<void, FfiError> {
     val ft = if object_file { 1u32 } else { 0u32 }
     val f: ForeignFn<i32> = lib.lookup("LLVMTargetMachineEmitToFile", "u64, u64, cstr, u32, cbuf")?
-    val rc = f.call(tm, module, path, ft, 0u64)?
+    // 错误消息出参必须给真缓冲:传 NULL 时 emit 失败(如输出目录不存在)
+    // 会直接段错误而不是返回错误——CI 全新 checkout 无 out/ 目录时踩中。
+    val err_buf: u64[] = [0u64]
+    val rc = f.call(tm, module, path, ft, err_buf)?
     if rc != 0 {
-        throw FfiError(CallFailed, "LLVMTargetMachineEmitToFile failed: " + path)
+        var msg = "unknown emit failure"
+        if err_buf[0] != 0u64 {
+            val crt = Lib.open(crt_lib_name())?
+            msg = read_cstr(crt, err_buf[0])?
+            crt.close()
+            match lib.lookup("LLVMDisposeMessage", "cstr") {
+                Ok(free_msg) => {
+                    match free_msg.call(err_buf[0]) {
+                        Ok(_) => {}
+                        Error(_) => {}
+                    }
+                },
+                Error(_) => {}
+            }
+        }
+        throw FfiError(CallFailed, "LLVMTargetMachineEmitToFile failed for " + path + ": " + msg)
     }
     Ok(void)
 }
