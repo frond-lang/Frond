@@ -551,7 +551,12 @@ warnings 节随全节比对通过(原「镜像多 6 条 unreachable」残差同�
 **新立案(未复现)**:qualified_types 的一次 checkmany 运行 >900s 被
 超时杀(stdout 空致差分假红),此后同命令 3/3 复跑全绿(39s/2551 行,
 warm cache)。疑引擎 async 调度偶发挂起,观察项:再遇即取 stack/计时
-分段定位,不阻断主线。**1E 剩余 = 终局验收三级(2026-08-31 全数达成,Stage 1 收官)**:
+分段定位,不阻断主线。
+**引擎网络栈观察(2026-08-31 CI 首跑)**:llvmfetch(自研 TLS 1.3 客户端)
+在 runner 上不稳——macos 报 `tls: alert level 2 code 20`、linux-x64
+跑 fetch **段错误**、linux-arm64 则全成(132MB 校验过)——同代码三种
+命运,环境相关性大。CI 预取已改 curl 直拉(零依赖);std.tls 作为承重
+件(apps/llvmfetch 立身之本)的跨环境稳定性立案待查。**1E 剩余 = 终局验收三级(2026-08-31 全数达成,Stage 1 收官)**:
 ① 双跑等价:functional 93 过/2 平台跳过(ffi_lib、crypto_primitives
 = Windows 特化夹具,PLATFORMS 声明)+ llvm_bind 待平台资产(CI 预取
 覆盖)+ **negative 64/64**;② **std 全库自检**:checkmany 全部 128 个
