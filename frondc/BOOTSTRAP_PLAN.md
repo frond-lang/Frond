@@ -567,6 +567,26 @@ warm cache)。疑引擎 async 调度偶发挂起,观察项:再遇即取 stack/�
 在 runner 上不稳——macos 报 `tls: alert level 2 code 20`、linux-x64
 跑 fetch **段错误**、linux-arm64 则全成(132MB 校验过)——同代码三种
 命运,环境相关性大。CI 预取已改 curl 直拉(零依赖);std.tls 作为承重
+
+**引擎 UAF 双案(2026-09-01,ASAN -Zbuild-std 全插桩定位)**:
+**案一(已修)**:marshal 的 AoS 序列化臂序错误——u8-blob 兼容臂先于
+同 tag 臂,`arr[0..n]` 切片(i64 元素向量)被逐元素压成 N 字节,而配对
+Int 槽仍是元素数 → C 侧 `count*8` 读短缓冲(ASAN:8 字节区读 24;
+无 ASAN:静默读相邻堆=错值,或 SIGSEGV)。**CI 的 await 家族抖动 =
+此 UB 的显形**。修 = 臂序对调(Value.rs,5bedfdc);List.from+push
+最小复现、collections/edge_async ASAN 全绿、全套件回归绿。
+**案二(立案待修,帧链所有权)**:reuse chain(parent_frame_ptr/
+root_frame_ptr 裸指针)与帧池无生命周期契约——祖先帧完成即池化/
+溢出释放,裸指针悬空(get_value_by_global 走链 UAF,双栈:
+释放 T13 process_frame→release vs 访问 T17 run_frame_nodes)。
+引用计数+墓园方案已原型并验证到「确定性复现」(20/20),但残余
+**帧所有权双释放**(complete_and_wake_caller 与 worker 执行竞争,
+账本正确走完仍崩)超出链会计范围——已回退,黄金资产留下:
+ASAN 全插桩构建命令、审计日志法(chain_refs 流水+差分平衡分析)、
+确定性触发(await_loop 单跑 ASAN)。根治方向:release 前清链 +
+set/drop 全走 set_chain_ptrs 单点 + acquire 重置账本(三者缺一
+不可,均已原型过),最后一步需吃透 complete_and_wake_caller 的
+所有权语义(引擎作者领域)。
 件(apps/llvmfetch 立身之本)的跨环境稳定性立案待查。**tls13_handshake
 在 CI 四平台全红**(localhost:47631 自建监听,`tcp connect failed`;本地
 同代码全绿)——引擎 async/网络在 runner 环境起不来,同族问题,暂以
