@@ -1934,23 +1934,21 @@ impl ArrayValue {
             };
             return Some((bytes, tag));
         }
-        // AoS fallback. Two shapes reach here (no SoA column):
-        // 1. The legacy u8-blob idiom: `blob ++ args[i].bytes() ++ [0]` — the
-        //    `[0]` literal is i32-tagged, so a u8[]-typed array can carry MIXED
-        //    integer tags. Those serialize per-element to single bytes (exact
-        //    legacy `collect_u8_bytes` semantics; writeback rewrites every
-        //    element to u8, normalizing the tags).
-        // 2. A homogeneous scalar array whose SoA was invalidated by a soft
-        //    store — serialize natively by that tag.
-        let first = self.elements.first()?.scalar_tag()?;
-        if self.elements.iter().all(|e| e.scalar_tag().is_some_and(is_int_scalar_tag)) {
-            return Some((self.elements.iter().map(|e| e.as_u8()).collect(), ValueTag::U8));
-        }
-        let tag = first;
-        if !self.elements.iter().all(|e| e.scalar_tag() == Some(tag)) {
-            return None;
-        }
-        let bytes: Vec<u8> = match tag {
+                // AoS fallback (no SoA column). ORDER MATTERS:
+        // 1. Homogeneous column (e.g. an i64 slice copied out as elements, or a
+        //    SoA column invalidated by a soft store) — serialize natively by
+        //    that tag, matching scalar_marshal_tag and the paired Int slot's
+        //    element count. Must run FIRST: with the u8-blob arm first, a 3×i64
+        //    slice serialized to 3 BYTES while the Int slot kept 3 elements —
+        //    the C side then read count*esize from an undersized words buffer
+        //    (heap-buffer-overflow under ASAN, silent garbage or SIGSEGV
+        //    otherwise depending on heap layout).
+        // 2. Legacy u8-blob idiom (`blob ++ args[i].bytes() ++ [0]`): mixed
+        //    INTEGER tags serialize per-element to single bytes; writeback
+        //    rewrites every element to u8, normalizing the tags.
+        let tag = self.elements.first()?.scalar_tag()?;
+        if self.elements.iter().all(|e| e.scalar_tag() == Some(tag)) {
+            let bytes: Vec<u8> = match tag {
             ValueTag::I8 => self.elements.iter().flat_map(|e| e.as_i8().to_ne_bytes()).collect(),
             ValueTag::I16 => self.elements.iter().flat_map(|e| e.as_i16().to_ne_bytes()).collect(),
             ValueTag::I32 => self.elements.iter().flat_map(|e| e.as_i32().to_ne_bytes()).collect(),
@@ -1979,7 +1977,12 @@ impl ArrayValue {
             }).collect(),
             _ => return None,
         };
-        Some((bytes, tag))
+            return Some((bytes, tag));
+        }
+        if self.elements.iter().all(|e| e.scalar_tag().is_some_and(is_int_scalar_tag)) {
+            return Some((self.elements.iter().map(|e| e.as_u8()).collect(), ValueTag::U8));
+        }
+        None
     }
 
     /// The element tag `collect_scalar_bytes` will serialize this array with
