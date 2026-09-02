@@ -301,6 +301,14 @@ pub struct Engine<S: LockStrategy> {
     pub global_queue: Option<Injector<FrameId>>,
     pub wakeup: Option<(ParkingMutex<()>, Condvar)>,
     pub active_count: Option<ParkingMutex<usize>>,
+    /// Queue-membership set (Multi only): at most ONE pending ready-queue
+    /// entry per frame. Root fix (2026-09) for the duplicate-entry family:
+    /// the suspension handoff pushes AND the wake path pushes the same frame,
+    /// and a stale second entry that survived to a relaunch double-executed
+    /// the frame from its entry node (the CI-flaky await_loop corruption /
+    /// hang family). push/pop are guarded by the same mutex so membership and
+    /// queue content can never desynchronize.
+    pub queued_dedup: Option<ParkingMutex<HashSet<FrameId>>>,
     // pub(super): the struct is defined in engine::EngineCore; sibling submodules (Strategy, etc.)
     // must be allowed to write this field when constructing `Engine { ... }`.
     pub(super) _strategy: std::marker::PhantomData<S>,
@@ -558,10 +566,11 @@ impl EngineRef {
     /// workers (= `available_parallelism`); otherwise use a single thread.
     /// Key point: the reachability analysis only considers subgraphs callable from the entry, so
     /// "compiled-but-uncalled" stdlib async functions (such as open/read_file/sleep) are not
-    /// mistaken as requiring multiple workers.
-    /// A purely synchronous program has no suspension points, so single-threaded dataflow
-    /// scheduling is most efficient (no work-stealing overhead); a program containing async has
-    /// suspend/wake behavior, so multiple workers advancing frames concurrently is more efficient.
+    /// mistaken as async-requiring.
+    /// A purely synchronous program has no suspension points, so it takes the
+    /// `Single` variant; a program containing async takes `Multi`. Both
+    /// variants execute the same deterministic single-threaded event loop —
+    /// `Multi` is the async-capable marker, not a worker pool.
     pub fn new(graph: DataFlowGraph) -> Self {
         let mut graph = graph;
         // .fndo hot-path parity: loaded (mmap-backed) graphs unpack the

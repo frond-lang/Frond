@@ -9,11 +9,11 @@
 //! stack alignment / register allocation / stack arguments automatically.
 //!
 //! **Architecture-independent**: the trampoline table is defined in
-//! [`crate::platform::AbiTable`] using fully-typed `extern "C" fn` signatures, so
+//! [`crate::platform::Invoke`] (generated, order-preserving) using fully-typed `extern "C" fn` signatures, so
 //! rustc emits the ABI-correct code for each target platform. Differences in
 //! register capacity across SysV/Win64/AAPCS do not affect correctness (arguments
 //! beyond the register file spill onto the stack automatically), so neither this
-//! module nor `platform::AbiTable` carries any `#[cfg(target_arch)]`.
+//! module nor `platform::Invoke` carries any `#[cfg(target_arch)]`.
 //!
 //! Aggregate submodules:
 //! - [`Sig`]: ABI type and signature descriptions (AbiType / AbiSig / AbiSlot / RetSlot)

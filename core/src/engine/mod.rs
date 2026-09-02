@@ -40,7 +40,7 @@ pub use Frame::{prepare_defer_frame_sync, prepare_same_function_frame_sync};
 
 // Scheduler constants/helpers originate from EngineCore.rs; they are re-imported here into the
 // engine namespace so that submodules can use them by bare name after `use super::*`
-// (PENDING_EXTERNAL / GOLDEN_RATIO_64 / env_flag).
+// (PENDING_EXTERNAL / env_flag).
 // Note: the `Engine` / `EngineRef` types are already re-exported via the `pub use` above and must
 // not be re-`use`d here, otherwise they conflict with the `EngineCore` module name in the type
 // namespace (E0255).
@@ -60,12 +60,21 @@ mod ProgramArgs {
     use std::sync::OnceLock;
     use parking_lot::Mutex;
 
-    static ARGS: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+    // Leaked boxed slices: the C accessors hand raw (ptr, len) pairs into the
+    // linked frond_extern objects, so the backing bytes must live for the
+    // process lifetime. Leaking one short buffer per argv entry per process
+    // is bounded and intentional — the previous Mutex<Vec<Vec<u8>>> +
+    // lifetime-transmuted return handed out slices that a second `set`
+    // would dangle (and the lock is kept only to serialize re-sets).
+    static ARGS: OnceLock<Mutex<Vec<&'static [u8]>>> = OnceLock::new();
 
     pub fn set(args: Vec<String>) {
         let slot = ARGS.get_or_init(|| Mutex::new(Vec::new()));
         let mut g = slot.lock();
-        *g = args.into_iter().map(|a| a.into_bytes()).collect();
+        *g = args
+            .into_iter()
+            .map(|a| Box::leak(a.into_bytes().into_boxed_slice()) as &'static [u8])
+            .collect();
     }
 
     pub fn count() -> i32 {
@@ -75,7 +84,7 @@ mod ProgramArgs {
     pub fn get(i: i32) -> Option<&'static [u8]> {
         let m = ARGS.get()?;
         let g = m.lock();
-        g.get(i as usize).map(|v| unsafe { std::mem::transmute::<&[u8], &'static [u8]>(v.as_slice()) })
+        g.get(i as usize).copied()
     }
 }
 

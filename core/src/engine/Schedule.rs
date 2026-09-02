@@ -682,7 +682,7 @@ impl<S: LockStrategy> Engine<S> {
                             self.frames.lock().insert(body_fid, body);
                             frame.cached_child_frame = Some(body_fid);
                             queue.push(body_fid);
-                            self.event_waiters
+                                                        self.event_waiters
                                 .lock()
                                 .entry(RuntimeEvent::SubgraphComplete(body_fid))
                                 .or_default()
@@ -885,7 +885,7 @@ impl<S: LockStrategy> Engine<S> {
                             // in process_frame then applies verbatim).
                             self.frames.lock().insert(child_fid, child);
                             queue.push(child_fid);
-                            self.event_waiters
+                                                        self.event_waiters
                                 .lock()
                                 .entry(RuntimeEvent::SubgraphComplete(child_fid))
                                 .or_default()

@@ -1049,7 +1049,15 @@ impl<'a> IrBuilder<'a> {
     // compute_fns, never reaching the @extern dispatch path.)
 
     /// Build an AbiSig from a @extern("C") #{ }# function's declared params/return_type.
-    /// str params are expanded to (Ptr, Int) two slots. Unknown types fall back to Int{64}.
+    /// str params are expanded to (Ptr, Int) two slots.
+    ///
+    /// Rejects ABI shapes the dynamic caller cannot marshal instead of
+    /// silently degrading them to a single Int64 slot (which shifted every
+    /// trailing argument into the wrong register): scalar i128/u128/f128/f16
+    /// params (the C side expands them to register pairs — marshal them as
+    /// single-element arrays instead, the __mem_fill_* pattern) and
+    /// str/i128/u128/f128 returns (the C side appends trailing out-pointers
+    /// the runtime never passes).
     pub(super) fn build_abi_sig(&self, name: &str) -> crate::ffi::Abi::AbiSig {
         use crate::ast::Ast::Decl;
         let mut params = Vec::new();
@@ -1062,10 +1070,20 @@ impl<'a> IrBuilder<'a> {
                     let arena = &m.arena;
                     for p in decl_params.iter() {
                         let ty_name = type_name_in_arena(p.type_annotation, arena);
+                        if matches!(ty_name.as_str(), "i128" | "u128" | "f128" | "f16") {
+                            panic!(
+                                "@extern(\"C\") '{name}': scalar parameter type '{ty_name}' has                                  no dynamic-call ABI (the C side expands it to register pairs).                                  Pass it as a single-element array instead — the                                  `__mem_fill_i128(buf, [value])` pattern."
+                            );
+                        }
                         self.push_abi_types(&ty_name, &mut params);
                     }
                     if let Some(rt) = return_type {
                         let rt_name = type_name_in_arena(Some(*rt), arena);
+                        if matches!(rt_name.as_str(), "str" | "i128" | "u128" | "f128") {
+                            panic!(
+                                "@extern(\"C\") '{name}': return type '{rt_name}' uses the                                  C-side out-parameter pattern, which the dynamic caller does                                  not append. Return through a caller-provided array                                  out-parameter instead."
+                            );
+                        }
                         ret = self.abi_type_of(&rt_name);
                     }
                     break;

@@ -125,9 +125,18 @@ pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> 
                             .to_string()
                     })?;
                     if arr.len() == 0 && arr.scalar_soa.is_none() {
-                        static EMPTY_ELEMS: u64 = 0;
-                        slots.push(AbiSlot::Ptr(&EMPTY_ELEMS as *const u64 as *mut core::ffi::c_void));
+                        // Empty cbuf: a per-call keepalive word, NOT a read-only
+                        // static — out-parameter APIs write through the pointer,
+                        // and C mutating a `*const` static is UB (an access
+                        // violation on .rodata pages). Nothing to serialize,
+                        // nothing to write back.
+                        buffers.push(ArgBuf::Array { words: vec![0u64], nbytes: 0 });
+                        let ptr = match buffers.last() {
+                            Some(ArgBuf::Array { words, .. }) => words.as_ptr(),
+                            _ => unreachable!(),
+                        };
                         buf_owners.push(core::ptr::null());
+                        slots.push(AbiSlot::Ptr(ptr as *mut core::ffi::c_void));
                         param_idx += 1;
                         arg_idx += 1;
                         continue;
@@ -181,8 +190,16 @@ pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> 
                 // an empty operand), so hand C a non-null aligned pointer with
                 // element count 0. Nothing to serialize, nothing to write back.
                 if arr.len() == 0 && arr.scalar_soa.is_none() {
-                    static EMPTY_ELEMS: u64 = 0;
-                    slots.push(AbiSlot::Ptr(&EMPTY_ELEMS as *const u64 as *mut core::ffi::c_void));
+                    // Same per-call empty-buffer rule as the cbuf arm: writable,
+                    // 8-aligned, non-null — a legal C shape for zero-length
+                    // calls (never a read-only static handed out as *mut).
+                    buffers.push(ArgBuf::Array { words: vec![0u64], nbytes: 0 });
+                    let ptr = match buffers.last() {
+                        Some(ArgBuf::Array { words, .. }) => words.as_ptr(),
+                        _ => unreachable!(),
+                    };
+                    buf_owners.push(owner);
+                    slots.push(AbiSlot::Ptr(ptr as *mut core::ffi::c_void));
                     slots.push(AbiSlot::Int(0));
                     param_idx += 2;
                     arg_idx += 1;
@@ -268,7 +285,15 @@ pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> 
                 slots.push(AbiSlot::Int(arg.as_i64() as u64));
             }
             AbiType::Float32 => {
-                slots.push(AbiSlot::Float(arg.as_f32() as f64));
+                // f32 params cross in the LOW 32 BITS of the SSE register:
+                // every x64/aarch64 C ABI has the callee read `float` from the
+                // low half. Widening numerically to f64 leaves the DOUBLE
+                // encoding's low half there (1.5f32 → low32 = 0 → the callee
+                // reads 0.0f — verified against an MSVC-compiled callee). Pack
+                // the f32 BITS into the f64 transport word instead; the high
+                // half is a denormal garbage tail the callee never reads.
+                let bits = arg.as_f32().to_bits() as u64;
+                slots.push(AbiSlot::Float(f64::from_bits(bits)));
             }
             AbiType::Float64 => {
                 slots.push(AbiSlot::Float(arg.as_f64()));

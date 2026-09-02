@@ -8,6 +8,9 @@
 //! When adding a new platform, **only this module needs to change** — this is
 //! the verifiable criterion that platform dispatch is centralized here.
 
-pub mod AbiTable;
+// Attributes for the include!'d generated table (inner attributes cannot
+// appear in an include! fragment).
+#[allow(non_snake_case, unused_parens, clippy::all)]
+pub mod Invoke;
 pub mod Dylib;
 pub mod ResolveSelfSymbol;

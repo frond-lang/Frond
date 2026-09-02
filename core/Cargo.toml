@@ -5,6 +5,10 @@ edition = "2021"
 build = "build.rs"
 
 [dependencies]
+# Cross-platform allocator (Microsoft, MSVC/GCC/Clang, x64/arm64): the engine
+# and compiler are allocation-heavy (frames, HashMaps, strings); mimalloc's
+# thread-local free lists beat the system allocator on Windows.
+mimalloc = "0.1"
 bumpalo = { version = "3", features = ["collections"] }
 wide = "0.7"
 rayon = "1"

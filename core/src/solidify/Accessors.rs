@@ -105,9 +105,19 @@ impl DataFlowGraph {
             let r = mem.section(SectionKind::Inputs);
             let start = offset as usize * 4;
             let n = count as usize;
+            // Bounds check BEFORE the raw slice: offset/count come from the
+            // file, and a crafted or truncated .fndo must not turn them into
+            // an out-of-bounds read (checked panic = crash-level, not UB).
+            if start.checked_add(n * 4).map_or(true, |end| end > r.len()) {
+                panic!(
+                    "corrupt .fndo: node inputs [{start}..{}) exceed Inputs section len {}",
+                    start + n * 4,
+                    r.len()
+                );
+            }
             // SAFETY: NodeId is #[repr(transparent)] over u32 (4 bytes, 4-byte aligned).
             // The Inputs section starts 4-byte aligned (section align = 4), and start = offset*4 is a multiple of 4.
-            // The slice [start..start+n*4] is within the section bounds (the IR guarantees offset+count <= total).
+            // The slice [start..start+n*4] is within the section bounds (checked above).
             unsafe {
                 std::slice::from_raw_parts(r.as_ptr().add(start) as *const NodeId, n)
             }
@@ -357,9 +367,18 @@ impl DataFlowGraph {
             let r = mem.section(SectionKind::SgUpvalueNodes);
             let byte_start = off as usize;
             let count = len as usize;
+            // Bounds check BEFORE the raw slice (file-controlled offsets;
+            // checked panic on a corrupt .fndo instead of an OOB read).
+            if byte_start.checked_add(count * 4).map_or(true, |end| end > r.len()) {
+                panic!(
+                    "corrupt .fndo: sg[{sg_idx}] upvalue nodes [{byte_start}..{} exceed SgUpvalueNodes section len {}",
+                    byte_start + count * 4,
+                    r.len()
+                );
+            }
             // SAFETY: NodeId is #[repr(transparent)] over u32 (4 bytes, 4-byte aligned).
             // The SgUpvalueNodes section is 4-byte aligned, and offset was written during serialization (a multiple of 4).
-            // The slice range is within the section bounds (serialization guarantees offset + count*4 <= section len).
+            // The slice range is within the section bounds (checked above).
             unsafe {
                 std::slice::from_raw_parts(r.as_ptr().add(byte_start) as *const NodeId, count)
             }

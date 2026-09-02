@@ -102,17 +102,75 @@ impl<T> Lockable<T> for TracedMutex<T> {
 }
 
 /// Frame-queue abstraction: Single uses `RefCell<VecDeque>`, Multi uses `DequeWorker`.
+///
+/// Multi pushes are IDEMPOTENT: `dedup` tracks queue membership and a second
+/// push of an already-queued frame is dropped. Root fix for the duplicate-
+/// entry family (see `Engine::queued_dedup`).
 pub enum QueueHandle<'a> {
     Single(&'a RefCell<std::collections::VecDeque<FrameId>>),
-    Multi(&'a DequeWorker<FrameId>),
+    Multi {
+        worker: &'a DequeWorker<FrameId>,
+        dedup: &'a ParkingMutex<HashSet<FrameId>>,
+    },
 }
 impl QueueHandle<'_> {
     pub fn push(&self, fid: FrameId) {
         match self {
             Self::Single(q) => q.borrow_mut().push_back(fid),
-            Self::Multi(q) => q.push(fid),
+            Self::Multi { worker, dedup } => {
+                // Insert-then-push under one lock: membership and queue
+                // content cannot desynchronize (pops take the same lock).
+                let mut set = dedup.lock();
+                if set.insert(fid) {
+                    worker.push(fid);
+                }
+            }
         }
     }
+}
+
+/// Pops the worker's local deque under the dedup lock (see QueueHandle::push).
+#[inline]
+fn pop_local_dedup(
+    local_queue: &DequeWorker<FrameId>,
+    dedup: &ParkingMutex<HashSet<FrameId>>,
+) -> Option<FrameId> {
+    let mut set = dedup.lock();
+    let fid = local_queue.pop();
+    if let Some(f) = &fid {
+        set.remove(f);
+    }
+    fid
+}
+
+/// Steals one frame under the dedup lock (see QueueHandle::push).
+#[inline]
+fn steal_dedup(
+    stealers: &[Stealer<FrameId>],
+    worker_id: usize,
+    seed: &mut u64,
+    dedup: &ParkingMutex<HashSet<FrameId>>,
+) -> Option<FrameId> {
+    let mut set = dedup.lock();
+    let fid = try_steal(stealers, worker_id, seed);
+    if let Some(f) = &fid {
+        set.remove(f);
+    }
+    fid
+}
+
+/// Steals from the global injector under the dedup lock (see QueueHandle::push).
+#[inline]
+fn steal_global_dedup(
+    injector: &Injector<FrameId>,
+    dedup: &ParkingMutex<HashSet<FrameId>>,
+) -> Option<FrameId> {
+    let mut set = dedup.lock();
+    let fid = injector.steal().success();
+    if let Some(f) = &fid {
+        set.remove(f);
+    }
+    fid
 }
 
 // =========================================================================
@@ -143,6 +201,7 @@ impl Engine<Single> {
             global_queue: None,
             wakeup: None,
             active_count: None,
+            queued_dedup: None,
             _strategy: std::marker::PhantomData,
         }
     }
@@ -254,6 +313,7 @@ impl Engine<Multi> {
             global_queue: Some(Injector::new()),
             wakeup: Some((ParkingMutex::new(()), Condvar::new())),
             active_count: Some(ParkingMutex::new(num_workers)),
+            queued_dedup: Some(ParkingMutex::new(HashSet::new())),
             _strategy: std::marker::PhantomData,
         }
     }
@@ -457,8 +517,8 @@ fn worker_loop(
         }
 
         // 1. pop_local (LIFO, cache-friendly).
-        if let Some(fid) = local_queue.pop() {
-            let queue = QueueHandle::Multi(&local_queue);
+        if let Some(fid) = pop_local_dedup(&local_queue, shared.queued_dedup.as_ref().unwrap()) {
+            let queue = QueueHandle::Multi { worker: &local_queue, dedup: shared.queued_dedup.as_ref().unwrap() };
             shared.hang_progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             shared.process_frame(fid, &queue);
             {
@@ -469,8 +529,8 @@ fn worker_loop(
         }
 
         // 2. try_steal (random victim, FIFO steal).
-        if let Some(fid) = try_steal(&stealers, worker_id, &mut steal_seed) {
-            let queue = QueueHandle::Multi(&local_queue);
+        if let Some(fid) = steal_dedup(&stealers, worker_id, &mut steal_seed, shared.queued_dedup.as_ref().unwrap()) {
+            let queue = QueueHandle::Multi { worker: &local_queue, dedup: shared.queued_dedup.as_ref().unwrap() };
             shared.hang_progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             shared.process_frame(fid, &queue);
             {
@@ -481,8 +541,8 @@ fn worker_loop(
         }
 
         // 3. try_global (global injector queue).
-        if let Some(fid) = shared.global_queue.as_ref().unwrap().steal().success() {
-            let queue = QueueHandle::Multi(&local_queue);
+        if let Some(fid) = steal_global_dedup(shared.global_queue.as_ref().unwrap(), shared.queued_dedup.as_ref().unwrap()) {
+            let queue = QueueHandle::Multi { worker: &local_queue, dedup: shared.queued_dedup.as_ref().unwrap() };
             shared.hang_progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             shared.process_frame(fid, &queue);
             {
@@ -496,25 +556,29 @@ fn worker_loop(
         // Combining the active_count decrement and the park into the same wakeup-lock critical
         // section eliminates the lost-wakeup window: notify_one must acquire the wakeup lock first,
         // so a notification cannot slip between the decrement and wait_for.
+        //
+        // active_count bookkeeping (HANG-class fix, 2026-09): the counter means
+        // "workers not parked". A worker entering this block is still ACTIVE — it
+        // only decrements below, immediately before parking. The early-exit /
+        // re-check arms therefore must NOT touch the counter: the three
+        // `*active += 1` here were unpaired increments that permanently inflated
+        // the count, after which `*active == 0` (the quiescence rescue sweep for
+        // stranded Ready frames AND the all-idle deadlock exit) could never fire
+        // again — lost wakeups degenerated from 10ms self-heals into permanent
+        // hangs (the CI-flaky await_loop class).
         {
             let mut guard = shared.wakeup.as_ref().unwrap().0.lock();
             if shared.result.lock().is_some() || shared.panic_payload.lock().is_some() {
-                let mut active = shared.active_count.as_ref().unwrap().lock();
-                *active += 1;
                 return;
             }
             if !local_queue.is_empty() || !shared.global_queue.as_ref().unwrap().is_empty() {
-                let mut active = shared.active_count.as_ref().unwrap().lock();
-                *active += 1;
                 continue;
             }
             // Check timers before parking (a timer may have expired during park preparation).
-            let queue = QueueHandle::Multi(&local_queue);
+            let queue = QueueHandle::Multi { worker: &local_queue, dedup: shared.queued_dedup.as_ref().unwrap() };
             shared.check_timers(&queue);
             // check_timers may push ready frames into local_queue; re-check to avoid a spurious park.
             if !local_queue.is_empty() || !shared.global_queue.as_ref().unwrap().is_empty() {
-                let mut active = shared.active_count.as_ref().unwrap().lock();
-                *active += 1;
                 continue;
             }
             // Decrement the active count (inside the wakeup lock, eliminating the lost-wakeup window).
@@ -537,10 +601,24 @@ fn worker_loop(
                     // that window exists only while some worker is mid-dispatch,
                     // and here every other worker is parked.
                     {
-                        let stashed: std::collections::HashSet<FrameId> = {
+                        // Stash stranding check covers BOTH stash tables: a
+                        // completion (or event) that arrived while the frame was
+                        // out of the map, landing AFTER the frame's own dispatch
+                        // already drained, leaves the frame Suspended in-map with
+                        // no queue entry — only a re-dispatch (whose Suspended
+                        // branch drains stashes) can consume it. The sweep
+                        // originally covered pending_events only; a stashed
+                        // COMPLETION stranded its frame identically (verified by
+                        // deadlock-exit dumps: pending_completions=[child] while
+                        // the parent sat Suspended forever).
+                        let mut stashed: std::collections::HashSet<FrameId> = {
                             let pe = shared.pending_events.lock();
                             pe.keys().copied().collect()
                         };
+                        {
+                            let pc = shared.pending_completions.lock();
+                            stashed.extend(pc.keys().copied());
+                        }
                         let frames = shared.frames.lock();
                         for (fid, f) in frames.iter() {
                             if f.state == FrameState::Ready {
@@ -568,10 +646,92 @@ fn worker_loop(
                         *active += 1;
                         false
                     } else {
-                        // Last active worker: check whether there are pending timers or event_waiters.
-                        let has_pending_timer = shared.timer_runtime.lock().next_deadline().is_some();
-                        let has_event_waiters = !shared.event_waiters.lock().is_empty();
-                        !has_pending_timer && !has_event_waiters
+                        // Reconciler at true quiescence: re-verify every
+                        // registered waiter's event source. An AsyncJoin whose
+                        // result is stored but whose delivery was lost (the
+                        // completion fired while the waiter was mid-registration
+                        // — woken==0 — and the registration-side repoll also
+                        // missed it) is re-delivered here. At this instant every
+                        // other worker is parked, so the delivery races nothing.
+                        let mut redelivered = false;
+                        let stale_joins: Vec<(crate::ir::Ir::AsyncHandleId, Value)> = {
+                            let ew = shared.event_waiters.lock();
+                            let mut out = Vec::new();
+                            for (evt, waiters) in ew.iter() {
+                                if waiters.is_empty() {
+                                    continue;
+                                }
+                                if let RuntimeEvent::AsyncJoin(id) = evt {
+                                    // try_get_result CONSUMES the entry; the
+                                    // value is re-delivered right after (or
+                                    // restored in the defensive arm below).
+                                    if let Some(v) = shared
+                                        .async_join_runtime
+                                        .lock()
+                                        .try_get_result(*id)
+                                    {
+                                        out.push((*id, v));
+                                    }
+                                }
+                            }
+                            out
+                        };
+                        for (id, v) in stale_joins {
+                            let woken = shared.on_event_arrived(
+                                RuntimeEvent::AsyncJoin(id),
+                                v.clone(),
+                                &queue,
+                            );
+                            if woken > 0 {
+                                shared.async_join_runtime.lock().remove_entry(id);
+                                redelivered = true;
+                            } else {
+                                // Defensive (quiescent: cannot race): restore the
+                                // consumed result for a future poll.
+                                shared.async_join_runtime.lock().set_result(id, v);
+                            }
+                        }
+                        if redelivered {
+                            *active += 1;
+                            false
+                        } else {
+                            // Exit whenever no timer is pending. If waiters
+                            // remain, they are PROVABLY permanent: every event
+                            // source is a frame (none runnable — the sweep found
+                            // nothing) or a timer (none pending). Exiting makes
+                            // run_multi fail loudly with a full state dump for
+                            // the post-mortem, instead of parking forever.
+                            let has_pending_timer =
+                                shared.timer_runtime.lock().next_deadline().is_some();
+                            if !has_pending_timer {
+                                eprintln!("[DEADLOCK-EXIT] provably permanent waiters — engine state:");
+                                for (evt, waiters) in shared.event_waiters.lock().iter() {
+                                    eprintln!("  waiter evt={evt:?} frames={waiters:?}");
+                                }
+                                for (fid, f) in shared.frames.lock().iter() {
+                                    eprintln!(
+                                        "  frame {fid:?} sg={} state={:?} suspend={:?} event={:?} caller={:?}",
+                                        f.subgraph_id.0, f.state, f.suspend_state, f.suspend_event, f.caller
+                                    );
+                                }
+                                let pe = shared.pending_events.lock();
+                                if !pe.is_empty() {
+                                    eprintln!("  pending_events keys={:?}", pe.keys().collect::<Vec<_>>());
+                                }
+                                let pc = shared.pending_completions.lock();
+                                if !pc.is_empty() {
+                                    eprintln!("  pending_completions keys={:?}", pc.keys().collect::<Vec<_>>());
+                                }
+                                let dw = shared.defer_waiters.lock();
+                                if !dw.is_empty() {
+                                    eprintln!("  defer_waiters={:?}", dw.iter().collect::<Vec<_>>());
+                                }
+                                for line in shared.async_join_runtime.lock().debug_dump() {
+                                    eprintln!("  join: {line}");
+                                }
+                            }
+                            !has_pending_timer
+                        }
                     }
                 } else {
                     false
