@@ -1685,8 +1685,7 @@ impl<S: LockStrategy> Engine<S> {
                 // ENGINE arena's ref slots, and the thread_local GLOBAL_ARENA's
                 // ref slots (Closure bound_args handles live there, not in
                 // self.arena).
-                if self.worker_count <= 1
-                    && crate::value::Registry::registered_count() > 1 << 16 {
+                if crate::value::Registry::registered_count() > 1 << 16 {
                     let mut roots: Vec<crate::value::Value> = Vec::new();
                     // The completing frame itself was already TAKEN out of the
                     // frames map at the top of process_frame and is only held

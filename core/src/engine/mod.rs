@@ -44,7 +44,7 @@ pub use Frame::{prepare_defer_frame_sync, prepare_same_function_frame_sync};
 // Note: the `Engine` / `EngineRef` types are already re-exported via the `pub use` above and must
 // not be re-`use`d here, otherwise they conflict with the `EngineCore` module name in the type
 // namespace (E0255).
-use EngineCore::{PENDING_EXTERNAL, GOLDEN_RATIO_64, env_flag};
+use EngineCore::{PENDING_EXTERNAL, env_flag};
 
 // =========================================================================
 // Program argv — the engine-registered command-line view for std.os.Proc.args()

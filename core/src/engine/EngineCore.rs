@@ -12,10 +12,9 @@ use super::*;
 use crate::ir::Ir::*;
 use crate::value::{Value, ValueArena};
 use std::cell::RefCell;
-use parking_lot::{Condvar, Mutex as ParkingMutex};
+use parking_lot::Mutex as ParkingMutex;
 use hashbrown::{HashMap, HashSet};
 use std::sync::OnceLock;
-use crossbeam_deque::Injector;
 use std::sync::Arc;
 
 /// Caches boolean environment-variable flags to avoid calling `std::env::var` on every hot-path
@@ -243,9 +242,6 @@ pub fn exec_cov_dump(graph: &crate::ir::Ir::DataFlowGraph) {
 /// in-degree must stay below 65535).
 pub(super) const PENDING_EXTERNAL: u16 = u16::MAX;
 
-/// splitmix64 golden-ratio hash constant (ensures each worker steals in a distinct order).
-pub(super) const GOLDEN_RATIO_64: u64 = 0x9E3779B97F4A7C15;
-
 // =========================================================================
 // Engine<S> — unified execution engine (generic over lock strategy)
 // =========================================================================
@@ -253,13 +249,6 @@ pub(super) const GOLDEN_RATIO_64: u64 = 0x9E3779B97F4A7C15;
 /// Unified engine: field types are determined by `S`, while the business logic is written once.
 pub struct Engine<S: LockStrategy> {
     pub graph: Arc<DataFlowGraph>,
-    /// Worker count the engine was created with (immutable). Collection at the
-    /// pressure valve is stop-the-world: sound on ONE thread (Single, or Multi
-    /// with FROND_WORKERS=1), unsound with real concurrency (another worker
-    /// allocating/dropping while the mark phase walks raw pointers).
-    pub worker_count: usize,
-    /// Hang-watchdog progress counter (Multi debug; cheap atomic bump per frame).
-    pub hang_progress: std::sync::atomic::AtomicU64,
     pub frames: S::Mutex<HashMap<FrameId, Box<crate::ir::Ir::Frame>>>,
     pub next_frame_id: S::Mutex<FrameId>,
     pub arena: S::Mutex<ValueArena>,
@@ -290,22 +279,12 @@ pub struct Engine<S: LockStrategy> {
     /// number of defer frames still pending. When the count reaches zero the frame is resumed.
     pub defer_waiters: S::Mutex<HashMap<FrameId, u32>>,
     pub result: S::Mutex<Option<Value>>,
-    /// Poison state for the multi-threaded engine: the panic message captured
-    /// when a worker dies. Once set, every worker exits its park loop, the
-    /// scope joins, and `run_multi` panics with this ORIGINAL message (instead
-    /// of hanging forever waiting for a result that can never be produced —
-    /// async programs keep `event_waiters` non-empty, so the normal
-    /// all-workers-idle exit never triggers after a worker is gone).
-    pub panic_payload: S::Mutex<Option<String>>,
     /// Frame pool: reclaims completed `Box<Frame>` for reuse, eliminating frequent Vec
     /// allocation/deallocation.
     pub frame_pool: S::Mutex<Vec<Box<crate::ir::Ir::Frame>>>,
-    /// Single-threaded queue (None in Multi mode).
+    /// The ready-frame queue for both variants (Single direct; Multi's
+    /// deterministic event loop).
     pub ready_frames: Option<RefCell<std::collections::VecDeque<FrameId>>>,
-    /// Multi-threaded scheduling (None in Single mode).
-    pub global_queue: Option<Injector<FrameId>>,
-    pub wakeup: Option<(ParkingMutex<()>, Condvar)>,
-    pub active_count: Option<ParkingMutex<usize>>,
     /// Queue-membership set (Multi only): at most ONE pending ready-queue
     /// entry per frame. Root fix (2026-09) for the duplicate-entry family:
     /// the suspension handoff pushes AND the wake path pushes the same frame,
@@ -319,8 +298,13 @@ pub struct Engine<S: LockStrategy> {
     pub(super) _strategy: std::marker::PhantomData<S>,
 }
 
-// Safety: Frame contains raw pointers (root_frame_ptr/parent_frame_ptr), but every mutable field
-// is guarded by a ParkingMutex, so only one thread accesses each field at a time.
+// Safety: Frame contains raw pointers (root_frame_ptr/parent_frame_ptr) and the
+// RefCell-wrapped fields are not thread-safe. Sound by construction since M3b:
+// both Single and Multi execute the graph on ONE thread (the caller's), so no
+// field is accessed from another thread while the engine runs. The impls keep
+// `EngineRef::Multi(Arc<Engine<Multi>>)` satisfying auto-trait bounds; moving a
+// RUNNING engine across threads (or the value layer's thread_local
+// GLOBAL_ARENA keying) remains unsupported.
 unsafe impl Send for Engine<Multi> {}
 unsafe impl Sync for Engine<Multi> {}
 
@@ -632,16 +616,7 @@ impl EngineRef {
         materialize_linear_plans(&mut graph);
         let has_async = Self::entry_reaches_suspend(&graph);
         if has_async {
-            let workers = std::env::var("FROND_WORKERS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&w| w >= 1)
-                .unwrap_or_else(|| {
-                    std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(1)
-                });
-            Self::Multi(Arc::new(Engine::<Multi>::new_multi(graph, workers)))
+            Self::Multi(Arc::new(Engine::<Multi>::new_multi(graph)))
         } else {
             Self::Single(Engine::<Single>::new_single(graph))
         }

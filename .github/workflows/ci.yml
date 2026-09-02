@@ -1,9 +1,7 @@
 # CI — 跨平台一致性的执法者(BOOTSTRAP_PLAN.md 4d):
 #   suite          五平台矩阵跑 functional + negative + await_loop 稳定性电池
 #                  (linux-x64/linux-arm64/macos-arm64/macos-x64[Rosetta]/windows-x64)
-#                  M3 起默认调度器 = 确定性事件循环(本 job 即事件循环门禁)
-#   pool           同矩阵 FROND_EVENTLOOP=0 跑 functional + 电池 + diff_load
-#                  (worker 池逃生闸 soak:删除前保持同门禁覆盖)
+#                  调度器 = 确定性事件循环(M3b 起唯一,worker 池已删除)
 #   differential   四平台跑镜像差分 diff_lex/diff_ast/diff_load(Rust 引擎
 #                  vs frondc 逐字节);differential-heavy 在 linux-x64 加
 #                  diff_tyops + diff_sema(重负载)
@@ -84,58 +82,6 @@ jobs:
         shell: bash
         env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
         run: bash tests/scripts/await_loop_battery.sh 30
-
-  # ─────────────────────────────────────────────────────────────────────
-  # worker 池逃生闸 soak(FROND_EVENTLOOP=0)。M3 起事件循环为默认,suite
-  # job 即事件循环门禁;本 job 反向覆盖池路径直至其删除(M3b)。
-  # ─────────────────────────────────────────────────────────────────────
-  pool:
-    name: pool (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: linux-x64,   os: ubuntu-latest,    cc: clang, cxx: clang++, target: '',                   llvm: x86_64-unknown-linux-gnu }
-          - { name: linux-arm64, os: ubuntu-24.04-arm, cc: clang, cxx: clang++, target: '',                   llvm: aarch64-unknown-linux-gnu }
-          - { name: macos-arm64, os: macos-latest,      cc: clang, cxx: clang++, target: '',                   llvm: aarch64-apple-darwin }
-          - { name: macos-x64,   os: macos-latest,      cc: clang, cxx: clang++, target: x86_64-apple-darwin,  llvm: x86_64-apple-darwin }
-          - { name: windows-x64, os: windows-latest,    cc: cl,    cxx: cl,      target: '',                   llvm: x86_64-pc-windows-msvc }
-    env:
-      CC: ${{ matrix.cc }}
-      CXX: ${{ matrix.cxx }}
-      FROND_EVENTLOOP: '0'
-
-    steps:
-      # 本地 action 的元数据在自身步骤执行前解析——Frond 仓必须先于
-      # `uses` 检出(workspace 根 = $GITHUB_WORKSPACE,Frond 在子目录)。
-      - uses: actions/checkout@v5
-        with:
-          path: Frond
-      - id: setup
-        uses: ./Frond/.github/actions/setup-frond
-        with:
-          rust-target: ${{ matrix.target }}
-          prefetch: true
-          prefetch-triple: ${{ matrix.llvm }}
-
-      - name: Functional suite (worker pool escape)
-        shell: bash
-        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
-        run: bash tests/scripts/run_functional.sh
-
-      - name: await_loop stability battery (x50, worker pool)
-        shell: bash
-        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
-        run: bash tests/scripts/await_loop_battery.sh 50
-
-      # 池路径下 frondc 差分逐字节对齐(镜像差分在该调度器下的强信号)。
-      - name: diff load (worker pool)
-        shell: bash
-        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
-        run: bash tests/scripts/diff_load.sh
-        timeout-minutes: 30
 
   # ─────────────────────────────────────────────────────────────────────
   # 镜像差分(Rust 引擎 vs frondc,逐字节)— 四平台(macos-x64 走

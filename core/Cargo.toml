@@ -12,7 +12,6 @@ mimalloc = "0.1"
 bumpalo = { version = "3", features = ["collections"] }
 wide = "0.7"
 rayon = "1"
-crossbeam-deque = "0.8"
 parking_lot = "0.12"
 rustc-hash = "2.1"
 hashbrown = "0.17"
