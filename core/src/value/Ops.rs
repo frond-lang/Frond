@@ -6,7 +6,7 @@ use std::hash::Hash;
 
 use rayon::prelude::*;
 use pastey::paste;
-use wide::{f32x4, f64x4, i8x16, i16x8, i32x4, i64x4, u8x16, u16x8, u32x4, u64x4, CmpEq, CmpGe, CmpGt, CmpLe, CmpLt, CmpNe};
+use wide::{f32x4, f64x4, i8x16, i16x8, i32x4, i64x4, u8x16, u16x8, u32x4, u64x4};
 
 pub use super::Tag::ValueTag;
 
@@ -448,12 +448,12 @@ macro_rules! impl_simd_float_cmp {
                     // wide float comparison returns a mask: true is all-1 bits (f32 appears as NaN),
                     // false is 0.0. Use to_bits() != 0 to test.
                     let m = match op {
-                        CmpOp::Lt => va.cmp_lt(vb),
-                        CmpOp::Gt => va.cmp_gt(vb),
-                        CmpOp::Eq => va.cmp_eq(vb),
-                        CmpOp::Ne => va.cmp_ne(vb),
-                        CmpOp::Le => va.cmp_le(vb),
-                        CmpOp::Ge => va.cmp_ge(vb),
+                        CmpOp::Lt => va.simd_lt(vb),
+                        CmpOp::Gt => va.simd_gt(vb),
+                        CmpOp::Eq => va.simd_eq(vb),
+                        CmpOp::Ne => va.simd_ne(vb),
+                        CmpOp::Le => va.simd_le(vb),
+                        CmpOp::Ge => va.simd_ge(vb),
                     };
                     let arr = m.to_array();
                     for j in 0..$lanes {
@@ -672,21 +672,21 @@ macro_rules! impl_simd_signed_cmp {
                     let vb = <$vec>::new(b[i..i + $lanes].try_into().unwrap());
                     // wide signed integer comparison returns a same-type mask (all 1/0); convert to bool
                     let arr = match op {
-                        CmpOp::Eq => CmpEq::cmp_eq(va, vb).to_array(),
+                        CmpOp::Eq => va.simd_eq(vb).to_array(),
                         CmpOp::Ne => {
-                            let m = CmpEq::cmp_eq(va, vb);
+                            let m = va.simd_eq(vb);
                             (!m).to_array()
                         }
-                        CmpOp::Lt => CmpLt::cmp_lt(va, vb).to_array(),
-                        CmpOp::Gt => CmpGt::cmp_gt(va, vb).to_array(),
+                        CmpOp::Lt => va.simd_lt(vb).to_array(),
+                        CmpOp::Gt => va.simd_gt(vb).to_array(),
                         CmpOp::Le => {
-                            let lt = CmpLt::cmp_lt(va, vb);
-                            let eq = CmpEq::cmp_eq(va, vb);
+                            let lt = va.simd_lt(vb);
+                            let eq = va.simd_eq(vb);
                             (lt | eq).to_array()
                         }
                         CmpOp::Ge => {
-                            let gt = CmpGt::cmp_gt(va, vb);
-                            let eq = CmpEq::cmp_eq(va, vb);
+                            let gt = va.simd_gt(vb);
+                            let eq = va.simd_eq(vb);
                             (gt | eq).to_array()
                         }
                     };
@@ -740,9 +740,9 @@ macro_rules! impl_simd_unsigned_cmp {
                         let va = <$vec>::new(a[i..i + $lanes].try_into().unwrap());
                         let vb = <$vec>::new(b[i..i + $lanes].try_into().unwrap());
                         let arr = match op {
-                            CmpOp::Eq => CmpEq::cmp_eq(va, vb).to_array(),
+                            CmpOp::Eq => va.simd_eq(vb).to_array(),
                             CmpOp::Ne => {
-                                let m = CmpEq::cmp_eq(va, vb);
+                                let m = va.simd_eq(vb);
                                 (!m).to_array()
                             }
                             _ => unreachable!(),

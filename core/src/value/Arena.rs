@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use rayon::prelude::*;
-use wide::{i32x4, i64x4, CmpEq};
+use wide::{i32x4, i64x4};
 
 pub use super::Tag::ValueTag;
 
@@ -1270,7 +1270,7 @@ fn simd_eq_i32_chunk(a: &[i32], b: &[i32]) -> bool {
     {
         let va = i32x4::new(ca.try_into().unwrap());
         let vb = i32x4::new(cb.try_into().unwrap());
-        let mask = va.cmp_eq(vb);
+        let mask = va.simd_eq(vb);
         let arr = mask.to_array();
         if arr.contains(&0) {
             return false;
@@ -1310,7 +1310,7 @@ fn simd_eq_i64_chunk(a: &[i64], b: &[i64]) -> bool {
     {
         let va = i64x4::new(ca.try_into().unwrap());
         let vb = i64x4::new(cb.try_into().unwrap());
-        let mask = va.cmp_eq(vb);
+        let mask = va.simd_eq(vb);
         let arr = mask.to_array();
         if arr.contains(&0) {
             return false;
@@ -1361,7 +1361,7 @@ fn simd_eq_f32_bits_chunk(a: &[f32], b: &[f32]) -> bool {
             cb[2].to_bits() as i32,
             cb[3].to_bits() as i32,
         ]);
-        let mask = va.cmp_eq(vb);
+        let mask = va.simd_eq(vb);
         let arr = mask.to_array();
         if arr.contains(&0) {
             return false;
@@ -1412,7 +1412,7 @@ fn simd_eq_f64_bits_chunk(a: &[f64], b: &[f64]) -> bool {
             cb[2].to_bits() as i64,
             cb[3].to_bits() as i64,
         ]);
-        let mask = va.cmp_eq(vb);
+        let mask = va.simd_eq(vb);
         let arr = mask.to_array();
         if arr.contains(&0) {
             return false;
