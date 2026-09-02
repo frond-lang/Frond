@@ -49,6 +49,16 @@ runs:
       with:
         arch: ${{ inputs.msvc-arch }}
 
+    # negative/run.sh 与 diff_ast/load/sema/tyops 直接使用 GNU timeout,
+    # macOS 裸机没有该命令(macOS 差分/负向全红的根因);run_functional.sh
+    # 自带兜底不受影响,其余脚本依赖此步。
+    - name: Install GNU coreutils (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew install coreutils
+        echo "$(brew --prefix)/opt/coreutils/libexec/gnubin" >> "$GITHUB_PATH"
+
     - uses: dtolnay/rust-toolchain@stable
       with:
         targets: ${{ inputs.rust-target }}

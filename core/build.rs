@@ -193,17 +193,6 @@ pub unsafe fn {name}(pattern: u32, fn_ptr: *mut core::ffi::c_void, ints: &[u64],
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_extern_c)");
 
-    // Static-musl link order: rustc places its own -lc BEFORE the cc-built
-    // frond_extern archive; a static archive only satisfies symbols for
-    // objects that precede it on the linker line, so the C kernels' libc
-    // references (access/strtod/localtime_r/posix_spawn...) went unresolved.
-    // Appending one more -lc at the very end closes the window.
-    if let Ok(target) = env::var("TARGET") {
-        if target.contains("musl") {
-            println!("cargo:rustc-link-arg=-lc");
-        }
-    }
-
     let out_dir = env::var("OUT_DIR").unwrap();
 
     // The trampoline table is needed unconditionally (the lib includes it
@@ -336,6 +325,15 @@ fn main() {
                 println!("cargo::rustc-link-arg-bin=frond=-Wl,--whole-archive");
                 println!("cargo::rustc-link-arg-bin=frond=-lfrond_extern");
                 println!("cargo::rustc-link-arg-bin=frond=-Wl,--no-whole-archive");
+                if target.contains("musl") {
+                    // Static-musl archive extraction order: libc.a only
+                    // satisfies objects PRECEDING it on the linker line, and
+                    // frond_extern enters the line at the very end (via these
+                    // link-arg-bin directives) — rustc's own earlier -lc
+                    // cannot see the C kernels' references. Append one more
+                    // -lc AFTER the archive so it extracts them.
+                    println!("cargo::rustc-link-arg-bin=frond=-lc");
+                }
             }
             println!("cargo::rustc-cfg=has_extern_c");
             // After successful compilation, delete the .c intermediate artifacts from OUT_DIR
