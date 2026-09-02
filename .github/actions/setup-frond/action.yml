@@ -1,0 +1,109 @@
+# setup-frond — CI 复合步骤:三仓 checkout + 工具链 + 引擎构建(+可选交叉
+# target)+ 可选 LLVM 工具链资产预取。产出 frond-bin 供套件/差分步骤引用。
+#
+# 布局约定(与本地开发一致,scripts 以 ../../Frond/... 定位二进制):
+#   <workspace>/Frond   本仓库(checkout 默认)
+#   <workspace>/tests   frond-lang/tests
+#   <workspace>/apps    frond-lang/apps
+name: 'Setup Frond engine'
+description: 'Checkouts + toolchain + build the engine; optional cross target and LLVM asset prefetch'
+
+inputs:
+  rust-target:
+    description: 'rustup target triple (empty = host build, e.g. x86_64-apple-darwin / x86_64-unknown-linux-musl / aarch64-pc-windows-msvc)'
+    default: ''
+  msvc-arch:
+    description: 'ilammy/msvc-dev-cmd arch (x64 native, amd64_arm64 for windows-arm64 cross)'
+    default: 'x64'
+  prefetch:
+    description: 'Prefetch LLVM toolchain assets (llvm_bind/llvm_probe/crypto_primitives)'
+    default: 'false'
+  prefetch-triple:
+    description: 'LLVM release triple for the prefetch (e.g. aarch64-unknown-linux-gnu)'
+    default: ''
+
+outputs:
+  frond-bin:
+    description: 'Path to the built frond binary (relative to workspace)'
+    value: ${{ steps.bin.outputs.frond-bin }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v5
+      with:
+        path: Frond
+    - uses: actions/checkout@v5
+      with:
+        repository: frond-lang/tests
+        path: tests
+    - uses: actions/checkout@v5
+      with:
+        repository: frond-lang/apps
+        path: apps
+
+    - name: Setup MSVC (Windows)
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ inputs.msvc-arch }}
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.rust-target }}
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: Frond/core
+
+    # build.rs 在此步把 std 的全部 @extern("C") C 原语编译进二进制——
+    # 平台分支(#if _WIN32 / __APPLE__)只有本步会真正编译到。
+    - name: Build engine
+      shell: bash
+      working-directory: Frond/core
+      env:
+        TARGET: ${{ inputs.rust-target }}
+      run: cargo build --release ${TARGET:+--target "$TARGET"}
+
+    - id: bin
+      name: Resolve binary path
+      shell: bash
+      env:
+        TARGET: ${{ inputs.rust-target }}
+      run: |
+        rel="Frond/core/target"
+        if [ -n "$TARGET" ]; then rel="$rel/$TARGET"; fi
+        rel="$rel/release/frond"
+        if [ "$RUNNER_OS" = "Windows" ]; then rel="$rel.exe"; fi
+        echo "frond-bin=$rel" >> "$GITHUB_OUTPUT"
+
+    # 工具链资产预取:curl 直拉一次,喂 llvm_bind/llvm_probe/crypto_primitives。
+    # 不走 llvmfetch——自研 TLS 客户端对 github CDN 在部分 runner 上不稳,
+    # 且 Windows 的 RUNNER_TEMP 盘符路径会被 MSYS tar 误读;工作区相对路径无此问题。
+    - name: Prefetch toolchain assets (llvm_bind + llvm_probe + crypto)
+      if: inputs.prefetch == 'true'
+      shell: bash
+      env:
+        TRIPLE: ${{ inputs.prefetch-triple }}
+      run: |
+        set -euxo pipefail
+        tmp="$(pwd)/.tmp-tc"
+        rm -rf "$tmp" && mkdir -p "$tmp"
+        curl -sL --retry 3 -o "$tmp/tc.tar.gz" \
+          "https://github.com/frond-lang/llvm/releases/download/llvm-static-21.1.8/llvm-static-$TRIPLE.tar.gz"
+        tar -xzf "$tmp/tc.tar.gz" -C "$tmp"
+        root="$(find "$tmp" -maxdepth 2 -type d -name "llvm-static-$TRIPLE" | head -1)"
+        test -n "$root"
+        # crypto_primitives 读 <workspace>/.llvm-dist/llvm-static-<triple>.tar.gz
+        mkdir -p .llvm-dist
+        cp "$tmp/tc.tar.gz" ".llvm-dist/llvm-static-$TRIPLE.tar.gz"
+        lib="$(find "$root/lib" -maxdepth 1 -name 'llvm.*' ! -name '*.lib' | head -1)"
+        test -n "$lib"
+        cp "$lib" tests/functional/llvm_bind/src/assets/llvm-native.bin
+        dest="tests/functional/llvm_probe/assets/toolchain"
+        mkdir -p "$dest/lib" "$dest/bin"
+        cp "$lib" "$dest/lib/"
+        cp "$root"/bin/lld* "$dest/bin/"
+        cp -R "$root/linkview" "$dest/"
+        cp "$root/VERSION" "$dest/"
+        rm -rf "$tmp"

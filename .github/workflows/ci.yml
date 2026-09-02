@@ -1,12 +1,22 @@
 # CI — 跨平台一致性的执法者(BOOTSTRAP_PLAN.md 4d):
-#   五平台矩阵跑 functional + negative,linux-x64 跑差分门(tokens/ast/
-#   load/tyops)。release.yml 只构建打包;同源同行为由本矩阵保证。
+#   suite          五平台矩阵跑 functional + negative + await_loop 稳定性电池
+#                  (linux-x64/linux-arm64/macos-arm64/macos-x64[Rosetta]/windows-x64)
+#   eventloop      同矩阵 FROND_EVENTLOOP=1 跑 functional + 电池 + diff_load
+#                  (确定性事件循环 M2 灰度 soak:两调度器同门禁同口径)
+#   differential   四平台跑镜像差分 diff_lex/diff_ast/diff_load(Rust 引擎
+#                  vs frondc 逐字节);differential-heavy 在 linux-x64 加
+#                  diff_tyops + diff_sema(重负载)
+#   suite-musl     linux musl 静态链接:套件(FROND_SKIP 掉无 LLVM 发行物
+#                  的三套)——libc/分配器面差异的额外覆盖
+#   build-windows-arm64  aarch64-pc-windows-msvc 交叉构建(实验性,只验编译)
 #
+# release.yml 只构建打包;同源同行为由本矩阵保证。
 # 布局约定(与本地开发一致,scripts 以 ../../Frond/... 定位二进制):
 #   <workspace>/Frond   本仓库(checkout 默认)
 #   <workspace>/tests   frond-lang/tests
 #   <workspace>/apps    frond-lang/apps(llvmfetch 预取 + 差分语料)
-# 所有 runner 经 FROND 环境变量指定引擎二进制(脚本默认找 frond.exe)。
+# 所有 runner 经 FROND 环境变量指定引擎二进制(脚本默认找 frond.exe);
+# 公共 checkout/构建步骤收拢在 .github/actions/setup-frond。
 
 name: CI
 
@@ -25,12 +35,105 @@ env:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────
-  # 五平台回归矩阵(镜像 release.yml 的 triple 列表)
+  # 五平台回归矩阵(默认调度器 = worker 池)
+  # macos-x64:arm64 runner 交叉编译 x86_64-apple-darwin,Rosetta 真跑套件。
   # ─────────────────────────────────────────────────────────────────────
   suite:
     name: suite (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64,   os: ubuntu-latest,    cc: clang, cxx: clang++, target: '',                   llvm: x86_64-unknown-linux-gnu }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, cc: clang, cxx: clang++, target: '',                   llvm: aarch64-unknown-linux-gnu }
+          - { name: macos-arm64, os: macos-latest,      cc: clang, cxx: clang++, target: '',                   llvm: aarch64-apple-darwin }
+          - { name: macos-x64,   os: macos-latest,      cc: clang, cxx: clang++, target: x86_64-apple-darwin,  llvm: x86_64-apple-darwin }
+          - { name: windows-x64, os: windows-latest,    cc: cl,    cxx: cl,      target: '',                   llvm: x86_64-pc-windows-msvc }
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+
+    steps:
+      - id: setup
+        uses: ./.github/actions/setup-frond
+        with:
+          rust-target: ${{ matrix.target }}
+          prefetch: true
+          prefetch-triple: ${{ matrix.llvm }}
+
+      - name: Functional suite
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/run_functional.sh
+
+      - name: Negative suite
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/negative/run.sh
+
+      # 调度稳定性哨兵:历史上 Multi 模式挂死/抖动的专项电池。
+      - name: await_loop stability battery (x30)
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/await_loop_battery.sh 30
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 事件循环灰度 soak(FROND_EVENTLOOP=1,确定性单线程调度器)
+  # 与 suite 同矩阵同门禁——两调度器的行为等价性由同一口径持续验证。
+  # ─────────────────────────────────────────────────────────────────────
+  eventloop:
+    name: eventloop (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64,   os: ubuntu-latest,    cc: clang, cxx: clang++, target: '',                   llvm: x86_64-unknown-linux-gnu }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, cc: clang, cxx: clang++, target: '',                   llvm: aarch64-unknown-linux-gnu }
+          - { name: macos-arm64, os: macos-latest,      cc: clang, cxx: clang++, target: '',                   llvm: aarch64-apple-darwin }
+          - { name: macos-x64,   os: macos-latest,      cc: clang, cxx: clang++, target: x86_64-apple-darwin,  llvm: x86_64-apple-darwin }
+          - { name: windows-x64, os: windows-latest,    cc: cl,    cxx: cl,      target: '',                   llvm: x86_64-pc-windows-msvc }
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      FROND_EVENTLOOP: '1'
+
+    steps:
+      - id: setup
+        uses: ./.github/actions/setup-frond
+        with:
+          rust-target: ${{ matrix.target }}
+          prefetch: true
+          prefetch-triple: ${{ matrix.llvm }}
+
+      - name: Functional suite (event loop)
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/run_functional.sh
+
+      - name: await_loop stability battery (x50, event loop)
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/await_loop_battery.sh 50
+
+      # 事件循环下 frondc 差分逐字节对齐(镜像差分在该调度器下的强信号)。
+      - name: diff load (event loop)
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/diff_load.sh
+        timeout-minutes: 30
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 镜像差分(Rust 引擎 vs frondc,逐字节)— 四平台(macos-x64 走
+  # Rosetta 与 macos-arm64 同二进制语义,不重复;重差分单列)。
+  # ─────────────────────────────────────────────────────────────────────
+  differential:
+    name: differential (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -42,105 +145,67 @@ jobs:
     env:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
-      FROND: ${{ github.workspace }}/Frond/core/target/release/frond${{ matrix.os == 'windows-latest' && '.exe' || '' }}
 
     steps:
-      - uses: actions/checkout@v5
-        with:
-          path: Frond
-      - uses: actions/checkout@v5
-        with:
-          repository: frond-lang/tests
-          path: tests
-      - uses: actions/checkout@v5
-        with:
-          repository: frond-lang/apps
-          path: apps
+      - id: setup
+        uses: ./.github/actions/setup-frond
 
-      - name: Setup MSVC (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: Frond/core
-
-      # build.rs 在此步把 std 的全部 @extern("C") C 原语编译进二进制——
-      # Windows 分支(#if _WIN32)只有本步会真正编译到。
-      - name: Build engine
-        run: cargo build --release
-        working-directory: Frond/core
-
-      # run_functional.sh 每套件用 GNU timeout 包裹;macOS 出厂没有该命令。
-      - name: Install GNU coreutils (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install coreutils
-          echo "$(brew --prefix)/opt/coreutils/libexec/gnubin" >> "$GITHUB_PATH"
-
-      # 工具链资产预取:curl 直拉一次,喂两个套件(llvm_bind 的统一逻辑名
-      # 动态库 + llvm_probe 的动态库/lld/linkview)。不走 llvmfetch——自研
-      # TLS 客户端对 github CDN 在部分 runner 上不稳(macos alert20 /
-      # linux-x64 段错误),且 Windows 的 RUNNER_TEMP 是 D:\ 盘符路径,
-      # MSYS tar 会把 "D:" 当远程主机;工作区相对路径无此问题。
-      - name: Prefetch toolchain assets (llvm_bind + llvm_probe)
+      - name: diff lex (tokens)
         shell: bash
-        run: |
-          set -euxo pipefail
-          case "${{ matrix.name }}" in
-            linux-x64)   triple=x86_64-unknown-linux-gnu ;;
-            linux-arm64) triple=aarch64-unknown-linux-gnu ;;
-            macos-arm64) triple=aarch64-apple-darwin ;;
-            windows-x64) triple=x86_64-pc-windows-msvc ;;
-            *)           triple=x86_64-apple-darwin ;;
-          esac
-          tmp="$(pwd)/.tmp-tc"
-          rm -rf "$tmp" && mkdir -p "$tmp"
-          curl -sL --retry 3 -o "$tmp/tc.tar.gz" \
-            "https://github.com/frond-lang/llvm/releases/download/llvm-static-21.1.8/llvm-static-$triple.tar.gz"
-          tar -xzf "$tmp/tc.tar.gz" -C "$tmp"
-          root="$(find "$tmp" -maxdepth 2 -type d -name "llvm-static-$triple" | head -1)"
-          test -n "$root"
-          # crypto_primitives 读 <workspace>/.llvm-dist/llvm-static-<triple>.tar.gz
-          mkdir -p .llvm-dist
-          cp "$tmp/tc.tar.gz" ".llvm-dist/llvm-static-$triple.tar.gz"
-          lib="$(find "$root/lib" -maxdepth 1 -name 'llvm.*' ! -name '*.lib' | head -1)"
-          test -n "$lib"
-          cp "$lib" tests/functional/llvm_bind/src/assets/llvm-native.bin
-          dest="tests/functional/llvm_probe/assets/toolchain"
-          mkdir -p "$dest/lib" "$dest/bin"
-          cp "$lib" "$dest/lib/"
-          cp "$root"/bin/lld* "$dest/bin/"
-          cp -R "$root/linkview" "$dest/"
-          cp "$root/VERSION" "$dest/"
-          rm -rf "$tmp"
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/diff_lex.sh
+        timeout-minutes: 30
 
-      - name: Functional suite
+      - name: diff ast
         shell: bash
-        run: bash tests/scripts/run_functional.sh
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/diff_ast.sh
+        timeout-minutes: 30
 
-      - name: Negative suite
+      - name: diff load (load-dump v1)
         shell: bash
-        run: bash tests/negative/run.sh
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/diff_load.sh
+        timeout-minutes: 30
 
-  # ─────────────────────────────────────────────────────────────────────
-  # 差分门(Rust 引擎 vs frondc 镜像,逐字节)。重载:全语料批解析为
-  # 分钟级,每步 timeout ≥ 30min(BOOTSTRAP_PLAN 五、工程要点);先只在
-  # linux-x64 跑,Windows 的命令行长度上限已由脚本内部分批规避。
-  # TODO(1E): diff_sema.sh 接入(六语料声明前缀口径,当前 6/6 绿)。
-  # ─────────────────────────────────────────────────────────────────────
-  differential:
-    name: differential (linux-x64)
+  # 重差分(全语料批解析分钟级):linux-x64 单平台先覆盖。
+  differential-heavy:
+    name: differential-heavy (linux-x64)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       CC: clang
       CXX: clang++
-      FROND: ${{ github.workspace }}/Frond/core/target/release/frond
+    steps:
+      - id: setup
+        uses: ./.github/actions/setup-frond
+
+      - name: diff tyops
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/diff_tyops.sh
+        timeout-minutes: 45
+
+      - name: diff sema
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/diff_sema.sh
+        timeout-minutes: 45
+
+  # ─────────────────────────────────────────────────────────────────────
+  # linux musl 静态链接套件(libc/分配器面差异的额外覆盖;LLVM 三套件
+  # 因无 musl 发行物经 FROND_SKIP 跳过)
+  # ─────────────────────────────────────────────────────────────────────
+  suite-musl:
+    name: suite (linux-x64-musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CC: clang
+      CXX: clang++
+      FROND_SKIP: crypto_primitives llvm_bind llvm_probe
+      FROND: ${{ github.workspace }}/Frond/core/target/x86_64-unknown-linux-musl/release/frond
+
     steps:
       - uses: actions/checkout@v5
         with:
@@ -154,28 +219,50 @@ jobs:
           repository: frond-lang/apps
           path: apps
 
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: Frond/core
 
-      - name: Build engine
-        run: cargo build --release
+      - name: Build engine (musl static)
+        run: cargo build --release --target x86_64-unknown-linux-musl
         working-directory: Frond/core
 
-      - name: diff lex (tokens)
-        run: bash tests/scripts/diff_lex.sh
-        timeout-minutes: 30
+      - name: Functional suite (musl)
+        shell: bash
+        run: bash tests/scripts/run_functional.sh
 
-      - name: diff ast
-        run: bash tests/scripts/diff_ast.sh
-        timeout-minutes: 30
+      - name: Negative suite (musl)
+        shell: bash
+        run: bash tests/negative/run.sh
 
-      - name: diff load (load-dump v1)
-        run: bash tests/scripts/diff_load.sh
-        timeout-minutes: 30
+  # ─────────────────────────────────────────────────────────────────────
+  # windows-arm64 交叉构建(aarch64-pc-windows-msvc):仅验编译(build.rs
+  # C 内核/蹦床表在第五平台的编译面);GH runner 无 ARM64 执行环境。
+  # 实验性:runner VS 镜像的 ARM64 构建工具如缺失,此 job 允许失败。
+  # ─────────────────────────────────────────────────────────────────────
+  build-windows-arm64:
+    name: build (windows-arm64)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - id: setup
+        uses: ./.github/actions/setup-frond
+        with:
+          rust-target: aarch64-pc-windows-msvc
+          msvc-arch: amd64_arm64
 
-      - name: diff tyops
-        run: bash tests/scripts/diff_tyops.sh
-        timeout-minutes: 30
+      - name: Smoke-check artifact
+        shell: bash
+        run: |
+          set -euxo pipefail
+          bin="${{ steps.setup.outputs.frond-bin }}"
+          test -f "$bin"
+          file "$bin" || true
