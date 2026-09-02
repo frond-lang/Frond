@@ -349,6 +349,24 @@ pub(super) fn extract_child_return(child: &Frame, graph: &DataFlowGraph) -> Valu
     }
 }
 
+pub(super) fn run_offloaded_subgraph(graph: &DataFlowGraph, frame: &mut Frame) -> super::Offload::OffloadOutcome {
+    // Delegate to the ENGINE'S OWN plan loop (exec_plan_core) — the identical
+    // compiled loop the inline path uses. A textually identical copy in this
+    // module compiled ~30x slower per node (measured); sharing the one
+    // compiled loop guarantees engine parity by construction.
+    let plan: &[NodeId] = match graph.linear_plan(frame.subgraph_id.0 as usize) {
+        Some(p) if !p.is_empty() => p,
+        _ => return super::Offload::OffloadOutcome::Fallback,
+    };
+    match exec_plan_offload(frame, plan, graph) {
+        PlanFlowCore::Done => super::Offload::OffloadOutcome::Done(
+            extract_child_return(frame, graph),
+            frame.control_signal.clone(),
+        ),
+        PlanFlowCore::EngineNeeded => super::Offload::OffloadOutcome::Fallback,
+    }
+}
+
 // =========================================================================
 // impl<S: LockStrategy> Engine<S> — scheduling core methods
 // =========================================================================
@@ -1294,7 +1312,6 @@ impl<S: LockStrategy> Engine<S> {
             }
             let local = NodeId(gid.0.wrapping_sub(node_start));
             if frame.value_table.is_ready(local.0 as usize) {
-                // Params / injected slots / already-executed nodes.
                 continue;
             }
             let node = graph.node(gid.0 as usize);
@@ -2137,3 +2154,76 @@ impl<S: LockStrategy> Engine<S> {
         relay_branch_value(frame, graph, local);
     }
 }
+
+/// Offload executor outcome: plan finished, or hit an arm needing the engine.
+pub(super) enum PlanFlowCore {
+    Done,
+    EngineNeeded,
+}
+
+pub(super) fn exec_plan_offload(
+    frame: &mut Frame,
+    plan: &[NodeId],
+    graph: &DataFlowGraph,
+) -> PlanFlowCore {
+        let node_start = frame.node_offset;
+        for &gid in plan {
+            if !matches!(frame.control_signal, ControlSignal::None) {
+                return PlanFlowCore::Done;
+            }
+            if frame.state == FrameState::Cancelling || frame.state == FrameState::Suspended {
+                return PlanFlowCore::Done;
+            }
+            let local = NodeId(gid.0.wrapping_sub(node_start));
+            if frame.value_table.is_ready(local.0 as usize) {
+                // Params / injected slots / already-executed nodes.
+                continue;
+            }
+            let node = graph.node(gid.0 as usize);
+            let ctx = EvalContext { node_start, graph };
+            let result = (graph.compute_fns[node.compute_fn.0 as usize])(frame, gid, &ctx);
+            match result {
+                NodeResult::Value(v) => {
+                    let cc = graph.downstream_count(gid.0 as usize);
+                    frame.set_value(local, v, cc);
+                    if !frame.branch_relays.is_empty() {
+                        relay_branch_value(frame, graph, local);
+                    }
+                }
+                NodeResult::Batch(results) => {
+                    for &(lid, ref v) in &results {
+                        let g2 = lid.0 + node_start;
+                        let cc = graph.downstream_count(g2 as usize);
+                        frame.set_value(lid, v.clone(), cc);
+                    }
+                    if !frame.branch_relays.is_empty() {
+                        for &(lid, _) in &results {
+                            relay_branch_value(frame, graph, lid);
+                        }
+                    }
+                }
+                NodeResult::Return(v) => {
+                    frame.control_signal = ControlSignal::Return(v);
+                    return PlanFlowCore::Done;
+                }
+                NodeResult::Break => {
+                    frame.control_signal = ControlSignal::Break;
+                    return PlanFlowCore::Done;
+                }
+                NodeResult::Continue => {
+                    frame.control_signal = ControlSignal::Continue;
+                    return PlanFlowCore::Done;
+                }
+                NodeResult::Call(pending) => {
+                    let _ = pending;
+                    return PlanFlowCore::EngineNeeded;
+                }
+                _ => {
+                    // Engine-needing result (Await/ChannelNotify/Cancel/SelectWait):
+                    // bail — the dataflow engine re-drives it.
+                    return PlanFlowCore::EngineNeeded;
+                }
+            }
+        }
+        PlanFlowCore::Done
+    }

@@ -64,6 +64,7 @@ impl DataFlowGraph {
     /// Reads a node by index (load path: v2 packed record — 4B when offsets
     /// are elided, 8B otherwise — read from the mmap slice).
     #[inline]
+    #[inline(always)]
     pub fn node(&self, idx: usize) -> Node {
         // Materialized fast path: .fndo graphs copy the packed Nodes
         // section into `nodes` once at EngineRef::new (per-call mmap
@@ -95,6 +96,7 @@ impl DataFlowGraph {
 
     /// Reads the input slice for a node (zerocopy: transmuted from the mmap Inputs section into `&[NodeId]`).
     #[inline]
+    #[inline(always)]
     pub fn inputs(&self, offset: u32, count: u8) -> &[NodeId] {
         // Materialized fast path (see node()); build-path graphs live
         // in the pool natively.
@@ -326,6 +328,7 @@ impl DataFlowGraph {
     /// E4 perf: flat per-node downstream consumer count (materialized once at engine start).
     /// Replaces the `downstream_slice(idx).len()` CSR arithmetic on every set_value.
     #[inline]
+    #[inline(always)]
     pub fn downstream_count(&self, idx: usize) -> u16 {
         if !self.downstream_counts.is_empty() {
             self.downstream_counts[idx]

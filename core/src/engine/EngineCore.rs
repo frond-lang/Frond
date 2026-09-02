@@ -316,6 +316,23 @@ unsafe impl Sync for Engine<Multi> {}
 /// an ordinary subgraph (no loop machinery). Size thresholding happens at
 /// launch (FROND_OFFLOAD / FROND_OFFLOAD_MIN), not here.
 fn classify_offloadable(graph: &mut DataFlowGraph) {
+    // TEMP DIAG: full CF histogram for one sg (FROND_DEBUG_OFFLOAD_SG=<idx>)
+    if let Ok(idx) = std::env::var("FROND_DEBUG_OFFLOAD_SG").ok().and_then(|v| v.parse::<usize>().ok()).ok_or(()) {
+        let sg = &graph.subgraphs[idx];
+        let (ns, ne) = sg.node_range;
+        let mut hist = std::collections::BTreeMap::new();
+        for nid in ns.0..ne.0 {
+            if (nid as usize) < graph.node_count() {
+                let cf = graph.node(nid as usize).compute_fn.0;
+                *hist.entry(cf).or_insert(0usize) += 1;
+            }
+        }
+        eprintln!("[SG-DUMP] sg={idx} nodes {}..{} histogram {{", ns.0, ne.0);
+        for (cf, n) in hist {
+            eprintln!("  {cf} x{n}");
+        }
+        eprintln!("[SG-DUMP] end");
+    }
     let mut safe = vec![false; graph.subgraphs.len()];
     for (i, sg) in graph.subgraphs.iter().enumerate() {
         if sg.loop_kind != crate::ir::Ir::LoopKind::None {
@@ -329,7 +346,37 @@ fn classify_offloadable(graph: &mut DataFlowGraph) {
                 break;
             }
             let node = graph.node(nid as usize);
-            if !crate::ir::Ir::is_offload_safe_compute(node.compute_fn.0) {
+            let cf = node.compute_fn.0;
+            let pure = if crate::ir::Ir::is_offload_safe_compute(cf) {
+                true
+            } else if cf == crate::ir::Ir::CF_CELL_ALLOC.0 {
+                // Place-model var materialization: a FRESH private cell per
+                // frame — safe on a worker (the copy-in clone makes it
+                // frame-private). This is what unlocks var-bearing leaves.
+                true
+            } else if cf == crate::ir::Ir::CF_DEREF_READ.0
+                || cf == crate::ir::Ir::CF_DEREF_WRITE.0
+            {
+                // Cell read/write is safe iff the cell is FRAME-LOCAL: the
+                // ref input (inputs[0], per compute_deref_read/write's
+                // convention) must be produced by a CELL_ALLOC node inside
+                // this sg. A cell flowing from a PARAM carries &T reference
+                // semantics — mutating the worker's clone would be invisible
+                // to the caller.
+                let inputs = graph.inputs(node.inputs_offset, node.input_count);
+                match inputs.first() {
+                    Some(&cell_node) => {
+                        (cell_node.0 >= ns.0 && cell_node.0 < ne.0)
+                            && (cell_node.0 as usize) < graph.node_count()
+                            && graph.node(cell_node.0 as usize).compute_fn
+                                == crate::ir::Ir::CF_CELL_ALLOC
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if !pure {
                 if std::env::var("FROND_DEBUG_OFFLOAD").is_ok() && !ok {
                     // first disqualifier only, per sg
                 }

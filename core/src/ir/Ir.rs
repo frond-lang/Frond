@@ -794,6 +794,7 @@ impl ValueTable {
     }
 
     /// Sets the output value and downstream consumer count (local index).
+    #[inline(always)]
     pub fn set_value(&mut self, idx: usize, value: Value, consumer_count: u16) {
         self.values[idx] = value;
         self.set_ready(idx);
@@ -1412,6 +1413,7 @@ impl Frame {
 
 
     /// Sets a node's output value (local NodeId).
+    #[inline(always)]
     pub fn set_value(&mut self, node: NodeId, value: Value, consumer_count: u16) {
         self.value_table.set_value(node.0 as usize, value, consumer_count);
     }
@@ -4761,6 +4763,7 @@ pub const fn scalar_meta(tag: crate::value::ValueTag) -> Option<ScalarMeta> {
 /// result path), CAST_* (pure conversions/views), PATTERN_* / MATCH_FALLBACK
 /// (pure dispatch selects), REFLECT_TYPE_NAME (pure read). GLOBAL_LOAD and
 /// place-ref (DEREF_*/STORE) nodes stay OUT: they alias engine-owned storage.
+/// STR_CONCAT/STR_MULTI_CONCAT (fresh allocations, pure) included.
 /// Generated from `compute_fn_ids!`; audit any addition by hand.
 pub fn is_offload_safe_compute(cf: u32) -> bool {
     // Sorted; binary search.
@@ -4779,9 +4782,9 @@ pub fn is_offload_safe_compute(cf: u32) -> bool {
         185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200,
         201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216,
         217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232,
-        233, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 272, 273, 274,
-        275, 276, 290, 291, 292, 293, 294, 295, 298, 300, 301, 302, 303, 304, 305, 308,
-        311, 324, 341, 342, 343, 344, 345, 346, 347,
+        233, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 267, 272, 273,
+        274, 275, 276, 290, 291, 292, 293, 294, 295, 298, 300, 301, 302, 303, 304, 305,
+        308, 311, 316, 324, 341, 342, 343, 344, 345, 346, 347,
     ];
     SAFE.binary_search(&cf).is_ok()
 }

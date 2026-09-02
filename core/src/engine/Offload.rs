@@ -55,9 +55,18 @@ struct OffloadDone {
     call_node: NodeId,
     value: Value,
     signal: ControlSignal,
+    /// The executed child, shipped back for ENGINE-THREAD pool return.
+    /// Without it the pool drains and every launch pays a fresh cold value
+    /// table — the 30x slowdown root cause.
+    child_frame: Option<Box<Frame>>,
     /// Classifier escape: the engine re-drives this child through the real
     /// machinery instead of applying the partial result.
     fallback_child: Option<Box<Frame>>,
+    /// Restitution: the (cloned-arg) result aliased an argument object —
+    /// reference semantics demand re-execution with the ORIGINAL args on
+    /// the engine thread; carrying them here avoids stashing them in the
+    /// engine between launch and delivery.
+    fallback_args: Option<Vec<Value>>,
 }
 
 /// Shared offload runtime: held via Arc by the engine and every in-flight
@@ -68,6 +77,41 @@ pub(super) struct OffloadRt {
     inner: ParkingMutex<OffloadInner>,
     /// Engine-thread wakeup: notified on every delivery.
     pub parked: Condvar,
+    /// Profiling accumulators (FROND_OFFLOAD_STATS dump at exit).
+    pub stats: OffloadStats,
+}
+
+/// Nanosecond buckets: engine-side launch cost (frame build + clone),
+/// worker execution, and delivery apply.
+#[derive(Default)]
+pub struct OffloadStats {
+    pub launches: std::sync::atomic::AtomicU64,
+    pub launch_ns: std::sync::atomic::AtomicU64,
+    pub worker_ns: std::sync::atomic::AtomicU64,
+    pub deliver_ns: std::sync::atomic::AtomicU64,
+}
+
+impl OffloadStats {
+    fn add(&self, slot: &std::sync::atomic::AtomicU64, d: std::time::Duration) {
+        slot.fetch_add(d.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for OffloadStats {
+    fn drop(&mut self) {
+        if std::env::var("FROND_OFFLOAD_STATS").is_ok() {
+            let l = self.launches.load(std::sync::atomic::Ordering::Relaxed);
+            let ln = self.launch_ns.load(std::sync::atomic::Ordering::Relaxed);
+            let wn = self.worker_ns.load(std::sync::atomic::Ordering::Relaxed);
+            let dn = self.deliver_ns.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[OFFLOAD-STATS] launches={l} launch(engine)={ln}ns ({}/call) worker={wn}ns ({}/call) deliver={dn}ns ({}/call)",
+                if l > 0 { ln / l } else { 0 },
+                if l > 0 { wn / l } else { 0 },
+                if l > 0 { dn / l } else { 0 },
+            );
+        }
+    }
 }
 
 // Safety: the ONLY cross-thread component in the process. Every field is
@@ -102,6 +146,7 @@ impl OffloadRt {
                 ready: HashMap::new(),
             }),
             parked: Condvar::new(),
+            stats: OffloadStats::default(),
         })
     }
 
@@ -185,7 +230,7 @@ impl OffloadRt {
 // Worker-side executor
 // =========================================================================
 
-enum OffloadOutcome {
+pub(super) enum OffloadOutcome {
     Done(Value, ControlSignal),
     Fallback,
 }
@@ -195,71 +240,21 @@ enum OffloadOutcome {
 /// queue/gate machinery — the whitelist guarantees none of it is reachable.
 /// Reads only the frame's own table; a missing input (an outer-scope read
 /// the classifier let through) is a Fallback, never a panic.
-pub(super) fn run_offloaded_subgraph(graph: &DataFlowGraph, frame: &mut Frame) -> OffloadOutcome {
-    let plan: &[NodeId] = match graph.linear_plan(frame.subgraph_id.0 as usize) {
-        Some(p) if !p.is_empty() => p,
-        _ => return OffloadOutcome::Fallback,
-    };
-    let node_start = frame.node_offset;
-    for &gid in plan {
-        if !matches!(frame.control_signal, ControlSignal::None) {
-            break;
-        }
-        let local = NodeId(gid.0.wrapping_sub(node_start));
-        if local.0 as usize >= frame.value_table_len() {
-            return OffloadOutcome::Fallback;
-        }
-        if frame.value_table.is_ready(local.0 as usize) {
-            continue;
-        }
-        let node = graph.node(gid.0 as usize);
-        // Every input must be produced inside this frame (args are injected
-        // at construction); anything else is a classifier escape — bail.
-        let inputs = graph.inputs(node.inputs_offset, node.input_count);
-        for inp in inputs {
-            let inp_local = NodeId(inp.0.wrapping_sub(node_start));
-            if inp_local.0 as usize >= frame.value_table_len()
-                || !frame.value_table.is_ready(inp_local.0 as usize)
-            {
-                return OffloadOutcome::Fallback;
+fn diag_flag(name: &'static str) -> bool {
+    static FLAGS: std::sync::OnceLock<rustc_hash::FxHashMap<&'static str, bool>> =
+        std::sync::OnceLock::new();
+    *FLAGS
+        .get_or_init(|| {
+            let mut m = rustc_hash::FxHashMap::default();
+            for k in ["FROND_OFFLOAD_NOCHK", "FROND_OFFLOAD_NOCOMPUTE", "FROND_OFFLOAD_NOSTORE"] {
+                m.insert(k, std::env::var(k).is_ok());
             }
-        }
-        let ctx = EvalContext { node_start, graph };
-        let result = (graph.compute_fns[node.compute_fn.0 as usize])(frame, gid, &ctx);
-        match result {
-            NodeResult::Value(v) => {
-                let cc = graph.downstream_count(gid.0 as usize);
-                frame.set_value(local, v, cc);
-            }
-            NodeResult::Batch(results) => {
-                for &(lid, ref v) in &results {
-                    let g2 = lid.0 + node_start;
-                    let cc = graph.downstream_count(g2 as usize);
-                    frame.set_value(lid, v.clone(), cc);
-                }
-            }
-            NodeResult::Return(v) => {
-                frame.control_signal = ControlSignal::Return(v);
-                break;
-            }
-            NodeResult::Break => {
-                frame.control_signal = ControlSignal::Break;
-                break;
-            }
-            NodeResult::Continue => {
-                frame.control_signal = ControlSignal::Continue;
-                break;
-            }
-            // Engine-needing results cannot come from whitelisted compute
-            // functions; if the classifier is ever wrong this lands here.
-            _ => return OffloadOutcome::Fallback,
-        }
-    }
-    OffloadOutcome::Done(
-        super::Schedule::extract_child_return(frame, graph),
-        frame.control_signal.clone(),
-    )
+            m
+        })
+        .get(name)
+        .unwrap_or(&false)
 }
+
 
 // =========================================================================
 // Copy-in safety gate
@@ -293,6 +288,55 @@ fn value_offload_safe(v: &Value, seen: &mut HashSet<usize>) -> bool {
         },
         HeapObj::Cell(c) => value_offload_safe(&c.get(), seen),
         _ => true,
+    }
+}
+
+/// Collects every heap-object address reachable from `v` (cycles tolerated).
+fn collect_ref_ptrs(v: &Value, seen: &mut HashSet<usize>) {
+    let Value::Ref(rc) = v else { return };
+    let key = std::sync::Arc::as_ptr(rc) as usize;
+    if !seen.insert(key) {
+        return;
+    }
+    use crate::value::HeapObj;
+    match rc.as_ref() {
+        HeapObj::Array(a) => a.elements.iter().for_each(|e| collect_ref_ptrs(e, seen)),
+        HeapObj::Record(r) => r.fields.iter().for_each(|e| collect_ref_ptrs(e, seen)),
+        HeapObj::Adt(a) => a.fields.iter().for_each(|f| collect_ref_ptrs(&f.value, seen)),
+        HeapObj::Newtype(n) => collect_ref_ptrs(&n.inner, seen),
+        HeapObj::ThrowVal(t) => match &t.payload {
+            crate::value::ThrowPayload::Ok(v) | crate::value::ThrowPayload::Err(v) => {
+                collect_ref_ptrs(v, seen)
+            }
+        },
+        HeapObj::Cell(c) => collect_ref_ptrs(&c.get(), seen),
+        _ => {}
+    }
+}
+
+/// Does any heap object reachable from `v` appear in `arg_ptrs`?
+fn refs_intersect(v: &Value, arg_ptrs: &HashSet<usize>, seen: &mut HashSet<usize>) -> bool {
+    let Value::Ref(rc) = v else { return false };
+    let key = std::sync::Arc::as_ptr(rc) as usize;
+    if arg_ptrs.contains(&key) {
+        return true;
+    }
+    if !seen.insert(key) {
+        return false;
+    }
+    use crate::value::HeapObj;
+    match rc.as_ref() {
+        HeapObj::Array(a) => a.elements.iter().any(|e| refs_intersect(e, arg_ptrs, seen)),
+        HeapObj::Record(r) => r.fields.iter().any(|e| refs_intersect(e, arg_ptrs, seen)),
+        HeapObj::Adt(a) => a.fields.iter().any(|f| refs_intersect(&f.value, arg_ptrs, seen)),
+        HeapObj::Newtype(n) => refs_intersect(&n.inner, arg_ptrs, seen),
+        HeapObj::ThrowVal(t) => match &t.payload {
+            crate::value::ThrowPayload::Ok(v) | crate::value::ThrowPayload::Err(v) => {
+                refs_intersect(v, arg_ptrs, seen)
+            }
+        },
+        HeapObj::Cell(c) => refs_intersect(&c.get(), arg_ptrs, seen),
+        _ => false,
     }
 }
 
@@ -341,7 +385,12 @@ impl<S: LockStrategy> Engine<S> {
         if !offload_args_ok(&pending.args) {
             return false;
         }
+        // Reference args are now allowed (read-only by the whitelist); their
+        // single semantic risk is the RESULT aliasing an argument object —
+        // checked exactly on the worker (see the restitution fallback).
+        let args_have_refs = pending.args.iter().any(|v| matches!(v, Value::Ref(_)));
 
+        let __t0 = std::time::Instant::now();
         // Copy-in: private deep clones; from here on the worker shares
         // nothing with the engine's live object graph.
         let cloned: Vec<Value> = pending
@@ -349,6 +398,18 @@ impl<S: LockStrategy> Engine<S> {
             .iter()
             .map(|a| crate::value::Arena::deep_clone_isolated(a))
             .collect();
+        let arg_ref_ptrs: Option<HashSet<usize>> = if args_have_refs {
+            let mut set = HashSet::new();
+            for v in &cloned {
+                collect_ref_ptrs(v, &mut set);
+            }
+            Some(set)
+        } else {
+            None
+        };
+        // Originals for the restitution fallback (cheap: Arc bumps).
+        let original_args: Option<Vec<Value>> =
+            if args_have_refs { Some(pending.args.clone()) } else { None };
 
         let (child_fid, mut child) = self.start_subgraph_frame(
             caller_fid,
@@ -370,6 +431,8 @@ impl<S: LockStrategy> Engine<S> {
         // SubgraphComplete waiter); a launch-time registration left an EMPTY
         // bucket after every normal delivery, which the deadlock detector
         // then misread as a live waiter (dogfood_json ~50% false-deadlocks).
+        rt.stats.launches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        rt.stats.add(&rt.stats.launch_ns, __t0.elapsed());
         let seq = rt.launch_seq();
         let graph = self.graph.clone();
         let rt2 = rt.clone();
@@ -389,22 +452,50 @@ impl<S: LockStrategy> Engine<S> {
             call_node: NodeId,
             rt: &OffloadRt,
             seq: u64,
+            arg_ref_ptrs: Option<HashSet<usize>>,
+            original_args: Option<Vec<Value>>,
         ) {
-            let outcome = run_offloaded_subgraph(graph, &mut child);
+            let __tw = std::time::Instant::now();
+            let outcome = super::Schedule::run_offloaded_subgraph(graph, &mut child);
+            rt.stats.add(&rt.stats.worker_ns, __tw.elapsed());
+            // Restitution check: if the result aliases any (cloned) argument
+            // object, applying it would hand the caller a private clone where
+            // reference semantics demand the real object — fall back to a
+            // re-run with the ORIGINAL args on the engine thread.
+            let aliased = match (&outcome, &arg_ref_ptrs) {
+                (OffloadOutcome::Done(v, _), Some(ptrs)) => {
+                    let mut seen = HashSet::new();
+                    refs_intersect(v, ptrs, &mut seen)
+                }
+                _ => false,
+            };
             let done = match outcome {
-                OffloadOutcome::Done(value, signal) => OffloadDone {
+                OffloadOutcome::Done(value, signal) if !aliased => OffloadDone {
                     caller: caller_fid,
                     call_node,
                     value,
                     signal,
+                    child_frame: Some(child),
                     fallback_child: None,
+                    fallback_args: None,
+                },
+                OffloadOutcome::Done(..) => OffloadDone {
+                    caller: caller_fid,
+                    call_node,
+                    value: Value::VOID,
+                    signal: ControlSignal::None,
+                    child_frame: None,
+                    fallback_child: Some(child),
+                    fallback_args: original_args,
                 },
                 OffloadOutcome::Fallback => OffloadDone {
                     caller: caller_fid,
                     call_node,
                     value: Value::VOID,
                     signal: ControlSignal::None,
+                    child_frame: None,
                     fallback_child: Some(child),
+                    fallback_args: original_args,
                 },
             };
             if std::env::var("FROND_DEBUG_OFFLOAD").is_ok() {
@@ -416,7 +507,16 @@ impl<S: LockStrategy> Engine<S> {
         rayon::spawn(move || {
             let (graph, rt2, payload) = (graph, rt2, payload);
             let payload: Box<Frame> = payload.0;
-            offload_worker(&graph, payload, caller_fid, call_node, &rt2, seq);
+            offload_worker(
+                &graph,
+                payload,
+                caller_fid,
+                call_node,
+                &rt2,
+                seq,
+                arg_ref_ptrs,
+                original_args,
+            );
         });
 
         if std::env::var("FROND_DEBUG_OFFLOAD").is_ok() {
@@ -446,16 +546,26 @@ impl<S: LockStrategy> Engine<S> {
             return;
         }
         let mut completions: Vec<(FrameId, NodeId, Value, ControlSignal)> = Vec::new();
-        let mut fallbacks: Vec<Box<Frame>> = Vec::new();
-        rt.drain_apply(&mut |done| {
+        let mut fallbacks: Vec<(Box<Frame>, Option<Vec<Value>>)> = Vec::new();
+        let mut pooled_sink: Vec<Box<Frame>> = Vec::new();
+        let __td = std::time::Instant::now();
+        let __n_applied = rt.drain_apply(&mut |done| {
             if std::env::var("FROND_DEBUG_OFFLOAD").is_ok() {
                 eprintln!("[OFFLOAD] apply seq->caller={:?}", done.caller);
             }
             match done.fallback_child {
-                Some(child) => fallbacks.push(child),
-                None => completions.push((done.caller, done.call_node, done.value, done.signal)),
+                Some(child) => fallbacks.push((child, done.fallback_args)),
+                None => {
+                    if let Some(child) = done.child_frame {
+                        pooled_sink.push(child);
+                    }
+                    completions.push((done.caller, done.call_node, done.value, done.signal))
+                }
             }
         });
+        if __n_applied > 0 {
+            rt.stats.add(&rt.stats.deliver_ns, __td.elapsed());
+        }
         for (caller, node, value, signal) in completions {
             self.pending_completions
                 .lock()
@@ -464,7 +574,47 @@ impl<S: LockStrategy> Engine<S> {
                 .push((node, value, signal));
             queue.push(caller);
         }
-        for mut child in fallbacks {
+        for child in pooled_sink {
+            self.release_frame(child);
+        }
+        for (mut child, orig_args) in fallbacks {
+            if let Some(args) = orig_args {
+                // Restitution / ref-arg classifier escape: re-execute with
+                // the ORIGINAL arguments on this thread. Rebuild the child
+                // frame from the (Suspended, in-map) caller so reference
+                // semantics survive, then drive it through the real queue
+                // machinery.
+                let (caller_fid, call_node) =
+                    child.caller.expect("offload child has caller");
+                let target_sg = child.subgraph_id;
+                let caller_frame = self.frames.lock().remove(&caller_fid);
+                let Some(caller_frame) = caller_frame else {
+                    // The caller must be in-map Suspended waiting on this
+                    // child; absence is an engine-protocol breach.
+                    panic!("offload restitution: caller {caller_fid:?} not in frames map");
+                };
+                let (new_fid, mut new_child) = self.start_subgraph_frame(
+                    caller_fid,
+                    call_node,
+                    target_sg,
+                    &args,
+                    &caller_frame,
+                    None,
+                );
+                self.frames.lock().insert(caller_fid, caller_frame);
+                new_child.root_frame_ptr = std::ptr::null_mut();
+                new_child.parent_frame_ptr = std::ptr::null_mut();
+                new_child.state = FrameState::Ready;
+                self.event_waiters
+                    .lock()
+                    .entry(RuntimeEvent::SubgraphComplete(new_fid))
+                    .or_default()
+                    .push(caller_fid);
+                self.frames.lock().insert(new_fid, new_child);
+                queue.push(new_fid);
+                drop(child); // the clone-built child is discarded
+                continue;
+            }
             let cfid = child.id;
             child.state = FrameState::Ready;
             // The re-drive completes through complete_and_wake_caller, which
@@ -478,6 +628,12 @@ impl<S: LockStrategy> Engine<S> {
             }
             self.frames.lock().insert(cfid, child);
             queue.push(cfid);
+        }
+    }
+
+    fn stats_add_worker(&self, d: std::time::Duration) {
+        if let Some(rt) = self.offload_rt.as_ref() {
+            rt.stats.add(&rt.stats.worker_ns, d);
         }
     }
 
