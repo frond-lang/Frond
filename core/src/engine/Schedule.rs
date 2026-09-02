@@ -820,6 +820,13 @@ impl<S: LockStrategy> Engine<S> {
                             frame.cached_child_frame = Some(bfid);
                             bfid
                         }
+                    } else if self.try_launch_offload(fid, &pending, frame) {
+                        // L2: pure-heavy leaf executing on a worker with
+                        // deep-copied args; the caller is suspended and the
+                        // completion arrives via the offload sequencer. Takes
+                        // precedence over inline execution (offload eligibility
+                        // implies a heavy node count where parallelism pays).
+                        return;
                     } else if inline_sync {
                         // Placeholder: the inline path below builds the frame itself (without a
                         // frames-map insert). This arm must not be reachable for is_async.

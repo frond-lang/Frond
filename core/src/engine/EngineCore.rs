@@ -285,6 +285,9 @@ pub struct Engine<S: LockStrategy> {
     /// The ready-frame queue for both variants (Single direct; Multi's
     /// deterministic event loop).
     pub ready_frames: Option<RefCell<std::collections::VecDeque<FrameId>>>,
+    /// L2 offload runtime (Multi only; None in Single). Shared with worker
+    /// threads — the ONLY cross-thread state, fully mutex-guarded.
+    pub offload_rt: Option<std::sync::Arc<super::Offload::OffloadRt>>,
     /// Queue-membership set (Multi only): at most ONE pending ready-queue
     /// entry per frame. Root fix (2026-09) for the duplicate-entry family:
     /// the suspension handoff pushes AND the wake path pushes the same frame,
@@ -307,6 +310,58 @@ pub struct Engine<S: LockStrategy> {
 // GLOBAL_ARENA keying) remains unsupported.
 unsafe impl Send for Engine<Multi> {}
 unsafe impl Sync for Engine<Multi> {}
+
+/// L2 offload classification: a subgraph is offloadable iff every node in
+/// its range is in the pure whitelist (`is_offload_safe_compute`) and it is
+/// an ordinary subgraph (no loop machinery). Size thresholding happens at
+/// launch (FROND_OFFLOAD / FROND_OFFLOAD_MIN), not here.
+fn classify_offloadable(graph: &mut DataFlowGraph) {
+    let mut safe = vec![false; graph.subgraphs.len()];
+    for (i, sg) in graph.subgraphs.iter().enumerate() {
+        if sg.loop_kind != crate::ir::Ir::LoopKind::None {
+            continue;
+        }
+        let (ns, ne) = sg.node_range;
+        let mut ok = true;
+        for nid in ns.0..ne.0 {
+            if nid as usize >= graph.node_count() {
+                ok = false;
+                break;
+            }
+            let node = graph.node(nid as usize);
+            if !crate::ir::Ir::is_offload_safe_compute(node.compute_fn.0) {
+                if std::env::var("FROND_DEBUG_OFFLOAD").is_ok() && !ok {
+                    // first disqualifier only, per sg
+                }
+                if std::env::var("FROND_DEBUG_OFFLOAD").is_ok() {
+                    let fname = sg.function_id as usize;
+                    let fname = graph
+                        .sg_names
+                        .get(fname)
+                        .map(|s| s.as_str())
+                        .unwrap_or("?");
+                    eprintln!(
+                        "[OFFLOAD-CLASS] sg={} fn={fname} disqualified by cf={} at node {}",
+                        i, node.compute_fn.0, nid
+                    );
+                }
+                ok = false;
+                break;
+            }
+        }
+        if ok && std::env::var("FROND_DEBUG_OFFLOAD").is_ok() {
+            let fname = sg.function_id as usize;
+            let fname = graph
+                .sg_names
+                .get(fname)
+                .map(|s| s.as_str())
+                .unwrap_or("?");
+            eprintln!("[OFFLOAD-CLASS] sg={} fn={fname} SAFE nodes={}", i, ne.0 - ns.0);
+        }
+        safe[i] = ok;
+    }
+    graph.offload_safe = safe;
+}
 
 /// E0 perf: one-time materialization of every node's Const value (scalars inline; strings
 /// shared as one Arc for the whole run — previously every execution of a string const cost
@@ -614,6 +669,7 @@ impl EngineRef {
         precompute_sg_templates(&mut graph);
         materialize_downstream_counts(&mut graph);
         materialize_linear_plans(&mut graph);
+        classify_offloadable(&mut graph);
         let has_async = Self::entry_reaches_suspend(&graph);
         if has_async {
             Self::Multi(Arc::new(Engine::<Multi>::new_multi(graph)))

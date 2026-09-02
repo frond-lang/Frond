@@ -26,6 +26,7 @@
 
 pub mod EngineCore;
 pub mod AsyncRt;
+pub mod Offload;
 pub mod Schedule;
 pub mod Frame;
 pub mod Subgraph;

@@ -1805,6 +1805,16 @@ struct DeepCloneCache {
     value: FxHashMap<*const HeapObj, Value>,
 }
 
+/// Isolation deep clone (L2 offload copy-in): a structurally disjoint copy
+/// of `v` via a private scratch arena. Callers must have verified the value
+/// graph contains no Closure/Partial (their bound_args are arena handles and
+/// would dangle with the scratch arena).
+pub fn deep_clone_isolated(v: &Value) -> Value {
+    let mut arena = ValueArena::new();
+    let mut cache = DeepCloneCache { handle: FxHashMap::default(), value: FxHashMap::default() };
+    deep_clone_value(v, &mut arena, &mut cache)
+}
+
 /// Value-path deep clone: scalars/nulls clone directly (cheap); Ref recursively clones the HeapObj.
 fn deep_clone_value(v: &Value, arena: &mut ValueArena, cache: &mut DeepCloneCache) -> Value {
     match v {

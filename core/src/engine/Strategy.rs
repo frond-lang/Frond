@@ -107,6 +107,7 @@ impl Engine<Single> {
             frame_pool: RefCell::new(Vec::new()),
             ready_frames: Some(RefCell::new(std::collections::VecDeque::new())),
             queued_dedup: None,
+            offload_rt: None,
             _strategy: std::marker::PhantomData,
         }
     }
@@ -218,6 +219,7 @@ impl Engine<Multi> {
             frame_pool: RefCell::new(Vec::new()),
             ready_frames: Some(RefCell::new(std::collections::VecDeque::new())),
             queued_dedup: Some(ParkingMutex::new(HashSet::new())),
+            offload_rt: Some(super::Offload::OffloadRt::from_env()),
             _strategy: std::marker::PhantomData,
         }
     }
@@ -261,6 +263,8 @@ impl Engine<Multi> {
         let mut idle_spins: u64 = 0;
         loop {
             let queue = QueueHandle::EventLoop { queue: &rq, dedup };
+            // L2: replay offload completions in launch order (sequencer).
+            self.apply_offload_deliveries(&queue);
             let fid = {
                 let mut set = dedup.lock();
                 let f = rq.borrow_mut().pop_front();
@@ -288,10 +292,28 @@ impl Engine<Multi> {
                             self.rescue_stranded_frames_multi(&rq, dedup);
                         }
                         let next_deadline = self.timer_runtime.lock().next_deadline();
+                        let inflight = self.offload_inflight();
+                        if inflight > 0 {
+                            // Offload work in flight: park on the delivery
+                            // condvar (workers notify); the timer deadline (if
+                            // any) bounds the wait.
+                            if let Some(rt) = self.offload_rt.as_ref() {
+                                rt.park(next_deadline);
+                            }
+                            continue;
+                        }
+                        if self.offload_rt.as_ref().is_some_and(|rt| rt.head_ready()) {
+                            // A worker delivered BETWEEN the inflight read and
+                            // here; the sequencer head is applicable. The
+                            // loop-top apply is the only consumer — loop back
+                            // instead of evaluating the deadlock verdict.
+                            continue;
+                        }
                         if next_deadline.is_none() && !self.reconcile_stale_joins_multi(&queue) {
                             // Provably permanent: every waiter's source is a
                             // frame (none runnable — the sweep found nothing)
-                            // or a timer (none pending). Dump and exit loudly.
+                            // or a timer (none pending; no offload in flight).
+                            // Dump and exit loudly.
                             self.dump_deadlock_state_multi();
                             panic!(
                                 "event loop: provably permanent wait (no runnable frames, \
@@ -401,6 +423,9 @@ impl Engine<Multi> {
     fn dump_deadlock_state_multi(&self) {
         eprintln!("[DEADLOCK-EXIT] provably permanent waiters — engine state:");
         for (evt, waiters) in self.event_waiters.lock().iter() {
+            if waiters.is_empty() {
+                continue; // stale empty bucket (post-delivery residue)
+            }
             eprintln!("  waiter evt={evt:?} frames={waiters:?}");
         }
         for (fid, f) in self.frames.lock().iter() {
@@ -419,6 +444,9 @@ impl Engine<Multi> {
         }
         for line in self.async_join_runtime.lock().debug_dump() {
             eprintln!("  join: {line}");
+        }
+        if let Some(rt) = self.offload_rt.as_ref() {
+            eprintln!("  offload: {}", rt.debug_state());
         }
     }
 }
