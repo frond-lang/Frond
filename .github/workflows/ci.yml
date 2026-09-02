@@ -1,8 +1,9 @@
 # CI — 跨平台一致性的执法者(BOOTSTRAP_PLAN.md 4d):
 #   suite          五平台矩阵跑 functional + negative + await_loop 稳定性电池
 #                  (linux-x64/linux-arm64/macos-arm64/macos-x64[Rosetta]/windows-x64)
-#   eventloop      同矩阵 FROND_EVENTLOOP=1 跑 functional + 电池 + diff_load
-#                  (确定性事件循环 M2 灰度 soak:两调度器同门禁同口径)
+#                  M3 起默认调度器 = 确定性事件循环(本 job 即事件循环门禁)
+#   pool           同矩阵 FROND_EVENTLOOP=0 跑 functional + 电池 + diff_load
+#                  (worker 池逃生闸 soak:删除前保持同门禁覆盖)
 #   differential   四平台跑镜像差分 diff_lex/diff_ast/diff_load(Rust 引擎
 #                  vs frondc 逐字节);differential-heavy 在 linux-x64 加
 #                  diff_tyops + diff_sema(重负载)
@@ -35,7 +36,7 @@ env:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────
-  # 五平台回归矩阵(默认调度器 = worker 池)
+  # 五平台回归矩阵(默认调度器 = 确定性事件循环,M3 起为默认)
   # macos-x64:arm64 runner 交叉编译 x86_64-apple-darwin,Rosetta 真跑套件。
   # ─────────────────────────────────────────────────────────────────────
   suite:
@@ -85,11 +86,11 @@ jobs:
         run: bash tests/scripts/await_loop_battery.sh 30
 
   # ─────────────────────────────────────────────────────────────────────
-  # 事件循环灰度 soak(FROND_EVENTLOOP=1,确定性单线程调度器)
-  # 与 suite 同矩阵同门禁——两调度器的行为等价性由同一口径持续验证。
+  # worker 池逃生闸 soak(FROND_EVENTLOOP=0)。M3 起事件循环为默认,suite
+  # job 即事件循环门禁;本 job 反向覆盖池路径直至其删除(M3b)。
   # ─────────────────────────────────────────────────────────────────────
-  eventloop:
-    name: eventloop (${{ matrix.name }})
+  pool:
+    name: pool (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -104,7 +105,7 @@ jobs:
     env:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
-      FROND_EVENTLOOP: '1'
+      FROND_EVENTLOOP: '0'
 
     steps:
       # 本地 action 的元数据在自身步骤执行前解析——Frond 仓必须先于
@@ -119,18 +120,18 @@ jobs:
           prefetch: true
           prefetch-triple: ${{ matrix.llvm }}
 
-      - name: Functional suite (event loop)
+      - name: Functional suite (worker pool escape)
         shell: bash
         env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
         run: bash tests/scripts/run_functional.sh
 
-      - name: await_loop stability battery (x50, event loop)
+      - name: await_loop stability battery (x50, worker pool)
         shell: bash
         env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
         run: bash tests/scripts/await_loop_battery.sh 50
 
-      # 事件循环下 frondc 差分逐字节对齐(镜像差分在该调度器下的强信号)。
-      - name: diff load (event loop)
+      # 池路径下 frondc 差分逐字节对齐(镜像差分在该调度器下的强信号)。
+      - name: diff load (worker pool)
         shell: bash
         env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
         run: bash tests/scripts/diff_load.sh

@@ -185,6 +185,18 @@ fn steal_global_dedup(
     fid
 }
 
+/// M3 default flip: the deterministic event loop is the DEFAULT scheduler;
+/// the multi-worker pool survives as an escape hatch behind an explicit
+/// FROND_EVENTLOOP=0 (also "off"/"false") until its deletion. Unset or any
+/// other value selects the event loop — the M2 gray-release soak (CI green
+/// on all five platforms, both schedulers) promoted it to default.
+fn pool_escape_requested() -> bool {
+    matches!(
+        std::env::var("FROND_EVENTLOOP").ok().as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("")
+    )
+}
+
 // =========================================================================
 // impl Engine<Single> — single-threaded mode
 // =========================================================================
@@ -322,26 +334,30 @@ impl Engine<Multi> {
             result: TracedMutex(ParkingMutex::new(None)),
             panic_payload: TracedMutex(ParkingMutex::new(None)),
             frame_pool: TracedMutex(ParkingMutex::new(Vec::new())),
-            // The deterministic event loop (FROND_EVENTLOOP=1) runs on this
-            // same engine struct; the worker pool ignores ready_frames.
+            // The deterministic event loop (the default scheduler) runs on
+            // this same engine struct; the pool escape hatch ignores it.
             ready_frames: Some(RefCell::new(std::collections::VecDeque::new())),
             global_queue: Some(Injector::new()),
             wakeup: Some((ParkingMutex::new(()), Condvar::new())),
             active_count: Some(ParkingMutex::new(num_workers)),
             queued_dedup: Some(ParkingMutex::new(HashSet::new())),
             // Collection gate: sound on ONE thread (roots are complete since
-            // the M1 collector fix); the loop executes on the caller thread.
-            worker_count: if super::env_flag("FROND_EVENTLOOP") { 1 } else { num_workers },
+            // the M1 collector fix). The event loop (default) executes on the
+            // caller thread; only the FROND_EVENTLOOP=0 pool escape runs
+            // multi-worker (collection gated off there).
+            worker_count: if pool_escape_requested() { num_workers } else { 1 },
             _strategy: std::marker::PhantomData,
         }
     }
 
     /// Multi-worker entry point that executes the entry subgraph (replaces run_multi_worker).
     pub(super) fn run_multi(self: Arc<Self>) -> Value {
-        // M2 gray-release: the deterministic single-threaded event loop.
+        // M3: the deterministic single-threaded event loop is the DEFAULT.
         // Same frame protocol, same queue idempotence, same stash/reconciler
-        // safety nets; executed cooperatively on the caller's thread.
-        if super::env_flag("FROND_EVENTLOOP") {
+        // safety nets; executed cooperatively on the caller's thread. The
+        // multi-worker pool remains reachable as the FROND_EVENTLOOP=0
+        // escape hatch until its scheduled deletion.
+        if !pool_escape_requested() {
             return self.run_event_loop_multi();
         }
         let entry_sg = self.graph.entry_subgraph.expect("no entry subgraph");
