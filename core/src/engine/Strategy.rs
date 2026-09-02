@@ -103,13 +103,19 @@ impl<T> Lockable<T> for TracedMutex<T> {
 
 /// Frame-queue abstraction: Single uses `RefCell<VecDeque>`, Multi uses `DequeWorker`.
 ///
-/// Multi pushes are IDEMPOTENT: `dedup` tracks queue membership and a second
-/// push of an already-queued frame is dropped. Root fix for the duplicate-
-/// entry family (see `Engine::queued_dedup`).
+/// Multi/EventLoop pushes are IDEMPOTENT: `dedup` tracks queue membership and
+/// a second push of an already-queued frame is dropped. Root fix for the
+/// duplicate-entry family (see `Engine::queued_dedup`).
 pub enum QueueHandle<'a> {
     Single(&'a RefCell<std::collections::VecDeque<FrameId>>),
     Multi {
         worker: &'a DequeWorker<FrameId>,
+        dedup: &'a ParkingMutex<HashSet<FrameId>>,
+    },
+    /// Deterministic event loop (FROND_EVENTLOOP=1): one FIFO deque + the
+    /// same idempotence guarantee, on the engine's own ready queue.
+    EventLoop {
+        queue: &'a RefCell<std::collections::VecDeque<FrameId>>,
         dedup: &'a ParkingMutex<HashSet<FrameId>>,
     },
 }
@@ -123,6 +129,12 @@ impl QueueHandle<'_> {
                 let mut set = dedup.lock();
                 if set.insert(fid) {
                     worker.push(fid);
+                }
+            }
+            Self::EventLoop { queue, dedup } => {
+                let mut set = dedup.lock();
+                if set.insert(fid) {
+                    queue.borrow_mut().push_back(fid);
                 }
             }
         }
@@ -183,6 +195,7 @@ impl Engine<Single> {
         let graph = Arc::new(graph);
         Self {
             graph: graph.clone(),
+            worker_count: 1,
             hang_progress: std::sync::atomic::AtomicU64::new(0),
             frames: RefCell::new(HashMap::new()),
             next_frame_id: RefCell::new(FrameId(0)),
@@ -309,17 +322,28 @@ impl Engine<Multi> {
             result: TracedMutex(ParkingMutex::new(None)),
             panic_payload: TracedMutex(ParkingMutex::new(None)),
             frame_pool: TracedMutex(ParkingMutex::new(Vec::new())),
-            ready_frames: None,
+            // The deterministic event loop (FROND_EVENTLOOP=1) runs on this
+            // same engine struct; the worker pool ignores ready_frames.
+            ready_frames: Some(RefCell::new(std::collections::VecDeque::new())),
             global_queue: Some(Injector::new()),
             wakeup: Some((ParkingMutex::new(()), Condvar::new())),
             active_count: Some(ParkingMutex::new(num_workers)),
             queued_dedup: Some(ParkingMutex::new(HashSet::new())),
+            // Collection gate: sound on ONE thread (roots are complete since
+            // the M1 collector fix); the loop executes on the caller thread.
+            worker_count: if super::env_flag("FROND_EVENTLOOP") { 1 } else { num_workers },
             _strategy: std::marker::PhantomData,
         }
     }
 
     /// Multi-worker entry point that executes the entry subgraph (replaces run_multi_worker).
     pub(super) fn run_multi(self: Arc<Self>) -> Value {
+        // M2 gray-release: the deterministic single-threaded event loop.
+        // Same frame protocol, same queue idempotence, same stash/reconciler
+        // safety nets; executed cooperatively on the caller's thread.
+        if super::env_flag("FROND_EVENTLOOP") {
+            return self.run_event_loop_multi();
+        }
         let entry_sg = self.graph.entry_subgraph.expect("no entry subgraph");
         LOCK_TRACE_ON.store(super::env_flag("FROND_DEBUG_LOCKTRACE"), std::sync::atomic::Ordering::Relaxed);
         // Print every panic (message + location) the moment it fires, before
@@ -467,6 +491,201 @@ impl Engine<Multi> {
                 });
                 panic!("{}", msg);
             })
+    }
+}
+
+// =========================================================================
+// Deterministic event loop (FROND_EVENTLOOP=1) — M2 gray-release path
+// =========================================================================
+
+impl Engine<Multi> {
+    /// Deterministic single-threaded event loop for async-capable graphs.
+    ///
+    /// Executes every frame on the caller's thread with FIFO, idempotent
+    /// queueing — the value layer's "one thread executes graphs" invariant
+    /// holds by construction (no cross-worker access to heap objects, cells,
+    /// frame chains, or the GLOBAL_ARENA). Idle policy mirrors the proven
+    /// safety nets: timer poll, stranded-frame rescue sweep (BOTH stash
+    /// tables), AsyncJoin reconciler, and a provably-permanent-wait exit
+    /// with a full state dump (a Frond event source is always a frame or a
+    /// timer; when neither can run and nothing is deliverable, waiting is
+    /// mathematically permanent).
+    fn run_event_loop_multi(self: Arc<Self>) -> Value {
+        let entry_sg = self.graph.entry_subgraph.expect("no entry subgraph");
+        let fid = self.init_entry_frame(entry_sg);
+        let rq = self.ready_frames.as_ref().unwrap();
+        let dedup = self.queued_dedup.as_ref().unwrap();
+        {
+            let mut set = dedup.lock();
+            if set.insert(fid) {
+                rq.borrow_mut().push_back(fid);
+            }
+        }
+
+        let park_mutex = ParkingMutex::new(());
+        let park_cv = Condvar::new();
+        let mut idle_spins: u64 = 0;
+        loop {
+            let queue = QueueHandle::EventLoop { queue: &rq, dedup };
+            let fid = {
+                let mut set = dedup.lock();
+                let f = rq.borrow_mut().pop_front();
+                if let Some(f) = &f {
+                    set.remove(f);
+                }
+                f
+            };
+            let fid = match fid {
+                Some(f) => f,
+                None => {
+                    idle_spins += 1;
+                    if idle_spins > 200_000_000 {
+                        panic!(
+                            "event loop stuck: {idle_spins} idle iterations without a ready \
+                             frame (livelock suspected)"
+                        );
+                    }
+                    self.check_timers(&queue);
+                    if let Some(result) = self.result.lock().take() {
+                        return result;
+                    }
+                    if rq.borrow().is_empty() {
+                        if idle_spins.is_multiple_of(65_536) {
+                            self.rescue_stranded_frames_multi(&rq, dedup);
+                        }
+                        let next_deadline = self.timer_runtime.lock().next_deadline();
+                        if next_deadline.is_none() && !self.reconcile_stale_joins_multi(&queue) {
+                            // Provably permanent: every waiter's source is a
+                            // frame (none runnable — the sweep found nothing)
+                            // or a timer (none pending). Dump and exit loudly.
+                            self.dump_deadlock_state_multi();
+                            panic!(
+                                "event loop: provably permanent wait (no runnable frames, \
+                                 no timers, undeliverable waiters)"
+                            );
+                        }
+                        if let Some(deadline) = next_deadline {
+                            let wait_dur =
+                                deadline.saturating_duration_since(std::time::Instant::now());
+                            if !wait_dur.is_zero() {
+                                let mut guard = park_mutex.lock();
+                                park_cv.wait_for(&mut guard, wait_dur);
+                            }
+                        } else {
+                            std::thread::yield_now();
+                        }
+                    }
+                    continue;
+                }
+            };
+            self.process_frame(fid, &queue);
+            idle_spins = 0;
+            if let Some(result) = self.result.lock().take() {
+                return result;
+            }
+        }
+    }
+
+    /// Requeue frames that are provably ready-to-run but hold no queue entry
+    /// (Ready-but-unqueued; Suspended carrying a stashed event OR completion —
+    /// only a dispatch drains stashes). Defer-waiters are excluded.
+    fn rescue_stranded_frames_multi(
+        &self,
+        rq: &RefCell<std::collections::VecDeque<FrameId>>,
+        dedup: &ParkingMutex<HashSet<FrameId>>,
+    ) {
+        let mut rescued: Vec<FrameId> = Vec::new();
+        {
+            let mut stashed: HashSet<FrameId> = {
+                let pe = self.pending_events.lock();
+                pe.keys().copied().collect()
+            };
+            {
+                let pc = self.pending_completions.lock();
+                stashed.extend(pc.keys().copied());
+            }
+            let defer_waiters: HashSet<FrameId> = {
+                let dw = self.defer_waiters.lock();
+                dw.keys().copied().collect()
+            };
+            let frames = self.frames.lock();
+            for (fid, f) in frames.iter() {
+                if f.state == FrameState::Ready {
+                    rescued.push(*fid);
+                } else if f.state == FrameState::Suspended
+                    && stashed.contains(fid)
+                    && !defer_waiters.contains(fid)
+                {
+                    rescued.push(*fid);
+                }
+            }
+        }
+        if !rescued.is_empty() {
+            let mut set = dedup.lock();
+            let mut q = rq.borrow_mut();
+            for fid in rescued {
+                if set.insert(fid) {
+                    q.push_back(fid);
+                }
+            }
+        }
+    }
+
+    /// Re-deliver AsyncJoin results that are stored but whose delivery was
+    /// lost. Returns true when something was delivered (progress possible).
+    fn reconcile_stale_joins_multi(&self, queue: &QueueHandle<'_>) -> bool {
+        let stale: Vec<(crate::ir::Ir::AsyncHandleId, Value)> = {
+            let ew = self.event_waiters.lock();
+            let mut out = Vec::new();
+            for (evt, waiters) in ew.iter() {
+                if waiters.is_empty() {
+                    continue;
+                }
+                if let RuntimeEvent::AsyncJoin(id) = evt {
+                    if let Some(v) = self.async_join_runtime.lock().try_get_result(*id) {
+                        out.push((*id, v));
+                    }
+                }
+            }
+            out
+        };
+        let mut delivered = false;
+        for (id, v) in stale {
+            let woken = self.on_event_arrived(RuntimeEvent::AsyncJoin(id), v.clone(), queue);
+            if woken > 0 {
+                self.async_join_runtime.lock().remove_entry(id);
+                delivered = true;
+            } else {
+                self.async_join_runtime.lock().set_result(id, v);
+            }
+        }
+        delivered
+    }
+
+    /// Full engine state dump at the provable-deadlock exit (post-mortem for
+    /// any future lost-wakeup report).
+    fn dump_deadlock_state_multi(&self) {
+        eprintln!("[DEADLOCK-EXIT] provably permanent waiters — engine state:");
+        for (evt, waiters) in self.event_waiters.lock().iter() {
+            eprintln!("  waiter evt={evt:?} frames={waiters:?}");
+        }
+        for (fid, f) in self.frames.lock().iter() {
+            eprintln!(
+                "  frame {fid:?} sg={} state={:?} suspend={:?} event={:?}",
+                f.subgraph_id.0, f.state, f.suspend_state, f.suspend_event
+            );
+        }
+        let pe = self.pending_events.lock();
+        if !pe.is_empty() {
+            eprintln!("  pending_events keys={:?}", pe.keys().collect::<Vec<_>>());
+        }
+        let pc = self.pending_completions.lock();
+        if !pc.is_empty() {
+            eprintln!("  pending_completions keys={:?}", pc.keys().collect::<Vec<_>>());
+        }
+        for line in self.async_join_runtime.lock().debug_dump() {
+            eprintln!("  join: {line}");
+        }
     }
 }
 

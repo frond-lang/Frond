@@ -95,9 +95,7 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                     }
                 }
                 HeapObj::Newtype(n) => {
-                    // Newtype.inner is still a ValueHandle: convert to Value then recurse
-                    let inner_val = super::Arena::ValueArena::with_global(|arena| arena.get_value(n.inner));
-                    format!("{}({})", crate::sema::Sema::display_type_name(&n.type_name), format_value(&inner_val, depth + 1))
+                    format!("{}({})", crate::sema::Sema::display_type_name(&n.type_name), format_value(&n.inner, depth + 1))
                 }
                 HeapObj::Array(a) => {
                     let mut out = String::from("[");
@@ -187,10 +185,8 @@ fn value_size(v: &Value) -> u32 {
                 HeapObj::Record(rec) => rec.fields.iter().map(value_size).sum(),
                 // ADT: sum of field sizes (current constructor's fields, excluding tag)
                 HeapObj::Adt(a) => a.fields.iter().map(|f| value_size(&f.value)).sum(),
-                // Newtype: look up the inner value's size from the global arena
-                HeapObj::Newtype(n) => {
-                    super::Arena::ValueArena::with_global(|arena| value_size(&arena.get_value(n.inner)))
-                }
+                // Newtype: size of the inline inner value
+                HeapObj::Newtype(n) => value_size(&n.inner),
                 _ => 8,
             }
         }
@@ -218,10 +214,8 @@ fn value_alignment(v: &Value) -> u32 {
                 HeapObj::Str(_) | HeapObj::Array(_) => 8,
                 HeapObj::Record(rec) => rec.fields.iter().map(value_alignment).max().unwrap_or(1),
                 HeapObj::Adt(a) => a.fields.iter().map(|f| value_alignment(&f.value)).max().unwrap_or(1).max(1),
-                // Newtype: look up the inner value's alignment from the global arena
-                HeapObj::Newtype(n) => {
-                    super::Arena::ValueArena::with_global(|arena| value_alignment(&arena.get_value(n.inner)))
-                }
+                // Newtype: alignment of the inline inner value
+                HeapObj::Newtype(n) => value_alignment(&n.inner),
                 _ => 8,
             }
         }

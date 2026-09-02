@@ -253,6 +253,11 @@ pub(super) const GOLDEN_RATIO_64: u64 = 0x9E3779B97F4A7C15;
 /// Unified engine: field types are determined by `S`, while the business logic is written once.
 pub struct Engine<S: LockStrategy> {
     pub graph: Arc<DataFlowGraph>,
+    /// Worker count the engine was created with (immutable). Collection at the
+    /// pressure valve is stop-the-world: sound on ONE thread (Single, or Multi
+    /// with FROND_WORKERS=1), unsound with real concurrency (another worker
+    /// allocating/dropping while the mark phase walks raw pointers).
+    pub worker_count: usize,
     /// Hang-watchdog progress counter (Multi debug; cheap atomic bump per frame).
     pub hang_progress: std::sync::atomic::AtomicU64,
     pub frames: S::Mutex<HashMap<FrameId, Box<crate::ir::Ir::Frame>>>,

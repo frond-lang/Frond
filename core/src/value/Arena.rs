@@ -417,7 +417,7 @@ impl ValueArena {
     pub fn alloc_adt(&mut self, a: AdtValue) -> ValueHandle {
         self.alloc_ref(HeapObj::Adt(a))
     }
-    pub fn alloc_newtype(&mut self, type_name: impl Into<String>, inner: ValueHandle) -> ValueHandle {
+    pub fn alloc_newtype(&mut self, type_name: impl Into<String>, inner: Value) -> ValueHandle {
         self.alloc_ref(HeapObj::Newtype(NewtypeValue { type_name: type_name.into(), inner }))
     }
     pub fn alloc_cell(&mut self, val: Value) -> ValueHandle {
@@ -1587,7 +1587,7 @@ pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
                     .all(|(xf, yf)| value_equals_with_arena(&xf.value, &yf.value, arena))
         }
         (HeapObj::Newtype(x), HeapObj::Newtype(y)) => {
-            x.type_name == y.type_name && x.inner.equals(&y.inner, arena)
+            x.type_name == y.type_name && value_equals_with_arena(&x.inner, &y.inner, arena)
         }
         (HeapObj::Cell(x), HeapObj::Cell(y)) => {
             let xb = x.get();
@@ -1926,8 +1926,7 @@ fn deep_clone_heap(
         }
         HeapObj::Newtype(n) => HeapObj::Newtype(NewtypeValue {
             type_name: n.type_name.clone(),
-            // inner is still a ValueHandle
-            inner: deep_clone_handle(n.inner, arena, cache),
+            inner: deep_clone_value(&n.inner, arena, cache),
         }),
         HeapObj::Cell(c) => {
             let inner = c.get();
@@ -2168,7 +2167,7 @@ impl ValueArena {
             fields,
         )))
     }
-    pub fn newtype(&mut self, type_name: impl Into<String>, inner: ValueHandle) -> ValueHandle {
+    pub fn newtype(&mut self, type_name: impl Into<String>, inner: Value) -> ValueHandle {
         self.alloc_ref(HeapObj::Newtype(NewtypeValue {
             type_name: type_name.into(),
             inner,

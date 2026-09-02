@@ -1515,9 +1515,9 @@ pub fn compute_record_construct(frame: &mut Frame, node: NodeId, ctx: &EvalConte
             }))
         }
         RecordLitKind::Newtype => {
-            // Newtype: single field; store the inner Value in the global arena to obtain a ValueHandle.
-            let inner_val = fields.into_iter().next().unwrap_or(Value::VOID);
-            let inner = ValueArena::with_global_mut(|a| a.alloc_value(&inner_val));
+            // Newtype: single field, stored INLINE (no GLOBAL_ARENA handle —
+            // see NewtypeValue.inner).
+            let inner = fields.into_iter().next().unwrap_or(Value::VOID);
             Value::ref_val(HeapObj::Newtype(NewtypeValue {
                 type_name: info.type_name.clone(),
                 inner,
@@ -2149,10 +2149,10 @@ pub fn compute_pattern_adt_field_get(frame: &mut Frame, node: NodeId, ctx: &Eval
         Some(crate::value::HeapObj::Record(r)) => {
             r.fields.get(idx).cloned().unwrap_or(Value::VOID)
         }
-        // Newtype: single field; idx 0 fetches the inner value (via the ValueArena global handle dereference).
+        // Newtype: single field (stored inline).
         Some(crate::value::HeapObj::Newtype(n)) => {
             if idx == 0 {
-                crate::value::ValueArena::with_global(|a| a.get_value(n.inner))
+                n.inner.clone()
             } else {
                 Value::VOID
             }

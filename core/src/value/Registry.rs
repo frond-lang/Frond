@@ -73,6 +73,11 @@ pub fn for_each_child(obj: &HeapObj, f: &mut dyn FnMut(&Value)) {
             let v = c.get();
             f(&v);
         }
+        HeapObj::Newtype(n) => f(&n.inner),
+        HeapObj::AtomicVal(a) => {
+            let v = a.load();
+            f(&v);
+        }
         HeapObj::Closure(cl) => {
             for u in &cl.upvalues {
                 f(u);
@@ -106,10 +111,12 @@ pub fn for_each_child(obj: &HeapObj, f: &mut dyn FnMut(&Value)) {
         HeapObj::ArrayElemRef { arr, .. } => f(arr),
         HeapObj::RecordFieldRef { rec, .. } => f(rec),
         HeapObj::ChannelVal(c) => c.each_buffered(f),
-        // Sender/Receiver mirror their ChannelValue twin; the channel is
-        // reachable through them via the shared Arc, but that twin holds no
-        // back-reference, so nothing to traverse.
-        HeapObj::SenderVal(_) | HeapObj::ReceiverVal(_) => {}
+        // Sender/Receiver must traverse their shared ChannelValue twin's
+        // BUFFER: the twin is a separate allocation, so when a sender or
+        // receiver is the only live path to the channel, skipping the buffer
+        // left every buffered message unmarked → falsely swept mid-run.
+        HeapObj::SenderVal(s) => s.channel.each_buffered(f),
+        HeapObj::ReceiverVal(r) => r.channel.each_buffered(f),
         _ => {}
     }
 }
@@ -161,6 +168,16 @@ pub fn collect_cycles(roots: &[Value]) -> usize {
     }
     for p in &dead {
         reg.remove(p);
+    }
+    if trace {
+        for p in &dead {
+            let obj = unsafe { &*(*p as *const HeapObj) };
+            let desc = match obj {
+                HeapObj::Str(s) => format!("Str({s})"),
+                other => format!("{other:?}").chars().take(48).collect::<String>(),
+            };
+            eprintln!("[cycles] dead {p:p} = {desc}");
+        }
     }
     drop(reg);
     // Phase 1: CLONE every dead-source outgoing edge (a real Arc::clone,

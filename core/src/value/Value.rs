@@ -2279,7 +2279,12 @@ impl AdtValue {
 #[derive(Debug, Clone)]
 pub struct NewtypeValue {
     pub type_name: String,
-    pub inner: ValueHandle,
+    /// Inline inner value. Historically a `ValueHandle` into the thread_local
+    /// GLOBAL_ARENA — a Newtype allocated on one engine worker and read on
+    /// another indexed the WRONG thread's arena (wrong values / OOB panics).
+    /// Inline storage removes that entire class (UB-3) and lets Newtype
+    /// construction run on any thread (prerequisite for offload).
+    pub inner: Value,
 }
 
 /// Cell: a mutable reference cell (runtime carrier of `&T` reference semantics).

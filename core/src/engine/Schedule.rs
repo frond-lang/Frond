@@ -1670,13 +1670,22 @@ impl<S: LockStrategy> Engine<S> {
             FrameState::Completed => {
                 // Cycle-collection pressure valve: at frame completion (a
                 // quiescent point) collect cyclic garbage when the registry
-                // grows past the threshold. Roots = every live frame's value
-                // table (globals live in the root frame's slots).
-                // Single-threaded engines only: in Multi mode other workers
-                // mutate the object graph concurrently and the stop-the-world
-                // assumption breaks (mid-run collection would race). Multi-mode
-                // cycles are reclaimed by the teardown sweep instead.
-                if self.wakeup.is_none()
+                // grows past the threshold. Soundness rests on (a) a
+                // single-threaded engine (worker_count <= 1: no concurrent
+                // alloc/drop while the mark phase walks raw pointers) and (b)
+                // ROOT COMPLETENESS — the sweep replaces every unmarked
+                // registered object IN PLACE with Range(0,0), so any live
+                // Value location the roots miss is corrupted, not leaked.
+                // Root set: every frame table (live + pooled + this completing
+                // one) with its construct_cache, the graph's const_cache (the
+                // only holder of materialized constants between node
+                // executions — its omission swept ""-literals to Range(0,0)
+                // mid-run and corrupted str accumulators), pending
+                // completions/events, the result, async-join results, the
+                // ENGINE arena's ref slots, and the thread_local GLOBAL_ARENA's
+                // ref slots (Closure bound_args handles live there, not in
+                // self.arena).
+                if self.worker_count <= 1
                     && crate::value::Registry::registered_count() > 1 << 16 {
                     let mut roots: Vec<crate::value::Value> = Vec::new();
                     // The completing frame itself was already TAKEN out of the
@@ -1686,11 +1695,27 @@ impl<S: LockStrategy> Engine<S> {
                     // 5万-entry maps in main) reads as garbage and gets its
                     // edges released → use-after-free at teardown.
                     roots.extend(frame.value_table.values.iter().cloned());
+                    roots.extend(frame.construct_cache.iter().map(|(_, v)| v.clone()));
                     let frames = self.frames.lock();
                     for f in frames.values() {
                         roots.extend(f.value_table.values.iter().cloned());
+                        roots.extend(f.construct_cache.iter().map(|(_, v)| v.clone()));
                     }
                     drop(frames);
+                    // The graph's materialized constants (shared Arcs, often
+                    // the ONLY holder between node executions).
+                    roots.extend(self.graph.const_cache.iter().cloned());
+                    // Global variables live in graph.global_var_storage (the
+                    // place model's GlobalSlotRef home — NOT "the root frame's
+                    // slots" as older comments claimed). frondc's loader
+                    // caches are globals; without this root the first valve
+                    // fire swept the entire module-path/AST-string universe.
+                    for slot in self.graph.global_var_storage.iter() {
+                        let g = slot.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(v) = g.as_ref() {
+                            roots.push(v.clone());
+                        }
+                    }
                     // Engine-side Value holders outside the frame map:
                     // pooled frames, pending completions/events, the final
                     // result, resolved-but-unjoined async results, and the
@@ -1698,6 +1723,7 @@ impl<S: LockStrategy> Engine<S> {
                     // so rooted conservatively here).
                     for f in self.frame_pool.lock().iter() {
                         roots.extend(f.value_table.values.iter().cloned());
+                        roots.extend(f.construct_cache.iter().map(|(_, v)| v.clone()));
                     }
                     for v in self.pending_completions.lock().values() {
                         for (_, val, _) in v.iter() {
@@ -1722,6 +1748,17 @@ impl<S: LockStrategy> Engine<S> {
                             roots.push(crate::value::Value::from_ref(a));
                         }
                     }
+                    // The thread_local GLOBAL_ARENA is a DIFFERENT arena from
+                    // self.arena: Closure bound_args (and formerly Newtype
+                    // inner) handles are allocated there and were never rooted
+                    // by the self.arena pass above.
+                    crate::value::ValueArena::with_global(|g| {
+                        let mut arcs: Vec<std::sync::Arc<crate::value::HeapObj>> = Vec::new();
+                        g.collect_ref_arcs(&mut arcs);
+                        for a in arcs {
+                            roots.push(crate::value::Value::from_ref(a));
+                        }
+                    });
                     crate::value::Registry::collect_cycles(&roots);
                 }
 
