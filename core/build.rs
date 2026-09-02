@@ -193,6 +193,17 @@ pub unsafe fn {name}(pattern: u32, fn_ptr: *mut core::ffi::c_void, ints: &[u64],
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_extern_c)");
 
+    // Static-musl link order: rustc places its own -lc BEFORE the cc-built
+    // frond_extern archive; a static archive only satisfies symbols for
+    // objects that precede it on the linker line, so the C kernels' libc
+    // references (access/strtod/localtime_r/posix_spawn...) went unresolved.
+    // Appending one more -lc at the very end closes the window.
+    if let Ok(target) = env::var("TARGET") {
+        if target.contains("musl") {
+            println!("cargo:rustc-link-arg=-lc");
+        }
+    }
+
     let out_dir = env::var("OUT_DIR").unwrap();
 
     // The trampoline table is needed unconditionally (the lib includes it

@@ -59,12 +59,24 @@ runs:
 
     # build.rs 在此步把 std 的全部 @extern("C") C 原语编译进二进制——
     # 平台分支(#if _WIN32 / __APPLE__)只有本步会真正编译到。
-    - name: Build engine
+    # Windows 必须走 pwsh:Git Bash 会把 /usr/bin/link.exe(coreutils!)
+    # 排在 MSVC link.exe 之前,rustc 链接 build script 时直接炸。
+    - name: Build engine (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      working-directory: Frond/core
+      env:
+        TARGET: ${{ inputs.rust-target }}
+      run: |
+        if ($env:TARGET) { cargo build --release "--target=$env:TARGET" }
+        else { cargo build --release }
+    - name: Build engine (unix)
+      if: runner.os != 'Windows'
       shell: bash
       working-directory: Frond/core
       env:
         TARGET: ${{ inputs.rust-target }}
-      run: cargo build --release ${TARGET:+--target "$TARGET"}
+      run: cargo build --release ${TARGET:+--target="$TARGET"}
 
     - id: bin
       name: Resolve binary path
@@ -76,7 +88,10 @@ runs:
         if [ -n "$TARGET" ]; then rel="$rel/$TARGET"; fi
         rel="$rel/release/frond"
         if [ "$RUNNER_OS" = "Windows" ]; then rel="$rel.exe"; fi
-        echo "frond-bin=$rel" >> "$GITHUB_OUTPUT"
+        # ABSOLUTE path: the test/diff scripts cd into tests/scripts before
+        # resolving $FROND, so a workspace-relative path lands in the wrong
+        # directory (the first full-matrix red).
+        echo "frond-bin=$GITHUB_WORKSPACE/$rel" >> "$GITHUB_OUTPUT"
 
     # 工具链资产预取:curl 直拉一次,喂 llvm_bind/llvm_probe/crypto_primitives。
     # 不走 llvmfetch——自研 TLS 客户端对 github CDN 在部分 runner 上不稳,
