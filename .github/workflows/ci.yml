@@ -56,8 +56,13 @@ jobs:
       CXX: ${{ matrix.cxx }}
 
     steps:
+      # 本地 action 的元数据在自身步骤执行前解析——Frond 仓必须先于
+      # `uses` 检出(workspace 根 = $GITHUB_WORKSPACE,Frond 在子目录)。
+      - uses: actions/checkout@v5
+        with:
+          path: Frond
       - id: setup
-        uses: ./.github/actions/setup-frond
+        uses: ./Frond/.github/actions/setup-frond
         with:
           rust-target: ${{ matrix.target }}
           prefetch: true
@@ -102,8 +107,13 @@ jobs:
       FROND_EVENTLOOP: '1'
 
     steps:
+      # 本地 action 的元数据在自身步骤执行前解析——Frond 仓必须先于
+      # `uses` 检出(workspace 根 = $GITHUB_WORKSPACE,Frond 在子目录)。
+      - uses: actions/checkout@v5
+        with:
+          path: Frond
       - id: setup
-        uses: ./.github/actions/setup-frond
+        uses: ./Frond/.github/actions/setup-frond
         with:
           rust-target: ${{ matrix.target }}
           prefetch: true
@@ -147,8 +157,13 @@ jobs:
       CXX: ${{ matrix.cxx }}
 
     steps:
+      # 本地 action 的元数据在自身步骤执行前解析——Frond 仓必须先于
+      # `uses` 检出(workspace 根 = $GITHUB_WORKSPACE,Frond 在子目录)。
+      - uses: actions/checkout@v5
+        with:
+          path: Frond
       - id: setup
-        uses: ./.github/actions/setup-frond
+        uses: ./Frond/.github/actions/setup-frond
 
       - name: diff lex (tokens)
         shell: bash
@@ -177,8 +192,13 @@ jobs:
       CC: clang
       CXX: clang++
     steps:
+      # 本地 action 的元数据在自身步骤执行前解析——Frond 仓必须先于
+      # `uses` 检出(workspace 根 = $GITHUB_WORKSPACE,Frond 在子目录)。
+      - uses: actions/checkout@v5
+        with:
+          path: Frond
       - id: setup
-        uses: ./.github/actions/setup-frond
+        uses: ./Frond/.github/actions/setup-frond
 
       - name: diff tyops
         shell: bash
@@ -253,8 +273,13 @@ jobs:
     timeout-minutes: 45
     continue-on-error: true
     steps:
+      # 本地 action 的元数据在自身步骤执行前解析——Frond 仓必须先于
+      # `uses` 检出(workspace 根 = $GITHUB_WORKSPACE,Frond 在子目录)。
+      - uses: actions/checkout@v5
+        with:
+          path: Frond
       - id: setup
-        uses: ./.github/actions/setup-frond
+        uses: ./Frond/.github/actions/setup-frond
         with:
           rust-target: aarch64-pc-windows-msvc
           msvc-arch: amd64_arm64

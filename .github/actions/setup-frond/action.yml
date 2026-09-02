@@ -27,12 +27,13 @@ outputs:
     description: 'Path to the built frond binary (relative to workspace)'
     value: ${{ steps.bin.outputs.frond-bin }}
 
+# NOTE: the calling job MUST check out the Frond repo (path: Frond) BEFORE
+# `uses: ./Frond/.github/actions/setup-frond` — the runner resolves a local
+# action's metadata before any of its own steps run, so this action cannot
+# bootstrap its own definition.
 runs:
   using: composite
   steps:
-    - uses: actions/checkout@v5
-      with:
-        path: Frond
     - uses: actions/checkout@v5
       with:
         repository: frond-lang/tests
