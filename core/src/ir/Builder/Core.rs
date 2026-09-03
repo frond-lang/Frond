@@ -335,6 +335,10 @@ pub(super) fn reflect_method_intrinsic(method: &str) -> Option<(crate::sema::Sem
 pub(crate) struct TailRecCtx {
     pub(super) self_name: String,
     pub(super) param_cells: Vec<NodeId>,
+    /// L3' slot transport flag: non-empty = params ride while_sg PARAM
+    /// slots + ResetPlan carries (no Cells); the tail call lowers to a bare
+    /// void node. The entries are the while_sg param Const nodes.
+    pub(super) slot_params: Vec<NodeId>,
 }
 
 /// call_result_map marker: the mapped call's result lives in the nontail-rec

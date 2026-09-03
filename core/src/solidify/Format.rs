@@ -1342,13 +1342,16 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
     // .fndo format; recomputed at load).
     // v3: nested_ranges are derived (no longer serialized) — must run BEFORE
     // precompute_reset_plans, whose condition-tree walk reads them.
+    // E2 fused carries (inside precompute_reset_plans) read downstream slices,
+    // so the downstream derivation must run BEFORE it too (order bug exposed
+    // by L3' — the first non-empty carries on a loaded graph panicked).
     graph.compute_nested_ranges();
-    graph.precompute_reset_plans();
     // E0 perf: materialize GateBranches once (no-op on the owned path, which
     // already owns them).
     graph.materialize_gate_branches();
     // v2: downstreams are derived from inputs + gate condition edges.
     graph.compute_downstreams();
+    graph.precompute_reset_plans();
     Ok(graph)
 }
 
@@ -1752,13 +1755,15 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
     // accessors on the zerocopy backing.
     // v3: nested_ranges are derived (no longer serialized) — must run BEFORE
     // precompute_reset_plans, whose condition-tree walk reads them.
+    // E2 fused carries (inside precompute_reset_plans) read downstream slices:
+    // derive the CSR first (order bug exposed by L3' — see the owned loader).
     graph.compute_nested_ranges();
-    graph.precompute_reset_plans();
     // E0 perf: materialize GateBranches once (borrowed access on every Gate execution).
     graph.materialize_gate_branches();
     // v2: Downstreams section dropped — derive the flat CSR table from inputs
     // + gate condition edges (gate branches must be materialized first).
     graph.compute_downstream_csr();
+    graph.precompute_reset_plans();
     Ok(graph)
 }
 

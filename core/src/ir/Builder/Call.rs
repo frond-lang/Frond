@@ -485,6 +485,14 @@ impl<'a> IrBuilder<'a> {
             if let Some(ctx) = &self.tail_rec_ctx.clone() {
                 if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
                     if *name == ctx.self_name {
+                    // L3' slot transport: the rec args were hoisted into the
+                    // while frame at transform time and ride PARAM slots via
+                    // ResetPlan carries — lower the call itself to a bare
+                    // void node. No stores, no Continue barrier: the while
+                    // loop's normal body completion IS the continue signal.
+                    if !ctx.slot_params.is_empty() {
+                        return self.compile_void_const();
+                    }
                     // Compile all actual-argument expressions (evaluate first, then store, to avoid races between parameters)
                     let arg_nodes: Vec<NodeId> = args
                         .iter()

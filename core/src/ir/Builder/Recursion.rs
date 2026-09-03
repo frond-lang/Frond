@@ -21,6 +21,12 @@ impl<'a> IrBuilder<'a> {
         params: &[crate::ast::Ast::Param<'_>],
         info: &crate::pass::Analyzer::TailRecInfo,
     ) -> NodeId {
+        // L3' slot transport: eligible shapes ride PARAM slots + phi carries
+        // instead of parameter-register Cells.
+        if self.tail_rec_slot_eligible(params, info) {
+            return self.compile_tail_rec_to_loop_slots(name, body_expr, params, info);
+        }
+
         // 1. Collect parameter nodes (already `bind_var`'d by `compile_function`).
         let param_nodes: Vec<NodeId> = params
             .iter()
@@ -85,6 +91,7 @@ impl<'a> IrBuilder<'a> {
         self.tail_rec_ctx = Some(TailRecCtx {
             self_name: name.to_string(),
             param_cells,
+            slot_params: Vec::new(),
         });
 
         // 5. Compile body_sg: compiles the original function body (LoopBody; after completion
@@ -165,6 +172,310 @@ impl<'a> IrBuilder<'a> {
         //     `loop_kind=None` -> loop reset would fail.
         let call_node = self.compile_recursive_call(while_sg_id);
         call_node
+    }
+
+    /// L3' eligibility: the shape where params can ride while_sg PARAM slots
+    /// + ResetPlan phi carries instead of parameter-register Cells.
+    ///
+    /// - exactly one base case WITH a synthesizable condition and exactly one
+    ///   rec branch (a single tail-call site — the carry source is unambiguous;
+    ///   multiple sites would leave the engine no statically known final node);
+    /// - the recorded condition, every rec arg, and the base return expr are
+    ///   pure and reference nothing but the params: they compile in the while
+    ///   frame / exit sg where body-local bindings do not exist, and a
+    ///   condition not parameter-derived could diverge from the body's own if;
+    /// - no param is cell-backed at entry (assigned params, ③), lambda-captured
+    ///   or address-taken — those already ride entry Cells.
+    fn tail_rec_slot_eligible(
+        &self,
+        params: &[crate::ast::Ast::Param<'_>],
+        info: &crate::pass::Analyzer::TailRecInfo,
+    ) -> bool {
+        use crate::ast::Ast;
+        if info.base_cases.len() != 1 || info.rec_branches.len() != 1 {
+            return false;
+        }
+        let (base_cond, base_ret) = info.base_cases[0];
+        if base_cond.is_none() {
+            return false;
+        }
+        for param in params {
+            if self.lookup_var(param.name).is_none() {
+                return false;
+            }
+            if self.lookup_cell_binding(param.name).is_some() {
+                return false;
+            }
+            if self.fn_address_taken.contains(param.name)
+                || self.fn_lambda_captured.contains(param.name)
+            {
+                return false;
+            }
+        }
+        let arena = &self.current_module().arena;
+        let mut param_names = rustc_hash::FxHashSet::default();
+        for param in params {
+            param_names.insert(param.name);
+        }
+        if !expr_params_only_pure(arena, base_cond.unwrap(), &param_names) {
+            return false;
+        }
+        if !expr_params_only_pure(arena, base_ret, &param_names) {
+            return false;
+        }
+        info.rec_branches[0]
+            .1
+            .iter()
+            .all(|&a| expr_params_only_pure(arena, a, &param_names))
+    }
+
+    /// L3' slot transport — the Cell-free tail-rec loop.
+    ///
+    /// Contrast with the Cell path above:
+    /// - params ride while_sg PARAM slots: the entry call injects the incoming
+    ///   args; each iteration's `ResetPlan.carries_value` copies the
+    ///   (speculatively hoisted) next-iteration args back into the slots.
+    ///   Zero heap Cells, zero deref loads/stores per iteration.
+    /// - the single tail call lowers to a bare void node: no stores and NO
+    ///   Continue barrier. `loop_kind` is While, so the body's normal
+    ///   completion IS the continue signal; the loop exits through the gate's
+    ///   false branch (exit_sg compiles the base-case value).
+    /// - the rec args are hoisted into the while frame and chained into the
+    ///   condition root as ordering deps, so the per-iteration condition-tree
+    ///   reset re-fires them BEFORE the gate can relaunch the body, and their
+    ///   slots (mirrored into the body frame at launch) are the carry sources.
+    ///
+    /// Eligibility (`tail_rec_slot_eligible`) guarantees cond/args/exit
+    /// reference nothing but params, so the speculative hoist can never
+    /// observe a different state than the recursive evaluation would.
+    fn compile_tail_rec_to_loop_slots(
+        &mut self,
+        name: &str,
+        body_expr: crate::ast::Ast::ExprId,
+        params: &[crate::ast::Ast::Param<'_>],
+        info: &crate::pass::Analyzer::TailRecInfo,
+    ) -> NodeId {
+        // 1. Entry args: the function's own param bindings (eligibility proved
+        //    them plain — no entry Cells, no captures).
+        let entry_args: Vec<NodeId> = params
+            .iter()
+            .filter_map(|p| self.lookup_var(p.name))
+            .collect();
+
+        // 2. Placeholder while_sg; param_count = P (first-P-node convention:
+        //    the entry call and the phi carries inject into these slots).
+        let node_start = self.graph.nodes.len() as u32;
+        let while_sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
+        self.graph.add_subgraph(SubGraph {
+            converter_generated: false,
+            id: while_sg_id,
+            node_range: (NodeId(node_start), NodeId(node_start)),
+            param_count: params.len() as u8,
+            entry_node: NodeId(node_start),
+            return_node: NodeId(node_start),
+            has_suspend: false,
+            event_source_decls: Vec::new(),
+            defer_table: Vec::new(),
+            loop_kind: LoopKind::None,
+            loop_parent_sg: None,
+            cond_node: None,
+            function_id: self.current_function_id,
+            iter_next_node: None,
+            upvalue_count: 0,
+            upvalue_outer_nodes: Vec::new(),
+            nested_ranges: Vec::new(),
+            reset_plan: None,
+        });
+
+        // 3. Param Const nodes — the FIRST nodes inside while_sg.
+        let param_nodes: Vec<NodeId> = params
+            .iter()
+            .map(|_| {
+                let off = self.graph.inputs_pool.push(&[]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::Const,
+                    input_count: 0,
+                    inputs_offset: off,
+                    compute_fn: CF_NOOP,
+                })
+            })
+            .collect();
+
+        // 4. Rebind the names to the slots for cond / args / body / exit
+        //    compilation (scope-local; the function-level binding keeps
+        //    pointing at the entry-arg nodes).
+        self.enter_scope();
+        for (param, &pn) in params.iter().zip(param_nodes.iter()) {
+            self.bind_var(param.name, pn);
+        }
+
+        // 5. Condition = NOT(base_cond) — reads the param slots directly
+        //    (no loads; the params are the loop's own injected slots).
+        let cond_node = self.build_tail_rec_cond(&info.base_cases, &info.rec_branches);
+
+        // 6. Hoist the rec args into the while frame. EVERY arg is chained
+        //    into the condition root (arg_0 -> ... -> arg_{P-1} -> cond, via
+        //    CF_SEQ passthroughs) — only tree members are reset and re-fired
+        //    per iteration, so a non-chained arg would compute once and its
+        //    stale value would be carried forever. The chain also orders the
+        //    gate: it cannot relaunch the body before fresh values exist.
+        //    Each chain link's value is its arg's value (SEQ returns the last
+        //    input), so the carries point straight at the chain links.
+        let arg_exprs = info.rec_branches[0].1.clone();
+        let mut arg_nodes: Vec<NodeId> = Vec::with_capacity(arg_exprs.len());
+        let mut chain_prev: Option<NodeId> = None;
+        for &a in &arg_exprs {
+            let raw = self.compile_subexpr(a);
+            let rep = match chain_prev {
+                Some(prev) => self.chain_effects(Some(prev), raw),
+                None => raw,
+            };
+            arg_nodes.push(rep);
+            chain_prev = Some(rep);
+        }
+        let cond_root = match chain_prev {
+            Some(last) => self.chain_effects(Some(last), cond_node),
+            None => cond_node,
+        };
+
+        // 7. Slot-mode ctx: compile_call lowers the single self-call to a
+        //    bare void node (args already hoisted; no stores, no barrier).
+        self.tail_rec_ctx = Some(TailRecCtx {
+            self_name: name.to_string(),
+            param_cells: Vec::new(),
+            slot_params: param_nodes.clone(),
+        });
+
+        // 8. body_sg — generic body compile (leading statements, the dead
+        //    base arm, nested structures all keep their exact recursive
+        //    semantics). The converter stamp is lifted so the body's plain
+        //    if-arms qualify for E7 same-frame execution (the rec arm is a
+        //    single void Const once the call is intercepted).
+        let prev_effect = self.current_effect;
+        let prev_tail = self.in_tail_position;
+        let prev_conv = self.graph.converter_scope;
+        self.graph.converter_scope = false;
+        self.current_effect = None;
+        self.in_tail_position = true;
+        let body_sg = self.compile_loop_body_subgraph(body_expr, while_sg_id, true);
+        self.in_tail_position = prev_tail;
+        self.current_effect = prev_effect;
+        self.graph.converter_scope = prev_conv;
+
+        // 9. exit_sg = the base-case return value.
+        let (exit_sg, exit_inputs) = self.compile_slot_exit_sg(info.base_cases[0].1);
+
+        self.exit_scope();
+
+        // 10. Gate(cond_root): true -> body_sg, false -> exit_sg.
+        let gate_off = self.graph.inputs_pool.push(&[cond_root]);
+        let gate_node = self.graph.add_node(Node {
+            kind: NodeKind::Gate,
+            input_count: 1,
+            inputs_offset: gate_off,
+            compute_fn: CF_GATE_LAUNCH,
+        });
+        self.graph.set_gate_branches(
+            gate_node,
+            GateBranches {
+                capture: false,
+                condition_input: cond_root,
+                branches: vec![
+                    (true, body_sg, Vec::new()),
+                    (false, exit_sg, exit_inputs),
+                ],
+            },
+        );
+
+        // 11. Metadata: loop_kind = While (the body's None-completion
+        //     continues via reset; the TailRec kind's None-means-base-case
+        //     exit does not apply — the base case never runs in the body).
+        //     The reset plan's condition tree roots at cond_root (the plan
+        //     precompute flattens it, hoisted args included) and the carries
+        //     are pure value copies arg_i -> param slot i.
+        let node_end = self.graph.nodes.len() as u32;
+        let sg = &mut self.graph.subgraphs[while_sg_id.0 as usize];
+        sg.node_range = (NodeId(node_start), NodeId(node_end));
+        sg.entry_node = NodeId(node_start);
+        sg.return_node = gate_node;
+        sg.loop_kind = LoopKind::While;
+        sg.cond_node = Some(cond_root);
+        sg.reset_plan = Some(ResetPlan {
+            reset_to_zero: vec![],
+            reset_to_one: vec![],
+            reset_condition_tree: vec![cond_root],
+            fused_carries: Vec::new(),
+            condition_tree_plan: Vec::new(),
+            carries_value: param_nodes
+                .iter()
+                .zip(arg_nodes.iter())
+                .map(|(&p, &a)| (p, a))
+                .collect(),
+            carries_cell: vec![],
+        });
+
+        // 12. Entry call: args FIRST (compute_call_launch takes the first
+        //     param_count inputs as the argument vector), trailing effect
+        //     dep for ordering — mirrors compile_recursive_call's contract.
+        let mut call_inputs = entry_args;
+        if let Some(eff) = self.current_effect {
+            call_inputs.push(eff);
+        }
+        let call_off = self.graph.inputs_pool.push(&call_inputs);
+        let call_node = self.graph.add_node(Node {
+            kind: NodeKind::Call,
+            input_count: call_inputs.len() as u8,
+            inputs_offset: call_off,
+            compute_fn: CF_CALL_LAUNCH,
+        });
+        self.graph.set_call_target(call_node, while_sg_id);
+        call_node
+    }
+
+    /// exit_sg for the slot transport: the base-case return value. A bare
+    /// param read lowers to the outer slot node itself, which would leave
+    /// exit_sg empty with an out-of-range return_node — wrap it in an in-sg
+    /// identity node. Richer exprs produce in-sg nodes naturally.
+    fn compile_slot_exit_sg(
+        &mut self,
+        exit_expr: crate::ast::Ast::ExprId,
+    ) -> (SubGraphId, Vec<NodeId>) {
+        use crate::ast::Ast;
+        if let Ast::Expr::Ident(n) = &self.current_module().arena.expr(exit_expr).node {
+            if let Some(outer) = self.lookup_var(n) {
+                let node_start = self.graph.nodes.len() as u32;
+                let off = self.graph.inputs_pool.push(&[outer]);
+                let wrap = self.graph.add_node(Node {
+                    kind: NodeKind::UnOp,
+                    input_count: 1,
+                    inputs_offset: off,
+                    compute_fn: CF_SEQ,
+                });
+                let sg_id = SubGraphId(self.graph.subgraphs.len() as u32);
+                self.graph.add_subgraph(SubGraph {
+                    converter_generated: false,
+                    id: sg_id,
+                    node_range: (NodeId(node_start), NodeId(node_start + 1)),
+                    param_count: 0,
+                    entry_node: wrap,
+                    return_node: wrap,
+                    has_suspend: false,
+                    event_source_decls: Vec::new(),
+                    defer_table: Vec::new(),
+                    loop_kind: LoopKind::None,
+                    loop_parent_sg: None,
+                    cond_node: None,
+                    function_id: self.current_function_id,
+                    iter_next_node: None,
+                    upvalue_count: 0,
+                    upvalue_outer_nodes: Vec::new(),
+                    nested_ranges: Vec::new(),
+                    reset_plan: None,
+                });
+                return (sg_id, Vec::new());
+            }
+        }
+        self.compile_branch_subgraph(exit_expr)
     }
 
     /// Build the loop condition for tail-recursion-to-iteration.
@@ -1039,4 +1350,33 @@ impl<'a> IrBuilder<'a> {
         sg_id
     }
 
+}
+
+/// L3' eligibility walker: the expr is pure and its free identifiers are all
+/// params (literals and param-derived arithmetic/casts only). Calls, records,
+/// arrays, field/index reads, references and string interpolations are all
+/// rejected — they either have effects/allocations or may reference bindings
+/// that do not exist in the while frame.
+fn expr_params_only_pure(
+    arena: &crate::ast::Ast::AstArena<'_>,
+    expr: crate::ast::Ast::ExprId,
+    param_names: &rustc_hash::FxHashSet<&str>,
+) -> bool {
+    use crate::ast::Ast;
+    match &arena.expr(expr).node {
+        Ast::Expr::IntLit { .. }
+        | Ast::Expr::FloatLit { .. }
+        | Ast::Expr::BoolLit(_)
+        | Ast::Expr::CharLit(_)
+        | Ast::Expr::NullLit
+        | Ast::Expr::VoidLit => true,
+        Ast::Expr::Ident(n) => param_names.contains(n),
+        Ast::Expr::Binary { lhs, rhs, .. } => {
+            expr_params_only_pure(arena, *lhs, param_names)
+                && expr_params_only_pure(arena, *rhs, param_names)
+        }
+        Ast::Expr::Unary { operand, .. } => expr_params_only_pure(arena, *operand, param_names),
+        Ast::Expr::As { expr, .. } => expr_params_only_pure(arena, *expr, param_names),
+        _ => false,
+    }
 }
