@@ -204,6 +204,10 @@ fn classify_same_frame_callees(graph: &mut DataFlowGraph) {
             || cf == CF_CONTINUE.0
             || cf == CF_THROW_WRAP_ERR.0
             || cf == CF_PROPAGATE.0
+            || cf == CF_CANCEL_ASYNC_HANDLE.0
+            || cf == CF_DEFER_REGISTER.0
+            || cf == CF_BLOCK_DEFER_REGISTER.0
+            || cf == CF_DEFER_RUN.0
     };
     let mut own_bad = vec![false; sg_count];
     for t in 0..sg_count {
@@ -284,6 +288,18 @@ fn classify_same_frame_callees(graph: &mut DataFlowGraph) {
         ok[s] = children_idx[s]
             .iter()
             .all(|&c| visit(graph, &children_idx, &own_bad, &mut memo, s, c));
+    }
+    if std::env::var_os("FROND_L3PP_DEBUG").is_some() {
+        let eligible: Vec<String> = (0..sg_count)
+            .filter(|&i| ok[i])
+            .map(|i| format!("{}#{}", graph.sg_names.get(i).map(|s| s.as_str()).unwrap_or("?"), i))
+            .collect();
+        if let Some(idx) = std::env::var("FROND_L3PP_SG").ok().and_then(|v| v.parse::<usize>().ok()) {
+            let (ns, ne) = graph.subgraphs[idx].node_range;
+            for gid in ns.0..ne.0 {
+                let n = graph.node(gid as usize);
+            }
+        }
     }
     graph.sg_callee_same_frame = ok;
 }

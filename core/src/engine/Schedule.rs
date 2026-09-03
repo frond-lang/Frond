@@ -513,8 +513,6 @@ impl<S: LockStrategy> Engine<S> {
                 );
                 let call_local = ctx.call_node_local;
                 restore_caller_ctx(frame, ctx, &mut l3_scratch);
-                let v = std::mem::replace(&mut frame.control_signal, crate::ir::Ir::ControlSignal::None);
-                let _ = v;
                 frame.set_value(call_local, crate::value::Value::NULL, cc);
                 notify_downstream(frame, &graph, call_local, NodeId(call_local.0 + frame.node_offset), NodeId(frame.node_offset));
                 iter_guard = 0;
@@ -530,6 +528,10 @@ impl<S: LockStrategy> Engine<S> {
                 // completion, no scheduler round-trip. Cross-function returns
                 // are data, not signals, so nothing propagates (same matrix as
                 // finish_call_in_caller).
+                // Only TAKE a Return: the take runs before the pattern match,
+                // so an unguarded take would silently swallow Break/Continue
+                // signals (observed: while-break loops forever).
+                if matches!(frame.control_signal, ControlSignal::Return(_)) {
                 if let ControlSignal::Return(v) = std::mem::take(&mut frame.control_signal) {
                     if let Some(ctx) = l3_saved.pop() {
                         let cc = graph.downstream_count(
@@ -546,6 +548,7 @@ impl<S: LockStrategy> Engine<S> {
                         continue;
                     }
                     frame.control_signal = ControlSignal::Return(v);
+                }
                 }
                 break;
             }
@@ -1361,6 +1364,25 @@ impl<S: LockStrategy> Engine<S> {
                     }
                 }
                 NodeResult::Return(v) => {
+                    // L3'': a same-frame callee's explicit return completes
+                    // the call in place — restore the caller and relay the
+                    // value. MUST live here: the loop-top signal check never
+                    // runs after this arm (it breaks the loop), so a stacked
+                    // context would strand and the caller state be lost.
+                    if let Some(ctx) = l3_saved.pop() {
+                        let cc = graph.downstream_count(
+                            (ctx.call_node_local.0 + ctx.node_offset) as usize,
+                        );
+                        let call_local = ctx.call_node_local;
+                        restore_caller_ctx(frame, ctx, &mut l3_scratch);
+                        frame.set_value(call_local, v, cc);
+                        notify_downstream(frame, &graph, call_local, NodeId(call_local.0 + frame.node_offset), NodeId(frame.node_offset));
+                        if !frame.branch_relays.is_empty() {
+                            relay_branch_value(frame, &graph, call_local);
+                        }
+                        iter_guard = 0;
+                        continue;
+                    }
                     frame.control_signal = ControlSignal::Return(v);
                     break;
                 }

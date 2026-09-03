@@ -407,3 +407,31 @@ L3' 未动。L3'' 机制代码留档 tmp_probe/patch_l3pp.py 可复生。
 - loop_sum seg0 269→285 疑机器噪声(本机已知混合 CPU 调度方差;L3' 不触其 IR,同构建重复跑 283-290 与账本带重叠)。待 CI 或钉核复核。
 - v2 细化空间:reset_to_zero 承载 args(省 SEQ 链 2 节点/迭代)、body 内 if-cond 与 while-cond 同源去重(省 cmp_if+gate_if ≈130ns/迭代)、多递归点 phi 合并(当前回退 Cell)。
 - L3''(同帧被调执行,match_dispatch ~2×)地图已画完,重启须最小用例二分(教训见上)。
+
+---
+
+# L3'' 同帧被调执行 v2(2026-09-04)——落地(小赢+诚实账)
+
+## 结果
+
+功能 95(2 pre-existing 不变)+负向 64+perf 门禁全绿。**预期修正:match_dispatch ~2× 的前提已死**——compute() 现被优化器内联进 main 循环体(无运行时调用),且纯标量叶子调用早有标量链快路原地执行(零帧零派发)。L3'' 的真实生态位 = **不可内联、不可标量化**(记录/数组/字符串参数或体内操作)的叶子调用,recbench(记录参数 20 节点函数×100万调用)实测 **1870-1999(E1)→ 1866-1887ms,~3-4%/75ns 每调用**;Multi 引擎(卸载激活禁用标量路)收益面更大。
+
+## 机制(v2 对回退版的三处根修 + 过程三雷)
+
+SavedCallCtx 全量上下文(value_table/pending/queue/信号/branch_relays/hot_body/cached_child/**defer_stack/双帧链指针/suspend 态**)+ switch_subgraph 原地切换 + 刮擦表停车复用(免每次分配) + 切换后线性计划直跑。资格预计算成 sg 位图(EngineCore classify_same_frame_callees:函数级 sg、无 converter/挂起/事件源/上值、自身+全部后代禁 call/await/select/break/continue/throw传播/**defer 注册**节点;Gate/CF_RETURN 放行)。
+
+过程三雷(全在最小用例二分下速破,验证了重启纪律):
+1. **Return 臂绕过**:显式 `return` 的被调走 `NodeResult::Return` 臂直接 break 循环,循环顶拦截永远不执行→帧带着 l3 栈走完成→调用者蒸发(挂起帧复用新调用栈,ctx 永久丢失)。修=拦截移进 Return 臂本身。
+2. **take 吞信号**:循环顶 `if let Return(v) = take(signal)` 的 take 在模式匹配前执行,Break/Continue 被清空→while-break 死循环。修=matches! 预判再 take。
+3. **动态 defer 隐形**:defer 机制已动态化(CF_DEFER_REGISTER 运行时注册),静态 defer_table 是空遗迹→静态资格检查扑空,含 defer 的被调被点亮,defer 在切换帧里丢失。修=禁令表加 CF_DEFER_REGISTER/BLOCK_DEFER_REGISTER/DEFER_RUN。
+
+## 教训
+
+- 回退版的 50→95 挂家族 = 完成信号处理三雷的复合(Return 臂/信号吞噬/defer);当时"收紧更差"的疑团与构建缓存无关,是资格收紧改变了对齐而非根因。
+- 复用休眠/既有机制前必须问:这条路径历史上真的走过吗(carries→.fndo panic、defer_table→隐形,两次同型)。
+- 热路径禁放 env::var_os(Windows 环境块查询 ~100ns+,曾造成 L3'' 伪回归 12%)。
+
+## 遗留
+
+- match_dispatch 新大头 = 内联体节点派发(~20 节点/迭代)——下一刀应为 M4 def-use ctor 传播/标量链扩记录操作,而非调用路径。
+- 多递归点尾递归(L3' 回退面)、闭包上值调用、async 被调 = v2 资格排除面,按需再开。
