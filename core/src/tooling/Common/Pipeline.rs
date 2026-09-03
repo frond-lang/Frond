@@ -78,6 +78,14 @@ pub fn load_all_modules_or_exit(
         }
         process::exit(1);
     }
+    if std::env::var("FROND_BUILD_TIME").is_ok() {
+        eprintln!(
+            "[build-time] modules: std_preload={} dep_closure={} loaded_total={}",
+            std_keys.len(),
+            dep_keys.len(),
+            loader.loaded_keys().len()
+        );
+    }
     (loader, std_keys, dep_keys)
 }
 

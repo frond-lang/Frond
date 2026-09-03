@@ -291,11 +291,6 @@ impl<'a> InferContext<'a> {
                                     .record_ctor_resolution(&rec_mod, expr.0 as u64, adt_name);
                             }
                         }
-                        if std::env::var("FROND_TRACE_CTOR").is_ok() {
-                            if let Expr::Ident(n) = &ast.expr(*callee).node {
-                                eprintln!("[ctor-infer] callee {} -> {:?}", n, self.arena.get(self.arena.resolve(t)));
-                            }
-                        }
                         t
                     }
                 } else {
@@ -562,15 +557,6 @@ impl<'a> InferContext<'a> {
                     );
                 if bare_var_recv {
                     self.deferred_method_calls.push((expr, env));
-                }
-                if std::env::var("FROND_TRACE_CTOR").is_ok() && *method == "empty" {
-                    if let crate::ast::Ast::Expr::Ident(rn) = &ast.expr(*recv).node {
-                        eprintln!(
-                            "[method-sugar] recv {} -> {:?}",
-                            rn,
-                            self.arena.get(self.arena.resolve(recv_ty))
-                        );
-                    }
                 }
 
                 // Path 0a: ModuleRef recv → module-path function call.

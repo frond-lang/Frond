@@ -59,14 +59,6 @@ impl<'a> IrBuilder<'a> {
                 ],
             },
         );
-        if std::env::var("FROND_DEBUG_COMPILE").is_ok() {
-            let then_r = self.graph.subgraphs[then_sg.0 as usize].node_range;
-            let else_r = self.graph.subgraphs[else_sg.0 as usize].node_range;
-            eprintln!("[COMPILE_IF] cond_node={} then_sg={} then_range=[{},{}) else_sg={} else_range=[{},{}) gate_node={} cur_mod={:?}",
-                cond_node.0, then_sg.0, then_r.0.0, then_r.1.0,
-                else_sg.0, else_r.0.0, else_r.1.0,
-                gate_node.0, self.current_module().name);
-        }
         gate_node
     }
 

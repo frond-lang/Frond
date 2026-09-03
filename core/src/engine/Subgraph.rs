@@ -1,7 +1,6 @@
 //! Subgraph invocation and return: switch_subgraph + start_subgraph + complete_and_wake_caller.
 
 use super::*;
-use super::EngineCore::exec_cov_bump;
 use crate::ir::Ir::*;
 use crate::ir::Ir::Frame;
 use crate::value::Value;
@@ -9,7 +8,6 @@ use crate::value::Value;
 /// Tail-call graph jump: reuses the current frame to execute the target subgraph (zero pool
 /// allocation).
 pub fn switch_subgraph(frame: &mut Frame, graph: &DataFlowGraph, target_sg: SubGraphId, args: &[Value]) {
-    exec_cov_bump(target_sg, graph.subgraphs.len());
     let (node_start, node_end) = graph.subgraphs[target_sg.0 as usize].node_range;
     let node_count = (node_end.0 - node_start.0) as usize;
 
@@ -81,24 +79,6 @@ pub(super) fn finish_call_in_caller(
     let call_graph_id = NodeId(call_node.0 + caller_offset.0);
     let consumer_count = graph.downstream_count(call_graph_id.0 as usize);
 
-    if super::env_flag("FROND_DEBUG_IFELSE") {
-        let child_sg = &graph.subgraphs[child_sg_id.0 as usize];
-        eprintln!("[COMPLETE-INLINE] child_sg={} call_node_local={} call_graph_id={} caller_offset={} return_value={:?} child_loop_kind={:?} caller_sg={}",
-            child_sg_id.0, call_node.0, call_graph_id.0, caller_offset.0,
-            return_value, child_sg.loop_kind, caller_frame.subgraph_id.0);
-        if super::env_flag("FROND_DEBUG_STALL") {
-            let (bs, be) = child_sg.node_range;
-            let mut unready: Vec<u32> = Vec::new();
-            for i in 0..child.value_table.len() {
-                let gid = (child.node_offset as usize + i) as u32;
-                if gid >= bs.0 && gid < be.0 && !child.value_table.is_ready(i) {
-                    unready.push(gid);
-                }
-            }
-            eprintln!("[COMPLETE-INLINE-UNREADY] child_sg={} unready={:?}",
-                child_sg_id.0, &unready[..unready.len().min(12)]);
-        }
-    }
 
     caller_frame.set_value(call_node, return_value, consumer_count);
     // E7: the call node may be a same-frame branch's return relay target
@@ -119,10 +99,6 @@ pub(super) fn finish_call_in_caller(
     let child_loop_kind = graph.subgraphs[child_sg_id.0 as usize].loop_kind;
     let should_propagate = !capture_gate
         && crate::ir::Ir::should_propagate_control_signal(&child_signal, is_gate, child_loop_kind);
-    if super::env_flag("FROND_DEBUG_SIGNAL") {
-        eprintln!("[SIG-PROP-I] child_sg={} caller_sg={} signal={:?} propagate={} capture={}",
-            child_sg_id.0, caller_frame.subgraph_id.0, child_signal, should_propagate, capture_gate);
-    }
     if should_propagate {
         let child_fn_id = graph.subgraphs[child_sg_id.0 as usize].function_id;
         let caller_fn_id = graph.subgraphs[caller_frame.subgraph_id.0 as usize].function_id;
@@ -183,7 +159,6 @@ impl<S: LockStrategy> Engine<S> {
         parent_frame: &Frame,
         closure_val: Option<Value>,
     ) -> (FrameId, Box<Frame>) {
-        exec_cov_bump(subgraph_id, self.graph.subgraphs.len());
         let child_fid = self.alloc_frame_id();
         let parent_sg = &self.graph.subgraphs[parent_frame.subgraph_id.0 as usize];
         let child_sg = &self.graph.subgraphs[subgraph_id.0 as usize];
@@ -204,25 +179,6 @@ impl<S: LockStrategy> Engine<S> {
             && subgraph_id != parent_frame.subgraph_id
             && subgraph_id.0 != child_sg.function_id;
 
-        if super::env_flag("FROND_DEBUG_STALL")
-            && super::EngineCore::sf_trace_match(&self.graph, subgraph_id.0)
-        {
-            let (cs, ce) = child_sg.node_range;
-            let child_sz = ce.0 - cs.0;
-            if child_sz <= 3 {
-                let nested: Vec<(u32, u32, u32)> = self.graph.subgraphs.iter()
-                    .filter(|sg| sg.id != subgraph_id
-                        && sg.node_range.0 .0 >= cs.0
-                        && sg.node_range.1 .0 <= ce.0)
-                    .map(|sg| (sg.node_range.0 .0, sg.node_range.1 .0, sg.id.0))
-                    .collect();
-                eprintln!("[START-SG] target_sg={} same_func={} child_range=[{},{}) parent_sg={} parent_range=[{},{}) nested_count={} nested={:?}",
-                    subgraph_id.0, same_function, cs.0, ce.0,
-                    parent_frame.subgraph_id.0,
-                    parent_sg.node_range.0 .0, parent_sg.node_range.1 .0,
-                    nested.len(), nested);
-            }
-        }
 
         if same_function {
             // Same-function branch: value table is sized to the parent frame and parent-frame
@@ -393,22 +349,6 @@ impl<S: LockStrategy> Engine<S> {
             // E5: fresh same_function branch frame — eligible for one linear run.
             child.linear_fresh = true;
 
-            if super::env_flag("FROND_DEBUG_FORIN") {
-                let rq_len = child.ready_queue.len();
-                let mut pending_info: Vec<(u32, u16, bool)> = Vec::new();
-                for i in 0..parent_node_count {
-                    let gid = (parent_start as usize + i) as u32;
-                    if gid >= branch_start.0 && gid < child_sg.node_range.1 .0 {
-                        let p = child.pending_inputs[i];
-                        let r = child.value_table.is_ready(i);
-                        if p != PENDING_EXTERNAL {
-                            pending_info.push((gid, p, r));
-                        }
-                    }
-                }
-                eprintln!("[FORIN-SG-CREATE] sg={} rq_len={} pending_info={:?}",
-                    subgraph_id.0, rq_len, &pending_info[..pending_info.len().min(15)]);
-            }
 
             (child_fid, child)
         } else {
@@ -417,10 +357,6 @@ impl<S: LockStrategy> Engine<S> {
             let node_count = (node_end.0 - node_start.0) as usize;
             let offset = node_start.0 as usize;
 
-            if super::env_flag("FROND_DEBUG_CALL") && node_count == 0 {
-                eprintln!("[SUBGRAPH-ZERO] sg={} has 0 nodes! node_range=[{:?},{:?}) param_count={} — function body was NOT compiled (placeholder)",
-                    subgraph_id.0, node_start, node_end, child_sg.param_count);
-            }
 
             let mut child = self.acquire_frame(child_fid, subgraph_id, node_count);
             self.prepare_frame(&mut child);
@@ -544,20 +480,6 @@ impl<S: LockStrategy> Engine<S> {
                 }
                 ControlSignal::None => {
                     // Normal completion: check the caller's loop kind.
-                    if super::env_flag("FROND_DEBUG_FORIN") {
-                        let bsg = &self.graph.subgraphs[child_frame.subgraph_id.0 as usize];
-                        let rq_len = child_frame.ready_queue.len();
-                        let (bs, be) = bsg.node_range;
-                        let mut unready: Vec<u32> = Vec::new();
-                        for i in 0..child_frame.value_table.len() {
-                            let gid = (child_frame.node_offset as usize + i) as u32;
-                            if gid >= bs.0 && gid < be.0 && !child_frame.value_table.is_ready(i) {
-                                unready.push(gid);
-                            }
-                        }
-                        eprintln!("[FORIN-BODY-DONE] child_sg={} rq_len={} unready_count={} unready={:?}",
-                            child_frame.subgraph_id.0, rq_len, unready.len(), &unready[..unready.len().min(10)]);
-                    }
                     let loop_frame_opt = self.frames.lock().remove(&loop_fid);
 
                     match loop_frame_opt {
@@ -645,12 +567,6 @@ impl<S: LockStrategy> Engine<S> {
                 let consumer_count =
                     self.graph.downstream_count(call_graph_id.0 as usize);
 
-                if super::env_flag("FROND_DEBUG_IFELSE") {
-                    let child_sg = &self.graph.subgraphs[child_sg_id.0 as usize];
-                    eprintln!("[COMPLETE] child_sg={} caller_fid={:?} call_node_local={} call_graph_id={} caller_offset={} return_value={:?} child_loop_kind={:?} caller_sg={}",
-                        child_sg_id.0, caller_fid, call_node.0, call_graph_id.0, caller_offset.0,
-                        return_value, child_sg.loop_kind, caller_frame.subgraph_id.0);
-                }
 
                 caller_frame.set_value(call_node, return_value, consumer_count);
                 if !caller_frame.branch_relays.is_empty() {
@@ -698,10 +614,6 @@ impl<S: LockStrategy> Engine<S> {
                         is_gate,
                         child_loop_kind,
                     );
-                if super::env_flag("FROND_DEBUG_SIGNAL") {
-                    eprintln!("[SIG-PROP-Q] child_sg={} caller_sg={} signal_ok={} capture={} is_gate={}",
-                        child_sg_id.0, caller_frame.subgraph_id.0, should_propagate, capture_gate, is_gate);
-                }
                 if should_propagate {
                     let child_fn_id = self.graph.subgraphs[child_sg_id.0 as usize].function_id;
                     let caller_fn_id =

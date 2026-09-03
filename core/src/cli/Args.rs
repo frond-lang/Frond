@@ -86,6 +86,7 @@ pub enum Commands {
     Lsp,
 }
 
+
 /// Stage options for the debug subcommand.
 #[derive(Clone, Debug, clap::ValueEnum)]
 pub enum DebugStage {

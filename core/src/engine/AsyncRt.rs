@@ -306,13 +306,14 @@ impl<S: LockStrategy> EventSource<S> for TimerSource {
         engine: &Engine<S>,
         pending: &crate::ir::Ir::PendingAwait,
     ) -> (RuntimeEvent, Option<Value>) {
-        let duration_ns = match pending.event_obj.heap_obj() {
-            Some(crate::value::HeapObj::Record(r)) => {
-                r.find_field(TIMER_DURATION_NS_FIELD)
-                    .map(|v| v.as_i64())
-                    .expect("timer event record missing duration_ns field")
+        let duration_ns = match pending.event_obj.as_record() {
+            Some(r) => {
+                let i = r.shape().field_names.iter()
+                    .position(|n| n.as_deref() == Some(TIMER_DURATION_NS_FIELD))
+                    .expect("timer event record missing duration_ns field");
+                r.field(i).as_i64()
             }
-            _ => pending.event_obj.as_i64(),
+            None => pending.event_obj.as_i64(),
         };
         // start + is_fired are atomicized inside the timer_runtime lock (check_and_fire uses the
         // same lock). Explicitly drop the timer lock before the caller registers the waiter (to
@@ -351,10 +352,6 @@ impl<S: LockStrategy> Engine<S> {
     ) -> (RuntimeEvent, Option<Value>, crate::ir::Ir::NodeId) {
         use crate::ir::Ir::EventSourceKind;
         let await_node = pending.await_node_local;
-        let dbg = super::env_flag("FROND_DEBUG_AWAIT");
-        if dbg {
-            eprintln!("[AWAIT] fid={:?} kind={:?} enter", fid, pending.event_kind);
-        }
         let (event, val) = match pending.event_kind {
             EventSourceKind::AsyncJoin => AsyncJoinSource.resolve(self, pending),
             EventSourceKind::Channel => ChannelSource.resolve(self, pending),
@@ -406,9 +403,6 @@ impl<S: LockStrategy> Engine<S> {
                 // can race into the poll→register window.
                 EventSourceKind::Timer | EventSourceKind::SubgraphComplete => None,
             };
-            if dbg {
-                eprintln!("[AWAIT] fid={:?} repoll raced={}", fid, raced.is_some());
-            }
             if let Some(v) = raced {
                 if let Some(bucket) = self.event_waiters.lock().get_mut(&event) {
                     bucket.retain(|f| *f != fid);
@@ -480,9 +474,6 @@ impl<S: LockStrategy> Engine<S> {
             event_waiters.remove(&event).unwrap_or_default()
         };
         let mut delivered = 0usize;
-        if super::env_flag("FROND_DEBUG_AWAIT") {
-            eprintln!("[EVT] event={:?} waiters={:?}", event, waiters);
-        }
 
         for fid in waiters {
             // Check-then-take under one frames-lock critical section: ONLY a frame

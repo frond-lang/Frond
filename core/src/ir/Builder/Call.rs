@@ -143,6 +143,16 @@ impl<'a> IrBuilder<'a> {
             crate::sema::Sema::TypeDefKind::Newtype => RecordLitKind::Newtype,
             crate::sema::Sema::TypeDefKind::Alias => RecordLitKind::Record,
         };
+        let field_tags: Vec<u8> = ctor
+            .field_type_reprs
+            .iter()
+            .map(|r| match r {
+                crate::sema::Sema::TypeRepr::Named(n) => {
+                    crate::ir::Ir::scalar_type_name_to_tag(n).unwrap_or(0xFF)
+                }
+                _ => 0xFF,
+            })
+            .collect();
         Some(TypeFieldInfo {
             field_names: ctor
                 .field_names
@@ -151,6 +161,7 @@ impl<'a> IrBuilder<'a> {
                 .collect(),
             type_name: ctor.type_name.to_string(),
             kind,
+            field_tags,
         })
     }
 
@@ -269,7 +280,7 @@ impl<'a> IrBuilder<'a> {
                 // constructed type's canonical Sym). Consume it first — the
                 // string-keyed scope lookups below (bare-name, first-wins,
                 // registration-order-sensitive) are a FALLBACK whose hits are
-                // measured via FROND_TRACE_S2; the bug classes they caused
+                // measured via S2 tracing (2026-08 campaigns); the bug classes they caused
                 // (empty field tables from variant/type name collisions, std
                 // bare-name hijacks) are bypassed entirely on the ID path.
                 let mut tf_info: Option<TypeFieldInfo> =
@@ -285,14 +296,6 @@ impl<'a> IrBuilder<'a> {
                         .or_else(|| self.lookup_constructor_field_names(name)),
                 };
                 if !s2_hit && tf_info.is_some() {
-                    if std::env::var("FROND_TRACE_S2").is_ok() {
-                        eprintln!(
-                            "[s2-fallback:construct] name={} mod={} arity={}",
-                            *name,
-                            self.current_module().name,
-                            args.len()
-                        );
-                    }
                 }
                 if let Some(info) = tf_info.as_ref() {
                     if info.field_names.len() != args.len() && !args.is_empty() {
@@ -319,6 +322,7 @@ impl<'a> IrBuilder<'a> {
                         field_names: info.field_names.into_iter().map(Some).collect(),
                         constructor: name.to_string(),
                         kind: info.kind,
+                        field_tags: info.field_tags.clone(),
                     });
                     return node;
                 }
@@ -965,7 +969,8 @@ impl<'a> IrBuilder<'a> {
                     field_names,
                     type_name: ctor.type_name.to_string(),
                     kind,
-                });
+                field_tags: Vec::new(),
+});
             }
         }
         None
@@ -1130,29 +1135,6 @@ impl<'a> IrBuilder<'a> {
     /// shape mismatch — Sema guarantees the annotation path, so this is a
     /// defensive fallback.
     fn lib_lookup_ret_tag(&self, call_expr_id: crate::ast::Ast::ExprId) -> u8 {
-        if std::env::var("FROND_DEBUG_LIB").is_ok() {
-            let dbg = self.expr_type_handle(call_expr_id).map(|h| {
-                let r = self.type_arena.resolve(h);
-                let inner = match self.type_arena.get(r) {
-                    crate::types::Type::Throw(_) => {
-                        let (v, e) = self.type_arena.throw_parts(r);
-                        let vr = self.type_arena.resolve(v);
-                        let ff_inner = match self.type_arena.get(vr) {
-                            crate::types::Type::ForeignFn(_) => {
-                                let ret = self.type_arena.foreign_fn_ret(vr);
-                                let rr = self.type_arena.resolve(ret);
-                                format!(" ForeignFn ret={:?} err={:?}", self.type_arena.get(rr), self.type_arena.get(self.type_arena.resolve(e)))
-                            }
-                            other => format!(" value={:?} err={:?}", other, self.type_arena.get(self.type_arena.resolve(e))),
-                        };
-                        format!("Throw{{{:?}{}}}", self.type_arena.get(vr), ff_inner)
-                    }
-                    other => format!("{:?}", other),
-                };
-                format!("{:?} -> {}", self.type_arena.get(r), inner)
-            });
-            eprintln!("[LIB-RET-TAG] expr {:?} ty = {:?}", call_expr_id, dbg);
-        }
         self.expr_type_handle(call_expr_id)
             .map(|h| {
                 let resolved = self.type_arena.resolve(h);
@@ -1318,7 +1300,16 @@ pub(super) fn compile_method_call(
                         field_names,
                         constructor: ctor_name,
                         kind,
-                    });
+                        // 乙②: storage tags from static arg types.
+                        field_tags: args
+                            .iter()
+                            .map(|a| {
+                                self.expr_type_name(*a)
+                                    .and_then(crate::ir::Ir::scalar_type_name_to_tag)
+                                    .unwrap_or(0xFF)
+                            })
+                            .collect(),
+        });
                     return node;
                 }
             }
@@ -1580,6 +1571,7 @@ pub(super) fn compile_method_call(
                                 field_names: info.field_names.into_iter().map(Some).collect(),
                                 constructor: method.to_string(),
                                 kind: info.kind,
+                                field_tags: info.field_tags.clone(),
                             });
                             return node;
                         }
@@ -1611,12 +1603,6 @@ pub(super) fn compile_method_call(
                 compute_fn: CF_CALL_LAUNCH,
             });
 
-            if std::env::var("FROND_TRACE_CTOR").is_ok() {
-                let k = crate::sema::Sema::module_expr_key(self.expr_key_module(), recv.0 as u64);
-                let tn = self.sema.expr_types.get(&k).map(|i| i.type_name.clone());
-                let tid = self.expr_type_id(recv);
-                eprintln!("[dispatch-recv] method={} type_name={:?} type_id={:?} recv_expr={} cur_mod={}", method, tn, tid, recv.0, self.current_module().name);
-            }
             // Dispatch priority (semantic priority, not fallback):
             //   1. trait object dynamic dispatch (recv type is a trait -> vtable runtime dispatch)
             //   2. type's own method / trait method override: (type_id, method_idx) lookup into method_subgraphs
@@ -1648,7 +1634,7 @@ pub(super) fn compile_method_call(
             // Path 2: type's own method / trait method override.
             // S4: sema recorded the resolved (type_def_idx, method_idx) at
             // check time — consume it FIRST. The name/type-id lookups below
-            // are the measured fallback (FROND_TRACE_S2).
+            // are the measured fallback (S2 tracing, 2026-08).
             let dkey = crate::sema::Sema::module_expr_key(
                 self.expr_key_module(),
                 call_expr_id.0 as u64,
@@ -1663,22 +1649,8 @@ pub(super) fn compile_method_call(
             let recv_type: Option<(String, u16)> = if let Some((tn, tid)) = s4_tyname_tid {
                 Some((tn, tid))
             } else if recv_node_override.is_some() {
-                if std::env::var("FROND_TRACE_S2").is_ok() {
-                    eprintln!(
-                        "[s2-fallback:dispatch] method={} mod={}",
-                        method,
-                        self.current_module().name
-                    );
-                }
                 self.current_method_type.as_ref().map(|(n, id)| (n.to_string(), *id))
             } else {
-                if std::env::var("FROND_TRACE_S2").is_ok() {
-                    eprintln!(
-                        "[s2-fallback:dispatch] method={} mod={}",
-                        method,
-                        self.current_module().name
-                    );
-                }
                 self.expr_type_name(recv).map(|n| n.to_string()).zip(self.expr_type_id(recv))
             };
             if let Some((type_name, type_id)) = recv_type {
@@ -1689,18 +1661,6 @@ pub(super) fn compile_method_call(
                         .lookup_method_idx_by_type_id(type_id, method)
                         .or_else(|| self.sema.lookup_method_idx(type_name.as_str(), method)),
                 };
-                if std::env::var("FROND_TRACE_GET").is_ok() && method == "get" {
-                    let chosen_sg = method_idx
-                        .and_then(|idx| self.method_subgraphs.get(&(type_id, idx)).copied());
-                    let sg_name = chosen_sg.map(|sg| {
-                        let fid = self.graph.subgraphs[sg.0 as usize].function_id;
-                        self.graph.sg_names.get(fid as usize).cloned().unwrap_or_default()
-                    });
-                    eprintln!(
-                        "[get-dispatch] recv_ty={} tid={} s4={:?} midx={:?} sg={:?} sg_fn={:?} call_expr={} mod={}",
-                        type_name, type_id, s4_target, method_idx, chosen_sg, sg_name, call_expr_id.0, self.current_module().name
-                    );
-                }
                 if let Some(method_idx) = method_idx {
                     if let Some(&target_sg) = self.method_subgraphs.get(&(type_id, method_idx)) {
                         // Inheritance dynamic dispatch: when any type's

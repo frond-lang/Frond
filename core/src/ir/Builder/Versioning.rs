@@ -27,7 +27,7 @@
 //! to the next epoch node (the branch Gate / loop launch Call), which is the
 //! same-frame node that actually orders post-branch/post-loop reads.
 //!
-//! Kill switch: `FROND_NO_VERSIONING=1`.
+//! Always on (the former kill switch was removed 2026-09-03).
 
 use super::Core::IrBuilder;
 use crate::ir::Ir::*;
@@ -71,9 +71,6 @@ impl IrBuilder<'_> {
     /// Entry: run storage versioning over the whole graph. Call after
     /// `compute_nested_ranges()` and before `compute_downstreams()`.
     pub(super) fn apply_storage_versioning(&mut self) {
-        if std::env::var("FROND_NO_VERSIONING").is_ok() {
-            return;
-        }
         // Child range -> child subgraph id lookup.
         let mut range_to_sg: FxHashMap<(u32, u32), SubGraphId> = FxHashMap::default();
         for sg in &self.graph.subgraphs {
@@ -90,9 +87,6 @@ impl IrBuilder<'_> {
             let mut state = ScanState::default();
             let mut fixups: Vec<BodyFixup> = Vec::new();
             let in_loop: Option<((u32, u32), NodeId)> = None; // function level is never a LoopBody
-            if std::env::var("FROND_VERSIONING_DBG").is_ok() {
-                eprintln!("[VER] scan fn sg {}", sg_id.0);
-            }
             self.scan_subgraph(sg_id, &range_to_sg, &mut state, &mut fixups, in_loop);
         }
     }
@@ -128,14 +122,6 @@ impl IrBuilder<'_> {
                 let (cs, ce) = children[ci];
                 ci += 1;
                 if let Some(&child_id) = range_to_sg.get(&(cs, ce)) {
-                    let dbg = std::env::var("FROND_VERSIONING_DBG").is_ok();
-                    if dbg {
-                        eprintln!(
-                            "[VER] sg{} enter child sg{} range [{}..{}) kind={:?}",
-                            sg_id.0, child_id.0, cs, ce,
-                            self.graph.subgraphs[child_id.0 as usize].loop_kind
-                        );
-                    }
                     let child_kind = self.graph.subgraphs[child_id.0 as usize].loop_kind;
                     let child_in_loop = if child_kind == LoopKind::LoopBody {
                         self.graph.subgraphs[child_id.0 as usize]
@@ -221,9 +207,6 @@ impl IrBuilder<'_> {
                 // still makes it iteration-variant, and the fixup will ensure
                 // it carries a loop-internal input (cond_node) in that case.
                 if in_loop.is_some() {
-                    if std::env::var("FROND_VERSIONING_DBG").is_ok() {
-                        eprintln!("[VER] record read {} in body {:?}", pos, (start.0, end.0));
-                    }
                     fixups.push(BodyFixup {
                         read: NodeId(pos),
                         positions,

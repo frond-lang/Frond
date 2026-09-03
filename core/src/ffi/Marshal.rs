@@ -105,19 +105,19 @@ pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> 
         // Anything else falls through to the generic pointer slot (raw handle
         // passthrough — integers/OpaquePtr, `0u64` yields a NULL pointer).
         if matches!(param, AbiType::Ptr) && sig.raw_ptr_params.contains(&param_idx) {
+            if let Some(sval) = arg.as_str() {
+                let bytes = sval;
+                let mut buf = bytes.as_bytes().to_vec();
+                buf.push(0);
+                let ptr = buf.as_ptr();
+                buffers.push(ArgBuf::Str { buf, len: bytes.len() });
+                buf_owners.push(core::ptr::null());
+                slots.push(AbiSlot::Ptr(ptr as *mut core::ffi::c_void));
+                param_idx += 1;
+                arg_idx += 1;
+                continue;
+            }
             match arg.heap_obj() {
-                Some(HeapObj::Str(s)) => {
-                    let bytes = s.bytes();
-                    let mut buf = bytes.as_bytes().to_vec();
-                    buf.push(0);
-                    let ptr = buf.as_ptr();
-                    buffers.push(ArgBuf::Str { buf, len: bytes.len() });
-                    buf_owners.push(core::ptr::null());
-                    slots.push(AbiSlot::Ptr(ptr as *mut core::ffi::c_void));
-                    param_idx += 1;
-                    arg_idx += 1;
-                    continue;
-                }
                 Some(HeapObj::Array(arr)) => {
                     let tag = arr.scalar_marshal_tag().ok_or_else(|| {
                         "encode_args: cbuf argument is not a marshalable scalar array \
@@ -255,14 +255,10 @@ pub fn encode_args(sig: &AbiSig, args: &[Value]) -> Result<MarshalArgs, String> 
         if matches!(param, AbiType::Ptr)
             && param_idx + 1 < sig.params.len()
             && matches!(sig.params[param_idx + 1], AbiType::Int { .. })
-            && matches!(arg.heap_obj(), Some(HeapObj::Str(_)))
+            && arg.is_str()
         {
             // str → (NULL-ended data_ptr, len)
-            let s = match arg.heap_obj() {
-                Some(HeapObj::Str(s)) => s,
-                _ => unreachable!(),
-            };
-            let bytes = s.bytes();
+            let bytes = arg.as_str().unwrap();
             // Build a NULL-terminated copy so C functions (strlen/printf/etc.) see a valid C string.
             let mut buf = bytes.as_bytes().to_vec();
             buf.push(0);

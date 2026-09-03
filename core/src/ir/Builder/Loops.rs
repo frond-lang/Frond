@@ -266,25 +266,6 @@ impl<'a> IrBuilder<'a> {
         let mut assigned_names = rustc_hash::FxHashSet::default();
         collect_assigned_names(&self.current_module().arena, body, &mut assigned_names);
         let mut carried_cells: Vec<NodeId> = Vec::new();
-        // A DIRECT `continue` in this body jumps via Call(while_sg) with NO
-        // args — switch_subgraph would re-enter with empty params (condition
-        // reads NULL). Such loops keep the plain (cell-load) lowering.
-        let has_direct_continue = body_has_direct_continue(&self.current_module().arena, body);
-        // Opt-in (FROND_PHI=1): one known interaction bug remains (a second
-        // loop in the same function reading a cell built by a previous
-        // carried loop exits after one iteration — see place-model notes).
-        let phi_enabled = std::env::var("FROND_PHI").map(|v| v != "0").unwrap_or(false);
-        if !has_direct_continue && phi_enabled {
-            for name in &assigned_names {
-                if let Some(cell) = self.lookup_cell_binding(name) {
-                    // Only forwardable cells participate (address-taken cells may
-                    // be written through refs the Builder cannot see).
-                    if !self.no_forward_cells.contains(&cell) && !carried_cells.contains(&cell) {
-                        carried_cells.push(cell);
-                    }
-                }
-            }
-        }
         let entry_args: Vec<NodeId> = carried_cells
             .iter()
             .map(|&cell| match self.cell_forwarded_value(cell) {
@@ -458,7 +439,6 @@ pub(super) fn body_has_direct_continue(
     arena: &crate::ast::Ast::AstArena<'_>,
     expr: crate::ast::Ast::ExprId,
 ) -> bool {
-    use crate::ast::Ast;
     expr_has_direct_continue(arena, expr)
 }
 

@@ -38,11 +38,10 @@ pub fn alloc_const_value(cv: ConstValue, pool: &[u8]) -> Value {
         ConstValue::Null => Value::NULL,
         ConstValue::Void => Value::VOID,
         ConstValue::Str { offset, len } => {
-            use crate::value::{HeapObj, Str};
             let off = offset as usize;
             let end = off + len as usize;
             let s = std::str::from_utf8(&pool[off..end]).unwrap_or("");
-            Value::ref_val(HeapObj::Str(Str::new(s)))
+            Value::str_val(s)
         }
     }
 }
@@ -74,10 +73,6 @@ pub fn prepare_frame_nodes(frame: &mut Frame, graph: &DataFlowGraph) {
     // Use the precomputed nested_ranges (filled at build time) to avoid a runtime full-graph scan.
     let nested_ranges: &[(u32, u32)] = graph.sg_nested_ranges(sg_id.0 as usize);
 
-    if super::env_flag("FROND_DEBUG_STALL") {
-        eprintln!("[PREPARE] sg={} node_range=[{},{}) nested={:?}",
-            sg_id.0, node_start.0, node_start.0 + node_count as u32, nested_ranges);
-    }
 
     let is_nested = |global_idx: u32| -> bool {
         nested_ranges.iter().any(|&(s, e)| global_idx >= s && global_idx < e)
@@ -187,7 +182,32 @@ pub fn rebuild_linear_bailout(frame: &mut Frame, graph: &DataFlowGraph) {
 /// same-function branch, non-converter, no suspension/event sources, plain
 /// target sg, plain/LoopBody caller, non-body, control-signal-free own nodes,
 /// non-capturing gate. The pending-dependent bits (is_async, closure_val) and
-/// the FROND_NO_SAMEFRAME env stay at the call sites.
+/// same-frame eligibility stay at the call sites.
+/// E7 outer-value snapshot: walks the frame chain (parent first, then root —
+/// mirroring `get_value_by_global`) for the nearest frame whose slot for
+/// `gid` is ready, and clones that value. None when unready everywhere.
+fn snapshot_outer_value(frame: &Frame, gid: NodeId) -> Option<Value> {
+    let mut tried_root = false;
+    let mut f: *const Frame = frame as *const Frame;
+    loop {
+        let fr = unsafe { &*f };
+        let local = gid.0.wrapping_sub(fr.node_offset) as usize;
+        if local < fr.value_table.len() && fr.value_table.is_ready(local) {
+            return Some(fr.value_table.get_value(local));
+        }
+        if !fr.parent_frame_ptr.is_null() {
+            f = fr.parent_frame_ptr;
+            continue;
+        }
+        if !tried_root && !fr.root_frame_ptr.is_null() {
+            tried_root = true;
+            f = fr.root_frame_ptr;
+            continue;
+        }
+        return None;
+    }
+}
+
 pub(super) fn same_frame_branch_ok(
     graph: &DataFlowGraph,
     frame: &Frame,
@@ -229,35 +249,7 @@ pub(super) fn same_frame_branch_ok(
     true
 }
 
-/// E7 outer-value snapshot: walks the frame chain (parent first, then root —
-/// mirroring `get_value_by_global`) for the nearest frame whose slot for
-/// `gid` is ready, and clones that value. None when unready everywhere.
-fn snapshot_outer_value(frame: &Frame, gid: NodeId) -> Option<Value> {
-    let mut tried_root = false;
-    let mut f: *const Frame = frame as *const Frame;
-    loop {
-        let fr = unsafe { &*f };
-        let local = gid.0.wrapping_sub(fr.node_offset) as usize;
-        if local < fr.value_table.len() && fr.value_table.is_ready(local) {
-            return Some(fr.value_table.get_value(local));
-        }
-        if !fr.parent_frame_ptr.is_null() {
-            f = fr.parent_frame_ptr;
-            continue;
-        }
-        if !tried_root && !fr.root_frame_ptr.is_null() {
-            tried_root = true;
-            f = fr.root_frame_ptr;
-            continue;
-        }
-        return None;
-    }
-}
-
-/// E7 relay (free-function form for cross-module completion paths): `local`
-/// just produced a value on `frame` and is a registered branch return — copy
-/// the value to the gate's slot, notify the gate's consumers, and propagate
-/// chained relays (a cascade's outer return IS the inner gate).
+/// L3'': restores a caller context saved for same-frame callee execution.
 pub(super) fn relay_branch_value(
     frame: &mut Frame,
     graph: &DataFlowGraph,
@@ -269,9 +261,6 @@ pub(super) fn relay_branch_value(
             return;
         };
         let (_, gate_local) = frame.branch_relays.swap_remove(pos);
-        if super::env_flag("FROND_DEBUG_SF") && super::EngineCore::sf_trace_match(graph, frame.subgraph_id.0) {
-            eprintln!("[SF-FIRE] ret_local={} -> gate_local={}", cur.0, gate_local.0);
-        }
         let offset = frame.node_offset;
         let gate_gid = NodeId(gate_local.0 + offset);
         let cc = graph.downstream_count(gate_gid.0 as usize);
@@ -412,26 +401,6 @@ impl<S: LockStrategy> Engine<S> {
             let local_id = match frame.pop_ready() {
                 Some(n) => n,
                 None => {
-                    if super::env_flag("FROND_DEBUG_STALL")
-                        && super::EngineCore::sf_trace_match(&graph, frame.subgraph_id.0)
-                    {
-                        let sg_id = frame.subgraph_id;
-                        let (ns, ne) = graph.subgraphs[sg_id.0 as usize].node_range;
-                        let ncnt = (ne.0 - ns.0) as usize;
-                        eprintln!("[STALL] frame={} sg={} node_range=[{},{}) control={:?}",
-                            fid.0, sg_id.0, ns.0, ne.0, frame.control_signal);
-                        for i in 0..ncnt {
-                            let gid = NodeId(i as u32 + ns.0);
-                            let n = graph.node(gid.0 as usize);
-                            let ready = i < frame.value_table.len() && frame.value_table.is_ready(i);
-                            let pi = frame.pending_inputs[i];
-                            if pi != PENDING_EXTERNAL || !ready {
-                                let inputs = graph.inputs(n.inputs_offset, n.input_count);
-                                eprintln!("  node={} kind={:?} cf={} ready={} pending={} inputs={:?}",
-                                    gid.0, n.kind, n.compute_fn.0, ready, pi, inputs);
-                            }
-                        }
-                    }
                     break;
                 }
             };
@@ -442,7 +411,6 @@ impl<S: LockStrategy> Engine<S> {
             let ctx = EvalContext { node_start, graph: &graph };
 
             // COMPUTE: uniformly invoke compute_fn, with no specialization checks.
-            super::EngineCore::exec_count_bump(&graph, frame.subgraph_id);
             let result = (graph.compute_fns[node.compute_fn.0 as usize])(frame, graph_node_id, &ctx);
 
             // MATCH NodeResult: unified side-effect handling.
@@ -574,21 +542,15 @@ impl<S: LockStrategy> Engine<S> {
                     // value, not terminate this frame), LoopBody (E2 owns it), and
                     // async spawns.
                     // E7 same-frame branch execution (default on;
-                    // FROND_NO_SAMEFRAME=1 restores the child-frame protocol).
+                    // the child-frame protocol remains below as the ineligible fallback).
                     // The outer-input snapshot at launch mirrors the child
                     // frame's launch-time copy — without it, branch reads of
                     // enclosing-frame values (loop condition chains) see slots
                     // the E6 boundary delta cleared.
-                    if !pending.is_async
-                        && pending.closure_val.is_none()
-                        && !super::env_flag("FROND_NO_SAMEFRAME")
-                    {
+                    if !pending.is_async && pending.closure_val.is_none() {
                         let gate_gid =
                             NodeId(pending.call_node_local.0 + frame.node_offset);
                         if same_frame_branch_ok(&graph, frame, gate_gid, pending.target_sg) {
-                            if super::env_flag("FROND_DEBUG_SF") && super::EngineCore::sf_trace_match(&graph, frame.subgraph_id.0) {
-                                eprintln!("[DRV-GATE] gate={} target={}", gate_gid.0, pending.target_sg.0);
-                            }
                             self.launch_same_frame_branch(
                                 frame,
                                 pending.call_node_local,
@@ -596,6 +558,55 @@ impl<S: LockStrategy> Engine<S> {
                                 &pending.args,
                             );
                             continue;
+                        }
+                    }
+
+                    // Scalar-chain fast call: an eligible pure-leaf subgraph with
+                    // all-scalar args executes its compiled program in place —
+                    // no child frame, no queue round-trip, no compute_fn
+                    // dispatch. Bit-identical to the generic path (same
+                    // arith kernels); the offload intercept below keeps
+                    // precedence when --offload / [engine] offload is active.
+                    if !pending.is_async
+                        && pending.closure_val.is_none()
+                        && self.offload_rt.is_none()
+                    {
+                        if let Some(prog) =
+                            graph.scalar_prog(pending.target_sg.0 as usize)
+                        {
+                            if pending
+                                .args
+                                .iter()
+                                .all(|v| matches!(v, crate::value::Value::Scalar(..)))
+                            {
+                                let value =
+                                    crate::pass::Scalarizer::run_scalar_prog(&prog, &pending.args);
+                                let node_start = frame.node_offset;
+                                let graph_node_id =
+                                    NodeId(pending.call_node_local.0 + node_start);
+                                let consumer_count =
+                                    graph.downstream_count(graph_node_id.0 as usize);
+                                frame.set_value(
+                                    pending.call_node_local,
+                                    value,
+                                    consumer_count,
+                                );
+                                notify_downstream(
+                                    frame,
+                                    &graph,
+                                    pending.call_node_local,
+                                    graph_node_id,
+                                    NodeId(node_start),
+                                );
+                                if !frame.branch_relays.is_empty() {
+                                    relay_branch_value(
+                                        frame,
+                                        &graph,
+                                        pending.call_node_local,
+                                    );
+                                }
+                                continue;
+                            }
                         }
                     }
 
@@ -676,7 +687,7 @@ impl<S: LockStrategy> Engine<S> {
                                 );
                             }
                             body.caller = Some((fid, pending.call_node_local));
-                            if !super::env_flag("FROND_NO_REUSECHAIN") {
+                            {
                                 let parent_ptr =
                                     frame as *const Frame as *mut Frame;
                                 body.parent_frame_ptr = parent_ptr;
@@ -685,8 +696,6 @@ impl<S: LockStrategy> Engine<S> {
                                 } else {
                                     parent_ptr
                                 };
-                            } else {
-                                body.parent_frame_ptr = std::ptr::null_mut();
                             }
                             body.state = FrameState::Ready;
                         }
@@ -697,9 +706,24 @@ impl<S: LockStrategy> Engine<S> {
                             // Body awaits/selects: hand it to the queue protocol (legacy
                             // suspend), where its completion re-enters
                             // complete_and_wake_caller's LoopBody handling.
+                            // Offload waits push NO queue entry: the offload
+                            // delivery is the guaranteed requeuer (it applies
+                            // the completion and requeues the caller). A
+                            // suspend-time push would only produce a no-op
+                            // dispatch while the worker is still computing.
+                            // Predicate: the waited-for child never entered
+                            // the frames map (offload children live on the
+                            // worker; queue-protocol children are in-map).
+                            let offload_wait = matches!(
+                                body.suspend_state,
+                                SuspendState::WaitingSubgraph(k)
+                                    if !self.frames.lock().contains_key(&k)
+                            );
                             self.frames.lock().insert(body_fid, body);
                             frame.cached_child_frame = Some(body_fid);
-                            queue.push(body_fid);
+                            if !offload_wait {
+                                queue.push(body_fid);
+                            }
                                                         self.event_waiters
                                 .lock()
                                 .entry(RuntimeEvent::SubgraphComplete(body_fid))
@@ -803,9 +827,7 @@ impl<S: LockStrategy> Engine<S> {
                                 // and the condition re-read a stale snapshot forever.
                                 // Box addresses are stable across remove/insert (see
                                 // process_frame), so the in-hand frame pointer is safe.
-                                if super::env_flag("FROND_NO_REUSECHAIN") {
-                                    bf.parent_frame_ptr = std::ptr::null_mut();
-                                } else {
+                                {
                                     let parent_ptr = frame as *const Frame as *mut Frame;
                                     bf.parent_frame_ptr = parent_ptr;
                                     bf.root_frame_ptr = if !frame.root_frame_ptr.is_null() {
@@ -829,12 +851,6 @@ impl<S: LockStrategy> Engine<S> {
                                 frame,
                                 pending.closure_val.clone(),
                             );
-                            if super::env_flag("FROND_DEBUG_FORIN") {
-                                let bsg = &graph.subgraphs[pending.target_sg.0 as usize];
-                                eprintln!("[FORIN-CREATE] body_sg={} bfid={:?} args={:?} body_range=[{},{})",
-                                    pending.target_sg.0, bfid, pending.args,
-                                    bsg.node_range.0 .0, bsg.node_range.1 .0);
-                            }
                             frame.cached_child_frame = Some(bfid);
                             bfid
                         }
@@ -1139,9 +1155,6 @@ impl<S: LockStrategy> Engine<S> {
                     }
                 }
                 NodeResult::Return(v) => {
-                    if super::env_flag("FROND_DEBUG_SIGNAL") {
-                        eprintln!("[SIG-SET] node_local={} sg={} v={:?}", local_id.0, frame.subgraph_id.0, v);
-                    }
                     frame.control_signal = ControlSignal::Return(v);
                     break;
                 }
@@ -1356,12 +1369,8 @@ impl<S: LockStrategy> Engine<S> {
                     let gate_gid = NodeId(pending.call_node_local.0 + node_start);
                     if !pending.is_async
                         && pending.closure_val.is_none()
-                        && !super::env_flag("FROND_NO_SAMEFRAME")
                         && same_frame_branch_ok(graph, frame, gate_gid, pending.target_sg)
                     {
-                        if super::env_flag("FROND_DEBUG_SF") && super::EngineCore::sf_trace_match(graph, frame.subgraph_id.0) {
-                            eprintln!("[LIN-GATE] gate={}", gate_gid.0);
-                        }
                         self.launch_same_frame_branch(
                             frame,
                             pending.call_node_local,
@@ -1466,12 +1475,8 @@ impl<S: LockStrategy> Engine<S> {
                     let gate_gid = NodeId(pending.call_node_local.0 + node_start);
                     if !pending.is_async
                         && pending.closure_val.is_none()
-                        && !super::env_flag("FROND_NO_SAMEFRAME")
                         && same_frame_branch_ok(graph, frame, gate_gid, pending.target_sg)
                     {
-                        if super::env_flag("FROND_DEBUG_SF") && super::EngineCore::sf_trace_match(graph, frame.subgraph_id.0) {
-                            eprintln!("[DRAIN-GATE] gate={}", gate_gid.0);
-                        }
                         let (nbs, nbe) =
                             graph.subgraphs[pending.target_sg.0 as usize].node_range;
                         ranges.push((nbs.0, nbe.0));
@@ -1709,7 +1714,20 @@ impl<S: LockStrategy> Engine<S> {
                 // ENGINE arena's ref slots, and the thread_local GLOBAL_ARENA's
                 // ref slots (Closure bound_args handles live there, not in
                 // self.arena).
-                if crate::value::Registry::registered_count() > 1 << 16 {
+                // Leak-suspicion heuristic (乙①): fire only when the live
+                // set is LARGE and GROWING. A cyclic leak grows monotonically
+                // and is still caught; a stable large live set (e.g. a 1M
+                // record array) no longer pays a full-root mark at every
+                // frame completion — that transient (roots Vec + marked set)
+                // dominated peak RSS on big-live-set programs.
+                static VALVE_PREV: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let live_now = crate::value::Registry::registered_count();
+                let live_prev = VALVE_PREV.swap(live_now, std::sync::atomic::Ordering::Relaxed);
+                // The entry frame's completion IS program end — a full-root
+                // mark there is pure transient peak (dead=0 on healthy
+                // programs); teardown collection is the correct moment.
+                let is_entry = frame.subgraph_id == frame.graph.entry_subgraph.unwrap_or(frame.subgraph_id);
+                if !is_entry && live_now > (1 << 16) && live_now > live_prev + (1 << 15) {
                     let mut roots: Vec<crate::value::Value> = Vec::new();
                     // The completing frame itself was already TAKEN out of the
                     // frames map at the top of process_frame and is only held
@@ -1833,9 +1851,6 @@ impl<S: LockStrategy> Engine<S> {
                                     self.async_join_runtime
                                         .lock()
                                         .set_result(async_id, return_value.clone());
-                                    if super::env_flag("FROND_DEBUG_AWAIT") {
-                                        eprintln!("[CHILD-DONE] child={:?} async_id={:?}", fid, async_id);
-                                    }
 
                                     let woken = self.on_event_arrived(
                                         RuntimeEvent::AsyncJoin(async_id),
@@ -2010,13 +2025,6 @@ impl<S: LockStrategy> Engine<S> {
         args: &[Value],
     ) {
         let graph = frame.graph.clone();
-        if super::env_flag("FROND_DEBUG_SF") && super::EngineCore::sf_trace_match(&graph, frame.subgraph_id.0) {
-            let sg = &graph.subgraphs[target_sg.0 as usize];
-            let (bs, be) = sg.node_range;
-            eprintln!("[SF-LAUNCH] sg={} range=[{},{}) frame_sg={} offset={} qlen={} ret={}",
-                target_sg.0, bs.0, be.0, frame.subgraph_id.0, frame.node_offset, frame.ready_queue.len(), sg.return_node.0);
-        }
-        super::EngineCore::exec_cov_bump(target_sg, graph.subgraphs.len());
         let sg = &graph.subgraphs[target_sg.0 as usize];
         let (bs, be) = sg.node_range;
         let offset = frame.node_offset;

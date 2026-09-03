@@ -59,6 +59,17 @@ pub fn compile_graph(entry_path: &str, opt_level: crate::pass::Optimizer::OptLev
 }
 
 fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptLevel, debug: bool) -> crate::ir::Ir::DataFlowGraph {
+    // Diagnostic stage timing (FROND_BUILD_TIME=1): per-stage wall time to
+    // stderr; same env-gated diagnostic pattern as FROND_TRACE_CYCLES.
+    let bt = std::env::var("FROND_BUILD_TIME").is_ok();
+    let mut bt_prev = std::time::Instant::now();
+    fn bt_mark(name: &str, bt: bool, prev: &mut std::time::Instant) {
+        if bt {
+            let now = std::time::Instant::now();
+            eprintln!("[build-time] {name}: {} us", now.duration_since(*prev).as_micros());
+            *prev = now;
+        }
+    }
     let source = read_source(entry_path);
 
     if debug {
@@ -69,6 +80,7 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
     // 1. Parse
     let arena = bumpalo::Bump::new();
     let entry_module = Pipeline::parse_entry_module_or_exit(&arena, &source, entry_path);
+    bt_mark("parse_entry", bt, &mut bt_prev);
 
     if debug {
         eprintln!("  AST: {} declarations", entry_module.declarations.len());
@@ -77,6 +89,16 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
 
     // 2. Module loading
     let (loader, std_keys, dep_keys) = Pipeline::load_all_modules_or_exit(&entry_module, entry_path);
+    // Closure scoping (frondc loaddeps parity): the full std preload keeps
+    // the resolution env complete, but SEMA CHECK + IR BUILD only see the
+    // entry's transitive import closure — the mirror compiler loads deps
+    // only, and the optimizer's reachability pre-pass had been killing these
+    // functions post-hoc at 3× the cost (compile + prune-rebuild).
+    // (Closure scoping was tried and reverted — see MEM_OPT_PLAN_60: std
+    // module CHECKS populate method/resolution tables that user code and
+    // sibling std modules consume, and std modules reference each other
+    // without imports, so neither sema nor ir-build can be import-scoped.)
+    bt_mark("load_modules", bt, &mut bt_prev);
 
     if debug {
         let builtin_count = loader.builtin_modules().count();
@@ -88,6 +110,7 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
     // 3. Sema check (shared pipeline; any module type error is printed and exits)
     let (type_arena, sema_result) =
         Pipeline::run_sema_pipeline_or_exit(&loader, &std_keys, &dep_keys, &entry_module, entry_path);
+    bt_mark("sema", bt, &mut bt_prev);
 
     if debug {
         eprintln!("  Sema: OK (no type errors)");
@@ -97,6 +120,7 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
     // 4. Static analysis (after Sema, before IR): dead code/dead vars/dead functions + memoization strategy.
     //    Runs analysis on the entry module; prints a report summary in debug mode.
     let mut analysis_report = Analyzer::analyze(&entry_module, &entry_module.arena, &sema_result);
+    bt_mark("analyze_entry", bt, &mut bt_prev);
     if debug {
         eprintln!("  Analyzer: dead_code={} dead_var={} dead_func={} memo_candidates={} dead_param={} inline={} stack_alloc={} non_exhaustive={} unreachable_arms={}",
             analysis_report.dead_code.dead_stmts.len(),
@@ -125,6 +149,12 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
             (seen_module_ptrs.insert(m as *const _ as usize)).then_some(m)
         })
         .collect();
+    // NOTE: IR build keeps the FULL std preload — std modules reference
+    // each other WITHOUT imports (legacy cross-module bare-call compat,
+    // e.g. Instant.frond bare-calls Duration()), so import-closure scoping
+    // here breaks call binding. Sema stays closure-scoped: the predeclare
+    // rounds register every loaded module's declarations, so type checking
+    // resolves through them, while std bodies are trusted as pre-checked.
     for key in &std_keys {
         if let Some(m) = loader.get_module_by_key(key) {
             if seen_module_ptrs.insert(m as *const _ as usize) {
@@ -156,6 +186,7 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
             .with_builtin_analyses(builtin_analyses)
             .build()
     };
+    bt_mark("ir_build", bt, &mut bt_prev);
 
     // Check for IR compilation errors (unimplemented feature fallbacks, missing functions, etc.).
     if !graph.ir_errors.is_empty() {
@@ -178,18 +209,15 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
 
     // Loop analysis (after IR): identify invariants + unrollable loops, populating analysis_report.loop_analysis.
     analysis_report.loop_analysis = crate::pass::Analyzer::analyze_loops(&graph);
+    bt_mark("loop_analysis", bt, &mut bt_prev);
     if debug {
         eprintln!("  LoopAnalysis: invariants={} unrollable={}",
             analysis_report.loop_analysis.invariants.len(),
             analysis_report.loop_analysis.unrollable.len());
     }
 
-    // TEMP (stmt-drop hunt): FROND_DUMP_PRE dumps the pre-optimizer graph so
+    // TEMP (stmt-drop hunt): --dump-pre dumps the pre-optimizer graph so
     // build-time vs optimizer-introduced range scatter can be distinguished.
-    if std::env::var("FROND_DUMP_PRE").is_ok() {
-        eprintln!("=== PRE-OPT DUMP ===");
-        dump_ir(&graph);
-    }
 
     // Post-IR optimization: LICM/Unroll/Inline + ConstFold/CSE/CopyProp/DCE fixed-point iteration.
     // Driven by opt_level: O0 skips, O1 fixed-point only, O2 full, O3 full + wider stall window.
@@ -199,10 +227,8 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
     // condition-tree reset plans — recompute them on the final graph so the
     // engine applies the mechanical fast path.
     graph.precompute_reset_plans();
+    bt_mark("optimize", bt, &mut bt_prev);
 
-    if std::env::var("FROND_DUMP_IR").is_ok() {
-        dump_ir(&graph);
-    }
 
     if debug {
         eprintln!("  IR (after opt):  {} nodes, {} subgraphs, {} compute_fns",
@@ -215,51 +241,6 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
     graph
 }
 
-/// FROND_DUMP_IR: human-readable graph dump (subgraphs + nodes + edges + metadata).
-fn dump_ir(graph: &crate::ir::Ir::DataFlowGraph) {
-    eprintln!("=== IR DUMP: {} nodes, {} subgraphs, entry={:?} ===",
-        graph.nodes.len(), graph.subgraphs.len(), graph.entry_subgraph);
-    for (si, sg) in graph.subgraphs.iter().enumerate() {
-        let sg_name = graph.sg_names.get(si).map(|s| s.as_str()).unwrap_or("");
-        eprintln!("[sg {}] name={:?} range={:?} params={} entry={:?} ret={:?} loop={:?} fn_id={} suspend={} conv={}",
-            si, sg_name, (sg.node_range.0 .0, sg.node_range.1 .0), sg.param_count,
-            sg.entry_node.0, sg.return_node.0, format!("{:?}", sg.loop_kind), sg.function_id, sg.has_suspend, sg.converter_generated);
-        for n in sg.node_range.0 .0..sg.node_range.1 .0 {
-            let node = &graph.nodes[n as usize];
-            let inputs: Vec<u32> = graph.inputs_pool
-                .get(node.inputs_offset, node.input_count)
-                .iter().map(|i| i.0).collect();
-            let mut extra = String::new();
-            if let Some(t) = graph.call_targets.get(n as usize).and_then(|t| *t) {
-                extra += &format!(" call_sg={}", t.0);
-            }
-            if let Some(info) = graph.dyn_ffi_infos.get(n as usize).and_then(|i| i.as_ref()) {
-                extra += &format!(" ffi={}", info.symbol);
-            }
-            if let Some(gb) = graph.gate_branches.get(n as usize) {
-                if let Some(gb) = gb {
-                    extra += &format!(" gate[cond={:?} capture={}", gb.condition_input.0, gb.capture);
-                    for (val, bsg, params) in &gb.branches {
-                        extra += &format!(" {}=>sg{}({:?})", val, bsg.0, params.iter().map(|p| p.0).collect::<Vec<_>>());
-                    }
-                    extra += "]";
-                }
-            }
-            if let Some(cv) = graph.const_values.get(n as usize) {
-                if let Some(cv) = cv {
-                    extra += &format!(" const={:?}", cv);
-                }
-            }
-            if std::env::var("FROND_DUMP_DOWNSTREAM").is_ok() {
-                let ds: Vec<u32> = graph.downstreams.get(n as usize)
-                    .map(|d| d.iter().map(|x| x.0).collect()).unwrap_or_default();
-                let cnt = graph.downstream_counts.get(n as usize).copied().unwrap_or(0);
-                extra += &format!(" ds={:?} cnt={}", ds, cnt);
-            }
-            eprintln!("  n{} {:?} cf{} in={:?}{}", n, node.kind, node.compute_fn.0, inputs, extra);
-        }
-    }
-}
 
 /// Compile + execute within a project (also reused by debug full).
 pub fn run_from_project(opt_level: crate::pass::Optimizer::OptLevel, debug: bool) {
@@ -284,16 +265,11 @@ pub fn run_from_project(opt_level: crate::pass::Optimizer::OptLevel, debug: bool
     // The graph Arc is kept for the panic path so execution-coverage
     // instrumentation still reports what ran before the crash.
     let engine = EngineRef::new(graph);
-    let cov_graph = match &engine {
-        EngineRef::Single(e) => e.graph.clone(),
-        EngineRef::Multi(e) => e.graph.clone(),
-    };
     let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         engine.run()
     })) {
         Ok(result) => result,
         Err(payload) => {
-            crate::engine::EngineCore::exec_cov_dump(&cov_graph);
             eprintln!(
                 "error: internal runtime error: {}",
                 crate::pass::Optimizer::panic_payload_message(&payload)

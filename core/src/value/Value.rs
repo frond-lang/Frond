@@ -1115,6 +1115,16 @@ pub union ScalarValue {
 pub enum Value {
     Null,
     Void,
+    /// Frond str: single-allocation UTF-8 (`Arc<str>`). Deliberately NOT a
+    /// HeapObj: strings are leaf values (no Value edges → can never join a
+    /// reference cycle) and the dominant heap allocation source, so they
+    /// skip the 104-byte HeapObj shell and the cycle registry entirely.
+    Str(std::sync::Arc<str>),
+    /// Record/Adt/Newtype: single-block storage (see RecordRef). NOT a
+    /// HeapObj — the former three enum variants paid 104B of enum shell
+    /// (72B padding from the largest variant) plus a separate fields Vec
+    /// per instance.
+    Record(RecordRef),
     /// Scalar value. The tag must be a scalar variant (Bool/Char/I8.../F128);
     /// non-scalar tags (Null/Void/Ref) must not enter this path.
     Scalar(ScalarValue, ValueTag),
@@ -1162,17 +1172,61 @@ impl Value {
         Self::scalar(ScalarValue { f128_val: unsafe { std::mem::transmute(v.0) } }, ValueTag::F128)
     }
 
+    // ---- Str constructors/accessors (single-layer: Arc<str> held inline) ----
+    pub fn str_val(s: &str) -> Self {
+        Value::Str(std::sync::Arc::from(s))
+    }
+    pub fn str_from_string(s: String) -> Self {
+        Value::Str(std::sync::Arc::from(s))
+    }
+    pub fn str_from_arc(a: std::sync::Arc<str>) -> Self {
+        Value::Str(a)
+    }
+    pub fn str_arc(&self) -> Option<&std::sync::Arc<str>> {
+        match self { Value::Str(a) => Some(a), _ => None }
+    }
+    pub fn as_str(&self) -> Option<&str> {
+        match self { Value::Str(s) => Some(s), _ => None }
+    }
+    pub fn is_str(&self) -> bool {
+        matches!(self, Value::Str(_))
+    }
+
+    // ---- Record accessors (single-block Record/Adt/Newtype) ----
+    pub fn as_record(&self) -> Option<&RecordRef> {
+        match self { Value::Record(r) => Some(r), _ => None }
+    }
+    pub fn as_record_mut(&mut self) -> Option<&mut RecordRef> {
+        match self { Value::Record(r) => Some(r), _ => None }
+    }
+    pub fn is_record(&self) -> bool {
+        matches!(self, Value::Record(_))
+    }
+    /// Record-shaped field get by name (Record/Adt share the shape lookup).
+    pub fn record_field_get(&self, name: &str) -> Option<Value> {
+        let r = self.as_record()?;
+        r.shape().field_names.iter().position(|n| n.as_deref() == Some(name))
+            .map(|i| r.field(i))
+    }
+
     // ---- Heap object constructors ----
     pub fn ref_val(obj: HeapObj) -> Self {
+        // Leaf kinds can never join a cycle — skip registry insertion (and
+        // the matching drop-side deregister is gated the same way).
+        let cyclable = super::Registry::can_cycle(&obj);
         let arc = Arc::new(obj);
-        super::Registry::register(Arc::as_ptr(&arc) as usize);
+        if cyclable {
+            super::Registry::register(Arc::as_ptr(&arc) as usize);
+        }
         Value::Ref(arc)
     }
 
     /// Arc<HeapObj> allocation funnel for sites that build the Arc directly
     /// (deep clone): registers the object in the cycle registry.
     pub fn register_arc(arc: std::sync::Arc<HeapObj>) -> std::sync::Arc<HeapObj> {
-        super::Registry::register(std::sync::Arc::as_ptr(&arc) as usize);
+        if super::Registry::can_cycle(arc.as_ref()) {
+            super::Registry::register(std::sync::Arc::as_ptr(&arc) as usize);
+        }
         arc
     }
     pub fn from_ref(r: HeapRef) -> Self { Value::Ref(r) }
@@ -1348,6 +1402,8 @@ impl fmt::Debug for Value {
                     _ => unreachable!("non-scalar tag {:?} in ScalarValue", tag),
                 }
             }
+            Value::Str(s) => write!(f, "\"{}\"", s),
+            Value::Record(r) => fmt::Debug::fmt(r, f),
             Value::Ref(r) => fmt::Debug::fmt(r.as_ref(), f),
         }
     }
@@ -1383,6 +1439,8 @@ impl Hash for Value {
                     _ => unreachable!("non-scalar tag {:?} in ScalarValue", tag),
                 }
             }
+            Value::Str(s) => (std::sync::Arc::as_ptr(s) as *const u8 as usize).hash(state),
+            Value::Record(r) => r.as_block_ptr().hash(state),
             Value::Ref(r) => (Arc::as_ptr(r) as usize).hash(state),
         }
     }
@@ -1597,78 +1655,15 @@ impl From<char> for Char {
 // Part 2: heap object types (merges 6 files)
 // =========================================================================
 
-// ---- str.rs → Str ----
-
-/// Frond string: a reference-counted immutable UTF-8 string
-#[derive(Debug, Clone)]
-pub struct Str {
-    inner: Arc<str>,
-}
-
-impl Str {
-    pub fn new(s: impl Into<String>) -> Self {
-        Self { inner: Arc::from(s.into().as_str()) }
-    }
-    pub fn from_rust_str(s: &str) -> Self {
-        Self { inner: Arc::from(s) }
-    }
-    pub fn bytes(&self) -> &str {
-        &self.inner
-    }
-    pub fn byte_len(&self) -> usize {
-        self.inner.len()
-    }
-    pub fn codepoint_count(&self) -> usize {
-        self.inner.chars().count()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-    pub fn concat(&self, other: &Self) -> Self {
-        let mut buf = String::with_capacity(self.byte_len() + other.byte_len());
-        buf.push_str(&self.inner);
-        buf.push_str(&other.inner);
-        Self::from_rust_str(&buf)
-    }
-    pub fn equals(&self, other: &Self) -> bool {
-        self.inner == other.inner
-    }
-    pub fn compare(&self, other: &Self) -> Ordering {
-        self.inner.cmp(&other.inner)
-    }
-
-    /// Returns the character at the given codepoint index (UTF-8 safe).
-    ///
-    /// Returns the `idx`-th Unicode codepoint, or None if out of bounds.
-    pub fn char_at(&self, idx: usize) -> Option<char> {
-        self.inner.chars().nth(idx)
-    }
-}
-
-impl PartialEq for Str {
-    fn eq(&self, other: &Self) -> bool {
-        self.inner == other.inner
-    }
-}
-impl Eq for Str {}
-
-impl Hash for Str {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.inner.hash(state);
-    }
-}
-
-impl fmt::Display for Str {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.inner)
-    }
-}
-
 impl Drop for HeapObj {
     fn drop(&mut self) {
         // Normal (acyclic) reclamation leaves the cycle registry. Cyclic
         // garbage never runs this until a collection releases its edges.
-        super::Registry::deregister(self as *const HeapObj as usize);
+        // Leaf kinds never registered (see Registry::can_cycle), so their
+        // drops skip the lock entirely.
+        if super::Registry::can_cycle(self) {
+            super::Registry::deregister(self as *const HeapObj as usize);
+        }
     }
 }
 
@@ -2212,80 +2207,677 @@ pub struct RecordField {
     pub value: ValueHandle,
 }
 
-/// Record value: structured data of a named type
-#[derive(Debug, Clone)]
-pub struct RecordValue {
-    pub type_name: String,
-    pub fields: Vec<Value>,
-    pub field_names: Vec<Option<String>>,
-    pub field_ref_bits: u64,
+/// Shared, immutable per-construction-site shape: type name + constructor
+/// name + field-name table. Materialized once per construct node at engine
+/// start (graph-side `record_shapes` table, same derived-data pattern as
+/// `const_cache`) and cloned as an `Arc` by every instance — replacing the
+/// former per-instance `type_name: String` + `field_names:
+/// Vec<Option<String>>` (one String alloc per named field) with a single
+/// pointer. Dynamic-shape sites (record `{...spread}` extends) build shapes
+/// through the same Arc and cache them by (base shape, node).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ShapeKind {
+    Record = 0,
+    Adt = 1,
+    Newtype = 2,
 }
 
-impl RecordValue {
-    pub fn new(type_name: String, fields: Vec<Value>, field_names: Vec<Option<String>>) -> Self {
-        Self { type_name, fields, field_names, field_ref_bits: 0 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordShape {
+    pub type_name: Box<str>,
+    /// Constructor name; empty for plain Records and Newtypes.
+    pub constructor: Box<str>,
+    pub field_names: Vec<Option<Box<str>>>,
+    /// Observable kind (Record/Adt/Newtype) — preserves reflect `kind()`
+    /// distinctions after the three HeapObj variants merged into one
+    /// single-block representation.
+    pub kind: ShapeKind,
+    /// Packed field layout (乙②): per-field storage tag (ValueTag byte for
+    /// scalars at native width; 0xFF = generic 24B Value slot) and the
+    /// field's byte offset within the record block tail. The tail is
+    /// `[packed scalar region][value-slot region]` — scalar fields are
+    /// packed at their native width, everything else occupies a Value slot.
+    pub field_packs: Vec<u8>,
+    pub pack_offsets: Vec<u32>,
+    /// Total bytes of the value-slot region (multiple of 24).
+    pub value_region_bytes: u32,
+    /// Constructor discriminant (M1): stable id of (type_name, constructor).
+    /// Match arms compare this u32 instead of strings.
+    pub disc: u32,
+}
+
+pub const PACK_VALUE_SLOT: u8 = 0xFF;
+
+// ---- Constructor discriminant interner (M1) ----
+// Global stable id per (type_name, constructor). Match arms precompute the
+// acceptable disc set; runtime ctor tests become a u32 compare instead of
+// string compares + an inheritance walk. Only hit at shape/materialize time
+// (compile + engine start); execution compares plain u32s.
+
+fn ctor_disc_interner() -> &'static std::sync::Mutex<rustc_hash::FxHashMap<(Box<str>, Box<str>), u32>> {
+    static INNER: std::sync::OnceLock<
+        std::sync::Mutex<rustc_hash::FxHashMap<(Box<str>, Box<str>), u32>>,
+    > = std::sync::OnceLock::new();
+    INNER.get_or_init(|| std::sync::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Assigns-or-gets the stable discriminant for a (type_name, constructor)
+/// pair. 0 is reserved (no disc); ids start at 1.
+pub fn ctor_disc(type_name: &str, constructor: &str) -> u32 {
+    let mut map = ctor_disc_interner().lock().unwrap();
+    let key: (Box<str>, Box<str>) = (type_name.into(), constructor.into());
+    if let Some(&d) = map.get(&key) {
+        return d;
     }
-    pub fn get_field(&self, index: usize) -> Option<&Value> {
-        self.fields.get(index)
+    let d = (map.len() + 1) as u32;
+    map.insert(key, d);
+    d
+}
+
+impl RecordShape {
+    /// Computes the packed layout for a field-tag list (0xFF = Value slot).
+    pub fn compute_layout(field_tags: &[u8]) -> (Vec<u8>, Vec<u32>, u32) {
+        let mut packs = Vec::with_capacity(field_tags.len());
+        let mut offsets = Vec::with_capacity(field_tags.len());
+        let mut scalar_cursor: u32 = 0;
+        let mut value_slots: u32 = 0;
+        for &t in field_tags {
+            if t == PACK_VALUE_SLOT {
+                offsets.push(scalar_cursor); // patched to value region below
+                value_slots += 1;
+            } else {
+                let w = crate::value::tag_byte_width(t) as u32;
+                // natural alignment within the packed region
+                let aligned = (scalar_cursor + w - 1) & !(w - 1);
+                offsets.push(aligned);
+                scalar_cursor = aligned + w;
+            }
+            packs.push(t);
+        }
+        // value-slot fields live AFTER the packed region; fix up offsets
+        let packed_bytes = (scalar_cursor + 7) & !7; // 8-align the regions
+        let mut vslot = 0u32;
+        for (i, &t) in packs.iter().enumerate() {
+            if t == PACK_VALUE_SLOT {
+                offsets[i] = packed_bytes + vslot * (std::mem::size_of::<Value>() as u32);
+                vslot += 1;
+            }
+        }
+        (packs, offsets, value_slots * std::mem::size_of::<Value>() as u32)
     }
-    pub fn find_field(&self, name: &str) -> Option<&Value> {
-        for (i, field_name) in self.field_names.iter().enumerate() {
-            if let Some(n) = field_name {
-                if n == name {
-                    return self.fields.get(i);
+
+    /// Total tail bytes (packed region + value slots).
+    #[inline]
+    pub fn tail_bytes(&self) -> u32 {
+        self.packed_bytes() + self.value_region_bytes
+    }
+
+    #[inline]
+    fn packed_bytes(&self) -> u32 {
+        let mut end = 0u32;
+        for (o, t) in self.pack_offsets.iter().zip(&self.field_packs) {
+            if *t != PACK_VALUE_SLOT {
+                let e = o + crate::value::tag_byte_width(*t) as u32;
+                if e > end { end = e; }
+            }
+        }
+        (end + 7) & !7
+    }
+}
+
+/// Single-block record storage (MEM_OPT_PLAN_60 甲): one allocation holds
+/// `[strong][shape Arc][field_count][tail: field_count × Value]`, replacing
+/// the former Arc<HeapObj> enum shell (104B, of which 72B padding from the
+/// largest variant) plus the separate fields Vec. Thin pointer with manual
+/// refcounting — Arc<DST-with-custom-tail> would need a fat pointer (Value
+/// would grow to 32B) and sized-layout dealloc.
+pub struct RecordRef(std::ptr::NonNull<RecordBlock>);
+
+#[repr(C)]
+struct RecordBlock {
+    strong: std::sync::atomic::AtomicUsize,
+    shape: std::sync::Arc<RecordShape>,
+    field_count: u32,
+    // Intrusive cycle-registry links (乙①): records thread themselves into
+    // a global doubly-linked list instead of hashing their addresses into a
+    // FxHashSet — zero registry-side memory, no rehash doubling spikes, and
+    // thread/unthread are two pointer writes. 0 = list end.
+    reg_next: std::sync::atomic::AtomicUsize,
+    reg_prev: std::sync::atomic::AtomicUsize,
+    // tail: field_count × Value follows in the same allocation
+}
+
+// ---- Intrusive record registry (乙①) ----
+// The list head/tail and an atomic live count; a small mutex serializes
+// pointer swaps on thread/unthread (critical section = 2 writes).
+static REC_LIST_HEAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REC_LIST_TAIL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REC_LIST_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REC_LIST_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Uncontended-favoring spin guard for the registry list (critical section
+/// is two pointer writes; the previous std Mutex cost ~20ns per
+/// lock/unlock pair on the construct/free hot path).
+struct RecGuard;
+
+impl Drop for RecGuard {
+    fn drop(&mut self) {
+        REC_LIST_LOCK.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn rec_lock() -> RecGuard {
+    let mut spins = 0u32;
+    while REC_LIST_LOCK
+        .compare_exchange_weak(
+            false,
+            true,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        spins += 1;
+        if spins > 64 {
+            // Contended (offload workers): yield instead of burning a core.
+            std::hint::spin_loop();
+            if spins > 4096 {
+                std::thread::yield_now();
+                spins = 0;
+            }
+        }
+    }
+    RecGuard
+}
+
+fn rec_block_next_ptr(block: *mut RecordBlock) -> *mut std::sync::atomic::AtomicUsize {
+    unsafe {
+        std::ptr::addr_of_mut!((*block).reg_next)
+    }
+}
+fn rec_block_prev_ptr(block: *mut RecordBlock) -> *mut std::sync::atomic::AtomicUsize {
+    unsafe {
+        std::ptr::addr_of_mut!((*block).reg_prev)
+    }
+}
+
+/// Threads a freshly allocated record block into the registry list.
+/// (Called from RecordRef::new; skips under FROND_NO_CYCLES.)
+pub fn record_list_thread(ptr: *mut RecordBlock) {
+    let _guard = rec_lock();
+    let tail = REC_LIST_TAIL.load(std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        (*rec_block_next_ptr(ptr)).store(0, std::sync::atomic::Ordering::Relaxed);
+        (*rec_block_prev_ptr(ptr)).store(tail, std::sync::atomic::Ordering::Relaxed);
+    }
+    if tail != 0 {
+        unsafe {
+            (*rec_block_next_ptr(tail as *mut RecordBlock)).store(
+                ptr as usize,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    } else {
+        REC_LIST_HEAD.store(ptr as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+    REC_LIST_TAIL.store(ptr as usize, std::sync::atomic::Ordering::Relaxed);
+    REC_LIST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Unthreads a block whose last reference is gone (before the free).
+pub fn record_list_unthread(ptr: *mut RecordBlock) {
+    let _guard = rec_lock();
+    let p = ptr as usize;
+    let (prev, next) = unsafe {
+        (
+            (*rec_block_prev_ptr(ptr)).load(std::sync::atomic::Ordering::Relaxed),
+            (*rec_block_next_ptr(ptr)).load(std::sync::atomic::Ordering::Relaxed),
+        )
+    };
+    if prev != 0 {
+        unsafe {
+            (*rec_block_next_ptr(prev as *mut RecordBlock)).store(
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    } else {
+        REC_LIST_HEAD.store(next, std::sync::atomic::Ordering::Relaxed);
+    }
+    if next != 0 {
+        unsafe {
+            (*rec_block_prev_ptr(next as *mut RecordBlock)).store(
+                prev,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    } else {
+        REC_LIST_TAIL.store(prev, std::sync::atomic::Ordering::Relaxed);
+    }
+    REC_LIST_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Number of live registered record blocks (O(1)).
+pub fn record_list_count() -> usize {
+    REC_LIST_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Walks every live registered record block (collector mark/sweep input).
+///
+/// # Safety
+/// Stop-the-world quiescent point: no concurrent thread/unthread runs while
+/// the caller holds the walk snapshot (the engine valve is the only caller
+/// and runs between frames).
+pub unsafe fn record_list_walk(f: &mut dyn FnMut(usize)) {
+    let _guard = rec_lock();
+    let mut cur = REC_LIST_HEAD.load(std::sync::atomic::Ordering::Relaxed);
+    while cur != 0 {
+        f(cur | 1); // collector tag bit (same convention as the mixed heap)
+        let block = (cur & !1) as *mut RecordBlock;
+        cur = (*rec_block_next_ptr(block)).load(std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl RecordRef {
+    /// Allocates the single block and packs `fields` into the inline tail
+    /// (乙②: scalar fields at native width per the shape's pack layout,
+    /// everything else in 24B Value slots).
+    pub fn new(shape: std::sync::Arc<RecordShape>, fields: Vec<Value>) -> RecordRef {
+        let n = fields.len();
+        debug_assert_eq!(
+            shape.field_packs.len(),
+            n,
+            "record shape pack arity mismatch ({} packs vs {n} fields)",
+            shape.field_packs.len()
+        );
+        let tail = shape.tail_bytes() as usize;
+        let size = std::mem::size_of::<RecordBlock>() + tail;
+        let layout = std::alloc::Layout::from_size_align(size, std::mem::align_of::<RecordBlock>())
+            .expect("record block layout overflow");
+        let ptr = unsafe { std::alloc::alloc(layout) } as *mut RecordBlock;
+        assert!(!ptr.is_null(), "record block allocation failure");
+        unsafe {
+            std::ptr::addr_of_mut!((*ptr).strong)
+                .write(std::sync::atomic::AtomicUsize::new(1));
+            std::ptr::addr_of_mut!((*ptr).shape).write(shape.clone());
+            std::ptr::addr_of_mut!((*ptr).field_count).write(n as u32);
+            std::ptr::addr_of_mut!((*ptr).reg_next)
+                .write(std::sync::atomic::AtomicUsize::new(0));
+            std::ptr::addr_of_mut!((*ptr).reg_prev)
+                .write(std::sync::atomic::AtomicUsize::new(0));
+            let tail_base = (ptr as *mut u8).add(std::mem::size_of::<RecordBlock>());
+            for (i, f) in fields.into_iter().enumerate() {
+                if i < shape.field_packs.len() {
+                    pack_write(tail_base, shape.field_packs[i], shape.pack_offsets[i], &f);
+                }
+                // fields beyond the shape (shouldn't happen) are dropped.
+            }
+        }
+        // Records always hold Value edges → always potentially-cyclic.
+        // (乙①: intrusive list thread replaces the hash-set insert.)
+        if super::Registry::record_registration_enabled() {
+            record_list_thread(ptr);
+        }
+        RecordRef(std::ptr::NonNull::new(ptr).unwrap())
+    }
+
+    /// Adopts a raw block pointer as a +1 reference (cycle-collector cushion).
+    ///
+    /// # Safety
+    /// `ptr` must point to a live RecordBlock allocated by `new`.
+    pub unsafe fn from_raw_borrowed(ptr: *mut RecordBlock) -> RecordRef {
+        (*ptr).strong.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        RecordRef(std::ptr::NonNull::new(ptr).unwrap())
+    }
+
+    /// Raw block pointer (registry identity; no count change).
+    pub fn as_block_ptr(&self) -> *mut RecordBlock {
+        self.0.as_ptr()
+    }
+
+    #[inline]
+    pub fn shape(&self) -> &std::sync::Arc<RecordShape> {
+        unsafe { &self.0.as_ref().shape }
+    }
+
+    #[inline]
+    pub fn field_count(&self) -> usize {
+        unsafe { self.0.as_ref().field_count as usize }
+    }
+
+    /// Reads field `i`, reconstructing a scalar Value from its packed
+    /// bytes (zero heap allocation; the returned Value is inline).
+    #[inline]
+    pub fn field(&self, i: usize) -> Value {
+        unsafe {
+            let b = self.0.as_ref();
+            debug_assert!(i < b.field_count as usize);
+            let shape = &b.shape;
+            if i < shape.field_packs.len() {
+                let tail = (b as *const RecordBlock as *const u8)
+                    .add(std::mem::size_of::<RecordBlock>());
+                return pack_read(tail, shape.field_packs[i], shape.pack_offsets[i]);
+            }
+            Value::VOID
+        }
+    }
+
+    /// Iterator construction: writes each field straight into the block
+    /// tail — no intermediate `Vec<Value>` heap round-trip (the hot
+    /// construct path previously paid a 48B alloc+free per record).
+    pub fn new_from_iter<I>(shape: std::sync::Arc<RecordShape>, fields: I) -> RecordRef
+    where
+        I: IntoIterator<Item = Value>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let it = fields.into_iter();
+        let n = it.len();
+        let tail = shape.tail_bytes() as usize;
+        debug_assert_eq!(
+            shape.field_packs.len(),
+            n,
+            "record shape pack arity mismatch ({} packs vs {n} fields)",
+            shape.field_packs.len()
+        );
+        let size = std::mem::size_of::<RecordBlock>() + tail;
+        let layout = std::alloc::Layout::from_size_align(size, std::mem::align_of::<RecordBlock>())
+            .expect("record block layout overflow");
+        let ptr = unsafe { std::alloc::alloc(layout) } as *mut RecordBlock;
+        assert!(!ptr.is_null(), "record block allocation failure");
+        unsafe {
+            std::ptr::addr_of_mut!((*ptr).strong)
+                .write(std::sync::atomic::AtomicUsize::new(1));
+            std::ptr::addr_of_mut!((*ptr).shape).write(shape.clone());
+            std::ptr::addr_of_mut!((*ptr).field_count).write(n as u32);
+            std::ptr::addr_of_mut!((*ptr).reg_next)
+                .write(std::sync::atomic::AtomicUsize::new(0));
+            std::ptr::addr_of_mut!((*ptr).reg_prev)
+                .write(std::sync::atomic::AtomicUsize::new(0));
+            let tail_base = (ptr as *mut u8).add(std::mem::size_of::<RecordBlock>());
+            for (i, f) in it.enumerate() {
+                if i < shape.field_packs.len() {
+                    pack_write(tail_base, shape.field_packs[i], shape.pack_offsets[i], &f);
                 }
             }
         }
-        None
-    }
-}
-
-/// ADT field: a constructor argument
-#[derive(Debug, Clone)]
-pub struct AdtField {
-    pub name: Option<String>,
-    pub value: Value,
-}
-
-/// ADT value: an algebraic data type instance
-#[derive(Debug, Clone)]
-pub struct AdtValue {
-    pub type_name: String,
-    pub constructor: String,
-    pub fields: Vec<AdtField>,
-    pub field_ref_bits: u64,
-}
-
-impl AdtValue {
-    pub fn new(type_name: String, constructor: String, fields: Vec<AdtField>) -> Self {
-        Self { type_name, constructor, fields, field_ref_bits: 0 }
-    }
-    pub fn get_field(&self, index: usize) -> Option<&Value> {
-        self.fields.get(index).map(|f| &f.value)
-    }
-    pub fn find_field(&self, name: &str) -> Option<&Value> {
-        for field in &self.fields {
-            if let Some(n) = &field.name {
-                if n == name {
-                    return Some(&field.value);
-                }
-            }
+        if super::Registry::record_registration_enabled() {
+            record_list_thread(ptr);
         }
-        None
+        RecordRef(std::ptr::NonNull::new(ptr).unwrap())
+    }
+
+    /// In-place single-field write WITHOUT clone/COW (place-model store).
+    /// Packed scalar fields store their native-width bytes; Value slots
+    /// replace the slot (dropping the old Value).
+    ///
+    /// # Safety
+    /// Caller must hold the sole live reference (engine single-writer
+    /// discipline — the same argument as the previous in-place HeapObj
+    /// mutation via Arc::as_ptr).
+    pub unsafe fn set_field(&self, idx: usize, v: Value) {
+        let b = self.0.as_ref();
+        debug_assert!(idx < b.field_count as usize);
+        let shape = &b.shape;
+        if idx >= shape.field_packs.len() {
+            return;
+        }
+        let tail = (b as *const RecordBlock as *const u8)
+            .add(std::mem::size_of::<RecordBlock>());
+        if shape.field_packs[idx] == PACK_VALUE_SLOT {
+            let slot = tail.add(shape.pack_offsets[idx] as usize) as *mut Value;
+            std::ptr::write(slot, v);
+        } else {
+            pack_write(tail as *mut u8, shape.field_packs[idx], shape.pack_offsets[idx], &v);
+        }
+    }
+
+    fn layout_of_bytes(tail_bytes: usize) -> std::alloc::Layout {
+        let size = std::mem::size_of::<RecordBlock>() + tail_bytes;
+        std::alloc::Layout::from_size_align(size, std::mem::align_of::<RecordBlock>())
+            .expect("record block layout overflow")
+    }
+
+    unsafe fn drop_slow(&mut self) {
+        let ptr = self.0.as_ptr();
+        let b = &mut *ptr;
+        let layout = Self::layout_of_bytes(b.shape.tail_bytes() as usize);
+        drop_value_slots(b);
+        std::ptr::drop_in_place(&mut b.shape);
+        std::alloc::dealloc(ptr as *mut u8, layout);
     }
 }
 
-/// Newtype value: a named type wrapping a single inner value
-#[derive(Debug, Clone)]
-pub struct NewtypeValue {
-    pub type_name: String,
-    /// Inline inner value. Historically a `ValueHandle` into the thread_local
-    /// GLOBAL_ARENA — a Newtype allocated on one engine worker and read on
-    /// another indexed the WRONG thread's arena (wrong values / OOB panics).
-    /// Inline storage removes that entire class (UB-3) and lets Newtype
-    /// construction run on any thread (prerequisite for offload).
-    pub inner: Value,
+/// Drops every Value slot in the block tail (packed bytes have no Drop).
+///
+/// # Safety
+/// `b` must point at a live, not-yet-released RecordBlock.
+unsafe fn drop_value_slots(b: &mut RecordBlock) {
+    let shape = b.shape.clone();
+    let tail = (b as *mut RecordBlock as *mut u8).add(std::mem::size_of::<RecordBlock>());
+    for (i, &t) in shape.field_packs.iter().enumerate() {
+        if t == PACK_VALUE_SLOT && (i as u32) < b.field_count {
+            let slot = tail.add(shape.pack_offsets[i] as usize) as *mut Value;
+            std::ptr::drop_in_place(slot);
+        }
+    }
 }
+
+/// Width of a packed scalar field by ValueTag byte.
+pub fn tag_byte_width(tag: u8) -> usize {
+    use crate::value::ValueTag;
+    match tag {
+        t if t == ValueTag::Bool as u8 || t == ValueTag::I8 as u8 || t == ValueTag::U8 as u8 => 1,
+        t if t == ValueTag::I16 as u8 || t == ValueTag::U16 as u8 || t == ValueTag::F16 as u8 => 2,
+        t if t == ValueTag::Char as u8
+            || t == ValueTag::I32 as u8
+            || t == ValueTag::U32 as u8
+            || t == ValueTag::F32 as u8 => 4,
+        t if t == ValueTag::I64 as u8
+            || t == ValueTag::U64 as u8
+            || t == ValueTag::F64 as u8
+            || t == ValueTag::Isize as u8
+            || t == ValueTag::Usize as u8 => 8,
+        t if t == ValueTag::I128 as u8
+            || t == ValueTag::U128 as u8
+            || t == ValueTag::F128 as u8 => 16,
+        _ => 8, // PACK_VALUE_SLOT handled separately; unknown → slot-sized
+    }
+}
+
+/// Writes a field into the tail at its packed offset.
+///
+/// # Safety (internal)
+/// `tail` must have the shape-computed layout; packed fields must carry a
+/// Scalar Value of the matching tag (sema guarantee — a mismatch is a loud
+/// engine bug, never silently stored).
+unsafe fn pack_write(tail: *mut u8, pack: u8, offset: u32, v: &Value) {
+    use crate::value::ValueTag;
+    if pack == PACK_VALUE_SLOT {
+        let slot = tail.add(offset as usize) as *mut Value;
+        std::ptr::write(slot, v.clone());
+        return;
+    }
+    let Value::Scalar(sv, t) = v else {
+        panic!("packed record field got non-scalar value (tag {pack})");
+    };
+    let dst = tail.add(offset as usize);
+    let w = tag_byte_width(pack);
+    // Numeric tolerance: the static field type (pack) may differ from the
+    // runtime scalar tag — e.g. `Instant(nanos: i128)` fed an i64 from an
+    // extern C fn; sema inserts no widening cast at construct sites. Convert
+    // through the pack family's lane so the written bytes are exact.
+    let sv_storage: ScalarValue;
+    let src = if *t as u8 == pack {
+        sv
+    } else {
+        use crate::value::ValueTag;
+        sv_storage = match pack {
+            b if b == ValueTag::I8 as u8
+                || b == ValueTag::I16 as u8
+                || b == ValueTag::I32 as u8
+                || b == ValueTag::I64 as u8
+                || b == ValueTag::I128 as u8
+                || b == ValueTag::Isize as u8 =>
+            {
+                let x = v.as_int_i128();
+                ScalarValue { i128_val: unsafe {
+                    std::mem::transmute::<[u8; 16], [u64; 2]>(x.to_ne_bytes())
+                } }
+            }
+            b if b == ValueTag::U8 as u8
+                || b == ValueTag::U16 as u8
+                || b == ValueTag::U32 as u8
+                || b == ValueTag::U64 as u8
+                || b == ValueTag::U128 as u8
+                || b == ValueTag::Usize as u8 =>
+            {
+                let x = v.as_u128();
+                ScalarValue { u128_val: unsafe {
+                    std::mem::transmute::<[u8; 16], [u64; 2]>(x.to_ne_bytes())
+                } }
+            }
+            b if b == ValueTag::F16 as u8 => {
+                let f = crate::value::F16::from_f32(v.as_float_f64() as f32);
+                ScalarValue { f16_val: f.to_bits() }
+            }
+            b if b == ValueTag::F32 as u8 => {
+                ScalarValue { f32_val: v.as_float_f64() as f32 }
+            }
+            b if b == ValueTag::F64 as u8 => {
+                ScalarValue { f64_val: v.as_float_f64() }
+            }
+            b if b == ValueTag::F128 as u8 => {
+                let f = v.as_f128();
+                ScalarValue { f128_val: unsafe {
+                    std::mem::transmute::<[u8; 16], [u64; 2]>(f.0)
+                } }
+            }
+            b if b == ValueTag::Char as u8 => {
+                ScalarValue { char_val: v.as_char() as u32 }
+            }
+            b if b == ValueTag::Bool as u8 => {
+                ScalarValue { bool_val: v.as_bool() }
+            }
+            _ => *sv,
+        };
+        &sv_storage
+    };
+    // ScalarValue is #[repr(C)] with every lane at offset 0 — copy the low
+    // `w` bytes of the union (little-endian target).
+    std::ptr::copy_nonoverlapping(
+        (src as *const ScalarValue) as *const u8,
+        dst,
+        w,
+    );
+    let _ = ValueTag::Bool;
+}
+
+/// Reads a field from the tail at its packed offset into an inline Value.
+///
+/// # Safety (internal)
+unsafe fn pack_read(tail: *const u8, pack: u8, offset: u32) -> Value {
+    use crate::value::ValueTag;
+    if pack == PACK_VALUE_SLOT {
+        let slot = tail.add(offset as usize) as *const Value;
+        return (*slot).clone();
+    }
+    let w = tag_byte_width(pack);
+    let mut sv = ScalarValue { i128_val: [0, 0] };
+    std::ptr::copy_nonoverlapping(
+        tail.add(offset as usize),
+        (&mut sv as *mut ScalarValue) as *mut u8,
+        w,
+    );
+    let tag: ValueTag = num_enum::TryFromPrimitive::try_from_primitive(pack)
+        .unwrap_or(ValueTag::I64);
+    Value::Scalar(sv, tag)
+}
+
+impl Clone for RecordRef {
+    fn clone(&self) -> Self {
+        unsafe {
+            self.0.as_ref().strong.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        RecordRef(self.0)
+    }
+}
+
+impl Drop for RecordRef {
+    fn drop(&mut self) {
+        if unsafe { self.0.as_ref().strong.fetch_sub(1, std::sync::atomic::Ordering::Release) } == 1 {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            // (乙①: unthread BEFORE freeing so the registry never holds a
+            // dangling pointer.)
+            if super::Registry::record_registration_enabled() {
+                record_list_unthread(self.0.as_ptr());
+            }
+            unsafe { self.drop_slow() }
+        }
+    }
+}
+
+// Safety: record blocks cross threads exactly like Arc<HeapObj> did —
+// reference-counted, no location mutation except under the engine's
+// single-writer discipline (see set_field).
+unsafe impl Send for RecordRef {}
+unsafe impl Sync for RecordRef {}
+
+// ---- Mixed-heap collector hooks (Registry walks records through these) ----
+
+pub fn record_tagged_ptr(r: &RecordRef) -> usize {
+    r.as_block_ptr() as usize
+}
+
+/// Walks a tagged record pointer's field edges.
+///
+/// # Safety (caller: Registry, stop-the-world quiescent point; the record is
+/// held alive by the edge that pushed it).
+pub unsafe fn record_walk_tagged(p: usize, f: &mut dyn FnMut(&Value)) {
+    let r = record_from_tagged(p);
+    for i in 0..r.field_count() {
+        f(&r.field(i));
+    }
+}
+
+/// +1 borrowed reference keeping a (possibly dead) record block alive while
+/// the collector releases other dead sources' edges.
+///
+/// # Safety (caller: Registry; p must be a live tagged record pointer).
+pub unsafe fn record_cushion_tagged(p: usize) -> RecordRef {
+    record_from_tagged(p)
+}
+
+/// Drops the record's inline tail IN PLACE (children decref); the block
+/// itself stays alive under its cushions.
+///
+/// # Safety (caller: Registry; stop-the-world quiescent point).
+pub unsafe fn record_release_edges_tagged(p: usize) {
+    let ptr = (p & !super::Registry::RECORD_TAG) as *mut RecordBlock;
+    drop_value_slots(&mut *ptr);
+    // Tail dropped: make the count zero so a later accidental field() walk
+    // returns nothing for this dead block.
+    (*ptr).field_count = 0;
+}
+
+unsafe fn record_from_tagged(p: usize) -> RecordRef {
+    let ptr = (p & !super::Registry::RECORD_TAG) as *mut RecordBlock;
+    RecordRef::from_raw_borrowed(ptr)
+}
+
+impl std::fmt::Debug for RecordRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Record")
+            .field("type", &self.shape().type_name)
+            .field("arity", &self.field_count())
+            .finish_non_exhaustive()
+    }
+}
+
+
+
+
+
 
 /// Cell: a mutable reference cell (runtime carrier of `&T` reference semantics).
 ///
@@ -2818,11 +3410,7 @@ pub struct ForeignFnValue {
 /// Heap object: unified representation of all heap-allocated value types (24 kinds)
 #[derive(Debug, Clone)]
 pub enum HeapObj {
-    Str(Str),
     Array(ArrayValue),
-    Record(RecordValue),
-    Adt(AdtValue),
-    Newtype(NewtypeValue),
     Cell(Cell),
     /// Place reference (place model B-stage): handle to a mutable storage
     /// location. `&arr[i]` creates this; `*r` reads the element LIVE (SoA
@@ -2861,7 +3449,7 @@ pub type HeapRef = Arc<HeapObj>;
 /// Reference kind enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefKind {
-    Str, Array, Record, Adt, Newtype, Cell, Range, Closure, Partial, Builtin,
+    Array, Cell, Range, Closure, Partial, Builtin,
     TraitVal, LazyVal, ErrorVal, ThrowVal, ArrayElemRef, RecordFieldRef, GlobalSlotRef,
     AtomicVal, AsyncVal, ChannelVal, SenderVal, ReceiverVal, CoroutineFrame,
     OpaquePtr, LibVal, ForeignFnVal,
@@ -2884,8 +3472,6 @@ impl HeapObj {
     /// Eliminates hardcoded dispatch over field names and types in compute_record_field_get.
     pub fn field_get(&self, name: &str) -> Option<Value> {
         match self {
-            HeapObj::Record(r) => r.find_field(name).cloned(),
-            HeapObj::Adt(a) => a.find_field(name).cloned(),
             HeapObj::ChannelVal(ch) => match name {
                 "sender" => Some(Value::ref_val(HeapObj::SenderVal(SenderValue { channel: ch.clone() }))),
                 "receiver" => Some(Value::ref_val(HeapObj::ReceiverVal(ReceiverValue { channel: ch.clone() }))),
@@ -2897,11 +3483,7 @@ impl HeapObj {
 
     pub fn ref_kind(&self) -> RefKind {
         match self {
-            HeapObj::Str(_) => RefKind::Str,
             HeapObj::Array(_) => RefKind::Array,
-            HeapObj::Record(_) => RefKind::Record,
-            HeapObj::Adt(_) => RefKind::Adt,
-            HeapObj::Newtype(_) => RefKind::Newtype,
             HeapObj::Cell(_) => RefKind::Cell,
             HeapObj::ArrayElemRef { .. } => RefKind::ArrayElemRef,
             HeapObj::RecordFieldRef { .. } => RefKind::RecordFieldRef,
@@ -2928,11 +3510,7 @@ impl HeapObj {
 
     pub fn type_name(&self) -> &'static str {
         match self {
-            HeapObj::Str(_) => "str",
             HeapObj::Array(_) => "array",
-            HeapObj::Record(_) => "record",
-            HeapObj::Adt(_) => "adt",
-            HeapObj::Newtype(_) => "newtype",
             HeapObj::Cell(_) => "cell",
             HeapObj::ArrayElemRef { .. } => "array_elem_ref",
             HeapObj::RecordFieldRef { .. } => "record_field_ref",
@@ -2959,11 +3537,7 @@ impl HeapObj {
 
     pub fn display_name(&self) -> &'static str {
         match self {
-            HeapObj::Str(_) => "str",
             HeapObj::Array(_) => "[...]",
-            HeapObj::Record(_) => "record",
-            HeapObj::Adt(_) => "adt",
-            HeapObj::Newtype(_) => "newtype",
             HeapObj::Cell(_) => "cell",
             HeapObj::ArrayElemRef { .. } => "array_elem_ref",
             HeapObj::RecordFieldRef { .. } => "record_field_ref",
@@ -2991,8 +3565,7 @@ impl HeapObj {
     pub fn is_memoizable(&self) -> bool {
         matches!(
             self,
-            HeapObj::Str(_) | HeapObj::Array(_) | HeapObj::Record(_) | HeapObj::Adt(_)
-                | HeapObj::Newtype(_) | HeapObj::Range(_) | HeapObj::ErrorVal(_) | HeapObj::ThrowVal(_)
+            HeapObj::Array(_) | HeapObj::Range(_) | HeapObj::ErrorVal(_) | HeapObj::ThrowVal(_)
         )
     }
 }
@@ -3001,7 +3574,6 @@ impl Hash for HeapObj {
     fn hash<H: Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
-            HeapObj::Str(s) => s.hash(state),
             HeapObj::Array(a) => {
                 a.len().hash(state);
                 // SoA SIMD fast path: batch-hash scalars
@@ -3013,26 +3585,6 @@ impl Hash for HeapObj {
                     }
                 }
                 a.fixed_size.hash(state);
-            }
-            HeapObj::Record(r) => {
-                r.type_name.hash(state);
-                r.fields.len().hash(state);
-                for f in &r.fields {
-                    f.hash(state);
-                }
-                r.field_names.hash(state);
-            }
-            HeapObj::Adt(a) => {
-                a.type_name.hash(state);
-                a.constructor.hash(state);
-                a.fields.len().hash(state);
-                for f in &a.fields {
-                    f.value.hash(state);
-                }
-            }
-            HeapObj::Newtype(n) => {
-                n.type_name.hash(state);
-                n.inner.hash(state);
             }
             HeapObj::Cell(c) => {
                 c.get().hash(state);

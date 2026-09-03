@@ -1,10 +1,10 @@
 //! Offload — L2: pure-subgraph compute offload for the deterministic event
-//! loop (FROND_OFFLOAD=1, gray-release).
+//! loop (--offload, gray-release).
 //!
 //! Model: the engine thread owns ALL mutable state and scheduling, always.
 //! A synchronous call whose subgraph is classified pure
 //! (`is_offload_safe_compute` over every node — see ir/Ir.rs) and heavy
-//! enough (node-count threshold, FROND_OFFLOAD_MIN) executes on a rayon
+//! enough (node-count threshold, [engine] offload_min) executes on a rayon
 //! worker instead:
 //!
 //!   1. LAUNCH (engine thread): arguments pass a reachability gate (no
@@ -33,21 +33,23 @@
 //!      Bug-#78 drain path in process_frame).
 
 use super::*;
-use crate::ir::Ir::{self as ir, Frame, FrameId, NodeId, PendingCall, EvalContext, NodeResult, ControlSignal, LoopKind, RuntimeEvent, SuspendState, FrameState, SubGraphId, DataFlowGraph};
+use crate::pass::Scalarizer::{run_scalar_prog, ScalarProg};
+use super::Schedule::relay_branch_value;
+use crate::ir::Ir::{Frame, FrameId, NodeId, PendingCall, ControlSignal, LoopKind, RuntimeEvent, SuspendState, FrameState, SubGraphId, DataFlowGraph};
 use crate::value::Value;
 use parking_lot::{Condvar, Mutex as ParkingMutex};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Launch threshold below which offload is pointless (copy + delivery
-/// overhead exceeds the compute). Tunable via FROND_OFFLOAD_MIN.
+/// overhead exceeds the compute). Tunable via [engine] offload_min.
 pub(super) const DEFAULT_OFFLOAD_MIN_NODES: usize = 2000;
 // Threshold economics (measured): launch+copy+delivery overhead is ~0.5ms
 // per offload; a pure straight-line leaf averages ~1µs/node, so a node-count
 // gate must sit where work clearly dominates. 2000 nodes ≈ ≥1ms of compute.
 // A real cost model (and loop-level / slot-provenance extensions) is the L2
 // follow-up; until then this keeps the machinery sound and dormant by
-// default, exercised via FROND_OFFLOAD=1 soak.
+// default, exercised via --offload soak.
 
 /// One completed offload, waiting for its turn in the sequencer.
 struct OffloadDone {
@@ -55,9 +57,9 @@ struct OffloadDone {
     call_node: NodeId,
     value: Value,
     signal: ControlSignal,
-    /// The executed child, shipped back for ENGINE-THREAD pool return.
-    /// Without it the pool drains and every launch pays a fresh cold value
-    /// table — the 30x slowdown root cause.
+    /// The executed child, shipped back only when the frame must return to
+    /// the engine (unused on the clean path since the worker-frame cache:
+    /// clean completions keep the frame worker-side for warm reuse).
     child_frame: Option<Box<Frame>>,
     /// Classifier escape: the engine re-drives this child through the real
     /// machinery instead of applying the partial result.
@@ -72,46 +74,10 @@ struct OffloadDone {
 /// Shared offload runtime: held via Arc by the engine and every in-flight
 /// worker. The ONLY cross-thread state in the process, fully mutex-guarded.
 pub(super) struct OffloadRt {
-    pub enabled: bool,
     pub min_nodes: usize,
     inner: ParkingMutex<OffloadInner>,
     /// Engine-thread wakeup: notified on every delivery.
     pub parked: Condvar,
-    /// Profiling accumulators (FROND_OFFLOAD_STATS dump at exit).
-    pub stats: OffloadStats,
-}
-
-/// Nanosecond buckets: engine-side launch cost (frame build + clone),
-/// worker execution, and delivery apply.
-#[derive(Default)]
-pub struct OffloadStats {
-    pub launches: std::sync::atomic::AtomicU64,
-    pub launch_ns: std::sync::atomic::AtomicU64,
-    pub worker_ns: std::sync::atomic::AtomicU64,
-    pub deliver_ns: std::sync::atomic::AtomicU64,
-}
-
-impl OffloadStats {
-    fn add(&self, slot: &std::sync::atomic::AtomicU64, d: std::time::Duration) {
-        slot.fetch_add(d.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-impl Drop for OffloadStats {
-    fn drop(&mut self) {
-        if std::env::var("FROND_OFFLOAD_STATS").is_ok() {
-            let l = self.launches.load(std::sync::atomic::Ordering::Relaxed);
-            let ln = self.launch_ns.load(std::sync::atomic::Ordering::Relaxed);
-            let wn = self.worker_ns.load(std::sync::atomic::Ordering::Relaxed);
-            let dn = self.deliver_ns.load(std::sync::atomic::Ordering::Relaxed);
-            eprintln!(
-                "[OFFLOAD-STATS] launches={l} launch(engine)={ln}ns ({}/call) worker={wn}ns ({}/call) deliver={dn}ns ({}/call)",
-                if l > 0 { ln / l } else { 0 },
-                if l > 0 { wn / l } else { 0 },
-                if l > 0 { dn / l } else { 0 },
-            );
-        }
-    }
 }
 
 // Safety: the ONLY cross-thread component in the process. Every field is
@@ -131,14 +97,21 @@ struct OffloadInner {
     ready: HashMap<u64, OffloadDone>,
 }
 
+/// Outcome of the merged single-lock park.
+pub enum ParkOutcome {
+    /// Sequence head applicable — the loop-top drain makes progress.
+    HeadReady,
+    /// Nothing in flight and head not ready — caller runs the
+    /// timer/reconcile/deadlock path.
+    NothingInFlight,
+    /// Wait bounded by a timer deadline; still work in flight.
+    TimedOut,
+}
+
 impl OffloadRt {
-    pub fn from_env() -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            enabled: std::env::var("FROND_OFFLOAD").is_ok(),
-            min_nodes: std::env::var("FROND_OFFLOAD_MIN")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_OFFLOAD_MIN_NODES),
+            min_nodes: DEFAULT_OFFLOAD_MIN_NODES,
             inner: ParkingMutex::new(OffloadInner {
                 next_launch_seq: 0,
                 next_apply_seq: 0,
@@ -146,7 +119,6 @@ impl OffloadRt {
                 ready: HashMap::new(),
             }),
             parked: Condvar::new(),
-            stats: OffloadStats::default(),
         })
     }
 
@@ -159,12 +131,21 @@ impl OffloadRt {
     }
 
     fn deliver(&self, seq: u64, done: OffloadDone) {
-        {
+        // Wake coalescing: notify ONLY when this delivery unblocks an apply
+        // (it completed the sequence head — the engine's loop-top drain will
+        // apply the whole ready chain in one pass) or when it was the last
+        // completion in flight (the engine must run its idle/deadlock pass).
+        // Out-of-order deliveries never wake the engine — they just buffer.
+        // The engine is the sole waiter, so notify_one suffices.
+        let should_wake = {
             let mut g = self.inner.lock();
             g.ready.insert(seq, done);
             g.inflight -= 1;
+            seq == g.next_apply_seq || g.inflight == 0
+        };
+        if should_wake {
+            self.parked.notify_one();
         }
-        self.parked.notify_all();
     }
 
     /// Engine thread: apply completions that reached the head of the launch
@@ -189,6 +170,11 @@ impl OffloadRt {
         self.inner.lock().inflight
     }
 
+    /// The subgraph's compiled scalar program, compiling on first use.
+    fn fast_prog(&self, graph: &DataFlowGraph, sg: SubGraphId) -> Option<std::sync::Arc<ScalarProg>> {
+        graph.scalar_prog(sg.0 as usize)
+    }
+
     /// Deadlock-dump view: sequencer position + stuck reorder-buffer keys.
     pub fn debug_state(&self) -> String {
         let g = self.inner.lock();
@@ -210,10 +196,17 @@ impl OffloadRt {
         g.ready.contains_key(&g.next_apply_seq)
     }
 
-    /// Engine-thread park while offloads are in flight: workers notify on
-    /// delivery; `limit` (a timer deadline) bounds the wait.
-    pub fn park(&self, limit: Option<std::time::Instant>) {
+    /// Single-lock wake path (replaces the inflight()/park()/head_ready()
+    /// triple acquisition): head check + inflight check + bounded wait in
+    /// ONE mutex acquisition on the hot park/wake cycle.
+    pub fn park_for_head(&self, limit: Option<std::time::Instant>) -> ParkOutcome {
         let mut g = self.inner.lock();
+        if g.ready.contains_key(&g.next_apply_seq) {
+            return ParkOutcome::HeadReady;
+        }
+        if g.inflight == 0 {
+            return ParkOutcome::NothingInFlight;
+        }
         match limit {
             Some(deadline) => {
                 let dur = deadline.saturating_duration_since(std::time::Instant::now());
@@ -223,6 +216,18 @@ impl OffloadRt {
             }
             None => self.parked.wait(&mut g),
         }
+        if g.ready.contains_key(&g.next_apply_seq) {
+            ParkOutcome::HeadReady
+        } else {
+            ParkOutcome::TimedOut
+        }
+    }
+
+    /// Merged pending check for the apply early-exit (one lock instead of
+    /// inflight() + head_ready()).
+    pub fn has_pending(&self) -> bool {
+        let g = self.inner.lock();
+        g.inflight > 0 || g.ready.contains_key(&g.next_apply_seq)
     }
 }
 
@@ -240,21 +245,6 @@ pub(super) enum OffloadOutcome {
 /// queue/gate machinery — the whitelist guarantees none of it is reachable.
 /// Reads only the frame's own table; a missing input (an outer-scope read
 /// the classifier let through) is a Fallback, never a panic.
-fn diag_flag(name: &'static str) -> bool {
-    static FLAGS: std::sync::OnceLock<rustc_hash::FxHashMap<&'static str, bool>> =
-        std::sync::OnceLock::new();
-    *FLAGS
-        .get_or_init(|| {
-            let mut m = rustc_hash::FxHashMap::default();
-            for k in ["FROND_OFFLOAD_NOCHK", "FROND_OFFLOAD_NOCOMPUTE", "FROND_OFFLOAD_NOSTORE"] {
-                m.insert(k, std::env::var(k).is_ok());
-            }
-            m
-        })
-        .get(name)
-        .unwrap_or(&false)
-}
-
 
 // =========================================================================
 // Copy-in safety gate
@@ -269,6 +259,13 @@ fn offload_args_ok(args: &[Value]) -> bool {
 }
 
 fn value_offload_safe(v: &Value, seen: &mut HashSet<usize>) -> bool {
+    if let Value::Record(r) = v {
+        let key = crate::value::record_tagged_ptr(r);
+        if !seen.insert(key) {
+            return true;
+        }
+        return (0..r.field_count()).all(|i| value_offload_safe(&r.field(i), seen));
+    }
     let Value::Ref(rc) = v else { return true };
     let key = Arc::as_ptr(rc) as usize;
     if !seen.insert(key) {
@@ -278,9 +275,6 @@ fn value_offload_safe(v: &Value, seen: &mut HashSet<usize>) -> bool {
     match rc.as_ref() {
         HeapObj::Closure(_) | HeapObj::Partial(_) => false,
         HeapObj::Array(a) => a.elements.iter().all(|e| value_offload_safe(e, seen)),
-        HeapObj::Record(r) => r.fields.iter().all(|e| value_offload_safe(e, seen)),
-        HeapObj::Adt(a) => a.fields.iter().all(|f| value_offload_safe(&f.value, seen)),
-        HeapObj::Newtype(n) => value_offload_safe(&n.inner, seen),
         HeapObj::ThrowVal(t) => match &t.payload {
             crate::value::ThrowPayload::Ok(v) | crate::value::ThrowPayload::Err(v) => {
                 value_offload_safe(v, seen)
@@ -291,8 +285,215 @@ fn value_offload_safe(v: &Value, seen: &mut HashSet<usize>) -> bool {
     }
 }
 
+// =========================================================================
+// Worker-side frame lifecycle
+// =========================================================================
+
+thread_local! {
+    /// Per-worker reused offload execution frames, keyed by target subgraph
+    /// (a cross-function frame's layout — node_offset, table sizes, seeding —
+    /// is fully determined by the sg). A repeated offload of the same sg
+    /// re-executes on a value table already resident in THIS core's cache:
+    /// no per-launch allocation, no engine-thread-initialized memory being
+    /// invalidated cross-core, no frame shipping either direction. The
+    /// engine's own cached_child_frame/hot_body reuse for loop bodies is the
+    /// in-thread analogue of this mechanism.
+    static WORKER_FRAMES: std::cell::RefCell<HashMap<u32, Box<Frame>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+/// Cache cap: distinct subgraphs retained per worker. Evicted frames drop
+/// (Arc'd values released) on the worker thread, which owns them.
+const WORKER_FRAME_CACHE_MAX: usize = 4;
+
+/// Builds or reuses this worker's execution frame for `sg` and seeds it with
+/// exactly the engine's cross-function `start_subgraph_frame` recipe — the
+/// same `prepare_frame_nodes` and the same parameter-injection loop, so the
+/// worker's frame is behaviorally identical to an engine-built one.
+fn take_worker_frame(
+    graph: &std::sync::Arc<DataFlowGraph>,
+    child_fid: FrameId,
+    caller_fid: FrameId,
+    call_node: NodeId,
+    sg_id: SubGraphId,
+    args: &[Value],
+) -> Box<Frame> {
+    let sg = &graph.subgraphs[sg_id.0 as usize];
+    let (node_start, node_end) = sg.node_range;
+    let node_count = (node_end.0 - node_start.0) as usize;
+
+    let mut child = WORKER_FRAMES
+        .with(|cache| cache.borrow_mut().remove(&sg_id.0))
+        .unwrap_or_else(|| Box::new(Frame::new(child_fid, sg_id, node_count, graph.clone())));
+    // Re-target the reused frame exactly like the engine's acquire_frame.
+    child.id = child_fid;
+    child.subgraph_id = sg_id;
+    child.value_table.resize(node_count);
+    child.value_table.disable_dirty_tracking();
+    child.pending_inputs.resize(node_count, 0);
+
+    // Seed: mirror of Engine::prepare_frame (reset + linear-fresh + seeding).
+    child.value_table.reset_all();
+    child.ready_queue.clear();
+    child.control_signal = ControlSignal::None;
+    child.linear_fresh = true;
+    super::Schedule::prepare_frame_nodes(&mut child, graph);
+    // Engine-machinery residues must not survive a pooled/reused frame.
+    child.defer_stack.clear();
+    child.suspend_event = None;
+    child.select_timers.clear();
+    child.cached_child_frame = None;
+    child.hot_body = None;
+    child.same_fn_prep_cache = None;
+    child.construct_cache.clear();
+    child.branch_relays.clear();
+    child.closure_val = None;
+    child.caller = Some((caller_fid, call_node));
+    // Queue-path contract: chain pointers nulled (the executor verified
+    // every input is local, so parents are never walked).
+    child.root_frame_ptr = std::ptr::null_mut();
+    child.parent_frame_ptr = std::ptr::null_mut();
+    child.state = FrameState::Ready;
+
+    // Parameter injection — verbatim the engine's cross-function path.
+    let offset = node_start.0 as usize;
+    for (i, arg) in args.iter().enumerate().take(sg.param_count as usize) {
+        let local_id = NodeId(i as u32);
+        let global_id = NodeId((offset + i) as u32);
+        let consumer_count = graph.downstream_count(offset + i);
+        child.set_value(local_id, arg.clone(), consumer_count);
+        // Do not push_ready: the parameter value is already set; notify_downstream
+        // propagates it downstream.
+        super::Schedule::notify_downstream(
+            &mut child,
+            graph,
+            local_id,
+            global_id,
+            NodeId(node_start.0),
+        );
+    }
+    child
+}
+
+/// Returns a cleanly-finished frame to this worker's cache for the next
+/// launch of the same sg. Results are dropped here (worker-thread drop of
+/// values this worker produced); the allocation and table memory stay warm.
+fn store_worker_frame(sg_id: SubGraphId, mut frame: Box<Frame>) {
+    frame.value_table.reset_all();
+    frame.branch_relays.clear();
+    frame.defer_stack.clear();
+    frame.select_timers.clear();
+    WORKER_FRAMES.with(|cache| {
+        let mut m = cache.borrow_mut();
+        if m.len() >= WORKER_FRAME_CACHE_MAX && !m.contains_key(&sg_id.0) {
+            if let Some(evict) = m.keys().next().copied() {
+                m.remove(&evict);
+            }
+        }
+        m.insert(sg_id.0, frame);
+    });
+}
+
+/// Worker-side job body: obtain the (reused) frame, execute, and either cache
+/// it for the next launch of this sg (clean completion) or ship it back to
+/// the engine for the fallback re-drive (classifier escape / restitution).
+fn offload_worker(
+    graph: &std::sync::Arc<DataFlowGraph>,
+    child_fid: FrameId,
+    caller_fid: FrameId,
+    call_node: NodeId,
+    target_sg: SubGraphId,
+    cloned_args: Vec<Value>,
+    rt: &OffloadRt,
+    seq: u64,
+    arg_ref_ptrs: Option<HashSet<usize>>,
+    original_args: Option<Vec<Value>>,
+) {
+    // Fast path: scalar-args launch of a subgraph with a compiled scalar
+    // program runs frame-less (params → straight-line ops → return slot).
+    // Scalar results cannot alias argument objects, so the restitution
+    // check is vacuous here.
+    if cloned_args.iter().all(|v| matches!(v, Value::Scalar(..))) {
+        if let Some(prog) = rt.fast_prog(graph, target_sg) {
+            let value = run_scalar_prog(&prog, &cloned_args);
+            let done = OffloadDone {
+                caller: caller_fid,
+                call_node,
+                value,
+                signal: ControlSignal::None,
+                child_frame: None,
+                fallback_child: None,
+                fallback_args: None,
+            };
+            rt.deliver(seq, done);
+            return;
+        }
+    }
+
+    let mut child = take_worker_frame(
+        graph,
+        child_fid,
+        caller_fid,
+        call_node,
+        target_sg,
+        &cloned_args,
+    );
+    let outcome = super::Schedule::run_offloaded_subgraph(graph, &mut child);
+    // Restitution check: if the result aliases any (cloned) argument
+    // object, applying it would hand the caller a private clone where
+    // reference semantics demand the real object — fall back to a
+    // re-run with the ORIGINAL args on the engine thread.
+    let aliased = match (&outcome, &arg_ref_ptrs) {
+        (OffloadOutcome::Done(v, _), Some(ptrs)) => {
+            let mut seen = HashSet::new();
+            refs_intersect(v, ptrs, &mut seen)
+        }
+        _ => false,
+    };
+    let done = match outcome {
+        OffloadOutcome::Done(value, signal) if !aliased => {
+            // Clean completion: keep the frame warm on this worker.
+            store_worker_frame(target_sg, child);
+            OffloadDone {
+                caller: caller_fid,
+                call_node,
+                value,
+                signal,
+                child_frame: None,
+                fallback_child: None,
+                fallback_args: None,
+            }
+        }
+        OffloadOutcome::Done(..) => OffloadDone {
+            caller: caller_fid,
+            call_node,
+            value: Value::VOID,
+            signal: ControlSignal::None,
+            child_frame: None,
+            fallback_child: Some(child),
+            fallback_args: original_args,
+        },
+        OffloadOutcome::Fallback => OffloadDone {
+            caller: caller_fid,
+            call_node,
+            value: Value::VOID,
+            signal: ControlSignal::None,
+            child_frame: None,
+            fallback_child: Some(child),
+            fallback_args: original_args,
+        },
+    };
+    rt.deliver(seq, done);
+}
+
 /// Collects every heap-object address reachable from `v` (cycles tolerated).
 fn collect_ref_ptrs(v: &Value, seen: &mut HashSet<usize>) {
+    if let Value::Record(r) = v {
+        let key = crate::value::record_tagged_ptr(r);
+        if seen.insert(key) {
+            (0..r.field_count()).for_each(|i| collect_ref_ptrs(&r.field(i), seen));
+        }
+        return;
+    }
     let Value::Ref(rc) = v else { return };
     let key = std::sync::Arc::as_ptr(rc) as usize;
     if !seen.insert(key) {
@@ -301,9 +502,6 @@ fn collect_ref_ptrs(v: &Value, seen: &mut HashSet<usize>) {
     use crate::value::HeapObj;
     match rc.as_ref() {
         HeapObj::Array(a) => a.elements.iter().for_each(|e| collect_ref_ptrs(e, seen)),
-        HeapObj::Record(r) => r.fields.iter().for_each(|e| collect_ref_ptrs(e, seen)),
-        HeapObj::Adt(a) => a.fields.iter().for_each(|f| collect_ref_ptrs(&f.value, seen)),
-        HeapObj::Newtype(n) => collect_ref_ptrs(&n.inner, seen),
         HeapObj::ThrowVal(t) => match &t.payload {
             crate::value::ThrowPayload::Ok(v) | crate::value::ThrowPayload::Err(v) => {
                 collect_ref_ptrs(v, seen)
@@ -316,6 +514,16 @@ fn collect_ref_ptrs(v: &Value, seen: &mut HashSet<usize>) {
 
 /// Does any heap object reachable from `v` appear in `arg_ptrs`?
 fn refs_intersect(v: &Value, arg_ptrs: &HashSet<usize>, seen: &mut HashSet<usize>) -> bool {
+    if let Value::Record(r) = v {
+        let key = crate::value::record_tagged_ptr(r);
+        if arg_ptrs.contains(&key) {
+            return true;
+        }
+        if !seen.insert(key) {
+            return false;
+        }
+        return (0..r.field_count()).any(|i| refs_intersect(&r.field(i), arg_ptrs, seen));
+    }
     let Value::Ref(rc) = v else { return false };
     let key = std::sync::Arc::as_ptr(rc) as usize;
     if arg_ptrs.contains(&key) {
@@ -327,9 +535,6 @@ fn refs_intersect(v: &Value, arg_ptrs: &HashSet<usize>, seen: &mut HashSet<usize
     use crate::value::HeapObj;
     match rc.as_ref() {
         HeapObj::Array(a) => a.elements.iter().any(|e| refs_intersect(e, arg_ptrs, seen)),
-        HeapObj::Record(r) => r.fields.iter().any(|e| refs_intersect(e, arg_ptrs, seen)),
-        HeapObj::Adt(a) => a.fields.iter().any(|f| refs_intersect(&f.value, arg_ptrs, seen)),
-        HeapObj::Newtype(n) => refs_intersect(&n.inner, arg_ptrs, seen),
         HeapObj::ThrowVal(t) => match &t.payload {
             crate::value::ThrowPayload::Ok(v) | crate::value::ThrowPayload::Err(v) => {
                 refs_intersect(v, arg_ptrs, seen)
@@ -355,7 +560,7 @@ impl<S: LockStrategy> Engine<S> {
         pending: &PendingCall,
         frame: &mut Frame,
     ) -> bool {
-        let Some(rt) = self.offload_rt.as_ref().filter(|r| r.enabled) else {
+        let Some(rt) = self.offload_rt.as_ref() else {
             return false;
         };
         if pending.is_async || pending.closure_val.is_some() {
@@ -390,7 +595,6 @@ impl<S: LockStrategy> Engine<S> {
         // checked exactly on the worker (see the restitution fallback).
         let args_have_refs = pending.args.iter().any(|v| matches!(v, Value::Ref(_)));
 
-        let __t0 = std::time::Instant::now();
         // Copy-in: private deep clones; from here on the worker shares
         // nothing with the engine's live object graph.
         let cloned: Vec<Value> = pending
@@ -411,19 +615,12 @@ impl<S: LockStrategy> Engine<S> {
         let original_args: Option<Vec<Value>> =
             if args_have_refs { Some(pending.args.clone()) } else { None };
 
-        let (child_fid, mut child) = self.start_subgraph_frame(
-            caller_fid,
-            pending.call_node_local,
-            pending.target_sg,
-            &cloned,
-            frame,
-            None,
-        );
-        // Queue-path contract: chain pointers nulled (the executor verified
-        // every input is local, so parents are never walked).
-        child.root_frame_ptr = std::ptr::null_mut();
-        child.parent_frame_ptr = std::ptr::null_mut();
-        child.state = FrameState::Ready;
+        // Lightweight launch: only ids + cloned args cross threads. The
+        // execution frame is built (and afterwards kept) on the worker —
+        // repeated offloads of the same subgraph re-execute on a value table
+        // that stays resident in that core's cache, mirroring the engine's
+        // cached_child_frame/hot_body reuse for loop bodies.
+        let child_fid = self.alloc_frame_id();
 
         // NOTE: no event_waiters registration on the normal path — the
         // delivery applies directly via pending_completions. Registration
@@ -431,87 +628,21 @@ impl<S: LockStrategy> Engine<S> {
         // SubgraphComplete waiter); a launch-time registration left an EMPTY
         // bucket after every normal delivery, which the deadlock detector
         // then misread as a live waiter (dogfood_json ~50% false-deadlocks).
-        rt.stats.launches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        rt.stats.add(&rt.stats.launch_ns, __t0.elapsed());
         let seq = rt.launch_seq();
         let graph = self.graph.clone();
         let rt2 = rt.clone();
         let call_node = pending.call_node_local;
-        // Frame carries chain raw pointers (nulled above) and a table of
-        // Arc'd values (Value: Send) — safe to move; pointers are never
-        // dereferenced on the worker (executor contract).
-        // The closure moves a Box<Frame> (raw chain pointers inside, NULLed
-        // at launch) across threads; pointer widths are plain data. Route it
-        // through an asserted-Send bundle so the closure type checks.
-        struct SendBox<T>(T);
-        unsafe impl<T> Send for SendBox<T> {}
-        fn offload_worker(
-            graph: &DataFlowGraph,
-            mut child: Box<Frame>,
-            caller_fid: FrameId,
-            call_node: NodeId,
-            rt: &OffloadRt,
-            seq: u64,
-            arg_ref_ptrs: Option<HashSet<usize>>,
-            original_args: Option<Vec<Value>>,
-        ) {
-            let __tw = std::time::Instant::now();
-            let outcome = super::Schedule::run_offloaded_subgraph(graph, &mut child);
-            rt.stats.add(&rt.stats.worker_ns, __tw.elapsed());
-            // Restitution check: if the result aliases any (cloned) argument
-            // object, applying it would hand the caller a private clone where
-            // reference semantics demand the real object — fall back to a
-            // re-run with the ORIGINAL args on the engine thread.
-            let aliased = match (&outcome, &arg_ref_ptrs) {
-                (OffloadOutcome::Done(v, _), Some(ptrs)) => {
-                    let mut seen = HashSet::new();
-                    refs_intersect(v, ptrs, &mut seen)
-                }
-                _ => false,
-            };
-            let done = match outcome {
-                OffloadOutcome::Done(value, signal) if !aliased => OffloadDone {
-                    caller: caller_fid,
-                    call_node,
-                    value,
-                    signal,
-                    child_frame: Some(child),
-                    fallback_child: None,
-                    fallback_args: None,
-                },
-                OffloadOutcome::Done(..) => OffloadDone {
-                    caller: caller_fid,
-                    call_node,
-                    value: Value::VOID,
-                    signal: ControlSignal::None,
-                    child_frame: None,
-                    fallback_child: Some(child),
-                    fallback_args: original_args,
-                },
-                OffloadOutcome::Fallback => OffloadDone {
-                    caller: caller_fid,
-                    call_node,
-                    value: Value::VOID,
-                    signal: ControlSignal::None,
-                    child_frame: None,
-                    fallback_child: Some(child),
-                    fallback_args: original_args,
-                },
-            };
-            if std::env::var("FROND_DEBUG_OFFLOAD").is_ok() {
-                eprintln!("[OFFLOAD] deliver seq={seq} caller={caller_fid:?}");
-            }
-            rt.deliver(seq, done);
-        }
-        let payload = SendBox(child);
+        let target_sg = pending.target_sg;
+        // Payload is plain data (Arc'd graph, Send values, ids) — no frame
+        // crosses threads on the launch path anymore.
         rayon::spawn(move || {
-            let (graph, rt2, payload) = (graph, rt2, payload);
-            let payload: Box<Frame> = payload.0;
             offload_worker(
                 &graph,
-                payload,
+                child_fid,
                 caller_fid,
                 call_node,
+                target_sg,
+                cloned,
                 &rt2,
                 seq,
                 arg_ref_ptrs,
@@ -519,15 +650,6 @@ impl<S: LockStrategy> Engine<S> {
             );
         });
 
-        if std::env::var("FROND_DEBUG_OFFLOAD").is_ok() {
-            eprintln!(
-                "[OFFLOAD] pre-launch sg={} nodes={} args={} caller={:?}",
-                sg_idx,
-                (ne.0 - ns.0),
-                pending.args.len(),
-                caller_fid
-            );
-        }
         // Caller suspension — identical fields to the queue path.
         frame.state = FrameState::Suspended;
         frame.suspend_state = SuspendState::WaitingSubgraph(child_fid);
@@ -542,17 +664,13 @@ impl<S: LockStrategy> Engine<S> {
     /// registration makes their completion wake the caller normally).
     pub(super) fn apply_offload_deliveries(&self, queue: &QueueHandle<'_>) {
         let Some(rt) = self.offload_rt.as_ref() else { return };
-        if rt.inflight() == 0 && !rt.head_ready() {
+        if !rt.has_pending() {
             return;
         }
         let mut completions: Vec<(FrameId, NodeId, Value, ControlSignal)> = Vec::new();
         let mut fallbacks: Vec<(Box<Frame>, Option<Vec<Value>>)> = Vec::new();
         let mut pooled_sink: Vec<Box<Frame>> = Vec::new();
-        let __td = std::time::Instant::now();
         let __n_applied = rt.drain_apply(&mut |done| {
-            if std::env::var("FROND_DEBUG_OFFLOAD").is_ok() {
-                eprintln!("[OFFLOAD] apply seq->caller={:?}", done.caller);
-            }
             match done.fallback_child {
                 Some(child) => fallbacks.push((child, done.fallback_args)),
                 None => {
@@ -563,16 +681,17 @@ impl<S: LockStrategy> Engine<S> {
                 }
             }
         });
-        if __n_applied > 0 {
-            rt.stats.add(&rt.stats.deliver_ns, __td.elapsed());
-        }
         for (caller, node, value, signal) in completions {
-            self.pending_completions
-                .lock()
-                .entry(caller)
-                .or_default()
-                .push((node, value, signal));
-            queue.push(caller);
+            if let Some((value, signal)) =
+                self.try_inline_offload_resume(caller, node, value, signal, queue)
+            {
+                self.pending_completions
+                    .lock()
+                    .entry(caller)
+                    .or_default()
+                    .push((node, value, signal));
+                queue.push(caller);
+            }
         }
         for child in pooled_sink {
             self.release_frame(child);
@@ -631,11 +750,82 @@ impl<S: LockStrategy> Engine<S> {
         }
     }
 
-    fn stats_add_worker(&self, d: std::time::Duration) {
-        if let Some(rt) = self.offload_rt.as_ref() {
-            rt.stats.add(&rt.stats.worker_ns, d);
+
+    /// Offload-delivery fast resume: when the caller frame is parked in the
+    /// frames map (not mid-processing), take it back, apply the completion
+    /// exactly like the dispatch-time stashed-completion path (value write +
+    /// signal propagation + notify + waiter cleanup), mark Ready, and drive
+    /// it INLINE — collapsing the apply/run/requeue dispatch cycle into this
+    /// call. Returns false (caller must stash + queue) when the frame is
+    /// absent (being processed — Bug #78 race) or not parked on this child.
+    fn try_inline_offload_resume(
+        &self,
+        caller: FrameId,
+        call_node: NodeId,
+        value: Value,
+        signal: ControlSignal,
+        queue: &QueueHandle<'_>,
+    ) -> Option<(Value, ControlSignal)> {
+        // Only frames suspended WaitingSubgraph-style park in the map; the
+        // offload launcher set exactly that. Anything else (Ready, absent,
+        // other wait kinds) falls back to the queue protocol.
+        let take = {
+            let mut frames = self.frames.lock();
+            match frames.get_mut(&caller) {
+                Some(f) if f.state == FrameState::Suspended => {
+                    frames.remove(&caller)
+                }
+                _ => None,
+            }
+        };
+        let Some(mut frame) = take else {
+            return Some((value, signal));
+        };
+        // Waiter cleanup (mirror of the dispatch path).
+        if let Some(e) = frame.suspend_event {
+            if let Some(bucket) = self.event_waiters.lock().get_mut(&e) {
+                bucket.retain(|wf| *wf != caller);
+            }
+        } else {
+            let mut ew = self.event_waiters.lock();
+            for bucket in ew.values_mut() {
+                bucket.retain(|wf| *wf != caller);
+            }
         }
+        let caller_offset = NodeId(frame.node_offset);
+        let call_graph_id = NodeId(call_node.0 + caller_offset.0);
+        let consumer_count = self.graph.downstream_count(call_graph_id.0 as usize);
+        frame.set_value(call_node, value, consumer_count);
+        if !frame.branch_relays.is_empty() {
+            relay_branch_value(&mut frame, &self.graph, call_node);
+        }
+        // Control-signal propagation (mirror of the dispatch path, including
+        // the broadened Bug #78 rule and the capture-gate exception).
+        let capture_gate = self.graph.node(call_graph_id.0 as usize).kind
+            == crate::ir::Ir::NodeKind::Gate
+            && self
+                .graph
+                .gate_branches_at(call_graph_id.0 as usize)
+                .map(|gb| gb.capture)
+                .unwrap_or(false);
+        if !capture_gate && !matches!(signal, ControlSignal::None) {
+            frame.control_signal = signal;
+        }
+        notify_downstream(
+            &mut frame,
+            &self.graph,
+            call_node,
+            call_graph_id,
+            caller_offset,
+        );
+        frame.state = FrameState::Ready;
+        frame.suspend_state = SuspendState::NotSuspended;
+        frame.suspend_event = None;
+        self.frames.lock().insert(caller, frame);
+        self.process_frame(caller, queue);
+        None
     }
+
 
     /// Engine thread: in-flight offload count (idle-policy input).
     pub(super) fn offload_inflight(&self) -> usize {

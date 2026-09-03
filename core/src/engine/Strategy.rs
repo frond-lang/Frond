@@ -219,7 +219,7 @@ impl Engine<Multi> {
             frame_pool: RefCell::new(Vec::new()),
             ready_frames: Some(RefCell::new(std::collections::VecDeque::new())),
             queued_dedup: Some(ParkingMutex::new(HashSet::new())),
-            offload_rt: Some(super::Offload::OffloadRt::from_env()),
+            offload_rt: Some(super::Offload::OffloadRt::new()),
             _strategy: std::marker::PhantomData,
         }
     }
@@ -292,22 +292,16 @@ impl Engine<Multi> {
                             self.rescue_stranded_frames_multi(&rq, dedup);
                         }
                         let next_deadline = self.timer_runtime.lock().next_deadline();
-                        let inflight = self.offload_inflight();
-                        if inflight > 0 {
-                            // Offload work in flight: park on the delivery
-                            // condvar (workers notify); the timer deadline (if
-                            // any) bounds the wait.
-                            if let Some(rt) = self.offload_rt.as_ref() {
-                                rt.park(next_deadline);
+                        if let Some(rt) = self.offload_rt.as_ref() {
+                            // Single-lock wake path: head check + inflight
+                            // check + bounded wait in one acquisition. Workers
+                            // notify only on head-applicable deliveries.
+                            let outcome = rt.park_for_head(next_deadline);
+                            match outcome {
+                                super::Offload::ParkOutcome::HeadReady => continue,
+                                super::Offload::ParkOutcome::TimedOut => continue,
+                                super::Offload::ParkOutcome::NothingInFlight => {}
                             }
-                            continue;
-                        }
-                        if self.offload_rt.as_ref().is_some_and(|rt| rt.head_ready()) {
-                            // A worker delivered BETWEEN the inflight read and
-                            // here; the sequencer head is applicable. The
-                            // loop-top apply is the only consumer — loop back
-                            // instead of evaluating the deadlock verdict.
-                            continue;
                         }
                         if next_deadline.is_none() && !self.reconcile_stale_joins_multi(&queue) {
                             // Provably permanent: every waiter's source is a

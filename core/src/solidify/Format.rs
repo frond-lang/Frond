@@ -468,6 +468,8 @@ pub fn serialize_solidify(graph: &DataFlowGraph) -> Vec<u8> {
                     let (co, cl) = string_pool.add(&ri.constructor);
                     write_u32(b, co); write_u32(b, cl);
                     write_u8(b, record_lit_kind_to_u8(ri.kind));
+                    write_u32(b, ri.field_tags.len() as u32);
+                    b.extend_from_slice(&ri.field_tags);
                 });
             }
         }
@@ -1168,7 +1170,10 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
             }
             let constructor = { let o = read_u32(&mut r); let l = read_u32(&mut r); mem.read_str(o, l) };
             let kind = u8_to_record_lit_kind(read_u8(&mut r));
-            v[idx as usize] = Some(RecordLitInfo { type_name, field_names, constructor, kind });
+            let tags_len = read_u32(&mut r) as usize;
+            let field_tags = r[..tags_len].to_vec();
+            r = &r[tags_len..];
+            v[idx as usize] = Some(RecordLitInfo { type_name, field_names, constructor, kind, field_tags });
         }
         v
     };
@@ -1267,12 +1272,15 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
 
     let mut graph = DataFlowGraph {
         const_cache: Vec::new(),
+        record_shapes: Vec::new(),
+        pattern_disc_sets: Vec::new(),
         sg_names: Vec::new(),
         sg_initial_pending: Vec::new(),
         sg_initial_seed: Vec::new(),
         downstream_counts: Vec::new(),
         linear_plans: Vec::new(),
             offload_safe: Vec::new(),
+            scalar_progs: Vec::new(),
         converter_scope: false,
         nodes,
         inputs_pool,
@@ -1318,7 +1326,6 @@ fn load_from_graph_memory(mem: &GraphMemory) -> io::Result<DataFlowGraph> {
         memo_tables,
         vtable_fallback_dispatch: parse_vtable_fallback_section(&mem),
         inheritance_links: parse_inheritance_links_section(&mem),
-        sg_debug_names: Vec::new(),
         string_pool,
         mem: None,
         sg_uv_offsets: Vec::new(),
@@ -1674,12 +1681,15 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
 
     let mut graph = DataFlowGraph {
         const_cache: Vec::new(),
+        record_shapes: Vec::new(),
+        pattern_disc_sets: Vec::new(),
         sg_names: Vec::new(),
         sg_initial_pending: Vec::new(),
         sg_initial_seed: Vec::new(),
         downstream_counts: Vec::new(),
         linear_plans: Vec::new(),
             offload_safe: Vec::new(),
+            scalar_progs: Vec::new(),
         converter_scope: false,
         nodes: Vec::new(),
         inputs_pool: InputsPool::new(),
@@ -1725,7 +1735,6 @@ pub fn load_zerocopy(mem: GraphMemory) -> io::Result<DataFlowGraph> {
         memo_tables,
         vtable_fallback_dispatch: parse_vtable_fallback_section(&mem),
         inheritance_links: parse_inheritance_links_section(&mem),
-        sg_debug_names: Vec::new(),
         string_pool,
         mem: Some(mem),
         sg_uv_offsets,

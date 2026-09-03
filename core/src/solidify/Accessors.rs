@@ -490,7 +490,9 @@ impl DataFlowGraph {
             }
             let constructor = { let o = super::Spec::read_u32(&mut r); let l = super::Spec::read_u32(&mut r); mem.read_str(o, l) };
             let kind = super::Spec::u8_to_record_lit_kind(super::Spec::read_u8(&mut r));
-            Some(RecordLitInfo { type_name, field_names, constructor, kind })
+            let tags_len = super::Spec::read_u32(&mut r) as usize;
+            let field_tags = r[..tags_len].to_vec();
+            Some(RecordLitInfo { type_name, field_names, constructor, kind, field_tags })
         } else {
             self.record_lit_infos[idx].clone()
         }

@@ -256,10 +256,6 @@ impl<'a> InferContext<'a> {
                         .collect();
                     origins.sort();
                     origins.dedup();
-                    if std::env::var("FROND_DEBUG_IMPORT").is_ok() {
-                        let po = self.sema_result.std_binding_origins.get("parse").cloned();
-                        eprintln!("[import-reexport] import={} origins={:?} parse={:?}", full_path, origins, po);
-                    }
                     // First path segment ModuleRef (`std.` qualified chains):
                     // the hierarchy anchor lives on the std layer, invisible
                     // to user code — re-register it into the importing env.
@@ -285,15 +281,6 @@ impl<'a> InferContext<'a> {
                                 if let Some(sym_ty) =
                                     self.sema_result.env.lookup_local(origin_env, &name)
                                 {
-                                    if std::env::var("FROND_TRACE_CTOR").is_ok()
-                                        && (name == "HashMap" || name == "Map" || name == "empty")
-                                    {
-                                        eprintln!(
-                                            "[import-reexport] import={} origin={} name={} -> {:?}",
-                                            full_path, origin, name,
-                                            self.arena.get(self.arena.resolve(sym_ty))
-                                        );
-                                    }
                                     self.sema_result.env.define(env, &name, sym_ty);
                                 }
                             }
@@ -658,12 +645,6 @@ impl<'a> InferContext<'a> {
                     // env binding is callable with the full signature.
                     let merged_ctor_reprs: Option<Vec<TypeRepr>> = if base_types.is_empty() {
                         None
-                    } else if std::env::var("FROND_TRACE_CTOR").is_ok() {
-                        eprintln!("[predeclare-merge] type {} bases={:?}", name, base_types.iter().map(|b| b.trait_name).collect::<Vec<_>>());
-                        self.sema_result
-                            .get_type_def(*name)
-                            .and_then(|d| d.constructors.first())
-                            .map(|c| c.field_type_reprs.to_vec())
                     } else {
                         self.sema_result
                             .get_type_def(*name)
@@ -730,10 +711,6 @@ impl<'a> InferContext<'a> {
                                 } else {
                                     self.sema_result.env.define(module_env, ctor.name, ctor_fn_ty);
                                     self.sema_result.env.define(root_env, ctor.name, ctor_fn_ty);
-                                }
-                                if std::env::var("FROND_TRACE_CTOR").is_ok() {
-                                    let back = self.sema_result.env.lookup(root_env, ctor.name);
-                                    eprintln!("[predeclare-bind] {} -> {:?}", ctor.name, back.map(|t| self.arena.get(self.arena.resolve(t))));
                                 }
                                 // Record constructor short name → module env (Zig @This semantics),
                                 // so `TypeName.free_func(args)` can fall back to lookup a

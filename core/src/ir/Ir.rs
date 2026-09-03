@@ -941,9 +941,7 @@ impl ConstValue {
                 let off = *offset as usize;
                 let end = off + *len as usize;
                 let s = std::str::from_utf8(&pool[off..end]).unwrap_or("");
-                crate::value::Value::ref_val(
-                    crate::value::HeapObj::Str(crate::value::Str::from_rust_str(s)),
-                )
+                crate::value::Value::str_val(s)
             }
             ConstValue::Null => crate::value::Value::NULL,
             ConstValue::Void => crate::value::Value::VOID,
@@ -1598,6 +1596,37 @@ pub struct TypeFieldInfo {
     pub field_names: Vec<String>,
     pub type_name: String,
     pub kind: RecordLitKind,
+    /// Per-field storage tags derived from sema's field_type_reprs
+    /// (乙② packing); empty = generic Value slots.
+    pub field_tags: Vec<u8>,
+}
+
+/// Maps a sema scalar type name to its ValueTag byte for record field
+/// packing; None → generic Value slot.
+pub fn scalar_type_name_to_tag(name: &str) -> Option<u8> {
+    use crate::value::ValueTag;
+    let t = match name {
+        "bool" => ValueTag::Bool,
+        "char" => ValueTag::Char,
+        "i8" => ValueTag::I8,
+        "i16" => ValueTag::I16,
+        "i32" => ValueTag::I32,
+        "i64" => ValueTag::I64,
+        "u8" => ValueTag::U8,
+        "u16" => ValueTag::U16,
+        "u32" => ValueTag::U32,
+        "u64" => ValueTag::U64,
+        "isize" => ValueTag::Isize,
+        "usize" => ValueTag::Usize,
+        "i128" => ValueTag::I128,
+        "u128" => ValueTag::U128,
+        "f16" => ValueTag::F16,
+        "f32" => ValueTag::F32,
+        "f64" => ValueTag::F64,
+        "f128" => ValueTag::F128,
+        _ => return None,
+    };
+    Some(t as u8)
 }
 
 /// Record construction info (for RecordLit nodes).
@@ -1607,11 +1636,16 @@ pub struct TypeFieldInfo {
 /// type_name stores the owning type name (not the constructor name); constructor stores the constructor name (for ADTs).
 #[derive(Debug, Clone)]
 pub struct RecordLitInfo {
-    pub type_name: String,
-    pub field_names: Vec<Option<String>>,
-    pub constructor: String,
-    pub kind: RecordLitKind,
-}
+        pub type_name: String,
+        pub field_names: Vec<Option<String>>,
+        pub constructor: String,
+        pub kind: RecordLitKind,
+        /// Per-field storage tags for the packed record layout (乙②):
+        /// a `ValueTag` byte for scalar fields packed at native width,
+        /// 0xFF for a generic 24B Value slot. Empty = shape unknown /
+        /// fully generic (unpacked).
+        pub field_tags: Vec<u8>,
+    }
 
 /// Closure construction node info (indexed by NodeId; None for non-closure-construction nodes).
 ///
@@ -2782,6 +2816,10 @@ pub struct DataFlowGraph {
     pub linear_plans: Vec<Option<Vec<NodeId>>>,
     /// L2 offload: per-subgraph "every node is in the pure whitelist" flag.
     pub offload_safe: Vec<bool>,
+    /// Compiled scalar-chain programs per subgraph (None = ineligible),
+    /// built once at engine construction and shared by the engine's
+    /// synchronous fast path and the offload workers.
+    pub scalar_progs: Vec<Option<std::sync::Arc<crate::pass::Scalarizer::ScalarProg>>>,
     /// Builder-time flag: subgraphs added while set are stamped
     /// `converter_generated` (strategy-converter internals).
     pub converter_scope: bool,
@@ -2793,6 +2831,17 @@ pub struct DataFlowGraph {
     pub field_access_infos: Vec<Option<u16>>,
     /// Record construction info (indexed by NodeId).
     pub record_lit_infos: Vec<Option<RecordLitInfo>>,
+    /// Per-node shared Record/Adt/Newtype shapes (parallel to `nodes`;
+    /// empty shape Arc for non-construct nodes). Derived data: materialized
+    /// once at EngineRef::new from `record_lit_infos` — never serialized,
+    /// and renumbering passes can never invalidate it (same pattern as
+    /// `const_cache`).
+    pub record_shapes: Vec<std::sync::Arc<crate::value::RecordShape>>,
+    /// Per-pattern-node acceptable constructor discriminants (M1): empty =
+    /// no fast path (fall back to the string compare). Set =
+    /// {disc(T', ctor) : T' == pattern type or inherits from it}. Derived
+    /// data populated at engine start; never serialized.
+    pub pattern_disc_sets: Vec<Box<[u32]>>,
     /// @extern("C") function name for FFI call nodes (used for compute_ffi_call dispatch).
     pub ffi_call_names: Vec<Option<String>>,
     /// stdlib @extern("C") #{ }# inline FFI call info (used by compute_dyn_ffi_call dispatch).
@@ -2876,8 +2925,7 @@ pub struct DataFlowGraph {
     /// table, remapped by `rebuild`'s sg compaction, NEVER serialized (the
     /// .fndo artifact carries no name table — loads leave this empty).
     /// Consumed by the execution-coverage instrumentation
-    /// (`FROND_EXEC_COVERAGE=1`): the "never-executed std path" detector.
-    pub sg_debug_names: Vec<Option<Box<str>>>,
+    /// (coverage detector, removed 2026-09-03): the "never-executed std path" notion.
     /// Vtable fallback dispatch: (vtable_method_idx, type_name) → SubGraphId.
     /// When a vtable call receives a concrete record (not a TraitVal), the runtime looks up
     /// the method subgraph by the value's type_name here, enabling static dispatch on the
@@ -2951,11 +2999,14 @@ impl Clone for DataFlowGraph {
             downstream_counts: self.downstream_counts.clone(),
             linear_plans: self.linear_plans.clone(),
             offload_safe: self.offload_safe.clone(),
+            scalar_progs: self.scalar_progs.clone(),
             converter_scope: false,
             call_targets: self.call_targets.clone(),
             gate_branches: self.gate_branches.clone(),
             field_access_infos: self.field_access_infos.clone(),
             record_lit_infos: self.record_lit_infos.clone(),
+            record_shapes: self.record_shapes.clone(),
+            pattern_disc_sets: self.pattern_disc_sets.clone(),
             ffi_call_names: self.ffi_call_names.clone(),
             dyn_ffi_infos: self.dyn_ffi_infos.clone(),
             field_set_names: self.field_set_names.clone(),
@@ -2989,7 +3040,6 @@ impl Clone for DataFlowGraph {
             memo_tables: self.memo_tables.clone(),
             vtable_fallback_dispatch: self.vtable_fallback_dispatch.clone(),
             inheritance_links: self.inheritance_links.clone(),
-            sg_debug_names: self.sg_debug_names.clone(),
             string_pool: self.string_pool.clone(),
             mem: None,
             sg_uv_offsets: self.sg_uv_offsets.clone(),
@@ -3018,6 +3068,14 @@ impl DataFlowGraph {
         self.offload_safe.get(sg_idx).copied().unwrap_or(false)
     }
 
+    /// The subgraph's compiled scalar-chain program (None = ineligible).
+    pub fn scalar_prog(
+        &self,
+        sg_idx: usize,
+    ) -> Option<std::sync::Arc<crate::pass::Scalarizer::ScalarProg>> {
+        self.scalar_progs.get(sg_idx).cloned().flatten()
+    }
+
     /// Creates an empty graph.
     pub fn new() -> Self {
         Self {
@@ -3027,6 +3085,7 @@ impl DataFlowGraph {
             downstream_counts: Vec::new(),
             linear_plans: Vec::new(),
             offload_safe: Vec::new(),
+            scalar_progs: Vec::new(),
             converter_scope: false,
             nodes: Vec::new(),
             inputs_pool: InputsPool::new(),
@@ -3040,6 +3099,8 @@ impl DataFlowGraph {
             gate_branches: Vec::new(),
             field_access_infos: Vec::new(),
             record_lit_infos: Vec::new(),
+            record_shapes: Vec::new(),
+            pattern_disc_sets: Vec::new(),
             ffi_call_names: Vec::new(),
             dyn_ffi_infos: Vec::new(),
             field_set_names: Vec::new(),
@@ -3074,7 +3135,6 @@ impl DataFlowGraph {
             memo_tables: Arc::new(Vec::new()),
             vtable_fallback_dispatch: rustc_hash::FxHashMap::default(),
             inheritance_links: Vec::new(),
-            sg_debug_names: Vec::new(),
             string_pool: Arc::from(Vec::new()),
             mem: None,
             sg_uv_offsets: Vec::new(),
@@ -3674,7 +3734,7 @@ impl DataFlowGraph {
         // that branch's native nodes, so the branch's recomputed range covers
         // them while the dispatching Gate (outside the branch's old range in id
         // order) stays outside — the recursion hazard the old function-level
-        // flattening guarded against cannot occur, and check_gate_in_branch
+        // flattening guarded against cannot occur
         // verifies it after every rebuild. Out-of-range owners still fall back
         // sanely below.
         for idx in 0..total {
@@ -4063,13 +4123,6 @@ impl DataFlowGraph {
                         for e in &sg.defer_table {
                             referenced.insert(e.body_subgraph);
                         }
-                        if std::env::var("FROND_DEBUG_REBUILD").is_ok() {
-                            eprintln!(
-                                "[REBUILD] sg={} removal vetoed: still referenced (fn={} kind={:?} range=[{},{})",
-                                sg.id.0, sg.function_id, sg.loop_kind,
-                                sg.node_range.0.0, sg.node_range.1.0
-                            );
-                        }
                     }
                 }
                 if !changed {
@@ -4077,13 +4130,6 @@ impl DataFlowGraph {
                 }
             }
         }
-        let dbg_rebuild = std::env::var("FROND_DEBUG_REBUILD").is_ok();
-        // Save old node_ranges for debugging.
-        let old_ranges: Vec<(u32, u32)> = if dbg_rebuild {
-            self.subgraphs.iter().map(|sg| (sg.node_range.0.0, sg.node_range.1.0)).collect()
-        } else {
-            Vec::new()
-        };
         for (sg_idx, sg) in self.subgraphs.iter_mut().enumerate() {
             let old_start = sg.node_range.0.0 as usize;
             let old_end = (sg.node_range.1.0 as usize).min(total);
@@ -4141,55 +4187,6 @@ impl DataFlowGraph {
             }
 
             // DEBUG: if this subgraph is a Gate branch and the new range contains the Gate node, print details.
-            if dbg_rebuild {
-                let (ns, ne) = match new_start {
-                    Some(ns) => (ns, new_end),
-                    None => (0u32, 0u32),
-                };
-                // Check if any Gate node's new_id falls in [ns, ne) for this subgraph's branches
-                let sg_idx = sg_id.0 as usize;
-                if sg_idx < old_ranges.len() {
-                    let (o_s, o_e) = old_ranges[sg_idx];
-                    // gate_branches was already compacted in step 3c, so gate_idx IS the new_id.
-                    // To get the old_idx, use new_to_old[gate_idx].
-                    for (gate_new_id, gb_opt) in self.gate_branches.iter().enumerate() {
-                        if let Some(gb) = gb_opt {
-                            // Check if this subgraph is a branch of this gate
-                            let is_branch = gb.branches.iter().any(|(_, bsg, _)| bsg.0 == sg_id.0);
-                            if is_branch {
-                                let gnid = gate_new_id as u32;
-                                if gnid >= ns && gnid < ne {
-                                    let gate_old_idx = if gate_new_id < new_to_old.len() { new_to_old[gate_new_id] } else { usize::MAX };
-                                    eprintln!("[REBUILD-DETAIL] sg={} old_range=[{},{}) new_range=[{},{}) gate_node old_idx={} new_id={} function_id={} loop_kind={:?} loop_parent={:?}",
-                                        sg_id.0, o_s, o_e, ns, ne, gate_old_idx, gnid,
-                                        sg.function_id, sg.loop_kind, sg.loop_parent_sg);
-                                    // Print the old_to_new mapping for nodes in [old_start, old_end)
-                                    eprint!("[REBUILD-DETAIL]   native mapping:");
-                                    for oi in old_start..old_end {
-                                        if let Some(nid) = old_to_new[oi] {
-                                            let st = if dead.contains(&NodeId(oi as u32)) { "dead" }
-                                                     else if redirect.contains_key(&NodeId(oi as u32)) { "redirect" }
-                                                     else { "live" };
-                                            eprint!(" {}→{}({})", oi, nid.0, st);
-                                        }
-                                    }
-                                    eprintln!();
-                                    // Print hoisted nodes for this sg
-                                    eprint!("[REBUILD-DETAIL]   hoisted (owner={}):", sg_id.0);
-                                    for oi in 0..total {
-                                        if node_owner_old[oi] == sg_id.0 && (oi < old_start || oi >= old_end) {
-                                            if let Some(nid) = old_to_new[oi] {
-                                                eprint!(" {}→{}", oi, nid.0);
-                                            }
-                                        }
-                                    }
-                                    eprintln!();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
 
             sg.node_range = match new_start {
                 Some(ns) => (NodeId(ns), NodeId(new_end)),
@@ -4238,20 +4235,7 @@ impl DataFlowGraph {
                         e.body_subgraph = map_sg(e.body_subgraph);
                     }
                 }
-                // Debug-only name sidecar follows the same renumbering
-                // (entries are parallel to `subgraphs`).
-                if !self.sg_debug_names.is_empty() {
-                    let mut new_names: Vec<Option<Box<str>>> =
-                        Vec::with_capacity(new_sgs.len());
-                    for (i, keep) in remove_sg.iter().enumerate() {
-                        if *keep {
-                            continue;
-                        }
-                        new_names.push(self.sg_debug_names.get(i).cloned().flatten());
-                    }
-                    self.sg_debug_names = new_names;
-                }
-                // sg_names (FROND_DUMP_IR / SF-trace sidecar, filled by
+                // sg_names (--dump-ir / SF-trace sidecar, filled by
                 // fill_sg_names from func_subgraphs at build end) must follow
                 // the same compaction — skipping it left every name attached
                 // to whichever sg landed on the old index after any
@@ -4323,13 +4307,6 @@ impl DataFlowGraph {
                 self.sg_initial_seed = Vec::new();
                 self.linear_plans = Vec::new();
 
-                if dbg_rebuild {
-                    eprintln!(
-                        "[REBUILD] compacted subgraphs: removed {} ({} remain)",
-                        removed_count,
-                        self.subgraphs.len()
-                    );
-                }
             }
         }
 
@@ -4384,50 +4361,9 @@ impl DataFlowGraph {
         self.compute_nested_ranges();
 
         // Verify: check for dangling references.
-        if std::env::var("FROND_VERIFY_GRAPH").is_ok() {
-            let total = self.nodes.len();
-            for (idx, node) in self.nodes.iter().enumerate() {
-                let inputs = self.inputs_pool.get(node.inputs_offset, node.input_count);
-                for &inp in inputs {
-                    if inp.0 as usize >= total {
-                        eprintln!("[VERIFY] node={} has dangling input {} (total={})", idx, inp.0, total);
-                    }
-                }
-            }
-            for (sg_idx, sg) in self.subgraphs.iter().enumerate() {
-                if sg.entry_node.0 as usize >= total {
-                    eprintln!("[VERIFY] sg={} has dangling entry_node {} (total={})", sg_idx, sg.entry_node.0, total);
-                }
-                if sg.return_node.0 as usize >= total {
-                    eprintln!("[VERIFY] sg={} has dangling return_node {} (total={})", sg_idx, sg.return_node.0, total);
-                }
-                let (s, e) = sg.node_range;
-                if e.0 < s.0 || e.0 as usize > total {
-                    eprintln!("[VERIFY] sg={} has invalid node_range [{},{}) (total={})", sg_idx, s.0, e.0, total);
-                }
-            }
-        }
 
         // DEBUG: check if any Gate node is inside its branch subgraph's node_range.
         // This would cause infinite recursion (Gate launches a subgraph that contains itself).
-        if std::env::var("FROND_DEBUG_REBUILD").is_ok() {
-            for (idx, gb_opt) in self.gate_branches.iter().enumerate() {
-                if let Some(gb) = gb_opt {
-                    let gate_node = NodeId(idx as u32);
-                    for (cond, branch_sg, _) in &gb.branches {
-                        let branch_sg_id = branch_sg.0 as usize;
-                        if branch_sg_id < self.subgraphs.len() {
-                            let (s, e) = self.subgraphs[branch_sg_id].node_range;
-                            if gate_node.0 >= s.0 && gate_node.0 < e.0 {
-                                eprintln!("[REBUILD-BUG] Gate node {} is INSIDE branch sg={} (cond={}) node_range [{},{}) function_id={}",
-                                    gate_node.0, branch_sg_id, cond, s.0, e.0,
-                                    self.subgraphs[branch_sg_id].function_id);
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         // Hoist flags are single-rebuild routing state: once this rebuild has
         // placed the hoisted nodes inside their owning sg's range, they are
@@ -4782,7 +4718,8 @@ pub fn is_offload_safe_compute(cf: u32) -> bool {
         185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200,
         201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216,
         217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232,
-        233, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 267, 272, 273,
+        233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248,
+        249, 250, 251, 252, 253, 254, 255, 256, 257, 267, 272, 273,
         274, 275, 276, 290, 291, 292, 293, 294, 295, 298, 300, 301, 302, 303, 304, 305,
         308, 311, 316, 324, 341, 342, 343, 344, 345, 346, 347,
     ];

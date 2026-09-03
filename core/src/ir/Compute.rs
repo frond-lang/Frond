@@ -14,29 +14,6 @@
 use super::Ir::*;
 use crate::engine::{notify_downstream, prepare_defer_frame_sync, prepare_frame_nodes, switch_subgraph};
 use crate::value::Value;
-use std::sync::OnceLock;
-
-/// Caches environment-variable boolean flags so hot paths do not call `std::env::var`
-/// (a `getenv` syscall plus a `String` allocation) on every invocation. The first call
-/// reads the env var; subsequent calls return the cached `bool`.
-#[inline]
-fn env_flag(name: &str) -> bool {
-    static FLAG_CALL: OnceLock<bool> = OnceLock::new();
-    static FLAG_GATE: OnceLock<bool> = OnceLock::new();
-    static FLAG_STALL: OnceLock<bool> = OnceLock::new();
-    static FLAG_WB: OnceLock<bool> = OnceLock::new();
-    static FLAG_SYNC: OnceLock<bool> = OnceLock::new();
-    static FLAG_MEMO: OnceLock<bool> = OnceLock::new();
-    match name {
-        "FROND_DEBUG_CALL" => *FLAG_CALL.get_or_init(|| std::env::var("FROND_DEBUG_CALL").is_ok()),
-        "FROND_DEBUG_GATE" => *FLAG_GATE.get_or_init(|| std::env::var("FROND_DEBUG_GATE").is_ok()),
-        "FROND_DEBUG_STALL" => *FLAG_STALL.get_or_init(|| std::env::var("FROND_DEBUG_STALL").is_ok()),
-        "FROND_DEBUG_WB" => *FLAG_WB.get_or_init(|| std::env::var("FROND_DEBUG_WB").is_ok()),
-        "FROND_DEBUG_SYNC" => *FLAG_SYNC.get_or_init(|| std::env::var("FROND_DEBUG_SYNC").is_ok()),
-        "FROND_DEBUG_MEMO" => *FLAG_MEMO.get_or_init(|| std::env::var("FROND_DEBUG_MEMO").is_ok()),
-        _ => std::env::var(name).is_ok(),
-    }
-}
 
 // =========================================================================
 // Sentinel constants — centralized to avoid scattered magic numbers.
@@ -95,7 +72,7 @@ fn make_error_throw(type_name: &str, msg: &str) -> Value {
 /// The returned ThrowVal(Err) flows downstream as a NodeResult::Value:
 ///   - If captured by the user with the `?` operator, compute_propagate triggers a NodeResult::Return early return
 ///   - If it directly participates in subsequent computation, the semantics match the throw expression (error value propagation)
-fn make_arith_throw(kind: &str, msg: &str) -> Value {
+pub(crate) fn make_arith_throw(kind: &str, msg: &str) -> Value {
     let full_msg = format!("{kind}: {msg}");
     make_error_throw("ArithmeticError", &full_msg)
 }
@@ -111,13 +88,15 @@ fn reflect_kind(v: &Value) -> u8 {
     match v {
         Value::Null => k::NULL,
         Value::Void => k::VOID,
+        Value::Str(_) => k::STR,
         Value::Scalar(_, _) => k::PRIMITIVE,
+        Value::Record(r) => match r.shape().kind {
+            crate::value::ShapeKind::Record => k::RECORD,
+            crate::value::ShapeKind::Adt => k::ADT,
+            crate::value::ShapeKind::Newtype => k::NEWTYPE,
+        },
         Value::Ref(r) => match &**r {
-            crate::value::HeapObj::Str(_) => k::STR,
             crate::value::HeapObj::Array(_) => k::ARRAY,
-            crate::value::HeapObj::Record(_) => k::RECORD,
-            crate::value::HeapObj::Adt(_) => k::ADT,
-            crate::value::HeapObj::Newtype(_) => k::NEWTYPE,
             crate::value::HeapObj::Cell(_) => k::CELL,
             crate::value::HeapObj::ArrayElemRef { .. }
             | crate::value::HeapObj::RecordFieldRef { .. }
@@ -148,13 +127,15 @@ fn reflect_kind_str(v: &Value) -> &'static str {
     match v {
         Value::Null => "Null",
         Value::Void => "Void",
+        Value::Str(_) => "Str",
         Value::Scalar(_, _) => "Primitive",
+        Value::Record(r) => match r.shape().kind {
+            crate::value::ShapeKind::Record => "Record",
+            crate::value::ShapeKind::Adt => "Adt",
+            crate::value::ShapeKind::Newtype => "Newtype",
+        },
         Value::Ref(r) => match &**r {
-            crate::value::HeapObj::Str(_) => "Str",
             crate::value::HeapObj::Array(_) => "Array",
-            crate::value::HeapObj::Record(_) => "Record",
-            crate::value::HeapObj::Adt(_) => "Adt",
-            crate::value::HeapObj::Newtype(_) => "Newtype",
             crate::value::HeapObj::Cell(_) => "Cell",
             crate::value::HeapObj::ArrayElemRef { .. }
             | crate::value::HeapObj::RecordFieldRef { .. }
@@ -211,13 +192,11 @@ fn reflect_type_name(v: &Value) -> String {
     match v {
         Value::Null => TYPE_NAME_NULL.to_string(),
         Value::Void => TYPE_NAME_VOID.to_string(),
+        Value::Str(_) => TYPE_NAME_STR.to_string(),
         Value::Scalar(_, tag) => tag.type_name().to_string(),
+        Value::Record(rec) => crate::sema::Sema::display_type_name(&rec.shape().type_name).to_string(),
         Value::Ref(r) => match &**r {
-            crate::value::HeapObj::Str(_) => TYPE_NAME_STR.to_string(),
             crate::value::HeapObj::Array(arr) => array_type_name(arr),
-            crate::value::HeapObj::Record(rec) => crate::sema::Sema::display_type_name(&rec.type_name),
-            crate::value::HeapObj::Adt(a) => crate::sema::Sema::display_type_name(&a.type_name),
-            crate::value::HeapObj::Newtype(n) => crate::sema::Sema::display_type_name(&n.type_name),
             crate::value::HeapObj::LazyVal(_) => "Lazy".to_string(),
             crate::value::HeapObj::ErrorVal(_) => "Error".to_string(),
             crate::value::HeapObj::ThrowVal(_) => "Throw".to_string(),
@@ -788,31 +767,72 @@ where F: FnOnce(u128, u128) -> bool
     Value::bool_val(result)
 }
 
+// Shared F128 comparison kernels (bit-pattern operands). Single source of
+// truth for both the compute_fns and the offload scalar fast path — the two
+// must never diverge (NaN and ±0 semantics are deliberate here).
+// BUGFIX (2026-09-03): le/ge used strict </> — equal operands returned false.
+
+// NaN handling lives INSIDE the kernels (comparisons false, ne true) so both
+// the compute_fns and the offload fast path share identical semantics.
+
+/// eq: bit-equal (non-NaN), or both operands zero (any sign); NaN → false.
+pub(crate) fn f128_eq_bits(ab: u128, bb: u128) -> bool {
+    if f128_is_nan(ab) || f128_is_nan(bb) {
+        return false;
+    }
+    ab == bb || (ab | bb) & F128_NONZERO_MASK == 0
+}
+/// ne: complement of eq; NaN → true.
+pub(crate) fn f128_ne_bits(ab: u128, bb: u128) -> bool {
+    if f128_is_nan(ab) || f128_is_nan(bb) {
+        return true;
+    }
+    ab != bb && (ab | bb) & F128_NONZERO_MASK != 0
+}
+/// lt: strict totalOrder; equal/both-zero/NaN → false.
+pub(crate) fn f128_lt_bits(ab: u128, bb: u128) -> bool {
+    !f128_is_nan(ab) && !f128_is_nan(bb)
+        && (ab | bb) & F128_NONZERO_MASK != 0
+        && f128_sort_key(ab) < f128_sort_key(bb)
+}
+/// gt: strict totalOrder; equal/both-zero/NaN → false.
+pub(crate) fn f128_gt_bits(ab: u128, bb: u128) -> bool {
+    !f128_is_nan(ab) && !f128_is_nan(bb)
+        && (ab | bb) & F128_NONZERO_MASK != 0
+        && f128_sort_key(ab) > f128_sort_key(bb)
+}
+/// le: both-zero true; otherwise key(ab) <= key(bb); NaN → false.
+pub(crate) fn f128_le_bits(ab: u128, bb: u128) -> bool {
+    if f128_is_nan(ab) || f128_is_nan(bb) {
+        return false;
+    }
+    (ab | bb) & F128_NONZERO_MASK == 0 || f128_sort_key(ab) <= f128_sort_key(bb)
+}
+/// ge: both-zero true; otherwise key(ab) >= key(bb); NaN → false.
+pub(crate) fn f128_ge_bits(ab: u128, bb: u128) -> bool {
+    if f128_is_nan(ab) || f128_is_nan(bb) {
+        return false;
+    }
+    (ab | bb) & F128_NONZERO_MASK == 0 || f128_sort_key(ab) >= f128_sort_key(bb)
+}
+
 pub fn compute_eq_f128(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
-    f128_cmp_with(frame, node, ctx, false, |ab, bb| ab == bb || (ab | bb) & F128_NONZERO_MASK == 0)
+    f128_cmp_with(frame, node, ctx, false, f128_eq_bits)
 }
 pub fn compute_ne_f128(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
-    f128_cmp_with(frame, node, ctx, true, |ab, bb| ab != bb && (ab | bb) & F128_NONZERO_MASK != 0)
+    f128_cmp_with(frame, node, ctx, true, f128_ne_bits)
 }
 pub fn compute_lt_f128(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
-    f128_cmp_with(frame, node, ctx, false, |ab, bb| {
-        if (ab | bb) & F128_NONZERO_MASK == 0 { false } else { f128_sort_key(ab) < f128_sort_key(bb) }
-    })
+    f128_cmp_with(frame, node, ctx, false, f128_lt_bits)
 }
 pub fn compute_gt_f128(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
-    f128_cmp_with(frame, node, ctx, false, |ab, bb| {
-        if (ab | bb) & F128_NONZERO_MASK == 0 { false } else { f128_sort_key(ab) > f128_sort_key(bb) }
-    })
+    f128_cmp_with(frame, node, ctx, false, f128_gt_bits)
 }
 pub fn compute_le_f128(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
-    f128_cmp_with(frame, node, ctx, false, |ab, bb| {
-        (ab | bb) & F128_NONZERO_MASK == 0 || f128_sort_key(ab) < f128_sort_key(bb)
-    })
+    f128_cmp_with(frame, node, ctx, false, f128_le_bits)
 }
 pub fn compute_ge_f128(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
-    f128_cmp_with(frame, node, ctx, false, |ab, bb| {
-        (ab | bb) & F128_NONZERO_MASK == 0 || f128_sort_key(ab) > f128_sort_key(bb)
-    })
+    f128_cmp_with(frame, node, ctx, false, f128_ge_bits)
 }
 
 // ---- bool logic (indices 22–24, 27) ----
@@ -960,10 +980,6 @@ pub fn compute_dyn_ffi_call(frame: &mut Frame, node: NodeId, ctx: &EvalContext) 
     let mut marshaled = match crate::ffi::Marshal::encode_args(&info.sig, &args) {
         Ok(m) => m,
         Err(e) => {
-            if env_flag("FROND_DEBUG_FFI") {
-                eprintln!("[FFI-ENCODE-ERR] symbol={} frame.sg={} err={} args={:?}",
-                    info.symbol, frame.subgraph_id.0, e, args);
-            }
             return make_error_throw("FfiError", &e);
         }
     };
@@ -977,11 +993,6 @@ pub fn compute_dyn_ffi_call(frame: &mut Frame, node: NodeId, ctx: &EvalContext) 
         ),
     };
 
-    if env_flag("FROND_DEBUG_FFI") {
-        eprintln!("[FFI] symbol={} frame.sg={} frame.offset={} arg_count={} slots={}",
-            info.symbol, frame.subgraph_id.0, frame.node_offset, info.arg_count,
-            marshaled.slots.len());
-    }
     // ABI dynamic call (marshaled must outlive this call for str NULL buffers)
     let result = match crate::ffi::Abi::CallDynamic::call_dynamic(&info.sig, fn_ptr, &marshaled.slots) {
         Ok(ret) => {
@@ -1049,10 +1060,7 @@ pub fn abi_name_to_lib_ret_kind(name: &str) -> u8 {
 
 /// Extracts a `&str` from a forced input value (None when not a str heap obj).
 fn input_str(v: &Value) -> Option<&str> {
-    match v.heap_obj() {
-        Some(crate::value::HeapObj::Str(s)) => Some(s.bytes()),
-        _ => None,
-    }
+    v.as_str()
 }
 
 /// FNV-1a 64 over the resource bytes — collision-safe filename component for
@@ -1308,7 +1316,7 @@ pub fn compute_reflect_format(frame: &mut Frame, node: NodeId, ctx: &EvalContext
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let s = crate::value::format_value(&v, 0);
-    Value::ref_val(crate::value::HeapObj::Str(crate::value::Str::from_rust_str(&s)))
+    Value::str_val(&s)
 }
 
 /// compute_fn (idx 289): scalar value → str.
@@ -1321,7 +1329,7 @@ pub fn compute_reflect_scalar_to_str(frame: &mut Frame, node: NodeId, ctx: &Eval
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let s = crate::value::format_value(&v, 0);
-    Value::ref_val(crate::value::HeapObj::Str(crate::value::Str::from_rust_str(&s)))
+    Value::str_val(&s)
 }
 
 // =========================================================================
@@ -1346,7 +1354,7 @@ pub fn compute_reflect_type_name(frame: &mut Frame, node: NodeId, ctx: &EvalCont
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let name = reflect_type_name(&v);
-    Value::ref_val(crate::value::HeapObj::Str(crate::value::Str::from_rust_str(&name)))
+    Value::str_val(&name)
 }
 
 /// compute_fn (328): `v.kind()` → str ("Record"/"Adt"/"Primitive"/...).
@@ -1355,7 +1363,7 @@ pub fn compute_reflect_kind_str(frame: &mut Frame, node: NodeId, ctx: &EvalConte
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let s = reflect_kind_str(&v);
-    Value::ref_val(crate::value::HeapObj::Str(crate::value::Str::from_rust_str(s)))
+    Value::str_val(s)
 }
 
 /// compute_fn (329): `v.size()` → u8 (scalar byte width; 0 for heap objects).
@@ -1391,12 +1399,13 @@ pub fn compute_reflect_field_count(frame: &mut Frame, node: NodeId, ctx: &EvalCo
     read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
-    let count: u16 = match v.heap_obj() {
-        Some(crate::value::HeapObj::Record(rec)) => rec.fields.len().min(u16::MAX as usize) as u16,
-        Some(crate::value::HeapObj::Adt(a)) => a.fields.len().min(u16::MAX as usize) as u16,
-        Some(crate::value::HeapObj::Newtype(_)) => 1,
-        Some(crate::value::HeapObj::Array(a)) => a.len().min(u16::MAX as usize) as u16,
-        _ => 0,
+    let count: u16 = if let Some(rec) = v.as_record() {
+        rec.field_count().min(u16::MAX as usize) as u16
+    } else {
+        match v.heap_obj() {
+            Some(crate::value::HeapObj::Array(a)) => a.len().min(u16::MAX as usize) as u16,
+            _ => 0,
+        }
     };
     Value::u16(count)
 }
@@ -1407,21 +1416,16 @@ pub fn compute_reflect_field_name(frame: &mut Frame, node: NodeId, ctx: &EvalCon
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let i = force_input(frame, inputs[1]).as_u16();
-    let name = match v.heap_obj() {
-        Some(crate::value::HeapObj::Record(rec)) => {
-            rec.field_names.get(i as usize)
-                .and_then(|n| n.as_ref())
-                .cloned()
-                .unwrap_or_default()
-        }
-        Some(crate::value::HeapObj::Adt(a)) => {
-            a.fields.get(i as usize)
-                .and_then(|f| f.name.as_ref().cloned())
-                .unwrap_or_default()
-        }
-        _ => String::new(),
+    let name = match v.as_record() {
+        Some(rec) => rec
+            .shape()
+            .field_names
+            .get(i as usize)
+            .and_then(|n| n.as_ref().map(|s| s.to_string()))
+            .unwrap_or_default(),
+        None => String::new(),
     };
-    Value::ref_val(crate::value::HeapObj::Str(crate::value::Str::from_rust_str(&name)))
+    Value::str_val(&name)
 }
 
 /// compute_fn (334): `v.field_value(i)` → Value (child value for recursive reflection).
@@ -1430,13 +1434,14 @@ pub fn compute_reflect_field_value(frame: &mut Frame, node: NodeId, ctx: &EvalCo
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
     let i = force_input(frame, inputs[1]).as_u16();
+    if let Some(rec) = v.as_record() {
+        return if (i as usize) < rec.field_count() {
+            rec.field(i as usize)
+        } else {
+            Value::NULL
+        };
+    }
     match v.heap_obj() {
-        Some(crate::value::HeapObj::Record(rec)) => {
-            rec.fields.get(i as usize).cloned().unwrap_or(Value::NULL)
-        }
-        Some(crate::value::HeapObj::Adt(a)) => {
-            a.fields.get(i as usize).map(|f| f.value.clone()).unwrap_or(Value::NULL)
-        }
         Some(crate::value::HeapObj::Array(a)) => {
             a.elements.get(i as usize).cloned().unwrap_or(Value::NULL)
         }
@@ -1461,25 +1466,26 @@ pub fn compute_reflect_adt_ctor(frame: &mut Frame, node: NodeId, ctx: &EvalConte
     read_node_inputs!(frame, node, ctx, graph, _n, inputs);
     let v = force_input(frame, inputs[0]);
     let v = force_lazy_value_sync(frame, &v);
-    let ctor = match v.heap_obj() {
-        Some(crate::value::HeapObj::Adt(a)) => a.constructor.clone(),
-        _ => String::new(),
+    let ctor = match v.as_record() {
+        Some(r) => r.shape().constructor.to_string(),
+        None => String::new(),
     };
-    Value::ref_val(crate::value::HeapObj::Str(crate::value::Str::from_rust_str(&ctor)))
+    Value::str_val(&ctor)
 }
 
 /// compute_fn: type construction (collects field values from inputs and builds
 /// a Record/Adt/Newtype HeapObj based on `kind`).
 pub fn compute_record_construct(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
-    use crate::ir::Ir::{RecordLitInfo, RecordLitKind};
-    use crate::value::{AdtField, AdtValue, HeapObj, NewtypeValue, RecordValue, ValueArena};
+    use crate::value::RecordRef;
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
-    let fields: Vec<Value> = inputs
+    // Iterator writes fields straight into the block tail (no intermediate
+    // Vec<Value> heap round-trip on the construct hot path).
+    let fields_iter = inputs
         .iter()
-        .map(|&input_node| frame.get_value_by_global(input_node))
-        .collect();
+        .map(|&input_node| frame.get_value_by_global(input_node));
+    let arity = inputs.len();
     let info = graph.record_lit_info_at(node.0 as usize);
-    let info: &RecordLitInfo = info
+    let info = info
         .as_ref()
         .expect("record construct node has no RecordLitInfo");
     // E8 nullary cache: a 0-input construct's value is metadata-determined —
@@ -1489,41 +1495,18 @@ pub fn compute_record_construct(frame: &mut Frame, node: NodeId, ctx: &EvalConte
             return v.clone();
         }
     }
-    let built = match info.kind {
-        RecordLitKind::Record => {
-            Value::ref_val(HeapObj::Record(RecordValue {
-                type_name: info.type_name.clone(),
-                fields,
-                field_names: info.field_names.clone(),
-                field_ref_bits: 0,
-            }))
-        }
-        RecordLitKind::Adt => {
-            let adt_fields: Vec<AdtField> = fields
-                .into_iter()
-                .enumerate()
-                .map(|(i, v)| AdtField {
-                    name: info.field_names.get(i).and_then(|n| n.clone()),
-                    value: v,
-                })
-                .collect();
-            Value::ref_val(HeapObj::Adt(AdtValue {
-                type_name: info.type_name.clone(),
-                constructor: info.constructor.clone(),
-                fields: adt_fields,
-                field_ref_bits: 0,
-            }))
-        }
-        RecordLitKind::Newtype => {
-            // Newtype: single field, stored INLINE (no GLOBAL_ARENA handle —
-            // see NewtypeValue.inner).
-            let inner = fields.into_iter().next().unwrap_or(Value::VOID);
-            Value::ref_val(HeapObj::Newtype(NewtypeValue {
-                type_name: info.type_name.clone(),
-                inner,
-            }))
-        }
-    };
+    // Per-node shared shape (materialized at engine start): the instance
+    // clones one Arc instead of allocating type_name + field_names (+ one
+    // String per named field) on every construction.
+    let shape = graph
+        .record_shapes
+        .get(node.0 as usize)
+        .expect("record construct node has no materialized shape")
+        .clone();
+    // All three kinds share the single-block representation; shape.kind
+    // (materialized from RecordLitKind) preserves the observable kind.
+    let _ = arity;
+    let built = Value::Record(RecordRef::new_from_iter(shape, fields_iter));
     if inputs.is_empty() {
         frame.construct_cache.push((node.0, built.clone()));
     }
@@ -1540,15 +1523,16 @@ pub fn compute_record_field_get(frame: &mut Frame, node: NodeId, ctx: &EvalConte
     let record_val = force_input(frame, inputs[0]);
     let name = graph.field_set_name(node.0 as usize);
     let make_err = |msg: &str| make_error_throw("FieldError", msg);
-    let Some(h) = record_val.heap_obj() else {
-        return make_err("field access on non-record value");
-    };
     let Some(name) = name else {
         return make_err("field_get node has no field name");
     };
-    h.field_get(name).unwrap_or_else(|| {
-        make_err(&format!("no such field '{}' on record", name))
-    })
+    if let Some(v) = record_val.record_field_get(name) {
+        return v;
+    }
+    match record_val.heap_obj().and_then(|h| h.field_get(name)) {
+        Some(v) => v,
+        None => make_err(&format!("no such field '{}' on record", name)),
+    }
 }
 
 /// compute_fn: array construction (collects elements from inputs and builds an ArrayValue).
@@ -1608,15 +1592,15 @@ pub fn compute_array_index(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
         panic!("index {} out of bounds (negative index)", idx_raw);
     }
     let idx = idx_raw as usize;
+    if let Some(s) = recv_val.as_str() {
+        return s.chars().nth(idx).map(|c| Value::char_val(c)).unwrap_or_else(|| {
+            panic!("index {} out of bounds (len {})", idx, s.chars().count())
+        });
+    }
     match recv_val.heap_obj() {
         Some(crate::value::HeapObj::Array(arr)) => {
             arr.get(idx).unwrap_or_else(|| {
                 panic!("index {} out of bounds (len {})", idx, arr.len())
-            })
-        }
-        Some(crate::value::HeapObj::Str(s)) => {
-            s.char_at(idx).map(|c| Value::char_val(c)).unwrap_or_else(|| {
-                panic!("index {} out of bounds (len {})", idx, s.codepoint_count())
             })
         }
         _ => panic!("index on non-indexable type"),
@@ -1632,7 +1616,7 @@ pub fn compute_array_index(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
 /// Out-of-bounds indices are clamped to `[0, len]`, matching Rust slice
 /// semantics (no panic).
 pub fn compute_slice(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
-    use crate::value::{ArrayValue, HeapObj, Str};
+    use crate::value::{ArrayValue, HeapObj};
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let recv_val = force_input(frame, inputs[0]);
     let start = force_input(frame, inputs[1]).as_usize();
@@ -1642,6 +1626,21 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Valu
         end = end.saturating_add(1);
     }
     let make_err = |msg: &str| make_error_throw("SliceError", msg);
+    if let Some(s) = recv_val.as_str() {
+        // Slice by codepoint index: collect chars in [start, end) and reassemble into a str.
+        let chars: Vec<char> = s.chars().collect();
+        let len = chars.len();
+        let st = start.min(len);
+        let en = end.min(len);
+        if st > en {
+            return make_err(&format!("slice start {} > end {}", st, en));
+        }
+        let mut buf = String::with_capacity(en - st);
+        for c in &chars[st..en] {
+            buf.push(*c);
+        }
+        return Value::str_from_string(buf);
+    }
     match recv_val.heap_obj() {
         Some(crate::value::HeapObj::Array(arr)) => {
             let len = arr.len();
@@ -1663,21 +1662,6 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Valu
                 scalar_soa: None,
             }))
         }
-        Some(crate::value::HeapObj::Str(s)) => {
-            // Slice by codepoint index: collect chars in [start, end) and reassemble into a str.
-            let chars: Vec<char> = s.bytes().chars().collect();
-            let len = chars.len();
-            let st = start.min(len);
-            let en = end.min(len);
-            if st > en {
-                return make_err(&format!("slice start {} > end {}", st, en));
-            }
-            let mut buf = String::with_capacity(en - st);
-            for c in &chars[st..en] {
-                buf.push(*c);
-            }
-            Value::ref_val(HeapObj::Str(Str::new(buf)))
-        }
         _ => make_err("slice on non-sliceable type"),
     }
 }
@@ -1686,14 +1670,16 @@ pub fn compute_slice(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Valu
 ///
 /// Two inputs: lhs, rhs. Returns an error value if either side is not a str.
 pub fn compute_str_concat(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
-    use crate::value::HeapObj;
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let lhs = force_input(frame, inputs[0]);
     let rhs = force_input(frame, inputs[1]);
     let make_err = |msg: &str| make_error_throw("TypeError", msg);
-    match (lhs.heap_obj(), rhs.heap_obj()) {
-        (Some(HeapObj::Str(a)), Some(HeapObj::Str(b))) => {
-            Value::ref_val(HeapObj::Str(a.concat(b)))
+    match (lhs.as_str(), rhs.as_str()) {
+        (Some(a), Some(b)) => {
+            let mut buf = String::with_capacity(a.len() + b.len());
+            buf.push_str(a);
+            buf.push_str(b);
+            Value::str_from_string(buf)
         }
         _ => make_err("str concat on non-str operand"),
     }
@@ -1705,12 +1691,11 @@ pub fn compute_str_concat(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
 /// Used for the compile-time lowering of string interpolation `"a{b}c{d}e"`, replacing the chained `compute_str_concat` which is O(n^2).
 /// Inputs have already been converted to str via `compute_reflect_format` in the Builder; here they are concatenated directly.
 pub fn compute_str_multi_concat(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
-    use crate::value::{HeapObj, Str};
     let graph = ctx.graph;
     let n = graph.node(node.0 as usize);
     let inputs = graph.inputs(n.inputs_offset, n.input_count);
     if inputs.is_empty() {
-        return Value::ref_val(HeapObj::Str(Str::from_rust_str("")));
+        return Value::str_val("");
     }
     // First force-evaluate all inputs and collect Values (to avoid temporary Values being dropped during the loop, which would invalidate references)
     let mut vals: Vec<Value> = Vec::with_capacity(inputs.len());
@@ -1720,19 +1705,19 @@ pub fn compute_str_multi_concat(frame: &mut Frame, node: NodeId, ctx: &EvalConte
     // First pass: compute total length
     let mut total_len: usize = 0;
     for v in &vals {
-        match v.heap_obj() {
-            Some(HeapObj::Str(s)) => total_len += s.byte_len(),
-            _ => return make_error_throw("TypeError", "str_multi_concat on non-str operand"),
+        match v.as_str() {
+            Some(s) => total_len += s.len(),
+            None => return make_error_throw("TypeError", "str_multi_concat on non-str operand"),
         }
     }
     // Second pass: one-shot allocation + copy
     let mut buf = String::with_capacity(total_len);
     for v in &vals {
-        if let Some(HeapObj::Str(s)) = v.heap_obj() {
-            buf.push_str(s.bytes());
+        if let Some(s) = v.as_str() {
+            buf.push_str(s);
         }
     }
-    Value::ref_val(HeapObj::Str(Str::from_rust_str(&buf)))
+    Value::str_from_string(buf)
 }
 
 /// compute_fn (idx 317): string array join — `str[] + sep → str`.
@@ -1740,46 +1725,46 @@ pub fn compute_str_multi_concat(frame: &mut Frame, node: NodeId, ctx: &EvalConte
 /// One-shot O(n) concat, replacing the stdlib loop `result = result + seg` (O(n^2)).
 /// inputs[0] = str[] array, inputs[1] = sep separator.
 pub fn compute_str_array_join(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
-    use crate::value::{HeapObj, Str};
+    use crate::value::HeapObj;
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let arr_val = force_input(frame, inputs[0]);
     let sep_val = force_input(frame, inputs[1]);
-    let sep = match sep_val.heap_obj() {
-        Some(HeapObj::Str(s)) => s,
-        _ => return make_error_throw("TypeError", "str_array_join: separator is not str"),
+    let sep = match sep_val.as_str() {
+        Some(s) => s,
+        None => return make_error_throw("TypeError", "str_array_join: separator is not str"),
     };
     let elements = match arr_val.heap_obj() {
         Some(HeapObj::Array(a)) => &a.elements,
         _ => return make_error_throw("TypeError", "str_array_join: first operand is not array"),
     };
     if elements.is_empty() {
-        return Value::ref_val(HeapObj::Str(Str::from_rust_str("")));
+        return Value::str_val("");
     }
     // First pass: compute total length
-    let sep_bytes = sep.byte_len();
+    let sep_bytes = sep.len();
     let mut total_len: usize = 0;
     let mut strs: Vec<&str> = Vec::with_capacity(elements.len());
     for (i, e) in elements.iter().enumerate() {
-        match e.heap_obj() {
-            Some(HeapObj::Str(s)) => {
-                total_len += s.byte_len();
+        match e.as_str() {
+            Some(s) => {
+                total_len += s.len();
                 if i > 0 {
                     total_len += sep_bytes;
                 }
-                strs.push(s.bytes());
+                strs.push(s);
             }
-            _ => return make_error_throw("TypeError", "str_array_join: array element is not str"),
+            None => return make_error_throw("TypeError", "str_array_join: array element is not str"),
         }
     }
     // Second pass: one-shot allocation + copy
     let mut buf = String::with_capacity(total_len);
     for (i, s) in strs.iter().enumerate() {
         if i > 0 {
-            buf.push_str(sep.bytes());
+            buf.push_str(sep);
         }
         buf.push_str(s);
     }
-    Value::ref_val(HeapObj::Str(Str::from_rust_str(&buf)))
+    Value::str_from_string(buf)
 }
 
 /// compute_fn (idx 340): `s.is_empty()` / `arr.is_empty()`.
@@ -1791,8 +1776,10 @@ pub fn compute_is_empty(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> V
     use crate::value::HeapObj;
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let v = force_input(frame, inputs[0]);
+    if let Some(s) = v.as_str() {
+        return Value::bool_val(s.is_empty());
+    }
     match v.heap_obj() {
-        Some(HeapObj::Str(s)) => Value::bool_val(s.byte_len() == 0),
         Some(HeapObj::Array(a)) => Value::bool_val(a.is_empty()),
         _ => make_error_throw("TypeError", "is_empty on non-str/non-array operand"),
     }
@@ -1836,7 +1823,6 @@ pub fn compute_global_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) 
 /// - hit: `hit=true`, `value=cached value`
 /// - miss: `hit=false`, `value=Void`
 pub fn compute_memo_check(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
-    use crate::value::{HeapObj, RecordValue};
     use std::hash::{Hash, Hasher};
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let info = graph.memo_info(node.0 as usize)
@@ -1847,9 +1833,6 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
     let param_vals: Vec<Value> = inputs[..param_count].iter()
         .map(|&inp| frame.get_value_by_global(inp))
         .collect();
-    if env_flag("FROND_DEBUG_MEMO") {
-        eprintln!("[MEMO_CHECK] table={} params={:?}", info.table_index, param_vals);
-    }
     for val in &param_vals {
         val.hash(&mut hasher);
     }
@@ -1860,27 +1843,38 @@ pub fn compute_memo_check(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
         let guard = table[info.table_index as usize].lock().unwrap();
         guard.get(&key).cloned()
     };
-    if env_flag("FROND_DEBUG_MEMO") {
-        eprintln!("[MEMO_CHECK] key={} hit={}", key, hit_val.is_some());
-    }
+    static MEMO_SHAPE: std::sync::OnceLock<std::sync::Arc<crate::value::RecordShape>> =
+        std::sync::OnceLock::new();
+    let shape = MEMO_SHAPE.get_or_init(|| {
+        {
+            let (fp, po, vr) = crate::value::RecordShape::compute_layout(&[0xFF, 0xFF]);
+            std::sync::Arc::new(crate::value::RecordShape {
+                type_name: "".into(),
+                constructor: "".into(),
+                field_names: vec![Some("hit".into()), Some("value".into())],
+                kind: crate::value::ShapeKind::Record,
+                field_packs: fp,
+                pack_offsets: po,
+                value_region_bytes: vr,
+                disc: 0,
+            })
+        }
+    })
+    .clone();
     match hit_val {
         Some(cached) => {
             // Hit: return record(hit=true, value=cached).
-            Value::ref_val(HeapObj::Record(RecordValue {
-                type_name: String::new(),
-                fields: vec![Value::bool_val(true), cached],
-                field_names: vec![Some("hit".into()), Some("value".into())],
-                field_ref_bits: 0,
-            }))
+            Value::Record(crate::value::RecordRef::new(
+                shape,
+                vec![Value::bool_val(true), cached],
+            ))
         }
         None => {
             // Miss: return record(hit=false, value=void).
-            Value::ref_val(HeapObj::Record(RecordValue {
-                type_name: String::new(),
-                fields: vec![Value::bool_val(false), Value::VOID],
-                field_names: vec![Some("hit".into()), Some("value".into())],
-                field_ref_bits: 0,
-            }))
+            Value::Record(crate::value::RecordRef::new(
+                shape,
+                vec![Value::bool_val(false), Value::VOID],
+            ))
         }
     }
 }
@@ -1906,10 +1900,6 @@ pub fn compute_memo_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
         val.hash(&mut hasher);
     }
     let key = hasher.finish();
-    if env_flag("FROND_DEBUG_MEMO") {
-        eprintln!("[MEMO_STORE] table={} key={} params={:?} result={:?}",
-            info.table_index, key, param_vals, result_val);
-    }
     // Write to the cache table.
     let table = &frame.graph.memo_tables;
     {
@@ -1927,7 +1917,6 @@ pub fn compute_memo_store(frame: &mut Frame, node: NodeId, ctx: &EvalContext) ->
 /// replaces same-named fields or appends new ones per `update_names`, building a
 /// new RecordValue (preserving the base's `type_name`).
 pub fn compute_record_extend(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
-    use crate::value::{HeapObj, RecordValue};
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let info = graph.record_extend_info_at(node.0 as usize);
     let info = info
@@ -1936,11 +1925,23 @@ pub fn compute_record_extend(frame: &mut Frame, node: NodeId, ctx: &EvalContext)
 
     // Take the base RecordValue.
     let base_val = force_input(frame, inputs[0]);
-    let base_record: RecordValue = match base_val.heap_obj() {
-        Some(HeapObj::Record(r)) => r.clone(),
+    let base_shape: std::sync::Arc<crate::value::RecordShape> = match base_val.as_record() {
+        Some(r) => r.shape().clone(),
         _ => {
             // base not a record: degrade to an empty record; all update fields are appended as new fields.
-            RecordValue::new(String::new(), Vec::new(), Vec::new())
+            {
+                let (fp, po, vr) = crate::value::RecordShape::compute_layout(&[]);
+                std::sync::Arc::new(crate::value::RecordShape {
+                    type_name: "".into(),
+                    constructor: "".into(),
+                    field_names: Vec::new(),
+                    kind: crate::value::ShapeKind::Record,
+                    field_packs: fp,
+                    pack_offsets: po,
+                    value_region_bytes: vr,
+                    disc: 0,
+                })
+            }
         }
     };
 
@@ -1950,32 +1951,81 @@ pub fn compute_record_extend(frame: &mut Frame, node: NodeId, ctx: &EvalContext)
         .map(|&in_node| frame.get_value_by_global(in_node))
         .collect();
 
-    // Clone the base fields and field names, then replace/append per `update_names`.
-    let mut fields: Vec<Value> = base_record.fields.clone();
-    let mut field_names: Vec<Option<String>> = base_record.field_names.clone();
+    // Result shape = base names with updates applied (replace keeps names;
+    // append extends them). The (base shape, node) pair is stable in steady
+    // state, so derived shapes are cached by pointer key — zero allocation
+    // after the first iteration.
+    static EXTEND_SHAPES: std::sync::OnceLock<
+        std::sync::Mutex<rustc_hash::FxHashMap<(usize, u32), std::sync::Arc<crate::value::RecordShape>>>,
+    > = std::sync::OnceLock::new();
+    let cache_key = (
+        std::sync::Arc::as_ptr(&base_shape) as usize,
+        node.0 as u32,
+    );
+    let shape = {
+        let mut guard = EXTEND_SHAPES
+            .get_or_init(|| std::sync::Mutex::new(rustc_hash::FxHashMap::default()))
+            .lock()
+            .unwrap();
+        if let Some(s) = guard.get(&cache_key) {
+            s.clone()
+        } else {
+            let mut names: Vec<Option<Box<str>>> =
+                base_shape.field_names.iter().map(|n| n.clone()).collect();
+            for update_name in info.update_names.iter() {
+                if !names.iter().any(|n| n.as_deref() == Some(update_name.as_str())) {
+                    names.push(Some(update_name.as_str().into()));
+                }
+            }
+            // Derive packs: base packs for base fields; appended fields
+            // (beyond the base pack arity) become generic Value slots.
+            let base_pack_len = base_shape.field_packs.len();
+            let mut tags: Vec<u8> = base_shape.field_packs.clone();
+            tags.extend(std::iter::repeat(0xFF).take(names.len().saturating_sub(base_pack_len)));
+            let (fp, po, vr) = crate::value::RecordShape::compute_layout(&tags);
+            let s = std::sync::Arc::new(crate::value::RecordShape {
+                type_name: base_shape.type_name.clone(),
+                constructor: base_shape.constructor.clone(),
+                field_names: names,
+                kind: base_shape.kind,
+                field_packs: fp,
+                pack_offsets: po,
+                value_region_bytes: vr,
+                disc: base_shape.disc,
+            });
+            guard.insert(cache_key, s.clone());
+            s
+        }
+    };
+
+    // Clone the base fields, then replace/append per `update_names`.
+    let base_fields: Vec<Value> = match base_val.as_record() {
+        Some(r) => (0..r.field_count()).map(|i| r.field(i)).collect(),
+        None => Vec::new(),
+    };
+    let mut fields: Vec<Value> = base_fields;
     for (i, update_name) in info.update_names.iter().enumerate() {
         let update_val = update_values[i].clone();
         // Find the position of a same-named field.
-        let pos = field_names.iter().position(|n| n.as_deref() == Some(update_name));
+        let pos = shape
+            .field_names
+            .iter()
+            .position(|n| n.as_deref() == Some(update_name.as_str()));
         match pos {
             Some(idx) => {
-                // Replace the existing field value.
-                fields[idx] = update_val;
+                if idx < fields.len() {
+                    // Replace the existing field value.
+                    fields[idx] = update_val;
+                } else {
+                    // Appended name beyond the base arity.
+                    fields.push(update_val);
+                }
             }
-            None => {
-                // Append a new field.
-                fields.push(update_val);
-                field_names.push(Some(update_name.clone()));
-            }
+            None => unreachable!("extend shape pre-appended every update name"),
         }
     }
 
-    Value::ref_val(HeapObj::Record(RecordValue {
-        type_name: base_record.type_name.clone(),
-        fields,
-        field_names,
-        field_ref_bits: 0,
-    }))
+    Value::Record(crate::value::RecordRef::new(shape, fields))
 }
 
 /// compute_fn (idx 271): atomic construction.
@@ -2074,30 +2124,37 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId, ctx: &EvalCon
             node, node.0 - frame.node_offset, ctor_name, tn);
     }
     let type_name = graph.pattern_type_name(node.0 as usize);
-    let matched = match val.heap_obj() {
-        // ADT: check both constructor name and owning type name (when available) to
-        // disambiguate same-named constructors across different types.
-        Some(crate::value::HeapObj::Adt(a)) => {
-            a.constructor == ctor_name
-                && type_name.map_or(true, |tn| {
-                    a.type_name == tn || type_inherits(graph, &a.type_name, tn)
-                })
+    let matched = match val.as_record() {
+        // ADT: constructor name + owning type name (disambiguates
+        // same-named constructors across types). M1 fast path: the engine
+        // precomputed the acceptable discriminant set (the disc equivalent
+        // of ctor+type+inheritance) — one u32 scan instead of string
+        // compares and an inheritance walk per arm.
+        Some(r) if r.shape().kind == crate::value::ShapeKind::Adt => {
+            let shape = r.shape();
+            let set: &[u32] = &graph.pattern_disc_sets[node.0 as usize];
+            if !set.is_empty() {
+                set.contains(&shape.disc)
+            } else {
+                shape.constructor.as_ref() == ctor_name
+                    && type_name.map_or(true, |tn| {
+                        shape.type_name.as_ref() == tn
+                            || type_inherits(graph, shape.type_name.as_ref(), tn)
+                    })
+            }
         }
         // Record/Newtype patterns key on the TYPE name (ctor name == type
-        // name for these kinds). Canonical identity: prefer the pattern's
-        // type-name metadata (module-qualified); the ctor-name slot is the
-        // legacy bare fallback.
-        Some(crate::value::HeapObj::Record(r)) => match type_name {
-            Some(tn) => r.type_name == tn,
-            None => r.type_name == ctor_name,
-        },
-        // Newtype: constructor name == type name; match `NewtypeValue.type_name`.
-        Some(crate::value::HeapObj::Newtype(n)) => match type_name {
-            Some(tn) => n.type_name == tn,
-            None => n.type_name == ctor_name,
-        },
-        Some(crate::value::HeapObj::ThrowVal(tv)) => match &tv.payload {
-            crate::value::ThrowPayload::Ok(_) => ctor_name == CTOR_OK,
+        // name for these kinds).
+        Some(r) => {
+            let tn = r.shape().type_name.as_ref();
+            match type_name {
+                Some(want) => tn == want,
+                None => tn == ctor_name,
+            }
+        }
+        None => match val.heap_obj() {
+            Some(crate::value::HeapObj::ThrowVal(tv)) => match &tv.payload {
+                crate::value::ThrowPayload::Ok(_) => ctor_name == CTOR_OK,
             crate::value::ThrowPayload::Err(payload) => {
                 if ctor_name == CTOR_ERR || ctor_name == CTOR_ERR_ALT {
                     true
@@ -2107,25 +2164,30 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId, ctx: &EvalCon
                     // (consistent with `Error(v)` arms, whose sub-patterns bind the
                     // payload). Without this, any error arm not spelled Error/Err
                     // could never match at runtime and fell into the fallback panic.
-                    match payload.heap_obj() {
-                        Some(crate::value::HeapObj::Adt(a)) => {
-                            a.constructor == ctor_name
-                                && type_name.map_or(true, |tn| a.type_name == tn)
+                    match payload.as_record() {
+                        // User error-type constructor payload (e.g. a
+                        // `MyErr(e)` arm on Throw<T, MyErr>): match the
+                        // payload record's constructor/type via its shape.
+                        Some(r) => {
+                            let shape = r.shape();
+                            if shape.kind == crate::value::ShapeKind::Adt {
+                                shape.constructor.as_ref() == ctor_name
+                                    && type_name.map_or(true, |tn| shape.type_name.as_ref() == tn)
+                            } else {
+                                let tn = shape.type_name.as_ref();
+                                match type_name {
+                                    Some(tn) => tn == tn,
+                                    None => tn == ctor_name,
+                                }
+                            }
                         }
-                        Some(crate::value::HeapObj::Newtype(n)) => match type_name {
-                            Some(tn) => n.type_name == tn,
-                            None => n.type_name == ctor_name,
-                        },
-                        Some(crate::value::HeapObj::Record(r)) => match type_name {
-                            Some(tn) => r.type_name == tn,
-                            None => r.type_name == ctor_name,
-                        },
-                        _ => false,
+                        None => false,
                     }
                 }
             }
         },
-        _ => false,
+            _ => false,
+        },
     };
     Value::bool_val(matched)
 }
@@ -2142,21 +2204,12 @@ pub fn compute_pattern_adt_field_get(frame: &mut Frame, node: NodeId, ctx: &Eval
     let idx = graph.pattern_field_index(node.0 as usize)
         .expect("pattern adt field get node has no field index")
         as usize;
+    if let Some(r) = val.as_record() {
+        // Records/Adts/Newtypes share the single-block tail; Newtype's
+        // single field is fields()[0].
+        return if idx < r.field_count() { r.field(idx) } else { Value::VOID };
+    }
     match val.heap_obj() {
-        Some(crate::value::HeapObj::Adt(a)) => {
-            a.fields.get(idx).map(|f| f.value.clone()).unwrap_or(Value::VOID)
-        }
-        Some(crate::value::HeapObj::Record(r)) => {
-            r.fields.get(idx).cloned().unwrap_or(Value::VOID)
-        }
-        // Newtype: single field (stored inline).
-        Some(crate::value::HeapObj::Newtype(n)) => {
-            if idx == 0 {
-                n.inner.clone()
-            } else {
-                Value::VOID
-            }
-        }
         Some(crate::value::HeapObj::ThrowVal(tv)) => {
             if idx == 0 {
                 match &tv.payload {
@@ -2182,15 +2235,10 @@ pub fn compute_pattern_str_eq(frame: &mut Frame, node: NodeId, ctx: &EvalContext
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let lhs = force_input(frame, inputs[0]);
     let rhs = force_input(frame, inputs[1]);
-    let lhs_str = match lhs.heap_obj() {
-        Some(crate::value::HeapObj::Str(s)) => s.bytes().to_string(),
-        _ => return Value::bool_val(false),
-    };
-    let rhs_str = match rhs.heap_obj() {
-        Some(crate::value::HeapObj::Str(s)) => s.bytes().to_string(),
-        _ => return Value::bool_val(false),
-    };
-    Value::bool_val(lhs_str == rhs_str)
+    match (lhs.as_str(), rhs.as_str()) {
+        (Some(a), Some(b)) => Value::bool_val(a == b),
+        _ => Value::bool_val(false),
+    }
 }
 
 /// compute_fn: str comparisons (292–297).
@@ -2204,10 +2252,8 @@ fn str_compare_operands(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> O
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let lhs = force_input(frame, inputs[0]);
     let rhs = force_input(frame, inputs[1]);
-    match (lhs.heap_obj(), rhs.heap_obj()) {
-        (Some(crate::value::HeapObj::Str(a)), Some(crate::value::HeapObj::Str(b))) => {
-            Some(a.compare(b))
-        }
+    match (lhs.as_str(), rhs.as_str()) {
+        (Some(a), Some(b)) => Some(a.cmp(b)),
         _ => None,
     }
 }
@@ -2249,11 +2295,17 @@ pub fn compute_ge_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Val
 ///   - Void → "void"
 ///   - other Ref → "<non-scalar>"
 pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
-    use crate::value::{HeapObj, Str, ValueTag};
+    use crate::value::{HeapObj, ValueTag};
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let val = force_input(frame, inputs[0]);
+    // Str input: identity — share the Arc instead of formatting a copy.
+    if val.is_str() {
+        return val.clone();
+    }
 
     let s: String = match &val {
+        Value::Str(_) => unreachable!("str identity handled above"),
+        Value::Record(r) => crate::value::format_record_value(r),
         Value::Null => TYPE_NAME_NULL.to_string(),
         Value::Void => TYPE_NAME_VOID.to_string(),
         Value::Scalar(_, tag) => {
@@ -2272,7 +2324,6 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
             }
         }
         Value::Ref(r) => match r.as_ref() {
-            HeapObj::Str(frond_str) => frond_str.bytes().to_string(),
             HeapObj::Array(arr) => {
                 // u8[] → str: lossless when the bytes are valid UTF-8; str is
                 // UTF-8 by construction (Arc<str>), so invalid bytes are a
@@ -2303,7 +2354,7 @@ pub fn compute_cast_to_str(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
             _ => "<non-scalar>".to_string(),
         },
     };
-    Value::ref_val(HeapObj::Str(Str::new(s)))
+    Value::str_from_string(s)
 }
 
 /// Convert one scalar `Value` to the target tag (shared by the scalar and
@@ -2493,6 +2544,10 @@ pub fn compute_ref_of(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Val
             let cell = crate::value::Cell::new(v.clone());
             Value::ref_val(crate::value::HeapObj::Cell(cell))
         }
+        // Str: share the Arc (reference semantics, same as heap refs).
+        Value::Str(_) => v.clone(),
+        // Record: share the single-block reference.
+        Value::Record(_) => v.clone(),
         // Already a heap reference: share the Arc directly (reference semantics, no deep copy).
         Value::Ref(_) => v,
     }
@@ -2577,21 +2632,15 @@ fn place_read_array_elem(arr: &Value, idx: &Value) -> Value {
 
 /// Place-ref live field read (Record by name position, Adt by field name).
 fn place_read_record_field(rec: &Value, field: &str) -> Value {
-    match rec.heap_obj() {
-        Some(crate::value::HeapObj::Record(r)) => r
+    match rec.as_record() {
+        Some(r) => r
+            .shape()
             .field_names
             .iter()
             .position(|n| n.as_deref() == Some(field))
-            .and_then(|i| r.fields.get(i))
-            .cloned()
+            .map(|i| r.field(i))
             .unwrap_or_else(|| panic!("place ref: record has no field '{}'", field)),
-        Some(crate::value::HeapObj::Adt(a)) => a
-            .fields
-            .iter()
-            .find(|f| f.name.as_deref() == Some(field))
-            .map(|f| f.value.clone())
-            .unwrap_or_else(|| panic!("place ref: variant has no field '{}'", field)),
-        _ => panic!("place ref: field access on non-record value"),
+        None => panic!("place ref: field access on non-record value"),
     }
 }
 
@@ -2638,8 +2687,8 @@ pub fn compute_deref_write(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
                 None => panic!("place ref: index on non-array value"),
             }
         }
-        Some(crate::value::HeapObj::RecordFieldRef { rec, field }) => match rec.heap_ref() {
-            Some(arc) => record_field_set_inplace(&arc, field, &new_val),
+        Some(crate::value::HeapObj::RecordFieldRef { rec, field }) => match rec.as_record() {
+            Some(r) => record_field_set_inplace(r, field, &new_val),
             None => panic!("place ref: field access on non-record value"),
         },
         Some(crate::value::HeapObj::GlobalSlotRef { slot }) => {
@@ -2682,8 +2731,8 @@ pub fn compute_record_field_set(frame: &mut Frame, node: NodeId, ctx: &EvalConte
     // access to the same HeapObj. The Arc's refcount is unchanged (no clone or
     // drop), only the heap data is mutated.
     if let Some(val) = frame.value_table.get_value_mut(record_node_local.0 as usize) {
-        if let Value::Ref(arc) = val {
-            record_field_set_inplace(arc, field_name, &new_value);
+        if let Value::Record(r) = val {
+            record_field_set_inplace(r, field_name, &new_value);
         }
     }
     Value::VOID
@@ -2694,26 +2743,21 @@ pub fn compute_record_field_set(frame: &mut Frame, node: NodeId, ctx: &EvalConte
 /// bypassing COW so every owner of the Arc observes the write — see
 /// compute_record_field_set for the safety argument (single-threaded engine).
 pub(crate) fn record_field_set_inplace(
-    rec_arc: &std::sync::Arc<crate::value::HeapObj>,
+    rec: &crate::value::RecordRef,
     field_name: &str,
     new_value: &Value,
 ) {
-    let ptr = std::sync::Arc::as_ptr(rec_arc) as *mut crate::value::HeapObj;
-    unsafe {
-        match &mut *ptr {
-            crate::value::HeapObj::Record(r) => {
-                if let Some(idx) = r.field_names.iter().position(|n| n.as_deref() == Some(field_name)) {
-                    if idx < r.fields.len() {
-                        r.fields[idx] = new_value.clone();
-                    }
-                }
-            }
-            crate::value::HeapObj::Adt(a) => {
-                if let Some(idx) = a.fields.iter().position(|f| f.name.as_deref() == Some(field_name)) {
-                    a.fields[idx].value = new_value.clone();
-                }
-            }
-            _ => {}
+    // Single-writer in-place tail write (same aliasing argument as the old
+    // Arc::as_ptr mutation: the engine executes one frame at a time and the
+    // owning frame is suspended while callees run).
+    if let Some(idx) = rec
+        .shape()
+        .field_names
+        .iter()
+        .position(|n| n.as_deref() == Some(field_name))
+    {
+        if idx < rec.field_count() {
+            unsafe { rec.set_field(idx, new_value.clone()) };
         }
     }
 }
@@ -2808,9 +2852,11 @@ pub fn compute_is_null(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Va
 pub fn compute_array_len(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> Value {
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let val = force_input(frame, inputs[0]);
+    if let Some(s) = val.as_str() {
+        return Value::i32(s.chars().count() as i32);
+    }
     let len = match val.heap_obj() {
         Some(crate::value::HeapObj::Array(arr)) => arr.len() as i32,
-        Some(crate::value::HeapObj::Str(s)) => s.codepoint_count() as i32,
         _ => 0,
     };
     Value::i32(len)
@@ -2961,10 +3007,6 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
 
     // Static binding: has call_target → collect args + return NodeResult::Call.
     if let Some(target_sg) = graph.call_target(node.0 as usize) {
-        if env_flag("FROND_DEBUG_CALL") {
-            eprintln!("[CALL] node={:?} target_sg={} frame.sg={} frame.offset={}",
-                node, target_sg.0, frame.subgraph_id.0, frame.node_offset);
-        }
         let is_async = graph.subgraphs[target_sg.0 as usize].has_suspend;
         let param_count = graph.subgraphs[target_sg.0 as usize].param_count as usize;
         let n = graph.node(node.0 as usize);
@@ -2990,30 +3032,13 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
         let inputs = graph.inputs(n.inputs_offset, n.input_count);
         let recv_val = force_input(frame, inputs[0]);
 
-        let (target_sg, upvalues): (SubGraphId, Vec<Value>) = match recv_val.heap_obj() {
-            Some(crate::value::HeapObj::TraitVal(tv)) => {
-                let idx = method_idx as usize;
-                match tv.method_values.get(idx).and_then(|v| v.heap_obj()) {
-                    Some(crate::value::HeapObj::Closure(c)) => {
-                        (SubGraphId(c.func_id), c.upvalues.clone())
-                    }
-                    _ => panic!("vtable method_idx {} is not a Closure", method_idx),
-                }
-            }
-            Some(other) => {
-                // Concrete record/ADT passed as a trait-typed parameter: use the
-                // vtable_fallback_dispatch table to statically resolve the method subgraph
-                // by the value's type_name. This avoids requiring the caller to box the
-                // value into a TraitVal.
-                let type_name = match other {
-                    crate::value::HeapObj::Adt(a) => a.type_name.as_str(),
-                    crate::value::HeapObj::Record(r) => r.type_name.as_str(),
-                    crate::value::HeapObj::Newtype(n) => n.type_name.as_str(),
-                    _ => {
-                        return NodeResult::Value(crate::value::Value::NULL);
-                    }
-                };
-                let found = graph.vtable_fallback_dispatch.iter()
+        let (target_sg, upvalues): (SubGraphId, Vec<Value>) =
+        if let Some(rec) = recv_val.as_record() {
+            // Concrete record/ADT passed as a trait-typed parameter: use the
+            // vtable_fallback_dispatch table to statically resolve the method subgraph
+            // by the value's type_name (from the shared shape).
+            let type_name: &str = rec.shape().type_name.as_ref();
+            let found = graph.vtable_fallback_dispatch.iter()
                     .find(|((mi, tn), _)| *mi == method_idx && tn.as_ref() == type_name)
                     .map(|(_, sg)| *sg);
                 match found {
@@ -3036,13 +3061,24 @@ pub fn compute_call_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
                             closure_val: None,
                         });
                     }
-                    None => {
-                        return NodeResult::Value(crate::value::Value::NULL);
-                    }
+                None => {
+                    return NodeResult::Value(crate::value::Value::NULL);
                 }
             }
-            None => {
-                return NodeResult::Value(crate::value::Value::NULL);
+        } else {
+            match recv_val.heap_obj() {
+                Some(crate::value::HeapObj::TraitVal(tv)) => {
+                    let idx = method_idx as usize;
+                    match tv.method_values.get(idx).and_then(|v| v.heap_obj()) {
+                        Some(crate::value::HeapObj::Closure(c)) => {
+                            (SubGraphId(c.func_id), c.upvalues.clone())
+                        }
+                        _ => panic!("vtable method_idx {} is not a Closure", method_idx),
+                    }
+                }
+                _ => {
+                    return NodeResult::Value(crate::value::Value::NULL);
+                }
             }
         };
 
@@ -3086,13 +3122,6 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
     let cond_raw = frame.get_value_by_global(branches.condition_input);
     let cond = cond_raw.as_bool();
 
-    if env_flag("FROND_DEBUG_GATE") {
-        let sg = &graph.subgraphs[frame.subgraph_id.0 as usize];
-        eprintln!("[GATE] node={:?} cond_raw={:?} cond={} frame.sg={} frame.offset={} sg.range=[{},{}) branches={:?}",
-            node, cond_raw, cond, frame.subgraph_id.0, frame.node_offset,
-            sg.node_range.0 .0, sg.node_range.1 .0,
-            branches.branches.iter().map(|(c, sg, _)| (*c, sg.0)).collect::<Vec<_>>());
-    }
 
     // Select a branch (borrowed — no branch-inputs clone per Gate execution).
     let (target_sg, branch_inputs) = branches
@@ -3110,19 +3139,6 @@ pub fn compute_gate_launch(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -
         .map(|&n| frame.get_value_by_global(n))
         .collect();
 
-    if env_flag("FROND_DEBUG_STALL")
-        && crate::engine::EngineCore::sf_trace_match(graph, frame.subgraph_id.0)
-    {
-        let (ns, ne) = graph.subgraphs[target_sg.0 as usize].node_range;
-        eprintln!("[GATE] node={} cond={} target_sg={} sg_range=[{},{}) params={} branch_inputs={:?} args={}",
-            node.0, cond, target_sg.0, ns.0, ne.0, param_count, branch_inputs, args.len());
-        for gid in ns.0..ne.0 {
-            let n = graph.node(gid as usize);
-            let cv = graph.const_value(gid as usize);
-            eprintln!("  [GATE-NODE] gid={} kind={:?} cf={} const_values={:?} inputs_count={}",
-                gid, n.kind, n.compute_fn.0, cv.is_some(), n.input_count);
-        }
-    }
 
     let gate_node_local = NodeId(node.0.wrapping_sub(frame.node_offset));
 
@@ -3574,28 +3590,7 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
                 if (return_local as usize) < frame.value_table.len()
                     && !frame.value_table.is_ready(return_local as usize)
                 {
-                    if env_flag("FROND_DEBUG_SYNC") {
-                        let ns = sg.node_range.0.0;
-                        let ne = sg.node_range.1.0;
-                        let nc = (ne - ns) as usize;
-                        eprintln!("[SYNC-NULL] sg={} return_node={} (local={}) offset={} range=[{},{}) not ready",
-                            sg.id.0, sg.return_node.0, return_local, frame.node_offset, ns, ne);
-                        // Print pending_inputs status for all nodes in range
-                        for i in 0..nc {
-                            let pi = frame.pending_inputs[i];
-                            let ready = frame.value_table.is_ready(i);
-                            let gid = NodeId(i as u32 + frame.node_offset);
-                            let kind = graph.node(gid.0 as usize).kind;
-                            eprintln!("[SYNC-NULL]   local={} global={} kind={:?} pending={} ready={}",
-                                i, gid.0, kind, pi, ready);
-                        }
-                    }
                     return Value::NULL;
-                }
-                if env_flag("FROND_DEBUG_SYNC") {
-                    let rv = frame.get_value_by_global(sg.return_node);
-                    eprintln!("[SYNC-RET] sg={} return_node={} (local={}) offset={} val={:?}",
-                        sg.id.0, sg.return_node.0, return_local, frame.node_offset, rv);
                 }
                 return frame.get_value_by_global(sg.return_node);
             }
@@ -3633,10 +3628,6 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
             NodeResult::Call(pending) => {
                 // Tail call: reuse the current frame.
                 if graph.tail_call_flag(graph_node_id.0 as usize) {
-                    if env_flag("FROND_DEBUG_CALL") {
-                        eprintln!("[CALL-TAIL] node={} target_sg={} (TAIL CALL)",
-                            graph_node_id.0, pending.target_sg.0);
-                    }
                     switch_subgraph(frame, graph, pending.target_sg, &pending.args);
                     continue;
                 }
@@ -3689,12 +3680,6 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
 
                 // Inject the return value into the current frame.
                 let consumer_count = graph.downstream_count(graph_node_id.0 as usize);
-                if env_flag("FROND_DEBUG_CALL") {
-                    let csg = &graph.subgraphs[pending.target_sg.0 as usize];
-                    eprintln!("[CALL] node={} target_sg={} range=[{},{}) child_result={:?} signal={:?} consumer_count={}",
-                        graph_node_id.0, pending.target_sg.0, csg.node_range.0.0, csg.node_range.1.0,
-                        child_result, child_signal, consumer_count);
-                }
                 frame.set_value(pending.call_node_local, child_result.clone(), consumer_count);
 
                 // Bug #65: do NOT unconditionally propagate ThrowVal(Err) as a Return
@@ -3733,12 +3718,6 @@ fn run_frame_sync_inner(frame: &mut Frame, graph: &DataFlowGraph) -> Value {
 
                 // LoopBody completion handling.
                 if target_loop_kind == LoopKind::LoopBody {
-                    if env_flag("FROND_DEBUG_CALL") {
-                        eprintln!("[CALL-LB] node={} target_sg={} child_signal={:?} frame.sg={} frame.loop_kind={:?}",
-                            graph_node_id.0, pending.target_sg.0, child_signal,
-                            frame.subgraph_id.0,
-                            graph.subgraphs[frame.subgraph_id.0 as usize].loop_kind);
-                    }
                     match child_signal {
                         ControlSignal::Break | ControlSignal::Return(_) => {
                             frame.control_signal = child_signal;
@@ -3818,12 +3797,12 @@ pub fn compute_str_bytes(frame: &mut Frame, node: NodeId, ctx: &EvalContext) -> 
     use crate::value::{ArrayValue, HeapObj};
     read_node_inputs!(frame, node, ctx, graph, n, inputs);
     let val = force_input(frame, inputs[0]);
-    let bytes: Vec<Value> = match val.heap_obj() {
-        Some(HeapObj::Str(s)) => s.bytes().as_bytes()
+    let bytes: Vec<Value> = match val.as_str() {
+        Some(s) => s.as_bytes()
             .iter()
             .map(|&b| Value::u8(b))
             .collect(),
-        _ => Vec::new(),
+        None => Vec::new(),
     };
     Value::ref_val(HeapObj::Array(ArrayValue::new(bytes)))
 }
@@ -4182,9 +4161,6 @@ pub fn compute_block_defer_register(frame: &mut Frame, node: NodeId, ctx: &EvalC
         captured_nodes,
         captured_values,
     };
-    if std::env::var("FROND_DEBUG_DEFER").is_ok() {
-        eprintln!("[DEFER-REG] sg={:?} frame_sg={:?} captures={}", body_sg, frame.subgraph_id, entry.captured_nodes.len());
-    }
     frame.defer_stack.push(entry);
     NodeResult::Value(Value::VOID)
 }

@@ -52,8 +52,7 @@ pub struct InferContext<'a> {
     /// Prevents ExprIds from different modules from colliding in the global expr_types.
     pub current_module_name: String,
     /// Diagnostic trace table: records (TypeHandle, Span) for each expression's inference result, used to trace unresolved TypeVars back to their source locations.
-    /// Only populated when FROND_SEMA_TRACE is enabled, to avoid memory overhead during normal compilation.
-    pub type_trace: Vec<(TypeHandle, crate::ast::Ast::Span)>,
+    /// (Unresolved-TypeVar tracing; the recorder was removed 2026-09-03.)
     /// Constructor short name → module EnvId where the type is defined (Zig-style @This semantics).
     ///
     /// When `import std.time.Duration` and the module defines `pub type Duration`,
@@ -109,7 +108,6 @@ impl<'a> InferContext<'a> {
             current_module_logical_path: None,
             current_module_env: None,
             current_module_name: String::new(),
-            type_trace: Vec::new(),
             ctor_module_envs: FxHashMap::default(),
             in_recv_position: false,
             deferred_method_calls: Vec::new(),
@@ -144,7 +142,6 @@ impl<'a> InferContext<'a> {
             current_module_logical_path: None,
             current_module_env: None,
             current_module_name: String::new(),
-            type_trace: Vec::new(),
             ctor_module_envs: FxHashMap::default(),
             in_recv_position: false,
             instantiation_ctx: None,
@@ -405,11 +402,6 @@ impl<'a> InferContext<'a> {
                 info.implicit_this = Some(access);
             }
         }
-        // Diagnostic trace: only record (TypeHandle, Span) when FROND_SEMA_TRACE is enabled.
-        if std::env::var("FROND_SEMA_TRACE").is_ok() {
-            let span = ast.expr(expr).span;
-            self.type_trace.push((ty, span));
-        }
         ty
     }
 
@@ -500,7 +492,7 @@ impl<'a> InferContext<'a> {
         // Scoped so the borrows end before the 9.2 retry pass, which needs the
         // whole InferContext (re-inference).
         {
-        let InferContext { arena, solver, witness_table, type_trace, .. } = self;
+        let InferContext { arena, solver, witness_table, .. } = self;
         solver.solve_with_witness(arena, Some(witness_table));
 
         // 9.1 Report solver ambiguity errors (Bug #83: generic parameter type
@@ -564,7 +556,7 @@ impl<'a> InferContext<'a> {
             self.deferred_method_calls.clear();
         }
 
-        let InferContext { arena, type_trace, witness_table, .. } = self;
+        let InferContext { arena, witness_table, .. } = self;
 
         // 9.4 Default unbound non-rigid TypeVars to void (root cause F).
         //
@@ -598,50 +590,7 @@ impl<'a> InferContext<'a> {
             .map(|(i, _)| i as u32)
             .collect();
 
-        // Verbose logging (controlled by FROND_SEMA_TRACE env var): print unresolved TypeVar details
         // for easier diagnosis.
-        if !unresolved.is_empty() && std::env::var("FROND_SEMA_TRACE").is_ok() {
-            let unresolved_set: FxHashSet<u32> = unresolved.iter().copied().collect();
-            eprintln!(
-                "[sema] {} unresolved type variable(s) after constraint solving:",
-                unresolved.len()
-            );
-            for &idx in unresolved.iter().take(50) {
-                let tv = &arena.type_vars[idx as usize];
-                eprintln!("  TypeVar({}) kind={:?}", idx, tv.kind);
-            }
-            if unresolved.len() > 50 {
-                eprintln!("  ... and {} more", unresolved.len() - 50);
-            }
-            // Print a sample of type slots containing unresolved TypeVars (up to 30).
-            // Only iterate over type slots newly added by this module (entries before baseline
-            // belong to prior modules).
-            eprintln!("  sample referencing types (baseline={}):", types_baseline);
-            let mut shown = 0u32;
-            for i in types_baseline..arena.types.len() {
-                let h = TypeHandle(i as u32);
-                let s = format!("{}", arena.display(h));
-                if s.contains("'_") {
-                    eprintln!("    types[{}] = {}", i, s);
-                    shown += 1;
-                    if shown >= 30 { break; }
-                }
-            }
-            // Reverse lookup: iterate type_trace to find expression spans referencing unresolved TypeVars.
-            eprintln!("  referencing expression spans:");
-            let mut span_shown = 0u32;
-            for &(ty, span) in type_trace.iter() {
-                if type_contains_any_unresolved(ty, arena, &unresolved_set) {
-                    let s = format!("{}", arena.display(ty));
-                    eprintln!("    {}:{}  {}", span.line, span.column, s);
-                    span_shown += 1;
-                    if span_shown >= 50 { break; }
-                }
-            }
-            if span_shown == 0 {
-                eprintln!("    (no direct expression references found — TypeVar may be inside fn signature)");
-            }
-        }
 
         // 9z. ExprInfo type_name backfill: fixpoint stores snapshot the type
         // BEFORE the solver finalizes; entries whose stored type_name is None
@@ -697,7 +646,6 @@ impl<'a> InferContext<'a> {
         self.this_binding_stack = ThisBindingStack::new();
         self.solver.reset();
         self.flow_ctx.reset();
-        self.type_trace.clear();
         // witness_table is not reset (accumulates across modules, supports multi-module trait impls).
     }
 

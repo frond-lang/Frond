@@ -107,6 +107,7 @@ impl<'a> IrBuilder<'a> {
                                     field_names: Vec::new(),
                                     constructor: name.to_string(),
                                     kind: info.kind,
+                    field_tags: Vec::new(),
                                 });
                                 node
                             }

@@ -183,6 +183,7 @@ impl<'a> IrBuilder<'a> {
                         field_names,
                         constructor: ctor_name,
                         kind,
+                        field_tags: Vec::new(),
                     });
                     return node;
                 }
@@ -242,6 +243,7 @@ impl<'a> IrBuilder<'a> {
                                 field_names,
                                 constructor: ctor.name.to_string(),
                                 kind,
+                                field_tags: Vec::new(),
                             });
                             return node;
                         }
@@ -366,6 +368,14 @@ impl<'a> IrBuilder<'a> {
                 field_names,
                 constructor: type_name.to_string(),
                 kind: RecordLitKind::Record,
+                field_tags: args
+                    .iter()
+                    .map(|a| {
+                        self.expr_type_name(*a)
+                            .and_then(crate::ir::Ir::scalar_type_name_to_tag)
+                            .unwrap_or(0xFF)
+                    })
+                    .collect(),
             },
         );
         node
@@ -400,6 +410,14 @@ impl<'a> IrBuilder<'a> {
                 field_names,
                 constructor: "Record".to_string(),
                 kind: RecordLitKind::Record,
+                field_tags: fields
+                    .iter()
+                    .map(|f| {
+                        self.expr_type_name(f.value)
+                            .and_then(crate::ir::Ir::scalar_type_name_to_tag)
+                            .unwrap_or(0xFF)
+                    })
+                    .collect(),
             },
         );
         node

@@ -793,7 +793,8 @@ impl<'a> IrBuilder<'a> {
                                     field_names,
                                     type_name: canonical.clone(),
                                     kind: RecordLitKind::Record,
-                                });
+                                field_tags: Vec::new(),
+});
                             }
                             crate::ast::Ast::TypeDef::Adt { constructors } => {
                                 // Register the type name + each constructor name (mapped to the type name)
@@ -801,7 +802,8 @@ impl<'a> IrBuilder<'a> {
                                     field_names: Vec::new(),
                                     type_name: canonical.clone(),
                                     kind: RecordLitKind::Adt,
-                                });
+                                field_tags: Vec::new(),
+});
                                 for ctor in constructors {
                                     let field_names: Vec<String> = ctor.fields.iter()
                                         .map(|f| f.name.unwrap_or("_").to_string())
@@ -810,7 +812,8 @@ impl<'a> IrBuilder<'a> {
                                         field_names,
                                         type_name: canonical.clone(),
                                         kind: RecordLitKind::Adt,
-                                    });
+                                    field_tags: Vec::new(),
+});
                                 }
                             }
                             crate::ast::Ast::TypeDef::Newtype { name: nt_name, .. } => {
@@ -818,7 +821,8 @@ impl<'a> IrBuilder<'a> {
                                     field_names: Vec::new(),
                                     type_name: canonical.clone(),
                                     kind: RecordLitKind::Newtype,
-                                });
+                                field_tags: Vec::new(),
+});
                             }
                             crate::ast::Ast::TypeDef::Alias { .. } => {}
                         }

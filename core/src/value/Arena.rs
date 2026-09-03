@@ -140,7 +140,7 @@ pub struct ValueArena {
     f32_bucket: Bucket<f32>,
     f64_bucket: Bucket<f64>,
     f128_bucket: Bucket<[u64; 2]>,
-    ref_bucket: Bucket<Arc<HeapObj>>,
+    ref_bucket: Bucket<Value>,
 }
 
 macro_rules! impl_scalar_bucket_methods {
@@ -201,7 +201,10 @@ impl ValueArena {
         if handle.tag() != ValueTag::Ref {
             return None;
         }
-        Some(Self::with_global(|arena| arena.get_ref(handle).clone()))
+        Self::with_global(|arena| match arena.get_ref(handle) {
+            Value::Ref(r) => Some(r.clone()),
+            _ => None,
+        })
     }
 
     /// Validates whether a handle points to a legal slot in the arena (FFI boundary defense).
@@ -282,16 +285,23 @@ impl ValueArena {
     // ---- Heap object allocation ----
     #[inline]
     pub fn alloc_ref(&mut self, obj: HeapObj) -> ValueHandle {
-        let idx = self.ref_bucket.alloc(Arc::new(obj));
+        let idx = self.ref_bucket.alloc(Value::Ref(Arc::new(obj)));
         ValueHandle::new(ValueTag::Ref, idx as usize)
     }
     #[inline]
     pub fn alloc_ref_rc(&mut self, r: Arc<HeapObj>) -> ValueHandle {
-        let idx = self.ref_bucket.alloc(r);
+        let idx = self.ref_bucket.alloc(Value::Ref(r));
+        ValueHandle::new(ValueTag::Ref, idx as usize)
+    }
+    /// Stores any heap-kind Value (Ref or Str) in the ref bucket and returns
+    /// its handle (the ValueTag::Ref tag now covers "heap slot" generally).
+    #[inline]
+    pub fn alloc_heap_value(&mut self, v: Value) -> ValueHandle {
+        let idx = self.ref_bucket.alloc(v);
         ValueHandle::new(ValueTag::Ref, idx as usize)
     }
     #[inline]
-    pub fn get_ref(&self, h: ValueHandle) -> &Arc<HeapObj> {
+    pub fn get_ref(&self, h: ValueHandle) -> &Value {
         self.ref_bucket.get(h.index() as u32)
     }
 
@@ -349,6 +359,8 @@ impl ValueArena {
                     _ => unreachable!("non-scalar tag {:?} in ScalarValue", tag),
                 }
             },
+            Value::Str(s) => self.alloc_heap_value(Value::Str(s.clone())),
+            Value::Record(r) => self.alloc_heap_value(Value::Record(r.clone())),
             Value::Ref(r) => self.alloc_ref_rc(r.clone()),
         }
     }
@@ -376,22 +388,22 @@ impl ValueArena {
             ValueTag::F32 => Value::f32(self.get_f32(h)),
             ValueTag::F64 => Value::f64(self.get_f64(h)),
             ValueTag::F128 => Value::f128(self.get_f128(h)),
-            ValueTag::Ref => Value::Ref(self.get_ref(h).clone()),
+            ValueTag::Ref => self.get_ref(h).clone(),
         }
     }
 
     // ---- Heap object convenience constructors ----
     pub fn alloc_str(&mut self, s: impl Into<String>) -> ValueHandle {
-        self.alloc_ref(HeapObj::Str(Str::new(s)))
+        self.alloc_heap_value(Value::str_from_string(s.into()))
     }
     pub fn alloc_str_from(&mut self, s: &str) -> ValueHandle {
-        self.alloc_ref(HeapObj::Str(Str::from_rust_str(s)))
+        self.alloc_heap_value(Value::str_val(s))
     }
     pub fn alloc_array(&mut self, arr: ArrayValue) -> ValueHandle {
         self.alloc_ref(HeapObj::Array(arr))
     }
-    pub fn alloc_record(&mut self, r: RecordValue) -> ValueHandle {
-        self.alloc_ref(HeapObj::Record(r))
+    pub fn alloc_record(&mut self, r: crate::value::RecordRef) -> ValueHandle {
+        self.alloc_heap_value(Value::Record(r))
     }
 
     /// In-place modification of a record field (via Arc::make_mut; zero-copy when refcount==1).
@@ -402,23 +414,38 @@ impl ValueArena {
         field_name: &str,
         new_value: Value,
     ) {
-        let rc = self.ref_bucket.get_mut(handle.index() as u32);
-        if let HeapObj::Record(ref mut r) = Arc::make_mut(rc) {
-            for (i, name) in r.field_names.iter().enumerate() {
-                if name.as_deref() == Some(field_name) {
-                    if i < r.fields.len() {
-                        r.fields[i] = new_value;
-                    }
-                    return;
-                }
+        let slot = self.ref_bucket.get_mut(handle.index() as u32);
+        let r = match slot { Value::Record(r) => r, _ => return };
+        let idx = r.shape().field_names.iter()
+            .position(|n| n.as_deref() == Some(field_name));
+        if let Some(i) = idx {
+            if i < r.field_count() {
+                let mut fields: Vec<Value> =
+                    (0..r.field_count()).map(|i| r.field(i)).collect();
+                fields[i] = new_value;
+                *slot = Value::Record(crate::value::RecordRef::new(r.shape().clone(), fields));
             }
         }
     }
-    pub fn alloc_adt(&mut self, a: AdtValue) -> ValueHandle {
-        self.alloc_ref(HeapObj::Adt(a))
-    }
     pub fn alloc_newtype(&mut self, type_name: impl Into<String>, inner: Value) -> ValueHandle {
-        self.alloc_ref(HeapObj::Newtype(NewtypeValue { type_name: type_name.into(), inner }))
+        self.alloc_heap_value(Value::Record(crate::value::RecordRef::new(
+            {
+                let (fp, po, vr) = crate::value::RecordShape::compute_layout(&[0xFF; 1]);
+                let tn: Box<str> = type_name.into().into();
+                let disc = crate::value::ctor_disc(&tn, "");
+                std::sync::Arc::new(crate::value::RecordShape {
+                    type_name: tn,
+                    constructor: "".into(),
+                    field_names: Vec::new(),
+                    kind: crate::value::ShapeKind::Newtype,
+                    field_packs: fp,
+                    pack_offsets: po,
+                    value_region_bytes: vr,
+                    disc,
+                })
+            },
+            vec![inner],
+        )))
     }
     pub fn alloc_cell(&mut self, val: Value) -> ValueHandle {
         self.alloc_ref(HeapObj::Cell(Cell::new(val)))
@@ -495,7 +522,11 @@ impl ValueArena {
     /// (arena handles are opaque to the collector's edge walk, so the
     /// arena itself conservatively keeps them alive).
     pub fn collect_ref_arcs(&self, out: &mut Vec<std::sync::Arc<HeapObj>>) {
-        out.extend(self.ref_bucket.data.iter().cloned());
+        for v in &self.ref_bucket.data {
+            if let Value::Ref(r) = v {
+                out.push(r.clone());
+            }
+        }
     }
 
 pub fn optimize_array_soa(&mut self, arr: &mut ArrayValue) {
@@ -606,9 +637,10 @@ fn arena_display(arena: &ValueArena, h: ValueHandle, f: &mut fmt::Formatter) -> 
         ValueTag::F32 => write!(f, "{}", arena.get_f32(h)),
         ValueTag::F64 => write!(f, "{}", arena.get_f64(h)),
         ValueTag::F128 => write!(f, "{}", arena.get_f128(h).to_f64()),
-        ValueTag::Ref => match arena.get_ref(h).as_ref() {
-            HeapObj::Str(s) => write!(f, "{}", s),
-            other => write!(f, "{:?}", other),
+        ValueTag::Ref => match arena.get_ref(h) {
+            Value::Str(s) => write!(f, "{}", s),
+            Value::Ref(r) => write!(f, "{:?}", r.as_ref()),
+            _ => write!(f, "?"),
         },
     }
 }
@@ -635,7 +667,7 @@ fn arena_debug(arena: &ValueArena, h: ValueHandle, f: &mut fmt::Formatter) -> fm
         ValueTag::F32 => write!(f, "{}f32", arena.get_f32(h)),
         ValueTag::F64 => write!(f, "{}", arena.get_f64(h)),
         ValueTag::F128 => write!(f, "{:?}", arena.get_f128(h)),
-        ValueTag::Ref => write!(f, "{:?}", arena.get_ref(h).as_ref()),
+        ValueTag::Ref => write!(f, "{:?}", arena.get_ref(h)),
     }
 }
 
@@ -690,11 +722,9 @@ pub trait ValueTrait: Sized + Clone + Copy + PartialEq + Eq + Hash {
     fn as_f128(&self, arena: &ValueArena) -> Option<F128>;
 
     // ---- Heap accessors ----
-    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a Str>;
+    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a str>;
     fn as_array<'a>(&self, arena: &'a ValueArena) -> Option<&'a ArrayValue>;
-    fn as_record<'a>(&self, arena: &'a ValueArena) -> Option<&'a RecordValue>;
-    fn as_adt<'a>(&self, arena: &'a ValueArena) -> Option<&'a AdtValue>;
-    fn as_newtype<'a>(&self, arena: &'a ValueArena) -> Option<&'a NewtypeValue>;
+    fn as_record<'a>(&self, arena: &'a ValueArena) -> Option<&'a crate::value::RecordRef>;
     fn as_cell<'a>(&self, arena: &'a ValueArena) -> Option<&'a Cell>;
     fn as_range<'a>(&self, arena: &'a ValueArena) -> Option<&'a Range>;
     fn as_closure<'a>(&self, arena: &'a ValueArena) -> Option<&'a Closure>;
@@ -773,7 +803,7 @@ impl ValueTrait for ValueHandle {
     // ---- Heap predicates (need arena to dereference HeapObj) ----
     #[inline]
     fn is_string(&self, arena: &ValueArena) -> bool {
-        matches!(arena.heap_obj_opt(*self), Some(HeapObj::Str(_)))
+        matches!(arena.get_ref(*self), Value::Str(_))
     }
     #[inline]
     fn is_array(&self, arena: &ValueArena) -> bool {
@@ -781,11 +811,12 @@ impl ValueTrait for ValueHandle {
     }
     #[inline]
     fn is_record(&self, arena: &ValueArena) -> bool {
-        matches!(arena.heap_obj_opt(*self), Some(HeapObj::Record(_)))
+        arena.get_ref(*self).is_record()
     }
     #[inline]
     fn is_adt(&self, arena: &ValueArena) -> bool {
-        matches!(arena.heap_obj_opt(*self), Some(HeapObj::Adt(_)))
+        matches!(arena.get_ref(*self),
+            Value::Record(r) if r.shape().kind == crate::value::ShapeKind::Adt)
     }
     #[inline]
     fn is_closure(&self, arena: &ValueArena) -> bool {
@@ -804,7 +835,11 @@ impl ValueTrait for ValueHandle {
         match self.tag() {
             ValueTag::Null => "null",
             ValueTag::Void => "void",
-            ValueTag::Ref => arena.get_ref(*self).type_name(),
+            ValueTag::Ref => match arena.get_ref(*self) {
+                Value::Str(_) => "str",
+                Value::Ref(r) => r.type_name(),
+                _ => unreachable!("non-heap slot in ref bucket"),
+            },
             t => t.name(),
         }
     }
@@ -966,11 +1001,8 @@ impl ValueTrait for ValueHandle {
 
     // ---- Heap accessors ----
     #[inline]
-    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a Str> {
-        match arena.heap_obj_opt(*self)? {
-            HeapObj::Str(s) => Some(s),
-            _ => None,
-        }
+    fn as_str<'a>(&self, arena: &'a ValueArena) -> Option<&'a str> {
+        arena.get_ref(*self).as_str()
     }
     #[inline]
     fn as_array<'a>(&self, arena: &'a ValueArena) -> Option<&'a ArrayValue> {
@@ -980,26 +1012,11 @@ impl ValueTrait for ValueHandle {
         }
     }
     #[inline]
-    fn as_record<'a>(&self, arena: &'a ValueArena) -> Option<&'a RecordValue> {
-        match arena.heap_obj_opt(*self)? {
-            HeapObj::Record(r) => Some(r),
-            _ => None,
-        }
+    fn as_record<'a>(&self, arena: &'a ValueArena) -> Option<&'a crate::value::RecordRef> {
+        arena.get_ref(*self).as_record()
     }
     #[inline]
-    fn as_adt<'a>(&self, arena: &'a ValueArena) -> Option<&'a AdtValue> {
-        match arena.heap_obj_opt(*self)? {
-            HeapObj::Adt(a) => Some(a),
-            _ => None,
-        }
-    }
     #[inline]
-    fn as_newtype<'a>(&self, arena: &'a ValueArena) -> Option<&'a NewtypeValue> {
-        match arena.heap_obj_opt(*self)? {
-            HeapObj::Newtype(n) => Some(n),
-            _ => None,
-        }
-    }
     #[inline]
     fn as_cell<'a>(&self, arena: &'a ValueArena) -> Option<&'a Cell> {
         match arena.heap_obj_opt(*self)? {
@@ -1100,10 +1117,9 @@ impl ValueTrait for ValueHandle {
     }
     #[inline]
     fn as_ref<'a>(&self, arena: &'a ValueArena) -> Option<&'a HeapRef> {
-        if self.tag() == ValueTag::Ref {
-            Some(arena.get_ref(*self))
-        } else {
-            None
+        match arena.get_ref(*self) {
+            Value::Ref(r) => Some(r),
+            _ => None,
         }
     }
     #[inline]
@@ -1186,9 +1202,12 @@ impl ValueTrait for ValueHandle {
             }
             ValueTag::F128 => arena.get_f128(*self).ieee_eq(&arena.get_f128(*other)),
             ValueTag::Ref => {
-                let a = arena.get_ref(*self);
-                let b = arena.get_ref(*other);
-                Arc::ptr_eq(a, b) || heap_equals(a, b, arena)
+                let (a, b) = (arena.get_ref(*self), arena.get_ref(*other));
+                match (a, b) {
+                    (Value::Str(x), Value::Str(y)) => x == y,
+                    (Value::Ref(x), Value::Ref(y)) => Arc::ptr_eq(x, y) || heap_equals(x, y, arena),
+                    _ => false,
+                }
             }
         }
     }
@@ -1553,7 +1572,6 @@ fn simd_soa_deep_clone(soa: &ScalarSoA) -> Vec<Value> {
 
 pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
     match (a, b) {
-        (HeapObj::Str(x), HeapObj::Str(y)) => x.equals(y),
         (HeapObj::Array(x), HeapObj::Array(y)) => {
             if x.fixed_size != y.fixed_size || x.elements.len() != y.elements.len() {
                 return false;
@@ -1569,25 +1587,6 @@ pub fn heap_equals(a: &HeapObj, b: &HeapObj, arena: &ValueArena) -> bool {
                 .iter()
                 .zip(&y.elements)
                 .all(|(p, q)| value_equals_with_arena(p, q, arena))
-        }
-        (HeapObj::Record(x), HeapObj::Record(y)) => {
-            x.type_name == y.type_name
-                && x.field_names == y.field_names
-                && x.fields.len() == y.fields.len()
-                && x.fields.iter().zip(&y.fields).all(|(p, q)| value_equals_with_arena(p, q, arena))
-        }
-        (HeapObj::Adt(x), HeapObj::Adt(y)) => {
-            x.type_name == y.type_name
-                && x.constructor == y.constructor
-                && x.fields.len() == y.fields.len()
-                && x
-                    .fields
-                    .iter()
-                    .zip(&y.fields)
-                    .all(|(xf, yf)| value_equals_with_arena(&xf.value, &yf.value, arena))
-        }
-        (HeapObj::Newtype(x), HeapObj::Newtype(y)) => {
-            x.type_name == y.type_name && value_equals_with_arena(&x.inner, &y.inner, arena)
         }
         (HeapObj::Cell(x), HeapObj::Cell(y)) => {
             let xb = x.get();
@@ -1758,6 +1757,14 @@ pub fn value_equals_with_arena(a: &Value, b: &Value, arena: &ValueArena) -> bool
                 _ => unreachable!("non-scalar tag in ScalarValue"),
             }
         }
+        (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::Record(x), Value::Record(y)) => {
+            std::sync::Arc::ptr_eq(x.shape(), y.shape())
+                || (*x.shape() == *y.shape()
+                    && x.field_count() == y.field_count()
+                    && (0..x.field_count())
+                        .all(|i| value_equals_with_arena(&x.field(i), &y.field(i), arena)))
+        }
         (Value::Ref(ax), Value::Ref(bx)) => heap_equals(ax.as_ref(), bx.as_ref(), arena),
         _ => false,
     }
@@ -1801,8 +1808,8 @@ fn scalar_cross_tag_eq(av: &crate::value::ScalarValue, at: ValueTag, bv: &crate:
 /// preventing infinite recursion from reference cycles (e.g. Cell). The two paths' caches are
 /// independent because HeapObj fields are partially migrated (some are Values, some remain ValueHandles).
 struct DeepCloneCache {
-    handle: FxHashMap<*const HeapObj, ValueHandle>,
-    value: FxHashMap<*const HeapObj, Value>,
+    handle: FxHashMap<usize, ValueHandle>,
+    value: FxHashMap<usize, Value>,
 }
 
 /// Isolation deep clone (L2 offload copy-in): a structurally disjoint copy
@@ -1818,9 +1825,21 @@ pub fn deep_clone_isolated(v: &Value) -> Value {
 /// Value-path deep clone: scalars/nulls clone directly (cheap); Ref recursively clones the HeapObj.
 fn deep_clone_value(v: &Value, arena: &mut ValueArena, cache: &mut DeepCloneCache) -> Value {
     match v {
-        Value::Null | Value::Void | Value::Scalar(_, _) => v.clone(),
+        Value::Null | Value::Void | Value::Scalar(_, _) | Value::Str(_) => v.clone(),
+        Value::Record(r) => {
+            let key = crate::value::record_tagged_ptr(r);
+            if let Some(cached) = cache.value.get(&key) {
+                return cached.clone();
+            }
+            let fields: Vec<Value> = (0..r.field_count())
+                .map(|i| deep_clone_value(&r.field(i), arena, cache))
+                .collect();
+            let new_v = Value::Record(crate::value::RecordRef::new(r.shape().clone(), fields));
+            cache.value.insert(key, new_v.clone());
+            new_v
+        }
         Value::Ref(rc) => {
-            let key = Arc::as_ptr(rc);
+            let key = Arc::as_ptr(rc) as usize;
             if let Some(cached) = cache.value.get(&key) {
                 return cached.clone();
             }
@@ -1858,17 +1877,20 @@ fn deep_clone_handle(
         ValueTag::F32 => arena.alloc_f32(arena.get_f32(h)),
         ValueTag::F64 => arena.alloc_f64(arena.get_f64(h)),
         ValueTag::F128 => arena.alloc_f128(arena.get_f128(h)),
-        ValueTag::Ref => {
-            let rc = arena.get_ref(h).clone();
-            let key = Arc::as_ptr(&rc);
-            if let Some(&cached) = cache.handle.get(&key) {
-                return cached;
+        ValueTag::Ref => match arena.get_ref(h).clone() {
+            Value::Str(s) => arena.alloc_heap_value(Value::Str(s)),
+            Value::Ref(rc) => {
+                let key = Arc::as_ptr(&rc) as usize;
+                if let Some(&cached) = cache.handle.get(&key) {
+                    return cached;
+                }
+                let new_obj = deep_clone_heap(&rc, arena, cache);
+                let new_h = arena.alloc_ref_rc(Arc::new(new_obj));
+                cache.handle.insert(key, new_h);
+                new_h
             }
-            let new_obj = deep_clone_heap(&rc, arena, cache);
-            let new_h = arena.alloc_ref_rc(Arc::new(new_obj));
-            cache.handle.insert(key, new_h);
-            new_h
-        }
+            _ => unreachable!("non-heap slot in ref bucket"),
+        },
     }
 }
 
@@ -1878,7 +1900,6 @@ fn deep_clone_heap(
     cache: &mut DeepCloneCache,
 ) -> HeapObj {
     match obj {
-        HeapObj::Str(s) => HeapObj::Str(s.clone()),
         HeapObj::Array(a) => {
             // SoA fast path: scalars are Copy; clone SoA directly and rebuild elements via Value
             if let Some(soa) = &a.scalar_soa {
@@ -1903,41 +1924,6 @@ fn deep_clone_heap(
                 scalar_soa: a.scalar_soa.clone(),
             })
         }
-        HeapObj::Record(r) => {
-            // fields have been migrated to Value
-            let fields: Vec<Value> = r
-                .fields
-                .iter()
-                .map(|e| deep_clone_value(e, arena, cache))
-                .collect();
-            HeapObj::Record(RecordValue {
-                type_name: r.type_name.clone(),
-                fields,
-                field_names: r.field_names.clone(),
-                field_ref_bits: r.field_ref_bits,
-            })
-        }
-        HeapObj::Adt(a) => {
-            // AdtField.value has been migrated to Value
-            let fields: Vec<AdtField> = a
-                .fields
-                .iter()
-                .map(|f| AdtField {
-                    name: f.name.clone(),
-                    value: deep_clone_value(&f.value, arena, cache),
-                })
-                .collect();
-            HeapObj::Adt(AdtValue {
-                type_name: a.type_name.clone(),
-                constructor: a.constructor.clone(),
-                fields,
-                field_ref_bits: a.field_ref_bits,
-            })
-        }
-        HeapObj::Newtype(n) => HeapObj::Newtype(NewtypeValue {
-            type_name: n.type_name.clone(),
-            inner: deep_clone_value(&n.inner, arena, cache),
-        }),
         HeapObj::Cell(c) => {
             let inner = c.get();
             HeapObj::Cell(Cell::new(deep_clone_value(&inner, arena, cache)))
@@ -2044,7 +2030,10 @@ impl ValueArena {
     #[inline]
     pub fn heap_obj_opt(&self, h: ValueHandle) -> Option<&HeapObj> {
         if h.tag() == ValueTag::Ref {
-            Some(self.get_ref(h).as_ref())
+            match self.get_ref(h) {
+                Value::Ref(r) => Some(r.as_ref()),
+                _ => None,
+            }
         } else {
             None
         }
@@ -2133,13 +2122,10 @@ impl ValueArena {
 
     // ---- Heap object convenience constructors ----
     pub fn str(&mut self, s: impl Into<String>) -> ValueHandle {
-        self.alloc_ref(HeapObj::Str(Str::new(s)))
+        self.alloc_heap_value(Value::str_from_string(s.into()))
     }
     pub fn str_from(&mut self, s: &str) -> ValueHandle {
-        self.alloc_ref(HeapObj::Str(Str::from_rust_str(s)))
-    }
-    pub fn from_str(&mut self, s: Str) -> ValueHandle {
-        self.alloc_ref(HeapObj::Str(s))
+        self.alloc_heap_value(Value::str_val(s))
     }
     pub fn heap(&mut self, obj: HeapObj) -> ValueHandle {
         self.alloc_ref(obj)
@@ -2159,29 +2145,75 @@ impl ValueArena {
         fields: Vec<Value>,
         field_names: Vec<Option<String>>,
     ) -> ValueHandle {
-        self.alloc_ref(HeapObj::Record(RecordValue::new(
-            type_name.into(),
+        self.alloc_heap_value(Value::Record(crate::value::RecordRef::new(
+            {
+                let n = field_names.len();
+                let (fp, po, vr) =
+                    crate::value::RecordShape::compute_layout(&vec![0xFF; n]);
+                let tn_owned: String = type_name.into();
+                let disc = crate::value::ctor_disc(&tn_owned, &tn_owned);
+                std::sync::Arc::new(crate::value::RecordShape {
+                    type_name: tn_owned.into(),
+                    constructor: "".into(),
+                    field_names: field_names
+                        .into_iter()
+                        .map(|n| n.map(|s| s.into_boxed_str()))
+                        .collect(),
+                    kind: crate::value::ShapeKind::Record,
+                    field_packs: fp,
+                    pack_offsets: po,
+                    value_region_bytes: vr,
+                    disc,
+                })
+            },
             fields,
-            field_names,
         )))
     }
     pub fn adt(
         &mut self,
         type_name: impl Into<String>,
         constructor: impl Into<String>,
-        fields: Vec<AdtField>,
+        fields: Vec<Value>,
     ) -> ValueHandle {
-        self.alloc_ref(HeapObj::Adt(AdtValue::new(
-            type_name.into(),
-            constructor.into(),
+        self.alloc_heap_value(Value::Record(crate::value::RecordRef::new(
+            {
+                let (fp, po, vr) = crate::value::RecordShape::compute_layout(&[]);
+                let tn_owned: String = type_name.into();
+                let ct_owned: String = constructor.into();
+                let disc = crate::value::ctor_disc(&tn_owned, &ct_owned);
+                std::sync::Arc::new(crate::value::RecordShape {
+                    type_name: tn_owned.into(),
+                    constructor: ct_owned.into(),
+                    field_names: Vec::new(),
+                    kind: crate::value::ShapeKind::Adt,
+                    field_packs: fp,
+                    pack_offsets: po,
+                    value_region_bytes: vr,
+                    disc,
+                })
+            },
             fields,
         )))
     }
     pub fn newtype(&mut self, type_name: impl Into<String>, inner: Value) -> ValueHandle {
-        self.alloc_ref(HeapObj::Newtype(NewtypeValue {
-            type_name: type_name.into(),
-            inner,
-        }))
+        self.alloc_heap_value(Value::Record(crate::value::RecordRef::new(
+            {
+                let (fp, po, vr) = crate::value::RecordShape::compute_layout(&[0xFF; 1]);
+                let tn: Box<str> = type_name.into().into();
+                let disc = crate::value::ctor_disc(&tn, "");
+                std::sync::Arc::new(crate::value::RecordShape {
+                    type_name: tn,
+                    constructor: "".into(),
+                    field_names: Vec::new(),
+                    kind: crate::value::ShapeKind::Newtype,
+                    field_packs: fp,
+                    pack_offsets: po,
+                    value_region_bytes: vr,
+                    disc,
+                })
+            },
+            vec![inner],
+        )))
     }
     pub fn cell(&mut self, val: Value) -> ValueHandle {
         self.alloc_ref(HeapObj::Cell(Cell::new(val)))
@@ -2350,7 +2382,11 @@ impl ValueArena {
 /// of the resource it refers to.
 pub fn deep_clone_data_value(v: &Value) -> Value {
     match v {
-        Value::Null | Value::Void | Value::Scalar(_, _) => v.clone(),
+        Value::Null | Value::Void | Value::Scalar(_, _) | Value::Str(_) => v.clone(),
+        Value::Record(r) => Value::Record(crate::value::RecordRef::new(
+            r.shape().clone(),
+            (0..r.field_count()).map(|i| deep_clone_data_value(&r.field(i))).collect(),
+        )),
         Value::Ref(rc) => match rc.as_ref() {
             HeapObj::Array(a) => {
                 // Single-source: an SoA array clones ONLY the contiguous
@@ -2373,27 +2409,6 @@ pub fn deep_clone_data_value(v: &Value) -> Value {
                     }))))
                 }
             }
-            HeapObj::Record(r) => Value::Ref(crate::value::Value::register_arc(std::sync::Arc::new(HeapObj::Record(RecordValue {
-                type_name: r.type_name.clone(),
-                fields: r.fields.iter().map(deep_clone_data_value).collect(),
-                field_names: r.field_names.clone(),
-                field_ref_bits: r.field_ref_bits,
-            })))),
-            // `type X = X(...)` positional constructors are Adts (kind() == "Adt"),
-            // the most common user-declared shape — they deep-clone too.
-            HeapObj::Adt(a) => Value::Ref(crate::value::Value::register_arc(std::sync::Arc::new(HeapObj::Adt(AdtValue {
-                type_name: a.type_name.clone(),
-                constructor: a.constructor.clone(),
-                fields: a
-                    .fields
-                    .iter()
-                    .map(|f| AdtField {
-                        name: f.name.clone(),
-                        value: deep_clone_data_value(&f.value),
-                    })
-                    .collect(),
-                field_ref_bits: a.field_ref_bits,
-            })))),
             _ => v.clone(),
         },
     }

@@ -1,5 +1,5 @@
 //! Engine core type definitions: the `Engine<S>` struct, the `EngineRef` factory, Send/Sync
-//! implementations, scheduler constants, and the `env_flag` helper.
+//! implementations, and scheduler constants.
 //!
 //! Business methods (`impl<S: LockStrategy> Engine<S>`) are spread across submodules:
 //! - [`crate::engine::Frame`]: frame lifecycle
@@ -14,225 +14,10 @@ use crate::value::{Value, ValueArena};
 use std::cell::RefCell;
 use parking_lot::Mutex as ParkingMutex;
 use hashbrown::{HashMap, HashSet};
-use std::sync::OnceLock;
 use std::sync::Arc;
 
-/// Caches boolean environment-variable flags to avoid calling `std::env::var` on every hot-path
-/// invocation. All known engine-side flag names are probed once (first call) and served from the
-/// map afterwards; unknown names fall back to an uncached probe (and are not memoized).
-/// TEMP DEBUG (stmt-drop hunt): FROND_SF_TRACE=<needle> restricts SF debug
-/// prints to frames whose owning function name contains the needle.
-pub(crate) fn sf_trace_match(graph: &crate::ir::Ir::DataFlowGraph, sg: u32) -> bool {
-    static NEEDLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let n = NEEDLE.get_or_init(|| std::env::var("FROND_SF_TRACE").ok());
-    match n.as_deref() {
-        None | Some("") => true,
-        // Resolve through function_id: arm/loop-body frames run NAMELESS
-        // subgraphs (only function-entry sgs carry names) — filtering on the
-        // frame's own sg name never matches them. Match the owning function
-        // instead so every frame of the traced function qualifies.
-        Some(needle) => {
-            let fn_id = graph
-                .subgraphs
-                .get(sg as usize)
-                .map(|s| s.function_id)
-                .unwrap_or(u32::MAX);
-            graph
-                .sg_names
-                .get(fn_id as usize)
-                .map(|nm| nm.contains(needle))
-                .unwrap_or(false)
-        }
-    }
-}
-
-pub(super) fn env_flag(name: &str) -> bool {
-    static FLAGS: OnceLock<hashbrown::HashMap<&'static str, bool>> = OnceLock::new();
-    const KNOWN_FLAGS: &[&str] = &[
-        "FROND_DEBUG_STALL",
-        "FROND_NO_REUSECHAIN",
-        "FROND_NO_DELTA_RESET",
-        "FROND_NO_SAMEFRAME",
-        "FROND_SAMEFRAME",
-        "FROND_DEBUG_SF",
-        "FROND_DEBUG_FORIN",
-        "FROND_DEBUG_CALL",
-        "FROND_DEBUG_IFELSE",
-        "FROND_DEBUG_GATE",
-        "FROND_DEBUG_WB",
-        "FROND_DEBUG_SYNC",
-        "FROND_DEBUG_MEMO",
-        "FROND_VERIFY",
-        "FROND_VERIFY_STRICT",
-        "FROND_EXEC_COVERAGE",
-    ];
-    let flags = FLAGS.get_or_init(|| {
-        let mut m = hashbrown::HashMap::with_capacity(KNOWN_FLAGS.len());
-        for flag in KNOWN_FLAGS {
-            m.insert(*flag, std::env::var(flag).is_ok());
-        }
-        m
-    });
-    match flags.get(name) {
-        Some(&v) => v,
-        None => std::env::var(name).is_ok(),
-    }
-}
 
 // =========================================================================
-// Execution coverage (FROND_EXEC_COVERAGE=1)
-// =========================================================================
-
-/// Process-global per-sg frame-start counters — the class-level detector for
-/// "std paths that exist in the final graph but are NEVER executed by any
-/// test". Every incident in this family (u64(x) silent void, `[0u8]*len` empty
-/// array, open-flags abort, File.remove deleting nothing) lived for months in
-/// exactly such paths. Instrumented at `start_subgraph_frame` (both the queue
-/// and the inline sync path) and at `switch_subgraph` (tail-call frame reuse);
-/// reported by `exec_cov_dump` keyed by the graph's debug name sidecar.
-static EXEC_COV: OnceLock<Vec<std::sync::atomic::AtomicU32>> = OnceLock::new();
-
-/// Bumps the execution counter for `sg`; initializes the counter table on
-/// first use (sized to the graph). No-op unless FROND_EXEC_COVERAGE is set.
-/// TEMP (perf profile): FROND_EXEC_COUNTS=1 — per-FUNCTION node-execution
-/// counters (function_id keyed; frame's sg resolves through subgraphs).
-/// Reported at exit keyed by sg_names. Statistical cost: one relaxed atomic
-/// fetch_add per compute under the flag, zero otherwise.
-static EXEC_COUNTS: OnceLock<Vec<std::sync::atomic::AtomicU64>> = OnceLock::new();
-
-pub(super) fn exec_count_bump(graph: &crate::ir::Ir::DataFlowGraph, sg: crate::ir::Ir::SubGraphId) {
-    // 0 = unresolved, 1 = off, 2 = on. One relaxed load on the hot path.
-    static STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-    use std::sync::atomic::Ordering::Relaxed;
-    let st = STATE.load(Relaxed);
-    if st == 0 {
-        let on = env_flag("FROND_EXEC_COUNTS");
-        STATE.store(if on { 2 } else { 1 }, Relaxed);
-        if !on {
-            return;
-        }
-    } else if st == 1 {
-        return;
-    }
-    let counts = EXEC_COUNTS.get_or_init(|| {
-        (0..graph.subgraphs.len())
-            .map(|_| std::sync::atomic::AtomicU64::new(0))
-            .collect::<Vec<_>>()
-    });
-    if let Some(slot) = counts.get(sg.0 as usize) {
-        slot.fetch_add(1, Relaxed);
-    }
-}
-
-/// Exit report for FROND_EXEC_COUNTS: per function-entry sg, aggregate over
-/// its function's sgs.
-pub fn exec_counts_dump(graph: &crate::ir::Ir::DataFlowGraph) {
-    if !env_flag("FROND_EXEC_COUNTS") {
-        return;
-    }
-    let Some(counts) = EXEC_COUNTS.get() else { return };
-    // aggregate per function_id
-    let mut by_fn: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-    for (idx, c) in counts.iter().enumerate() {
-        let v = c.load(std::sync::atomic::Ordering::Relaxed);
-        if v > 0 {
-            if let Some(sg) = graph.subgraphs.get(idx) {
-                *by_fn.entry(sg.function_id).or_insert(0) += v;
-            }
-        }
-    }
-    let mut rows: Vec<(u64, &str, u32)> = by_fn
-        .into_iter()
-        .map(|(f, v)| {
-            let name = graph
-                .sg_names
-                .get(f as usize)
-                .map(|s| s.as_str())
-                .unwrap_or("?");
-            (v, name, f)
-        })
-        .collect();
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
-    let total: u64 = rows.iter().map(|r| r.0).sum();
-    eprintln!("EXECCNT-TOTAL {total}");
-    for (v, name, f) in rows.into_iter().take(40) {
-        let pct = if total > 0 { v as f64 / total as f64 * 100.0 } else { 0.0 };
-        eprintln!("EXECCNT-FN {name} fn={f} count={v} pct={pct:.1}%");
-    }
-}
-
-pub(super) fn exec_cov_bump(sg: crate::ir::Ir::SubGraphId, total_sgs: usize) {
-    if !env_flag("FROND_EXEC_COVERAGE") {
-        return;
-    }
-    let cov = EXEC_COV.get_or_init(|| {
-        (0..total_sgs).map(|_| std::sync::atomic::AtomicU32::new(0)).collect()
-    });
-    if let Some(slot) = cov.get(sg.0 as usize) {
-        slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// End-of-run report, keyed by the qualified debug names (`sg_debug_names`):
-///   EXECCOV-INV <name>  — std.* function present in the final graph
-///   EXECCOV-RUN <name>  — …and actually frame-started at least once
-/// Aggregated across the whole test suite by tests/scripts/run_execcov.sh
-/// (names are stable across processes; sg ids are not).
-pub fn exec_cov_dump(graph: &crate::ir::Ir::DataFlowGraph) {
-    if !env_flag("FROND_EXEC_COVERAGE") {
-        return;
-    }
-    let Some(cov) = EXEC_COV.get() else { return };
-    let mut inv = 0usize;
-    let mut ran = 0usize;
-    for (idx, name) in graph.sg_debug_names.iter().enumerate() {
-        let Some(name) = name else { continue };
-        if !name.starts_with("std.") {
-            continue;
-        }
-        inv += 1;
-        eprintln!("EXECCOV-INV {name}");
-        if graph.subgraphs.get(idx).is_some()
-            && cov.get(idx).map_or(false, |c| c.load(std::sync::atomic::Ordering::Relaxed) > 0)
-        {
-            ran += 1;
-            eprintln!("EXECCOV-RUN {name}");
-        }
-    }
-    eprintln!("EXECCOV-SUMMARY std_inv={inv} std_ran={ran}");
-    // TEMP (stmt-drop hunt): per-FUNCTION aggregate over ALL sgs (arms and
-    // loop sgs are nameless — attribute them via function_id). One line per
-    // function entry sg: name, fn_id, number of sgs, total frame starts,
-    // and the per-sg nonzero counts (sg_id:count) for drilling into arms.
-    let mut fn_name: std::collections::HashMap<u32, &str> = std::collections::HashMap::new();
-    for (idx, name) in graph.sg_debug_names.iter().enumerate() {
-        if let Some(name) = name {
-            if let Some(sg) = graph.subgraphs.get(idx) {
-                if sg.id.0 == sg.function_id {
-                    fn_name.entry(sg.function_id).or_insert(name);
-                }
-            }
-        }
-    }
-    let mut by_fn: std::collections::HashMap<u32, Vec<(u32, u32)>> = std::collections::HashMap::new();
-    for (idx, sg) in graph.subgraphs.iter().enumerate() {
-        let c = cov
-            .get(idx)
-            .map_or(0, |c| c.load(std::sync::atomic::Ordering::Relaxed));
-        if c > 0 {
-            by_fn.entry(sg.function_id).or_default().push((sg.id.0, c));
-        }
-    }
-    let mut fns: Vec<u32> = by_fn.keys().copied().collect();
-    fns.sort_unstable();
-    for f in fns {
-        let list = &by_fn[&f];
-        let total: u32 = list.iter().map(|(_, c)| c).sum();
-        let name = fn_name.get(&f).copied().unwrap_or("?");
-        let detail: Vec<String> = list.iter().map(|(s, c)| format!("{s}:{c}")).collect();
-        eprintln!("EXECCOV-FN {name} fn={f} sgs={} total={total} [{}]", list.len(), detail.join(","));
-    }
-}
 
 // =========================================================================
 // Sentinel constants — used by the scheduler
@@ -314,25 +99,9 @@ unsafe impl Sync for Engine<Multi> {}
 /// L2 offload classification: a subgraph is offloadable iff every node in
 /// its range is in the pure whitelist (`is_offload_safe_compute`) and it is
 /// an ordinary subgraph (no loop machinery). Size thresholding happens at
-/// launch (FROND_OFFLOAD / FROND_OFFLOAD_MIN), not here.
+/// launch (--offload / [engine] offload / [engine] offload_min), not here.
 fn classify_offloadable(graph: &mut DataFlowGraph) {
-    // TEMP DIAG: full CF histogram for one sg (FROND_DEBUG_OFFLOAD_SG=<idx>)
-    if let Ok(idx) = std::env::var("FROND_DEBUG_OFFLOAD_SG").ok().and_then(|v| v.parse::<usize>().ok()).ok_or(()) {
-        let sg = &graph.subgraphs[idx];
-        let (ns, ne) = sg.node_range;
-        let mut hist = std::collections::BTreeMap::new();
-        for nid in ns.0..ne.0 {
-            if (nid as usize) < graph.node_count() {
-                let cf = graph.node(nid as usize).compute_fn.0;
-                *hist.entry(cf).or_insert(0usize) += 1;
-            }
-        }
-        eprintln!("[SG-DUMP] sg={idx} nodes {}..{} histogram {{", ns.0, ne.0);
-        for (cf, n) in hist {
-            eprintln!("  {cf} x{n}");
-        }
-        eprintln!("[SG-DUMP] end");
-    }
+    // TEMP DIAG: full CF histogram for one sg (--offload-sg IDX)
     let mut safe = vec![false; graph.subgraphs.len()];
     for (i, sg) in graph.subgraphs.iter().enumerate() {
         if sg.loop_kind != crate::ir::Ir::LoopKind::None {
@@ -377,33 +146,9 @@ fn classify_offloadable(graph: &mut DataFlowGraph) {
                 false
             };
             if !pure {
-                if std::env::var("FROND_DEBUG_OFFLOAD").is_ok() && !ok {
-                    // first disqualifier only, per sg
-                }
-                if std::env::var("FROND_DEBUG_OFFLOAD").is_ok() {
-                    let fname = sg.function_id as usize;
-                    let fname = graph
-                        .sg_names
-                        .get(fname)
-                        .map(|s| s.as_str())
-                        .unwrap_or("?");
-                    eprintln!(
-                        "[OFFLOAD-CLASS] sg={} fn={fname} disqualified by cf={} at node {}",
-                        i, node.compute_fn.0, nid
-                    );
-                }
                 ok = false;
                 break;
             }
-        }
-        if ok && std::env::var("FROND_DEBUG_OFFLOAD").is_ok() {
-            let fname = sg.function_id as usize;
-            let fname = graph
-                .sg_names
-                .get(fname)
-                .map(|s| s.as_str())
-                .unwrap_or("?");
-            eprintln!("[OFFLOAD-CLASS] sg={} fn={fname} SAFE nodes={}", i, ne.0 - ns.0);
         }
         safe[i] = ok;
     }
@@ -414,6 +159,123 @@ fn classify_offloadable(graph: &mut DataFlowGraph) {
 /// shared as one Arc for the whole run — previously every execution of a string const cost
 /// two heap allocations). Runs at EngineRef::new, the single choke point after
 /// build/optimize/load, so renumbering passes can never invalidate a populated cache.
+/// Per-node shared Record/Adt/Newtype shapes, built once from each construct
+/// node's RecordLitInfo. Every runtime instance then clones one Arc instead
+/// of re-allocating type_name String + field_names Vec (+ per-field name
+/// Strings).
+fn materialize_record_shapes(graph: &mut DataFlowGraph) {
+    if !graph.record_shapes.is_empty() {
+        return;
+    }
+    let n = graph.node_count();
+    let mut shapes: Vec<std::sync::Arc<crate::value::RecordShape>> = Vec::with_capacity(n);
+    for idx in 0..n {
+        // .fndo-loaded graphs keep opt-metadata in packed mmap sections: the
+        // `record_lit_infos` Vec is EMPTY there and only the accessor decodes
+        // it. Reading the raw Vec silently produced blank shapes (constructor
+        // names lost → match dispatch found no arm).
+        let shape = match graph.record_lit_info_at(idx) {
+            Some(info) => {
+                // Packing guard: tags must be arity-exact; any mismatch
+                // (literal-path sites without sema reprs, partial data)
+                // degrades the WHOLE shape to generic Value slots — packed
+                // storage with a short pack table would silently drop
+                // fields.
+                // Newtype literals carry ONE field but an empty name
+                // table — pack arity must follow the actual field count.
+                let arity = if info.field_names.is_empty()
+                    && matches!(
+                        info.kind,
+                        crate::ir::Ir::RecordLitKind::Newtype
+                    ) {
+                    1
+                } else {
+                    info.field_names.len()
+                };
+                let generic: Vec<u8>;
+                let tags: &[u8] = if info.field_tags.len() == arity {
+                    &info.field_tags
+                } else {
+                    generic = vec![0xFF; arity];
+                    &generic
+                };
+                let (field_packs, pack_offsets, value_region_bytes) =
+                    crate::value::RecordShape::compute_layout(tags);
+                let disc = crate::value::ctor_disc(&info.type_name, &info.constructor);
+                std::sync::Arc::new(crate::value::RecordShape {
+                    type_name: info.type_name.as_str().into(),
+                    constructor: info.constructor.as_str().into(),
+                    field_names: info
+                        .field_names
+                        .iter()
+                        .map(|n| n.as_ref().map(|s| s.as_str().into()))
+                        .collect(),
+                    kind: match info.kind {
+                        crate::ir::Ir::RecordLitKind::Record => crate::value::ShapeKind::Record,
+                        crate::ir::Ir::RecordLitKind::Adt => crate::value::ShapeKind::Adt,
+                        crate::ir::Ir::RecordLitKind::Newtype => crate::value::ShapeKind::Newtype,
+                    },
+                    field_packs,
+                    pack_offsets,
+                    value_region_bytes,
+                    disc,
+                })
+            }
+            None => std::sync::Arc::new(crate::value::RecordShape {
+                type_name: "".into(),
+                constructor: "".into(),
+                field_names: Vec::new(),
+                kind: crate::value::ShapeKind::Record,
+                field_packs: Vec::new(),
+                pack_offsets: Vec::new(),
+                value_region_bytes: 0,
+                disc: 0,
+            }),
+        };
+        shapes.push(shape);
+    }
+    graph.record_shapes = shapes;
+}
+
+/// M1: per-pattern-node acceptable ctor discriminants. For every pattern
+/// ctor-match node with a type-adjudicated ctor, the set is
+/// {disc(T', ctor) : T' == pattern_type or inherits(pattern_type)} — the
+/// disc equivalent of the old string-compare + type_inherits walk. Nodes
+/// without adjudication (or non-Adt shapes at runtime) keep the string path.
+fn materialize_pattern_discs(graph: &mut DataFlowGraph) {
+    if !graph.pattern_disc_sets.is_empty() {
+        return;
+    }
+    let n = graph.node_count();
+    let mut sets: Vec<Box<[u32]>> = vec![Box::from([0u32; 0]); n];
+    // Reverse-inheritance closure: all types inheriting from `tn` (incl. tn).
+    let descendants = |tn: &str| -> Vec<String> {
+        let mut out: Vec<String> = vec![tn.to_string()];
+        let mut frontier: Vec<String> = vec![tn.to_string()];
+        while let Some(c) = frontier.pop() {
+            for (child, base) in &graph.inheritance_links {
+                if base.as_ref() == c.as_str() && !out.iter().any(|o| o.as_str() == child.as_ref()) {
+                    out.push(child.to_string());
+                    frontier.push(child.to_string());
+                }
+            }
+        }
+        out
+    };
+    for idx in 0..n {
+        let Some(ctor) = graph.pattern_ctor_name(idx) else { continue };
+        let Some(tn) = graph.pattern_type_name(idx) else { continue };
+        let mut set: Vec<u32> = descendants(tn)
+            .iter()
+            .map(|t| crate::value::ctor_disc(t, ctor.as_ref()))
+            .collect();
+        set.sort_unstable();
+        set.dedup();
+        sets[idx] = set.into_boxed_slice();
+    }
+    graph.pattern_disc_sets = sets;
+}
+
 fn materialize_const_cache(graph: &mut DataFlowGraph) {
     if !graph.const_cache.is_empty() {
         return;
@@ -712,11 +574,18 @@ impl EngineRef {
                 graph.slice_inclusive = v;
             }
         }
+        materialize_record_shapes(&mut graph);
+        materialize_pattern_discs(&mut graph);
         materialize_const_cache(&mut graph);
         precompute_sg_templates(&mut graph);
         materialize_downstream_counts(&mut graph);
         materialize_linear_plans(&mut graph);
         classify_offloadable(&mut graph);
+        // Scalar-chain programs for every subgraph (shared by the engine's
+        // synchronous fast path and the offload workers).
+        graph.scalar_progs = (0..graph.subgraphs.len())
+            .map(|i| crate::pass::Scalarizer::build_scalar_prog(&graph, crate::ir::Ir::SubGraphId(i as u32)))
+            .collect();
         let has_async = Self::entry_reaches_suspend(&graph);
         if has_async {
             Self::Multi(Arc::new(Engine::<Multi>::new_multi(graph)))
@@ -767,16 +636,10 @@ impl EngineRef {
 
     /// Runs the engine and returns the result value.
     pub fn run(self) -> Value {
-        let graph = match &self {
-            Self::Single(e) => e.graph.clone(),
-            Self::Multi(e) => e.graph.clone(),
-        };
         let result = match self {
             Self::Single(e) => e.run_single(),
             Self::Multi(e) => Engine::<Multi>::run_multi(e),
         };
-        exec_cov_dump(&graph);
-        exec_counts_dump(&graph);
         // Teardown cycle sweep: releases any cyclic garbage still registered
         // (roots empty — nothing runs after this).
         let _ = crate::value::Registry::collect_cycles(&[]);

@@ -3948,12 +3948,6 @@ pub fn inline_pass(
     sema: &SemaResult,
 ) -> InlineReport {
     let mut report = InlineReport::default();
-    // Allow disabling AST inlining for debugging (FROND_NO_AST_INLINE=1).
-    // AST inlining is independent of OptLevel — it happens at compile time,
-    // not in the optimizer pipeline.
-    if std::env::var("FROND_NO_AST_INLINE").is_ok() {
-        return report;
-    }
     // Pass 1: collect the set of inlineable functions (unified traversal of FunDecl + Method)
     let mut inlineable: FxHashSet<FuncId> = FxHashSet::default();
     let func_metas: Vec<(FuncId, &str, crate::ast::Ast::ExprId, bool)> = cg.iter_funcs(module)

@@ -12,7 +12,7 @@
 //! it indirectly via `graph.compute_fns[idx]` rather than referencing concrete compute_fns.
 //!
 //! Submodules:
-//! - [`EngineCore`]: core type definitions — `Engine<S>` struct + `EngineRef` factory + Send/Sync + scheduler constants + env_flag
+//! - [`EngineCore`]: core type definitions — `Engine<S>` struct + `EngineRef` factory + Send/Sync + scheduler constants + env
 //! - [`AsyncRt`]: async runtime (TimerRuntime / AsyncJoinRuntime) + event handling
 //! - [`Schedule`]: dataflow scheduling core (readiness scheduling, batching, run_frame_nodes, process_frame)
 //! - [`Frame`]: frame lifecycle management (allocation, initialization, reset, frame chain)
@@ -41,11 +41,11 @@ pub use Frame::{prepare_defer_frame_sync, prepare_same_function_frame_sync};
 
 // Scheduler constants/helpers originate from EngineCore.rs; they are re-imported here into the
 // engine namespace so that submodules can use them by bare name after `use super::*`
-// (PENDING_EXTERNAL / env_flag).
+// (PENDING_EXTERNAL).
 // Note: the `Engine` / `EngineRef` types are already re-exported via the `pub use` above and must
 // not be re-`use`d here, otherwise they conflict with the `EngineCore` module name in the type
 // namespace (E0255).
-use EngineCore::{PENDING_EXTERNAL, env_flag};
+use EngineCore::PENDING_EXTERNAL;
 
 // =========================================================================
 // Program argv — the engine-registered command-line view for std.os.Proc.args()

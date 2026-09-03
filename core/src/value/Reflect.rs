@@ -23,7 +23,54 @@ use super::value::{F16, F128, HeapObj, Value};
 const FORMAT_MAX_DEPTH: u32 = 64;
 
 /// Recursively formats a Value into a String (internal helper, not `extern "C"`).
+/// Formats a single-block record via its shared shape (cast_to_str path).
+pub fn format_record_value(r: &crate::value::RecordRef) -> String {
+    use crate::value::ShapeKind;
+    let shape = r.shape();
+    match shape.kind {
+        ShapeKind::Adt => {
+            if r.field_count() == 0 {
+                shape.constructor.to_string()
+            } else {
+                let mut out = format!("{}(", shape.constructor);
+                for i in 0..r.field_count() {
+                    if i > 0 { out.push_str(", "); }
+                    if let Some(name) = shape.field_names.get(i).and_then(|n| n.as_ref()) {
+                        out.push_str(name);
+                        out.push_str(": ");
+                    }
+                    out.push_str(&format_value(&r.field(i), 0));
+                }
+                out.push(')');
+                out
+            }
+        }
+        ShapeKind::Newtype => format!(
+            "{}({})",
+            crate::sema::Sema::display_type_name(&shape.type_name),
+            format_value(&if r.field_count() > 0 { r.field(0) } else { crate::value::Value::VOID }, 0)
+        ),
+        ShapeKind::Record => {
+            let mut out = format!("{}(", crate::sema::Sema::display_type_name(&shape.type_name));
+            for i in 0..r.field_count() {
+                if i > 0 { out.push_str(", "); }
+                if let Some(name) = shape.field_names.get(i).and_then(|n| n.as_ref()) {
+                    out.push_str(name);
+                    out.push_str(": ");
+                }
+                out.push_str(&format_value(&r.field(i), 0));
+            }
+            out.push(')');
+            out
+        }
+    }
+}
+
 pub fn format_value(v: &Value, depth: u32) -> String {
+    if let Value::Str(s) = v {
+        return s.to_string();
+    }
+
     // Depth exceeded: truncate to ellipsis to avoid stack overflow (defense against cycles/deep nesting)
     if depth > FORMAT_MAX_DEPTH {
         return "...".to_string();
@@ -61,42 +108,50 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                 }
             }
         }
-        Value::Ref(r) => {
-            // Heap object: match on HeapObj
-            match &**r {
-                HeapObj::Record(rec) => {
-                    let mut out = format!("{}(", crate::sema::Sema::display_type_name(&rec.type_name));
-                    for (i, f) in rec.fields.iter().enumerate() {
-                        if i > 0 { out.push_str(", "); }
-                        if let Some(name) = rec.field_names.get(i).and_then(|n| n.as_ref()) {
-                            out.push_str(name);
-                            out.push_str(": ");
-                        }
-                        out.push_str(&format_value(f, depth + 1));
-                    }
-                    out.push(')');
-                    out
-                }
-                HeapObj::Adt(a) => {
-                    if a.fields.is_empty() {
-                        a.constructor.clone()
+        Value::Str(_) => unreachable!("handled by early return"),
+        Value::Record(rec) => {
+            let shape = rec.shape();
+            match shape.kind {
+                crate::value::ShapeKind::Adt => {
+                    if rec.field_count() == 0 {
+                        shape.constructor.to_string()
                     } else {
-                        let mut out = format!("{}(", a.constructor);
-                        for (i, f) in a.fields.iter().enumerate() {
+                        let mut out = format!("{}(", shape.constructor);
+                        for i in 0..rec.field_count() {
                             if i > 0 { out.push_str(", "); }
-                            if let Some(name) = &f.name {
+                            if let Some(name) = shape.field_names.get(i).and_then(|n| n.as_ref()) {
                                 out.push_str(name);
                                 out.push_str(": ");
                             }
-                            out.push_str(&format_value(&f.value, depth + 1));
+                            out.push_str(&format_value(&rec.field(i), depth + 1));
                         }
                         out.push(')');
                         out
                     }
                 }
-                HeapObj::Newtype(n) => {
-                    format!("{}({})", crate::sema::Sema::display_type_name(&n.type_name), format_value(&n.inner, depth + 1))
+                crate::value::ShapeKind::Newtype => format!(
+                    "{}({})",
+                    crate::sema::Sema::display_type_name(&shape.type_name),
+                    format_value(&if rec.field_count() > 0 { rec.field(0) } else { Value::VOID }, depth + 1)
+                ),
+                crate::value::ShapeKind::Record => {
+                    let mut out = format!("{}(", crate::sema::Sema::display_type_name(&shape.type_name));
+                    for i in 0..rec.field_count() {
+                        if i > 0 { out.push_str(", "); }
+                        if let Some(name) = shape.field_names.get(i).and_then(|n| n.as_ref()) {
+                            out.push_str(name);
+                            out.push_str(": ");
+                        }
+                        out.push_str(&format_value(&rec.field(i), depth + 1));
+                    }
+                    out.push(')');
+                    out
                 }
+            }
+        }
+        Value::Ref(r) => {
+            // Heap object: match on HeapObj
+            match &**r {
                 HeapObj::Array(a) => {
                     let mut out = String::from("[");
                     // SoA-first: elements can be an empty shell (single-source
@@ -110,7 +165,6 @@ pub fn format_value(v: &Value, depth: u32) -> String {
                     out.push(']');
                     out
                 }
-                HeapObj::Str(frond_str) => frond_str.bytes().to_string(),
                 HeapObj::LazyVal(lazy) => {
                     // Forced LazyValue: format the cached value
                     // Unforced LazyValue: normally pre-processed by Engine's force_lazy_value_sync;
@@ -178,15 +232,11 @@ fn value_size(v: &Value) -> u32 {
                 _ => unreachable!("non-scalar tag in ScalarValue"),
             }
         }
+        Value::Str(_) => 16,
+        Value::Record(rec) => (0..rec.field_count()).map(|i| value_size(&rec.field(i))).sum(),
         Value::Ref(r) => {
             match &**r {
-                HeapObj::Str(_) => 16,
                 HeapObj::Array(_) => 16,
-                HeapObj::Record(rec) => rec.fields.iter().map(value_size).sum(),
-                // ADT: sum of field sizes (current constructor's fields, excluding tag)
-                HeapObj::Adt(a) => a.fields.iter().map(|f| value_size(&f.value)).sum(),
-                // Newtype: size of the inline inner value
-                HeapObj::Newtype(n) => value_size(&n.inner),
                 _ => 8,
             }
         }
@@ -209,13 +259,11 @@ fn value_alignment(v: &Value) -> u32 {
                 _ => unreachable!("non-scalar tag in ScalarValue"),
             }
         }
+        Value::Str(_) => 8,
+        Value::Record(rec) => (0..rec.field_count()).map(|i| value_alignment(&rec.field(i))).max().unwrap_or(1),
         Value::Ref(r) => {
             match &**r {
-                HeapObj::Str(_) | HeapObj::Array(_) => 8,
-                HeapObj::Record(rec) => rec.fields.iter().map(value_alignment).max().unwrap_or(1),
-                HeapObj::Adt(a) => a.fields.iter().map(|f| value_alignment(&f.value)).max().unwrap_or(1).max(1),
-                // Newtype: alignment of the inline inner value
-                HeapObj::Newtype(n) => value_alignment(&n.inner),
+                HeapObj::Array(_) => 8,
                 _ => 8,
             }
         }

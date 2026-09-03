@@ -1523,12 +1523,6 @@ impl<'a> IrBuilder<'a> {
             self.log_call_bind(site, name, recv, name, sg);
             return Some(Ok(sg));
         }
-        if std::env::var("FROND_DEBUG_BUILD").is_ok() {
-            eprintln!(
-                "[CALL-BIND] site={} callee={:?} recv={:?} key=<unresolved> cur_mod={:?}",
-                site, name, recv, self.current_module().name
-            );
-        }
         None
     }
 
@@ -1573,14 +1567,8 @@ impl<'a> IrBuilder<'a> {
 
     /// Provenance for every resolution: which site asked, which key won, and
     /// which sg it bound — "who did I actually call" in one glance
-    /// (FROND_DEBUG_BUILD=1).
+    /// (module-name diagnostic, removed 2026-09-03).
     pub(super) fn log_call_bind(&self, site: &str, name: &str, recv: Option<&str>, key: &str, sg: SubGraphId) {
-        if std::env::var("FROND_DEBUG_BUILD").is_ok() {
-            eprintln!(
-                "[CALL-BIND] site={} callee={:?} recv={:?} key={:?} sg={} cur_mod={:?}",
-                site, name, recv, key, sg.0, self.current_module().name
-            );
-        }
     }
 
     /// @internal access enforcement. Functions marked `@internal` are stdlib
@@ -2062,6 +2050,7 @@ impl<'a> IrBuilder<'a> {
                                 field_names,
                                 type_name: canonical.clone(),
                                 kind: RecordLitKind::Record,
+            field_tags: Vec::new(),
                             });
                         }
                         crate::ast::Ast::TypeDef::Adt { constructors } => {
@@ -2083,6 +2072,7 @@ impl<'a> IrBuilder<'a> {
                                                 field_names,
                                                 type_name: canonical.clone(),
                                                 kind: RecordLitKind::Adt,
+            field_tags: Vec::new(),
                                             });
                                         }
                                         continue;
@@ -2097,6 +2087,7 @@ impl<'a> IrBuilder<'a> {
                                     field_names: Vec::new(),
                                     type_name: canonical.clone(),
                                     kind: RecordLitKind::Adt,
+            field_tags: Vec::new(),
                                 });
                                 for ctor in constructors {
                                     let field_names: Vec<String> = match &merged_names {
@@ -2109,6 +2100,7 @@ impl<'a> IrBuilder<'a> {
                                         field_names,
                                         type_name: canonical.clone(),
                                         kind: RecordLitKind::Adt,
+            field_tags: Vec::new(),
                                     });
                                 }
                             } else {
@@ -2133,6 +2125,7 @@ impl<'a> IrBuilder<'a> {
                                         field_names,
                                         type_name: canonical.clone(),
                                         kind: RecordLitKind::Adt,
+            field_tags: Vec::new(),
                                     });
                                 }
                                 let taken_module = self
@@ -2145,12 +2138,14 @@ impl<'a> IrBuilder<'a> {
                                         field_names: Vec::new(),
                                         type_name: canonical.clone(),
                                         kind: RecordLitKind::Adt,
+            field_tags: Vec::new(),
                                     });
                                 }
                                 self.bind_type_fields_base_first_wins(name, TypeFieldInfo {
                                     field_names: Vec::new(),
                                     type_name: canonical.clone(),
                                     kind: RecordLitKind::Adt,
+            field_tags: Vec::new(),
                                 });
                             }
                         }
@@ -2160,6 +2155,7 @@ impl<'a> IrBuilder<'a> {
                                 field_names: Vec::new(),
                                 type_name: canonical.clone(),
                                 kind: RecordLitKind::Newtype,
+            field_tags: Vec::new(),
                             });
                         }
                         crate::ast::Ast::TypeDef::Alias { .. } => {}
@@ -2322,24 +2318,6 @@ impl<'a> IrBuilder<'a> {
         }
 
         // DEBUG: dump all func_subgraphs whose node_range is (0,0) — these are uncompiled placeholders
-        if std::env::var("FROND_DEBUG_BUILD").is_ok() {
-            eprintln!("=== [BUILD] func_subgraphs with EMPTY node_range (uncompiled) ===");
-            for (name, &sg_id) in &self.func_subgraphs {
-                let sg = &self.graph.subgraphs[sg_id.0 as usize];
-                let (s, e) = sg.node_range;
-                if s.0 == 0 && e.0 == 0 {
-                    eprintln!("  EMPTY: name={:?} sg_id={} param_count={}", name, sg_id.0, sg.param_count);
-                }
-            }
-            eprintln!("=== [BUILD] func_subgraphs with NON-EMPTY node_range (compiled) ===");
-            for (name, &sg_id) in &self.func_subgraphs {
-                let sg = &self.graph.subgraphs[sg_id.0 as usize];
-                let (s, e) = sg.node_range;
-                if !(s.0 == 0 && e.0 == 0) {
-                    eprintln!("  OK: name={:?} sg_id={} nodes=[{},{}) param_count={}", name, sg_id.0, s.0, e.0, sg.param_count);
-                }
-            }
-        }
 
         // W2: storage versioning needs nested_ranges first; downstreams must
         // reflect the version edges appended by the versioning pass.
@@ -2381,30 +2359,12 @@ impl<'a> IrBuilder<'a> {
         // Move IR compile-time errors (unimplemented features, etc.) in for the caller to inspect
         self.graph.ir_errors = std::mem::take(&mut self.errors);
 
-        // Debug name sidecar for the execution-coverage instrumentation
-        // (FROND_EXEC_COVERAGE=1): sg → qualified function name, parallel to
-        // subgraphs; remapped by rebuild's sg compaction, never serialized.
-        {
-            let total_sgs = self.graph.subgraphs.len();
-            let mut names: Vec<Option<Box<str>>> = vec![None; total_sgs];
-            for (sg, qualified) in &self.sg_qualified_names {
-                let idx = sg.0 as usize;
-                if idx < total_sgs {
-                    names[idx] = Some(qualified.as_str().into());
-                }
-            }
-            self.graph.sg_debug_names = names;
-        }
-
         // Pre-compute nested_ranges for all subgraphs; runtime O(len) lookup replaces full-graph scans
         self.graph.compute_nested_ranges();
 
         // W5: flatten loop condition-tree reset plans once, so the engine's
         // per-iteration reset is mechanical (no per-iteration DFS).
         self.graph.precompute_reset_plans();
-
-        // W0: structural invariant verification (debug builds / FROND_VERIFY=1).
-        crate::pass::Verifier::verify_and_report(&self.graph, "build");
 
         // Move the build-time string_pool into graph.string_pool (ConstValue::Str references this pool)
         let pool = std::mem::take(&mut self.string_pool);
@@ -2415,7 +2375,7 @@ impl<'a> IrBuilder<'a> {
     }
 
     /// Debug aid: mirror func_subgraphs (mangled → sg_id) into a vec indexed
-    /// by sg_id so FROND_DUMP_IR can name the function owning each subgraph.
+    /// by sg_id so --dump-ir can name the function owning each subgraph.
     fn fill_sg_names(&mut self) {
         let n = self.graph.subgraphs.len();
         self.graph.sg_names = vec![String::new(); n];

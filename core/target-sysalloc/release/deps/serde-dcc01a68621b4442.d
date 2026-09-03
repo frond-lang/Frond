@@ -1,0 +1,14 @@
+F:\Projects\Rust\frond-lang\Frond\core\target-sysalloc\release\deps\serde-dcc01a68621b4442.d: C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs F:\Projects\Rust\frond-lang\Frond\core\target-sysalloc\release\build\serde-009d67ca170ca123\out/private.rs
+
+F:\Projects\Rust\frond-lang\Frond\core\target-sysalloc\release\deps\libserde-dcc01a68621b4442.rlib: C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs F:\Projects\Rust\frond-lang\Frond\core\target-sysalloc\release\build\serde-009d67ca170ca123\out/private.rs
+
+F:\Projects\Rust\frond-lang\Frond\core\target-sysalloc\release\deps\libserde-dcc01a68621b4442.rmeta: C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs F:\Projects\Rust\frond-lang\Frond\core\target-sysalloc\release\build\serde-009d67ca170ca123\out/private.rs
+
+C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs:
+C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs:
+C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs:
+C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs:
+C:\Users\99671\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs:
+F:\Projects\Rust\frond-lang\Frond\core\target-sysalloc\release\build\serde-009d67ca170ca123\out/private.rs:
+
+# env-dep:OUT_DIR=F:\\Projects\\Rust\\frond-lang\\Frond\\core\\target-sysalloc\\release\\build\\serde-009d67ca170ca123\\out

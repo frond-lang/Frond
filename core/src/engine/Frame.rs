@@ -479,9 +479,7 @@ impl<S: LockStrategy> Engine<S> {
         // First boundary runs the legacy full reset + full copy, which leaves the two frames
         // value-synchronized; tracking is enabled there, so from the second boundary on the
         // delta path has a complete dirty history.
-        let delta_eligible = reset_plan.is_some()
-            && !super::env_flag("FROND_NO_DELTA_RESET")
-            && !super::env_flag("FROND_NO_REUSECHAIN");
+        let delta_eligible = reset_plan.is_some();
         let delta_reset = delta_eligible && loop_frame.value_table.dirty_tracking_enabled();
         let body_offset = body_frame.node_offset;
         let body_len = body_frame.value_table.len();

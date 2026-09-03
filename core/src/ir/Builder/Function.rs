@@ -97,9 +97,6 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         // Unified memo-strategy query (memo_pass already makes the unique decision; mutually
         // exclusive).
         let strategy = self.lookup_memo_strategy(name, self_type);
-        if std::env::var("FROND_DEBUG_MEMO").is_ok() {
-            eprintln!("[MEMO] {}{} -> {:?}", self_type.unwrap_or(""), name, strategy.as_ref().map(|s| match s { crate::pass::Analyzer::MemoStrategy::TailRecToLoop { .. } => "TailRecToLoop", crate::pass::Analyzer::MemoStrategy::NonTailRecToLoop { .. } => "NonTailRecToLoop", crate::pass::Analyzer::MemoStrategy::Memoize { .. } => "Memoize", _ => "Other" }));
-        }
         // Place-model C1-① pre-pass: collect address-taken / lambda-captured
         // names for THIS function (all functions — B1 2026-08-22 removed the
         // strategy-fn skip along with the writeback lowering it protected).
@@ -611,19 +608,10 @@ pub(super) fn type_ref_returns_throw(arena: &crate::ast::Ast::AstArena<'_>, rt: 
         self.compiling_builtin = prev_builtin;
 
         let node_end = self.graph.nodes.len() as u32;
-        let debug_mod_name = if std::env::var("FROND_DEBUG_BUILD").is_ok() {
-            Some(self.current_module().name.to_string())
-        } else {
-            None
-        };
         let sg = &mut self.graph.subgraphs[sg_id.0 as usize];
         sg.node_range = (NodeId(node_start), NodeId(node_end));
         sg.entry_node = NodeId(node_start);
         sg.return_node = return_node;
-        if let Some(ref mod_name) = debug_mod_name {
-            eprintln!("[COMPILE-FN] name={:?} sg_id={} nodes=[{},{}) param_count={} mod={:?}",
-                name, sg_id.0, node_start, node_end, param_count, mod_name);
-        }
         // Consumes sema's FuncSigInfo.is_async (builtin modules fall back to AST is_async)
         sg.has_suspend = fn_is_async;
         sg.function_id = sg_id.0;
