@@ -380,3 +380,30 @@ match_dispatch:**sameframe hit=8 / miss=1,000,016**。解读:
 3. **破坏面待定位**:50→95 的失败模式表明存在一个比资格判定更根本的缺陷(候选:被调值表与调用者帧链的 get_value_by_global 交互/construct_cache gid 语义/pending_completions 路径不知道 l3 栈)。下次应先用**最小失败用例**(如 arrays 套件单跑+二分)定位,而非套件级试错。
 
 L3' 未动。L3'' 机制代码留档 tmp_probe/patch_l3pp.py 可复生。
+
+---
+
+# L3' 槽化尾递归参数(2026-09-04)——落地
+
+## 结果
+
+**recursion_tco 1081/1057ms → 444-451/419-424ms(≈2.5×,-59%)**;功能 95(2 个 pre-existing 挂不变)+负向 64+perf 门禁全绿。改动 = `ir/Builder/` 三文件 352 行**纯新增**(零引擎改动)+ solidify/Format.rs 加载顺序修正 9 行。
+
+## 机制:slot 通道取代参数 Cell
+
+资格(单递归点形状):恰一个带条件 base case + 恰一个 rec 分支;cond/args/exit 纯且自由标识符 ⊆ 参数(白名单走查:字面量/Ident/Binary/Unary/As);参数无入口 Cell(③被赋值)/无 lambda 捕获/无取址。不合格 → 原 Cell 路径不变(回退)。
+
+- 参数驻 while_sg PARAM 槽(param Const 首 P 节点;入场 Call 注入);循环迭代传输 = `ResetPlan.carries_value`(引擎既有 phi-carry 机制,此前休眠——builder 从未填充)。
+- **递归参数投机提升**:rec args 在 while 帧编译,经 CF_SEQ 链**全部**链入条件树根——只有条件树成员每迭代重置重算(首版只链最后一个 arg,n 的 carry 恒为陈旧值 1,n≥2 全挂——最小用例二分速破)。
+- 尾调用点降为裸 void 节点:无 Cell 写、**无 Continue barrier**;loop_kind 改 While——body 正常完成即"继续",base case 由 cond 否决走 exit_sg(bare-Ident exit 用 sg 内 CF_SEQ 包装防空 sg 外部 return_node)。
+- body 通用编译不动(前导语句/死 base 臂/嵌套结构语义原样);converter 盖章临时 lifted → rec 臂(单 void Const)获 E7 同帧资格。
+
+## 连带修复:.fndo 装载顺序 bug(休眠机制激活暴露)
+
+装载路径 `precompute_reset_plans` 跑在 downstream 派生**之前**——其内部 E2 fused carry 派生读 downstream_slice,装载图上该表为空 → 首个非空 carry 的装载图直接 panic(owned+zerocopy 两路同病)。修正=两处 loader 把 `materialize_gate_branches`/`compute_downstream(s|_csr)` 提前到 precompute 之前。此前 carries 全库恒空,此路径从未走过。
+
+## 遗留(下一刀)
+
+- loop_sum seg0 269→285 疑机器噪声(本机已知混合 CPU 调度方差;L3' 不触其 IR,同构建重复跑 283-290 与账本带重叠)。待 CI 或钉核复核。
+- v2 细化空间:reset_to_zero 承载 args(省 SEQ 链 2 节点/迭代)、body 内 if-cond 与 while-cond 同源去重(省 cmp_if+gate_if ≈130ns/迭代)、多递归点 phi 合并(当前回退 Cell)。
+- L3''(同帧被调执行,match_dispatch ~2×)地图已画完,重启须最小用例二分(教训见上)。

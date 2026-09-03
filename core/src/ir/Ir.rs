@@ -2816,6 +2816,12 @@ pub struct DataFlowGraph {
     pub linear_plans: Vec<Option<Vec<NodeId>>>,
     /// L2 offload: per-subgraph "every node is in the pure whitelist" flag.
     pub offload_safe: Vec<bool>,
+    /// L3'' perf: per-subgraph "eligible for same-frame callee execution"
+    /// flag (function-level leaf sgs: sync, no defer/event sources, no call /
+    /// await / select / control-flow nodes anywhere in their own or descendant
+    /// ranges, descendants all same-function). Derived data: populated once at
+    /// EngineRef::new — never serialized.
+    pub sg_callee_same_frame: Vec<bool>,
     /// Compiled scalar-chain programs per subgraph (None = ineligible),
     /// built once at engine construction and shared by the engine's
     /// synchronous fast path and the offload workers.
@@ -2999,6 +3005,7 @@ impl Clone for DataFlowGraph {
             downstream_counts: self.downstream_counts.clone(),
             linear_plans: self.linear_plans.clone(),
             offload_safe: self.offload_safe.clone(),
+            sg_callee_same_frame: self.sg_callee_same_frame.clone(),
             scalar_progs: self.scalar_progs.clone(),
             converter_scope: false,
             call_targets: self.call_targets.clone(),
@@ -3068,6 +3075,12 @@ impl DataFlowGraph {
         self.offload_safe.get(sg_idx).copied().unwrap_or(false)
     }
 
+    /// L3'': same-frame callee eligibility for `sg_idx` (false when the
+    /// precompute never ran — LSP / sync-interpreter contexts).
+    pub fn callee_same_frame(&self, sg_idx: usize) -> bool {
+        self.sg_callee_same_frame.get(sg_idx).copied().unwrap_or(false)
+    }
+
     /// The subgraph's compiled scalar-chain program (None = ineligible).
     pub fn scalar_prog(
         &self,
@@ -3085,6 +3098,7 @@ impl DataFlowGraph {
             downstream_counts: Vec::new(),
             linear_plans: Vec::new(),
             offload_safe: Vec::new(),
+            sg_callee_same_frame: Vec::new(),
             scalar_progs: Vec::new(),
             converter_scope: false,
             nodes: Vec::new(),

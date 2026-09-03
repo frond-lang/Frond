@@ -155,6 +155,139 @@ fn classify_offloadable(graph: &mut DataFlowGraph) {
     graph.offload_safe = safe;
 }
 
+/// L3'' classification: which function-level subgraphs may execute as
+/// same-frame callees (saved-context switch instead of a child-frame launch).
+/// A leaf straight-line function: sync, no defer / event sources / converter
+/// machinery / loop kinds / upvalues, whose OWN nodes contain no call launch /
+/// closure call / await / select / break / continue / throw-propagation node
+/// (Gates and plain CF_RETURN are fine — arms run via the E7 same-frame relay
+/// inside the switched frame), and the same shape recursively for EVERY
+/// descendant sg (all same-function). Nested calls are thereby excluded in
+/// v1: a call inside an arm would stack a second SavedCallCtx, which the
+/// runtime supports but the static shape stays leaf-only.
+fn classify_same_frame_callees(graph: &mut DataFlowGraph) {
+    use crate::ir::Ir::*;
+    let sg_count = graph.subgraphs.len();
+
+    // Direct-children index tree via the same sort+stack nesting walk as
+    // compute_nested_ranges (which stores ranges only, without indices).
+    let mut order: Vec<(u32, u32, usize)> = (0..sg_count)
+        .map(|i| (graph.subgraphs[i].node_range.0 .0, graph.subgraphs[i].node_range.1 .0, i))
+        .filter(|&(s, e, _)| s < e)
+        .collect();
+    order.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    let mut children_idx: Vec<Vec<usize>> = vec![Vec::new(); sg_count];
+    let mut stack: Vec<(u32, usize)> = Vec::new();
+    for &(start, end, idx) in &order {
+        while let Some(&(top_end, _)) = stack.last() {
+            if top_end <= start || end > top_end {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+        if let Some(&(_, parent)) = stack.last() {
+            children_idx[parent].push(idx);
+        }
+        stack.push((end, idx));
+    }
+
+    // own_bad[t]: t's own nodes (range minus direct children) contain a
+    // banned compute fn.
+    let banned = |cf: u32| {
+        cf == CF_CALL_LAUNCH.0
+            || cf == CF_ASYNC_CALL_LAUNCH.0
+            || cf == CF_CLOSURE_CALL.0
+            || cf == CF_AWAIT.0
+            || cf == CF_SELECT_GATE.0
+            || cf == CF_BREAK.0
+            || cf == CF_CONTINUE.0
+            || cf == CF_THROW_WRAP_ERR.0
+            || cf == CF_PROPAGATE.0
+    };
+    let mut own_bad = vec![false; sg_count];
+    for t in 0..sg_count {
+        let (ts, te) = graph.subgraphs[t].node_range;
+        if te.0 <= ts.0 {
+            continue;
+        }
+        let children = graph.subgraphs[t].nested_ranges.clone();
+        let mut ci = 0usize;
+        let mut gid = ts.0;
+        let mut bad = false;
+        while gid < te.0 {
+            while ci < children.len() && children[ci].1 <= gid {
+                ci += 1;
+            }
+            if ci < children.len() && gid >= children[ci].0 {
+                gid = children[ci].1;
+                ci += 1;
+                continue;
+            }
+            if gid as usize >= graph.node_count() {
+                break;
+            }
+            if banned(graph.node(gid as usize).compute_fn.0) {
+                bad = true;
+                break;
+            }
+            gid += 1;
+        }
+        own_bad[t] = bad;
+    }
+
+    // Subtree validity memo (0 unknown / 1 ok / 2 bad), checked against the
+    // function id of the DFS root.
+    let mut memo = vec![0u8; sg_count];
+    fn visit(
+        graph: &DataFlowGraph,
+        children_idx: &Vec<Vec<usize>>,
+        own_bad: &Vec<bool>,
+        memo: &mut Vec<u8>,
+        root_fn: usize,
+        t: usize,
+    ) -> bool {
+        if memo[t] != 0 {
+            return memo[t] == 1;
+        }
+        let sg = &graph.subgraphs[t];
+        let ok = sg.function_id as usize == root_fn
+            && !sg.has_suspend
+            && sg.event_source_decls.is_empty()
+            && sg.defer_table.is_empty()
+            && sg.loop_kind == crate::ir::Ir::LoopKind::None
+            && sg.loop_parent_sg.is_none()
+            && sg.upvalue_count == 0
+            && !own_bad[t]
+            && children_idx[t]
+                .iter()
+                .all(|&c| visit(graph, children_idx, own_bad, memo, root_fn, c));
+        memo[t] = if ok { 1 } else { 2 };
+        ok
+    }
+
+    let mut ok = vec![false; sg_count];
+    for s in 0..sg_count {
+        let sg = &graph.subgraphs[s];
+        if sg.function_id as usize != s
+            || sg.converter_generated
+            || sg.has_suspend
+            || !sg.event_source_decls.is_empty()
+            || !sg.defer_table.is_empty()
+            || sg.loop_kind != crate::ir::Ir::LoopKind::None
+            || sg.loop_parent_sg.is_some()
+            || sg.upvalue_count != 0
+            || own_bad[s]
+        {
+            continue;
+        }
+        ok[s] = children_idx[s]
+            .iter()
+            .all(|&c| visit(graph, &children_idx, &own_bad, &mut memo, s, c));
+    }
+    graph.sg_callee_same_frame = ok;
+}
+
 /// E0 perf: one-time materialization of every node's Const value (scalars inline; strings
 /// shared as one Arc for the whole run — previously every execution of a string const cost
 /// two heap allocations). Runs at EngineRef::new, the single choke point after
@@ -581,6 +714,7 @@ impl EngineRef {
         materialize_downstream_counts(&mut graph);
         materialize_linear_plans(&mut graph);
         classify_offloadable(&mut graph);
+        classify_same_frame_callees(&mut graph);
         // Scalar-chain programs for every subgraph (shared by the engine's
         // synchronous fast path and the offload workers).
         graph.scalar_progs = (0..graph.subgraphs.len())

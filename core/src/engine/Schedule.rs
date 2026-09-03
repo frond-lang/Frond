@@ -208,6 +208,124 @@ fn snapshot_outer_value(frame: &Frame, gid: NodeId) -> Option<Value> {
     }
 }
 
+/// L3'': saved caller context for a same-frame callee execution. The callee
+/// runs in THIS frame via the tail-call `switch_subgraph` machinery; when it
+/// completes (Return signal OR queue exhaustion — expression bodies never
+/// emit Return, the value sits in the return_node slot), the caller context
+/// is restored and the value written to the call node — replacing the E1
+/// child-frame launch (frame acquire + prepare + release).
+pub(super) struct SavedCallCtx {
+    pub subgraph_id: crate::ir::Ir::SubGraphId,
+    pub node_offset: u32,
+    pub value_table: crate::ir::Ir::ValueTable,
+    pub pending_inputs: Vec<u16>,
+    pub ready_queue: std::collections::VecDeque<crate::ir::Ir::NodeId>,
+    pub control_signal: crate::ir::Ir::ControlSignal,
+    pub suspend_state: crate::ir::Ir::SuspendState,
+    pub suspend_event: Option<crate::ir::Ir::RuntimeEvent>,
+    pub defer_stack: Vec<crate::ir::Ir::RuntimeDefer>,
+    pub branch_relays: Vec<(crate::ir::Ir::NodeId, crate::ir::Ir::NodeId)>,
+    pub linear_fresh: bool,
+    pub hot_body: Option<(crate::ir::Ir::FrameId, Box<Frame>)>,
+    pub cached_child_frame: Option<crate::ir::Ir::FrameId>,
+    pub same_fn_prep_cache: Option<Box<(u32, Vec<u8>, Vec<u16>, Vec<crate::ir::Ir::NodeId>)>>,
+    pub select_timers: Vec<(usize, crate::ir::Ir::TimerId)>,
+    /// The caller's frame chain — restored verbatim (a LoopBody caller's
+    /// outer-variable reads walk these; nulling them corrupts resolution).
+    pub root_frame_ptr: *mut Frame,
+    pub parent_frame_ptr: *mut Frame,
+    pub call_node_local: crate::ir::Ir::NodeId,
+}
+
+/// L3'' scratch: reusable callee-side table allocations, parked across calls
+/// (the pooled-frame equivalent — no per-call malloc/free for the switch).
+pub(super) struct L3Scratch {
+    pub table: crate::ir::Ir::ValueTable,
+    pub pending: Vec<u16>,
+    pub queue: std::collections::VecDeque<crate::ir::Ir::NodeId>,
+}
+
+/// L3'': pushes the caller context and switches the frame to the callee.
+/// Everything `switch_subgraph` resets is either saved here or intentionally
+/// kept (construct_cache: gid-keyed, valid across retargets — and RETAINED
+/// across calls, unlike a pooled E1 child whose cache is cleared on reuse).
+pub(super) fn enter_same_frame_callee(
+    frame: &mut Frame,
+    graph: &DataFlowGraph,
+    target_sg: crate::ir::Ir::SubGraphId,
+    args: &[crate::value::Value],
+    call_node_local: crate::ir::Ir::NodeId,
+    scratch: &mut Vec<L3Scratch>,
+) -> SavedCallCtx {
+    let sc = scratch.pop().unwrap_or(L3Scratch {
+        table: crate::ir::Ir::ValueTable::new(),
+        pending: Vec::new(),
+        queue: std::collections::VecDeque::new(),
+    });
+    let ctx = SavedCallCtx {
+        subgraph_id: frame.subgraph_id,
+        node_offset: frame.node_offset,
+        value_table: std::mem::replace(&mut frame.value_table, sc.table),
+        pending_inputs: std::mem::replace(&mut frame.pending_inputs, sc.pending),
+        ready_queue: std::mem::replace(&mut frame.ready_queue, sc.queue),
+        control_signal: frame.control_signal.clone(),
+        suspend_state: frame.suspend_state.clone(),
+        suspend_event: frame.suspend_event.clone(),
+        defer_stack: std::mem::take(&mut frame.defer_stack),
+        branch_relays: std::mem::take(&mut frame.branch_relays),
+        linear_fresh: frame.linear_fresh,
+        hot_body: frame.hot_body.take(),
+        cached_child_frame: frame.cached_child_frame.take(),
+        same_fn_prep_cache: frame.same_fn_prep_cache.take(),
+        select_timers: std::mem::take(&mut frame.select_timers),
+        root_frame_ptr: frame.root_frame_ptr,
+        parent_frame_ptr: frame.parent_frame_ptr,
+        call_node_local,
+    };
+    switch_subgraph(frame, graph, target_sg, args);
+    ctx
+}
+
+/// L3'': restores a saved caller context after the callee completed. The
+/// return value must be extracted from the callee frame BEFORE this runs.
+/// The callee-side allocations are parked back into the scratch for reuse
+/// (bounded: v1 callees cannot nest, so the stack stays tiny).
+pub(super) fn restore_caller_ctx(
+    frame: &mut Frame,
+    ctx: SavedCallCtx,
+    scratch: &mut Vec<L3Scratch>,
+) {
+    frame.subgraph_id = ctx.subgraph_id;
+    frame.node_offset = ctx.node_offset;
+    if scratch.len() < 4 {
+        let sc = L3Scratch {
+            table: std::mem::replace(&mut frame.value_table, ctx.value_table),
+            pending: std::mem::replace(&mut frame.pending_inputs, ctx.pending_inputs),
+            queue: std::mem::replace(&mut frame.ready_queue, ctx.ready_queue),
+        };
+        scratch.push(sc);
+    } else {
+        frame.value_table = ctx.value_table;
+        frame.pending_inputs = ctx.pending_inputs;
+        frame.ready_queue = ctx.ready_queue;
+    }
+    frame.control_signal = ctx.control_signal;
+    frame.suspend_state = ctx.suspend_state;
+    frame.suspend_event = ctx.suspend_event;
+    frame.defer_stack = ctx.defer_stack;
+    frame.branch_relays = ctx.branch_relays;
+    frame.linear_fresh = ctx.linear_fresh;
+    frame.hot_body = ctx.hot_body;
+    frame.cached_child_frame = ctx.cached_child_frame;
+    frame.same_fn_prep_cache = ctx.same_fn_prep_cache;
+    frame.select_timers = ctx.select_timers;
+    frame.root_frame_ptr = ctx.root_frame_ptr;
+    frame.parent_frame_ptr = ctx.parent_frame_ptr;
+    frame.state = FrameState::Ready;
+    frame.suspend_state = crate::ir::Ir::SuspendState::NotSuspended;
+    frame.suspend_event = None;
+}
+
 pub(super) fn same_frame_branch_ok(
     graph: &DataFlowGraph,
     frame: &Frame,
@@ -375,17 +493,60 @@ impl<S: LockStrategy> Engine<S> {
     pub(super) fn run_frame_nodes(&self, frame: &mut Frame, fid: FrameId, queue: &QueueHandle<'_>, depth: u32) {
         let graph = frame.graph.clone();
 
+        // L3'': stack of same-frame callee contexts. A leaf call pushes one;
+        // its completion (Return or queue exhaustion) pops. Scoped to this
+        // dispatch invocation — dropped when the frame finishes.
+        let mut l3_saved: Vec<SavedCallCtx> = Vec::new();
+        let mut l3_scratch: Vec<L3Scratch> = Vec::new();
         let mut iter_guard: u64 = 0;
         loop {
         iter_guard += 1;
         if iter_guard > 500000 {
             // Over the limit: mark Failed to prevent process_frame from re-enqueuing and causing a
             // livelock. process_frame's Failed branch wakes the caller or returns NULL.
+            // L3'': a same-frame callee hitting the guard must not fail the
+            // CALLER's frame — restore and continue with a NULL result
+            // (mirrors E1's Completed-or-Failed writeback).
+            if let Some(ctx) = l3_saved.pop() {
+                let cc = graph.downstream_count(
+                    (ctx.call_node_local.0 + ctx.node_offset) as usize,
+                );
+                let call_local = ctx.call_node_local;
+                restore_caller_ctx(frame, ctx, &mut l3_scratch);
+                let v = std::mem::replace(&mut frame.control_signal, crate::ir::Ir::ControlSignal::None);
+                let _ = v;
+                frame.set_value(call_local, crate::value::Value::NULL, cc);
+                notify_downstream(frame, &graph, call_local, NodeId(call_local.0 + frame.node_offset), NodeId(frame.node_offset));
+                iter_guard = 0;
+                continue;
+            }
             frame.state = FrameState::Failed;
             return;
         }
             // Check the control signal (return/break/continue already triggered).
             if !matches!(frame.control_signal, ControlSignal::None) {
+                // L3'': a leaf callee's Return restores the caller context in
+                // place and relays the value to the call node — no frame
+                // completion, no scheduler round-trip. Cross-function returns
+                // are data, not signals, so nothing propagates (same matrix as
+                // finish_call_in_caller).
+                if let ControlSignal::Return(v) = std::mem::take(&mut frame.control_signal) {
+                    if let Some(ctx) = l3_saved.pop() {
+                        let cc = graph.downstream_count(
+                            (ctx.call_node_local.0 + ctx.node_offset) as usize,
+                        );
+                        let call_local = ctx.call_node_local;
+                        restore_caller_ctx(frame, ctx, &mut l3_scratch);
+                        frame.set_value(call_local, v, cc);
+                        notify_downstream(frame, &graph, call_local, NodeId(call_local.0 + frame.node_offset), NodeId(frame.node_offset));
+                        if !frame.branch_relays.is_empty() {
+                            relay_branch_value(frame, &graph, call_local);
+                        }
+                        iter_guard = 0;
+                        continue;
+                    }
+                    frame.control_signal = ControlSignal::Return(v);
+                }
                 break;
             }
             // Check whether the frame has been cancelled.
@@ -401,6 +562,24 @@ impl<S: LockStrategy> Engine<S> {
             let local_id = match frame.pop_ready() {
                 Some(n) => n,
                 None => {
+                    // L3'': queue exhaustion inside a same-frame callee = its
+                    // completion (expression bodies never emit Return; the
+                    // value sits in the return_node slot). Extract, restore,
+                    // relay to the call node.
+                    if let Some(ctx) = l3_saved.pop() {
+                        let ret = extract_child_return(frame, &graph);
+                        let cc = graph.downstream_count(
+                            (ctx.call_node_local.0 + ctx.node_offset) as usize,
+                        );
+                        let call_local = ctx.call_node_local;
+                        restore_caller_ctx(frame, ctx, &mut l3_scratch);
+                        frame.set_value(call_local, ret, cc);
+                        notify_downstream(frame, &graph, call_local, NodeId(call_local.0 + frame.node_offset), NodeId(frame.node_offset));
+                        if !frame.branch_relays.is_empty() {
+                            relay_branch_value(frame, &graph, call_local);
+                        }
+                        continue;
+                    }
                     break;
                 }
             };
@@ -903,6 +1082,33 @@ impl<S: LockStrategy> Engine<S> {
                         );
                         if !frame.branch_relays.is_empty() {
                             relay_branch_value(frame, &graph, pending.call_node_local);
+                        }
+                        continue;
+                    } else if inline_sync
+                        && pending.closure_val.is_none()
+                        && graph.callee_same_frame(pending.target_sg.0 as usize)
+                    {
+                        // L3'': leaf straight-line callee — execute it in THIS
+                        // frame (context swap via the tail-call switch machine)
+                        // instead of a child-frame launch. Completion is
+                        // intercepted at the Return signal or queue exhaustion.
+                        l3_saved.push(enter_same_frame_callee(
+                            frame,
+                            &graph,
+                            pending.target_sg,
+                            &pending.args,
+                            pending.call_node_local,
+                            &mut l3_scratch,
+                        ));
+                        // Linear-planned callee: run its plan to completion
+                        // right here (the E9 fast path the pooled E1 child
+                        // gets); completion then lands in the interceptors
+                        // (Return at loop top / queue-exhaustion at pop). A
+                        // Bailed plan simply falls back to the queue loop.
+                        if let Some(bplan) = graph.linear_plan(pending.target_sg.0 as usize) {
+                            if !bplan.is_empty() {
+                                let _ = self.exec_plan(frame, fid, queue, depth, bplan, &graph);
+                            }
                         }
                         continue;
                     } else if inline_sync {
