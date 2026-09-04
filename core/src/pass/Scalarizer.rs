@@ -1705,11 +1705,17 @@ pub(crate) fn build_scalar_prog_for_ex(
                 continue; // nested selects (their own arms get the same check)
             }
             let cf = n.compute_fn.0;
+            // Trapping ops stay OUT of eager arm evaluation: the select
+            // executor materializes every arm value unconditionally, but the
+            // generic path only runs the taken arm. ArrayIndex (bounds
+            // PANIC) and FieldGet (throws FieldError eagerly at the op, not
+            // as a value) are observable on arms that never run. The scalar
+            // div/mod/shift traps are VALUE-level throws (an unselected arm
+            // produces a Throw value that is simply dropped — observably
+            // identical to never running the arm), so they stay admissible.
             let pure_value = cf == 0
                 || cf == 47
-                || cf == 279 /* deref READ */
-                || cf == 30 /* field get */
-                || cf == 32 /* array/str element read (pure) */
+                || cf == 279 /* deref READ (non-Cell operand degrades to a value clone) */
                 || cf == 29 /* record construct: allocation observable only
                              through its VALUE — dead chains are DCE'd
                              (liveness-driven, below) */
@@ -1911,6 +1917,7 @@ pub(crate) fn build_scalar_prog_for_ex(
     let outer_count = outer_gids.len();
     let total = slot_count + outer_count;
     let ops = optimize_sops_ex(ops, param_count, total, return_slot, export_slots);
+
     let (dops, consts, return_ref, slot_ops) =
         lower_to_def_use_ex(ops, param_count, slot_count, outer_count, return_slot, undef_remap);
     let mut exports: Vec<(u32, u32)> = Vec::new();

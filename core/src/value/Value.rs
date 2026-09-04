@@ -2626,6 +2626,12 @@ impl RecordRef {
             .add(std::mem::size_of::<RecordBlock>());
         if shape.field_packs[idx] == PACK_VALUE_SLOT {
             let slot = tail.add(shape.pack_offsets[idx] as usize) as *mut Value;
+            // Drop the OLD slot value before overwriting — ptr::write alone
+            // overwrites without destructing, leaking the previous field
+            // value's refcount (rec.f = v in a loop leaked every old value:
+            // the mirror's string-builder loop accumulated O(n²) bytes and
+            // OOM-killed the process on large dumps).
+            std::ptr::drop_in_place(slot);
             std::ptr::write(slot, v);
         } else {
             pack_write(tail as *mut u8, shape.field_packs[idx], shape.pack_offsets[idx], &v);

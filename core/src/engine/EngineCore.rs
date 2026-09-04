@@ -169,7 +169,16 @@ fn classify_same_frame_callees(graph: &mut DataFlowGraph) {
             if gid as usize >= graph.node_count() {
                 break;
             }
-            if banned(graph.node(gid as usize).compute_fn.0) {
+            let node = graph.node(gid as usize);
+            if banned(node.compute_fn.0)
+                // Gates inside a same-frame callee execute their arms via the
+                // E7 branch relay in the switched frame; the relay's outer-
+                // input snapshot mis-resolves a compound (multi-node) else-if
+                // condition in nested wrap chains (f3(98) reproduced as arm3
+                // instead of arm2). Until that path is reworked, keep
+                // same-frame callees strictly straight-line.
+                || node.kind == crate::ir::Ir::NodeKind::Gate
+            {
                 bad = true;
                 break;
             }
