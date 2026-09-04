@@ -86,6 +86,12 @@ jobs:
         env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
         run: bash tests/scripts/native_slice0.sh
 
+      # 切片 1:控制流(if 值/while/loop+break+continue)+ 多函数递归调用。
+      - name: Stage 2 native slice1
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/native_slice1.sh
+
       # 调度稳定性哨兵:历史上 Multi 模式挂死/抖动的专项电池。
       - name: await_loop stability battery (x30)
         shell: bash

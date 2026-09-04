@@ -244,6 +244,64 @@ impl<'a> InferContext<'a> {
                                 }
                             }
                         }
+                        // ── S2c: bare free-function call precedence ──
+                        // (a) selective-import item (explicit binding) is
+                        //     authoritative over the std predeclare level:
+                        //     record the ruling for the IR binding layer —
+                        //     bare keys are globally contested by std names
+                        //     (`get` ×3) and the collision tripwire would
+                        //     veto the call even though sema adjudicated it
+                        //     through the import binding.
+                        // (b) zero-silence: a bare name resolved from the
+                        //     ROOT (std predeclare) level with multiple
+                        //     global owners has no single correct answer —
+                        //     error at the call site (previously silent env
+                        //     last-writer-wins, starving downstream inference
+                        //     and surfacing as a pattern-position ambiguity
+                        //     far from the cause).
+                        {
+                            let cur_mod: &str = self
+                                .instantiation_ctx
+                                .as_ref()
+                                .map(|i| i.module_name.as_ref())
+                                .unwrap_or(&self.current_module_name);
+                            let alias_owned_here = self
+                                .sema_result
+                                .module_ownership
+                                .alias_keys
+                                .get(cur_mod)
+                                .is_some_and(|s| s.contains(&**name));
+                            if alias_owned_here {
+                                if let Some(crate::sema::Sema::AliasTarget::Symbol(mangled)) =
+                                    self.sema_result.get_import_alias(name)
+                                {
+                                    if let Some((mp, _)) = mangled.rsplit_once('.') {
+                                        let key = crate::sema::Sema::module_expr_key(
+                                            cur_mod,
+                                            expr.0 as u64,
+                                        );
+                                        self.sema_result
+                                            .bare_call_targets
+                                            .insert(key, mp.to_string().into_boxed_str());
+                                    }
+                                }
+                            } else if self.sema_result.env.lookup_at_root(env, name).is_some() {
+                                if let Some(owners) = self.sema_result.func_sig_owners.get(&**name) {
+                                    if owners.len() >= 2 {
+                                        let span = ast.expr(expr).span;
+                                        self.add_error_at(
+                                            &format!(
+                                                "ambiguous call '{}': [{}] — qualify the call or bind it with a selective import",
+                                                name,
+                                                owners.join(", ")
+                                            ),
+                                            span.line,
+                                            span.column,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         let t = self.infer_expr(*callee, ast, env, None);
                         // S2: 单构造器带参调用经 predeclared 绑定推理——callee 类型
                         // 是 Fn(参)->Adt(或零字段值绑定直接是 Adt);名字确是

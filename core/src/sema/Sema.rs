@@ -159,6 +159,23 @@ impl EnvArena {
         self.envs[env.0 as usize].bindings.get(name).copied()
     }
 
+    /// Look up `name` walking up from `env`, returning the type ONLY when the
+    /// binding lives in the ROOT env (the std predeclare/global level). A hit
+    /// in any deeper env (locals, same-module definitions, selective-import
+    /// items) returns None — those are deliberate bindings that shadow the
+    /// global level silently. Used by the bare-call multi-owner zero-silence
+    /// check: only root-level resolutions are ambiguity candidates.
+    pub fn lookup_at_root(&self, env: EnvId, name: &str) -> Option<TypeHandle> {
+        let mut env = env;
+        loop {
+            let node = &self.envs[env.0 as usize];
+            if let Some(&ty) = node.bindings.get(name) {
+                return if node.parent.is_none() { Some(ty) } else { None };
+            }
+            env = node.parent?;
+        }
+    }
+
     /// Walk up from `env` looking for a binding named `name` that satisfies
     /// `pred` (skipping same-named bindings that do not satisfy the predicate).
     /// Used for method-call dispatch `recv.method(args)` → `method(recv, args)`,
@@ -865,6 +882,13 @@ pub struct SemaResult {
     /// short key, so a user module named like a std module no longer errors
     /// or misbinds (BOOTSTRAP 1C).
     pub module_func_call_targets: FxHashMap<u64, Box<str>>,
+    /// S2c: bare free-function calls adjudicated by a selective-import item
+    /// (explicit binding beats the std predeclare level). Key =
+    /// module_expr_key(owner module, call expr) — same family as
+    /// call_instantiations; value = target module logical path. Consumed by
+    /// the IR bare-call branch to bind by the full mangled key, bypassing
+    /// the std-contested bare-key tripwire.
+    pub bare_call_targets: FxHashMap<u64, Box<str>>,
     /// Module-constant-access recv ExprId key → mangled name
     /// (module_path.field).
     ///
@@ -990,6 +1014,7 @@ impl SemaResult {
             witness_table: WitnessTable::new(),
             module_func_recv_exprs: FxHashSet::default(),
             module_func_call_targets: FxHashMap::default(),
+            bare_call_targets: FxHashMap::default(),
             module_const_recv_exprs: FxHashMap::default(),
             pattern_ctor_types: FxHashMap::default(),
             captures: FxHashMap::default(),
@@ -1950,6 +1975,7 @@ impl SemaResult {
                 self.call_instantiations.remove(k);
                 self.module_func_recv_exprs.remove(k);
                 self.module_func_call_targets.remove(k);
+                self.bare_call_targets.remove(k);
                 self.module_const_recv_exprs.remove(k);
                 self.super_dispatches.remove(k);
             }

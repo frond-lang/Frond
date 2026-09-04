@@ -307,7 +307,17 @@ impl<'a> InferContext<'a> {
                         // Look up the symbol by bare name in the module env (does not traverse
                         // the parent env, to avoid importing global symbols).
                         if let Some(sym_ty) = self.sema_result.env.lookup_local(module_env, item.name) {
-                            self.sema_result.env.define(env, item.alias.unwrap_or(item.name), sym_ty);
+                            // S2c precedence at the env layer: a selective
+                            // import item is an EXPLICIT binding — when the
+                            // target env already holds the name (std
+                            // predeclares at a shared root), first-wins
+                            // `define` would silently drop the item and bare
+                            // calls resolve to the ambient binding instead.
+                            // Redefine: explicit beats ambient.
+                            let local_name = item.alias.unwrap_or(item.name);
+                            if !self.sema_result.env.define(env, local_name, sym_ty) {
+                                self.sema_result.env.redefine(env, local_name, sym_ty);
+                            }
                             // Register the alias for the IR binding layer
                             // (sema.import_aliases → IrBuilder's func_subgraphs /
                             // global_var_slots alias keys). Without this the

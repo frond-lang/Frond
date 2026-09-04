@@ -560,16 +560,104 @@ TargetMachine .obj → 资产 lld 链接 → 跑产物回显退出码)。
 
 **工程事实(handleprobe 实证,Back 架构依据)**:LLVM u64 句柄经
 局部值/函数参数/函数返回/数组元素/List 元素/Map 值/nullable/模块 var
-读回后 FFI marshal **全部安全**;**record 字段读回 = 软类型值,FFI
-call 收 0**(引擎已知洞)——Back 状态一律 Map/参数,禁含 u64 字段的
-record。字面量走 LLVMConstIntOfString/LLVMConstRealOfString(文本
+读回后 FFI marshal **全部安全**。~~record 字段读回 = 软类型值,FFI
+call 收 0~~(**2026-09-04 复测已被引擎治好**,见 附三)。字面量走 LLVMConstIntOfString/LLVMConstRealOfString(文本
 直达 APInt/APFloat,f128 全精度;radix/前缀/下划线自剥,负号按二补)。
 
 **值表示记账**:切片 0 标量全程 SSA/栈槽零堆值;v0 Value 盒(计划 4e)
 随聚合/str/引用切片(需 frond_rt C 层)进入,骨架表示无关。
 
-**下一片 = 切片 1**:控制流(IfE/嵌套 BlockE/逻辑短路/循环)+ 多
-函数与调用(命名/mangled)→ 再聚合/str + frond_rt + v0 盒。
+**下一片 = 切片 1**:~~控制流(IfE/嵌套 BlockE/逻辑短路/循环)+ 多
+函数与调用(命名/mangled)→ 再聚合/str + frond_rt + v0 盒~~
+(**2026-09-04 切片 1 落地**,见 附四;短路先行落地见 附三)。
+
+## 附四:Stage 2 切片 1 记录(2026-09-04)
+
+**范围**:IfE 值表达式(结果槽 + cond_br 两臂 store + merge load;
+无 else 非 void = 报错,对齐引擎口径)/块表达式作用域(**副本式**:
+块内定义只进 slots/tyslots 副本,退出即弃,免保存-恢复栈)/嵌套
+遮蔽/WhileS(条件块回边)/LoopS/BreakS/ContinueS/免花括号循环体的
+AssignE/入口模块多函数(**两相装配**:原型先行解互递归;签名取
+`Envs.lookup_local(root_env)` 的 TFn → `Arena.fn_parts`;main 强制
+i32() ABI,其余 mangle `frond_<name>` 防 CRT 碰撞)/CallE(实参逐一
+conv 到参数槽类型)/ReturnS 按函数返回类型泛化(void → ret_void)。
+
+**终止路径纪律(flow_stopped 模块 var)**:return/break/continue 发
+终结指令后置位;一切表达式组合器(binary/unary/AsCast/call/if-cond/
+short-circuit/赋值)在消费子表达式值前检查——stopped 路径的 0u64
+占位句柄**不得**再进任何 build(FFI null = 段错误)。if 双臂终止 →
+merge 无前驱,补 `unreachable` 保 verifier。while/loop 体后回边仅在
+未终止时发出;循环上下文(break/continue 目标块)List<u64> 栈。
+
+**验收**:`tests/fixtures/native_slice1`(5 用例)退出码全中
+11/210/37/244/31——if 值嵌套/while 累加/loop+continue+break/fib(12)
+递归+双函数/块遮蔽+if 值;driver = `tests/scripts/native_slice1.sh`,
+CI 五平台矩阵已挂(负套件后)。语料退出码全锁 0..255(POSIX wait
+status 8 位截断,保 CI 可移植)。checkmany 引擎侧 sema 先行验证 0 错。
+
+**雷**:无 else 的 if **不得**预创建 else 块——空块无终结指令 =
+"Basic Block does not have terminator" Broken module(LLVM 硬规则:
+每块必恰一条终结指令,孤儿块同罪);块按形态懒创建。
+
+**下一片 = 切片 2**:聚合(record 构造/字段)+ 数组 + str 字面量 →
+frond_rt C 层起步(v0 Value 盒);跨模块函数与 monomorph 实例 lower
+随自举临近再排。
+
+## 附五:S2c 导入优先级格 + 裸名多主零静默(2026-09-04,用户裁决"地基要稳")
+
+**动机**:import .{} 现代化试点(Relate 转换)三连炸,暴露语言层三处
+结构性缺口——选择性导入此前在 Frond 是半残特性。
+
+1. **(a) 显式条目权威**:sema 在裸调用点记裁决(`bare_call_targets`,
+   键 = module_expr_key 哈希,与 call_instantiations 同族);IR 裸调用
+   分支(`compile_call`)按完整 mangled 键直绑,绕过被 std 名(`get`×3)
+   争夺的裸键绊线——此前 0b 段把别名注册记成冲突键,绊线推翻 sema 已
+   裁决的显式绑定。
+2. **(b) 裸名多主零静默**:裸名自由函数经 **root(std 预declare)层**
+   解析且全局 ≥2 主人 → 调用点响亮错("ambiguous call '{n}': [owners]
+   — qualify the call or bind it with a selective import")。守卫 =
+   `lookup_at_root`(仅 root 层命中才算歧义候选:局部/本模块定义/显式
+   条目都在更深层,天然胜出不报)。此前 env last-writer-wins 静默,
+   饿死下游推断,在模式位爆出误导性歧义错(离病因一个间接层)。
+3. **env 层优先级**:选择性条目 `define` 失败(与同层既有绑定撞名,
+   define 首胜制)→ `redefine` 覆盖。治 frondc 镜像管线 dep 模块共享
+   root env 导致条目丢失、裸名回落 std 绑定的病灶(引擎管线每模块
+   独立 env 故沙箱不复现——镜像管线结构性差异首次显形)。
+
+**落地**:引擎 Sema.rs(lookup_at_root/bare_call_targets/purge)+
+ModuleEnv.rs(redefine)+ CallInfer.rs(裁决记录+零静默)+ Builder/Call.rs
+(bare_sema_target 直绑);镜像 Envs/Modenv/Semares(import_alias_owners)/
+Infer 四文件同步(消息逐字节一致)。Rust/Java/Haskell 同款"显式>glob"
+格 + 零静默教义从构造器位扩展到自由函数位。
+
+**验收**:三场景沙箱(显式胜出跑通/无显式响亮错带主人清单/单主无扰);
+**Relate 全量转换(Arena 23 名 + Semares 2 名,130 处)树内加载绿**;
+顺带咬出并修 Tyops 裸 `resolve`(与 std.net.Dns 撞名,潜伏 last-wins
+赌对——零静默的第一笔红利)。全量门禁见当日电池。
+
+**import{} 现代化装备**:`tmp_probe/selimport.py` 转换器(std 黑名单
+防线保留为冗余保险;根修后 get 类不再需要);推广(Infer 848 处/
+Parse 的 Lex.* 零参值)待后续批次。
+
+## 附三:地基整固三裁决(2026-09-04,用户拍板"地基要稳")
+
+1. **libs/llvm 模板删除**:零 import 消费者(README 自述拷贝式分发,
+   实际三个消费者全是物理副本)、三副本发散、val 参数名 bug 潜伏数日
+   无人发现——backend/Llvm.frond 自此为唯一来源(头注释已改);
+   llvm_bind/llvm_probe 测试副本随引擎验收各自演进。
+2. **"record 字段软类型"引擎洞销案**:handleprobe 五形态实证(单字段/
+   混合家族/嵌套/List 装载/跨函数的 record 字段读回值过 LLVMTypeOf 真
+   FFI oracle 全绿;迭代拼接 str 过 lookup 亦绿)——洞已被引擎侧治好
+   (marshal as_i64 仍只认硬 tag,治在字段读取侧:读回重建硬 tag)。
+   三副本 Llvm.frond + Back.frond 头注释过时段落全部更正;Back 的
+   Map/参数状态架构保留(已验证稳定,非性能约束),record 形态解禁。
+3. **&&/|| 短路化**(切片 1 前置件):引擎语义 = 短路(Bug #38,
+   `lhs && rhs => if lhs { rhs } else { false }`),切片 0 的非短路
+   bitwise 形态只在纯操作数下等价——Back 改为槽位 + cond_br 真短路
+   (短路值预存槽、RHS 仅在求值侧覆写、merge load 收口);fref(函数
+   句柄)穿进 lowering 链(新块创建需要,控制流切片的地基)。验收:
+   05_shortcircuit(x=0 除零守卫,非短路实现原生侧 = sdiv 0 崩溃)
+   exit 1 ✓,native_slice0 5/5。
 
 ## 附:Stage 2 首刀记录(2026-08-31,macOS 首绿)
 

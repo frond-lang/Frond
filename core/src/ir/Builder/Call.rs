@@ -760,7 +760,37 @@ impl<'a> IrBuilder<'a> {
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
             let inst_id = self.sema.call_instantiations.get(&call_inst_key);
             let mangled = inst_id.map(|&id| format!("{}#{}", name, id));
-            match self.resolve_func("compile_call", name, mangled.as_deref(), None) {
+            // S2c: sema's selective-import ruling is AUTHORITATIVE for bare
+            // calls — bind by the full mangled key (monomorph instance
+            // preferred), bypassing the string-key families entirely: the
+            // bare key is std-contested (`get` ×3) and the tripwire would
+            // veto the call even though sema adjudicated the import binding.
+            let bare_sema_target: Option<(String, String, SubGraphId)> = self
+                .sema
+                .bare_call_targets
+                .get(&call_inst_key)
+                .and_then(|mp| {
+                    if let Some(m) = mangled.as_deref() {
+                        if let Some(&sg) = self.func_subgraphs.get(m) {
+                            return Some((mp.to_string(), m.to_string(), sg));
+                        }
+                    }
+                    let full = format!("{}.{}", mp, name);
+                    self.func_subgraphs
+                        .get(full.as_str())
+                        .map(|&sg| (mp.to_string(), full, sg))
+                });
+            if bare_sema_target.is_some() && self.internal_access_blocked(name) {
+                self.errors.push(self.internal_access_diag(name));
+            }
+            let resolved: Option<Result<SubGraphId, String>> = match bare_sema_target {
+                Some((mp, key, sg)) => {
+                    self.log_call_bind("bare_sema_target", name, Some(&mp), &key, sg);
+                    Some(Ok(sg))
+                }
+                None => self.resolve_func("compile_call", name, mangled.as_deref(), None),
+            };
+            match resolved {
                 Some(Ok(target_sg)) => {
                     self.graph.set_call_target(call_node, target_sg);
                     // is_async is derived at runtime by compute_call_launch from has_suspend;

@@ -23,7 +23,7 @@ fun run_unify(a: TypeArena, t1: u32, t2: u32, label: str): void {
 fun run_unify_resolve(a: TypeArena, t1: u32, t2: u32, label: str): void {
     match unify(a, t1, t2) {
         Ok(_) => {
-            val r = resolve(a, t1)
+            val r = Arena.resolve(a, t1)
             line(label + " -> ok resolve=" + display(a, r))
         },
         Error(e) => { line(label + " -> err " + unify_err_str(e)) }
