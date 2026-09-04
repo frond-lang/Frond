@@ -16,7 +16,6 @@
 //   cd Frond/frondc && frond run -- lex <abs-path-to-file.frond>
 
 import std.os.Proc
-import std.time.Instant
 import std.io.Fs
 import std.io.Path
 import std.collections.List
@@ -132,7 +131,8 @@ async fun cmd_load(cmd: str, args: str[]): void {
 // ─── 1E check:sema 全管线 + sema-dump v1 ─────────────────────────
 // 镜像 Rust dump_sema(CommonPipeline::run_sema_pipeline_or_exit):
 // prepipeline(root/std 层 + 别名 + POPULATE-FIRST + predeclare 轮)→
-// check 循环(builtin → std → dep → entry)→ 有错 exit(1),无错 dump。
+// check 循环(builtin → std → dep → entry,新增 errors/warnings 即时打
+// stderr)→ 有错免 dump;无错 dump。
 
 // 键("std/io/Fs.frond")→ 逻辑路径("std.io.Fs")。
 fun key_to_logical(key: str): str {
@@ -157,7 +157,30 @@ fun check_one(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAst,
     Check.check_module_with_env(ctx, a, s, m, env0, all_modules)
 }
 
-fun run_sema(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst): str? {
+// 分段诊断(镜像 Rust run_sema_pipeline_or_exit 的 stderr 契约):每模块
+// check 完打印新增 errors/warnings;格式 "{path}:{line}:{column}: {message}"
+// (warning 多插 " warning:")。error 前缀只有 builtin 段查 err 自带路径,
+// std/dep/entry 段用段键;warning 前缀一律自带路径优先。
+fun print_diag_segment(s: SemaRes, err_base: usize, warn_base: usize,
+    fallback: str, err_use_path: bool): void {
+    var ei: usize = err_base
+    while ei < s.errors.len() {
+        val e0 = s.errors.get(ei) ?? Semares.SErr("", 0, 0, null)
+        val p = if err_use_path { (e0.file_path ?? fallback) } else { fallback }
+        eprintln("{p}:{e0.line}:{e0.column}: {e0.message}")
+        ei = ei + 1
+    }
+    var wi: usize = warn_base
+    while wi < s.warnings.len() {
+        val w0 = s.warnings.get(wi) ?? Semares.SErr("", 0, 0, null)
+        val wp = w0.file_path ?? fallback
+        eprintln("{wp}:{w0.line}:{w0.column}: warning: {w0.message}")
+        wi = wi + 1
+    }
+}
+
+fun run_sema(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
+    entry_filename: str): str? {
     val a = types.Arena.new_arena()
     val s = Semares.new_semares()
     val ctx = Ictx.new_ictx()
@@ -182,7 +205,6 @@ fun run_sema(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst): str?
         i = i + 1
     }
     val builtin_paths = StdPaths.builtin_paths()
-    val t_aliases = Instant.now()
     i = 0
     while i < builtin_paths.len() {
         match loader_module(loader, builtin_paths[i]) {
@@ -191,7 +213,6 @@ fun run_sema(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst): str?
         }
         i = i + 1
     }
-    val t_builtin_pre = Instant.now()
     val all_modules = List.empty<ModuleAst>()
     i = 0
     while i < builtin_paths.len() {
@@ -224,7 +245,6 @@ fun run_sema(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst): str?
         Populate.populate_module(a, s, all_modules.get(i) ?? entry_module, all_modules)
         i = i + 1
     }
-    val t_populate = Instant.now()
     val std_paths2 = StdPaths.std_paths()
     i = 0
     while i < std_paths2.len() {
@@ -244,57 +264,57 @@ fun run_sema(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst): str?
         }
         i = i + 1
     }
-    val t_predeclare2 = Instant.now()
+    // check: builtin → std → dep → entry;每模块新增 errors/warnings 即时
+    // 打 stderr(镜像 run_sema_pipeline_or_exit 的分段水位诊断)。
     i = 0
     while i < builtin_paths.len() {
         match loader_module(loader, builtin_paths[i]) {
             null => {}
             m => {
-                val m0 = Instant.now()
+                val eb = s.errors.len()
+                val wb = s.warnings.len()
                 Check.check_module_with_env(ctx, a, s, m, root_env, all_modules)
-                eprintln("[PMOD-B] {builtin_paths[i]} {m0.elapsed().as_millis()}ms")
-            }
+                print_diag_segment(s, eb, wb, builtin_paths[i], true)
+            },
         }
         i = i + 1
     }
-    val t_check_builtin = Instant.now()
     i = 0
     while i < std_paths2.len() {
         match loader_module(loader, std_paths2[i]) {
             null => {}
             m => {
-                val m0 = Instant.now()
+                val eb = s.errors.len()
+                val wb = s.warnings.len()
                 Check.check_module_with_env(ctx, a, s, m, std_env, all_modules)
-                eprintln("[PMOD-S] {std_paths2[i]} {m0.elapsed().as_millis()}ms")
-            }
+                print_diag_segment(s, eb, wb, std_paths2[i], false)
+            },
         }
         i = i + 1
     }
-    val t_check_std = Instant.now()
     i = 0
     while i < dep_keys.len() {
         match loader_module(loader, dep_keys.get(i) ?? "") {
             null => {}
-            m => { Check.check_module_with_env(ctx, a, s, m, root_env, all_modules) }
+            m => {
+                val eb = s.errors.len()
+                val wb = s.warnings.len()
+                Check.check_module_with_env(ctx, a, s, m, root_env, all_modules)
+                print_diag_segment(s, eb, wb, dep_keys.get(i) ?? "", false)
+            },
         }
         i = i + 1
     }
-    Check.check_module_with_env(ctx, a, s, entry_module, root_env, all_modules)
-    val t_check_user = Instant.now()
+    {
+        val eb = s.errors.len()
+        val wb = s.warnings.len()
+        Check.check_module_with_env(ctx, a, s, entry_module, root_env, all_modules)
+        print_diag_segment(s, eb, wb, entry_filename, false)
+    }
     if s.errors.len() > 0 {
-        // 调试出口:镜像错面(前 N 条;对齐 stderr 输出属后续项)。
-        var ei: usize = 0
-        while ei < s.errors.len() && ei < 12 {
-            val e0 = s.errors.get(ei) ?? Semares.SErr("", 0, 0, null)
-            println("[mir-err] {e0.message}")
-            ei = ei + 1
-        }
         return null
     }
-    val out0 = Sdump.render(a, s)
-    val t_end = Instant.now()
-    eprintln("[PROF] builtin_pre={t_builtin_pre.duration_since(t_aliases).as_millis()}ms populate={t_populate.duration_since(t_builtin_pre).as_millis()}ms predeclare2={t_predeclare2.duration_since(t_populate).as_millis()}ms check_builtin={t_check_builtin.duration_since(t_predeclare2).as_millis()}ms check_std={t_check_std.duration_since(t_check_builtin).as_millis()}ms check_user={t_check_user.duration_since(t_check_std).as_millis()}ms render={t_end.duration_since(t_check_user).as_millis()}ms")
-    out0
+    Sdump.render(a, s)
 }
 
 // std 文件直入时按 std 键名归类(与引擎 Dump.canonical_std_entry_name 同规):
@@ -342,10 +362,8 @@ async fun dump_sema_entry(entry_raw: str, std_root: str, std_cache: Map<str, Mod
                     loader.search.push(Manifest.parent_dir_of(entry))
                     Loader.force_load_std(loader).await()
                     val dep_keys = Loader.load_transitive_imports(loader, entry_module).await()
-                    match run_sema(loader, dep_keys, entry_module) {
-                        null => {
-                            println("[probe] run_sema null")
-                        },
+                    match run_sema(loader, dep_keys, entry_module, entry) {
+                        null => {},
                         dump => { print(dump) },
                     }
                 },

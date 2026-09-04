@@ -23,7 +23,6 @@ import std.io.Path
 import std.core.types.Str
 import std.collections.List
 import std.collections.Map
-import std.time.Instant
 import builtin.io.Console
 import syntax.Ast
 import syntax.AstCodec
@@ -184,15 +183,12 @@ pub async fun warm(c: DCache?, std_root: str): Async<Warmed> {
         null => { Warmed(cache, fd) }
         cc => {
             val keys = StdPaths.builtin_paths() ++ StdPaths.std_paths()
-            val t0 = Instant.now()
             val raws = List.empty<u8[]>()
             var i: usize = 0
             while i < keys.len() {
                 raws.push(read_snapshot(cc, std_root, keys[i]).await())
                 i = i + 1
             }
-            val t_read = Instant.now()
-            var hits: usize = 0
             i = 0
             while i < keys.len() {
                 val bytes = raws.get(i) ?? []
@@ -203,11 +199,9 @@ pub async fun warm(c: DCache?, std_root: str): Async<Warmed> {
                     val words = unpack_words(bytes, 56, hdr[6] as usize)
                     cache.set(keys[i], AstCodec.decode_module(words))
                     fd.set(keys[i], true)
-                    hits = hits + 1
                 }
                 i = i + 1
             }
-            eprintln("[ASTCACHE] warm hits={hits}/{keys.len()} read={t_read.duration_since(t0).as_millis()}ms decode={Instant.now().duration_since(t_read).as_millis()}ms")
             Warmed(cache, fd)
         },
     }
@@ -268,11 +262,8 @@ pub async fun flush(c: DCache?, std_root: str, cache: Map<str, ModuleAst>,
         null => {}
         cc => {
             // 目录惰性建(已存在则 Error,忽略);之后的写失败均按单文件降级。
-            val t0 = Instant.now()
             val _m = Dir.create(Path.from(cc.dir)).await()
             val keys = cache.keys()
-            var todo: usize = 0
-            var written: usize = 0
             var i: usize = 0
             while i < keys.len() {
                 val key = keys[i]
@@ -283,22 +274,16 @@ pub async fun flush(c: DCache?, std_root: str, cache: Map<str, ModuleAst>,
                 match cache.get(key) {
                     null => {}
                     m => {
-                        todo = todo + 1
                         match File.stat_of(Path.from(disk_path(std_root, key))).await() {
                             Error(_) => {}
                             Ok(st) => {
-                                if write_snapshot(cc, key, st.size as i64, st.mtime_ns,
-                                    st.ctime_ns, AstCodec.encode_module(m)).await() {
-                                    written = written + 1
-                                }
+                                val _w = write_snapshot(cc, key, st.size as i64, st.mtime_ns,
+                                    st.ctime_ns, AstCodec.encode_module(m)).await()
                             },
                         }
                     },
                 }
                 i = i + 1
-            }
-            if todo > 0 {
-                eprintln("[ASTCACHE] flush written={written}/{todo} {t0.elapsed().as_millis()}ms")
             }
         },
     }

@@ -1759,11 +1759,15 @@ pub fn value_equals_with_arena(a: &Value, b: &Value, arena: &ValueArena) -> bool
         }
         (Value::Str(a), Value::Str(b)) => a == b,
         (Value::Record(x), Value::Record(y)) => {
-            std::sync::Arc::ptr_eq(x.shape(), y.shape())
-                || (*x.shape() == *y.shape()
-                    && x.field_count() == y.field_count()
-                    && (0..x.field_count())
-                        .all(|i| value_equals_with_arena(&x.field(i), &y.field(i), arena)))
+            // Shape Arc identity is a FAST PATH for structural compatibility
+            // (same constructor) only — the shape is shared per construction
+            // site, so ptr_eq must never short-circuit the equality itself:
+            // two instances of the same constructor carry different field
+            // values and are NOT equal.
+            (std::sync::Arc::ptr_eq(x.shape(), y.shape()) || *x.shape() == *y.shape())
+                && x.field_count() == y.field_count()
+                && (0..x.field_count())
+                    .all(|i| value_equals_with_arena(&x.field(i), &y.field(i), arena))
         }
         (Value::Ref(ax), Value::Ref(bx)) => heap_equals(ax.as_ref(), bx.as_ref(), arena),
         _ => false,

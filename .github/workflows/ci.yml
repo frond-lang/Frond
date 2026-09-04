@@ -1,13 +1,11 @@
 # CI — 跨平台一致性的执法者(BOOTSTRAP_PLAN.md 4d):
 #   suite          五平台矩阵跑 functional + negative + await_loop 稳定性电池
 #                  (linux-x64/linux-arm64/macos-arm64/macos-x64[Rosetta]/windows-x64)
-#                  调度器 = 确定性事件循环(M3b 起唯一,worker 池已删除)
+#                  调度器 = 确定性事件循环(M3b 起唯一,worker 池已删除,
+#                  offload 亦已物理删除 — 单核 JS 式协程切片)
 #   differential   四平台跑镜像差分 diff_lex/diff_ast/diff_load(Rust 引擎
 #                  vs frondc 逐字节);differential-heavy 在 linux-x64 加
 #                  diff_tyops + diff_sema(重负载)
-#   offload        五平台 L2 极限 soak(FROND_OFFLOAD=1 + MIN=1,每一处
-#                  合格调用都走 worker):调度时序 bug 按 OS 调度器分布,
-#                  condvar 三平台三实现,全矩阵覆盖
 #   suite-musl     linux musl 静态链接:套件(FROND_SKIP 掉无 LLVM 发行物
 #                  的三套)——libc/分配器面差异的额外覆盖
 #   build-windows-arm64  aarch64-pc-windows-msvc 交叉构建(实验性,只验编译)
