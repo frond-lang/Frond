@@ -1,8 +1,11 @@
-// frondc — 自举编译器 CLI(Stage 1)。薄分发层;实现按目录模块组织:
+// frondc — 自举编译器 CLI(Stage 1 + Stage 2 切片 0)。薄分发层;
+// 实现按目录模块组织:
 //
 //   syntax/  前端(1A/1B):Lex / Ast / Parse / Dump(tokens/ast 呈现)
 //   module/  模块加载(1C,镜像 Rust core/src/module/):
 //            StdPaths(生成清单)/ Toml / Loader / Manifest
+//   types/   1D 类型系统;sema/ 1E sema 全家
+//   backend/ Stage 2:Back(切片 0 lowering)+ Llvm(绑定)+ Toolchain
 //
 // 子命令:
 //   lex|parse|lexmany|parsemany <file>...
@@ -11,6 +14,11 @@
 //                1C 差分:Root.toml 清单 + import 图,输出与
 //                `frond debug --stage load` 逐字节一致的 load-dump v1。
 //                批量形态 = loadmany(分隔行 "@@FRONDC_SPLIT_9Q7Z@@ <path>")。
+//   check|checkmany [--std <dir>] <file>...
+//                1E 差分:sema 全管线,输出 sema-dump v1。
+//   native [--run] [--std <dir>] <file>...
+//                Stage 2 切片 0:sema → LLVM AST 直下 → .obj → 资产 lld
+//                链接;--run 跑产物回显退出码。
 //
 // 用法(跑在 Rust 引擎上):
 //   cd Frond/frondc && frond run -- lex <abs-path-to-file.frond>
@@ -42,6 +50,9 @@ import sema.Populate
 import sema.Modenv
 import sema.Check
 import sema.Sdump
+import backend.Back
+import backend.Toolchain
+import std.os.Info
 
 // 单入口的完整 load-dump v1(与 Rust dump_load 逐字节对齐)。
 // std_cache 跨入口共享(loadmany 场景 N 入口一份 std 解析)。
@@ -179,8 +190,13 @@ fun print_diag_segment(s: SemaRes, err_base: usize, warn_base: usize,
     }
 }
 
-fun run_sema(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
-    entry_filename: str): str? {
+// sema 产物(native 消费;不含 LLVM 句柄,record 无软类型风险)。
+type SemaOk = SemaOk(pub a: TypeArena, pub s: SemaRes)
+
+// 全 sema 管线(诊断即时 stderr;有错 = null)。check 与 native 共用;
+// check 再走 Sdump.render,native 走 backend.Back.lower_entry。
+fun run_sema_core(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
+    entry_filename: str): SemaOk? {
     val a = types.Arena.new_arena()
     val s = Semares.new_semares()
     val ctx = Ictx.new_ictx()
@@ -314,7 +330,15 @@ fun run_sema(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
     if s.errors.len() > 0 {
         return null
     }
-    Sdump.render(a, s)
+    SemaOk(a, s)
+}
+
+fun run_sema(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
+    entry_filename: str): str? {
+    match run_sema_core(loader, dep_keys, entry_module, entry_filename) {
+        null => { null }
+        ok => { Sdump.render(ok.a, ok.s) }
+    }
 }
 
 // std 文件直入时按 std 键名归类(与引擎 Dump.canonical_std_entry_name 同规):
@@ -414,6 +438,129 @@ async fun cmd_check(cmd: str, args: str[]): void {
     }
 }
 
+// ─── Stage 2 native:sema → LLVM lower → .obj → lld 链接(→ 跑产物)─
+// 产物落 CWD:<base>.o / <base>.exe(base = 入口尾段去扩展)。--run 时
+// 跑产物回显退出码(切片 0 验收口径:main 整型返回 = 进程退出码)。
+fun out_base(entry: str): str {
+    var seg = entry
+    val pos = Semares.find_last_sub(entry, "/")
+    if pos >= 0 {
+        seg = Str.substring(entry, (pos + 1) as usize, entry.len())
+    }
+    if Str.ends_with(seg, ".frond") {
+        seg = Str.substring(seg, 0, seg.len() - 6)
+    }
+    if seg.len() == 0 {
+        return "frondc_out"
+    }
+    seg
+}
+
+async fun native_entry(entry_raw: str, std_root: str, do_run: bool,
+    std_cache: Map<str, ModuleAst>): void {
+    val entry = Manifest.norm_path(entry_raw)
+    match Loader.read_text(entry).await() {
+        null => {
+            eprintln("frondc: native: readfail {entry_raw}")
+        },
+        text => {
+            match Parse.parse_module_text(text, std_entry_module_name(entry, std_root)) {
+                Error(e) => {
+                    eprintln("frondc: native: parsefail {e.line}:{e.column}: {e.message}")
+                },
+                Ok(entry_module) => {
+                    val loader = Loader.new_loader(std_root, std_cache)
+                    Loader.preload_builtins(loader).await()
+                    loader.search.push(Manifest.parent_dir_of(entry))
+                    Loader.force_load_std(loader).await()
+                    val dep_keys = Loader.load_transitive_imports(loader, entry_module).await()
+                    match run_sema_core(loader, dep_keys, entry_module, entry) {
+                        null => {
+                            eprintln("frondc: native: sema failed (diagnostics above)")
+                        },
+                        ok => {
+                            val base = out_base(entry)
+                            val os = Info.os_name()
+                            val obj = base + ".o"
+                            val exe = if os == "windows" { base + ".exe" } else { base }
+                            match Back.lower_entry(ok.a, ok.s, entry_module, obj) {
+                                Error(e) => {
+                                    eprintln("frondc: native: lower/emit failed: {e}")
+                                },
+                                Ok(_) => {
+                                    println("native: {obj} emitted")
+                                    match Toolchain.link(Toolchain.toolchain_dir(), os, Info.arch(), obj, exe) {
+                                        Error(e) => {
+                                            eprintln("frondc: native: {e}")
+                                        },
+                                        Ok(rc) => {
+                                            if rc != 0 {
+                                                eprintln("frondc: native: lld exit {rc}")
+                                            } else {
+                                                println("native: linked {exe}")
+                                                if do_run {
+                                                    match Toolchain.run(exe) {
+                                                        Error(e2) => {
+                                                            eprintln("frondc: native: {e2}")
+                                                        },
+                                                        Ok(code) => {
+                                                            println("native: run {exe} -> exit {code}")
+                                                        },
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+async fun cmd_native(args: str[]): void {
+    var std_flag = ""
+    var do_run = false
+    val entries = List.empty<str>()
+    var i: i64 = 1
+    while i < args.len() as i64 {
+        val a = args[i as usize]
+        if a == "--std" && i + 1 < args.len() as i64 {
+            std_flag = args[(i + 1) as usize]
+            i = i + 2
+        } else if a == "--run" {
+            do_run = true
+            i = i + 1
+        } else {
+            entries.push(a)
+            i = i + 1
+        }
+    }
+    if entries.is_empty() {
+        println("usage: frondc native [--run] [--std <dir>] <entry>...")
+        return
+    }
+    match Manifest.resolve_std_root(std_flag).await() {
+        null => {
+            println("frondc: std root not found (pass --std <dir> or set FRONDC_STD_ROOT)")
+        },
+        root => {
+            val dcache = AstDiskCache.open().await()
+            val warmed = AstDiskCache.warm(dcache, root).await()
+            val std_cache = warmed.cache
+            var j: usize = 0
+            while j < entries.len() {
+                native_entry(entries.get(j) ?? "", root, do_run, std_cache).await()
+                j = j + 1
+            }
+            AstDiskCache.flush(dcache, root, std_cache, warmed.from_disk).await()
+        },
+    }
+}
+
 async fun main(): void {
     val args = Proc.args()
     val nargs = args.len() as i64
@@ -422,7 +569,7 @@ async fun main(): void {
         return
     }
     if args.len() < 2 {
-        println("usage: frondc tyops|lex|parse|lexmany|parsemany|loaddeps|loadmany|check|checkmany [--std <dir>] <file>...")
+        println("usage: frondc tyops|lex|parse|lexmany|parsemany|loaddeps|loadmany|check|checkmany|native [--run] [--std <dir>] <file>...")
         return
     }
     val cmd = args[0]
@@ -432,6 +579,10 @@ async fun main(): void {
     }
     if cmd == "check" || cmd == "checkmany" {
         cmd_check(cmd, args).await()
+        return
+    }
+    if cmd == "native" {
+        cmd_native(args).await()
         return
     }
     if cmd != "lex" && cmd != "parse" && cmd != "lexmany" && cmd != "parsemany" && cmd != "astcheck" {

@@ -238,15 +238,269 @@ pub fun build_mul(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<
 }
 
 // 整常量(LLVMConstInt;负数按位型传,如 (-1i64) as u64)。
-pub fun const_int(lib: Lib, int_ty: u64, val: u64, sign_extend: bool): Throw<u64, FfiError> {
+pub fun const_int(lib: Lib, int_ty: u64, value: u64, sign_extend: bool): Throw<u64, FfiError> {
     val flag = if sign_extend { 1u32 } else { 0u32 }
     val f: ForeignFn<u64> = lib.lookup("LLVMConstInt", "u64, u64, u32")?
-    f.call(int_ty, val, flag)
+    f.call(int_ty, value, flag)
 }
 
 pub fun build_ret(lib: Lib, builder: u64, v: u64): Throw<void, FfiError> {
     val f: ForeignFn<void> = lib.lookup("LLVMBuildRet", "u64, u64")?
     f.call(builder, v)
+}
+
+pub fun build_ret_void(lib: Lib, builder: u64): Throw<void, FfiError> {
+    val f: ForeignFn<void> = lib.lookup("LLVMBuildRetVoid", "u64")?
+    f.call(builder)
+}
+
+// ── 标量类型族(Stage 2 Back 切片 0)──────────────────────────────
+
+// 位宽整型(1 = i1 bool,8/16/32/64/128)。
+pub fun int_type(lib: Lib, ctx: u64, bits: u32): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMIntTypeInContext", "u64, u32")?
+    f.call(ctx, bits)
+}
+
+pub fun half_type(lib: Lib, ctx: u64): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMHalfTypeInContext", "u64")?
+    f.call(ctx)
+}
+
+pub fun float_type(lib: Lib, ctx: u64): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMFloatTypeInContext", "u64")?
+    f.call(ctx)
+}
+
+pub fun double_type(lib: Lib, ctx: u64): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMDoubleTypeInContext", "u64")?
+    f.call(ctx)
+}
+
+pub fun fp128_type(lib: Lib, ctx: u64): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMFP128TypeInContext", "u64")?
+    f.call(ctx)
+}
+
+// ── 常量(字符串形态;radix 0 = 前缀自动识别,负号按二补位型)──────
+
+// 整常量自文本(LLVMConstIntOfString;解析失败返回 null)。
+pub fun const_int_str(lib: Lib, int_ty: u64, text: str, radix: u8): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMConstIntOfString", "u64, cstr, u8")?
+    val v = f.call(int_ty, text, radix)?
+    if v == 0u64 {
+        throw FfiError(Other, "LLVMConstIntOfString failed for '{text}' radix {radix}")
+    }
+    Ok(v)
+}
+
+// 浮点常量自文本(LLVMConstRealOfString;十进制与 0x1p3 十六进制浮点
+// 全精度直达 APFloat,f128 不丢精度;失败返回 null)。
+pub fun const_real_str(lib: Lib, real_ty: u64, text: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMConstRealOfString", "u64, cstr")?
+    val v = f.call(real_ty, text)?
+    if v == 0u64 {
+        throw FfiError(Other, "LLVMConstRealOfString failed for '{text}'")
+    }
+    Ok(v)
+}
+
+// ── 内存(栈槽)+ 其余算术/比较/转型(Stage 2 切片 0)─────────────
+
+pub fun build_alloca(lib: Lib, builder: u64, ty: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildAlloca", "u64, u64, cstr")?
+    f.call(builder, ty, name)
+}
+
+// opaque pointers:LLVMBuildLoad2 须显式给值类型。
+pub fun build_load(lib: Lib, builder: u64, ty: u64, ptr: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildLoad2", "u64, u64, u64, cstr")?
+    f.call(builder, ty, ptr, name)
+}
+
+pub fun build_store(lib: Lib, builder: u64, v: u64, ptr: u64): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildStore", "u64, u64, u64")?
+    f.call(builder, v, ptr)
+}
+
+pub fun build_fadd(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildFAdd", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_fsub(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildFSub", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_fmul(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildFMul", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_fdiv(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildFDiv", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_frem(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildFRem", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_sdiv(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildSDiv", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_udiv(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildUDiv", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_srem(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildSRem", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_urem(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildURem", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_and(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildAnd", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_or(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildOr", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_xor(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildXor", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_shl(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildShl", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_ashr(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildAShr", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_lshr(lib: Lib, builder: u64, lhs: u64, rhs: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildLShr", "u64, u64, u64, cstr")?
+    f.call(builder, lhs, rhs, name)
+}
+
+pub fun build_fneg(lib: Lib, builder: u64, v: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildFNeg", "u64, u64, cstr")?
+    f.call(builder, v, name)
+}
+
+// pred:LLVMIntPredicate 枚举值(EQ=32..SLE=41;Core.h)。⚠ LLVM 21 参数
+// 序 = (builder, pred, lhs, rhs, name)——谓词在第 2 位(与旧文献的
+// 第 4 位相反;传错位 = 小整数被当 Value* unwrap,段错误,实测)。
+pub fun build_icmp(lib: Lib, builder: u64, lhs: u64, rhs: u64, pred: u32, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildICmp", "u64, u32, u64, u64, cstr")?
+    f.call(builder, pred, lhs, rhs, name)
+}
+
+// pred:LLVMRealPredicate 枚举值(OEQ=1..UNE=14;NaN 参与即假 = O 族,
+// 与引擎 IEEE754 比较语义一致)。参数序同上(谓词第 2 位)。
+pub fun build_fcmp(lib: Lib, builder: u64, lhs: u64, rhs: u64, pred: u32, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildFCmp", "u64, u32, u64, u64, cstr")?
+    f.call(builder, pred, lhs, rhs, name)
+}
+
+pub fun build_sext(lib: Lib, builder: u64, v: u64, dest_ty: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildSExt", "u64, u64, u64, cstr")?
+    f.call(builder, v, dest_ty, name)
+}
+
+pub fun build_zext(lib: Lib, builder: u64, v: u64, dest_ty: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildZExt", "u64, u64, u64, cstr")?
+    f.call(builder, v, dest_ty, name)
+}
+
+pub fun build_trunc(lib: Lib, builder: u64, v: u64, dest_ty: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildTrunc", "u64, u64, u64, cstr")?
+    f.call(builder, v, dest_ty, name)
+}
+
+pub fun build_fpext(lib: Lib, builder: u64, v: u64, dest_ty: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildFPExt", "u64, u64, u64, cstr")?
+    f.call(builder, v, dest_ty, name)
+}
+
+pub fun build_fptrunc(lib: Lib, builder: u64, v: u64, dest_ty: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildFPTrunc", "u64, u64, u64, cstr")?
+    f.call(builder, v, dest_ty, name)
+}
+
+pub fun build_sitofp(lib: Lib, builder: u64, v: u64, dest_ty: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildSIToFP", "u64, u64, u64, cstr")?
+    f.call(builder, v, dest_ty, name)
+}
+
+pub fun build_uitofp(lib: Lib, builder: u64, v: u64, dest_ty: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildUIToFP", "u64, u64, u64, cstr")?
+    f.call(builder, v, dest_ty, name)
+}
+
+pub fun build_fptosi(lib: Lib, builder: u64, v: u64, dest_ty: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildFPToSI", "u64, u64, u64, cstr")?
+    f.call(builder, v, dest_ty, name)
+}
+
+pub fun build_fptoui(lib: Lib, builder: u64, v: u64, dest_ty: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildFPToUI", "u64, u64, u64, cstr")?
+    f.call(builder, v, dest_ty, name)
+}
+
+// ── PassBuilder(O2 IR 优化;mem2reg 吃掉 naive alloca)────────────
+
+// LLVMRunPasses(module, passes, tm, options);成功 = 0。options **不可为
+// NULL**——21.1.8 实现直接 unwrap(Options) 解引用(实测段错误),必须
+// LLVMCreatePassBuilderOptions 真建对象,用毕 Dispose。
+// 失败消息走 LLVMGetErrorMessage(配 LLVMDisposeErrorMessage 释放,与
+// LLVMDisposeMessage 不同族)。
+pub fun run_passes(lib: Lib, module: u64, passes: str, tm: u64): Throw<void, FfiError> {
+    val mk: ForeignFn<u64> = lib.lookup("LLVMCreatePassBuilderOptions", "")?
+    val opts = mk.call()?
+    val f: ForeignFn<u64> = lib.lookup("LLVMRunPasses", "u64, cstr, u64, u64")?
+    val rc = f.call(module, passes, tm, opts)?
+    match lib.lookup("LLVMDisposePassBuilderOptions", "u64") {
+        Ok(free_opts) => {
+            match free_opts.call(opts) {
+                Ok(_) => {}
+                Error(_) => {}
+            }
+        },
+        Error(_) => {}
+    }
+    if rc != 0u64 {
+        var msg = "unknown pass error"
+        val get_msg: ForeignFn<u64> = lib.lookup("LLVMGetErrorMessage", "u64")?
+        val mptr = get_msg.call(rc)?
+        if mptr != 0u64 {
+            val crt = Lib.open(crt_lib_name())?
+            msg = read_cstr(crt, mptr)?
+            crt.close()
+            val free_msg: ForeignFn<void> = lib.lookup("LLVMDisposeErrorMessage", "cstr")?
+            match free_msg.call(mptr) {
+                Ok(_) => {}
+                Error(_) => {}
+            }
+        }
+        throw FfiError(CallFailed, "LLVMRunPasses('{passes}') failed: {msg}")
+    }
+    Ok(void)
 }
 
 // ── TargetMachine ──────────────────────────────────────────────────

@@ -10,6 +10,7 @@
 import std.os.Env
 import std.os.Info
 import std.os.Proc
+import std.core.types.Str
 
 pub fun toolchain_dir(): str {
     val env = Env.get("FRONDC_TOOLCHAIN")
@@ -17,6 +18,21 @@ pub fun toolchain_dir(): str {
         return env
     }
     "assets/toolchain"
+}
+
+// 资产 LLVM 动态库(统一逻辑名,lib/ 下按平台扩展名;Lib 按内容识别,
+// 后缀无关)。dev/发布同一条路径:发布态资产先经 Assets.extract 落到
+// 解析序指向的目录。
+pub fun open_llvm(): Throw<Lib, FfiError> {
+    val os = Info.os_name()
+    val file = if os == "windows" {
+        "llvm.dll"
+    } else if os == "macos" {
+        "llvm.dylib"
+    } else {
+        "llvm.so"
+    }
+    Lib.open(toolchain_dir() + "/lib/" + file)
 }
 
 pub fun link_args(tc: str, os: str, arch: str, obj: str, exe: str): str[] {
@@ -55,15 +71,25 @@ pub fun link_args(tc: str, os: str, arch: str, obj: str, exe: str): str[] {
             "-o", exe]
 }
 
+// 链接失败必须透传诊断:spawn 的子进程输出不落控制台,失败时逐行回显
+// (llvm_probe CI 首跑教训——没有它每轮失败都是盲改)。
 pub fun link(tc: str, os: str, arch: str, obj: str, exe: str): Throw<i32, str> {
-    val proc = match Proc.spawn(tc + "/bin/lld", link_args(tc, os, arch, obj, exe)) {
-        Ok(p) => p,
+    val out = match Proc.capture(tc + "/bin/lld", link_args(tc, os, arch, obj, exe)) {
+        Ok(o) => o,
         Error(e) => throw "spawn lld failed: {e.message}",
     }
-    match proc.wait() {
-        Ok(rc) => Ok(rc),
-        Error(e) => throw "wait lld failed: {e.message}",
+    if out.exit_code != 0 {
+        val lines = Str.split(out.output, "\n")
+        var li: usize = 0
+        while li < lines.len() && li < 12 {
+            val line = lines[li]
+            if line.len() > 0 {
+                println("lld| {line}")
+            }
+            li = li + 1
+        }
     }
+    Ok(out.exit_code)
 }
 
 pub fun run(exe: str): Throw<i32, str> {

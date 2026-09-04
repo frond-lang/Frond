@@ -78,6 +78,14 @@ jobs:
         env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
         run: bash tests/negative/run.sh
 
+      # Stage 2 切片 0 native 验收(BOOTSTRAP_PLAN 附二):frondc(镜像)
+      # → LLVM lower → .obj → 资产 lld 链接 → 原生 exe 退出码断言。
+      # 资产 = setup-frond 预取的 llvm_probe 布局(脚本默认 TC 路径)。
+      - name: Stage 2 native slice0
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/native_slice0.sh
+
       # 调度稳定性哨兵:历史上 Multi 模式挂死/抖动的专项电池。
       - name: await_loop stability battery (x30)
         shell: bash

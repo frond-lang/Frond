@@ -25,7 +25,7 @@
 |---|---|---|
 | **Stage 0** | Rust 编译器+引擎(现状) | ✓ 存在 |
 | **Stage 1** | frondc 跑在 Rust 引擎上:词法+语法+全套 sema(含 monomorph)。**不碰 LLVM**——验证"Frond 语言表达力足以承载自己的语义系统" | ✓ **完成(2026-08-31:全节差分绿 + 终局验收三级)** |
-| **Stage 2** | frondc 的后端模块用 std.llvm(Frond 代码调 LLVM-C)lower AST→.obj,内嵌 lld 解出后 spawn 链接(零宿主工具链,见 四) | **探针首跑绿(2026-08-31,macOS 实证;CI 五平台待首跑)** |
+| **Stage 2** | frondc 的后端模块用 std.llvm(Frond 代码调 LLVM-C)lower AST→.obj,内嵌 lld 解出后 spawn 链接(零宿主工具链,见 四) | **切片 0 落地(2026-09-04):Back lowering 字面量/算术/main + `native` 子命令端到端,退出码验收 4/4**;探针绿(2026-08-31 macOS 实证 + CI) |
 | **Stage 3** | 引擎里跑 frondc.frond 编译它自己 → 原生 fronc.exe。**此刻闭环达成** | 未开始 |
 | **Stage 4** | (可选)Rust 引擎退役,fronc 为唯一编译器 | 未开始 |
 
@@ -520,9 +520,56 @@ libc_nonshared.a(__libc_csu_init/fini 的家);② 目录名排序选目录必
 ③ 链接失败必须透传诊断(探针 `FAIL: lld|` 前缀穿透 runner 的
 失败报告 grep——没有它这轮要多三趟盲改)。遗留:mem 计时断言按
 CI 并行负载放宽(意图不变);tls13 留 NOCI 待引擎修。
-**下一步 = Stage 2 后端本体**:frondc/src/backend 已立(Toolchain
+**下一步 = Stage 2 后端本体**:~~frondc/src/backend 已立(Toolchain
 资产解析序 + Llvm 绑定副本),下一片 = Back lowering(切片 0:
-字面量/算术/main)→ `native` 子命令端到端 → AST 全量。
+字面量/算术/main)→ `native` 子命令端到端 → AST 全量~~
+(**2026-09-04 切片 0 落地**,见 附二;下一片 = 切片 1 控制流)。
+
+## 附二:Stage 2 切片 0 记录(2026-09-04)
+
+**范围**:字面量(0x/0o/0b/负号/后缀)/一元(- ! ~)/算术(含
+f16-f128)/比较(O 族 IEEE754)/位运算/移位/AsCast 全转型族/局部
+val/var 栈槽/重赋值/return;`frondc native [--run] [--std] <entry>`
+端到端(sema 管线复用 → Back lower → verify → default\<O2\> →
+TargetMachine .obj → 资产 lld 链接 → 跑产物回显退出码)。
+
+**验收**:`tests/fixtures/native_slice0`(4 用例:基本算术/整型族/
+浮点+转型/混合;fixtures 而非 functional——run_functional.sh 按目录
+跑 `frond run`,本验收是脚本驱动)退出码全中 31/509/25/147,driver =
+`tests/scripts/native_slice0.sh`(EXPECT-EXIT 头注释 + FRONDC_TOOLCHAIN
+资产序);差分 diff_sema 6/6 + diff_load 12/12 + diff_tyops 77/77
+(sema 管线重构 run_sema_core 返回 SemaOk 记录,check/native 共用,
+字节契约不变)+ functional/negative 全绿。
+
+**三雷(全修)**:
+1. **LLVM 21 LLVMBuildICmp/FCmp 谓词在第 2 位**((builder, pred, lhs,
+   rhs, name);旧文献/旧版是第 4 位)——传错位 = 谓词落 LHS 槽被当
+   Value* unwrap,段错误(03 过 04 崩,隔离用例二分定位);
+2. **LLVMRunPasses 的 Options 不可 NULL**——21.1.8 实现 `unwrap(Options)`
+   直接解引用;必须 LLVMCreatePassBuilderOptions 真建对象,用毕 Dispose;
+3. **引擎洞:大模块内 match 臂返回裸零参 ADT 变体 → 静默 null**
+   ([ctor-match-null] 警告 + 调用方拿到 null 返回值;ty_kind 返回
+   BT ADT 时 llty_key 全灭)。handleprobe 小规模复刻不触发(if 臂/
+   match 臂/or-pattern/List 读回全绿),frondc 模块规模触发——
+   规避 = Back.frond 分类全用 i64 标签 + 整数字面量臂,不再定义
+   返回位 ADT。根因未深挖(疑优化器吃臂家族),复现资产在
+   tmp_probe/handleprobe。
+连带:backend/Llvm.frond `val` 参数名(const_int)从未被引擎解析过
+(backend 从未被 import)——首跑显形,改 value;libs/llvm/Llvm.frond
+同病潜伏未修。
+
+**工程事实(handleprobe 实证,Back 架构依据)**:LLVM u64 句柄经
+局部值/函数参数/函数返回/数组元素/List 元素/Map 值/nullable/模块 var
+读回后 FFI marshal **全部安全**;**record 字段读回 = 软类型值,FFI
+call 收 0**(引擎已知洞)——Back 状态一律 Map/参数,禁含 u64 字段的
+record。字面量走 LLVMConstIntOfString/LLVMConstRealOfString(文本
+直达 APInt/APFloat,f128 全精度;radix/前缀/下划线自剥,负号按二补)。
+
+**值表示记账**:切片 0 标量全程 SSA/栈槽零堆值;v0 Value 盒(计划 4e)
+随聚合/str/引用切片(需 frond_rt C 层)进入,骨架表示无关。
+
+**下一片 = 切片 1**:控制流(IfE/嵌套 BlockE/逻辑短路/循环)+ 多
+函数与调用(命名/mangled)→ 再聚合/str + frond_rt + v0 盒。
 
 ## 附:Stage 2 首刀记录(2026-08-31,macOS 首绿)
 
