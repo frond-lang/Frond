@@ -456,24 +456,6 @@ pub(super) fn extract_child_return(child: &Frame, graph: &DataFlowGraph) -> Valu
     }
 }
 
-pub(super) fn run_offloaded_subgraph(graph: &DataFlowGraph, frame: &mut Frame) -> super::Offload::OffloadOutcome {
-    // Delegate to the ENGINE'S OWN plan loop (exec_plan_core) — the identical
-    // compiled loop the inline path uses. A textually identical copy in this
-    // module compiled ~30x slower per node (measured); sharing the one
-    // compiled loop guarantees engine parity by construction.
-    let plan: &[NodeId] = match graph.linear_plan(frame.subgraph_id.0 as usize) {
-        Some(p) if !p.is_empty() => p,
-        _ => return super::Offload::OffloadOutcome::Fallback,
-    };
-    match exec_plan_offload(frame, plan, graph) {
-        PlanFlowCore::Done => super::Offload::OffloadOutcome::Done(
-            extract_child_return(frame, graph),
-            frame.control_signal.clone(),
-        ),
-        PlanFlowCore::EngineNeeded => super::Offload::OffloadOutcome::Fallback,
-    }
-}
-
 // =========================================================================
 // impl<S: LockStrategy> Engine<S> — scheduling core methods
 // =========================================================================
@@ -485,6 +467,10 @@ impl<S: LockStrategy> Engine<S> {
     /// the cap is lowered to stay well inside the 1MB Windows main-thread stack (measured: 256
     /// levels overflow in debug, pass in release).
     pub(super) const INLINE_MAX_DEPTH: u32 = if cfg!(debug_assertions) { 48 } else { 256 };
+
+    /// Fairness slice budget: loop iterations before a frame yields back to
+    /// the scheduler (amortized yield cost at 2^18 iterations ≈ 0).
+    pub(super) const SLICE_ITERS: u64 = 1 << 18;
 
     /// Executes all ready nodes in the frame until the ready queue is empty or the frame suspends.
     ///
@@ -499,6 +485,13 @@ impl<S: LockStrategy> Engine<S> {
         let mut l3_saved: Vec<SavedCallCtx> = Vec::new();
         let mut l3_scratch: Vec<L3Scratch> = Vec::new();
         let mut iter_guard: u64 = 0;
+        // Fairness slicing: after SLICE_ITERS loop iterations the frame
+        // yields — state=Ready back to process_frame's requeue arm, giving
+        // every OTHER runnable frame (async tasks, timers, channels) a turn.
+        // The loop resumes exactly where it left off: the reset leaves the
+        // condition tree re-armed and the gate re-fires on re-dispatch.
+        // Amortized cost at 2^18 iterations is sub-nanosecond per iteration.
+        let mut slice_iters: u64 = 0;
         loop {
         iter_guard += 1;
         if iter_guard > 500000 {
@@ -743,52 +736,62 @@ impl<S: LockStrategy> Engine<S> {
                         }
                     }
 
-                    // Scalar-chain fast call: an eligible pure-leaf subgraph with
-                    // all-scalar args executes its compiled program in place —
-                    // no child frame, no queue round-trip, no compute_fn
-                    // dispatch. Bit-identical to the generic path (same
-                    // arith kernels); the offload intercept below keeps
-                    // precedence when --offload / [engine] offload is active.
-                    if !pending.is_async
-                        && pending.closure_val.is_none()
-                        && self.offload_rt.is_none()
-                    {
+                    // Scalar-chain fast call: an eligible pure-leaf subgraph
+                    // executes its compiled program in place — no child
+                    // frame, no queue round-trip, no compute_fn dispatch.
+                    // Bit-identical to the generic path (same arith kernels,
+                    // same record construct/field-get semantics). Outer
+                    // references (rare in leaves) read from THIS frame.
+                    if !pending.is_async && pending.closure_val.is_none() {
+                        // Leaf-call shape only: function-level plain sgs. A
+                        // LoopBody/branch/loop target must go through its own
+                        // completion protocol (E2 arm / branch relay) —
+                        // executing its program here would bypass Continue/
+                        // None handling and derail the loop.
+                        let tsg = &graph.subgraphs[pending.target_sg.0 as usize];
+                        if tsg.loop_kind == crate::ir::Ir::LoopKind::None
+                            && tsg.loop_parent_sg.is_none()
+                            && tsg.param_count as usize <= pending.args.len().max(tsg.param_count as usize)
+                        {
                         if let Some(prog) =
                             graph.scalar_prog(pending.target_sg.0 as usize)
                         {
-                            if pending
-                                .args
+                            let outer_vals: Vec<crate::value::Value> = prog
+                                .outer_gids
                                 .iter()
-                                .all(|v| matches!(v, crate::value::Value::Scalar(..)))
-                            {
-                                let value =
-                                    crate::pass::Scalarizer::run_scalar_prog(&prog, &pending.args);
-                                let node_start = frame.node_offset;
-                                let graph_node_id =
-                                    NodeId(pending.call_node_local.0 + node_start);
-                                let consumer_count =
-                                    graph.downstream_count(graph_node_id.0 as usize);
-                                frame.set_value(
-                                    pending.call_node_local,
-                                    value,
-                                    consumer_count,
-                                );
-                                notify_downstream(
+                                .map(|&g| frame.get_value_by_global(NodeId(g)))
+                                .collect();
+                            let value = crate::pass::Scalarizer::run_scalar_prog(
+                                &prog,
+                                &pending.args,
+                                &outer_vals,
+                            );
+                            let node_start = frame.node_offset;
+                            let graph_node_id =
+                                NodeId(pending.call_node_local.0 + node_start);
+                            let consumer_count =
+                                graph.downstream_count(graph_node_id.0 as usize);
+                            frame.set_value(
+                                pending.call_node_local,
+                                value,
+                                consumer_count,
+                            );
+                            notify_downstream(
+                                frame,
+                                &graph,
+                                pending.call_node_local,
+                                graph_node_id,
+                                NodeId(node_start),
+                            );
+                            if !frame.branch_relays.is_empty() {
+                                relay_branch_value(
                                     frame,
                                     &graph,
                                     pending.call_node_local,
-                                    graph_node_id,
-                                    NodeId(node_start),
                                 );
-                                if !frame.branch_relays.is_empty() {
-                                    relay_branch_value(
-                                        frame,
-                                        &graph,
-                                        pending.call_node_local,
-                                    );
-                                }
-                                continue;
                             }
+                            continue;
+                        }
                         }
                     }
 
@@ -882,31 +885,193 @@ impl<S: LockStrategy> Engine<S> {
                             body.state = FrameState::Ready;
                         }
 
-                        self.run_frame_dispatch(&mut body, body_fid, queue, depth + 1);
+                        // Scalar-chain fast body: a LoopBody sg whose entire
+                        // body scalarizes (records included) executes as a
+                        // compiled program — zero frame dispatch this
+                        // iteration. Gated to carry-free loops: phi carries
+                        // stash from the body frame's slot mirrors, which the
+                        // program path never populates. Outer references
+                        // (loop-carried cells, enclosing locals) read from
+                        // the loop frame; heap cells are the transport.
+                        let scalar_body = graph
+                            .scalar_prog(pending.target_sg.0 as usize)
+                            .filter(|_| {
+                                graph.subgraphs[frame.subgraph_id.0 as usize]
+                                    .reset_plan
+                                    .as_ref()
+                                    .map_or(true, |p| {
+                                        p.carries_value.is_empty()
+                                            && p.carries_cell.is_empty()
+                                    })
+                            });
+                        if let Some(prog) = scalar_body {
+                            // Outer values are read ONCE: heap Cells are
+                            // Arc-stable (allocation happens at declaration)
+                            // and plain outer bindings are SSA — both progs
+                            // re-read fresh cell CONTENTS via DerefRead.
+                            let outer_vals: Vec<crate::value::Value> = prog
+                                .outer_gids
+                                .iter()
+                                .map(|&g| frame.get_value_by_global(NodeId(g)))
+                                .collect();
+                            let simd_plan =
+                                graph.simd_maps.get(frame.subgraph_id.0 as usize)
+                                    .and_then(|p| p.clone());
+                            if let Some(plan) = simd_plan {
+                                let co0: Vec<crate::value::Value> = graph
+                                    .cond_prog(frame.subgraph_id.0 as usize)
+                                    .map(|cp| {
+                                        cp.outer_gids
+                                            .iter()
+                                            .map(|&g| frame.get_value_by_global(NodeId(g)))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let bo0: Vec<crate::value::Value> = prog
+                                    .outer_gids
+                                    .iter()
+                                    .map(|&g| frame.get_value_by_global(NodeId(g)))
+                                    .collect();
+                                let cprog0 =
+                                    graph.cond_prog(frame.subgraph_id.0 as usize).unwrap();
+                                if crate::pass::Scalarizer::run_simd_map(
+                                    &plan, &prog, &cprog0, &co0, &bo0,
+                                ) {
+                                    body.control_signal = ControlSignal::None;
+                                    body.state = FrameState::Ready;
+                                    self.reset_loop_iteration(frame, fid, &mut body);
+                                    frame.hot_body = Some((body_fid, body));
+                                    iter_guard = 0;
+                                    continue;
+                                }
+                            }
+                            if let Some(cprog) =
+                                graph.cond_prog(frame.subgraph_id.0 as usize)
+                            {
+                                // Tight-loop driver: body program + condition
+                                // program per iteration — no per-iteration
+                                // reset, no node dispatch, no gate relaunch.
+                                // Exits into the regular machinery: one final
+                                // reset, the condition tree re-evaluates for
+                                // real, the gate takes the exit branch.
+                                loop {
+                                    slice_iters += 1;
+                                    if slice_iters >= Self::SLICE_ITERS {
+                                        // Yield mid-loop: the loop state lives in heap
+                                        // cells + the while frame's slots — both survive
+                                        // the requeue; the reset re-arms the condition
+                                        // and the gate re-fires on the next dispatch.
+                                        body.control_signal = ControlSignal::None;
+                                        body.state = FrameState::Ready;
+                                        self.reset_loop_iteration(frame, fid, &mut body);
+                                        frame.hot_body = Some((body_fid, body));
+                                        frame.state = FrameState::Ready;
+                                        return;
+                                    }
+                                    // Outer values are RE-READ every iteration: the
+                                    // optimizer rewrites loop-carried state into
+                                    // mutable slots OUTSIDE the body sg — a read-once
+                                    // cache would pin the initial value forever.
+                                    let bo: Vec<crate::value::Value> = prog
+                                        .outer_gids
+                                        .iter()
+                                        .map(|&g| frame.get_value_by_global(NodeId(g)))
+                                        .collect();
+                                    let mut exports: Vec<crate::value::Value> = Vec::new();
+                                    crate::pass::Scalarizer::run_scalar_prog_ex(
+                                        &prog,
+                                        &pending.args,
+                                        &bo,
+                                        &[],
+                                        Some(&mut exports),
+                                    );
+                                    // Write the body's exported values back into
+                                    // the LOOP FRAME's slots: optimizer-rotated
+                                    // loops park the phi in an enclosing-frame
+                                    // slot that BOTH the body (as an outer
+                                    // read) and the condition consume — without
+                                    // the write-back every iteration would read
+                                    // the initial value and never terminate.
+                                    {
+                                        let bns = graph.subgraphs
+                                            [pending.target_sg.0 as usize]
+                                            .node_range
+                                            .0
+                                            .0;
+                                        let foff = frame.node_offset;
+                                        for (i, &(bl, _op)) in prog.exports.iter().enumerate() {
+                                            let Some(v) = exports.get(i) else { continue };
+                                            let gid = bns + bl;
+                                            let local = gid.wrapping_sub(foff);
+                                            if (local as usize) < frame.value_table.len() {
+                                                let cc = graph.downstream_count(gid as usize);
+                                                frame.set_value(NodeId(local), v.clone(), cc);
+                                            }
+                                        }
+                                    }
+                                    let co: Vec<crate::value::Value> = cprog
+                                        .outer_gids
+                                        .iter()
+                                        .map(|&g| frame.get_value_by_global(NodeId(g)))
+                                        .collect();
+                                    let mut cexports: Vec<crate::value::Value> = Vec::new();
+                                    let more = crate::pass::Scalarizer::run_scalar_prog_ex(
+                                        &cprog,
+                                        &[],
+                                        &co,
+                                        &exports,
+                                        Some(&mut cexports),
+                                    );
+                                    // Write the condition's tree-node slots back
+                                    // (the body's next outer re-read consumes
+                                    // them — e.g. the loop counter deref).
+                                    {
+                                        let wns = graph.subgraphs
+                                            [frame.subgraph_id.0 as usize]
+                                            .node_range
+                                            .0
+                                            .0;
+                                        let foff = frame.node_offset;
+                                        for (i, &(cslot, _op)) in cprog.exports.iter().enumerate() {
+                                            let Some(v) = cexports.get(i) else { continue };
+                                            let gid = wns + cslot;
+                                            let local = gid.wrapping_sub(foff);
+                                            if (local as usize) < frame.value_table.len() {
+                                                let cc = graph.downstream_count(gid as usize);
+                                                frame.set_value(NodeId(local), v.clone(), cc);
+                                            }
+                                        }
+                                    }
+                                    if !more.as_bool() {
+                                        break;
+                                    }
+                                }
+                                body.control_signal = ControlSignal::None;
+                                body.state = FrameState::Ready;
+                                self.reset_loop_iteration(frame, fid, &mut body);
+                                frame.hot_body = Some((body_fid, body));
+                                iter_guard = 0;
+                                continue;
+                            }
+                            let _ = crate::pass::Scalarizer::run_scalar_prog(
+                                &prog,
+                                &pending.args,
+                                &outer_vals,
+                            );
+                            body.control_signal = ControlSignal::None;
+                            body.state = FrameState::Ready;
+                        } else {
+                            self.run_frame_dispatch(&mut body, body_fid, queue, depth + 1);
+                        }
 
                         if body.state == FrameState::Suspended {
                             // Body awaits/selects: hand it to the queue protocol (legacy
                             // suspend), where its completion re-enters
                             // complete_and_wake_caller's LoopBody handling.
-                            // Offload waits push NO queue entry: the offload
-                            // delivery is the guaranteed requeuer (it applies
-                            // the completion and requeues the caller). A
-                            // suspend-time push would only produce a no-op
-                            // dispatch while the worker is still computing.
-                            // Predicate: the waited-for child never entered
-                            // the frames map (offload children live on the
-                            // worker; queue-protocol children are in-map).
-                            let offload_wait = matches!(
-                                body.suspend_state,
-                                SuspendState::WaitingSubgraph(k)
-                                    if !self.frames.lock().contains_key(&k)
-                            );
                             self.frames.lock().insert(body_fid, body);
                             frame.cached_child_frame = Some(body_fid);
-                            if !offload_wait {
-                                queue.push(body_fid);
-                            }
-                                                        self.event_waiters
+                            queue.push(body_fid);
+                            self.event_waiters
                                 .lock()
                                 .entry(RuntimeEvent::SubgraphComplete(body_fid))
                                 .or_default()
@@ -951,6 +1116,11 @@ impl<S: LockStrategy> Engine<S> {
                                 // livelock: reset the node-pop guard (long loops legitimately
                                 // exceed 500k pops inside one run_frame_nodes invocation).
                                 iter_guard = 0;
+                                slice_iters += 1;
+                                if slice_iters >= Self::SLICE_ITERS {
+                                    frame.state = FrameState::Ready;
+                                    return;
+                                }
                                 continue;
                             }
                             ControlSignal::None => {
@@ -970,6 +1140,11 @@ impl<S: LockStrategy> Engine<S> {
                                 self.reset_loop_iteration(frame, fid, &mut body);
                                 frame.hot_body = Some((body_fid, body));
                                 iter_guard = 0;
+                                slice_iters += 1;
+                                if slice_iters >= Self::SLICE_ITERS {
+                                    frame.state = FrameState::Ready;
+                                    return;
+                                }
                                 continue;
                             }
                         }
@@ -1036,13 +1211,6 @@ impl<S: LockStrategy> Engine<S> {
                             frame.cached_child_frame = Some(bfid);
                             bfid
                         }
-                    } else if self.try_launch_offload(fid, &pending, frame) {
-                        // L2: pure-heavy leaf executing on a worker with
-                        // deep-copied args; the caller is suspended and the
-                        // completion arrives via the offload sequencer. Takes
-                        // precedence over inline execution (offload eligibility
-                        // implies a heavy node count where parallelism pays).
-                        return;
                     } else if inline_sync {
                         // Placeholder: the inline path below builds the frame itself (without a
                         // frames-map insert). This arm must not be reachable for is_async.
@@ -1129,6 +1297,27 @@ impl<S: LockStrategy> Engine<S> {
                             pending.closure_val.clone(),
                         );
                         self.run_frame_dispatch(&mut child, child_fid, queue, depth + 1);
+                        if child.state == FrameState::Ready {
+                            // Fairness slice yield (SLICE_ITERS): the child's
+                            // loop yielded mid-flight. Requeue it and suspend
+                            // the caller on its completion — exactly the
+                            // suspend fallback protocol minus the event
+                            // registration on the child (the queue push IS the
+                            // wakeup).
+                            self.frames.lock().insert(child_fid, child);
+                            queue.push(child_fid);
+                            self.event_waiters
+                                .lock()
+                                .entry(RuntimeEvent::SubgraphComplete(child_fid))
+                                .or_default()
+                                .push(fid);
+                            frame.state = FrameState::Suspended;
+                            frame.suspend_state =
+                                SuspendState::WaitingSubgraph(child_fid);
+                            frame.suspend_event =
+                                Some(RuntimeEvent::SubgraphComplete(child_fid));
+                            return;
+                        }
                         if child.state == FrameState::Suspended {
                             // Suspend fallback: hand the child to the queue exactly like the
                             // legacy suspend path (Bug #78's pending_completions race resolution
@@ -2391,75 +2580,3 @@ impl<S: LockStrategy> Engine<S> {
     }
 }
 
-/// Offload executor outcome: plan finished, or hit an arm needing the engine.
-pub(super) enum PlanFlowCore {
-    Done,
-    EngineNeeded,
-}
-
-pub(super) fn exec_plan_offload(
-    frame: &mut Frame,
-    plan: &[NodeId],
-    graph: &DataFlowGraph,
-) -> PlanFlowCore {
-        let node_start = frame.node_offset;
-        for &gid in plan {
-            if !matches!(frame.control_signal, ControlSignal::None) {
-                return PlanFlowCore::Done;
-            }
-            if frame.state == FrameState::Cancelling || frame.state == FrameState::Suspended {
-                return PlanFlowCore::Done;
-            }
-            let local = NodeId(gid.0.wrapping_sub(node_start));
-            if frame.value_table.is_ready(local.0 as usize) {
-                // Params / injected slots / already-executed nodes.
-                continue;
-            }
-            let node = graph.node(gid.0 as usize);
-            let ctx = EvalContext { node_start, graph };
-            let result = (graph.compute_fns[node.compute_fn.0 as usize])(frame, gid, &ctx);
-            match result {
-                NodeResult::Value(v) => {
-                    let cc = graph.downstream_count(gid.0 as usize);
-                    frame.set_value(local, v, cc);
-                    if !frame.branch_relays.is_empty() {
-                        relay_branch_value(frame, graph, local);
-                    }
-                }
-                NodeResult::Batch(results) => {
-                    for &(lid, ref v) in &results {
-                        let g2 = lid.0 + node_start;
-                        let cc = graph.downstream_count(g2 as usize);
-                        frame.set_value(lid, v.clone(), cc);
-                    }
-                    if !frame.branch_relays.is_empty() {
-                        for &(lid, _) in &results {
-                            relay_branch_value(frame, graph, lid);
-                        }
-                    }
-                }
-                NodeResult::Return(v) => {
-                    frame.control_signal = ControlSignal::Return(v);
-                    return PlanFlowCore::Done;
-                }
-                NodeResult::Break => {
-                    frame.control_signal = ControlSignal::Break;
-                    return PlanFlowCore::Done;
-                }
-                NodeResult::Continue => {
-                    frame.control_signal = ControlSignal::Continue;
-                    return PlanFlowCore::Done;
-                }
-                NodeResult::Call(pending) => {
-                    let _ = pending;
-                    return PlanFlowCore::EngineNeeded;
-                }
-                _ => {
-                    // Engine-needing result (Await/ChannelNotify/Cancel/SelectWait):
-                    // bail — the dataflow engine re-drives it.
-                    return PlanFlowCore::EngineNeeded;
-                }
-            }
-        }
-        PlanFlowCore::Done
-    }

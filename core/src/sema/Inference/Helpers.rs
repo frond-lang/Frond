@@ -525,6 +525,43 @@ impl<'a> InferContext<'a> {
     /// behalf), which is why `ret_ty` arrives Async-wrapped for async bodies
     /// and the first check below filters them out. Unsolved TypeVars are
     /// skipped: the fixpoint solver may still bind them to Throw.
+    /// Sync fun declaring Async<T> with a non-Async tail: the raw value
+    /// leaks where the runtime expects an async handle — `.await()` on it
+    /// reads the payload as an async_id and the event loop livelocks (the
+    /// fairness-campaign trap shape). Async funs are exempt (their ret_ty is
+    /// wrap_async_return'd, body T vs Async<T> unifies by unfolding). A body
+    /// that already evaluates to Async<..> (forwarding a handle) is legal.
+    pub(super) fn check_sync_fun_async_return(
+        &mut self,
+        what: &str,
+        ret_ty: TypeHandle,
+        body_ty: TypeHandle,
+        body: ExprId,
+        ast: &AstArena<'_>,
+        line: u32,
+        column: u32,
+    ) {
+        if !matches!(self.arena.get(self.arena.resolve(ret_ty)), Type::Async(_)) {
+            return;
+        }
+        match self.arena.get(self.arena.resolve(body_ty)) {
+            Type::Async(_) | Type::TypeVar(_) | Type::Unknown | Type::Never | Type::Void => return,
+            _ => {}
+        }
+        if let Expr::Block { trailing: None, .. } = &ast.expr(body).node {
+            return;
+        }
+        let ret_str = format!("{}", self.arena.display(ret_ty));
+        let tail_str = format!("{}", self.arena.display(body_ty));
+        self.add_error_at(
+            &format!(
+                "{what} declares return type '{ret_str}' but its tail evaluates to '{tail_str}': declare it 'async fun' (or return an Async value) — a sync function does not create an async handle, and awaiting the raw value deadlocks the event loop"
+            ),
+            line,
+            column,
+        );
+    }
+
     pub(super) fn check_throw_tail_wrapped(
         &mut self,
         what: &str,

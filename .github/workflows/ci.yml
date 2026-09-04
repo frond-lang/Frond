@@ -162,61 +162,6 @@ jobs:
         run: bash tests/scripts/diff_sema.sh
         timeout-minutes: 45
 
-  # ─────────────────────────────────────────────────────────────────────
-  # L2 纯子图卸载极限 soak(FROND_OFFLOAD=1 FROND_OFFLOAD_MIN=1)。
-  # MIN=1 把阈值压到地板:每一处合格同步调用都发射到 worker,最大化
-  # 拷入隔离/定序器/回放机械的覆盖。全五平台镜像 suite 矩阵:offload
-  # 的历史 bug(定序器头阻塞/worker 静默 panic)是调度时序类,按 OS
-  # 调度器分布(parking_lot 的 condvar 三平台三实现),不按内存模型
-  # 分布——Windows 的唤醒时序同样必须覆盖。本地口径:dogfood_json
-  # ×100=100/100 + 四套件 ×15 全绿。
-  # ─────────────────────────────────────────────────────────────────────
-  offload:
-    name: offload (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: linux-x64,   os: ubuntu-latest,    cc: clang, cxx: clang++, target: '',                  llvm: x86_64-unknown-linux-gnu }
-          - { name: linux-arm64, os: ubuntu-24.04-arm, cc: clang, cxx: clang++, target: '',                  llvm: aarch64-unknown-linux-gnu }
-          - { name: macos-arm64, os: macos-latest,      cc: clang, cxx: clang++, target: '',                  llvm: aarch64-apple-darwin }
-          - { name: macos-x64,   os: macos-latest,      cc: clang, cxx: clang++, target: x86_64-apple-darwin, llvm: x86_64-apple-darwin }
-          - { name: windows-x64, os: windows-latest,    cc: cl,    cxx: cl,      target: '',                  llvm: x86_64-pc-windows-msvc }
-    env:
-      CC: ${{ matrix.cc }}
-      CXX: ${{ matrix.cxx }}
-      FROND_OFFLOAD: '1'
-      FROND_OFFLOAD_MIN: '1'
-
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          path: Frond
-      - id: setup
-        uses: ./Frond/.github/actions/setup-frond
-        with:
-          rust-target: ${{ matrix.target }}
-          # functional 含 llvm_bind/llvm_probe/crypto_primitives,与 suite
-          # 同源需要资产预取——初版漏了,全新 checkout 上三套件必挂。
-          prefetch: true
-          prefetch-triple: ${{ matrix.llvm }}
-
-      - name: Functional suite (extreme offload)
-        shell: bash
-        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
-        run: bash tests/scripts/run_functional.sh
-
-      - name: await_loop battery (extreme offload)
-        shell: bash
-        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
-        run: bash tests/scripts/await_loop_battery.sh 30
-
-  # ─────────────────────────────────────────────────────────────────────
-  # linux musl 静态链接套件(libc/分配器面差异的额外覆盖;LLVM 三套件
-  # 因无 musl 发行物经 FROND_SKIP 跳过)
-  # ─────────────────────────────────────────────────────────────────────
   suite-musl:
     name: suite (linux-x64-musl)
     runs-on: ubuntu-latest

@@ -435,3 +435,295 @@ SavedCallCtx 全量上下文(value_table/pending/queue/信号/branch_relays/hot_
 
 - match_dispatch 新大头 = 内联体节点派发(~20 节点/迭代)——下一刀应为 M4 def-use ctor 传播/标量链扩记录操作,而非调用路径。
 - 多递归点尾递归(L3' 回退面)、闭包上值调用、async 被调 = v2 资格排除面,按需再开。
+
+---
+
+# Offload 战役终章:多核腿物理删除(2026-09-04)
+
+## 决策与结果
+
+用户裁决:**offload 完全消除**,吞吐押注共享内核的通用算法阶梯(路线图见下)。运行时定位收敛为「并发但单核」:async 任务共享唯一调度器,重纯叶子经标量快路就地执行(其 offload_rt.is_none() 门随 rt 不构造而永久打开)。
+
+**实测代价(旗舰卸载基准,8 async 任务×300 次 16k 节点纯调用)**:worker 版 185ms → 单核版 236-254ms = **1.28×**,结果逐位一致。注意反向启示:8 路并行硬件只产出 1.28×——每调用的克隆/挂起/定序开销吞掉了绝大部分并行收益,这是对机制本身的低效判决。sync 程序零影响(Single 本无 rt);串行程序零影响(多核本帮不了)。
+
+## 删除清单(-1162 行 / +16)
+
+Offload.rs 全文件(834 行:worker 池/定序器/copy-in/restitution/park_for_head)、offload_rt 字段与构造、classify_offloadable + offload_safe 位图 + is_offload_safe_compute 白名单(**每个新内置函数的 worker 安检义务永久消失**)、Call 臂卸载分支、run_offloaded_subgraph/PlanFlowCore/exec_plan_offload(worker 侧执行器)、deep_clone_isolated(唯一用户即 offload)、E2 路径 offload_wait 谓词(化简为恒 push)、rayon 卸载依赖(注:Value 层批量求值仍用 rayon,保留)、CI offload soak job(其 FROND_OFFLOAD 环境变量在零旗战役后已无读者,job 实为套件重跑)。
+
+**保留**:标量程序编译(引擎快路本体)、parking_lot(事件循环 Mutex/Condvar)、队列协议加固(timer 线程仍跨线程投递,这层不是 worker 专属)。
+
+## 验证
+
+功能 95(2 pre-existing 不变)+ 负向 64 + perf 门禁 + await_loop 电池 ×30 全绿;loop_sum 当日 267-302 波动属本机已知 CPU 调度方差带。
+
+## 后续路线图(用户拍板,按序)
+
+1. **标量覆盖扩展 + M4**(记录/数组操作入标量程序 + def-use 构造器传播,各 ~1.5-2×);
+2. **逃逸分析/bumpalo 第 0 层**(非逃逸构造免分配,内存吞吐双吃,设计在本文档附录);
+3. **图级 CSE/GVN + 向量化**(标量程序 IR 为底物,wide 依赖就位);
+4. **分片(公平层)**:async 重计算按预算切片让位事件循环——协程化单核不阻塞,节点级挂起为机制前提,独立立项;
+5. (远期)AOT/JIT 走 LLVM——单核吞吐的数量级杠杆。
+
+历史机制留档:offload 全套设计/竞态修复/ETW 取证见本文档与 tmp_probe/offload_bench(含 etl_*.py 分析链);若未来需要数据并行,节点级挂起地基可从同一接口接回 worker。
+
+---
+
+# 标量覆盖扩展(2026-09-04)——落地:记录入链 + 外槽值 + 循环体直跑
+
+## 结果(全部结果逐位一致)
+
+| 基准 | 前 | 后 | Δ |
+|---|---|---|---|
+| recbench(记录参数叶子调用×1M) | 1870ms | **813ms** | **2.3×** |
+| churn C(循环内构造+读字段×5M) | 2893ms | **1936ms** | **-33%** |
+| churn B(构造即弃) | 2152ms | 1571ms | -27% |
+| churn A(纯循环骨架) | 1400ms | 1149ms | -18% |
+| loop_sum(perf 门禁) | 267ms | 237ms | -12% |
+| fib seg1 | 40ms | 25ms | -38% |
+
+95(2 pre-existing)+64+perf+await电池30 全绿。
+
+## 机制
+
+- **Sop/DSop 新增 RecordConstruct/FieldGet**:镜像 compute_record_construct/field_get 语义(shape 来自 record_shapes;按名查找;空元构造编译期预建为 Const——E8 洞见);RecordConstruct 分配+注册是真实效应,**DCE 保活**。
+- **外槽值(outer_gids)**:sg 范围外的输入 gid(循环承载 Cell、外层局部)映射为伪槽,launch 时从发起帧读值,经 `Param(param_count+i)` 统一通道进 prog——**堆 Cell 是传输层**(DerefWrite 打真 Cell,条件树 deref 重读见新值)。
+- **E2 循环体直跑**:LoopBody sg 的 prog 就地执行替代整帧派发(body 帧作 reset 乘客保留);门=reset_plan 无 carry(L3' 槽循环的 carry 需 body 帧镜像,prog 路径不填充)。
+- **Call 快路资格收紧**:仅函数级纯 sg(loop_kind None + 无 loop_parent)——否则 LoopBody/臂的完成协议(Continue/None→reset/relay)被绕过。
+
+## 过程两雷(均最小复现速破)
+
+1. **DCE 删真 Cell 写**:「结果值无人读的堆 Cell 写」被当死码删除(devirt 后剩下的 DerefWriteCell 全是真堆 Cell)——叶子时代潜伏,循环体的语句写必然触发(sum 丢失、i 独活)。修=效应保活。
+2. **快路拦截 LoopBody**:Call 臂标量快路位于 is_loop_body 分支之前,原本靠「叶子本地构建失败」天然挡住循环体;外槽放行后 body 有了 prog 被当叶子调用执行,循环协议整条被绕过(一迭代即退)。修=资格门。
+3. 另:外槽 Cell 判定首版写反(拒绝的恰是外槽),CRLF 正则坑两连。
+
+## 遗留
+
+- M4(def-use 构造器传播,match_dispatch 内联体判别测试消减)未动——本刀只交付标量覆盖半场。
+- 重置机械(~200ns/迭代)成为纯循环新地板(reset_loop_iteration 的 waiter 清扫+计划应用+delta 拷贝)——下一层压缩点。
+- 死构造不消除(保活语义,与逃逸分析第 0 层联动是正解)。
+
+---
+
+# 循环紧驱动(2026-09-04)——落地:双程序直跑,免重置免派发
+
+## 结果(结果全逐位一致;95+64+perf+电池30 全绿)
+
+| 基准 | 今晨基线 | 标量覆盖后 | 紧驱动后 | 累计 |
+|---|---|---|---|---|
+| loop_sum | 267ms | 237 | **175** | **-34%** |
+| fib seg1 | 40ms | 25 | **19** | **-53%** |
+| churn A | 1400ms | 1149 | **940** | **-33%** |
+| churn B | 2152ms | 1571 | **1287** | **-40%** |
+| churn C | 2893ms | 1936 | **1639** | **-43%** |
+
+## 机制
+
+While 循环(body 有标量程序 + 条件树可标量化 + 无 carry/无 For 位)进入**紧循环**:每迭代 = body 程序 + 条件程序直跑,零重置/零节点派发/零门重发射;退出走一次常规重置,条件树真实重评,门取出口分支。
+
+配套管道(全部通用件):
+- `build_cond_prog`:条件树(condition_tree_plan 是 **DFS 前序**,须先拓扑排序——LT 曾在其操作数之前)→ 标量程序,返回=条件值;
+- **外槽每迭代重读**(优化器把循环承载状态改写成 sg 外可变槽,读一次会永久钉在初值);
+- **phi 写回链**:优化器旋转循环后,body 读条件树内 DEREF 节点的槽、条件读 body 计算值——条件程序导出树内被 body 消费的槽值(含 LT/deref),驱动写回帧槽;body 程序导出条件所需槽值(OpRef::Body 引用),同样写回。三处写回补齐旋转语义;
+- L3' 槽循环(carry 非空)被门排除,走原路径 ✓。
+
+## 过程雷(3 颗,均最小复现定位)
+
+1. **读一次假设**:外槽值 Arc 稳定只对 Cell/SSA 成立,优化器的旋转 phi 槽每迭代变——val 界循环挂死首证;
+2. **前序≠拓扑**:condition_tree_plan 根在前,构建器要输入先于使用——主循环探测静默失败;
+3. **旋转的中间人**:body 读的是条件树 deref 的槽(不是 Cell 也不是 body 值),紧循环里无人更新——条件程序导出+写回才闭环。
+
+## 遗留
+
+- match_dispatch 内联体(match/gate 不入标量程序)不受益——M4 仍是它的刀;
+- 纯循环新地板 ≈ 188ns/迭代(loop_sum 175ms/1M 中的 body+cond 程序 ~30ns + 外槽重读+导出写回机械);
+- For 循环(reset_to_zero/one)未纳入——迭代器 next() 程序化后可扩。
+
+---
+
+# M4 构造器 def-use 传播(2026-09-04)——落地(诚实账:-5%)
+
+## 结果
+
+**match_dispatch 1584→1505-1528ms(-5%)**;95+64+perf+电池30 全绿,其余基准(fib 24/loop_sum 174/recursion_tco 431)不受影响。M1 时代预估 1.3-1.5× 偏乐观——判别测试只占循环体 ~40 节点中的 4 个,体成本分散在 eq×4+两链门+算术×4+Cell 机械。
+
+## 机制(pass_ctor_prop,phase2 内联后)
+
+构造器测试(cf272)的 scrutinee 经**SEQ 转发+else-链包裹参数回溯**(参数占位 Const→launcher 门分支参数→源节点)解析到构造点派发门;门链每臂(真臂 sg 返回链→cf29 构造→RecordLitInfo 的 type/ctor)枚举;测试与臂 (type,ctor) 精确匹配且唯一命中→`redirect(测试→臂条件)`+DCE。两链融合为一层派发,构造的记录与 scrutinee 管道死亡。
+
+v1.5 死派发消除(值消费者全死时连门一起消)安全拒绝:链 SEQ 同时是**效应脊柱**(deref 们链在其上保序),消费检查遇活 deref 即退——机制保留(其他形状可触发),本形状不适用。
+
+## 发现与遗留
+
+- scrutinee 解析三跳:SEQ 末输入→包裹参数(gb 分支参数是唯一回边,downstream_slice 不含 gb 参数边)→终局门;else-链门的臂条件可以是常量(fallback 臂)。
+- match_dispatch 剩余大头 = 算术**全部四臂预计算**+两链门发射(E7 同帧已便宜)——下一刀候选:**标量 Select 化**(纯选择门→标量选择 op,体全量化→紧驱动接管,潜在 ~8×)与惰性臂(只算命中臂)。
+- 类型继承匹配未做(非精确匹配保守不折叠,正确性无损)。
+
+---
+
+# 标量 Select 化(2026-09-04)——**DISABLED:五轮未破的槽解析 bug,管线休眠**
+
+## 状态
+
+Select 管道完整就位(Sop/DSop::Select、执行器、DCE、expand_selects 预展开+占位传递解析+闭包补全+拓扑排序),但**展开被禁用**(expand_selects 首行 early-return)——带门循环体走通用执行器。已验证:禁用态 95+64+perf+电池30 全绿,全部战果保持(fib 20/loop_sum 174/match 1500/recursion 426)。
+
+## 战果闪现(证明机制潜力)
+
+解除禁用瞬间 match_dispatch **1549→227ms(~6.8×)**——但结果错(891896832≠945985787);seltest 复现:迭代 1 选择正确、迭代 2+ 恒选末臂。
+
+## Bug 解剖(五轮,留档续查)
+
+- **现象**:程序内 `Eq(Undef(1), const)` ×2 排在 Mod 之前——eq 的操作数槽(=Mod 的槽)在 lower 时未定义(Undef),即**拓扑排序后 eq 仍在 Mod 前**;下游 Select 用这两个坏 eq 做条件 → 恒 false → 末臂。
+- **已排除**:外槽传输(实测 body_outers=0/1/2/3 逐迭代新鲜✓)、效应内联(已冻结,case 写/构造禁)、占位符自环/下溢(已传递解析+输入映射先行)、未收集体内节点(已闭包补全——补全后现象不变,说明 eq 的输入 gid 既在体内又没进列表,或进列表但排序仍放行)。
+- **疑点**:lower 的 slot 语义 vs M4 redirect 目标的槽交错;或排序器 `!set.contains(inp)→external` 对某个恰好落在体内的输入误判(闭包应该已覆盖——除非该输入是 gate_info 的 select 边,闭包对 [c,a,b] 也补了)。
+- **调试工具**:反汇编打印(ops+consts+值)可复生于 `expand_selects` 禁用处;seltest(tmp_probe/l3pp/seltest)是标准复现。
+
+## 判决
+
+227ms 的闪现证明 ~7× 在机制射程内;但五轮未破,按止损纪律禁用休眠,保住当日四刀战果。重启线索:从 lower 的 Undef(slot) 打印源头 gid 入手,比对 node_list 与 set 的成员差。
+
+---
+
+# 标量 Select 化·重启收官(2026-09-04)——**修复落地:match_dispatch 6.7×**
+
+## 结果
+
+**match_dispatch 1584→227-237ms(≈6.7×),结果逐位一致**;95+64+perf+电池30 全绿,全部前序战果保持(fib 19/loop_sum 174/recursion 437/recbench 804/churn 同)。
+
+## 两颗真雷(重启即破——上次五轮盲区的根因)
+
+1. **★排序器的占位符间接层**:拓扑排序按**原始图边**判就绪,而主循环的输入映射把包裹参数占位符**改写为解析后的源**——eq 的原始输入是无依赖的占位符(早期就绪),真实依赖(Mod)在改写后的边上——排序器不知道 → 消费者排到生产者前 → 槽 Undef → 条件恒假恒选末臂。修=排序器与闭包补全同样先经 param_src 解析再判依赖。
+2. **★终局启发式误判 if-else 的 else 臂**:match 的终局 false=panic 网(不可达,b:=真值退化),但 **if-else 的 else 是无内嵌门的叶子真臂**——被当 panic → b:=a → 恒选 then(collatzStep 全走 n/2)。修=终局分辨:ret_value 是真值节点→else 臂入 b 侧;cf311(panic)→退化。
+
+## 教训
+
+- 「排序器/lower/闭包三个视图必须共享同一套边语义」——任何一边的改写(占位符解析)都要同步到所有顺序敏感的消费者;
+- 启发式分类(panic vs else)必须按可观察特征(cf/返回链)判,不能按形状(有无内嵌门)猜;
+- 上次五轮的盲区:现象(Eq(Undef) 排 Mod 前)其实每次都直指雷 1,但被「排序器已处理」的错觉跳过——重启时从反汇编的槽号(1=Mod 槽)反推,十分钟破案。
+
+## 终态
+
+match 类负载(match_dispatch 形态)全链入标量程序:整数 match→eq 选择集、构造 match→M4 折叠后的条件、门→Select——循环体纯数据流化,紧驱动接管。当日五刀全部落地。
+
+---
+
+# 逃逸分析第 0 层:字段 def-use 前推(2026-09-04)——零分配达成
+
+## 结果
+
+**churn C 1639→983ms(自 2893 累计 -66%);B 段 1571→739ms(死构造 DCE 后工作量反低于 A 段)**;95+64+perf+电池30 全绿,match_dispatch 230/recbench 同步保持。
+
+## 机制(比计划附录的 bumpalo 方案更简)
+
+附录原案 = Frame 挂 bumpalo 竞技场+非逃逸构造走帧局部分配。标量覆盖落地后,同一目标在**程序层**一步到位:`FieldGet(RecordConstruct(...), name)` 在 optimize_sops 前置遍中**前推为构造的字段操作数**(Seq 链穿越解析定义;按名查 shape.field_names 与 record_field_get 的 find_field 同源;pack 往返与操作数值等价)——构造失去最后消费者,活性驱动 DCE 整体消掉,**分配+原子+注册三项全免**,无需帧机械。逃逸构造(入 Cell/返回)不前推,自然回退堆分配。
+
+## 判决
+
+第 0 层收官:非逃逸构造在标量化路径零成本;bumpalo 帧层的剩余价值只在「逃逸但帧内死亡」的中间形态,降为可选后续。路线图下一项=图级 CSE/GVN+向量化。
+
+---
+
+# 数组元素读写入标量程序(2026-09-04)——数组循环标量化,向量化铺底
+
+## 结果(4M 迭代基准,结果逐位一致)
+
+| arrbench | 前 | 后 | Δ |
+|---|---|---|---|
+| A 填充(arr[i%8]=i) | 1145ms | **717ms** | **-37%** |
+| B 求和(sum+=arr[i%8]) | 1373ms | **922ms** | -33% |
+| C 读写混合 | 1788ms | **957ms** | **-46%** |
+
+95+64+perf+电池30 全绿,其余基准持平(match 231/fib 23/loop_sum 174)。
+
+## 机制
+
+Sop/DSop 增 `ArrayIndex`(cf32,纯读:镜像 compute_array_index 的 str→码点 char/数组→元素克隆/负界与越界 panic)与 `ArrayStore`(cf299,效应写:经 array_store_inplace 就地改,VOID 结果,DCE 保活)。数组槽只**借用**(in-place 经 Arc)不标记逃逸;select 臂效应冻结放行 32(纯)、继续禁 299(写)。数组循环体自此可程序化,紧驱动接管。
+
+## 位置
+
+路线图「CSE/GVN+向量化」项的铺底半场:图级 CSE 早已在优化器(pass_cse);SIMD 的对象(map 形数组循环)现在有了可识别的标量程序底物——下一刀=map-shape 识别 + wide 向量化(4-16× 潜力)。
+
+---
+
+# SIMD 向量化(2026-09-04)——map 形循环 lane 化落地:18-23×
+
+## 结果(mapbench 4M 元素,结果逐位一致;95+64+perf+电池30 全绿)
+
+| 段 | 标量程序 | SIMD | 幅度 |
+|---|---|---|---|
+| i32 map(out[i]=a[i]*b[i]+3) | 978ms | **44ms** | **22×** |
+| f64 map(of[i]=af[i]*2+1) | 894ms | **49ms** | **18×** |
+| i32 mix(out[i]=a[i]-b[i]*2) | 1008ms | **44ms** | **23×** |
+
+## 机制
+
+- **识别**(engine start,`analyze_simd_map`):紧驱动程序对上匹配 map 形——cond=`i<n`(DerefRead+Lt **或去虚拟化单 op Lt{a:Param}**);body=feeds(ArrayIndex,索引全同一直接 **Param 值槽**=去虚拟化的 i)、单 ArrayStore(同索引)、纯标量表达式链(Add/Sub/Mul/Shl/Shr/BitAnd/Or/Xor,f64 加 Div)、增量 DW(cell, Add(i, Const));**增量的索引算术(I32)排除出值族统一**。任何偏离拒绝→标量紧循环。
+- **执行**(驱动入口先试):运行时解析 n(cond 外槽/常量)、i0(body 外槽)、数组 Arc;**SoA 类型化连续缓冲直取**(i32x8/f64x4 lane 装载,`new([slice…])`/`to_array` 落地);长度预检(len<n → 回退标量,OOB panic 语义保留);尾数(≤7/3 个)走标量内核逐元素;终值 i=n 写回 Cell。整型 Div/Mod 禁 SIMD(scalar panic vs packed wrapping_div 分叉)。
+- 落地路径完全复用当日基建:标量程序对(紧驱动)、数组入链(SoA 直取)、外槽解析。
+
+## 过程三坑
+
+1. 条件程序 DerefRead **被去虚拟化**(cond 内只读)→ 单 op Lt 形态,分析需双形态;
+2. body 的 i 读同样去虚拟化为直接 Param(值槽)——索引匹配按 Param 不按 Op;
+3. 优化器强度削减把 `*2` 变 **Shl**——SIMD 白名单必须含位运算(否则 mix 类全拒)。
+
+## 遗留
+
+- 归约(sum += a[i])与非常量步长/偏移索引(i+k)未识别;u8/u16/u32/u64/f32 族未开(i32x8/f64x4 先行);
+- str(char 索引)不 SIMD(码点路径)。
+
+---
+
+# SIMD 归约扩展 + 公平分片(2026-09-04)——落地
+
+## SIMD 归约(追加战果)
+
+| redbench 4M | 标量程序 | SIMD | 幅度 |
+|---|---|---|---|
+| i32 sum(sum += a[i]) | 840ms | **17ms** | **50×** |
+| i32 加权(acc += a[i]*2+1) | 936ms | **48ms** | **19×** |
+
+- 识别:body 有第二个 DerefWrite(累加器真 Cell 读+写)、**无** ArrayStore、spine 经 `spine_roots_at` 左根链验证锚在 DR;**DR 按 0 代入即得逐元素贡献**(i32 wrapping 加法结合律 → lane 分组逐位一致;f64 归约因重排舍入分叉被分析拒绝)。
+- 执行:`acc_vec = splat(acc0) + Σ贡献 lanes`;水平归约 to_array 累加;尾数标量内核;终值写累加 Cell + i Cell。
+- ★坑:match 兜底臂 `_ => {}` 插在 ArrayStore 臂后把 Scalar 臂全吞(exprs=[] 静默)——加臂必须审它在 match 里的位置。
+
+## 公平分片(SLICE_ITERS)
+
+- 机制:`run_frame_nodes` 携带 `slice_iters`,紧循环与 Continue/None 重置路径每 `SLICE_ITERS`(2^18)次迭代:`state=Ready` + 紧循环路径补一次 `reset_loop_iteration`(重臂条件树)后 return → `process_frame` 的既有 `_` 重入队臂接手 → 泵给其他帧轮次 → 重派发时 hot_body 恢复、门重发射、紧循环续跑。循环状态全在堆 Cell + 帧槽,重入队零丢失。E1 内联子帧路径补了 Ready 分支(重入队+调用者挂 SubgraphComplete)作防御,但**深度门控 depth==0 才让位**——async 任务体里的 while 走 E1 子帧(depth>0)当前不让位。
+- 摊销成本:2^18 迭代一次重置+重入队 ≈ 0;全部基准(fib 19/loop_sum 174/match 225/recursion 438)持平确认。
+- **遗留(已知限制)**:async fun 体内重循环的 E1 子帧让位涉及 async-join 唤醒链(async 任务在 E1 挂起 SubgraphComplete 后,任务完成时 main 的 AsyncJoin 唤醒路径未走通,全链追踪留档),按结构 gating 收口保正确性;重启从 `complete_and_wake_caller` 的 async-child 分支(find_by_child)与 E1-挂起调用者的交互入手。
+- 测试形状教训:`fun f(): Async<i32>` 非 async 声明 + `.await()` = 错误形状(既存坑,与分片无关);标准形 = `async fun`。
+
+---
+
+# 公平分片·收官(2026-09-04)——E1 让位解封,公平性实证
+
+## 结论
+
+**上轮的 depth==0 门控已移除——此前"挂死"确证为错误测试形状(非 `async` 声明返回 `Async<T>`,既存坑),非分片之过。** 正确 `async fun` 形状下 E1 子帧让位链路天然走通:首让 depth=1 走 E1 Ready 分支(重入队+调用者挂 SubgraphComplete),后续让位 depth=0 走 process_frame `_` 重入队臂;循环完成时 complete_and_wake_caller 唤醒调用者,async 完成走 find_by_child → AsyncJoin 主线。
+
+## 公平性实证(双任务交错)
+
+重循环任务(800 万迭代)+ Timer 任务(8×20ms)并发:tick 时间戳 **46/94/186/282/377/471/565/660** —— 以 ~20ms 间隔分布在重循环执行期间(无分片时 timer 事件只会在循环结束后扎堆)。重循环结果逐位正确。
+
+## 终态
+
+- 95+64+perf+电池30 全绿;recursion_tco 466/438(带让位的让步,带宽内);全部微基准(map 44ms/归约 17ms/seltest/collatz/fairness)正确。
+- 分片公平层**完整收官**:单核运行时的所有重循环(同步/异步、E1/顶层)每 2^18 迭代让出事件循环轮次。
+
+---
+
+# 零静默:sync fun 声明 Async<T> 静默死锁 → 编译期诊断(2026-09-04)
+
+## 根因
+
+`fun f(): Async<T>`(非 async 声明)+ 表达式体产出 T:`wrap_async_return` 只在 is_async 时包装,声明的 Async<T> 原样保留而 unify 经 Async 解 fold 放行 T 体——**裸值泄漏到运行时被当作 async 句柄**;`.await()` 把 payload 读成 async_id,注册到不存在的条目 → 事件循环空转 2 亿次死锁(公平分片战役的陷阱形状)。sync fun 无任何机制产出真句柄(async 句柄=spawn 时的 join 注册,声明驱动)。
+
+## 修复(零静默原则)
+
+sema 新检查 `check_sync_fun_async_return`(Helpers.rs,镜像 check_throw_tail_wrapped 结构):非 async 声明 + ret 解析为 Async(_) + 体尾非 Async/TypeVar/Unknown/Never/Void + 非空尾块 → **编译错误**,消息含修复指引("declare it 'async fun' (or return an Async value)…awaiting the raw value deadlocks the event loop")。三接线点=FunDecl + 类型块方法 + trait 块方法(is_async 各在作用域)。
+
+**合法形状不误伤**(实测):`async fun` 声明体 T(解 fold 放行✓);sync fun 转发真句柄(`fun f(): Async<i32> { heavy() }`,体已 Async 型✓)。
+
+## 验证
+
+负向 64→66(两用例:sync_fun_async_return_deadlock / sync_method_async_return_deadlock);95+64+perf+电池30 全绿;公平分片实证保持(tick 46~652 分布)。错误形状现在 1:1 指到声明处,死锁不可能再到达运行时。

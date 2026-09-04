@@ -2814,8 +2814,6 @@ pub struct DataFlowGraph {
     /// nodes; None = not linearizable: EventSource present or cyclic). Populated once at
     /// EngineRef::new — derived data, never serialized (F-7 safe by construction).
     pub linear_plans: Vec<Option<Vec<NodeId>>>,
-    /// L2 offload: per-subgraph "every node is in the pure whitelist" flag.
-    pub offload_safe: Vec<bool>,
     /// L3'' perf: per-subgraph "eligible for same-frame callee execution"
     /// flag (function-level leaf sgs: sync, no defer/event sources, no call /
     /// await / select / control-flow nodes anywhere in their own or descendant
@@ -2824,8 +2822,13 @@ pub struct DataFlowGraph {
     pub sg_callee_same_frame: Vec<bool>,
     /// Compiled scalar-chain programs per subgraph (None = ineligible),
     /// built once at engine construction and shared by the engine's
-    /// synchronous fast path and the offload workers.
+    /// synchronous fast path.
     pub scalar_progs: Vec<Option<std::sync::Arc<crate::pass::Scalarizer::ScalarProg>>>,
+    /// Loop-condition scalar programs per While sg (the tight-loop driver's
+    /// condition half; None = ineligible). Derived at EngineRef::new.
+    pub cond_progs: Vec<Option<std::sync::Arc<crate::pass::Scalarizer::ScalarProg>>>,
+    /// SIMD map plans per While sg (None = not a recognized map loop).
+    pub simd_maps: Vec<Option<std::sync::Arc<crate::pass::Scalarizer::SimdMapPlan>>>,
     /// Builder-time flag: subgraphs added while set are stamped
     /// `converter_generated` (strategy-converter internals).
     pub converter_scope: bool,
@@ -3004,9 +3007,10 @@ impl Clone for DataFlowGraph {
             sg_initial_seed: self.sg_initial_seed.clone(),
             downstream_counts: self.downstream_counts.clone(),
             linear_plans: self.linear_plans.clone(),
-            offload_safe: self.offload_safe.clone(),
             sg_callee_same_frame: self.sg_callee_same_frame.clone(),
             scalar_progs: self.scalar_progs.clone(),
+            cond_progs: self.cond_progs.clone(),
+            simd_maps: Vec::new(),
             converter_scope: false,
             call_targets: self.call_targets.clone(),
             gate_branches: self.gate_branches.clone(),
@@ -3069,12 +3073,6 @@ impl DataFlowGraph {
         self.linear_plans.get(sg_idx).and_then(|p| p.as_deref())
     }
 
-    /// L2 offload: is this subgraph classified pure-offloadable? (Filled by
-    /// `classify_offloadable` at engine construction.)
-    pub fn offload_safe(&self, sg_idx: usize) -> bool {
-        self.offload_safe.get(sg_idx).copied().unwrap_or(false)
-    }
-
     /// L3'': same-frame callee eligibility for `sg_idx` (false when the
     /// precompute never ran — LSP / sync-interpreter contexts).
     pub fn callee_same_frame(&self, sg_idx: usize) -> bool {
@@ -3089,6 +3087,15 @@ impl DataFlowGraph {
         self.scalar_progs.get(sg_idx).cloned().flatten()
     }
 
+    /// Tight-loop driver: the While sg's condition program (None when the
+    /// loop shape is ineligible).
+    pub fn cond_prog(
+        &self,
+        sg_idx: usize,
+    ) -> Option<std::sync::Arc<crate::pass::Scalarizer::ScalarProg>> {
+        self.cond_progs.get(sg_idx).cloned().flatten()
+    }
+
     /// Creates an empty graph.
     pub fn new() -> Self {
         Self {
@@ -3097,9 +3104,10 @@ impl DataFlowGraph {
             sg_initial_seed: Vec::new(),
             downstream_counts: Vec::new(),
             linear_plans: Vec::new(),
-            offload_safe: Vec::new(),
             sg_callee_same_frame: Vec::new(),
             scalar_progs: Vec::new(),
+            cond_progs: Vec::new(),
+            simd_maps: Vec::new(),
             converter_scope: false,
             nodes: Vec::new(),
             inputs_pool: InputsPool::new(),
@@ -4702,40 +4710,3 @@ pub const fn scalar_meta(tag: crate::value::ValueTag) -> Option<ScalarMeta> {
 // =========================================================================
 
 
-/// L2 offload whitelist: compute fns that are pure dataflow over their
-/// inputs — scalar arithmetic/bitwise/comparison (every width), constructors
-/// and READ accessors, throw plumbing, and control-signal passthrough.
-/// Anything that writes heap objects in place, launches (Call/Gate/Await/
-/// select), touches FFI/IO/globals/channels/atomics, or builds closures is
-/// absent on purpose: an offloaded worker shares NOTHING with the engine
-/// except its (deep-copied) arguments, and this list is what keeps that true.
-/// Plus the pure control/cast/pattern family: RETURN (every function's
-/// result path), CAST_* (pure conversions/views), PATTERN_* / MATCH_FALLBACK
-/// (pure dispatch selects), REFLECT_TYPE_NAME (pure read). GLOBAL_LOAD and
-/// place-ref (DEREF_*/STORE) nodes stay OUT: they alias engine-owned storage.
-/// STR_CONCAT/STR_MULTI_CONCAT (fresh allocations, pure) included.
-/// Generated from `compute_fn_ids!`; audit any addition by hand.
-pub fn is_offload_safe_compute(cf: u32) -> bool {
-    // Sorted; binary search.
-    const SAFE: &[u32] = &[
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-        32, 34, 35, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56,
-        57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
-        73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88,
-        89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104,
-        105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120,
-        121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136,
-        137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152,
-        153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168,
-        169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184,
-        185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200,
-        201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216,
-        217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232,
-        233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248,
-        249, 250, 251, 252, 253, 254, 255, 256, 257, 267, 272, 273,
-        274, 275, 276, 290, 291, 292, 293, 294, 295, 298, 300, 301, 302, 303, 304, 305,
-        308, 311, 316, 324, 341, 342, 343, 344, 345, 346, 347,
-    ];
-    SAFE.binary_search(&cf).is_ok()
-}

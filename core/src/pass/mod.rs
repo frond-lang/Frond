@@ -9,7 +9,7 @@
 //! - [`Scalarizer`]: L2 标量化器 — pure-leaf subgraph → def-use straight-line
 //!   scalar program (build → cell devirtualization/DCE → def-use lowering);
 //!   the compiled `ScalarProg` is stored on the graph and executed by the
-//!   engine's synchronous fast path and the offload workers.
+//!   engine's synchronous fast path.
 //! - [`Optimizer`]: IR-post graph optimization. Pass pipeline: Phase 1 (one-shot,
 //!   O2+): LICM → LoopUnroll; Phase 2 (fixpoint): Inline → ConstFold →
 //!   StrengthRed → CSE → CopyProp → DCE → DSE.

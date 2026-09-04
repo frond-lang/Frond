@@ -11,8 +11,8 @@ build = "build.rs"
 mimalloc = "0.1"
 bumpalo = { version = "3", features = ["collections"] }
 wide = "1.7.0"
-rayon = "1"
 parking_lot = "0.12"
+rayon = "1"
 rustc-hash = "2.1"
 hashbrown = "0.17"
 clap = { version = "4.6", features = ["derive"] }

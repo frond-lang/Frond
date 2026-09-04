@@ -747,6 +747,264 @@ pub fn pass_dce(graph: &DataFlowGraph, ctx: &mut OptimizerContext, pure_set: &Fx
 /// reachability covers them. Non-escaping lambdas share the enclosing
 /// function's `function_id` and die together with it. `rebuild`'s removal
 /// veto (reference scan) is the final safety net for anything missed here.
+
+/// M4 def-use constructor propagation: a ctor-pattern test whose scrutinee
+/// resolves (through SEQ forwarding and else-chain wrap params) to a match
+/// DISPATCH GATE whose every arm returns a constructor literal folds to the
+/// matching arm's condition node — the constructor is statically known from
+/// the construction site. The dispatch's constructed records and the
+/// scrutinee plumbing become dead code for the DCE passes.
+///
+/// Shape (match_dispatch class): `val op = match i % 4 { .. => Add .. }` then
+/// `match op { Add => .. }` — the inner dispatch constructs, the outer tests.
+/// After the fold both chains fuse into one dispatch over the inner arms.
+pub fn pass_ctor_prop(graph: &DataFlowGraph, ctx: &mut OptimizerContext) {
+    use rustc_hash::FxHashMap;
+
+    let node_count = graph.node_count();
+    if node_count == 0 {
+        return;
+    }
+
+    // sg_of: node → innermost containing sg (param resolution needs the
+    // owning wrap). Build by smallest-range-wins over all sgs.
+    let mut sg_of: Vec<i32> = vec![-1; node_count];
+    for (si, sg) in graph.subgraphs.iter().enumerate() {
+        let (ns, ne) = sg.node_range;
+        if ns.0 >= ne.0 {
+            continue;
+        }
+        for g in ns.0..ne.0 {
+            let gu = g as usize;
+            if gu >= node_count {
+                continue;
+            }
+            let cur = sg_of[gu];
+            if cur < 0 {
+                sg_of[gu] = si as i32;
+            } else {
+                let cs = &graph.subgraphs[cur as usize];
+                let cur_len = cs.node_range.1 .0 - cs.node_range.0 .0;
+                let my_len = ne.0 - ns.0;
+                if my_len < cur_len {
+                    sg_of[gu] = si as i32;
+                }
+            }
+        }
+    }
+
+    // target_sg → (gate gid, branch params) for every gate branch (the wrap
+    // param resolution's back edge).
+    let mut launcher_of: FxHashMap<u32, (u32, Vec<u32>)> = FxHashMap::default();
+    for g in 0..node_count {
+        if let Some(gb) = graph.gate_branches_at(g) {
+            for (_, tgt, params) in gb.branches.iter() {
+                launcher_of.entry(tgt.0).or_insert((
+                    g as u32,
+                    params.iter().map(|p| p.0).collect(),
+                ));
+            }
+        }
+    }
+
+    // resolve an arm sg's returned constructor: (type_name, ctor_name)
+    let arm_ctor = |sgidx: usize| -> Option<(String, String)> {
+        let sg = &graph.subgraphs[sgidx];
+        let mut r = sg.return_node;
+        for _ in 0..16 {
+            let n = graph.node(r.0 as usize);
+            match n.compute_fn.0 {
+                47 /* CF_SEQ */ => {
+                    let ins = graph.inputs(n.inputs_offset, n.input_count);
+                    r = *ins.last()?;
+                }
+                29 | 288 /* construct */ => {
+                    let info = graph.record_lit_info_at(r.0 as usize)?;
+                    return Some((info.type_name.clone(), info.constructor.clone()));
+                }
+                _ => return None,
+            }
+        }
+        None
+    };
+
+    // scrutinee resolution: SEQ-forward / wrap-param hop / terminal gate.
+    // `chain` records every intermediate node walked (the dead-dispatch
+    // elimination reclaims them when the dispatch's value dies).
+    let resolve = |mut s: u32, chain: &mut Vec<u32>| -> Option<u32> {
+        for _ in 0..24 {
+            if s as usize >= node_count {
+                return None;
+            }
+            let n = graph.node(s as usize);
+            if n.kind == crate::ir::Ir::NodeKind::Gate {
+                return Some(s);
+            }
+            match n.compute_fn.0 {
+                47 /* CF_SEQ */ => {
+                    let ins = graph.inputs(n.inputs_offset, n.input_count);
+                    s = ins.last()?.0;
+                    chain.push(s);
+                }
+                0 /* const/param placeholder */ => {
+                    if graph.const_value(s as usize).is_some() {
+                        return None; // a real constant — not a scrutinee chain
+                    }
+                    let owner = sg_of[s as usize];
+                    if owner < 0 {
+                        return None;
+                    }
+                    let osg = &graph.subgraphs[owner as usize];
+                    let (ons, _one) = osg.node_range;
+                    let pidx = s.wrapping_sub(ons.0);
+                    if pidx >= osg.param_count as u32 {
+                        return None; // placeholder not in the param prefix
+                    }
+                    let Some((_, params)) = launcher_of.get(&(owner as u32)) else {
+                        return None;
+                    };
+                    let src = *params.get(pidx as usize)?;
+                    if src == s {
+                        return None; // self-feeding (defensive)
+                    }
+                    s = src;
+                    chain.push(s);
+                }
+                _ => return None,
+            }
+        }
+        None
+    };
+
+    // dispatch arm enumeration: else-chain of gates; each true arm returns a
+    // ctor literal. Arms: (cond_gid, ctor). The final false target may be a
+    // panic/void sg (non-exhaustive safety net) — ignored (unreachable).
+    let enumerate = |root: u32| -> Option<Vec<(u32, (String, String))>> {
+        let mut arms: Vec<(u32, (String, String))> = Vec::new();
+        let mut gate = root;
+        for _ in 0..32 {
+            let n = graph.node(gate as usize);
+            if n.kind != crate::ir::Ir::NodeKind::Gate {
+                return None;
+            }
+            let gb = graph.gate_branches_at(gate as usize)?;
+            let mut tsg = None;
+            let mut fsg = None;
+            for (c, tgt, _) in gb.branches.iter() {
+                if *c {
+                    tsg = Some(tgt.0);
+                } else {
+                    fsg = Some(tgt.0);
+                }
+            }
+            let (Some(tsg), fsg) = (tsg, fsg) else { return None };
+            arms.push((gb.condition_input.0, arm_ctor(tsg as usize)?));
+            let Some(fsg) = fsg else { break };
+            // Descend into the wrap: the next gate is the wrap's own Gate node.
+            let wsg = &graph.subgraphs[fsg as usize];
+            let (wns, wne) = wsg.node_range;
+            let mut next: Option<u32> = None;
+            let nested = graph.sg_nested_ranges(fsg as usize);
+            for g2 in wns.0..wne.0 {
+                if nested.iter().any(|&(a, b)| g2 >= a && g2 < b) {
+                    continue;
+                }
+                if graph.node(g2 as usize).kind == crate::ir::Ir::NodeKind::Gate {
+                    next = Some(g2);
+                    break;
+                }
+            }
+            let Some(nx) = next else { break }; // terminal (panic/void) — done
+            gate = nx;
+        }
+        if arms.is_empty() {
+            return None;
+        }
+        Some(arms)
+    };
+
+    let mut changed = false;
+    // root gate → every scrutinee chain node that led tests to it.
+    let mut roots: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for t in 0..node_count {
+        let n = graph.node(t);
+        if n.compute_fn.0 != 272 /* CF_PATTERN_CTOR_MATCH */ {
+            continue;
+        }
+        let tid = NodeId(t as u32);
+        if ctx.dead.contains(&tid) || ctx.redirect.contains_key(&tid) {
+            continue;
+        }
+        let ins = graph.inputs(n.inputs_offset, n.input_count);
+        if ins.is_empty() {
+            continue;
+        }
+        let Some(tctor) = graph.pattern_ctor_name(t) else { continue };
+        let ttype = graph.pattern_type_name(t);
+        let mut chain: Vec<u32> = Vec::new();
+        let Some(root) = resolve(ins[0].0, &mut chain) else { continue };
+        let Some(arms) = enumerate(root) else { continue };
+        roots.entry(root).or_default().extend(chain.iter().copied());
+        // Exact ctor match (v1: no inheritance walk — non-exact simply folds
+        // nothing and keeps the runtime test).
+        let hits: Vec<u32> = arms
+            .iter()
+            .filter(|(_, (cty, cctr))| {
+                cctr == tctor
+                    && ttype.map_or(true, |w| cty == w)
+            })
+            .map(|(cond, _)| *cond)
+            .collect();
+        if hits.len() == 1 {
+            ctx.redirect.insert(tid, NodeId(hits[0]));
+            ctx.dead.insert(tid);
+            changed = true;
+        }
+    }
+    // Dead-dispatch elimination (v1.5): for each root whose scrutinee chains
+    // are now test-free, check whether the dispatch's VALUE has any consumer
+    // outside the chains and the dead tests. If not, the dispatch is
+    // computationally dead: its arms construct literals nobody reads. Fold
+    // the root gate to its condition input (the launches vanish, arm/wrap
+    // sgs lose their launcher) and reclaim the chain nodes.
+    if changed {
+        for (&root, chain) in roots.iter() {
+            let chain_set: rustc_hash::FxHashSet<u32> =
+                chain.iter().copied().collect();
+            let mut ok = true;
+            for &cnode in std::iter::once(&root).chain(chain.iter()) {
+                for &ds in graph.downstream_slice(cnode as usize) {
+                    if chain_set.contains(&ds.0) || ds.0 == root {
+                        continue;
+                    }
+                    if !ctx.dead.contains(&NodeId(ds.0)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let Some(gb) = graph.gate_branches_at(root as usize) else { continue };
+            let cond = gb.condition_input;
+            ctx.redirect.insert(NodeId(root), cond);
+            ctx.dead.insert(NodeId(root));
+            for &cnode in chain.iter() {
+                let cn = NodeId(cnode);
+                if !ctx.redirect.contains_key(&cn) {
+                    ctx.redirect.insert(cn, cond);
+                }
+                ctx.dead.insert(cn);
+            }
+        }
+        ctx.mutated = true;
+    }
+}
+
 pub fn pass_func_dce(graph: &DataFlowGraph, ctx: &mut OptimizerContext) {
     if graph.entry_subgraph.is_none() {
         return;
@@ -1401,6 +1659,7 @@ pub fn optimize_with_analysis(
         // and ends optimization instead of killing the compile.
         let progressed = run_guarded(graph, &format!("phase2 round {round}"), |graph| {
             pass_inline(graph, &mut ctx, None);
+            pass_ctor_prop(graph, &mut ctx);
             pass_const_fold(graph, &mut ctx);
             pass_strength_reduction(graph, &mut ctx);
             pass_cse(graph, &mut ctx, &pure_set);

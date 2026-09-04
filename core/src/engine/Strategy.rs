@@ -107,7 +107,6 @@ impl Engine<Single> {
             frame_pool: RefCell::new(Vec::new()),
             ready_frames: Some(RefCell::new(std::collections::VecDeque::new())),
             queued_dedup: None,
-            offload_rt: None,
             _strategy: std::marker::PhantomData,
         }
     }
@@ -219,7 +218,6 @@ impl Engine<Multi> {
             frame_pool: RefCell::new(Vec::new()),
             ready_frames: Some(RefCell::new(std::collections::VecDeque::new())),
             queued_dedup: Some(ParkingMutex::new(HashSet::new())),
-            offload_rt: Some(super::Offload::OffloadRt::new()),
             _strategy: std::marker::PhantomData,
         }
     }
@@ -263,8 +261,6 @@ impl Engine<Multi> {
         let mut idle_spins: u64 = 0;
         loop {
             let queue = QueueHandle::EventLoop { queue: &rq, dedup };
-            // L2: replay offload completions in launch order (sequencer).
-            self.apply_offload_deliveries(&queue);
             let fid = {
                 let mut set = dedup.lock();
                 let f = rq.borrow_mut().pop_front();
@@ -292,21 +288,10 @@ impl Engine<Multi> {
                             self.rescue_stranded_frames_multi(&rq, dedup);
                         }
                         let next_deadline = self.timer_runtime.lock().next_deadline();
-                        if let Some(rt) = self.offload_rt.as_ref() {
-                            // Single-lock wake path: head check + inflight
-                            // check + bounded wait in one acquisition. Workers
-                            // notify only on head-applicable deliveries.
-                            let outcome = rt.park_for_head(next_deadline);
-                            match outcome {
-                                super::Offload::ParkOutcome::HeadReady => continue,
-                                super::Offload::ParkOutcome::TimedOut => continue,
-                                super::Offload::ParkOutcome::NothingInFlight => {}
-                            }
-                        }
                         if next_deadline.is_none() && !self.reconcile_stale_joins_multi(&queue) {
                             // Provably permanent: every waiter's source is a
                             // frame (none runnable — the sweep found nothing)
-                            // or a timer (none pending; no offload in flight).
+                            // or a timer (none pending).
                             // Dump and exit loudly.
                             self.dump_deadlock_state_multi();
                             panic!(
@@ -438,9 +423,6 @@ impl Engine<Multi> {
         }
         for line in self.async_join_runtime.lock().debug_dump() {
             eprintln!("  join: {line}");
-        }
-        if let Some(rt) = self.offload_rt.as_ref() {
-            eprintln!("  offload: {}", rt.debug_state());
         }
     }
 }

@@ -57,7 +57,7 @@ const TYPE_NAME_ARRAY: &str = "array";
 /// Uses the same `HeapObj::ErrorVal` representation as `ValueArena::alloc_error_val`,
 /// eliminating the repeated hand-rolled `RecordValue` pattern across compute_fns.
 /// compute_fns have no Arena access, so they construct `Value::ref_val` directly.
-fn make_error_throw(type_name: &str, msg: &str) -> Value {
+pub fn make_error_throw(type_name: &str, msg: &str) -> Value {
     use crate::value::{ErrorValue, HeapObj, ThrowPayload, ThrowValue};
     let err_val = Value::ref_val(HeapObj::ErrorVal(ErrorValue {
         type_name: type_name.to_string(),
@@ -293,7 +293,7 @@ macro_rules! impl_cmp_compute {
 // autonomously by the EvalContext).
 // =========================================================================
 
-/// Batch-extracts binary-op inputs → SIMD/rayon batch eval → returns a list of
+/// Batch-extracts binary-op inputs → SIMD batch eval → returns a list of
 /// `(local NodeId, Value)`. Does not write `frame.value_table` and does not
 /// notify downstream — the engine hot loop handles these via `NodeResult::Batch`.
 macro_rules! compute_bin_batch_results {
@@ -316,7 +316,7 @@ macro_rules! compute_bin_batch_results {
     }};
 }
 
-/// Batch-extracts comparison-op inputs → SIMD/rayon batch eval → returns a list
+/// Batch-extracts comparison-op inputs → SIMD batch eval → returns a list
 /// of `(local NodeId, bool Value)`. Does not write `frame.value_table` and does
 /// not notify downstream — the engine hot loop handles these via `NodeResult::Batch`.
 macro_rules! compute_cmp_batch_results {
@@ -339,7 +339,7 @@ macro_rules! compute_cmp_batch_results {
     }};
 }
 
-/// Batch-extracts unary-op inputs → SIMD/rayon batch eval → returns a list of
+/// Batch-extracts unary-op inputs → SIMD batch eval → returns a list of
 /// `(local NodeId, Value)`. Does not write `frame.value_table` and does not
 /// notify downstream — the engine hot loop handles these via `NodeResult::Batch`.
 macro_rules! compute_unary_batch_results {
@@ -768,12 +768,12 @@ where F: FnOnce(u128, u128) -> bool
 }
 
 // Shared F128 comparison kernels (bit-pattern operands). Single source of
-// truth for both the compute_fns and the offload scalar fast path — the two
+// truth for both the compute_fns and the scalar fast path — the two
 // must never diverge (NaN and ±0 semantics are deliberate here).
 // BUGFIX (2026-09-03): le/ge used strict </> — equal operands returned false.
 
 // NaN handling lives INSIDE the kernels (comparisons false, ne true) so both
-// the compute_fns and the offload fast path share identical semantics.
+// the compute_fns and the scalar fast path share identical semantics.
 
 /// eq: bit-equal (non-NaN), or both operands zero (any sign); NaN → false.
 pub(crate) fn f128_eq_bits(ab: u128, bb: u128) -> bool {

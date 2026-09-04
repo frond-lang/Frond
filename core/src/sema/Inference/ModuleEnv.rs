@@ -1026,6 +1026,17 @@ impl<'a> InferContext<'a> {
                         decl_span.line,
                         decl_span.column,
                     );
+                    if !is_async {
+                        self.check_sync_fun_async_return(
+                            &format!("function '{}'", name),
+                            ret_ty,
+                            body_ty,
+                            *body,
+                            ast,
+                            decl_span.line,
+                            decl_span.column,
+                        );
+                    }
                 }
                 if !type_params.is_empty() {
                     self.pop_type_bindings();
@@ -1238,6 +1249,17 @@ impl<'a> InferContext<'a> {
                         // (the from_datetime_utc/scanln leak class). ret_ty arrives
                         // Async-wrapped for async methods, which the helper filters.
                         if let Some(r) = ret_ty {
+                            if !method.is_async {
+                                self.check_sync_fun_async_return(
+                                    &format!("method '{}'", method.name),
+                                    r,
+                                    body_ty,
+                                    body,
+                                    ast,
+                                    decl_span.line,
+                                    decl_span.column,
+                                );
+                            }
                             self.check_throw_tail_wrapped(
                                 &format!("method '{}'", method.name),
                                 r,
@@ -1331,6 +1353,17 @@ impl<'a> InferContext<'a> {
                         // (the from_datetime_utc/scanln leak class). ret_ty arrives
                         // Async-wrapped for async methods, which the helper filters.
                         if let Some(r) = ret_ty {
+                            if !method.is_async {
+                                self.check_sync_fun_async_return(
+                                    &format!("method '{}'", method.name),
+                                    r,
+                                    body_ty,
+                                    body,
+                                    ast,
+                                    decl_span.line,
+                                    decl_span.column,
+                                );
+                            }
                             self.check_throw_tail_wrapped(
                                 &format!("method '{}'", method.name),
                                 r,

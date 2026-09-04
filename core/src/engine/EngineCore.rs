@@ -70,9 +70,6 @@ pub struct Engine<S: LockStrategy> {
     /// The ready-frame queue for both variants (Single direct; Multi's
     /// deterministic event loop).
     pub ready_frames: Option<RefCell<std::collections::VecDeque<FrameId>>>,
-    /// L2 offload runtime (Multi only; None in Single). Shared with worker
-    /// threads — the ONLY cross-thread state, fully mutex-guarded.
-    pub offload_rt: Option<std::sync::Arc<super::Offload::OffloadRt>>,
     /// Queue-membership set (Multi only): at most ONE pending ready-queue
     /// entry per frame. Root fix (2026-09) for the duplicate-entry family:
     /// the suspension handoff pushes AND the wake path pushes the same frame,
@@ -95,65 +92,6 @@ pub struct Engine<S: LockStrategy> {
 // GLOBAL_ARENA keying) remains unsupported.
 unsafe impl Send for Engine<Multi> {}
 unsafe impl Sync for Engine<Multi> {}
-
-/// L2 offload classification: a subgraph is offloadable iff every node in
-/// its range is in the pure whitelist (`is_offload_safe_compute`) and it is
-/// an ordinary subgraph (no loop machinery). Size thresholding happens at
-/// launch (--offload / [engine] offload / [engine] offload_min), not here.
-fn classify_offloadable(graph: &mut DataFlowGraph) {
-    // TEMP DIAG: full CF histogram for one sg (--offload-sg IDX)
-    let mut safe = vec![false; graph.subgraphs.len()];
-    for (i, sg) in graph.subgraphs.iter().enumerate() {
-        if sg.loop_kind != crate::ir::Ir::LoopKind::None {
-            continue;
-        }
-        let (ns, ne) = sg.node_range;
-        let mut ok = true;
-        for nid in ns.0..ne.0 {
-            if nid as usize >= graph.node_count() {
-                ok = false;
-                break;
-            }
-            let node = graph.node(nid as usize);
-            let cf = node.compute_fn.0;
-            let pure = if crate::ir::Ir::is_offload_safe_compute(cf) {
-                true
-            } else if cf == crate::ir::Ir::CF_CELL_ALLOC.0 {
-                // Place-model var materialization: a FRESH private cell per
-                // frame — safe on a worker (the copy-in clone makes it
-                // frame-private). This is what unlocks var-bearing leaves.
-                true
-            } else if cf == crate::ir::Ir::CF_DEREF_READ.0
-                || cf == crate::ir::Ir::CF_DEREF_WRITE.0
-            {
-                // Cell read/write is safe iff the cell is FRAME-LOCAL: the
-                // ref input (inputs[0], per compute_deref_read/write's
-                // convention) must be produced by a CELL_ALLOC node inside
-                // this sg. A cell flowing from a PARAM carries &T reference
-                // semantics — mutating the worker's clone would be invisible
-                // to the caller.
-                let inputs = graph.inputs(node.inputs_offset, node.input_count);
-                match inputs.first() {
-                    Some(&cell_node) => {
-                        (cell_node.0 >= ns.0 && cell_node.0 < ne.0)
-                            && (cell_node.0 as usize) < graph.node_count()
-                            && graph.node(cell_node.0 as usize).compute_fn
-                                == crate::ir::Ir::CF_CELL_ALLOC
-                    }
-                    None => false,
-                }
-            } else {
-                false
-            };
-            if !pure {
-                ok = false;
-                break;
-            }
-        }
-        safe[i] = ok;
-    }
-    graph.offload_safe = safe;
-}
 
 /// L3'' classification: which function-level subgraphs may execute as
 /// same-frame callees (saved-context switch instead of a child-frame launch).
@@ -729,13 +667,50 @@ impl EngineRef {
         precompute_sg_templates(&mut graph);
         materialize_downstream_counts(&mut graph);
         materialize_linear_plans(&mut graph);
-        classify_offloadable(&mut graph);
         classify_same_frame_callees(&mut graph);
         // Scalar-chain programs for every subgraph (shared by the engine's
-        // synchronous fast path and the offload workers).
+        // synchronous fast path).
         graph.scalar_progs = (0..graph.subgraphs.len())
             .map(|i| crate::pass::Scalarizer::build_scalar_prog(&graph, crate::ir::Ir::SubGraphId(i as u32)))
             .collect();
+        let mut cond_progs: Vec<Option<std::sync::Arc<crate::pass::Scalarizer::ScalarProg>>> =
+            (0..graph.subgraphs.len()).map(|_| None).collect();
+        for i in 0..graph.subgraphs.len() {
+            if let Some((c, body)) = crate::pass::Scalarizer::build_cond_with_body(
+                &graph,
+                crate::ir::Ir::SubGraphId(i as u32),
+            ) {
+                // The joint build returns an EXPORT-AUGMENTED body program —
+                // overwrite the plain one so the tight loop and the plain
+                // path share the same (richer) program.
+                for (bi, b) in graph.subgraphs.iter().enumerate() {
+                    if b.loop_kind == crate::ir::Ir::LoopKind::LoopBody
+                        && b.loop_parent_sg == Some(crate::ir::Ir::SubGraphId(i as u32))
+                    {
+                        graph.scalar_progs[bi] = Some(body);
+                        break;
+                    }
+                }
+                cond_progs[i] = Some(c);
+            }
+        }
+        graph.cond_progs = cond_progs;
+        let mut simd_maps: Vec<Option<std::sync::Arc<crate::pass::Scalarizer::SimdMapPlan>>> =
+            (0..graph.subgraphs.len()).map(|_| None).collect();
+        for wi in 0..graph.subgraphs.len() {
+            let (Some(cond), Some(bodyp)) = (
+                graph.cond_prog(wi),
+                graph.subgraphs.iter().position(|b| {
+                    b.loop_kind == crate::ir::Ir::LoopKind::LoopBody
+                        && b.loop_parent_sg == Some(crate::ir::Ir::SubGraphId(wi as u32))
+                })
+                .and_then(|bi| graph.scalar_prog(bi)),
+            ) else { continue };
+            if let Some(plan) = crate::pass::Scalarizer::analyze_simd_map(&bodyp, &cond) {
+                simd_maps[wi] = Some(plan);
+            }
+        }
+        graph.simd_maps = simd_maps;
         let has_async = Self::entry_reaches_suspend(&graph);
         if has_async {
             Self::Multi(Arc::new(Engine::<Multi>::new_multi(graph)))
