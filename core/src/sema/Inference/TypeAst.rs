@@ -146,6 +146,7 @@ impl<'a> InferContext<'a> {
                 // Delegate to resolve_name_to_type: builtin scalar → trait → alias unfolding → Adt.
                 let mut visiting = FxHashSet::default();
                 self.resolve_name_to_type(name, type_param_map, &mut visiting)
+
             }
             TypeNode::ThisType => match self.current_this_type() {
                 Some(ty) => ty,

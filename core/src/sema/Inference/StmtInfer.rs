@@ -22,6 +22,41 @@ impl<'a> InferContext<'a> {
             for e in errors {
                 self.sema_result.add_error(e);
             }
+            // 方案 B 零静默收尾(check 期局部注解位):裸类型名既未注册
+            // 也不在本模块 pending 集(前向引用)时,历史上静默造成 Adt
+            // (`val t: Fmt` 无声通过)—— 报 unknown type。只在局部注解
+            // 位检查:predeclare/早期 populate 的签名解析存在合法的跨
+            // 模块时序前向引用,不能上解析干道。
+            if let crate::ast::Ast::TypeNode::Named { name } = &ast.ty(ta).node {
+                if !name.contains('.') {
+                    // 内建豁免:标量/str/void/Lib 经 concrete 表解析,
+                    // trait 在 trait 注册表 —— 均不落 type_defs。
+                    let builtin_like = super::Helpers::name_to_concrete(&**name).is_some()
+                        || &**name == "Lib"
+                        || &**name == "str"
+                        || &**name == "void"
+                        || &**name == "null"
+                        || self.sema_result.get_trait_def(&**name).is_some();
+                    if !builtin_like {
+                    let canonical = self.sema_result.resolve_type_key(&**name);
+                    let registered =
+                        self.sema_result.get_type_def(canonical.as_str()).is_some();
+                    let pending_own = self
+                        .sema_result
+                        .pending_own_types
+                        .iter()
+                        .any(|t| t == &**name);
+                    if !registered && !pending_own {
+                        let span = ast.ty(ta).span;
+                        self.add_error_at(
+                            &format!("unknown type '{}'", &**name),
+                            span.line,
+                            span.column,
+                        );
+                    }
+                    }
+                }
+            }
         }
         let expected_ty = type_annotation.map(|ta| self.type_from_ast(ta, ast));
         let val_ty = self.infer_expr(value, ast, env, expected_ty);

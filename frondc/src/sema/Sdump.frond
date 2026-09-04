@@ -7,7 +7,7 @@ import std.core.types.Str
 import types.Arena.{display}
 
 import module.Loader
-import sema.Data
+import sema.Data.{ik_debug, tdk_debug}
 import sema.Semares.{trait_def_idx, type_def_idx}
 import sema.Modenv.{str_bytes_lt, str_list_sort}
 

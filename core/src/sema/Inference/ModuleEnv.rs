@@ -1,5 +1,13 @@
 //! ModuleEnv — Module-level checking: builtins, imports, predeclare, check_decl. Mechanically split from Inference.rs (no logic changes).
 
+/// 方案 B 环境面(用户裁决 2026-09-05):root 层(全模块裸可见)的
+/// 函数 = 声明位打 `@export` 的函数(显式意图,环境面 = grep @export)。
+/// print 族/跨家族内部内核(@export 或 __ 前缀约定)由此声明;其余
+/// 一律模块内可见或显式选择性导入(S2c 优先级格)。
+pub fn is_ambient_exported(attributes: &[crate::ast::Ast::Attribute<'_>]) -> bool {
+    attributes.iter().any(|a| a.name == "export")
+}
+
 use super::*;
 
 impl<'a> InferContext<'a> {
@@ -216,6 +224,29 @@ impl<'a> InferContext<'a> {
                 // Ensure the imported module's hierarchy env exists (including intermediate path
                 // prefixes and first-segment ModuleRef registration).
                 let module_env = self.ensure_module_env(&full_path, env);
+                // 方案 B(2026-09-05):用户模块导入获得与 std 层同款的
+                // "显式可见性授予"——历史路径是整模块导入的成员裸调经
+                // ROOT 预declare glob 解析(`import Helper; helper_value()`),
+                // 环境面收缩到 @export 后,导入语句成为唯一通道:把被导入
+                // 模块 env 的全部绑定再输出进导入方 env(导入即真理的
+                // 裸名臂;selective 条目随后的 redefine 保持 S2c 优先级)。
+                if let Some(&target_env) = self.sema_result.module_envs.get(&full_path) {
+                    if target_env != env {
+                        let names: Vec<String> = self
+                            .sema_result
+                            .env
+                            .snapshot_names(target_env)
+                            .into_iter()
+                            .collect();
+                        for name in names {
+                            if let Some(sym_ty) =
+                                self.sema_result.env.lookup_local(target_env, &name)
+                            {
+                                self.sema_result.env.define(env, &name, sym_ty);
+                            }
+                        }
+                    }
+                }
                 // Bug #103 layering: the std layer is invisible to user code,
                 // so the import statement is the channel that re-exports it.
                 // Re-export every std-layer binding whose origin module lies
@@ -568,7 +599,7 @@ impl<'a> InferContext<'a> {
         let mut seen_fns: FxHashSet<&str> = FxHashSet::default();
         for decl in module.declarations.iter() {
             match &decl.node {
-                Decl::FunDecl { name, type_params, params, return_type, is_async, .. } => {
+                Decl::FunDecl { name, type_params, params, return_type, is_async, attributes, .. } => {
                     if !seen_fns.insert(name) {
                         self.add_error_at(
                             &format!("duplicate definition of function '{}' in this module", name),
@@ -620,11 +651,26 @@ impl<'a> InferContext<'a> {
                     );
                     // Register into the module-dedicated env (bare name); ModuleRef lookup uses
                     // lookup_local in this env.
-                    // Also register into root_env to make it globally visible (cross-module
-                    // bare-name reference compatibility):
-                    //   define does not overwrite existing bindings; the first registration wins.
+                    // Register into the module-dedicated env (bare name); ModuleRef lookup
+                    // uses lookup_local in this env.
                     self.sema_result.env.define(module_env, name, fn_ty);
-                    self.sema_result.env.define(root_env, name, fn_ty);
+                    // Ambient whitelist (Plan B, 2026-09-05): the historical root_env
+                    // define made EVERY loaded function globally bare-visible (a
+                    // ~330-name implicit glob; `get` x3 / `parse` x20 collisions,
+                    // method-sugar namespace pollution — see BOOTSTRAP_PLAN 附七).
+                    // The root layer now keeps ONLY the primitive surface:
+                    //   - the print family (language-level console I/O),
+                    //   - `__`-prefixed functions (builtin cross-module internals,
+                    //     named by convention, zero user-visible collision cost).
+                    // Everything else resolves bare ONLY inside its own module or
+                    // through an explicit selective import (S2c precedence).
+                    // @export 只对 builtin 层生效(环境面是引擎特权层
+                    // 的声明;user/std 模块打 @export 不产生全局可见性,
+                    // std 的跨模块内部互调走显式选择性导入)。
+                    let in_builtin = module.name.starts_with("builtin/");
+                    if in_builtin && is_ambient_exported(attributes) {
+                        self.sema_result.env.define(root_env, name, fn_ty);
+                    }
                     // Generic function: pop type_bindings (symmetric with check_decl).
                     if !type_params.is_empty() {
                         self.pop_type_bindings();
@@ -926,8 +972,11 @@ impl<'a> InferContext<'a> {
                 if !is_builtin {
                     for attr in attributes {
                         match attr.name {
-                            crate::ffi::ATTR_INTERNAL if !is_stdlib => self.add_error_at(
-                                "attribute '@internal' is reserved for the standard library implementation",
+                            // Phase 2c(2026-09-05):tag 收紧 builtin-only —— std 本体
+                            // 的 @internal 已清标(私有函数由 IR 规则统一守卫:
+                            // std 非 pub 一律用户禁调),打标即错。
+                            crate::ffi::ATTR_INTERNAL if !is_builtin => self.add_error_at(
+                                "attribute '@internal' is reserved for builtin modules",
                                 decl_span.line,
                                 decl_span.column,
                             ),

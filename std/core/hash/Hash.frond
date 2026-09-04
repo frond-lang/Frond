@@ -69,7 +69,6 @@ pub fun key<K>(k: K): u64 {
 // keeps its sign. A str key that literally contains "-0" normalizes too
 // — that only creates a hash collision with "0", which `==` still
 // disambiguates; normalization can never split ==-equal values.
-@internal
 fun normalize_zero(s: str): str {
     val b = s.bytes()
     var out: u8[] = [0, ..b.len()]

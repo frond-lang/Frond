@@ -13,6 +13,7 @@
 // Returns -1 when offset is out of range or an invalid UTF-8 sequence is encountered.
 @internal
 @extern("C")
+@export
 fun __str_utf8_decode_at(s: str, offset: usize): i64 #{
     if (offset >= s_len) return -1;
     unsigned char c = (unsigned char)s_data[offset];
@@ -44,6 +45,7 @@ fun __str_utf8_decode_at(s: str, offset: usize): i64 #{
 // Returns 0 when offset is out of range. Invalid UTF-8 leading bytes are treated as 1.
 @internal
 @extern("C")
+@export
 fun __str_utf8_char_len_at(s: str, offset: usize): usize #{
     if (offset >= s_len) return 0;
     unsigned char c = (unsigned char)s_data[offset];
@@ -109,6 +111,7 @@ fun __str_join_packed_into(blob: u8[], sep: str, out: u8[]): i64 #{
 // NOTE: str.len() counts Unicode chars, not bytes — all sizing here uses
 // bytes().len().
 @internal
+@export
 fun __str_array_join(arr: str[], sep: str): str {
     if arr.len() == 0 {
         return ""
@@ -167,6 +170,7 @@ fun __str_array_join(arr: str[], sep: str): str {
 // disambiguates anyway.
 @internal
 @extern("C")
+@export
 fun __hash_key_str(s: str): u64 #{
     unsigned long long h = 14695981039346656037ULL;
     size_t i = 0;
@@ -190,6 +194,7 @@ fun __hash_key_str(s: str): u64 #{
 // FNV-1a 64 over a byte buffer (C twin of Hash.fnv1a_bytes).
 @internal
 @extern("C")
+@export
 fun __fnv1a_bytes(data: u8[]): u64 #{
     unsigned long long h = 14695981039346656037ULL;
     for (size_t i = 0; i < data_len; i++) {
@@ -202,6 +207,7 @@ fun __fnv1a_bytes(data: u8[]): u64 #{
 // -1 when absent. Empty needle matches at from (Str.find_bytes twin).
 @internal
 @extern("C")
+@export
 fun __find_bytes(hay: u8[], needle: u8[], from: usize): i64 #{
     if (needle_len == 0) return (int64_t)from;
     if (hay_len < needle_len) return -1;
@@ -218,6 +224,7 @@ fun __find_bytes(hay: u8[], needle: u8[], from: usize): i64 #{
 // Lexicographic byte compare (mirror sort key; -1 / 0 / 1). Zero-copy views.
 @internal
 @extern("C")
+@export
 fun __str_bytes_cmp(x: str, y: str): i32 #{
     size_t n = (x_len < y_len) ? x_len : y_len;
     for (size_t i = 0; i < n; i++) {
@@ -242,6 +249,7 @@ fun __str_bytes_cmp(x: str, y: str): i32 #{
 @c_include("stdlib.h")
 @internal
 @extern("C")
+@export
 fun __fp_parse_f64(s: str, ok: u8[]): f64 #{
     ok_data[0] = 0;
     if (s_len == 0) return 0.0;
@@ -271,6 +279,7 @@ fun __fp_parse_f64(s: str, ok: u8[]): f64 #{
 @c_include("stdlib.h")
 @internal
 @extern("C")
+@export
 fun __fp_parse_f32(s: str, ok: u8[]): f32 #{
     ok_data[0] = 0;
     if (s_len == 0) return 0.0f;
@@ -304,6 +313,7 @@ fun __fp_parse_f32(s: str, ok: u8[]): f32 #{
 @c_include("stdlib.h")
 @internal
 @extern("C")
+@export
 fun __fp_parse_f16(s: str, ok: u8[]): u16 #{
     ok_data[0] = 0;
     if (s_len == 0) return 0;
@@ -385,6 +395,7 @@ fun __fp_parse_f16(s: str, ok: u8[]): u16 #{
 @c_include("stdint.h")
 @internal
 @extern("C")
+@export
 fun __fp_f128_from_bits(hi: u64, lo: u64, out: f128[]): void #{
     out_data[0] = lo;
     out_data[1] = hi;

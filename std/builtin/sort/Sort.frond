@@ -108,6 +108,7 @@ fun __sort_heap_by<T>(a: T[], cmp: (T, T) -> i32): void {
 // Sorts the array in place (ascending, unstable). Scalar element types take
 // the C heapsort fast path; every other ordered element type (str, ...) uses
 // the pure-Frond heapsort.
+@export
 pub fun sort<T>(a: T[]): void {
     val n = a.type_name()
     if n == "i8[]" {
@@ -151,11 +152,13 @@ pub fun sort<T>(a: T[]): void {
 
 // Sorts the array in place by a three-way comparator (negative = first sorts
 // before second, 0 = equal, positive = after). Works for any element type.
+@export
 pub fun sort_by<T>(a: T[], cmp: (T, T) -> i32): void {
     __sort_heap_by(a, cmp)
 }
 
 // Whether the array is in nondecreasing order.
+@export
 pub fun is_sorted<T>(a: T[]): bool {
     var i = 1 as usize
     while i < a.len() {
@@ -170,6 +173,7 @@ pub fun is_sorted<T>(a: T[]): bool {
 // First index at which v could be inserted without breaking order: the count
 // of elements strictly less than v (classic lower_bound / bisect_left).
 // Requires a sorted array.
+@export
 pub fun lower_bound<T>(a: T[], v: T): usize {
     var lo = 0 as usize
     var hi = a.len()
@@ -187,6 +191,7 @@ pub fun lower_bound<T>(a: T[], v: T): usize {
 // First index at which v could be inserted after equal runs: the count of
 // elements less than OR equal to v (classic upper_bound / bisect_right).
 // Requires a sorted array.
+@export
 pub fun upper_bound<T>(a: T[], v: T): usize {
     var lo = 0 as usize
     var hi = a.len()

@@ -162,7 +162,6 @@ pub fun weekday_abbr(w: u8): str {
 // ─── ISO 8601 parse ─────────────────────────────────────────────────────────
 
 // Parse exactly `count` decimal digits at `pos`, error on anything else.
-@internal
 fun __expect_digits(b: u8[], pos: usize, count: usize): Throw<i64, TimeError> {
     var v: i64 = 0
     var i: usize = 0
@@ -182,7 +181,6 @@ fun __expect_digits(b: u8[], pos: usize, count: usize): Throw<i64, TimeError> {
 }
 
 // Expect exactly one byte value at `pos`.
-@internal
 fun __expect_byte(b: u8[], pos: usize, expected: u8): Throw<void, TimeError> {
     if pos >= b.len() || b[pos] != expected {
         throw TimeError(ParseFailed, "unexpected separator", "")
@@ -192,7 +190,6 @@ fun __expect_byte(b: u8[], pos: usize, expected: u8): Throw<void, TimeError> {
 
 // Expect the date/time separator at `pos`: 'T' (ISO 8601), 't' or ' '
 // (RFC 3339 §5.6 NOTE allows a human-readable space).
-@internal
 fun __expect_date_sep(b: u8[], pos: usize): Throw<void, TimeError> {
     if pos >= b.len() || (b[pos] != 84 && b[pos] != 116 && b[pos] != 32) {
         throw TimeError(ParseFailed, "expected T separator", "")

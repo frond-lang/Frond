@@ -15,7 +15,7 @@ import std.core.types.Str
 import syntax.Ast
 import types.Arena.{adt_parts, array_parts, async_value, atomic_elem, channel_elem, detail_of, fn_parts, foreign_fn_ret, generic_parts, lazy_value, make, make_adt, make_array, make_async, make_atomic, make_channel, make_fn, make_foreign_fn, make_generic, make_lazy, make_nullable, make_receiver, make_record, make_ref, make_sender, make_throw, make_trait, nullable_inner, receiver_elem, record_fields, ref_parts, resolve, sender_elem, thr_parts, trait_parts}
 import std.os.Proc
-import types.Ty
+import types.Ty.{ty_source_name}
 
 import sema.Data.{new_err, new_err_path}
 import sema.Semares.{canonical_type_key, dynamic_type_id, get_trait_def, get_type_def, list_has_str, list_remove_str, put_func_sig, put_trait_def, put_type_def, record_module_import, resolve_trait_key, resolve_trait_key_in, resolve_type_key, resolve_type_key_in, tail_seg, trait_parent_closure, type_def_has, type_def_idx}

@@ -17,7 +17,6 @@
 // Host platform check: reads the same builtin primitive as std.os.Info.os_name.
 // (A std.io → std.os cross-pack import has no precedent; the builtin layer is
 // fully visible to all std modules.)
-@internal
 fun __path_host_is_windows(): bool {
     val buf: u8[] = [0, ..32]
     val n = __os_platform_into(buf)

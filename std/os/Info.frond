@@ -80,7 +80,6 @@ pub fun cpu_count(): i64 {
 
 // Read LE u64 from the disk-space buffer (local twin of File.__read_u64_le —
 // @internal helpers are not shared across packs).
-@internal
 fun __read_u64_at(buf: u8[], offset: usize): u64 {
     ((buf[offset]) as u64)
         | (((buf[offset + 1]) as u64) << 8)
@@ -94,7 +93,6 @@ fun __read_u64_at(buf: u8[], offset: usize): u64 {
 
 // Query one filesystem field via __os_disk_space_into.
 // 0 = free bytes, 8 = total bytes (buffer offsets).
-@internal
 fun __disk_field(path: Path, offset: usize): Throw<u64, OsError> {
     val buf: u8[] = [0, ..16]
     val rc = __os_disk_space_into(path.to_str(), buf)

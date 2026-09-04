@@ -2,8 +2,8 @@
 // 对齐)。操作序列与 Rust 侧完全同序 — handle 编号是差分锚。
 
 import std.collections.List
-import types.Ty
-import types.Arena
+import types.Ty.{kind_debug, unify_err_str}
+import types.Arena.{fresh_kind_var, fresh_type_var_with_kind, from_scalar_name, kind_of, resolve_kind, unify_kind}
 
 var out: str = ""
 var n: i64 = 0

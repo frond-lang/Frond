@@ -1002,7 +1002,68 @@ impl<'a> InferContext<'a> {
                     return self.arena.fresh_type_var();
                 }
                 let span = ast.expr(expr).span;
-                self.add_error_at(&format!("undefined variable '{}'", name), span.line, span.column);
+                // 方案 B 诊断升级(2026-09-05):名字**存在但不可见** ≠ 名字
+                // 不存在 —— 环境面收缩后,裸调未导入的名字是常态错误,给
+                // 出准确归属与导入导引(零静默:错误要可行动)。函数注册表
+                // → 构造器表(def_module)逐级回查;都无才维持原文案。
+                let diag = {
+                    let mut found = false;
+                    let mut msg = format!("undefined variable '{}'", name);
+                    if let Some(owners) = self.sema_result.func_sig_owners.get(&**name) {
+                        if !owners.is_empty() {
+                            let mods: Vec<String> = owners
+                                .iter()
+                                .map(|o| {
+                                    o.strip_suffix(".frond").unwrap_or(o).replace('/', ".")
+                                })
+                                .collect();
+                            msg = format!(
+                                "function '{}' exists in module(s) [{}] — import it explicitly (e.g. import {}.{{{}}}) or use the qualified form",
+                                name,
+                                mods.join(", "),
+                                mods[0],
+                                name
+                            );
+                            found = true;
+                        }
+                    }
+                    if !found {
+                        // 模块尾段命中(Fmt.dec 的 recv 位/值位通用):
+                        // 给模块导入导引(module_envs 键尾段匹配,注册序)。
+                        let mut tail_mods: Vec<String> = Vec::new();
+                        for k in self.sema_result.module_envs.keys() {
+                            if let Some(tail) = k.rsplit('.').next() {
+                                if tail == &**name {
+                                    tail_mods.push(k.clone());
+                                }
+                            }
+                        }
+                        if !tail_mods.is_empty() {
+                            msg = format!(
+                                "module '{}' exists — import it explicitly (e.g. import {}) to use its members",
+                                name,
+                                tail_mods[0]
+                            );
+                            found = true;
+                        }
+                    }
+                    if !found {
+                        let ctors = self.sema_result.get_ctor_defs(&**name);
+                        if let Some(first) = ctors.first() {
+                            let m = first
+                                .def_module
+                                .strip_suffix(".frond")
+                                .unwrap_or(&first.def_module)
+                                .replace('/', ".");
+                            msg = format!(
+                                "constructor '{}' of type '{}' exists in module [{}] — import it explicitly (e.g. import {}.{{{}}}) or use the qualified form",
+                                name, first.type_name, m, m, first.type_name
+                            );
+                        }
+                    }
+                    msg
+                };
+                self.add_error_at(&diag, span.line, span.column);
                 self.arena.fresh_type_var()
             }
             _ => unreachable!("infer_ident_expr called on non-Ident expression"),

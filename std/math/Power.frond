@@ -8,7 +8,9 @@
 // g_{n+1} = (g_n + x/g_n) / 2, negative returns NaN, 0 returns 0
 // First normalize x to [1, 4) to extract even exponent e, iterate on mantissa then restore with ldexp
 
-@internal
+import std.math.Round.{ldexp_f32_impl, ldexp_f64_impl}
+
+@export
 fun sqrt_f64_impl(x: f64): f64 {
     if x < 0.0 { return 0.0 / 0.0 }
     if x == 0.0 { return 0.0 }
@@ -30,7 +32,7 @@ fun sqrt_f64_impl(x: f64): f64 {
     }
     ldexp_f64_impl(g, e)
 }
-@internal
+@export
 fun sqrt_f32_impl(x: f32): f32 {
     if x < 0.0 { return Math.nan_f32() }
     if x == 0.0 { return 0.0 }
@@ -52,7 +54,7 @@ fun sqrt_f32_impl(x: f32): f32 {
     }
     ldexp_f32_impl(g, e)
 }
-@internal
+@export
 fun sqrt_f16_impl(x: f16): f16 {
     if x < 0.0 { return 0.0f16 / 0.0f16 }
     if x == 0.0 { return 0.0 }
@@ -74,7 +76,7 @@ fun sqrt_f16_impl(x: f16): f16 {
     }
     ldexp_f16_impl(g, e)
 }
-@internal
+@export
 fun sqrt_f128_impl(x: f128): f128 {
     if x < 0.0 { return 0.0f128 / 0.0f128 }
     if x == 0.0 { return 0.0 }
@@ -111,7 +113,6 @@ pub fun sqrt<T>(x: T): T {
 // g_{n+1} = (2*g + x/(g*g)) / 3, 0 returns 0
 // Take absolute value then normalize to [1, 8) to extract exponent e, cbrt(x) = cbrt(m) * 2^e, finally restore sign
 
-@internal
 fun cbrt_f64_impl(x: f64): f64 {
     if x == 0.0 { return 0.0 }
     var a = if x < 0.0 { 0.0 - x } else { x }
@@ -134,7 +135,6 @@ fun cbrt_f64_impl(x: f64): f64 {
     val r = ldexp_f64_impl(g, e)
     if x < 0.0 { 0.0 - r } else { r }
 }
-@internal
 fun cbrt_f32_impl(x: f32): f32 {
     if x == 0.0 { return 0.0 }
     var a = if x < 0.0 { 0.0 - x } else { x }
@@ -157,7 +157,6 @@ fun cbrt_f32_impl(x: f32): f32 {
     val r = ldexp_f32_impl(g, e)
     if x < 0.0 { 0.0 - r } else { r }
 }
-@internal
 fun cbrt_f16_impl(x: f16): f16 {
     if x == 0.0 { return 0.0 }
     var a = if x < 0.0 { 0.0 - x } else { x }
@@ -180,7 +179,6 @@ fun cbrt_f16_impl(x: f16): f16 {
     val r = ldexp_f16_impl(g, e)
     if x < 0.0 { 0.0 - r } else { r }
 }
-@internal
 fun cbrt_f128_impl(x: f128): f128 {
     if x == 0.0 { return 0.0 }
     var a = if x < 0.0 { 0.0 - x } else { x }
@@ -219,7 +217,7 @@ pub fun cbrt<T>(x: T): T {
 // exp(r) = 1 + r + r²/2! + r³/3! + ...
 // Large x returns Inf/0 directly to avoid ldexp infinite loop
 
-@internal
+@export
 fun exp_f64_impl(x: f64): f64 {
     val ln2 = 0x1.62e42fefa39efp-1
     if x == 0.0 { return 1.0 }
@@ -237,7 +235,7 @@ fun exp_f64_impl(x: f64): f64 {
     }
     ldexp_f64_impl(sum, k)
 }
-@internal
+@export
 fun exp_f32_impl(x: f32): f32 {
     val ln2: f32 = 0x1.62e42fefa39efp-1
     if x == 0.0 { return 1.0 }
@@ -255,7 +253,7 @@ fun exp_f32_impl(x: f32): f32 {
     }
     ldexp_f32_impl(sum, k)
 }
-@internal
+@export
 fun exp_f16_impl(x: f16): f16 {
     val ln2: f16 = 0x1.63p-1f16
     if x == 0.0 { return 1.0 }
@@ -273,7 +271,7 @@ fun exp_f16_impl(x: f16): f16 {
     }
     ldexp_f16_impl(sum, k)
 }
-@internal
+@export
 fun exp_f128_impl(x: f128): f128 {
     val ln2: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1f128
     if x == 0.0 { return 1.0 as f128 }
@@ -308,7 +306,7 @@ pub fun exp<T>(x: T): T {
 // atanh series |s|≤1/3 converges fast, no sign branch, no alternating cancellation, accuracy far better than Taylor
 // x == 0 returns -Inf, x < 0 returns NaN
 
-@internal
+@export
 fun log_f64_impl(x: f64): f64 {
     val ln2 = 0x1.62e42fefa39efp-1
     if x == 0.0 { return -1.0 / 0.0 }
@@ -335,7 +333,7 @@ fun log_f64_impl(x: f64): f64 {
     }
     2.0 * sum + e as f64 * ln2
 }
-@internal
+@export
 fun log_f32_impl(x: f32): f32 {
     val ln2: f32 = 0x1.62e42fefa39efp-1
     if x == 0.0 { return Math.neg_inf_f32() }
@@ -362,7 +360,7 @@ fun log_f32_impl(x: f32): f32 {
     }
     2.0 * sum + e as f32 * ln2
 }
-@internal
+@export
 fun log_f16_impl(x: f16): f16 {
     val ln2: f16 = 0x1.63p-1f16
     if x == 0.0 { return -1.0f16 / 0.0f16 }
@@ -389,7 +387,7 @@ fun log_f16_impl(x: f16): f16 {
     }
     2.0 * sum + e as f16 * ln2
 }
-@internal
+@export
 fun log_f128_impl(x: f128): f128 {
     val ln2: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1f128
     if x == 0.0 { return -1.0f128 / 0.0f128 }
@@ -430,7 +428,6 @@ pub fun log<T>(x: T): T {
 // ─── pow (power, exp(exp * log(base))) ───
 // Handle base <= 0 boundary: base>0 uses formula; base==0 returns by exp sign; base<0 returns NaN
 
-@internal
 fun pow_f64_impl(base: f64, exp: f64): f64 {
     if base > 0.0 { return exp_f64_impl(exp * log_f64_impl(base)) }
     if base == 0.0 {
@@ -440,7 +437,6 @@ fun pow_f64_impl(base: f64, exp: f64): f64 {
     }
     0.0 / 0.0
 }
-@internal
 fun pow_f32_impl(base: f32, exp: f32): f32 {
     if base > 0.0 { return exp_f32_impl(exp * log_f32_impl(base)) }
     if base == 0.0 {
@@ -450,7 +446,6 @@ fun pow_f32_impl(base: f32, exp: f32): f32 {
     }
     Math.nan_f32()
 }
-@internal
 fun pow_f16_impl(base: f16, exp: f16): f16 {
     if base > 0.0 { return exp_f16_impl(exp * log_f16_impl(base)) }
     if base == 0.0 {
@@ -460,7 +455,6 @@ fun pow_f16_impl(base: f16, exp: f16): f16 {
     }
     Math.nan_f16()
 }
-@internal
 fun pow_f128_impl(base: f128, exp: f128): f128 {
     if base > 0.0 { return exp_f128_impl(exp * log_f128_impl(base)) }
     if base == 0.0 {
@@ -484,22 +478,18 @@ pub fun pow<T>(base: T, exp: T): T {
 // ─── exp2 / exp10 (2^x and 10^x) ───
 // exp2(x) = exp(x * ln2), exp10(x) = exp(x * ln10)
 
-@internal
 fun exp2_f64_impl(x: f64): f64 {
     val ln2 = 0x1.62e42fefa39efp-1
     exp_f64_impl(x * ln2)
 }
-@internal
 fun exp2_f32_impl(x: f32): f32 {
     val ln2: f32 = 0x1.62e42fefa39efp-1
     exp_f32_impl(x * ln2)
 }
-@internal
 fun exp2_f16_impl(x: f16): f16 {
     val ln2: f16 = 0x1.63p-1f16
     exp_f16_impl(x * ln2)
 }
-@internal
 fun exp2_f128_impl(x: f128): f128 {
     val ln2: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1f128
     exp_f128_impl(x * ln2)
@@ -515,22 +505,18 @@ pub fun exp2<T>(x: T): T {
     }
 }
 
-@internal
 fun exp10_f64_impl(x: f64): f64 {
     val ln10 = 0x1.26bb1bbb55516p+1
     exp_f64_impl(x * ln10)
 }
-@internal
 fun exp10_f32_impl(x: f32): f32 {
     val ln10: f32 = 0x1.26bb1bbb55516p+1
     exp_f32_impl(x * ln10)
 }
-@internal
 fun exp10_f16_impl(x: f16): f16 {
     val ln10 = 0x1.26cp+1f16
     exp_f16_impl(x * ln10)
 }
-@internal
 fun exp10_f128_impl(x: f128): f128 {
     val ln10 = 0x1.26bb1bbb5551582dd9ad3a9f9f6ep+1f128
     exp_f128_impl(x * ln10)
@@ -549,22 +535,18 @@ pub fun exp10<T>(x: T): T {
 // ─── log2 / log10 (change of base formula) ───
 // log2(x) = log(x) / ln2, log10(x) = log(x) / ln10
 
-@internal
 fun log2_f64_impl(x: f64): f64 {
     val ln2 = 0x1.62e42fefa39efp-1
     log_f64_impl(x) / ln2
 }
-@internal
 fun log2_f32_impl(x: f32): f32 {
     val ln2: f32 = 0x1.62e42fefa39efp-1
     log_f32_impl(x) / ln2
 }
-@internal
 fun log2_f16_impl(x: f16): f16 {
     val ln2: f16 = 0x1.63p-1f16
     log_f16_impl(x) / ln2
 }
-@internal
 fun log2_f128_impl(x: f128): f128 {
     val ln2: f128 = 0x1.62e42fefa39ef35793c7673007e6p-1f128
     log_f128_impl(x) / ln2
@@ -580,22 +562,18 @@ pub fun log2<T>(x: T): T {
     }
 }
 
-@internal
 fun log10_f64_impl(x: f64): f64 {
     val ln10 = 0x1.26bb1bbb55516p+1
     log_f64_impl(x) / ln10
 }
-@internal
 fun log10_f32_impl(x: f32): f32 {
     val ln10 = 0x1.26bb1bbb55516p+1
     log_f32_impl(x) / ln10
 }
-@internal
 fun log10_f16_impl(x: f16): f16 {
     val ln10 = 0x1.26cp+1f16
     log_f16_impl(x) / ln10
 }
-@internal
 fun log10_f128_impl(x: f128): f128 {
     val ln10 = 0x1.26bb1bbb5551582dd9ad3a9f9f6ep+1f128
     log_f128_impl(x) / ln10
@@ -614,7 +592,6 @@ pub fun log10<T>(x: T): T {
 // ─── gcd (greatest common divisor, Euclidean algorithm) ───
 // Signed integers take absolute value first, unsigned compute directly
 
-@internal
 fun gcd_i32_impl(a: i32, b: i32): i32 {
     var x = if a < 0 { 0 - a } else { a }
     var y = if b < 0 { 0 - b } else { b }
@@ -625,7 +602,6 @@ fun gcd_i32_impl(a: i32, b: i32): i32 {
     }
     x
 }
-@internal
 fun gcd_i64_impl(a: i64, b: i64): i64 {
     var x = if a < 0 { 0 - a } else { a }
     var y = if b < 0 { 0 - b } else { b }
@@ -636,7 +612,6 @@ fun gcd_i64_impl(a: i64, b: i64): i64 {
     }
     x
 }
-@internal
 fun gcd_i128_impl(a: i128, b: i128): i128 {
     var x = if a < 0 { 0 - a } else { a }
     var y = if b < 0 { 0 - b } else { b }
@@ -647,7 +622,6 @@ fun gcd_i128_impl(a: i128, b: i128): i128 {
     }
     x
 }
-@internal
 fun gcd_u32_impl(a: u32, b: u32): u32 {
     var x = a
     var y = b
@@ -658,7 +632,6 @@ fun gcd_u32_impl(a: u32, b: u32): u32 {
     }
     x
 }
-@internal
 fun gcd_u64_impl(a: u64, b: u64): u64 {
     var x = a
     var y = b
@@ -669,7 +642,6 @@ fun gcd_u64_impl(a: u64, b: u64): u64 {
     }
     x
 }
-@internal
 fun gcd_i8_impl(a: i8, b: i8): i8 {
     var x = if a < 0 { 0 - a } else { a }
     var y = if b < 0 { 0 - b } else { b }
@@ -680,7 +652,6 @@ fun gcd_i8_impl(a: i8, b: i8): i8 {
     }
     x
 }
-@internal
 fun gcd_i16_impl(a: i16, b: i16): i16 {
     var x = if a < 0 { 0 - a } else { a }
     var y = if b < 0 { 0 - b } else { b }
@@ -691,7 +662,6 @@ fun gcd_i16_impl(a: i16, b: i16): i16 {
     }
     x
 }
-@internal
 fun gcd_isize_impl(a: isize, b: isize): isize {
     var x = if a < 0 { 0 - a } else { a }
     var y = if b < 0 { 0 - b } else { b }
@@ -702,7 +672,6 @@ fun gcd_isize_impl(a: isize, b: isize): isize {
     }
     x
 }
-@internal
 fun gcd_u8_impl(a: u8, b: u8): u8 {
     var x = a
     var y = b
@@ -713,7 +682,6 @@ fun gcd_u8_impl(a: u8, b: u8): u8 {
     }
     x
 }
-@internal
 fun gcd_u16_impl(a: u16, b: u16): u16 {
     var x = a
     var y = b
@@ -724,7 +692,6 @@ fun gcd_u16_impl(a: u16, b: u16): u16 {
     }
     x
 }
-@internal
 fun gcd_u128_impl(a: u128, b: u128): u128 {
     var x = a
     var y = b
@@ -735,7 +702,6 @@ fun gcd_u128_impl(a: u128, b: u128): u128 {
     }
     x
 }
-@internal
 fun gcd_usize_impl(a: usize, b: usize): usize {
     var x = a
     var y = b
@@ -768,84 +734,72 @@ pub fun gcd<T>(a: T, b: T): T {
 // ─── lcm (least common multiple) ───
 // lcm = a/gcd(a,b)*b, a==0 || b==0 returns 0
 
-@internal
 fun lcm_i32_impl(a: i32, b: i32): i32 {
     if a == 0 || b == 0 { return 0 }
     val g = gcd_i32_impl(a, b)
     val q = a / g
     q * b
 }
-@internal
 fun lcm_i64_impl(a: i64, b: i64): i64 {
     if a == 0 || b == 0 { return 0 }
     val g = gcd_i64_impl(a, b)
     val q = a / g
     q * b
 }
-@internal
 fun lcm_i128_impl(a: i128, b: i128): i128 {
     if a == 0 || b == 0 { return 0 }
     val g = gcd_i128_impl(a, b)
     val q = a / g
     q * b
 }
-@internal
 fun lcm_u32_impl(a: u32, b: u32): u32 {
     if a == 0 || b == 0 { return 0 }
     val g = gcd_u32_impl(a, b)
     val q = a / g
     q * b
 }
-@internal
 fun lcm_u64_impl(a: u64, b: u64): u64 {
     if a == 0 || b == 0 { return 0 }
     val g = gcd_u64_impl(a, b)
     val q = a / g
     q * b
 }
-@internal
 fun lcm_i8_impl(a: i8, b: i8): i8 {
     if a == 0 || b == 0 { return 0 }
     val g = gcd_i8_impl(a, b)
     val q = a / g
     q * b
 }
-@internal
 fun lcm_i16_impl(a: i16, b: i16): i16 {
     if a == 0 || b == 0 { return 0 }
     val g = gcd_i16_impl(a, b)
     val q = a / g
     q * b
 }
-@internal
 fun lcm_isize_impl(a: isize, b: isize): isize {
     if a == 0 || b == 0 { return 0 }
     val g = gcd_isize_impl(a, b)
     val q = a / g
     q * b
 }
-@internal
 fun lcm_u8_impl(a: u8, b: u8): u8 {
     if a == 0 || b == 0 { return 0 }
     val g = gcd_u8_impl(a, b)
     val q = a / g
     q * b
 }
-@internal
 fun lcm_u16_impl(a: u16, b: u16): u16 {
     if a == 0 || b == 0 { return 0 }
     val g = gcd_u16_impl(a, b)
     val q = a / g
     q * b
 }
-@internal
 fun lcm_u128_impl(a: u128, b: u128): u128 {
     if a == 0 || b == 0 { return 0 }
     val g = gcd_u128_impl(a, b)
     val q = a / g
     q * b
 }
-@internal
 fun lcm_usize_impl(a: usize, b: usize): usize {
     if a == 0 || b == 0 { return 0 }
     val g = gcd_usize_impl(a, b)
@@ -874,63 +828,51 @@ pub fun lcm<T>(a: T, b: T): T {
 // ─── div_floor (floor division) ───
 // q = a/b, r = a%b; if r!=0 and r and b have opposite signs then q-1
 
-@internal
 fun div_floor_i32_impl(a: i32, b: i32): i32 {
     val q = a / b
     val r = a % b
     if r != 0 && ((r < 0) != (b < 0)) { q - 1 } else { q }
 }
-@internal
 fun div_floor_i64_impl(a: i64, b: i64): i64 {
     val q = a / b
     val r = a % b
     if r != 0 && ((r < 0) != (b < 0)) { q - 1 } else { q }
 }
-@internal
 fun div_floor_i128_impl(a: i128, b: i128): i128 {
     val q = a / b
     val r = a % b
     if r != 0 && ((r < 0) != (b < 0)) { q - 1 } else { q }
 }
-@internal
 fun div_floor_u32_impl(a: u32, b: u32): u32 {
     a / b
 }
-@internal
 fun div_floor_u64_impl(a: u64, b: u64): u64 {
     a / b
 }
-@internal
 fun div_floor_i8_impl(a: i8, b: i8): i8 {
     val q = a / b
     val r = a % b
     if r != 0 && ((r < 0) != (b < 0)) { q - 1 } else { q }
 }
-@internal
 fun div_floor_i16_impl(a: i16, b: i16): i16 {
     val q = a / b
     val r = a % b
     if r != 0 && ((r < 0) != (b < 0)) { q - 1 } else { q }
 }
-@internal
 fun div_floor_isize_impl(a: isize, b: isize): isize {
     val q = a / b
     val r = a % b
     if r != 0 && ((r < 0) != (b < 0)) { q - 1 } else { q }
 }
-@internal
 fun div_floor_u8_impl(a: u8, b: u8): u8 {
     a / b
 }
-@internal
 fun div_floor_u16_impl(a: u16, b: u16): u16 {
     a / b
 }
-@internal
 fun div_floor_u128_impl(a: u128, b: u128): u128 {
     a / b
 }
-@internal
 fun div_floor_usize_impl(a: usize, b: usize): usize {
     a / b
 }
@@ -956,73 +898,61 @@ pub fun div_floor<T>(a: T, b: T): T {
 // ─── div_ceil (ceiling division) ───
 // q = a/b, r = a%b; if r!=0 and r and b have same sign then q+1
 
-@internal
 fun div_ceil_i32_impl(a: i32, b: i32): i32 {
     val q = a / b
     val r = a % b
     if r != 0 && ((r > 0) == (b > 0)) { q + 1 } else { q }
 }
-@internal
 fun div_ceil_i64_impl(a: i64, b: i64): i64 {
     val q = a / b
     val r = a % b
     if r != 0 && ((r > 0) == (b > 0)) { q + 1 } else { q }
 }
-@internal
 fun div_ceil_i128_impl(a: i128, b: i128): i128 {
     val q = a / b
     val r = a % b
     if r != 0 && ((r > 0) == (b > 0)) { q + 1 } else { q }
 }
-@internal
 fun div_ceil_u32_impl(a: u32, b: u32): u32 {
     val q = a / b
     val r = a % b
     if r != 0 { q + 1 } else { q }
 }
-@internal
 fun div_ceil_u64_impl(a: u64, b: u64): u64 {
     val q = a / b
     val r = a % b
     if r != 0 { q + 1 } else { q }
 }
-@internal
 fun div_ceil_i8_impl(a: i8, b: i8): i8 {
     val q = a / b
     val r = a % b
     if r != 0 && ((r > 0) == (b > 0)) { q + 1 } else { q }
 }
-@internal
 fun div_ceil_i16_impl(a: i16, b: i16): i16 {
     val q = a / b
     val r = a % b
     if r != 0 && ((r > 0) == (b > 0)) { q + 1 } else { q }
 }
-@internal
 fun div_ceil_isize_impl(a: isize, b: isize): isize {
     val q = a / b
     val r = a % b
     if r != 0 && ((r > 0) == (b > 0)) { q + 1 } else { q }
 }
-@internal
 fun div_ceil_u8_impl(a: u8, b: u8): u8 {
     val q = a / b
     val r = a % b
     if r != 0 { q + 1 } else { q }
 }
-@internal
 fun div_ceil_u16_impl(a: u16, b: u16): u16 {
     val q = a / b
     val r = a % b
     if r != 0 { q + 1 } else { q }
 }
-@internal
 fun div_ceil_u128_impl(a: u128, b: u128): u128 {
     val q = a / b
     val r = a % b
     if r != 0 { q + 1 } else { q }
 }
-@internal
 fun div_ceil_usize_impl(a: usize, b: usize): usize {
     val q = a / b
     val r = a % b
@@ -1051,7 +981,6 @@ pub fun div_ceil<T>(a: T, b: T): T {
 // |x| < 0.5: Taylor series x + x²/2! + x³/3! + ... to avoid cancellation loss
 // |x| >= 0.5: exp(x) - 1
 
-@internal
 fun expm1_f64_impl(x: f64): f64 {
     var a = if x < 0.0 { 0.0 - x } else { x }
     if a < 0.5 {
@@ -1068,7 +997,6 @@ fun expm1_f64_impl(x: f64): f64 {
         exp_f64_impl(x) - 1.0
     }
 }
-@internal
 fun expm1_f32_impl(x: f32): f32 {
     var a = if x < 0.0 { 0.0 - x } else { x }
     if a < 0.5 {
@@ -1085,7 +1013,6 @@ fun expm1_f32_impl(x: f32): f32 {
         exp_f32_impl(x) - 1.0
     }
 }
-@internal
 fun expm1_f16_impl(x: f16): f16 {
     var a = if x < 0.0 { 0.0 - x } else { x }
     if a < 0.5 {
@@ -1102,7 +1029,6 @@ fun expm1_f16_impl(x: f16): f16 {
         exp_f16_impl(x) - 1.0
     }
 }
-@internal
 fun expm1_f128_impl(x: f128): f128 {
     var a = if x < 0.0 { 0.0 - x } else { x }
     if a < 0.5 {
@@ -1134,7 +1060,6 @@ pub fun expm1<T>(x: T): T {
 // |x| < 0.5: Taylor series x - x²/2 + x³/3 - ... to avoid cancellation loss
 // |x| >= 0.5: log(1+x); x <= -1 returns NaN
 
-@internal
 fun log1p_f64_impl(x: f64): f64 {
     if x <= -1.0 { return 0.0 / 0.0 }
     var a = if x < 0.0 { 0.0 - x } else { x }
@@ -1153,7 +1078,6 @@ fun log1p_f64_impl(x: f64): f64 {
         log_f64_impl(1.0 + x)
     }
 }
-@internal
 fun log1p_f32_impl(x: f32): f32 {
     if x <= -1.0 { return Math.nan_f32() }
     var a = if x < 0.0 { 0.0 - x } else { x }
@@ -1172,7 +1096,6 @@ fun log1p_f32_impl(x: f32): f32 {
         log_f32_impl(1.0 + x)
     }
 }
-@internal
 fun log1p_f16_impl(x: f16): f16 {
     if x <= -1.0 { return 0.0f16 / 0.0f16 }
     var a = if x < 0.0 { 0.0 - x } else { x }
@@ -1191,7 +1114,6 @@ fun log1p_f16_impl(x: f16): f16 {
         log_f16_impl(1.0 + x)
     }
 }
-@internal
 fun log1p_f128_impl(x: f128): f128 {
     if x <= -1.0 { return 0.0f128 / 0.0f128 }
     var a = if x < 0.0 { 0.0 - x } else { x }
@@ -1225,7 +1147,6 @@ pub fun log1p<T>(x: T): T {
 // a = max(|x|,|y|), b = min(|x|,|y|); a==0 returns 0
 // hypot = a * sqrt(1 + (b/a)²)
 
-@internal
 fun hypot_f64_impl(x: f64, y: f64): f64 {
     var ax = if x < 0.0 { 0.0 - x } else { x }
     var ay = if y < 0.0 { 0.0 - y } else { y }
@@ -1239,7 +1160,6 @@ fun hypot_f64_impl(x: f64, y: f64): f64 {
     val ratio = b / a
     a * sqrt_f64_impl(1.0 + ratio * ratio)
 }
-@internal
 fun hypot_f32_impl(x: f32, y: f32): f32 {
     var ax = if x < 0.0 { 0.0 - x } else { x }
     var ay = if y < 0.0 { 0.0 - y } else { y }
@@ -1253,7 +1173,6 @@ fun hypot_f32_impl(x: f32, y: f32): f32 {
     val ratio = b / a
     a * sqrt_f32_impl(1.0 + ratio * ratio)
 }
-@internal
 fun hypot_f16_impl(x: f16, y: f16): f16 {
     var ax = if x < 0.0 { 0.0 - x } else { x }
     var ay = if y < 0.0 { 0.0 - y } else { y }
@@ -1267,7 +1186,6 @@ fun hypot_f16_impl(x: f16, y: f16): f16 {
     val ratio = b / a
     a * sqrt_f16_impl(1.0 + ratio * ratio)
 }
-@internal
 fun hypot_f128_impl(x: f128, y: f128): f128 {
     var ax = if x < 0.0 { 0.0 - x } else { x }
     var ay = if y < 0.0 { 0.0 - y } else { y }

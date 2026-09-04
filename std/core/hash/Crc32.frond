@@ -8,7 +8,6 @@ val POLY: u32 = 0xEDB88320
 val MASK: u32 = 0xFFFFFFFF
 
 // Fold one byte into the reflected CRC register (8 polynomial steps).
-@internal
 fun step_byte(crc: u32, b: u8): u32 {
     var c = crc ^ (b as u32)
     var i = 0 as u8

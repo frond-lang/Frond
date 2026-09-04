@@ -744,3 +744,89 @@ parse 已跨入口共享(std_cache/AST 盘缓存),sema 检查环仍逐入口重�
 **镜像侧已知残差(已销案,2026-08-31)**:~~`! warnings` 镜像多 6 条
 "unreachable match arm"~~——随引擎修复(75a6496)消散:默认语料全节
 比对(含 warnings 节)逐字节通过。
+
+## 附六:立案未决(2026-09-05,随 import{} 推广收尾)
+
+1. **type_name 方法糖隔离**:Infer 的 `Relate.type_name` 永久限定——
+   std Err trait 方法 `type_name()` 与自由函数名共享方法糖回落空间
+   (`recv.m(args)` → `m(recv,args)`),条目 redefine 后 std 接口方法
+   解析被带偏,症状为隐式 this 字段连锁失联。根修方向 = 接口方法名
+   与自由函数名的空间隔离(或 witness 装配不消费 root 层函数绑定)。
+2. **async 裸调用 null**:裸化 Main 的 native_entry(async fun)内,
+   经选择性条目绑定的裸调用(`read_text`/`parse_module_text` 族)
+   运行时返回 null(Error|Ok scrutinee 崩);限定形态正常。async +
+   bare_call_targets 裁决 + IR 绑定的交互失效,复现资产:selimp 沙箱
+   + 怪胎 Main(b3d6717 版,已以 b638666 限定版回退规避)。
+3. **环境白名单收缩(方案 B,进行中)**:root 预declare 的 330 名
+   隐式 glob 收缩为原语白名单,见附七。
+
+## 附七:方案 B 环境白名单收缩落地(2026-09-05,@export 制)
+
+**裁决演进**:命名模式白名单(println 族+`__` 前缀)→ 用户改判
+**@export 声明位 opt-in**(显式意图 > 调用侧启发式;环境面 = grep
+@end…@export)。分层律:builtin = 打标特权层(@export/@extern/
+@internal/内嵌 C),std = 干净公共库,用户 = 显式导入。
+
+**引擎改动**(ModuleEnv + 镜像 Modenv 同步):
+1. **@export 门**:predeclare 的 root define(全局裸可见)只收
+   `@export` 且 **builtin-only** 生效(用户/std 打标无效——环境面是
+   引擎特权层声明)。历史"全函数 root 双注册"(330 名隐式 glob,
+   `get`×3/`parse`×20 碰撞面、方法糖污染源)终结。
+2. **用户模块导入成员再输出**("导入即真理"裸名臂):`import Helper`
+   把被导入模块 env 的全部绑定 define 进导入方 env——1C 语义
+   (整模块导入成员裸调)从 root glob 意外承载改为导入语句显式承载;
+   selective 条目随后的 redefine 保持 S2c 优先级。
+
+**环境面清单**(@export 打标):Console 六件套 print/println/eprint/
+eprintln/scan/scanln + for-in 基础设施 iter/str_iter + 方法糖回落
+家族 sort/sort_by/is_sorted/lower_bound/upper_bound + hash_iter +
+builtin 内部互调 `__` 族(~230 名,crypto/encoding/mem/sort/io/net/
+os/raw 全家)。
+
+**欠账清偿**:std 层 Power/TcpListener/UdpSocket 选择性导入
+(ldexp 族/tcp_close);frondc 层 import_sweep 一轮清零(8 文件);
+Back 的函数签名查询改 module_envs(root 面退役连锁)。
+
+**坑**:①引擎 std 是 StdlibEmbed 编译期内嵌——改 std 源必须重编
+引擎(沙箱跑旧烤入副本,@export"不生效"假象);②方法糖回落
+(`recv.m()`)吃自由函数环境面——iter/sort 家族断供即"no method";
+③`_impl` 后缀/math 家族跨模块裸调是 std 禁裸名欠账。
+
+**门禁**:slice0/1 各 5/5 + functional 98 + negative 66 + tyops 77
++ load 12/12 + sema 6/6(镜像同步字节精确)+ ast 469/0。
+
+**Phase 2 落地(2026-09-05 同日收官,三件)**:
+1. **@internal 规则化**:语义考证 = "用户禁调"(IR internal_funcs 注册
+   表 + internal_access_blocked),非名字空间机制;std 本体的 @internal
+   全打在模块内**私有**函数上 —— 改由引擎规则统一覆盖:IR 注册条件
+   = @internal 标记 **或** std 层非 pub 函数(选择性导入绕过可见性时
+   的守卫);builtin 的显式 @internal 保留(声明位形态)。
+2. **std 本体 @internal 清标**(18 文件,hash/fmt/math/io/net/os/time
+   全族,~300 处):私有函数天然受规则保护,逐个打标是历史欠账。
+3. **tag 权限收紧 builtin-only**:@internal 在 std 打 → 报错("reserved
+   for builtin modules",引擎+镜像同步;负向 EXPECT 两处同步)。
+
+**诊断细化三件(同日,镜像字节一致)**:
+1. 调用位:callee 裸名全 miss(环境/函数表/ctor/模块尾段/方法体豁免)
+   → `undefined function 'X'`(值引用位仍 undefined variable);
+2. 模块尾段:`Fmt.dec(42)` → `module 'Fmt' exists — import it
+   explicitly (e.g. import std.core.fmt.Fmt) to use its members`;
+3. 类型位(check 期局部注解):裸类型未注册/非 pending/非内建 →
+   `unknown type 'Fmt'`(此前**静默造 Adt 零静默缺口**;仅局部注解位
+   ——predeclare/早期 populate 的签名解析存在合法跨模块时序前向引用,
+   不能上解析干道,Raw 签名的 IOError 即此)。
+★坑:①调用位前置曾误杀隐式 this 方法调用(`base(...)` 方法糖回落
+形态)——方法体内放行;②cargo exe 锁(后台 frond 进程)致 build
+静默失败,旧二进制跑出幽灵红。
+
+**Phase 2 留档**:std 本体 @internal 族(hash/fmt/math 可搬 builtin,
+io/Path 族类型反向依赖不可搬)迁 builtin + tag 权限收紧 builtin-only
+(现 std+builtin 都可打);~~未导入裸调错误文案升级~~(**已落地,当日
+收尾**):Ident 解析失败不再一律"undefined variable"——函数注册表 →
+构造器表逐级回查,存在即给归属+导入导引(引擎 ExprInfer + 镜像 Infer
+同步,文案逐字节一致):`function 'fnv1a' exists in module(s)
+[std.core.hash.Hash] — import it explicitly (e.g. import
+std.core.hash.Hash.{fnv1a}) or use the qualified form`;真未定义名维持
+原文案;方法糖位(模块短名 recv)提示待补。负向 EXPECT 同步更新,
+66/66 + sema 差分绿。
+

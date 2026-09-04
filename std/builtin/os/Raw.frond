@@ -14,6 +14,7 @@
 @c_include("string.h")
 @internal
 @extern("C")
+@export
 fun __os_env_get_into(key: str, buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         wchar_t* wkey = frond_utf8_to_utf16(key_data, key_len);
@@ -46,6 +47,7 @@ fun __os_env_get_into(key: str, buf: u8[]): i64 #{
 @c_include("stdlib.h")
 @internal
 @extern("C")
+@export
 fun __os_env_set(key: str, value: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         wchar_t* wkey = frond_utf8_to_utf16(key_data, key_len);
@@ -62,6 +64,7 @@ fun __os_env_set(key: str, value: str): i32 #{
 @c_include("stdlib.h")
 @internal
 @extern("C")
+@export
 fun __os_env_remove(key: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         // Setting an empty value removes the variable on Windows
@@ -80,6 +83,7 @@ fun __os_env_remove(key: str): i32 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __os_is_tty(fd: i32): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         // _isatty misclassifies ANY character device (NUL, printers) as a tty.
@@ -97,6 +101,7 @@ fun __os_is_tty(fd: i32): i32 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __os_getpid(): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         return (int64_t)GetCurrentProcessId();
@@ -111,6 +116,7 @@ fun __os_getpid(): i64 #{
 @c_include("stdlib.h")
 @internal
 @extern("C")
+@export
 fun __os_exit(code: i32): void #{
     exit(code);
 }#
@@ -119,6 +125,7 @@ fun __os_exit(code: i32): void #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __os_cwd_into(buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         if (_getcwd((char*)buf_data, (int)buf_len) == NULL) return -1;
@@ -132,6 +139,7 @@ fun __os_cwd_into(buf: u8[]): i64 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __os_set_cwd(path: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         return _chdir(path_data) == 0 ? 0 : -1;
@@ -144,6 +152,7 @@ fun __os_set_cwd(path: str): i32 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __os_hostname_into(buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         // Wide bridge: GetComputerNameA re-encodes through the active ANSI
@@ -165,6 +174,7 @@ fun __os_hostname_into(buf: u8[]): i64 #{
 @c_include("string.h")
 @internal
 @extern("C")
+@export
 fun __os_platform_into(buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         const char* s = "windows";
@@ -184,6 +194,7 @@ fun __os_platform_into(buf: u8[]): i64 #{
 @c_include("string.h")
 @internal
 @extern("C")
+@export
 fun __os_arch_into(buf: u8[]): i64 #{
     #if defined(_M_X64) || defined(__x86_64__)
         const char* s = "x86_64";
@@ -209,6 +220,7 @@ fun __os_arch_into(buf: u8[]): i64 #{
 @c_include("sys/wait.h")
 @internal
 @extern("C")
+@export
 fun __os_system(cmd: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         return system(cmd_data);
@@ -227,6 +239,7 @@ fun __os_system(cmd: str): i32 #{
 // Reads the Rust-side runtime slot via direct symbol reference (same binary).
 @internal
 @extern("C")
+@export
 fun __os_arg_count(): i32 #{
     extern int frond_runtime_argc(void);
     return frond_runtime_argc();
@@ -235,6 +248,7 @@ fun __os_arg_count(): i32 #{
 // UTF-8 bytes of argument i copied into buf. -1 = out of range, -2 = buffer too small.
 @internal
 @extern("C")
+@export
 fun __os_arg_get_into(i: i32, buf: u8[]): i64 #{
     extern int frond_runtime_argc(void);
     extern const unsigned char* frond_runtime_arg_ptr(int i);
@@ -252,6 +266,7 @@ fun __os_arg_get_into(i: i32, buf: u8[]): i64 #{
 // Number of "KEY=VALUE" environment entries.
 @internal
 @extern("C")
+@export
 fun __os_env_vars_count(): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         LPWCH block = GetEnvironmentStringsW();
@@ -273,6 +288,7 @@ fun __os_env_vars_count(): i64 #{
 // The i-th "KEY=VALUE" entry copied into buf. -1 = out of range, -2 = buffer too small.
 @internal
 @extern("C")
+@export
 fun __os_env_var_get_into(i: i64, buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         LPWCH block = GetEnvironmentStringsW();
@@ -313,6 +329,7 @@ fun __os_env_var_get_into(i: i64, buf: u8[]): i64 #{
 // Temporary directory. Windows GetTempPathW (+ UTF-8 bridge); POSIX TMPDIR with "/tmp" fallback.
 @internal
 @extern("C")
+@export
 fun __os_tmp_dir_into(buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         // Wide bridge: GetTempPathA emits ANSI code-page bytes — a non-ASCII
@@ -340,6 +357,7 @@ fun __os_tmp_dir_into(buf: u8[]): i64 #{
 // User home directory (USERPROFILE on Windows, HOME elsewhere). -1 = not set.
 @internal
 @extern("C")
+@export
 fun __os_home_dir_into(buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         const char* s = getenv("USERPROFILE");
@@ -356,6 +374,7 @@ fun __os_home_dir_into(buf: u8[]): i64 #{
 // Current user name (USERNAME on Windows, USER/LOGNAME elsewhere). -1 = not set.
 @internal
 @extern("C")
+@export
 fun __os_user_name_into(buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         const char* s = getenv("USERNAME");
@@ -385,6 +404,7 @@ fun __os_user_name_into(buf: u8[]): i64 #{
 @c_include("sys/wait.h")
 @internal
 @extern("C")
+@export
 fun __os_spawn(program: str, args_blob: u8[], cwd: str, env_blob: u8[]): u64 #{
     // Append one MSVCRT-quoted argument to cmd at w (macro emitted once per file).
     #define FROND_APPEND_ARG(cmd, w, sd, sl) do { \
@@ -566,6 +586,7 @@ fun __os_spawn(program: str, args_blob: u8[], cwd: str, env_blob: u8[]): u64 #{
 // The child's process id (display purposes).
 @internal
 @extern("C")
+@export
 fun __os_process_pid(handle: u64): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         return (int64_t)GetProcessId((HANDLE)handle);
@@ -577,6 +598,7 @@ fun __os_process_pid(handle: u64): i64 #{
 // Block until the child exits; returns its exit code (signaled: 128+signal), -1 = wait failed.
 @internal
 @extern("C")
+@export
 fun __os_process_wait(handle: u64): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         if (WaitForSingleObject((HANDLE)handle, INFINITE) != WAIT_OBJECT_0) return -1;
@@ -595,6 +617,7 @@ fun __os_process_wait(handle: u64): i32 #{
 // Release the handle (Windows CloseHandle; POSIX pid needs no handle).
 @internal
 @extern("C")
+@export
 fun __os_process_close(handle: u64): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         return CloseHandle((HANDLE)handle) ? 0 : -1;
@@ -616,6 +639,7 @@ fun __os_process_close(handle: u64): i32 #{
 @c_include("fcntl.h")
 @internal
 @extern("C")
+@export
 fun __os_capture_spawn(program: str, args_blob: u8[], cwd: str, env_blob: u8[]): u64 #{
     // MSVCRT quoting (same rules as __os_spawn; separate macro name so the
     // per-file single-emission of FROND_APPEND_ARG is not disturbed).
@@ -842,6 +866,7 @@ fun __os_capture_spawn(program: str, args_blob: u8[], cwd: str, env_blob: u8[]):
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __os_capture_read_into(handle: u64, buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         HANDLE rd = (HANDLE)((uint64_t*)(uintptr_t)handle)[1];
@@ -863,6 +888,7 @@ fun __os_capture_read_into(handle: u64, buf: u8[]): i64 #{
 @c_include("stdlib.h")
 @internal
 @extern("C")
+@export
 fun __os_capture_finish(handle: u64): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         uint64_t* slots = (uint64_t*)(uintptr_t)handle;
@@ -898,6 +924,7 @@ fun __os_capture_finish(handle: u64): i32 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __os_executable_into(buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         wchar_t wpath[32768];  // Windows extended-length path bound
@@ -938,6 +965,7 @@ fun __os_executable_into(buf: u8[]): i64 #{
 @c_include("sys/wait.h")
 @internal
 @extern("C")
+@export
 fun __os_process_wait_timeout(handle: u64, timeout_ms: i64): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         DWORD ms = (timeout_ms < 0) ? 0 : (DWORD)timeout_ms;
@@ -971,6 +999,7 @@ fun __os_process_wait_timeout(handle: u64, timeout_ms: i64): i32 #{
 @c_include("signal.h")
 @internal
 @extern("C")
+@export
 fun __os_process_kill(handle: u64): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         return TerminateProcess((HANDLE)handle, 1) ? 0 : -1;
@@ -986,6 +1015,7 @@ fun __os_process_kill(handle: u64): i32 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __os_cpu_count(): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         SYSTEM_INFO si;
@@ -1006,6 +1036,7 @@ fun __os_cpu_count(): i64 #{
 @c_include("sys/statvfs.h")
 @internal
 @extern("C")
+@export
 fun __os_disk_space_into(path: str, buf: u8[]): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         // Wide bridge: the A variant decodes path bytes through the ANSI code
@@ -1043,6 +1074,7 @@ fun __os_disk_space_into(path: str, buf: u8[]): i32 #{
 @c_include("stdint.h")
 @internal
 @extern("C")
+@export
 fun __os_usize_max(): usize #{
     return (size_t)UINTPTR_MAX;
 }#
@@ -1050,6 +1082,7 @@ fun __os_usize_max(): usize #{
 @c_include("stdint.h")
 @internal
 @extern("C")
+@export
 fun __os_isize_max(): isize #{
     return (int64_t)INTPTR_MAX;
 }#
@@ -1057,6 +1090,7 @@ fun __os_isize_max(): isize #{
 @c_include("stdint.h")
 @internal
 @extern("C")
+@export
 fun __os_isize_min(): isize #{
     return (int64_t)INTPTR_MIN;
 }#

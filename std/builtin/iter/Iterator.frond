@@ -34,6 +34,8 @@ type ArrayIter<T>: (Iterator<T>) = ArrayIter(data: T[], pos: usize) {
     }
 }
 
+// @export:for-in/方法糖()的语言级基础设施,全库消费。
+@export
 pub fun iter<T>(arr: T[]): ArrayIter<T> {
     ArrayIter(arr, 0)
 }
@@ -65,6 +67,9 @@ pub type HashIterator<E>: (Iterator<E>) = HashIterator(buckets: E[][], bucket: u
     }
 }
 
+// @export:std/collections(Map/Set)的哈希桶迭代内部互调
+// (方案 B 环境面声明;2026-09-05 用户裁决)。
+@export
 pub fun hash_iter<E>(buckets: E[][]): HashIterator<E> {
     HashIterator(buckets, 0, 0)
 }
@@ -106,6 +111,7 @@ type StringIterator: (Iterator<i64>) = StringIterator(data: str, pos: usize) {
     }
 }
 
+@export
 pub fun str_iter(s: str): StringIterator {
     StringIterator(s, 0)
 }

@@ -21,7 +21,7 @@ import std.collections.Map
 import std.core.types.Str
 import syntax.Ast
 import types.Arena.{adt_parts, array_parts, async_value, atomic_elem, bind_var, channel_elem, detail_of, display, fn_parts, foreign_fn_ret, fresh_rigid_var, fresh_type_var, generic_parts, lazy_value, make, make_adt, make_array, make_async, make_atomic, make_channel, make_fn, make_foreign_fn, make_generic, make_lazy, make_nullable, make_receiver, make_record, make_ref, make_sender, make_throw, make_trait, make_trait_object, module_ref_parts, nullable_inner, receiver_elem, record_fields, ref_parts, resolve, sender_elem, thr_parts, trait_object_parts, trait_parts, tvar_is_rigid, unify}
-import types.Ty
+import types.Ty.{ty_source_name}
 
 import sema.Data
 import sema.Envs.{define, lookup, lookup_local, redefine}
@@ -2956,6 +2956,42 @@ fun check_local_decl(ctx: ICtx, a: TypeArena, s: SemaRes, name: str, type_annota
     match type_annotation {
         null => {}
         ta => {
+            // 方案 B 零静默收尾(引擎 StmtInfer 同步):check 期局部注解位
+            // 的裸类型名未注册/非本模块 pending/非内建 → 报 unknown type
+            // (此前静默造 Adt)。仅此位:predeclare/早期 populate 的签名
+            // 解析存在合法跨模块时序前向引用,不上解析干道。
+            match ast.ty(ta).node {
+                TNamed(tn) => {
+                    if !Str.contains(tn, ".") {
+                        val ftn = from_type_name(tn)
+                        val builtin_like = match ftn {
+                            TVoid => true
+                            TStr => true
+                            TNull => true
+                            TLib => true
+                            TBool | TChar | TI8 | TI16 | TI32 | TI64 | TI128 | TU8 | TU16 | TU32 | TU64 | TU128 | TIsize | TUsize | TF16 | TF32 | TF64 | TF128 => true
+                            _ => get_trait_def(s, tn) != null
+                        }
+                        if !builtin_like {
+                            val canonical = Semares.resolve_type_key(s, tn)
+                            val registered = Semares.get_type_def(s, canonical) != null
+                            var pending_own = false
+                            var pi: usize = 0
+                            while pi < s.pending_own_types.len() {
+                                if (s.pending_own_types.get(pi) ?? "") == tn {
+                                    pending_own = true
+                                }
+                                pi = pi + 1
+                            }
+                            if !registered && !pending_own {
+                                val sp = ast.ty(ta).span
+                                add_error_at(s, "unknown type '{tn}'", sp.line, sp.column)
+                            }
+                        }
+                    }
+                },
+                _ => {},
+            }
             expected_ty = if true { type_from_ast(ctx, a, s, ta, ast) } else { null }
         },
     }
@@ -4131,7 +4167,67 @@ fun infer_ident_expr(ctx: ICtx, a: TypeArena, s: SemaRes, expr: i64, ast: AstAre
                 return fresh_type_var(a)
             }
             val sp = ast.expr(expr).span
-            add_error_at(s, "undefined variable '{name}'", sp.line, sp.column)
+            // 方案 B 诊断升级(引擎 ExprInfer 同步):名字存在但不可见 ≠
+            // 不存在 —— 函数注册表 → 构造器表逐级回查,给归属+导入导引。
+            val diag = {
+                var msg = "undefined variable '{name}'"
+                var found = false
+                match s.func_sig_owners.get(name) {
+                    null => {}
+                    owners_csv => {
+                        val oc = owners_csv ?? ""
+                        val parts = Str.split(oc, ",")
+                        if parts.len() > 0 && oc.len() > 0 {
+                            var mods: str[] = []
+                            var mi: usize = 0
+                            while mi < parts.len() {
+                                var m = parts[mi]
+                                if Str.ends_with(m, ".frond") {
+                                    m = Str.substring(m, 0, m.len() - 6)
+                                }
+                                mods = mods ++ [Str.replace(m, "/", ".")]
+                                mi = mi + 1
+                            }
+                            msg = "function '{name}' exists in module(s) [{Semares.str_join(mods, ", ")}] — import it explicitly (e.g. import {mods[0]}.\{{name}\}) or use the qualified form"
+                            found = true
+                        }
+                    },
+                }
+                if !found {
+                    // 模块尾段命中(值位/recv 位通用):module_envs 键尾段
+                    // 匹配(引擎 ExprInfer 同步)。
+                    var tail_mods: str[] = []
+                    val all_env_keys = s.module_envs.keys()
+                    var tk: usize = 0
+                    while tk < all_env_keys.len() {
+                        val k = all_env_keys[tk]
+                        if Semares.tail_seg(k) == name {
+                            tail_mods = tail_mods ++ [k]
+                        }
+                        tk = tk + 1
+                    }
+                    if tail_mods.len() > 0 {
+                        msg = "module '{name}' exists — import it explicitly (e.g. import {tail_mods[0]}) to use its members"
+                        found = true
+                    }
+                }
+                if !found {
+                    match Semares.get_ctor_def(s, name) {
+                        null => {}
+                        c0 => {
+                            val c = c0 ?? Semares.Ctor("", "", [], [], [], false, null, null, [], Span(0, 0), "")
+                            var m = c.def_module
+                            if Str.ends_with(m, ".frond") {
+                                m = Str.substring(m, 0, m.len() - 6)
+                            }
+                            m = Str.replace(m, "/", ".")
+                            msg = "constructor '{name}' of type '{c.type_name}' exists in module [{m}] — import it explicitly (e.g. import {m}.\{{c.type_name}\}) or use the qualified form"
+                        },
+                    }
+                }
+                msg
+            }
+            add_error_at(s, diag, sp.line, sp.column)
             fresh_type_var(a)
         },
         _ => { fresh_type_var(a) }
@@ -4522,6 +4618,42 @@ fun infer_call_expr(ctx: ICtx, a: TypeArena, s: SemaRes, expr: i64, ast: AstAren
     env: u32, expected: u32?): u32 {
     match ast.expr(expr).node {
         CallE(callee, args, _) => {
+            // ── S2b+ 调用位专属诊断(引擎 CallInfer 同步):callee 裸名
+            // 环境/函数表/构造器表/模块尾段全 miss → undefined function;
+            // 命中任一注册表则放行(归属导引由 Ident 位升级诊断负责)──
+            match ast.expr(callee).node {
+                Ident(cname) => {
+                    val in_env = Envs.lookup(s.env, env, cname) != null
+                    val in_fns = match s.func_sig_owners.get(cname) {
+                        null => false
+                        oc => (oc ?? "").len() > 0
+                    }
+                    val in_ctors = Semares.get_ctor_def(s, cname) != null
+                    var in_mods = false
+                    val mek = s.module_envs.keys()
+                    var mk: usize = 0
+                    while mk < mek.len() {
+                        if Semares.tail_seg(mek[mk]) == cname {
+                            in_mods = true
+                        }
+                        mk = mk + 1
+                    }
+                    // 方法体内放行(引擎 CallInfer 同步):隐式 this 方法调用。
+                    val in_method = current_this_type(ctx) != null
+                    if !in_env && !in_fns && !in_ctors && !in_mods && !in_method {
+                        val csp = ast.expr(expr).span
+                        s.errors.push(Semares.new_err(
+                            "undefined function '{cname}'", csp.line, csp.column))
+                        var ai0: usize = 0
+                        while ai0 < args.len() {
+                            val _ = infer_expr(ctx, a, s, args[ai0], ast, env, null)
+                            ai0 = ai0 + 1
+                        }
+                        return Arena.fresh_type_var(a)
+                    }
+                },
+                _ => {},
+            }
             val e = ast.expr(expr)
             // 标量类型名作构造调用 → 报错(u64(x) 须写 as)。
             match ast.expr(callee).node {
@@ -6237,9 +6369,10 @@ pub fun check_decl(ctx: ICtx, a: TypeArena, s: SemaRes, decl: Decl, decl_span: S
                 var ai: usize = 0
                 while ai < attributes.len() {
                     val attr = attributes[ai]
-                    if attr.name == "internal" && !is_stdlib {
+                    // Phase 2c(引擎 ModuleEnv 同步):tag 收紧 builtin-only。
+                    if attr.name == "internal" && !is_builtin {
                         add_error_at(s,
-                            "attribute '@internal' is reserved for the standard library implementation",
+                            "attribute '@internal' is reserved for builtin modules",
                             decl_span.line, decl_span.column)
                     }
                     if attr.name == "extern" || attr.name == "c_include" {

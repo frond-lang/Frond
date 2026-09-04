@@ -1004,7 +1004,7 @@ fun mangle(name: str): str {
 // 原型注册:env 里的 fn 类型(lookup_local:入口模块 fun 定义在 root_env
 // 本层,不误取 std/内建)→ LLVM 函数;main 强制 i32() ABI。
 fun register_fn(lib: Lib, ctx: u64, module: u64, a: TypeArena, s: SemaRes,
-    root_env: u32, cache: Map<str, u64>, name: str, is_main: bool): Throw<void, FfiError> {
+    lookup_env: u32, cache: Map<str, u64>, name: str, is_main: bool): Throw<void, FfiError> {
     var fnty = 0u64
     var ret_h = 0u32
     var ph: u32[] = []
@@ -1013,7 +1013,7 @@ fun register_fn(lib: Lib, ctx: u64, module: u64, a: TypeArena, s: SemaRes,
         cache.set("i32", i32ty)
         fnty = Llvm.function_type0(lib, i32ty, false)?
     } else {
-        match Envs.lookup_local(s.env, root_env, name) {
+        match Envs.lookup_local(s.env, lookup_env, name) {
             null => throw FfiError(Other, "slice 1: no env type for fun '{name}'")
             fh => {
                 val parts = Arena.fn_parts(a, Arena.resolve(a, fh ?? 0))
@@ -1141,12 +1141,25 @@ pub fun lower_entry(a: TypeArena, s: SemaRes, entry: ModuleAst, obj_path: str,
     while fn_bodies.len() > 0 { fn_bodies.pop() }
     fn_index = Map.empty<str, i64>()
     val cache = Map.empty<str, u64>()
-    register_fn(lib, ctx, module, a, s, root_env, cache, "main", true)?
+    // 方案 B:用户模块函数住模块专属 env(module_envs),不再进 root
+    // 环境面 —— 签名查询按入口模块逻辑路径取,兜底 root(builtin)。
+    val entry_logical = Semares.module_logical_path(entry.name)
+    var lookup_env = root_env
+    match entry_logical {
+        null => {}
+        el => {
+            match s.module_envs.get(el ?? "") {
+                null => {}
+                me => { lookup_env = me ?? root_env }
+            }
+        },
+    }
+    register_fn(lib, ctx, module, a, s, lookup_env, cache, "main", true)?
     fn_ast_params.push(main_params)
     fn_bodies.push(main_body ?? 0)
     i = 0
     while i < names.len() {
-        register_fn(lib, ctx, module, a, s, root_env, cache, names.get(i) ?? "", false)?
+        register_fn(lib, ctx, module, a, s, lookup_env, cache, names.get(i) ?? "", false)?
         fn_ast_params.push(ast_params.get(i) ?? [])
         fn_bodies.push(bodies.get(i) ?? 0)
         i = i + 1

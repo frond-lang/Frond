@@ -50,12 +50,14 @@ fun __stdin_readln(): Throw<str?, IOError> {
 
 // ─── Standard output ──────────────────────────────────────────────────────
 
+@export
 pub fun print<T>(x: T): Throw<void, IOError> {
     val s = x.repr()
     __stdout_write(s)?
     Ok(void)
 }
 
+@export
 pub fun println<T>(x: T): Throw<void, IOError> {
     val s = x.repr()
     __stdout_write(s)?
@@ -65,12 +67,14 @@ pub fun println<T>(x: T): Throw<void, IOError> {
 
 // ─── Standard error ──────────────────────────────────────────────────────
 
+@export
 pub fun eprint<T>(x: T): Throw<void, IOError> {
     val s = x.repr()
     __stderr_write(s)?
     Ok(void)
 }
 
+@export
 pub fun eprintln<T>(x: T): Throw<void, IOError> {
     val s = x.repr()
     __stderr_write(s)?
@@ -83,12 +87,14 @@ pub fun eprintln<T>(x: T): Throw<void, IOError> {
 // scanln: reads one line (without newline), returns null on EOF
 // Tail passthrough of the Throw value itself — a `?` tail here would unwrap
 // to a bare str? where Throw was declared (the from_datetime_utc bug class).
+@export
 pub fun scanln(): Throw<str?, IOError> {
     __stdin_readln()
 }
 
 // scan: reads a whitespace-separated token, returns null if no token (EOF or blank line)
 // Implemented by composing existing str primitives (len/index/slice), no new built-in methods added.
+@export
 pub fun scan(): Throw<str?, IOError> {
     val line = __stdin_readln()?
     val token: str? = match line {

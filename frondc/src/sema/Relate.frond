@@ -9,7 +9,7 @@ import std.collections.List
 import std.core.types.Str
 import syntax.Ast
 import types.Arena
-import types.Ty
+import types.Ty.{ty_source_name}
 
 import sema.Data
 import sema.Semares

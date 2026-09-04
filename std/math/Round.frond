@@ -7,19 +7,15 @@
 // ─── trunc (truncation toward zero) ───
 // Implemented by casting to integer and back to achieve truncation
 
-@internal
 fun trunc_f64_impl(x: f64): f64 {
     (x as i64) as f64
 }
-@internal
 fun trunc_f32_impl(x: f32): f32 {
     (x as i64) as f32
 }
-@internal
 fun trunc_f16_impl(x: f16): f16 {
     (x as i16) as f16
 }
-@internal
 fun trunc_f128_impl(x: f128): f128 {
     (x as i128) as f128
 }
@@ -36,22 +32,22 @@ pub fun trunc<T>(x: T): T {
 
 // ─── floor (rounding toward negative infinity) ───
 
-@internal
+@export
 fun floor_f64_impl(x: f64): f64 {
     val t = trunc_f64_impl(x)
     if x < 0.0 && x != t { t - 1.0 } else { t }
 }
-@internal
+@export
 fun floor_f32_impl(x: f32): f32 {
     val t = trunc_f32_impl(x)
     if x < 0.0 && x != t { t - 1.0 } else { t }
 }
-@internal
+@export
 fun floor_f16_impl(x: f16): f16 {
     val t = trunc_f16_impl(x)
     if x < 0.0 && x != t { t - 1.0 } else { t }
 }
-@internal
+@export
 fun floor_f128_impl(x: f128): f128 {
     val t = trunc_f128_impl(x)
     if x < 0.0 && x != t { t - 1.0 } else { t }
@@ -69,22 +65,18 @@ pub fun floor<T>(x: T): T {
 
 // ─── ceil (rounding toward positive infinity) ───
 
-@internal
 fun ceil_f64_impl(x: f64): f64 {
     val t = trunc_f64_impl(x)
     if x > 0.0 && x != t { t + 1.0 } else { t }
 }
-@internal
 fun ceil_f32_impl(x: f32): f32 {
     val t = trunc_f32_impl(x)
     if x > 0.0 && x != t { t + 1.0 } else { t }
 }
-@internal
 fun ceil_f16_impl(x: f16): f16 {
     val t = trunc_f16_impl(x)
     if x > 0.0 && x != t { t + 1.0 } else { t }
 }
-@internal
 fun ceil_f128_impl(x: f128): f128 {
     val t = trunc_f128_impl(x)
     if x > 0.0 && x != t { t + 1.0 } else { t }
@@ -102,7 +94,6 @@ pub fun ceil<T>(x: T): T {
 
 // ─── round (round to nearest integer) ───
 
-@internal
 fun round_f64_impl(x: f64): f64 {
     val t = trunc_f64_impl(x)
     val frac = x - t
@@ -110,7 +101,6 @@ fun round_f64_impl(x: f64): f64 {
     else if frac < -0.5 { t - 1.0 }
     else { t }
 }
-@internal
 fun round_f32_impl(x: f32): f32 {
     val t = trunc_f32_impl(x)
     val frac = x - t
@@ -118,7 +108,6 @@ fun round_f32_impl(x: f32): f32 {
     else if frac < -0.5 { t - 1.0 }
     else { t }
 }
-@internal
 fun round_f16_impl(x: f16): f16 {
     val t = trunc_f16_impl(x)
     val frac = x - t
@@ -126,7 +115,6 @@ fun round_f16_impl(x: f16): f16 {
     else if frac < -0.5 { t - 1.0 }
     else { t }
 }
-@internal
 fun round_f128_impl(x: f128): f128 {
     val t = trunc_f128_impl(x)
     val frac = x - t
@@ -187,28 +175,28 @@ pub fun copysign<T>(x: T, y: T): T {
 
 // ─── fmod (floating point modulo, result has same sign as x) ───
 
-@internal
+@export
 fun fmod_f64_impl(x: f64, y: f64): f64 {
     if y == 0.0 { return 0.0 / 0.0 }
     val quotient = x / y
     val truncated = trunc_f64_impl(quotient)
     x - truncated * y
 }
-@internal
+@export
 fun fmod_f32_impl(x: f32, y: f32): f32 {
     if y == 0.0 { return Math.nan_f32() }
     val quotient = x / y
     val truncated = trunc_f32_impl(quotient)
     x - truncated * y
 }
-@internal
+@export
 fun fmod_f16_impl(x: f16, y: f16): f16 {
     if y == 0.0 { return 0.0f16 / 0.0f16 }
     val quotient = x / y
     val truncated = trunc_f16_impl(quotient)
     x - truncated * y
 }
-@internal
+@export
 fun fmod_f128_impl(x: f128, y: f128): f128 {
     if y == 0.0 { return 0.0f128 / 0.0f128 }
     val quotient = x / y
@@ -229,7 +217,7 @@ pub fun fmod<T>(x: T, y: T): T {
 // ─── ldexp (x * 2^exp) ───
 // Implemented by repeated multiplication by 2
 
-@internal
+@export
 fun ldexp_f64_impl(x: f64, exp: i32): f64 {
     var result = x
     var n = exp
@@ -243,7 +231,7 @@ fun ldexp_f64_impl(x: f64, exp: i32): f64 {
     }
     result
 }
-@internal
+@export
 fun ldexp_f32_impl(x: f32, exp: i32): f32 {
     var result = x
     var n = exp
@@ -257,7 +245,7 @@ fun ldexp_f32_impl(x: f32, exp: i32): f32 {
     }
     result
 }
-@internal
+@export
 fun ldexp_f16_impl(x: f16, exp: i32): f16 {
     var result = x
     var n = exp
@@ -271,7 +259,7 @@ fun ldexp_f16_impl(x: f16, exp: i32): f16 {
     }
     result
 }
-@internal
+@export
 fun ldexp_f128_impl(x: f128, exp: i32): f128 {
     var result = x
     var n = exp
@@ -300,7 +288,6 @@ pub fun ldexp<T>(x: T, exp: i32): T {
 // x==0 → m=0,e=0; NaN/Inf returned as-is with m=x,e=0
 // Frond has no tuples, split into frexp_mantissa and frexp_exponent two functions
 
-@internal
 fun frexp_f64_mantissa_impl(x: f64): f64 {
     if x == 0.0 { return 0.0 }
     if x != x { return x }
@@ -310,7 +297,6 @@ fun frexp_f64_mantissa_impl(x: f64): f64 {
     while m < 0.5 { m = m * 2.0 }
     if x < 0.0 { 0.0 - m } else { m }
 }
-@internal
 fun frexp_f64_exponent_impl(x: f64): i32 {
     if x == 0.0 { return 0 }
     if x != x { return 0 }
@@ -327,7 +313,6 @@ fun frexp_f64_exponent_impl(x: f64): i32 {
     }
     e
 }
-@internal
 fun frexp_f32_mantissa_impl(x: f32): f32 {
     if x == 0.0 { return 0.0 }
     if x != x { return x }
@@ -337,7 +322,6 @@ fun frexp_f32_mantissa_impl(x: f32): f32 {
     while m < 0.5 { m = m * 2.0 }
     if x < 0.0 { 0.0 - m } else { m }
 }
-@internal
 fun frexp_f32_exponent_impl(x: f32): i32 {
     if x == 0.0 { return 0 }
     if x != x { return 0 }
@@ -354,7 +338,6 @@ fun frexp_f32_exponent_impl(x: f32): i32 {
     }
     e
 }
-@internal
 fun frexp_f16_mantissa_impl(x: f16): f16 {
     if x == 0.0 { return 0.0 }
     if x != x { return x }
@@ -364,7 +347,6 @@ fun frexp_f16_mantissa_impl(x: f16): f16 {
     while m < 0.5 { m = m * 2.0 }
     if x < 0.0 { 0.0 - m } else { m }
 }
-@internal
 fun frexp_f16_exponent_impl(x: f16): i32 {
     if x == 0.0 { return 0 }
     if x != x { return 0 }
@@ -381,7 +363,6 @@ fun frexp_f16_exponent_impl(x: f16): i32 {
     }
     e
 }
-@internal
 fun frexp_f128_mantissa_impl(x: f128): f128 {
     if x == 0.0 { return 0.0 }
     if x != x { return x }
@@ -391,7 +372,6 @@ fun frexp_f128_mantissa_impl(x: f128): f128 {
     while m < 0.5 { m = m * 2.0 }
     if x < 0.0 { 0.0 - m } else { m }
 }
-@internal
 fun frexp_f128_exponent_impl(x: f128): i32 {
     if x == 0.0 { return 0 }
     if x != x { return 0 }
@@ -432,21 +412,13 @@ pub fun frexp_exponent<T>(x: T): i32 {
 // ─── modf (separate integer and fractional parts, both with same sign as x) ───
 // integral = trunc(x); fractional = x - trunc(x)
 
-@internal
 fun modf_f64_integral_impl(x: f64): f64 { trunc_f64_impl(x) }
-@internal
 fun modf_f64_fractional_impl(x: f64): f64 { x - trunc_f64_impl(x) }
-@internal
 fun modf_f32_integral_impl(x: f32): f32 { trunc_f32_impl(x) }
-@internal
 fun modf_f32_fractional_impl(x: f32): f32 { x - trunc_f32_impl(x) }
-@internal
 fun modf_f16_integral_impl(x: f16): f16 { trunc_f16_impl(x) }
-@internal
 fun modf_f16_fractional_impl(x: f16): f16 { x - trunc_f16_impl(x) }
-@internal
 fun modf_f128_integral_impl(x: f128): f128 { trunc_f128_impl(x) }
-@internal
 fun modf_f128_fractional_impl(x: f128): f128 { x - trunc_f128_impl(x) }
 
 pub fun modf_integral<T>(x: T): T {
@@ -472,7 +444,6 @@ pub fun modf_fractional<T>(x: T): T {
 // ─── ilogb (base-2 exponent, integer return) ───
 // x = m * 2^e, m∈[1,2), return e; x==0 returns 0 (simplified); NaN/Inf returns 0
 
-@internal
 fun ilogb_f64_impl(x: f64): i32 {
     if x == 0.0 { return 0 }
     if x != x { return 0 }
@@ -489,7 +460,6 @@ fun ilogb_f64_impl(x: f64): i32 {
     }
     e
 }
-@internal
 fun ilogb_f32_impl(x: f32): i32 {
     if x == 0.0 { return 0 }
     if x != x { return 0 }
@@ -506,7 +476,6 @@ fun ilogb_f32_impl(x: f32): i32 {
     }
     e
 }
-@internal
 fun ilogb_f16_impl(x: f16): i32 {
     if x == 0.0 { return 0 }
     if x != x { return 0 }
@@ -523,7 +492,6 @@ fun ilogb_f16_impl(x: f16): i32 {
     }
     e
 }
-@internal
 fun ilogb_f128_impl(x: f128): i32 {
     if x == 0.0 { return 0 }
     if x != x { return 0 }
@@ -554,13 +522,9 @@ pub fun ilogb<T>(x: T): i32 {
 // ─── logb (base-2 exponent, floating point return) ───
 // logb(x) = (ilogb(x)) as T
 
-@internal
 fun logb_f64_impl(x: f64): f64 { (ilogb_f64_impl(x)) as f64 }
-@internal
 fun logb_f32_impl(x: f32): f32 { (ilogb_f32_impl(x)) as f32 }
-@internal
 fun logb_f16_impl(x: f16): f16 { (ilogb_f16_impl(x)) as f16 }
-@internal
 fun logb_f128_impl(x: f128): f128 { (ilogb_f128_impl(x)) as f128 }
 
 pub fun logb<T>(x: T): T {
@@ -575,13 +539,9 @@ pub fun logb<T>(x: T): T {
 
 // ─── scalbn (x * 2^n, same semantics as ldexp, math function naming) ───
 
-@internal
 fun scalbn_f64_impl(x: f64, n: i32): f64 { ldexp_f64_impl(x, n) }
-@internal
 fun scalbn_f32_impl(x: f32, n: i32): f32 { ldexp_f32_impl(x, n) }
-@internal
 fun scalbn_f16_impl(x: f16, n: i32): f16 { ldexp_f16_impl(x, n) }
-@internal
 fun scalbn_f128_impl(x: f128, n: i32): f128 { ldexp_f128_impl(x, n) }
 
 pub fun scalbn<T>(x: T, n: i32): T {

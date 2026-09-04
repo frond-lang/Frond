@@ -11,7 +11,8 @@
 // - kvars 用 KVRec(bool 是否已绑)存 SemKind?,避免泛型装 nullable。
 
 import std.collections.List
-import types.Ty
+import types.Ty.{is_atomic_unit, ty_eq, ty_name}
+import types.Ty.{from_type_name, kind_eq}
 
 pub type TypeArena = TypeArena(
     pub types: List<Ty>,

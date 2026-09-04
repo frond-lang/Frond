@@ -6,7 +6,6 @@
 
 // ─── buffer read helpers (local, to avoid cross-package dependency on std.io.File) ──────────
 
-@internal
 fun __dns_read_u32_be(buf: u8[], offset: usize): u32 {
     ((buf[offset] as u32) << 24)
         | ((buf[offset + 1] as u32) << 16)
@@ -14,7 +13,6 @@ fun __dns_read_u32_be(buf: u8[], offset: usize): u32 {
         | (buf[offset + 3] as u32)
 }
 
-@internal
 fun __dns_read_u64_be(buf: u8[], offset: usize): u64 {
     ((buf[offset] as u64) << 56)
         | ((buf[offset + 1] as u64) << 48)
@@ -31,7 +29,6 @@ fun __dns_read_u64_be(buf: u8[], offset: usize): u64 {
 // __net_resolve(host: str): Throw<IpAddr[], IOError>
 // Fills the out-buffer via __net_resolve_into (17 bytes per entry), then assembles IpAddr[]
 // Buffer size: 16 entries max, 16 * 17 = 272 bytes
-@internal
 fun __net_resolve(host: str): Throw<IpAddr[], IOError> {
     val max_count: usize = 16
     var buf: u8[] = []

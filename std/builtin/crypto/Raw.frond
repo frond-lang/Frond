@@ -13,6 +13,7 @@
 @c_include("string.h")
 @internal
 @extern("C")
+@export
 fun __sha256_into(data: u8[], out: u8[]): i64 #{
     static const uint32_t K[64] = {
         0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
@@ -87,6 +88,7 @@ fun __sha256_into(data: u8[], out: u8[]): i64 #{
 // 128-bit length field are shared. Same macro trick as SHA-256.
 @internal
 @extern("C")
+@export
 fun __sha512_into(data: u8[], out: u8[], is384: u32): i64 #{
     static const uint64_t K[80] = {
         0x428A2F98D728AE22ull,0x7137449123EF65CDull,0xB5C0FBCFEC4D3B2Full,0xE9B5DBA58189DBBCull,
@@ -182,6 +184,7 @@ fun __sha512_into(data: u8[], out: u8[], is384: u32): i64 #{
 // the final encode folds 2^255-bits with 19*c and conditionally subtracts p.
 @internal
 @extern("C")
+@export
 fun __x25519(out: u8[], scalar: u8[], point: u8[]): i64 #{
     uint64_t x1[12], x2[12], z2[12], x3[12], z3[12];
     uint64_t t0[12], t1[12], t2[12], t3[12], t4[12], t5[12];
@@ -392,6 +395,7 @@ fun __x25519(out: u8[], scalar: u8[], point: u8[]): i64 #{
 // workloads; table variants can come later if profiles demand).
 @internal
 @extern("C")
+@export
 fun __aes_gcm_seal(key: u8[], iv: u8[], aad: u8[], pt: u8[], out_ct: u8[], out_tag: u8[]): i64 #{
     unsigned char sbox[256];
     uint32_t rk[60];
@@ -595,6 +599,7 @@ fun __aes_gcm_seal(key: u8[], iv: u8[], aad: u8[], pt: u8[], out_ct: u8[], out_t
 // reuses the same generated tables internally.
 @internal
 @extern("C")
+@export
 fun __aes_gcm_open(key: u8[], iv: u8[], aad: u8[], ct: u8[], tag: u8[], out_pt: u8[]): i64 #{
 
     unsigned char sbox[256];
@@ -806,6 +811,7 @@ fun __aes_gcm_open(key: u8[], iv: u8[], aad: u8[], ct: u8[], tag: u8[], out_pt: 
 // mi/db/ad) so nested expansions cannot capture each other.
 @internal
 @extern("C")
+@export
 fun __ecdsa_p256_verify(pub_xy: u8[], hash: u8[], rs: u8[]): i64 #{
 
 typedef uint64_t ecv_u64;
@@ -1131,6 +1137,7 @@ static const ecv_u64 ECV_B[4]  = {0x3bce3c3e27d2604bull, 0x651d06b0cc53b0f6ull, 
 // is recorded in the session notes. Macro locals carry the e3_ prefix.
 @internal
 @extern("C")
+@export
 fun __ecdsa_p384_verify(pub_xy: u8[], hash: u8[], rs: u8[]): i64 #{
 
 typedef uint64_t e3_u64;

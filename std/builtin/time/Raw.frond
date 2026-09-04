@@ -8,6 +8,7 @@
 @c_include("windows.h")
 @internal
 @extern("C")
+@export
 fun __instant_now_ns(): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         static LARGE_INTEGER freq = {0};
@@ -25,6 +26,7 @@ fun __instant_now_ns(): i64 #{
 @c_include("time.h")
 @internal
 @extern("C")
+@export
 fun __systemtime_now_ns(): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         FILETIME ft;
@@ -59,6 +61,7 @@ fun __sleep_ns(ns: i64): void #{
 @c_include("time.h")
 @internal
 @extern("C")
+@export
 fun __localtime_offset_minutes(): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         TIME_ZONE_INFORMATION tzi;

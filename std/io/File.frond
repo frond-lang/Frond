@@ -223,7 +223,6 @@ pub fun __compute_flags(mode: OpenMode): i32 {
 
 // __file_open_raw(path: str, flags: i32, mode: i32): i64 → Throw<i64, IOError>
 // fd < 0 = open failed
-@internal
 fun __file_open(path: str, flags: i32, mode: i32): Throw<i64, IOError> {
     val fd = __file_open_raw(path, flags, mode)
     if fd < 0 {
@@ -233,7 +232,6 @@ fun __file_open(path: str, flags: i32, mode: i32): Throw<i64, IOError> {
 }
 
 // __file_close(fd: i64): i32 → Throw<void, IOError>
-@internal
 fun __file_close(fd: i64): Throw<void, IOError> {
     val rc = __file_close_raw(fd)
     if rc < 0 {
@@ -243,7 +241,6 @@ fun __file_close(fd: i64): Throw<void, IOError> {
 }
 
 // __file_seek(fd: i64, offset: i64, whence: i32): i64 → Throw<i64, IOError>
-@internal
 fun __file_seek(fd: i64, offset: i64, whence: i32): Throw<i64, IOError> {
     val pos = __file_seek_raw(fd, offset, whence)
     if pos < 0 {
@@ -253,7 +250,6 @@ fun __file_seek(fd: i64, offset: i64, whence: i32): Throw<i64, IOError> {
 }
 
 // __file_remove(path: str): i32 → Throw<void, IOError>
-@internal
 fun __file_remove(path: str): Throw<void, IOError> {
     val rc = __file_remove_raw(path)
     if rc < 0 {
@@ -263,7 +259,6 @@ fun __file_remove(path: str): Throw<void, IOError> {
 }
 
 // __file_rename(old: str, new: str): i32 → Throw<void, IOError>
-@internal
 fun __file_rename(old: str, new: str): Throw<void, IOError> {
     val rc = __file_rename_raw(old, new)
     if rc < 0 {
@@ -273,7 +268,6 @@ fun __file_rename(old: str, new: str): Throw<void, IOError> {
 }
 
 // __file_chmod(path: str, mode: i32): i32 → Throw<void, IOError>
-@internal
 fun __file_chmod(path: str, mode: i32): Throw<void, IOError> {
     val rc = __file_chmod_raw(path, mode)
     if rc < 0 {
@@ -290,7 +284,6 @@ fun __file_chmod(path: str, mode: i32): Throw<void, IOError> {
 //   [16..24) ctime_ns i64
 //   [24..28) kind     i32 (0=file, 1=dir, 2=symlink, 3=other)
 
-@internal
 fun __read_u64_le(buf: u8[], offset: usize): u64 {
     ((buf[offset]) as u64)
         | (((buf[offset + 1]) as u64) << 8)
@@ -302,12 +295,10 @@ fun __read_u64_le(buf: u8[], offset: usize): u64 {
         | (((buf[offset + 7]) as u64) << 56)
 }
 
-@internal
 fun __read_i64_le(buf: u8[], offset: usize): i64 {
     (__read_u64_le(buf, offset)) as i64
 }
 
-@internal
 fun __read_i32_le(buf: u8[], offset: usize): i32 {
     (((buf[offset]) as u32)
         | (((buf[offset + 1]) as u32) << 8)
@@ -315,7 +306,6 @@ fun __read_i32_le(buf: u8[], offset: usize): i32 {
         | (((buf[offset + 3]) as u32) << 24)) as i32
 }
 
-@internal
 fun __kind_from_int(kind_int: i32): FileKind {
     if kind_int == 0 {
         FileKind.File
@@ -330,7 +320,6 @@ fun __kind_from_int(kind_int: i32): FileKind {
 
 // __file_stat(path: str): Throw<Stat, IOError>
 // Fill 28-byte buffer via @extern("C") __file_stat_into, then parse
-@internal
 fun __file_stat(path: str): Throw<Stat, IOError> {
     val buf: u8[] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     val rc = __file_stat_into(path, buf)
@@ -345,7 +334,6 @@ fun __file_stat(path: str): Throw<Stat, IOError> {
 }
 
 // __file_fstat(fd: i64): Throw<Stat, IOError>
-@internal
 fun __file_fstat(fd: i64): Throw<Stat, IOError> {
     val buf: u8[] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     val rc = __file_fstat_into(fd, buf)

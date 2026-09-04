@@ -21,6 +21,7 @@
 // dst[2n] gets the lowercase hex digits of src[n].
 @internal
 @extern("C")
+@export
 fun __hex_encode(dst: u8[], src: u8[]): void #{
     static const char digits[16] = {
         '0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'
@@ -37,6 +38,7 @@ fun __hex_encode(dst: u8[], src: u8[]): void #{
 // the FFI marshals it as a zero-copy const char*/len view.
 @internal
 @extern("C")
+@export
 fun __hex_decode(dst: u8[], src: str): i64 #{
     if (src_len % 2 != 0) return -1;
     const uint8_t* sb = (const uint8_t*)src_data;
@@ -63,6 +65,7 @@ fun __hex_decode(dst: u8[], src: str): i64 #{
 // dst[4*ceil(n/3)] gets the base64 of src[n] with mandatory '=' padding.
 @internal
 @extern("C")
+@export
 fun __b64_encode(dst: u8[], src: u8[]): void #{
     static const char alpha[64] = {
         'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P',
@@ -103,6 +106,7 @@ fun __b64_encode(dst: u8[], src: u8[]): void #{
 // outside the last two positions. src is a str (zero-copy view).
 @internal
 @extern("C")
+@export
 fun __b64_decode(dst: u8[], src: str): i64 #{
     if (src_len % 4 != 0) return -1;
     const uint8_t* sb = (const uint8_t*)src_data;

@@ -14,6 +14,7 @@
 @c_include("direct.h")
 @internal
 @extern("C")
+@export
 fun __file_open_raw(path: str, flags: i32, mode: i32): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         int posix_flags = 0;
@@ -54,6 +55,7 @@ fun __file_open_raw(path: str, flags: i32, mode: i32): i64 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __file_close_raw(fd: i64): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         return _close((int)fd);
@@ -65,6 +67,7 @@ fun __file_close_raw(fd: i64): i32 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __file_read_into(fd: i64, buf: u8[], len: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         return _read((int)fd, buf_data, (unsigned int)buf_len);
@@ -76,6 +79,7 @@ fun __file_read_into(fd: i64, buf: u8[], len: usize): i64 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __file_write(fd: i64, buf: u8[], len: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         return _write((int)fd, buf_data, (unsigned int)buf_len);
@@ -87,6 +91,7 @@ fun __file_write(fd: i64, buf: u8[], len: usize): i64 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __file_seek_raw(fd: i64, offset: i64, whence: i32): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         int origin = whence == 0 ? FILE_BEGIN : (whence == 1 ? FILE_CURRENT : FILE_END);
@@ -103,6 +108,7 @@ fun __file_seek_raw(fd: i64, offset: i64, whence: i32): i64 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __file_remove_raw(path: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         wchar_t* wpath = frond_utf8_to_utf16(path_data, path_len);
@@ -118,6 +124,7 @@ fun __file_remove_raw(path: str): i32 #{
 @c_include("stdio.h")
 @internal
 @extern("C")
+@export
 fun __file_rename_raw(old: str, new: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         wchar_t* wold = frond_utf8_to_utf16(old_data, old_len);
@@ -134,6 +141,7 @@ fun __file_rename_raw(old: str, new: str): i32 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __stdout_write_raw(s: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -162,6 +170,7 @@ fun __stdout_write_raw(s: str): i32 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __stderr_write_raw(s: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
@@ -189,6 +198,7 @@ fun __stderr_write_raw(s: str): i32 #{
 @c_include("io.h")
 @internal
 @extern("C")
+@export
 fun __stdin_readln_into(buf: u8[]): i64 #{
     size_t total = 0;
     char ch;
@@ -238,6 +248,7 @@ fun __stdin_readln_into(buf: u8[]): i64 #{
 @c_include("sys/stat.h")
 @internal
 @extern("C")
+@export
 fun __dir_create_raw(path: str, recursive: bool): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         // Walk in UTF-8 (separators are ASCII, never part of a multi-byte
@@ -285,6 +296,7 @@ fun __dir_create_raw(path: str, recursive: bool): i32 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __dir_remove_raw(path: str, recursive: bool): i32 #{
     (void)recursive;
     #if defined(_WIN32) || defined(_WIN64)
@@ -303,6 +315,7 @@ fun __dir_remove_raw(path: str, recursive: bool): i32 #{
 @c_include("sys/stat.h")
 @internal
 @extern("C")
+@export
 fun __file_chmod_raw(path: str, mode: i32): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         wchar_t* wpath = frond_utf8_to_utf16(path_data, path_len);
@@ -328,6 +341,7 @@ fun __file_chmod_raw(path: str, mode: i32): i32 #{
 @c_include("sys/stat.h")
 @internal
 @extern("C")
+@export
 fun __file_stat_into(path: str, buf: u8[]): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         struct _stat64 st;
@@ -375,6 +389,7 @@ fun __file_stat_into(path: str, buf: u8[]): i32 #{
 @c_include("sys/stat.h")
 @internal
 @extern("C")
+@export
 fun __file_fstat_into(fd: i64, buf: u8[]): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         struct _stat64 st;
@@ -433,6 +448,7 @@ fun __file_fstat_into(fd: i64, buf: u8[]): i32 #{
 @c_include("string.h")
 @internal
 @extern("C")
+@export
 fun __dir_list_into(path: str, names_buf: u8[], name_offsets: u8[], kinds_buf: u8[], max_count: usize): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         WIN32_FIND_DATAW fd;
@@ -514,6 +530,7 @@ fun __dir_list_into(path: str, names_buf: u8[], name_offsets: u8[], kinds_buf: u
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __file_exists_raw(path: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         wchar_t* wpath = frond_utf8_to_utf16(path_data, path_len);
@@ -532,6 +549,7 @@ fun __file_exists_raw(path: str): i32 #{
 @c_include("unistd.h")
 @internal
 @extern("C")
+@export
 fun __file_copy_raw(src: str, dst: str): i32 #{
     #if defined(_WIN32) || defined(_WIN64)
         wchar_t* wsrc = frond_utf8_to_utf16(src_data, src_len);
@@ -574,6 +592,7 @@ fun __file_copy_raw(src: str, dst: str): i32 #{
 @c_include("limits.h")
 @internal
 @extern("C")
+@export
 fun __fs_realpath_into(path: str, buf: u8[]): i64 #{
     #if defined(_WIN32) || defined(_WIN64)
         wchar_t* wpath = frond_utf8_to_utf16(path_data, path_len);

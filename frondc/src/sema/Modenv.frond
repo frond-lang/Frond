@@ -225,6 +225,26 @@ pub fun process_import_decls(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAst, 
                 val full_path = Semares.str_join(module_path, ".")
                 record_module_import(s, m.name, full_path)
                 val module_env = ensure_module_env(ctx, a, s, full_path, env)
+                // ── 方案 B:用户模块导入的成员再输出(引擎 ModuleEnv 同步;
+                // 历史上 `import Helper; helper_value()` 经 root 预declare glob
+                // 解析,环境面收缩后导入语句成为唯一通道)──
+                match s.module_envs.get(full_path) {
+                    null => {}
+                    target_env => {
+                        if (target_env ?? 0) != env {
+                            val names = Envs.snapshot_names(s.env, target_env ?? 0)
+                            var ni: usize = 0
+                            while ni < names.len() {
+                                val nm = names.get(ni) ?? ""
+                                match Envs.lookup_local(s.env, target_env ?? 0, nm) {
+                                    null => {}
+                                    sym_ty => { Envs.define(s.env, env, nm, sym_ty ?? 0) }
+                                }
+                                ni = ni + 1
+                            }
+                        }
+                    },
+                }
                 // ── std 层再输出(导入即显式可见性授予)──
                 val dot = last_dot_index(full_path)
                 var import_parent = ""
@@ -412,7 +432,7 @@ pub fun predeclare_declarations(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAs
     while di < m.decls.len() {
         val sd = m.decls[di]
         match sd.decl {
-            FunDeclD(_, name, tps, params, rt, _, is_async, _, _, _) => {
+            FunDeclD(_, name, tps, params, rt, _, is_async, _, attrs, _) => {
                 if list_has_str(seen_fns, name) {
                     Semares.add_error(s, new_err(
                         "duplicate definition of function '{name}' in this module", sd.span.line, sd.span.column))
@@ -443,7 +463,21 @@ pub fun predeclare_declarations(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAs
                 val ret_ty = wrap_async_return(a, ret_ty_raw, is_async)
                 val fn_ty = make_fn(a, param_types, ret_ty)
                 define(s.env, module_env, name, fn_ty)
-                define(s.env, root_env, name, fn_ty)
+                // 方案 B(用户裁决 2026-09-05):root 环境面(全模块裸
+                // 可见)只收 @export 且仅 builtin 层生效(引擎
+                // ModuleEnv is_ambient_exported 同步);其余裸名一律模块
+                // 内或显式选择性导入(S2c 优先级格)。
+                var exported = false
+                var xi: usize = 0
+                while xi < attrs.len() {
+                    if attrs[xi].name == "export" {
+                        exported = true
+                    }
+                    xi = xi + 1
+                }
+                if exported && Str.starts_with(s.current_module_name, "builtin/") {
+                    define(s.env, root_env, name, fn_ty)
+                }
                 if tps.len() > 0 {
                     pop_frame(ctx)
                 }

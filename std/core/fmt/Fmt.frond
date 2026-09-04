@@ -9,7 +9,6 @@
 // halves first so I128.MIN never overflows on its way to u128.
 
 // Digit byte for a nibble-and-up value 0..35 (lowercase 0-9a-z).
-@internal
 fun digit_byte(d: u8): u8 {
     if d < 10 { (48 + (d as i32)) as u8 } else { (87 + (d as i32)) as u8 }
 }
@@ -17,7 +16,6 @@ fun digit_byte(d: u8): u8 {
 // Magnitude digits (no sign). u128 base-2 worst case is 128 digits, so a
 // fixed 128-byte buffer is written back-to-front and sliced; every input
 // emits at least one digit (v = 0 → "0").
-@internal
 fun mag_digits(v: u128, base: u8): str {
     var buf: u8[] = [0, ..128]
     var i: usize = 128
@@ -34,14 +32,12 @@ fun mag_digits(v: u128, base: u8): str {
 
 // Magnitude of a negative i128 as u128. Plain 0 - x overflows at I128.MIN,
 // so halve first (always representable) and reassemble doubled.
-@internal
 fun neg_mag(x: i128): u128 {
     val half = (0 - (x / 2)) as u128
     if x % 2 == 0 { half * 2 } else { half * 2 + 1 }
 }
 
 // Signed i128 in any radix 2..36: sign prefix, then magnitude digits.
-@internal
 fun radix_i128(x: i128, base: u8): str {
     if x >= 0 { mag_digits(x as u128, base) } else { "-" + mag_digits(neg_mag(x), base) }
 }

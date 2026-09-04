@@ -17,6 +17,7 @@
 // Fills the whole buffer with byte (memset).
 @internal
 @extern("C")
+@export
 fun __mem_fill(buf: u8[], byte: u8): void #{
     memset(buf_data, byte, buf_len);
 }#
@@ -25,6 +26,7 @@ fun __mem_fill(buf: u8[], byte: u8): void #{
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy(dst: u8[], dst_at: usize, src: u8[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -45,6 +47,7 @@ fun __mem_copy(dst: u8[], dst_at: usize, src: u8[], src_at: usize, count: usize)
 // Byte-wise equality: 1 when lengths match and contents are equal, else 0.
 @internal
 @extern("C")
+@export
 fun __mem_equal(a: u8[], b: u8[]): i32 #{
     if (a_len != b_len) return 0;
     return memcmp(a_data, b_data, a_len) == 0 ? 1 : 0;
@@ -53,6 +56,7 @@ fun __mem_equal(a: u8[], b: u8[]): i32 #{
 // Swaps buf[i] and buf[j].
 @internal
 @extern("C")
+@export
 fun __mem_swap(buf: u8[], i: usize, j: usize): void #{
     if (i >= buf_len || j >= buf_len) {
         fprintf(stderr, "mem.swap: index %llu or %llu out of bounds (len %llu)\n",
@@ -68,6 +72,7 @@ fun __mem_swap(buf: u8[], i: usize, j: usize): void #{
 // Reverses the buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse(buf: u8[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -84,6 +89,7 @@ fun __mem_reverse(buf: u8[]): void #{
 // element-wise, then shorter-is-less). Returns <0 / 0 / >0.
 @internal
 @extern("C")
+@export
 fun __mem_compare_u8(a: u8[], b: u8[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     int rc = memcmp(a_data, b_data, n);
@@ -97,6 +103,7 @@ fun __mem_compare_u8(a: u8[], b: u8[]): i32 #{
 // Empty needle matches at 0. Naive O(n*m) — still ~100x the interpreted loop.
 @internal
 @extern("C")
+@export
 fun __mem_index_of_u8(hay: u8[], needle: u8[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -122,72 +129,84 @@ fun __mem_index_of_u8(hay: u8[], needle: u8[]): i64 #{
 // Fills the whole i8[] buffer with value.
 @internal
 @extern("C")
+@export
 fun __mem_fill_i8(buf: i8[], v: i8): void #{
     for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
 }#
 // Fills the whole i16[] buffer with value.
 @internal
 @extern("C")
+@export
 fun __mem_fill_i16(buf: i16[], v: i16): void #{
     for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
 }#
 // Fills the whole i32[] buffer with value.
 @internal
 @extern("C")
+@export
 fun __mem_fill_i32(buf: i32[], v: i32): void #{
     for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
 }#
 // Fills the whole i64[] buffer with value.
 @internal
 @extern("C")
+@export
 fun __mem_fill_i64(buf: i64[], v: i64): void #{
     for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
 }#
 // Fills the whole u16[] buffer with value.
 @internal
 @extern("C")
+@export
 fun __mem_fill_u16(buf: u16[], v: u16): void #{
     for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
 }#
 // Fills the whole u32[] buffer with value.
 @internal
 @extern("C")
+@export
 fun __mem_fill_u32(buf: u32[], v: u32): void #{
     for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
 }#
 // Fills the whole u64[] buffer with value.
 @internal
 @extern("C")
+@export
 fun __mem_fill_u64(buf: u64[], v: u64): void #{
     for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
 }#
 // Fills the whole isize[] buffer with value.
 @internal
 @extern("C")
+@export
 fun __mem_fill_isize(buf: isize[], v: isize): void #{
     for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
 }#
 // Fills the whole usize[] buffer with value.
 @internal
 @extern("C")
+@export
 fun __mem_fill_usize(buf: usize[], v: usize): void #{
     for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
 }#
 // Fills the whole f32[] buffer with value.
 @internal
 @extern("C")
+@export
 fun __mem_fill_f32(buf: f32[], v: f32): void #{
     for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
 }#
 // Fills the whole f64[] buffer with value.
 @internal
 @extern("C")
+@export
 fun __mem_fill_f64(buf: f64[], v: f64): void #{
     for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
 }#
 // Reverses the i8[] buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse_i8(buf: i8[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -202,6 +221,7 @@ fun __mem_reverse_i8(buf: i8[]): void #{
 // Reverses the i16[] buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse_i16(buf: i16[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -216,6 +236,7 @@ fun __mem_reverse_i16(buf: i16[]): void #{
 // Reverses the i32[] buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse_i32(buf: i32[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -230,6 +251,7 @@ fun __mem_reverse_i32(buf: i32[]): void #{
 // Reverses the i64[] buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse_i64(buf: i64[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -244,6 +266,7 @@ fun __mem_reverse_i64(buf: i64[]): void #{
 // Reverses the u16[] buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse_u16(buf: u16[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -258,6 +281,7 @@ fun __mem_reverse_u16(buf: u16[]): void #{
 // Reverses the u32[] buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse_u32(buf: u32[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -272,6 +296,7 @@ fun __mem_reverse_u32(buf: u32[]): void #{
 // Reverses the u64[] buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse_u64(buf: u64[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -286,6 +311,7 @@ fun __mem_reverse_u64(buf: u64[]): void #{
 // Reverses the isize[] buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse_isize(buf: isize[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -300,6 +326,7 @@ fun __mem_reverse_isize(buf: isize[]): void #{
 // Reverses the usize[] buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse_usize(buf: usize[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -314,6 +341,7 @@ fun __mem_reverse_usize(buf: usize[]): void #{
 // Reverses the f32[] buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse_f32(buf: f32[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -328,6 +356,7 @@ fun __mem_reverse_f32(buf: f32[]): void #{
 // Reverses the f64[] buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse_f64(buf: f64[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -343,6 +372,7 @@ fun __mem_reverse_f64(buf: f64[]): void #{
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_i8(dst: i8[], dst_at: usize, src: i8[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -363,6 +393,7 @@ fun __mem_copy_i8(dst: i8[], dst_at: usize, src: i8[], src_at: usize, count: usi
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_i16(dst: i16[], dst_at: usize, src: i16[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -383,6 +414,7 @@ fun __mem_copy_i16(dst: i16[], dst_at: usize, src: i16[], src_at: usize, count: 
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_i32(dst: i32[], dst_at: usize, src: i32[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -403,6 +435,7 @@ fun __mem_copy_i32(dst: i32[], dst_at: usize, src: i32[], src_at: usize, count: 
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_i64(dst: i64[], dst_at: usize, src: i64[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -423,6 +456,7 @@ fun __mem_copy_i64(dst: i64[], dst_at: usize, src: i64[], src_at: usize, count: 
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_u16(dst: u16[], dst_at: usize, src: u16[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -443,6 +477,7 @@ fun __mem_copy_u16(dst: u16[], dst_at: usize, src: u16[], src_at: usize, count: 
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_u32(dst: u32[], dst_at: usize, src: u32[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -463,6 +498,7 @@ fun __mem_copy_u32(dst: u32[], dst_at: usize, src: u32[], src_at: usize, count: 
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_u64(dst: u64[], dst_at: usize, src: u64[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -483,6 +519,7 @@ fun __mem_copy_u64(dst: u64[], dst_at: usize, src: u64[], src_at: usize, count: 
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_isize(dst: isize[], dst_at: usize, src: isize[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -503,6 +540,7 @@ fun __mem_copy_isize(dst: isize[], dst_at: usize, src: isize[], src_at: usize, c
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_usize(dst: usize[], dst_at: usize, src: usize[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -523,6 +561,7 @@ fun __mem_copy_usize(dst: usize[], dst_at: usize, src: usize[], src_at: usize, c
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_f32(dst: f32[], dst_at: usize, src: f32[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -543,6 +582,7 @@ fun __mem_copy_f32(dst: f32[], dst_at: usize, src: f32[], src_at: usize, count: 
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_f64(dst: f64[], dst_at: usize, src: f64[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -562,6 +602,7 @@ fun __mem_copy_f64(dst: f64[], dst_at: usize, src: f64[], src_at: usize, count: 
 // Lexicographic three-way comparison (element-wise, shorter-is-less).
 @internal
 @extern("C")
+@export
 fun __mem_compare_i8(a: i8[], b: i8[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -575,6 +616,7 @@ fun __mem_compare_i8(a: i8[], b: i8[]): i32 #{
 // Lexicographic three-way comparison (element-wise, shorter-is-less).
 @internal
 @extern("C")
+@export
 fun __mem_compare_i16(a: i16[], b: i16[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -588,6 +630,7 @@ fun __mem_compare_i16(a: i16[], b: i16[]): i32 #{
 // Lexicographic three-way comparison (element-wise, shorter-is-less).
 @internal
 @extern("C")
+@export
 fun __mem_compare_i32(a: i32[], b: i32[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -601,6 +644,7 @@ fun __mem_compare_i32(a: i32[], b: i32[]): i32 #{
 // Lexicographic three-way comparison (element-wise, shorter-is-less).
 @internal
 @extern("C")
+@export
 fun __mem_compare_i64(a: i64[], b: i64[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -614,6 +658,7 @@ fun __mem_compare_i64(a: i64[], b: i64[]): i32 #{
 // Lexicographic three-way comparison (element-wise, shorter-is-less).
 @internal
 @extern("C")
+@export
 fun __mem_compare_u16(a: u16[], b: u16[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -627,6 +672,7 @@ fun __mem_compare_u16(a: u16[], b: u16[]): i32 #{
 // Lexicographic three-way comparison (element-wise, shorter-is-less).
 @internal
 @extern("C")
+@export
 fun __mem_compare_u32(a: u32[], b: u32[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -640,6 +686,7 @@ fun __mem_compare_u32(a: u32[], b: u32[]): i32 #{
 // Lexicographic three-way comparison (element-wise, shorter-is-less).
 @internal
 @extern("C")
+@export
 fun __mem_compare_u64(a: u64[], b: u64[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -653,6 +700,7 @@ fun __mem_compare_u64(a: u64[], b: u64[]): i32 #{
 // Lexicographic three-way comparison (element-wise, shorter-is-less).
 @internal
 @extern("C")
+@export
 fun __mem_compare_isize(a: isize[], b: isize[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -666,6 +714,7 @@ fun __mem_compare_isize(a: isize[], b: isize[]): i32 #{
 // Lexicographic three-way comparison (element-wise, shorter-is-less).
 @internal
 @extern("C")
+@export
 fun __mem_compare_usize(a: usize[], b: usize[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -679,6 +728,7 @@ fun __mem_compare_usize(a: usize[], b: usize[]): i32 #{
 // Lexicographic three-way comparison (element-wise, shorter-is-less).
 @internal
 @extern("C")
+@export
 fun __mem_compare_f32(a: f32[], b: f32[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -692,6 +742,7 @@ fun __mem_compare_f32(a: f32[], b: f32[]): i32 #{
 // Lexicographic three-way comparison (element-wise, shorter-is-less).
 @internal
 @extern("C")
+@export
 fun __mem_compare_f64(a: f64[], b: f64[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -705,6 +756,7 @@ fun __mem_compare_f64(a: f64[], b: f64[]): i32 #{
 // Index of the first occurrence of needle in hay; -1 when absent.
 @internal
 @extern("C")
+@export
 fun __mem_index_of_i8(hay: i8[], needle: i8[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -720,6 +772,7 @@ fun __mem_index_of_i8(hay: i8[], needle: i8[]): i64 #{
 // Index of the first occurrence of needle in hay; -1 when absent.
 @internal
 @extern("C")
+@export
 fun __mem_index_of_i16(hay: i16[], needle: i16[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -735,6 +788,7 @@ fun __mem_index_of_i16(hay: i16[], needle: i16[]): i64 #{
 // Index of the first occurrence of needle in hay; -1 when absent.
 @internal
 @extern("C")
+@export
 fun __mem_index_of_i32(hay: i32[], needle: i32[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -750,6 +804,7 @@ fun __mem_index_of_i32(hay: i32[], needle: i32[]): i64 #{
 // Index of the first occurrence of needle in hay; -1 when absent.
 @internal
 @extern("C")
+@export
 fun __mem_index_of_i64(hay: i64[], needle: i64[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -765,6 +820,7 @@ fun __mem_index_of_i64(hay: i64[], needle: i64[]): i64 #{
 // Index of the first occurrence of needle in hay; -1 when absent.
 @internal
 @extern("C")
+@export
 fun __mem_index_of_u16(hay: u16[], needle: u16[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -780,6 +836,7 @@ fun __mem_index_of_u16(hay: u16[], needle: u16[]): i64 #{
 // Index of the first occurrence of needle in hay; -1 when absent.
 @internal
 @extern("C")
+@export
 fun __mem_index_of_u32(hay: u32[], needle: u32[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -795,6 +852,7 @@ fun __mem_index_of_u32(hay: u32[], needle: u32[]): i64 #{
 // Index of the first occurrence of needle in hay; -1 when absent.
 @internal
 @extern("C")
+@export
 fun __mem_index_of_u64(hay: u64[], needle: u64[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -810,6 +868,7 @@ fun __mem_index_of_u64(hay: u64[], needle: u64[]): i64 #{
 // Index of the first occurrence of needle in hay; -1 when absent.
 @internal
 @extern("C")
+@export
 fun __mem_index_of_isize(hay: isize[], needle: isize[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -825,6 +884,7 @@ fun __mem_index_of_isize(hay: isize[], needle: isize[]): i64 #{
 // Index of the first occurrence of needle in hay; -1 when absent.
 @internal
 @extern("C")
+@export
 fun __mem_index_of_usize(hay: usize[], needle: usize[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -841,6 +901,7 @@ fun __mem_index_of_usize(hay: usize[], needle: usize[]): i64 #{
 // equality loop: NaN never matches (matches the engine's != semantics).
 @internal
 @extern("C")
+@export
 fun __mem_index_of_f32(hay: f32[], needle: f32[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -856,6 +917,7 @@ fun __mem_index_of_f32(hay: f32[], needle: f32[]): i64 #{
 // equality loop: NaN never matches (matches the engine's != semantics).
 @internal
 @extern("C")
+@export
 fun __mem_index_of_f64(hay: f64[], needle: f64[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -878,18 +940,21 @@ fun __mem_index_of_f64(hay: f64[], needle: f64[]): i64 #{
 // Fills the whole bool[] buffer with value.
 @internal
 @extern("C")
+@export
 fun __mem_fill_bool(buf: bool[], v: bool): void #{
     for (size_t k = 0; k < buf_len; k++) buf_data[k] = (uint8_t)(v ? 1 : 0);
 }#
 // Fills the whole char[] buffer with value.
 @internal
 @extern("C")
+@export
 fun __mem_fill_char(buf: char[], v: char): void #{
     for (size_t k = 0; k < buf_len; k++) buf_data[k] = v;
 }#
 // Reverses the bool[] buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse_bool(buf: bool[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -904,6 +969,7 @@ fun __mem_reverse_bool(buf: bool[]): void #{
 // Reverses the char[] buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse_char(buf: char[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -919,6 +985,7 @@ fun __mem_reverse_char(buf: char[]): void #{
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_bool(dst: bool[], dst_at: usize, src: bool[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -941,6 +1008,7 @@ fun __mem_copy_bool(dst: bool[], dst_at: usize, src: bool[], src_at: usize, coun
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_char(dst: char[], dst_at: usize, src: char[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -962,6 +1030,7 @@ fun __mem_copy_char(dst: char[], dst_at: usize, src: char[], src_at: usize, coun
 // Lexicographic three-way comparison (element-wise, shorter-is-less).
 @internal
 @extern("C")
+@export
 fun __mem_compare_bool(a: bool[], b: bool[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -975,6 +1044,7 @@ fun __mem_compare_bool(a: bool[], b: bool[]): i32 #{
 // Lexicographic three-way comparison (element-wise, shorter-is-less).
 @internal
 @extern("C")
+@export
 fun __mem_compare_char(a: char[], b: char[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -990,6 +1060,7 @@ fun __mem_compare_char(a: char[], b: char[]): i32 #{
 // equality is byte-wise too).
 @internal
 @extern("C")
+@export
 fun __mem_index_of_bool(hay: bool[], needle: bool[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -1007,6 +1078,7 @@ fun __mem_index_of_bool(hay: bool[], needle: bool[]): i64 #{
 // equality is byte-wise too).
 @internal
 @extern("C")
+@export
 fun __mem_index_of_char(hay: char[], needle: char[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -1025,6 +1097,7 @@ fun __mem_index_of_char(hay: char[], needle: char[]): i64 #{
 // the f16 bit pattern).
 @internal
 @extern("C")
+@export
 fun __mem_fill_i128(buf: i128[], pattern: i128[]): void #{
     if (buf_len == 0 || pattern_len == 0) return;
     const uint64_t lo = pattern_data[0];
@@ -1040,6 +1113,7 @@ fun __mem_fill_i128(buf: i128[], pattern: i128[]): void #{
 // the f16 bit pattern).
 @internal
 @extern("C")
+@export
 fun __mem_fill_u128(buf: u128[], pattern: u128[]): void #{
     if (buf_len == 0 || pattern_len == 0) return;
     const uint64_t lo = pattern_data[0];
@@ -1055,6 +1129,7 @@ fun __mem_fill_u128(buf: u128[], pattern: u128[]): void #{
 // the f16 bit pattern).
 @internal
 @extern("C")
+@export
 fun __mem_fill_f128(buf: f128[], pattern: f128[]): void #{
     if (buf_len == 0 || pattern_len == 0) return;
     const uint64_t lo = pattern_data[0];
@@ -1067,6 +1142,7 @@ fun __mem_fill_f128(buf: f128[], pattern: f128[]): void #{
 // Reverses the i128[] buffer in place (2 x 8-byte word swaps per element).
 @internal
 @extern("C")
+@export
 fun __mem_reverse_i128(buf: i128[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -1083,6 +1159,7 @@ fun __mem_reverse_i128(buf: i128[]): void #{
 // Reverses the u128[] buffer in place (2 x 8-byte word swaps per element).
 @internal
 @extern("C")
+@export
 fun __mem_reverse_u128(buf: u128[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -1099,6 +1176,7 @@ fun __mem_reverse_u128(buf: u128[]): void #{
 // Reverses the f128[] buffer in place (2 x 8-byte word swaps per element).
 @internal
 @extern("C")
+@export
 fun __mem_reverse_f128(buf: f128[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -1116,6 +1194,7 @@ fun __mem_reverse_f128(buf: f128[]): void #{
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_i128(dst: i128[], dst_at: usize, src: i128[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -1138,6 +1217,7 @@ fun __mem_copy_i128(dst: i128[], dst_at: usize, src: i128[], src_at: usize, coun
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_u128(dst: u128[], dst_at: usize, src: u128[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -1160,6 +1240,7 @@ fun __mem_copy_u128(dst: u128[], dst_at: usize, src: u128[], src_at: usize, coun
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_f128(dst: f128[], dst_at: usize, src: f128[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -1181,6 +1262,7 @@ fun __mem_copy_f128(dst: f128[], dst_at: usize, src: f128[], src_at: usize, coun
 // Lexicographic three-way comparison over uint64-pair elements (signed 128: high word signed, low word unsigned (two's complement)).
 @internal
 @extern("C")
+@export
 fun __mem_compare_i128(a: i128[], b: i128[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -1197,6 +1279,7 @@ fun __mem_compare_i128(a: i128[], b: i128[]): i32 #{
 // Lexicographic three-way comparison over uint64-pair elements (unsigned 128).
 @internal
 @extern("C")
+@export
 fun __mem_compare_u128(a: u128[], b: u128[]): i32 #{
     size_t n = a_len < b_len ? a_len : b_len;
     for (size_t k = 0; k < n; k++) {
@@ -1216,6 +1299,7 @@ fun __mem_compare_u128(a: u128[], b: u128[]): i32 #{
 // payload). Elements are native uint64 lo/hi pairs.
 @internal
 @extern("C")
+@export
 fun __mem_compare_f128(a: f128[], b: f128[]): i32 #{
     #define FROND_K128(hi, lo, kh, kl) do {         if ((hi) >> 63) { kh = ~(hi); kl = ~(lo); }         else { kh = (hi) | 0x8000000000000000ULL; kl = (lo); }     } while (0)
     size_t n = a_len < b_len ? a_len : b_len;
@@ -1236,6 +1320,7 @@ fun __mem_compare_f128(a: f128[], b: f128[]): i32 #{
 // equality is byte-wise too).
 @internal
 @extern("C")
+@export
 fun __mem_index_of_i128(hay: i128[], needle: i128[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -1253,6 +1338,7 @@ fun __mem_index_of_i128(hay: i128[], needle: i128[]): i64 #{
 // equality is byte-wise too).
 @internal
 @extern("C")
+@export
 fun __mem_index_of_u128(hay: u128[], needle: u128[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -1272,6 +1358,7 @@ fun __mem_index_of_u128(hay: u128[], needle: u128[]): i64 #{
 // that are not NaN, or the two zero signs.
 @internal
 @extern("C")
+@export
 fun __mem_index_of_f128(hay: f128[], needle: f128[]): i64 #{
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
@@ -1302,6 +1389,7 @@ fun __mem_index_of_f128(hay: f128[], needle: f128[]): i64 #{
 // pattern array (bit pattern preserved: NaN payloads survive).
 @internal
 @extern("C")
+@export
 fun __mem_fill_f16(buf: f16[], pattern: f16[]): void #{
     if (buf_len == 0 || pattern_len == 0) return;
     const uint16_t p = pattern_data[0];
@@ -1310,6 +1398,7 @@ fun __mem_fill_f16(buf: f16[], pattern: f16[]): void #{
 // Reverses the f16[] buffer in place.
 @internal
 @extern("C")
+@export
 fun __mem_reverse_f16(buf: f16[]): void #{
     size_t i = 0;
     size_t j = buf_len;
@@ -1325,6 +1414,7 @@ fun __mem_reverse_f16(buf: f16[]): void #{
 // windows of the same buffer behave as if taken out first, then written).
 @internal
 @extern("C")
+@export
 fun __mem_copy_f16(dst: f16[], dst_at: usize, src: f16[], src_at: usize, count: usize): void #{
     if (count == 0) return;
     if (dst_at > dst_len || count > dst_len - dst_at) {
@@ -1350,6 +1440,7 @@ fun __mem_copy_f16(dst: f16[], dst_at: usize, src: f16[], src_at: usize, count: 
 
 @internal
 @extern("C")
+@export
 fun __mem_compare_f16(a: f16[], b: f16[]): i32 #{
 #define FROND_H2F(h, outf) do { \
     uint32_t sgn_ = (uint32_t)((h) >> 15); \
@@ -1381,6 +1472,7 @@ fun __mem_compare_f16(a: f16[], b: f16[]): i32 #{
 // NaN never equals anything, -0.0 == 0.0).
 @internal
 @extern("C")
+@export
 fun __mem_index_of_f16(hay: f16[], needle: f16[]): i64 #{
 #define FROND_H2F(h, outf) do { \
     uint32_t sgn_ = (uint32_t)((h) >> 15); \

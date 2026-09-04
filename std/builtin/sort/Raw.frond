@@ -17,6 +17,7 @@
 // some permutation, never UB (no library qsort involved).
 @internal
 @extern("C")
+@export
 fun __sort_i8(buf: i8[]): void #{
     if (buf_len < 2) return;
     size_t n = buf_len;
@@ -47,6 +48,7 @@ fun __sort_i8(buf: i8[]): void #{
 // some permutation, never UB (no library qsort involved).
 @internal
 @extern("C")
+@export
 fun __sort_i16(buf: i16[]): void #{
     if (buf_len < 2) return;
     size_t n = buf_len;
@@ -77,6 +79,7 @@ fun __sort_i16(buf: i16[]): void #{
 // some permutation, never UB (no library qsort involved).
 @internal
 @extern("C")
+@export
 fun __sort_i32(buf: i32[]): void #{
     if (buf_len < 2) return;
     size_t n = buf_len;
@@ -107,6 +110,7 @@ fun __sort_i32(buf: i32[]): void #{
 // some permutation, never UB (no library qsort involved).
 @internal
 @extern("C")
+@export
 fun __sort_i64(buf: i64[]): void #{
     if (buf_len < 2) return;
     size_t n = buf_len;
@@ -137,6 +141,7 @@ fun __sort_i64(buf: i64[]): void #{
 // some permutation, never UB (no library qsort involved).
 @internal
 @extern("C")
+@export
 fun __sort_u16(buf: u16[]): void #{
     if (buf_len < 2) return;
     size_t n = buf_len;
@@ -167,6 +172,7 @@ fun __sort_u16(buf: u16[]): void #{
 // some permutation, never UB (no library qsort involved).
 @internal
 @extern("C")
+@export
 fun __sort_u32(buf: u32[]): void #{
     if (buf_len < 2) return;
     size_t n = buf_len;
@@ -197,6 +203,7 @@ fun __sort_u32(buf: u32[]): void #{
 // some permutation, never UB (no library qsort involved).
 @internal
 @extern("C")
+@export
 fun __sort_u64(buf: u64[]): void #{
     if (buf_len < 2) return;
     size_t n = buf_len;
@@ -227,6 +234,7 @@ fun __sort_u64(buf: u64[]): void #{
 // some permutation, never UB (no library qsort involved).
 @internal
 @extern("C")
+@export
 fun __sort_isize(buf: isize[]): void #{
     if (buf_len < 2) return;
     size_t n = buf_len;
@@ -257,6 +265,7 @@ fun __sort_isize(buf: isize[]): void #{
 // some permutation, never UB (no library qsort involved).
 @internal
 @extern("C")
+@export
 fun __sort_usize(buf: usize[]): void #{
     if (buf_len < 2) return;
     size_t n = buf_len;
@@ -287,6 +296,7 @@ fun __sort_usize(buf: usize[]): void #{
 // some permutation, never UB (no library qsort involved).
 @internal
 @extern("C")
+@export
 fun __sort_f32(buf: f32[]): void #{
     if (buf_len < 2) return;
     size_t n = buf_len;
@@ -317,6 +327,7 @@ fun __sort_f32(buf: f32[]): void #{
 // some permutation, never UB (no library qsort involved).
 @internal
 @extern("C")
+@export
 fun __sort_f64(buf: f64[]): void #{
     if (buf_len < 2) return;
     size_t n = buf_len;
@@ -348,6 +359,7 @@ fun __sort_f64(buf: f64[]): void #{
 // In-place heapsort over the bool[] buffer (ascending, unstable).
 @internal
 @extern("C")
+@export
 fun __sort_bool(buf: bool[]): void #{
     if (buf_len < 2) return;
     size_t n = buf_len;
@@ -376,6 +388,7 @@ fun __sort_bool(buf: bool[]): void #{
 // In-place heapsort over the char[] buffer (ascending, unstable).
 @internal
 @extern("C")
+@export
 fun __sort_char(buf: char[]): void #{
     if (buf_len < 2) return;
     size_t n = buf_len;
@@ -407,6 +420,7 @@ fun __sort_char(buf: char[]): void #{
 // i128: signed high word, unsigned low word (two's complement pair order).
 @internal
 @extern("C")
+@export
 fun __sort_i128(buf: i128[]): void #{
 #define S_I128_GT(AH, AL, BH, BL) (((int64_t)(AH)) > ((int64_t)(BH)) || ((AH) == (BH) && (AL) > (BL)))
 #define S_I128_GE(AH, AL, BH, BL) (((int64_t)(AH)) > ((int64_t)(BH)) || ((AH) == (BH) && (AL) >= (BL)))
@@ -440,6 +454,7 @@ fun __sort_i128(buf: i128[]): void #{
 // u128: pure unsigned pair order.
 @internal
 @extern("C")
+@export
 fun __sort_u128(buf: u128[]): void #{
 #define S_U128_GT(AH, AL, BH, BL) ((AH) > (BH) || ((AH) == (BH) && (AL) > (BL)))
 #define S_U128_GE(AH, AL, BH, BL) ((AH) > (BH) || ((AH) == (BH) && (AL) >= (BL)))
@@ -475,6 +490,7 @@ fun __sort_u128(buf: u128[]): void #{
 // only yields some permutation, never UB in this self-contained heapsort).
 @internal
 @extern("C")
+@export
 fun __sort_f16(buf: f16[]): void #{
 #define S_F16V(h, outf) do { \
     uint32_t sgn_ = (uint32_t)((h) >> 15); \
@@ -535,6 +551,7 @@ fun __sort_f16(buf: f16[]): void #{
 // uint64 lo/hi pairs (first word = low).
 @internal
 @extern("C")
+@export
 fun __sort_f128(buf: f128[]): void #{
 #define S_F128_KH(HI, LO) (((HI) >> 63) ? ~(HI) : ((HI) | 0x8000000000000000ULL))
 #define S_F128_KL(HI, LO) (((HI) >> 63) ? ~(LO) : (LO))

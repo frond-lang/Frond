@@ -14,7 +14,7 @@ import std.collections.List
 import std.collections.Map
 import std.core.types.Str
 import syntax.Ast
-import sema.Data
+import sema.Data.{new_err_path}
 import sema.Envs.{new_enva}
 
 pub type SemaRes = SemaRes(

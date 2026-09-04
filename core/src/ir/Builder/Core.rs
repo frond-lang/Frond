@@ -1617,12 +1617,20 @@ impl<'a> IrBuilder<'a> {
         for m in &all_modules {
             let module_path = crate::sema::Sema::module_logical_path(m.name);
             for d in &m.declarations {
-                if let crate::ast::Ast::Decl::FunDecl { name, params, is_async, attributes, .. } = &d.node {
+                if let crate::ast::Ast::Decl::FunDecl { name, params, is_async, attributes, visibility, .. } = &d.node {
                     // @internal registry: bare names of stdlib implementation
                     // primitives, consulted by `internal_access_blocked` in
                     // BOTH resolution paths (externs are skipped as subgraph
                     // targets below but still land here).
-                    if attributes.iter().any(|a| a.name == crate::ffi::ATTR_INTERNAL) {
+                    if attributes.iter().any(|a| a.name == crate::ffi::ATTR_INTERNAL)
+                        // Phase 2 规则化(2026-09-05):@internal 的语义是
+                        // "用户禁调"——std 层的非 pub 函数天然如此(模块私有,
+                        // 选择性导入绕过可见性时的守卫),逐个打标是历史欠账;
+                        // 现由引擎规则统一覆盖(std 非 pub 一律入表),builtin
+                        // 的显式 @internal 保留(语义相同的声明位形态)。
+                        || (m.name.starts_with("std/")
+                            && !matches!(visibility, crate::ast::Ast::Visibility::Public))
+                    {
                         self.internal_funcs.insert(name.to_string());
                     }
                     // Skip @extern("C") functions: they are only called via FFI and need no subgraph

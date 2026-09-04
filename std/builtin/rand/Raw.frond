@@ -6,6 +6,7 @@
 
 @internal
 @extern("C")
+@export
 fun __rand_step(state: u64): u64 #{
     uint64_t x = state;
     x ^= x >> 12;

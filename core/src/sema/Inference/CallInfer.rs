@@ -39,6 +39,35 @@ impl<'a> InferContext<'a> {
                         }
                     }
                 }
+                // ── S2b+ 调用位专属诊断:callee 裸名在环境/函数表/构造器
+                // 表/模块尾段全 miss 时,报 undefined function(值引用位仍
+                // undefined variable);命中任一注册表则放行,归属导引文案
+                // 由 infer_ident 的升级诊断负责 ──
+                if let Expr::Ident(name) = &ast.expr(*callee).node {
+                    let in_env = self.sema_result.env.lookup(env, name).is_some();
+                    let in_fns = self.sema_result.func_sig_owners.get(&**name)
+                        .is_some_and(|o| !o.is_empty());
+                    let in_ctors = !self.sema_result.get_ctor_defs(&**name).is_empty();
+                    let in_mods = self.sema_result.module_envs.keys().any(|k| {
+                        k.rsplit('.').next() == Some(name.as_ref())
+                    });
+                    // 方法体内放行:裸调可能是隐式 this 方法(方法糖的自由
+                    // 函数回落形态,/),由后续分派路径
+                    // 处理;真未知名由 Ident 位诊断兜底(traits 家族实证)。
+                    let in_method = self.current_this_type().is_some();
+                    if !in_env && !in_fns && !in_ctors && !in_mods && !in_method {
+                        let span = ast.expr(expr).span;
+                        self.add_error_at(
+                            &format!("undefined function '{}'", name),
+                            span.line,
+                            span.column,
+                        );
+                        for &a in args.iter() {
+                            let _ = self.infer_expr(a, ast, env, None);
+                        }
+                        return self.arena.make(Type::Unknown);
+                    }
+                }
                 // ── Constructor multi-mapping disambiguation ──
                 // When callee is an Ident that maps to multiple same-named constructors, disambiguate by priority:
                 //   1. Type-oriented: when expected_ty is an Adt, select by type_name
