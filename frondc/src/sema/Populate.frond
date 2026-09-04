@@ -13,12 +13,12 @@ import std.collections.List
 import std.collections.Map
 import std.core.types.Str
 import syntax.Ast
-import types.Arena
+import types.Arena.{adt_parts, array_parts, async_value, atomic_elem, channel_elem, detail_of, fn_parts, foreign_fn_ret, generic_parts, lazy_value, make, make_adt, make_array, make_async, make_atomic, make_channel, make_fn, make_foreign_fn, make_generic, make_lazy, make_nullable, make_receiver, make_record, make_ref, make_sender, make_throw, make_trait, nullable_inner, receiver_elem, record_fields, ref_parts, resolve, sender_elem, thr_parts, trait_parts}
 import std.os.Proc
 import types.Ty
 
-import sema.Data
-import sema.Semares
+import sema.Data.{new_err, new_err_path}
+import sema.Semares.{canonical_type_key, dynamic_type_id, get_trait_def, get_type_def, list_has_str, list_remove_str, put_func_sig, put_trait_def, put_type_def, record_module_import, resolve_trait_key, resolve_trait_key_in, resolve_type_key, resolve_type_key_in, tail_seg, trait_parent_closure, type_def_has, type_def_idx}
 
 // ─── 名字工具 ─────────────────────────────────────────────────────
 
@@ -61,9 +61,9 @@ fun first_seg_before_lt(s: str): str {
 pub fun type_handle_name_matches(a: TypeArena, h: u32, name: str): bool {
     val t = Arena.get(a, h)
     match t {
-        TAdt(id) => { (Arena.adt_parts(a, h)).a == name }
-        TGeneric(id) => { (Arena.generic_parts(a, h)).a == name }
-        TTrait(id) => { (Arena.trait_parts(a, h)).a == name }
+        TAdt(id) => { (adt_parts(a, h)).a == name }
+        TGeneric(id) => { (generic_parts(a, h)).a == name }
+        TTrait(id) => { (trait_parts(a, h)).a == name }
         _ => { ty_source_name(t) == name }
     }
 }
@@ -193,11 +193,11 @@ pub fun substitute_named_adts_free(a: TypeArena, ty: u32, pairs: List<PairStrH>)
 }
 
 fun subst_inner(a: TypeArena, ty: u32, pairs: List<PairStrH>): u32 {
-    val resolved = Arena.resolve(a, ty)
+    val resolved = resolve(a, ty)
     val t = Arena.get(a, resolved)
     match t {
         TAdt(_) => {
-            val parts = Arena.adt_parts(a, resolved)
+            val parts = adt_parts(a, resolved)
             var i: usize = 0
             while i < pairs.len() {
                 val p = pairs.get(i) ?? PairStrH("", 0)
@@ -212,20 +212,20 @@ fun subst_inner(a: TypeArena, ty: u32, pairs: List<PairStrH>): u32 {
             new_args = new_args ++ [subst_inner(a, parts.b[k], pairs)]
                 k = k + 1
             }
-            Arena.make_adt(a, parts.a, new_args)
+            make_adt(a, parts.a, new_args)
         },
         TFn(_) => {
-            val parts = Arena.fn_parts(a, resolved)
+            val parts = fn_parts(a, resolved)
             var ps: u32[] = []
             var k: usize = 0
             while k < parts.ps.len() {
             ps = ps ++ [subst_inner(a, parts.ps[k], pairs)]
                 k = k + 1
             }
-            Arena.make_fn(a, ps, subst_inner(a, parts.ret, pairs))
+            make_fn(a, ps, subst_inner(a, parts.ret, pairs))
         },
         TRecord(_) => {
-            val fields = Arena.record_fields(a, resolved)
+            val fields = record_fields(a, resolved)
             val name = record_name_of(a, resolved)
             var out: FT[] = []
             var k: usize = 0
@@ -234,63 +234,63 @@ fun subst_inner(a: TypeArena, ty: u32, pairs: List<PairStrH>): u32 {
                 out = out ++ [FT(f.name, subst_inner(a, f.ty, pairs))]
                 k = k + 1
             }
-            Arena.make_record(a, out, name)
+            make_record(a, out, name)
         },
         TNullable(_) => {
-            Arena.make_nullable(a, subst_inner(a, Arena.nullable_inner(a, resolved), pairs))
+            make_nullable(a, subst_inner(a, nullable_inner(a, resolved), pairs))
         },
         TGeneric(_) => {
-            val parts = Arena.generic_parts(a, resolved)
+            val parts = generic_parts(a, resolved)
             var new_args: u32[] = []
             var k: usize = 0
             while k < parts.b.len() {
             new_args = new_args ++ [subst_inner(a, parts.b[k], pairs)]
                 k = k + 1
             }
-            Arena.make_generic(a, parts.a, new_args)
+            make_generic(a, parts.a, new_args)
         },
         TArray(_) => {
-            val parts = Arena.array_parts(a, resolved)
-            Arena.make_array(a, subst_inner(a, parts.a, pairs), parts.b)
+            val parts = array_parts(a, resolved)
+            make_array(a, subst_inner(a, parts.a, pairs), parts.b)
         },
         TThrow(_) => {
-            val parts = Arena.thr_parts(a, resolved)
-            Arena.make_throw(a, subst_inner(a, parts.a, pairs), subst_inner(a, parts.b, pairs))
+            val parts = thr_parts(a, resolved)
+            make_throw(a, subst_inner(a, parts.a, pairs), subst_inner(a, parts.b, pairs))
         },
         TTrait(_) => {
-            val parts = Arena.trait_parts(a, resolved)
+            val parts = trait_parts(a, resolved)
             var new_args: u32[] = []
             var k: usize = 0
             while k < parts.b.len() {
             new_args = new_args ++ [subst_inner(a, parts.b[k], pairs)]
                 k = k + 1
             }
-            Arena.make_trait(a, parts.a, new_args)
+            make_trait(a, parts.a, new_args)
         },
         TRef(_) => {
-            val parts = Arena.ref_parts(a, resolved)
-            Arena.make_ref(a, subst_inner(a, parts.a, pairs), parts.b)
+            val parts = ref_parts(a, resolved)
+            make_ref(a, subst_inner(a, parts.a, pairs), parts.b)
         },
         TChannel(_) => {
-            Arena.make_channel(a, subst_inner(a, Arena.channel_elem(a, resolved), pairs))
+            make_channel(a, subst_inner(a, channel_elem(a, resolved), pairs))
         },
         TAsync(_) => {
-            Arena.make_async(a, subst_inner(a, Arena.async_value(a, resolved), pairs))
+            make_async(a, subst_inner(a, async_value(a, resolved), pairs))
         },
         TLazy(_) => {
-            Arena.make_lazy(a, subst_inner(a, Arena.lazy_value(a, resolved), pairs))
+            make_lazy(a, subst_inner(a, lazy_value(a, resolved), pairs))
         },
         TAtomic(_) => {
-            Arena.make_atomic(a, subst_inner(a, Arena.atomic_elem(a, resolved), pairs))
+            make_atomic(a, subst_inner(a, atomic_elem(a, resolved), pairs))
         },
         TSender(_) => {
-            Arena.make_sender(a, subst_inner(a, Arena.sender_elem(a, resolved), pairs))
+            make_sender(a, subst_inner(a, sender_elem(a, resolved), pairs))
         },
         TReceiver(_) => {
-            Arena.make_receiver(a, subst_inner(a, Arena.receiver_elem(a, resolved), pairs))
+            make_receiver(a, subst_inner(a, receiver_elem(a, resolved), pairs))
         },
         TForeignFn(_) => {
-            Arena.make_foreign_fn(a, subst_inner(a, Arena.foreign_fn_ret(a, resolved), pairs))
+            make_foreign_fn(a, subst_inner(a, foreign_fn_ret(a, resolved), pairs))
         },
         // 标量/Never/Unknown/Void/Null/TraitObject/ModuleRef 无子节点 → 原样。
         _ => { resolved }
@@ -298,7 +298,7 @@ fun subst_inner(a: TypeArena, ty: u32, pairs: List<PairStrH>): u32 {
 }
 
 fun record_name_of(a: TypeArena, h: u32): str? {
-    match Arena.detail_of(a, detail_id_of_ty(Arena.get(a, h))) {
+    match detail_of(a, detail_id_of_ty(Arena.get(a, h))) {
         DRecord(_, name) => { name }
         _ => { null }
     }
@@ -346,39 +346,39 @@ pub fun concretize_type(a: TypeArena, s: SemaRes, type_ref: i64, type_args: u32[
                 i = i + 1
             }
             if name == "Throw" && resolved.len() == 2 {
-                Arena.make_throw(a, resolved[0], resolved[1])
+                make_throw(a, resolved[0], resolved[1])
             } else if name == "Channel" && resolved.len() == 1 {
-                Arena.make_channel(a, resolved[0])
+                make_channel(a, resolved[0])
             } else if name == "Async" && resolved.len() == 1 {
-                Arena.make_async(a, resolved[0])
+                make_async(a, resolved[0])
             } else if name == "Lazy" && resolved.len() == 1 {
-                Arena.make_lazy(a, resolved[0])
+                make_lazy(a, resolved[0])
             } else if name == "Atomic" && resolved.len() == 1 {
-                Arena.make_atomic(a, resolved[0])
+                make_atomic(a, resolved[0])
             } else if name == "Sender" && resolved.len() == 1 {
-                Arena.make_sender(a, resolved[0])
+                make_sender(a, resolved[0])
             } else if name == "Receiver" && resolved.len() == 1 {
-                Arena.make_receiver(a, resolved[0])
+                make_receiver(a, resolved[0])
             } else if name == "ForeignFn" && resolved.len() == 1 {
-                Arena.make_foreign_fn(a, resolved[0])
+                make_foreign_fn(a, resolved[0])
             } else {
                 match from_type_name_full(name) {
-                    null => { Arena.make_generic(a, name, []) }
-                    t => { Arena.make(a, t) }
+                    null => { make_generic(a, name, []) }
+                    t => { make(a, t) }
                 }
             }
         },
         TNullable(inner) => {
-            Arena.make_nullable(a, concretize_type(a, s, inner, type_args, ast))
+            make_nullable(a, concretize_type(a, s, inner, type_args, ast))
         },
         TRef(inner) => {
-            Arena.make_ref(a, concretize_type(a, s, inner, type_args, ast), false)
+            make_ref(a, concretize_type(a, s, inner, type_args, ast), false)
         },
         TRawPtr(inner) => {
-            Arena.make_ref(a, concretize_type(a, s, inner, type_args, ast), true)
+            make_ref(a, concretize_type(a, s, inner, type_args, ast), true)
         },
         TRecord(_) => {
-            Arena.make_record(a, [], null)
+            make_record(a, [], null)
         },
         TFunction(params, rt) => {
             var ps: u32[] = []
@@ -387,10 +387,10 @@ pub fun concretize_type(a: TypeArena, s: SemaRes, type_ref: i64, type_args: u32[
             ps = ps ++ [concretize_type(a, s, params[i], type_args, ast)]
                 i = i + 1
             }
-            Arena.make_fn(a, ps, concretize_type(a, s, rt, type_args, ast))
+            make_fn(a, ps, concretize_type(a, s, rt, type_args, ast))
         },
         TArray(elem, size) => {
-            Arena.make_array(a, concretize_type(a, s, elem, type_args, ast), size)
+            make_array(a, concretize_type(a, s, elem, type_args, ast), size)
         },
         TThis => {
             // This 以 detail 名为 "This" 的 Adt 存储,须 detail 感知匹配
@@ -402,7 +402,7 @@ pub fun concretize_type(a: TypeArena, s: SemaRes, type_ref: i64, type_args: u32[
                 }
                 i = i + 1
             }
-            Arena.make_adt(a, "This", [])
+            make_adt(a, "This", [])
         },
         TKindAnn(inner, _) => {
             concretize_type(a, s, inner, type_args, ast)
@@ -424,33 +424,33 @@ fun resolve_named_type_resolved(a: TypeArena, name: str, type_args: u32[], s: Se
     match from_type_name_full(name) {
         null => {}
         t => {
-            return Arena.make(a, t)
+            return make(a, t)
         }
     }
-    val canonical = Semares.resolve_type_key(s, name)
-    if Semares.list_has_str(visiting, canonical) {
-        return Arena.make_adt(a, canonical, [])
+    val canonical = resolve_type_key(s, name)
+    if list_has_str(visiting, canonical) {
+        return make_adt(a, canonical, [])
     }
     if visiting.len() >= 256 {
-        return Arena.make_adt(a, canonical, [])
+        return make_adt(a, canonical, [])
     }
     visiting.push(canonical)
     var inner_ty: u32? = null
     var target_key: str? = null
-    match Semares.get_type_def(s, canonical) {
+    match get_type_def(s, canonical) {
         null => {}
         td => {
             inner_ty = td.target_type
             target_key = match td.target_type_name {
                 null => null
-                n0 => Semares.resolve_type_key(s, n0)
+                n0 => resolve_type_key(s, n0)
             }
         },
     }
     match inner_ty {
         null => {}
         h => {
-            Semares.list_remove_str(visiting, canonical)
+            list_remove_str(visiting, canonical)
             return h
         },
     }
@@ -458,12 +458,12 @@ fun resolve_named_type_resolved(a: TypeArena, name: str, type_args: u32[], s: Se
         null => {}
         ttn => {
             val result = resolve_named_type_resolved(a, ttn, type_args, s, visiting)
-            Semares.list_remove_str(visiting, canonical)
+            list_remove_str(visiting, canonical)
             return result
         },
     }
-    Semares.list_remove_str(visiting, canonical)
-    Arena.make_adt(a, canonical, [])
+    list_remove_str(visiting, canonical)
+    make_adt(a, canonical, [])
 }
 
 // ─── 参数解析(resolve_param_type)──────────────────────────────────
@@ -472,7 +472,7 @@ pub type ParamInfo = ParamInfo(pub ty: u32, pub is_ref: bool, pub name: str?, pu
 
 pub fun resolve_param_type(a: TypeArena, param: Prm, ast: AstArena, s: SemaRes): ParamInfo {
     match param.ta {
-        null => { ParamInfo(Arena.make_adt(a, "param", []), false, null, TRNamed("unknown")) }
+        null => { ParamInfo(make_adt(a, "param", []), false, null, TRNamed("unknown")) }
         tr => {
             val node = (ast.ty(tr)).node
             var is_ref = false
@@ -506,7 +506,7 @@ pub fun ast_fun_decl_to_func_sig(a: TypeArena, s: SemaRes, name: str, tps: Tp[],
     var return_ty: u32 = 0
     var throwing = false
     match return_type {
-        null => { return_ty = Arena.make(a, TVoid) }
+        null => { return_ty = make(a, TVoid) }
         rt => {
             return_ty = concretize_type(a, s, rt, [], ast)
             throwing = is_throw_type((ast.ty(rt)).node)
@@ -522,7 +522,7 @@ pub fun ast_fun_decl_to_func_sig(a: TypeArena, s: SemaRes, name: str, tps: Tp[],
             }
         },
     }
-    Semares.put_func_sig(s, FSig(name, module_name, tp_names, return_ty, pir, return_is_ref, is_async, throwing))
+    put_func_sig(s, FSig(name, module_name, tp_names, return_ty, pir, return_is_ref, is_async, throwing))
 }
 
 // ─── method → MethodSigInfo ───────────────────────────────────────
@@ -558,7 +558,7 @@ pub fun build_method_sig_info(a: TypeArena, s: SemaRes, m: Md, ast: AstArena): M
     }
     val delegate: str? = match m.delegate {
         null => null
-        d => Semares.resolve_trait_key(s, d.trait_name)
+        d => resolve_trait_key(s, d.trait_name)
     }
     var pubness = m.vis == Pub
     if m.is_override || m.delegate != null {
@@ -570,8 +570,8 @@ pub fun build_method_sig_info(a: TypeArena, s: SemaRes, m: Md, ast: AstArena): M
 // 方法入 TDef.methods(按名幂等追加)。
 pub fun ast_method_to_func_sig(a: TypeArena, s: SemaRes, type_name: str, m: Md, ast: AstArena): bool {
     val sig = build_method_sig_info(a, s, m, ast)
-    val canonical = Semares.resolve_type_key(s, type_name)
-    match Semares.type_def_idx(s, canonical) {
+    val canonical = resolve_type_key(s, type_name)
+    match type_def_idx(s, canonical) {
         null => { false }
         type_idx => {
             match s.type_defs.get(type_idx as usize) {
@@ -596,13 +596,13 @@ pub fun ast_method_to_func_sig(a: TypeArena, s: SemaRes, type_name: str, m: Md, 
 
 pub fun ast_trait_decl_to_trait_def(a: TypeArena, s: SemaRes, name: str, parents: Tb[],
     methods: Md[], ast: AstArena, def_module: str): bool {
-    val canonical_name = Semares.canonical_type_key(def_module, name)
+    val canonical_name = canonical_type_key(def_module, name)
     var parent_names: str[] = []
     var i: usize = 0
     while i < parents.len() {
-        val pn = Semares.resolve_trait_key_in(s, def_module, parents[i].trait_name)
+        val pn = resolve_trait_key_in(s, def_module, parents[i].trait_name)
         if pn == canonical_name {
-            Semares.add_error(s, Data.new_err("trait '{canonical_name}' cannot inherit from itself", 0, 1))
+            Semares.add_error(s, new_err("trait '{canonical_name}' cannot inherit from itself", 0, 1))
             i = i + 1
             continue
         }
@@ -618,13 +618,13 @@ pub fun ast_trait_decl_to_trait_def(a: TypeArena, s: SemaRes, name: str, parents
             i = i + 1
             continue
         }
-        if Semares.get_trait_def(s, pn) == null {
-            Semares.add_error(s, Data.new_err(
+        if get_trait_def(s, pn) == null {
+            Semares.add_error(s, new_err(
                 "trait '{canonical_name}' parent '{pn}' is not a known trait (parents must be declared before the child)", 0, 1))
             i = i + 1
             continue
         }
-        val closure = Semares.trait_parent_closure(s, pn)
+        val closure = trait_parent_closure(s, pn)
         var cyc = false
         k = 0
         while k < closure.len() {
@@ -634,7 +634,7 @@ pub fun ast_trait_decl_to_trait_def(a: TypeArena, s: SemaRes, name: str, parents
             k = k + 1
         }
         if cyc {
-            Semares.add_error(s, Data.new_err("cyclic trait inheritance: '{pn}' already inherits from '{canonical_name}'", 0, 1))
+            Semares.add_error(s, new_err("cyclic trait inheritance: '{pn}' already inherits from '{canonical_name}'", 0, 1))
             i = i + 1
             continue
         }
@@ -645,7 +645,7 @@ pub fun ast_trait_decl_to_trait_def(a: TypeArena, s: SemaRes, name: str, parents
     i = 0
     while i < methods.len() {
         val m = methods[i]
-        var rt: u32 = Arena.make(a, TVoid)
+        var rt: u32 = make(a, TVoid)
         match m.rt {
             null => {}
             r => { rt = concretize_type(a, s, r, [], ast) }
@@ -653,7 +653,7 @@ pub fun ast_trait_decl_to_trait_def(a: TypeArena, s: SemaRes, name: str, parents
         msigs = msigs ++ [TMS(m.name, m.params.len() as i64, rt, m.is_async, m.body != null)]
         i = i + 1
     }
-    Semares.put_trait_def(s, TTDef(canonical_name, parent_names, msigs))
+    put_trait_def(s, TTDef(canonical_name, parent_names, msigs))
 }
 
 // ─── ctor 转换 ────────────────────────────────────────────────────
@@ -701,10 +701,10 @@ fun merge_base_fields_into_ctor(ctor: Ctor, base_fields: List<BaseField>, s: Sem
     var i: usize = 0
     while i < base_fields.len() {
         val bf = base_fields.get(i) ?? BaseField("", 0, false, TRNamed(""))
-        if !Semares.list_has_str(seen, bf.name) {
+        if !list_has_str(seen, bf.name) {
             seen.push(bf.name)
         } else {
-            Semares.add_error(s, Data.new_err_path(
+            Semares.add_error(s, new_err_path(
                 "inherited field name collision: '{bf.name}' appears in more than one base", def_module, def_span.line, def_span.column))
         }
         i = i + 1
@@ -714,10 +714,10 @@ fun merge_base_fields_into_ctor(ctor: Ctor, base_fields: List<BaseField>, s: Sem
         match ctor.field_names[i] {
             null => {}
             n => {
-                if !Semares.list_has_str(seen, n) {
+                if !list_has_str(seen, n) {
                     seen.push(n)
                 } else {
-                    Semares.add_error(s, Data.new_err_path(
+                    Semares.add_error(s, new_err_path(
                         "field '{n}' collides with an inherited base field", def_module, def_span.line, def_span.column))
                 }
             },
@@ -785,13 +785,13 @@ pub type BaseField = BaseField(pub name: str, pub ty: u32, pub is_pub: bool, pub
 
 // 传递祖先名(含直接;自体排除;环安全)。
 fun collect_ancestor_names(s: SemaRes, type_name: str, out: List<str>): void {
-    match Semares.get_type_def(s, type_name) {
+    match get_type_def(s, type_name) {
         null => {}
         def => {
             var i: usize = 0
             while i < def.bases.len() {
                 val b = def.bases[i]
-                if !Semares.list_has_str(out, b) {
+                if !list_has_str(out, b) {
                     out.push(b)
                     collect_ancestor_names(s, b, out)
                 }
@@ -805,7 +805,7 @@ fun collect_ancestor_names(s: SemaRes, type_name: str, out: List<str>): void {
 
 pub fun ast_type_decl_to_type_def(a: TypeArena, s: SemaRes, name: str, tps: Tp[],
     base_types: Tb[], def: TypeD, ast: AstArena, def_span: Span, def_module: str): bool {
-    val canonical_name = Semares.canonical_type_key(def_module, name)
+    val canonical_name = canonical_type_key(def_module, name)
     var tp_names: str[] = []
     var i: usize = 0
     while i < tps.len() {
@@ -818,17 +818,17 @@ pub fun ast_type_decl_to_type_def(a: TypeArena, s: SemaRes, name: str, tps: Tp[]
     val base_fields = List.empty<BaseField>()
     val base_all_flat = List.empty<Ctor>()
     val base_set_lens = List.empty<i64>()
-    val already_registered = Semares.type_def_has(s, canonical_name)
+    val already_registered = type_def_has(s, canonical_name)
     var bidx: usize = 0
     val base_limit: usize = if already_registered { 0 } else { base_types.len() }
     while bidx < base_limit {
         val b = base_types[bidx]
-        val bname = Semares.resolve_type_key_in(s, def_module, b.trait_name)
+        val bname = resolve_type_key_in(s, def_module, b.trait_name)
         var base_kind: TDK = TAlias
         var base_params: str[] = []
         var base_all_ctors: Ctor[] = []
         var found = false
-        match Semares.get_type_def(s, bname) {
+        match get_type_def(s, bname) {
             null => {}
             d => {
                 base_kind = d.kind
@@ -842,7 +842,7 @@ pub fun ast_type_decl_to_type_def(a: TypeArena, s: SemaRes, name: str, tps: Tp[]
             },
         }
         if !found {
-            Semares.add_error(s, Data.new_err_path(
+            Semares.add_error(s, new_err_path(
                 "inheritance base '{bname}' is not a known type (bases must be declared before the child)",
                 def_module, def_span.line, def_span.column))
             bidx = bidx + 1
@@ -855,7 +855,7 @@ pub fun ast_type_decl_to_type_def(a: TypeArena, s: SemaRes, name: str, tps: Tp[]
             _ => {}
         }
         if !admissible {
-            Semares.add_error(s, Data.new_err_path(
+            Semares.add_error(s, new_err_path(
                 "inheritance base '{bname}' must be a record or ADT (newtype/alias bases are rejected)",
                 def_module, def_span.line, def_span.column))
             bidx = bidx + 1
@@ -872,15 +872,15 @@ pub fun ast_type_decl_to_type_def(a: TypeArena, s: SemaRes, name: str, tps: Tp[]
         }
         k = 0
         while k < base_names.len() {
-            if Semares.list_has_str(chain, base_names[k]) {
-                Semares.add_error(s, Data.new_err_path(
+            if list_has_str(chain, base_names[k]) {
+                Semares.add_error(s, new_err_path(
                     "diamond inheritance forbidden: base '{base_names[k]}' is a transitive ancestor of base '{bname}'",
                     def_module, def_span.line, def_span.column))
             }
             k = k + 1
         }
-        if Semares.list_has_str(earlier_chain, bname) {
-            Semares.add_error(s, Data.new_err_path(
+        if list_has_str(earlier_chain, bname) {
+            Semares.add_error(s, new_err_path(
                 "diamond inheritance forbidden: base '{bname}' is a transitive ancestor of an earlier base",
                 def_module, def_span.line, def_span.column))
         }
@@ -950,7 +950,7 @@ pub fun ast_type_decl_to_type_def(a: TypeArena, s: SemaRes, name: str, tps: Tp[]
     match def {
         AdtD(ctor_defs) => {
             if base_names.len() > 0 && ctor_defs.len() > 1 {
-                Semares.add_error(s, Data.new_err_path(
+                Semares.add_error(s, new_err_path(
                     "inheritance on a multi-constructor ADT is not supported (ADT children may not add constructors)",
                     def_module, def_span.line, def_span.column))
             }
@@ -970,7 +970,7 @@ pub fun ast_type_decl_to_type_def(a: TypeArena, s: SemaRes, name: str, tps: Tp[]
             }
             if multi_ctor_base {
                 if ctors.len() != 1 || ctor_defs[0].fields.len() != 0 {
-                    Semares.add_error(s, Data.new_err_path(
+                    Semares.add_error(s, new_err_path(
                         "a multi-constructor ADT base requires the zero-field child form '= Child() \{ ... \}' (no own fields, no added constructors)",
                         def_module, def_span.line, def_span.column))
                 }
@@ -983,7 +983,7 @@ pub fun ast_type_decl_to_type_def(a: TypeArena, s: SemaRes, name: str, tps: Tp[]
             } else if ctors.len() == 1 && base_fields.len() > 0 {
                 merge_base_fields_into_ctor(ctors[0], base_fields, s, def_span, def_module)
             }
-            Semares.put_type_def(s, TDef(canonical_name, TAdt, ctors, tp_names,
+            put_type_def(s, TDef(canonical_name, TAdt, ctors, tp_names,
                 null, null, [], base_names), def_module)
         },
         RecordD(fields) => {
@@ -991,33 +991,33 @@ pub fun ast_type_decl_to_type_def(a: TypeArena, s: SemaRes, name: str, tps: Tp[]
             if base_fields.len() > 0 {
                 merge_base_fields_into_ctor(ctor, base_fields, s, def_span, def_module)
             }
-            Semares.put_type_def(s, TDef(canonical_name, TRecord, [ctor], tp_names,
+            put_type_def(s, TDef(canonical_name, TRecord, [ctor], tp_names,
                 null, null, [], base_names), def_module)
         },
         AliasD(target) => {
             var placeholder_args: u32[] = []
             var k: usize = 0
             while k < tp_names.len() {
-                placeholder_args = placeholder_args ++ [Arena.make_adt(a, tp_names[k], [])]
+                placeholder_args = placeholder_args ++ [make_adt(a, tp_names[k], [])]
                 k = k + 1
             }
             val target_ty = concretize_type(a, s, target, placeholder_args, ast)
             val ttn_branch: str? = match type_name_from_node(ast, target) {
                 null => null
-                n0 => Semares.resolve_type_key_in(s, def_module, n0)
+                n0 => resolve_type_key_in(s, def_module, n0)
             }
-            Semares.put_type_def(s, TDef(canonical_name, TAlias, [], tp_names,
+            put_type_def(s, TDef(canonical_name, TAlias, [], tp_names,
                 ttn_branch, target_ty, [], base_names), def_module)
         },
         NewtypeD(nt_name, inner) => {
             val target_ty = concretize_type(a, s, inner, [], ast)
             val ttn_branch: str? = match type_name_from_node(ast, inner) {
                 null => null
-                n0 => Semares.resolve_type_key_in(s, def_module, n0)
+                n0 => resolve_type_key_in(s, def_module, n0)
             }
             val target_repr = type_node_to_repr(ast, (ast.ty(inner)).node)
             val ctor = Ctor(nt_name, canonical_name, ["_0"], [target_ty], [true], true, null, null, [target_repr], def_span, def_module)
-            Semares.put_type_def(s, TDef(canonical_name, TNewtype, [ctor], tp_names,
+            put_type_def(s, TDef(canonical_name, TNewtype, [ctor], tp_names,
                 ttn_branch, target_ty, [], base_names), def_module)
         },
     }
@@ -1088,7 +1088,7 @@ pub fun collect_module_type_names(m: ModuleAst): List<str> {
     while i < m.decls.len() {
         match m.decls[i].decl {
             TypeDeclD(_, name, _, _, _, _, _) => {
-                if !Semares.list_has_str(out, name) {
+                if !list_has_str(out, name) {
                     out.push(name)
                 }
             },
@@ -1105,7 +1105,7 @@ pub fun collect_module_trait_names(m: ModuleAst): List<str> {
     while i < m.decls.len() {
         match m.decls[i].decl {
             TraitDeclD(_, name, _, _, _, _) => {
-                if !Semares.list_has_str(out, name) {
+                if !list_has_str(out, name) {
                     out.push(name)
                 }
             },
@@ -1137,7 +1137,7 @@ fun inheritance_bound_repr_pairs(b: Tb, base_params: str[], child_ast: AstArena)
 
 // 在候选模块里按裸名找类型声明,取 methods[src_idx]。
 fun find_method_decl(mods: List<ModuleAst>, src_type: str, src_idx: i64): MethodDeclHit? {
-    val bare = Semares.tail_seg(src_type)
+    val bare = tail_seg(src_type)
     var i: usize = 0
     while i < mods.len() {
         val m = mods.get(i) ?? mods.get(0)
@@ -1180,7 +1180,7 @@ pub fun expand_inherited_methods(m: ModuleAst, all_modules: List<ModuleAst>, a: 
             di = di + 1
             continue
         }
-        val canonical_name = Semares.resolve_type_key(s, decl_name)
+        val canonical_name = resolve_type_key(s, decl_name)
         var already = false
         var ii: usize = 0
         while ii < s.inherited_method_instances.len() {
@@ -1194,7 +1194,7 @@ pub fun expand_inherited_methods(m: ModuleAst, all_modules: List<ModuleAst>, a: 
             di = di + 1
             continue
         }
-        match Semares.type_def_idx(s, canonical_name) {
+        match type_def_idx(s, canonical_name) {
             null => { di = di + 1; continue }
             child_idx => {
                 // 本类型声明自身的有体方法数(own 前缀判定)。
@@ -1279,16 +1279,16 @@ pub fun expand_inherited_methods(m: ModuleAst, all_modules: List<ModuleAst>, a: 
                                 continue
                             }
                             val base_ast_method_count: i64 = base_methods.len() as i64
-                            val bname = Semares.resolve_type_key(s, b.trait_name)
+                            val bname = resolve_type_key(s, b.trait_name)
                             var base_table_len: usize = 0
-                            match Semares.get_type_def(s, bname) {
+                            match get_type_def(s, bname) {
                                 null => {}
                                 d => { base_table_len = d.methods.len() }
                             }
                             var table_idx: usize = 0
                             while table_idx < base_table_len {
                                 var m_name = ""
-                                match Semares.get_type_def(s, bname) {
+                                match get_type_def(s, bname) {
                                     null => {}
                                     d => {
                                         if table_idx < d.methods.len() {
@@ -1348,7 +1348,7 @@ pub fun expand_inherited_methods(m: ModuleAst, all_modules: List<ModuleAst>, a: 
                                             null => {}
                                             prev => {
                                                 if prev != "__pending__" && prev != bname {
-                                                    Semares.add_error(s, Data.new_err_path(
+                                                    Semares.add_error(s, new_err_path(
                                                         "ambiguous inherited method '{m_name}': offered by bases '{prev}' and '{bname}' — override it in '{decl_name}' to disambiguate",
                                                         m.name, sd.span.line, sd.span.column))
                                                 }
@@ -1370,14 +1370,14 @@ pub fun expand_inherited_methods(m: ModuleAst, all_modules: List<ModuleAst>, a: 
                                     null => {}
                                     hd => {
                                         ast_method_to_func_sig(a, s, decl_name, hd.method, hd.module.arena)
-                                        match Semares.get_type_def(s, decl_name) {
+                                        match get_type_def(s, decl_name) {
                                             null => {}
                                             child_now => {
                                                 val method_idx = child_now.methods.len() as i64 - 1
                                                 // pinned-arg 替换:子绑定的 base 形参
                                                 // → 实参 repr。
                                                 var base_sig_params: str[] = []
-                                                match Semares.get_type_def(s, bname) {
+                                                match get_type_def(s, bname) {
                                                     null => {}
                                                     d => { base_sig_params = d.type_params }
                                                 }
@@ -1396,7 +1396,7 @@ pub fun expand_inherited_methods(m: ModuleAst, all_modules: List<ModuleAst>, a: 
                                                         }
                                                     }
                                                 }
-                                                s.inherited_method_instances.push(InhI(Semares.dynamic_type_id(child_idx), canonical_name, method_idx, hd.module.name, src_type, src_idx))
+                                                s.inherited_method_instances.push(InhI(dynamic_type_id(child_idx), canonical_name, method_idx, hd.module.name, src_type, src_idx))
                                             },
                                         }
                                     },
@@ -1424,7 +1424,7 @@ pub fun populate_module(a: TypeArena, s: SemaRes, m: ModuleAst, all_modules: Lis
         match m.decls[i].decl {
             ImportDeclD(path, _, _) => {
                 if path.len() > 0 {
-                    Semares.record_module_import(s, m.name, Semares.str_join(path, "."))
+                    record_module_import(s, m.name, Semares.str_join(path, "."))
                 }
             },
             _ => {}
@@ -1439,9 +1439,9 @@ pub fun populate_module(a: TypeArena, s: SemaRes, m: ModuleAst, all_modules: Lis
         val sd = m.decls[i]
         match sd.decl {
             TraitDeclD(_, name, _, _, _, _) => {
-                if Semares.list_has_str(declared_traits, name) {
+                if list_has_str(declared_traits, name) {
                     Semares.add_error(s, new_err_path(
-                        "duplicate trait definition: '{Semares.canonical_type_key(m.name, name)}'",
+                        "duplicate trait definition: '{canonical_type_key(m.name, name)}'",
                         m.name, sd.span.line, sd.span.column))
                     ok = false
                     i = i + 1
@@ -1453,9 +1453,9 @@ pub fun populate_module(a: TypeArena, s: SemaRes, m: ModuleAst, all_modules: Lis
         }
         match sd.decl {
             TypeDeclD(_, name, _, _, _, _, _) => {
-                if Semares.list_has_str(declared_types, name) {
+                if list_has_str(declared_types, name) {
                     Semares.add_error(s, new_err_path(
-                        "duplicate type definition: '{Semares.canonical_type_key(m.name, name)}'",
+                        "duplicate type definition: '{canonical_type_key(m.name, name)}'",
                         m.name, sd.span.line, sd.span.column))
                     ok = false
                     i = i + 1

@@ -2,7 +2,7 @@
 // sema_prepipeline + Inference/Core.rs check_module_with_env 的镜像。
 //
 // 片4b:populate → alias 环/ctor 重名检查 → 状态复位 → import 处理 →
-// predeclare → witness 填充 → **真实体推断(Infer.check_decl)** → kind
+// predeclare → witness 填充 → **真实体推断(check_decl)** → kind
 // 检查 → solver 定点 + 9.1 歧义上报 + 9.2 挂起重试 + 9.4 未绑默认 void。
 // monomorph 实例收集(第 8 步)属片5:引擎侧该步只写 resolved_types/
 // call_instantiations 等(不进 HM 错误面),跳过无行为差异。
@@ -11,18 +11,18 @@ import std.collections.List
 import std.collections.Map
 import std.core.types.Str
 import syntax.Ast
-import types.Arena
+import types.Arena.{bind_var, display, make, resolve, tvars_len}
 import types.Ty
 
-import sema.Data
+import sema.Data.{new_err}
 import sema.Envs
-import sema.Semares
-import sema.Ictx
-import sema.Populate
-import sema.Modenv
-import sema.Relate
-import sema.Infer
-import sema.Mono
+import sema.Semares.{get_type_def, list_has_str, module_logical_path, put_type_def, type_def_has}
+import sema.Ictx.{reset_state}
+import sema.Populate.{populate_module}
+import sema.Modenv.{populate_witness_table, predeclare_declarations, process_import_decls}
+import sema.Relate.{check_type_node}
+import sema.Infer.{check_decl, infer_expr, solver_solve}
+import sema.Mono.{collect_monomorph_instances, collect_trait_default_instances, validate_trait_inheritance, validate_trait_method_bindings}
 
 // ─── check_alias_cycles(Bug#80)────────────────────────────────────
 
@@ -53,7 +53,7 @@ pub fun check_alias_cycles(s: SemaRes): void {
                 match current {
                     null => { go = false }
                     target_name => {
-                        if Semares.list_has_str(visiting, target_name) {
+                        if list_has_str(visiting, target_name) {
                             chain.push(target_name)
                             // 环起点 = 链中该名首现。
                             var start: usize = 0
@@ -72,13 +72,13 @@ pub fun check_alias_cycles(s: SemaRes): void {
                                 q = q + 1
                             }
                             val cycle_path = Semares.str_join(segs, " -> ")
-                            if !Semares.list_has_str(reported, cycle_path) {
+                            if !list_has_str(reported, cycle_path) {
                                 reported.push(cycle_path)
                                 to_report.push(cycle_path)
                             }
                             go = false
                         } else {
-                            match Semares.get_type_def(s, target_name) {
+                            match get_type_def(s, target_name) {
                                 null => { go = false }
                                 t => {
                                     if t.kind == TAlias {
@@ -100,7 +100,7 @@ pub fun check_alias_cycles(s: SemaRes): void {
     }
     i = 0
     while i < to_report.len() {
-        Semares.add_error(s, Data.new_err("cyclic type alias: {to_report.get(i)}", 0, 0))
+        Semares.add_error(s, new_err("cyclic type alias: {to_report.get(i)}", 0, 0))
         i = i + 1
     }
 }
@@ -123,11 +123,11 @@ pub fun check_duplicate_ctor_fields(s: SemaRes): void {
                 match ctor.field_names[fi] {
                     null => {}
                     fname => {
-                        if !Semares.list_has_str(seen, fname) {
+                        if !list_has_str(seen, fname) {
                             seen.push(fname)
                         } else {
                             val key = fname + "\u{0}" + ctor.name
-                            if !Semares.list_has_str(reported, key) {
+                            if !list_has_str(reported, key) {
                                 reported.push(key)
                                 new_errors.push("duplicate field '{fname}' in constructor {ctor.name}")
                             }
@@ -142,7 +142,7 @@ pub fun check_duplicate_ctor_fields(s: SemaRes): void {
     }
     i = 0
     while i < new_errors.len() {
-        Semares.add_error(s, Data.new_err(new_errors.get(i) ?? "", 0, 0))
+        Semares.add_error(s, new_err(new_errors.get(i) ?? "", 0, 0))
         i = i + 1
     }
 }
@@ -161,10 +161,10 @@ fun bsig(name: str, param_reprs: TR[], return_repr: TR?, intrinsic: IK?): MSig {
 }
 
 fun reg_builtin_type(s: SemaRes, type_name: str, type_params: str[], methods: MSig[]): void {
-    if Semares.type_def_has(s, type_name) {
+    if type_def_has(s, type_name) {
         return
     }
-    Semares.put_type_def(s, TDef(type_name, TAlias, [], type_params, null, null, methods, []), "")
+    put_type_def(s, TDef(type_name, TAlias, [], type_params, null, null, methods, []), "")
 }
 
 pub fun register_builtin_method_sigs(s: SemaRes): void {
@@ -225,13 +225,13 @@ pub fun run_kind_checks(s: SemaRes, m: ModuleAst): void {
                 while pi < params.len() {
                     match params[pi].ta {
                         null => {}
-                        ta => { Relate.check_type_node(s, m.arena, ta, no_params, errors) }
+                        ta => { check_type_node(s, m.arena, ta, no_params, errors) }
                     }
                     pi = pi + 1
                 }
                 match return_type {
                     null => {}
-                    rt => { Relate.check_type_node(s, m.arena, rt, no_params, errors) }
+                    rt => { check_type_node(s, m.arena, rt, no_params, errors) }
                 }
             },
             TypeDeclD(_, _, _, _, _, AdtD(constructors), _) => {
@@ -240,12 +240,12 @@ pub fun run_kind_checks(s: SemaRes, m: ModuleAst): void {
                     val ctor = constructors[ci]
                     var fi: usize = 0
                     while fi < ctor.fields.len() {
-                        Relate.check_type_node(s, m.arena, ctor.fields[fi].ty, no_params, errors)
+                        check_type_node(s, m.arena, ctor.fields[fi].ty, no_params, errors)
                         fi = fi + 1
                     }
                     match ctor.return_type {
                         null => {}
-                        rt => { Relate.check_type_node(s, m.arena, rt, no_params, errors) }
+                        rt => { check_type_node(s, m.arena, rt, no_params, errors) }
                     }
                     ci = ci + 1
                 }
@@ -266,24 +266,24 @@ pub fun run_kind_checks(s: SemaRes, m: ModuleAst): void {
 pub fun check_module_with_env(ctx: ICtx, a: TypeArena, s: SemaRes,
     m: ModuleAst, root_env: u32, all_modules: List<ModuleAst>): void {
     // 1. populate(幂等)。
-    Populate.populate_module(a, s, m, all_modules)
+    populate_module(a, s, m, all_modules)
     // 1b/1d. alias 环 + ctor 字段重名(增量化水位)。
     check_alias_cycles(s)
     check_duplicate_ctor_fields(s)
     s.checks_scan_base = s.type_defs.len()
     // 2. 状态复位 + 模块上下文 + tvars 基线(诊断只计本模块新增)。
-    Ictx.reset_state(ctx)
+    reset_state(ctx)
     ctx.current_module_env = null
-    ctx.current_module_logical_path = Semares.module_logical_path(m.name)
+    ctx.current_module_logical_path = module_logical_path(m.name)
     ctx.current_module_name = m.name
     s.current_module_name = m.name
-    val type_vars_baseline = Arena.tvars_len(a)
+    val type_vars_baseline = tvars_len(a)
     // 3. import 处理。
-    Modenv.process_import_decls(ctx, a, s, m, root_env)
+    process_import_decls(ctx, a, s, m, root_env)
     // 4. predeclare(幂等;含泛型签名绑定)。
-    Modenv.predeclare_declarations(ctx, a, s, m, root_env)
+    predeclare_declarations(ctx, a, s, m, root_env)
     // 5. witness 填充。
-    Modenv.populate_witness_table(ctx, s, m)
+    populate_witness_table(ctx, s, m)
     // builtin 合成类型注册是 collect_monomorph_instances 的第一步,
     // types 节依赖它,无条件先落。
     register_builtin_method_sigs(s)
@@ -292,24 +292,24 @@ pub fun check_module_with_env(ctx: ICtx, a: TypeArena, s: SemaRes,
     var di: usize = 0
     while di < m.decls.len() {
         val sd = m.decls[di]
-        Infer.check_decl(ctx, a, s, sd.decl, sd.span, m.arena, check_env)
+        check_decl(ctx, a, s, sd.decl, sd.span, m.arena, check_env)
         di = di + 1
     }
     // 7. kind 检查。
     run_kind_checks(s, m)
     // 8. monomorph 实例收集(泛型调用点 → 实例集 + 实例化重放)。
-    Mono.collect_monomorph_instances(a, s, m, all_modules)
+    collect_monomorph_instances(a, s, m, all_modules)
     // 9. 求解定点 + 9.1 歧义上报(仅 "ambiguous" 理由)。
-    Infer.solver_solve(ctx, a)
+    solver_solve(ctx, a)
     {
         var ei: usize = 0
         while ei < ctx.solver.errors.len() {
             val ce = ctx.solver.errors.get(ei) ?? CErr(0, 0, "")
             if Str.contains(ce.reason, "ambiguous") {
-                val r1 = Arena.resolve(a, ce.t1)
-                val r2 = Arena.resolve(a, ce.t2)
+                val r1 = resolve(a, ce.t1)
+                val r2 = resolve(a, ce.t2)
                 Semares.add_error(s, new_err(
-                    "type mismatch: {Arena.display(a, r1)} does not unify with {Arena.display(a, r2)} ({ce.reason})",
+                    "type mismatch: {display(a, r1)} does not unify with {display(a, r2)} ({ce.reason})",
                     0, 0))
             }
             ei = ei + 1
@@ -329,7 +329,7 @@ pub fun check_module_with_env(ctx: ICtx, a: TypeArena, s: SemaRes,
                 var i: usize = 0
                 while i < deferred.len() {
                     val d = deferred.get(i) ?? DCall(0, 0)
-                    val _t = Infer.infer_expr(ctx, a, s, d.expr, m.arena, d.env, null)
+                    val _t = infer_expr(ctx, a, s, d.expr, m.arena, d.env, null)
                     i = i + 1
                 }
             }
@@ -338,14 +338,14 @@ pub fun check_module_with_env(ctx: ICtx, a: TypeArena, s: SemaRes,
     }
     // 9.4 未绑非 rigid TypeVar 默认 void(ML 默认化;非错误回退)。
     {
-        val void_ty = Arena.make(a, TVoid)
+        val void_ty = make(a, TVoid)
         var i: usize = type_vars_baseline
-        while i < Arena.tvars_len(a) {
+        while i < tvars_len(a) {
             match a.tvars.get(i) {
                 null => {}
                 tv => {
                     if !tv.is_rigid && tv.bound == null {
-                        Arena.bind_var(a, i as u32, void_ty)
+                        bind_var(a, i as u32, void_ty)
                     }
                 },
             }
@@ -356,7 +356,7 @@ pub fun check_module_with_env(ctx: ICtx, a: TypeArena, s: SemaRes,
     {
         var count: i64 = 0
         var i: usize = type_vars_baseline
-        while i < Arena.tvars_len(a) {
+        while i < tvars_len(a) {
             match a.tvars.get(i) {
                 null => {}
                 tv => {
@@ -372,7 +372,7 @@ pub fun check_module_with_env(ctx: ICtx, a: TypeArena, s: SemaRes,
         }
     }
     // 10a. trait 方法绑定/继承验证 + trait 默认实例收集(依赖见证表)。
-    Mono.validate_trait_method_bindings(a, s, m)
-    Mono.validate_trait_inheritance(a, s, m)
-    Mono.collect_trait_default_instances(a, s, m)
+    validate_trait_method_bindings(a, s, m)
+    validate_trait_inheritance(a, s, m)
+    collect_trait_default_instances(a, s, m)
 }

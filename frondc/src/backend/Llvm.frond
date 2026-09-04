@@ -1,11 +1,13 @@
 // backend/Llvm.frond — frondc 后端的 LLVM C API 绑定(Stage 2)。
-// libs/llvm/Llvm.frond 的副本 + build_sub/build_mul;两处手工同步
-// (绑定面收敛为资产内单一来源是后续项)。
+// 单一来源(2026-09-04 裁决删除 libs/llvm 模板:零 import 消费者、
+// 三副本发散、val 参数名 bug 潜伏数日无人发现);llvm_bind/llvm_probe
+// 测试仍持各自副本,随引擎验收演进。
 //
 // v1 形态:句柄一律裸 u64,API 全自由函数(lib 为首参)。
-// 不用 record 封装的原因:record 字段读出的 u64 是软类型值,FFI marshal
-// 的 as_i64 只认硬 tag(display/== 正常、call 收 0)——引擎洞,修复后再
-// 引入 Context/Module 包装。
+// 裸 u64 形态保留原因(历史注记更正 2026-09-04):曾因"record 字段读回
+// 软类型值,FFI marshal 只认硬 tag"禁 record 封装——该洞已被引擎治好
+// (handleprobe 实证:单字段/混合家族/嵌套/List 装载的 record 字段读回
+// 值过 LLVMTypeOf 全绿);裸形态纯属简洁,非性能或正确性约束。
 //
 // 其余约定:
 // - const char* 参数走 cstr 原子(单槽 NUL 结尾);缓冲/出参走 cbuf;
@@ -68,8 +70,9 @@ pub fun read_cstr(lib: Lib, ptr: u64): Throw<str, FfiError> {
 }
 
 // ── target 初始化(重复调用幂等)───────────────────────────────────
-// 注:展开显式符号名而非 for-iter 拼接 —— 迭代器元素参与 str 拼接经
-// lookup 时会被判非 str(疑似引擎软类型洞,已立案),展开写法直白且稳。
+// 注:曾展开显式符号名规避"迭代器元素 str 拼接经 lookup 判非 str"的
+// 疑似洞——已实证不成立(2026-09-04 handleprobe:迭代拼接名过 lookup+
+// call 全绿);保留展开写法仅为直白。
 
 fun init_one(lib: Lib, name: str): Throw<void, FfiError> {
     val f: ForeignFn<void> = lib.lookup(name, "")?
@@ -501,6 +504,41 @@ pub fun run_passes(lib: Lib, module: u64, passes: str, tm: u64): Throw<void, Ffi
         throw FfiError(CallFailed, "LLVMRunPasses('{passes}') failed: {msg}")
     }
     Ok(void)
+}
+
+// ── 控制流 + 调用(Stage 2 切片 1)────────────────────────────────
+
+pub fun void_type(lib: Lib, ctx: u64): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMVoidTypeInContext", "u64")?
+    f.call(ctx)
+}
+
+pub fun build_cond_br(lib: Lib, builder: u64, cond: u64, then_blk: u64, else_blk: u64): Throw<void, FfiError> {
+    val f: ForeignFn<void> = lib.lookup("LLVMBuildCondBr", "u64, u64, u64, u64")?
+    f.call(builder, cond, then_blk, else_blk)
+}
+
+pub fun build_br(lib: Lib, builder: u64, blk: u64): Throw<void, FfiError> {
+    val f: ForeignFn<void> = lib.lookup("LLVMBuildBr", "u64, u64")?
+    f.call(builder, blk)
+}
+
+// 两个分支都终止后的空 merge 块需要终结指令,否则 verifier 拒绝。
+pub fun build_unreachable(lib: Lib, builder: u64): Throw<void, FfiError> {
+    val f: ForeignFn<void> = lib.lookup("LLVMBuildUnreachable", "u64")?
+    f.call(builder)
+}
+
+// LLVMBuildCall2(opaque pointers 必须带 fn 类型);args 走 cbuf 整体编组。
+pub fun build_call2(lib: Lib, builder: u64, fn_ty: u64, fn_ref: u64, args: u64[], name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildCall2", "u64, u64, u64, cbuf, u32, cstr")?
+    f.call(builder, fn_ty, fn_ref, args, args.len() as u32, name)
+}
+
+// 零参变体(空 u64[] 不能按 cbuf 编组,元素类型无从判定;NULL 合法)。
+pub fun build_call2_0(lib: Lib, builder: u64, fn_ty: u64, fn_ref: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildCall2", "u64, u64, u64, u64, u32, cstr")?
+    f.call(builder, fn_ty, fn_ref, 0u64, 0u32, name)
 }
 
 // ── TargetMachine ──────────────────────────────────────────────────

@@ -7,7 +7,7 @@
 // `frond debug --stage ast` 逐字节一致(见 tests/scripts/diff_ast.sh)。
 
 import std.collections.List
-import syntax.Lex
+import syntax.Lex.{AmpAmp, AmpEq, Ampersand, At, Bang, BangEq, Caret, CaretEq, CharLiteral, Colon, Comma, Dot, DotDot, DotDotEq, Ellipsis, Eof, EqEq, EqGt, Err, FalseLiteral, FloatLiteral, GtGt, GtGtEq, Identifier, IntLiteral, KwAs, KwAsync, KwAtomic, KwBreak, KwChannel, KwContinue, KwDefer, KwElse, KwFor, KwFun, KwIf, KwImport, KwIn, KwLazy, KwLoop, KwMatch, KwOverride, KwPack, KwPub, KwReturn, KwSelect, KwSuper, KwThis, KwThrow, KwTrait, KwType, KwVal, KwVar, KwWhile, LBrace, LBracket, LParen, LtLt, LtLtEq, Minus, MinusEq, MinusGt, NullLiteral, Percent, PercentEq, Pipe, PipeEq, PipePipe, Plus, PlusEq, PlusPlus, Question, QuestionDot, QuestionQuestion, RBrace, RBracket, RParen, RawBlock, Slash, SlashEq, Star, StarEq, StringLiteral, Tilde, TrueLiteral, tokenize}
 import syntax.Ast
 
 pub type PErr = PErr(pub line: i64, pub column: i64, pub message: str)
@@ -31,30 +31,30 @@ val MIN_PREC: i64 = ELVIS_PREC
 type OpMap = OpMap(tok: TokKind, op: BOp, prec: i64, deref_check: bool, right_assoc: bool)
 
 val BOPS: OpMap[] = [
-    OpMap(Lex.QuestionQuestion, ElvisOp, ELVIS_PREC, false, true),
-    OpMap(Lex.PipePipe, Or, OR_PREC, false, false),
-    OpMap(Lex.AmpAmp, And, AND_PREC, false, false),
-    OpMap(Lex.Pipe, BitOr, BIT_OR_PREC, false, false),
-    OpMap(Lex.Caret, BitXor, BIT_XOR_PREC, false, false),
-    OpMap(Lex.Ampersand, BitAnd, BIT_AND_PREC, false, false),
-    OpMap(Lex.LtLt, Shl, SHIFT_PREC, false, false),
-    OpMap(Lex.GtGt, Shr, SHIFT_PREC, false, false),
-    OpMap(Lex.EqEq, Eq, EQUALITY_PREC, false, false),
-    OpMap(Lex.BangEq, Neq, EQUALITY_PREC, false, false),
+    OpMap(QuestionQuestion, ElvisOp, ELVIS_PREC, false, true),
+    OpMap(PipePipe, Or, OR_PREC, false, false),
+    OpMap(AmpAmp, And, AND_PREC, false, false),
+    OpMap(Pipe, BitOr, BIT_OR_PREC, false, false),
+    OpMap(Caret, BitXor, BIT_XOR_PREC, false, false),
+    OpMap(Ampersand, BitAnd, BIT_AND_PREC, false, false),
+    OpMap(LtLt, Shl, SHIFT_PREC, false, false),
+    OpMap(GtGt, Shr, SHIFT_PREC, false, false),
+    OpMap(EqEq, Eq, EQUALITY_PREC, false, false),
+    OpMap(BangEq, Neq, EQUALITY_PREC, false, false),
     OpMap(Lex.RefEq, RefEq, EQUALITY_PREC, false, false),
     OpMap(Lex.RefNeq, RefNeq, EQUALITY_PREC, false, false),
     OpMap(Lex.Lt, Lt, COMPARISON_PREC, false, false),
     OpMap(Lex.Gt, Gt, COMPARISON_PREC, false, false),
     OpMap(Lex.LtEq, LtEq, COMPARISON_PREC, false, false),
     OpMap(Lex.GtEq, GtEq, COMPARISON_PREC, false, false),
-    OpMap(Lex.DotDot, Range, RANGE_PREC, false, false),
-    OpMap(Lex.DotDotEq, RangeIncl, RANGE_PREC, false, false),
-    OpMap(Lex.Plus, Add, ADDITION_PREC, false, false),
-    OpMap(Lex.PlusPlus, ConcatList, ADDITION_PREC, false, false),
-    OpMap(Lex.Minus, Sub, ADDITION_PREC, false, false),
-    OpMap(Lex.Star, Mul, MULTIPLICATION_PREC, true, false),
-    OpMap(Lex.Slash, Div, MULTIPLICATION_PREC, false, false),
-    OpMap(Lex.Percent, Mod, MULTIPLICATION_PREC, false, false),
+    OpMap(DotDot, Range, RANGE_PREC, false, false),
+    OpMap(DotDotEq, RangeIncl, RANGE_PREC, false, false),
+    OpMap(Plus, Add, ADDITION_PREC, false, false),
+    OpMap(PlusPlus, ConcatList, ADDITION_PREC, false, false),
+    OpMap(Minus, Sub, ADDITION_PREC, false, false),
+    OpMap(Star, Mul, MULTIPLICATION_PREC, true, false),
+    OpMap(Slash, Div, MULTIPLICATION_PREC, false, false),
+    OpMap(Percent, Mod, MULTIPLICATION_PREC, false, false),
 ]
 
 fun lookup_binary_op(k: TokKind): OpMap? {
@@ -347,7 +347,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun previous(): Tk { tok_at(current - 1) }
 
-    fun is_at_end(): bool { peek().kind == Lex.Eof }
+    fun is_at_end(): bool { peek().kind == Eof }
 
     fun &advance(): Tk {
         if pending_eq {
@@ -396,7 +396,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     }
 
     fun check_identifier(name: str): bool {
-        peek().kind == Lex.Identifier && lexeme_of(peek()) == name
+        peek().kind == Identifier && lexeme_of(peek()) == name
     }
 
     fun check_close_angle(): bool {
@@ -407,7 +407,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
             return false
         }
         val k = tok_at(current).kind
-        k == Lex.Gt || k == Lex.GtEq || k == Lex.GtGt || k == Lex.GtGtEq
+        k == Lex.Gt || k == Lex.GtEq || k == GtGt || k == GtGtEq
     }
 
     fun &expect_close_angle(message: str): Throw<void, PErr> {
@@ -427,12 +427,12 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
                 pending_eq = true
                 return Ok(void)
             }
-            if k == Lex.GtGt {
+            if k == GtGt {
                 current = current + 1
                 pending_gt = true
                 return Ok(void)
             }
-            if k == Lex.GtGtEq {
+            if k == GtGtEq {
                 current = current + 1
                 pending_gt_eq = true
                 return Ok(void)
@@ -457,7 +457,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     }
 
     fun &reject_paren_condition(kw_name: str): Throw<void, PErr> {
-        if check(Lex.LParen) && paren_wraps_full_condition() {
+        if check(LParen) && paren_wraps_full_condition() {
             report_error("parentheses are not allowed around the " + kw_name + " condition")?
         }
         Ok(void)
@@ -465,15 +465,15 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun paren_wraps_full_condition(): bool {
         var i: i64 = current
-        if i >= n() || tok_at(i).kind != Lex.LParen {
+        if i >= n() || tok_at(i).kind != LParen {
             return false
         }
         var depth: i64 = 0
         while i < n() {
             val k = tok_at(i).kind
-            if k == Lex.LParen {
+            if k == LParen {
                 depth = depth + 1
-            } else if k == Lex.RParen {
+            } else if k == RParen {
                 depth = depth - 1
                 if depth == 0 {
                     val next = i + 1
@@ -485,9 +485,9 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
                         return false
                     }
                     // 后缀续接(字段/索引/as)=接收者分组,非条件包裹。
-                    return !(nk == Lex.Dot || nk == Lex.LBracket || nk == Lex.KwAs)
+                    return !(nk == Dot || nk == LBracket || nk == KwAs)
                 }
-            } else if k == Lex.Eof {
+            } else if k == Eof {
                 return false
             }
             i = i + 1
@@ -498,11 +498,11 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     fun &synchronize(): void {
         while !is_at_end() {
             val k = peek().kind
-            if k == Lex.KwFun || k == Lex.KwType || k == Lex.KwTrait || k == Lex.KwImport
-                || k == Lex.KwPack || k == Lex.KwPub || k == Lex.KwVal || k == Lex.KwVar {
+            if k == KwFun || k == KwType || k == KwTrait || k == KwImport
+                || k == KwPack || k == KwPub || k == KwVal || k == KwVar {
                 break
             }
-            if k == Lex.RBrace {
+            if k == RBrace {
                 advance()
                 break
             }
@@ -516,8 +516,8 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
         val decls = List.empty()
         while !is_at_end() {
             val k = peek().kind
-            val at_decl_kw = k == Lex.KwFun || k == Lex.KwType || k == Lex.KwTrait
-                || k == Lex.KwImport || k == Lex.KwPack || k == Lex.KwPub || k == Lex.At
+            val at_decl_kw = k == KwFun || k == KwType || k == KwTrait
+                || k == KwImport || k == KwPack || k == KwPub || k == At
             val d = try_parse_decl()
             match d {
                 null => {}
@@ -571,34 +571,34 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_attributes(): Attr[] {
         val attrs = List.empty()
-        while check(Lex.At) {
+        while check(At) {
             advance()
-            val name_tok = match expect(Lex.Identifier, "expected attribute name") {
+            val name_tok = match expect(Identifier, "expected attribute name") {
                 Ok(t) => t
                 Error(_) => break
             }
             val args = List.empty()
-            if check(Lex.LParen) {
+            if check(LParen) {
                 advance()
-                while !check(Lex.RParen) && !is_at_end() {
-                    if check(Lex.StringLiteral) {
+                while !check(RParen) && !is_at_end() {
+                    if check(StringLiteral) {
                         val lex = lexeme_of(advance())
                         if lex.len() >= 2 {
                             args.push((lex.bytes()[1 as usize..(lex.len() - 1) as usize]) as str)
                         } else {
                             args.push(lex)
                         }
-                    } else if check(Lex.Identifier) {
+                    } else if check(Identifier) {
                         args.push(lexeme_of(advance()))
                     } else {
                         advance()
                     }
-                    if check(Lex.Comma) {
+                    if check(Comma) {
                         advance()
                     }
                 }
-                expect(Lex.RParen, "expected ')' after attribute args")?
-            } else if check(Lex.StringLiteral) {
+                expect(RParen, "expected ')' after attribute args")?
+            } else if check(StringLiteral) {
                 val lex = lexeme_of(advance())
                 if lex.len() >= 2 {
                     args.push((lex.bytes()[1 as usize..(lex.len() - 1) as usize]) as str)
@@ -614,52 +614,52 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     fun &try_parse_decl(): Sd? {
         val saved = current
         val attributes = parse_attributes()
-        if attributes.len() > 0 && !check(Lex.KwPub) && !check(Lex.KwAsync) && !check(Lex.KwFun) {
+        if attributes.len() > 0 && !check(KwPub) && !check(KwAsync) && !check(KwFun) {
             current = saved
             return null
         }
         var visibility = Priv
-        if match_token(Lex.KwPub) {
+        if match_token(KwPub) {
             visibility = Pub
         }
         var is_async = false
-        if match_token(Lex.KwAsync) {
-            if !check(Lex.KwFun) {
+        if match_token(KwAsync) {
+            if !check(KwFun) {
                 return null
             }
             is_async = true
         }
-        if check(Lex.KwFun) {
+        if check(KwFun) {
             match parse_fun_decl(visibility, is_async, attributes) {
                 Ok(d) => return d
                 Error(_) => return null
             }
         }
-        if check(Lex.KwType) {
+        if check(KwType) {
             match parse_type_decl(visibility) {
                 Ok(d) => return d
                 Error(_) => return null
             }
         }
-        if check(Lex.KwTrait) {
+        if check(KwTrait) {
             match parse_trait_decl(visibility) {
                 Ok(d) => return d
                 Error(_) => return null
             }
         }
-        if check(Lex.KwImport) {
+        if check(KwImport) {
             match parse_use_decl(visibility) {
                 Ok(d) => return d
                 Error(_) => return null
             }
         }
-        if check(Lex.KwPack) {
+        if check(KwPack) {
             match parse_pack_decl(visibility) {
                 Ok(d) => return d
                 Error(_) => return null
             }
         }
-        if visibility == Pub && (check(Lex.KwVal) || check(Lex.KwVar)) {
+        if visibility == Pub && (check(KwVal) || check(KwVar)) {
             match parse_stmt() {
                 Ok(stmt) => {
                     val ss = ast.stmt(stmt)
@@ -680,8 +680,8 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
             current = saved
         }
         val k = peek().kind
-        if k == Lex.KwVal || k == Lex.KwVar || k == Lex.KwFor || k == Lex.KwWhile
-            || k == Lex.KwLoop || k == Lex.KwDefer || k == Lex.KwThrow || k == Lex.KwReturn {
+        if k == KwVal || k == KwVar || k == KwFor || k == KwWhile
+            || k == KwLoop || k == KwDefer || k == KwThrow || k == KwReturn {
             match parse_stmt() {
                 Ok(stmt) => {
                     val span = ast.stmt(stmt).span
@@ -698,26 +698,26 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_fun_decl(visibility: Vis, is_async: bool, attributes: Attr[]): Throw<Sd, PErr> {
         val fun_tok = advance()
-        val name_tok = expect(Lex.Identifier, "expected function name")?
+        val name_tok = expect(Identifier, "expected function name")?
         val type_params = List.empty()
         if match_token(Lex.Lt) {
             parse_type_param_list(type_params)?
             expect_close_angle("expected '>' to close type parameter list")?
         }
         val params = List.empty()
-        expect(Lex.LParen, "expected '(' to start parameter list")?
-        if !check(Lex.RParen) {
+        expect(LParen, "expected '(' to start parameter list")?
+        if !check(RParen) {
             parse_param_list(params)?
         }
-        expect(Lex.RParen, "expected ')' to close parameter list")?
-        val return_type = if match_token(Lex.Colon) {
+        expect(RParen, "expected ')' to close parameter list")?
+        val return_type = if match_token(Colon) {
             parse_type()?
         } else {
             report_error_at(name_tok.line, name_tok.column,
                 "function declaration must explicitly annotate the return type (use ': void' for no return value)")?
             null
         }
-        val extern_c_body = if check(Lex.RawBlock) {
+        val extern_c_body = if check(RawBlock) {
             val tok = advance()
             lexeme_of(tok)
         } else {
@@ -735,7 +735,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_type_decl(visibility: Vis): Throw<Sd, PErr> {
         val type_tok = advance()
-        val name_tok = expect(Lex.Identifier, "expected type name")?
+        val name_tok = expect(Identifier, "expected type name")?
         val type_params = List.empty()
         if match_token(Lex.Lt) {
             parse_type_param_list(type_params)?
@@ -743,28 +743,28 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
         }
         val implemented_traits = List.empty()
         val base_types = List.empty()
-        if match_token(Lex.LParen) {
-            if !check(Lex.RParen) {
+        if match_token(LParen) {
+            if !check(RParen) {
                 parse_trait_bound_list(base_types)?
             }
-            expect(Lex.RParen, "expected ')' to close base type list")?
+            expect(RParen, "expected ')' to close base type list")?
         }
-        if match_token(Lex.Colon) {
-            val has_paren = check(Lex.LParen)
+        if match_token(Colon) {
+            val has_paren = check(LParen)
             if has_paren {
                 advance()
             }
             parse_trait_bound_list(implemented_traits)?
             if has_paren {
-                expect(Lex.RParen, "expected ')' after trait list")?
+                expect(RParen, "expected ')' after trait list")?
             }
         }
         expect(Lex.Eq, "expected '=' to define type body")?
         val def = parse_type_def()?
         val methods = List.empty()
-        if match_token(Lex.LBrace) {
+        if match_token(LBrace) {
             parse_method_block(methods)?
-            expect(Lex.RBrace, "expected '}}' to close method block")?
+            expect(RBrace, "expected '}}' to close method block")?
         }
         Ok(Sd(Span(type_tok.line, type_tok.column),
             TypeDeclD(visibility, lexeme_of(name_tok), type_params.as_array(),
@@ -772,10 +772,10 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     }
 
     fun &parse_type_def(): Throw<TypeD, PErr> {
-        if match_token(Lex.Pipe) {
+        if match_token(Pipe) {
             return parse_adt_body()
         }
-        if check(Lex.LParen) {
+        if check(LParen) {
             val saved = current
             val d = try_parse_record_type_def()
             if d != null {
@@ -783,16 +783,16 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
             }
             current = saved
         }
-        if check(Lex.Identifier) {
+        if check(Identifier) {
             val saved = current
             advance()
-            if check(Lex.LParen) {
+            if check(LParen) {
                 advance()
-                if !check(Lex.RParen) {
+                if !check(RParen) {
                     val saved2 = current
-                    if check(Lex.Identifier) {
+                    if check(Identifier) {
                         advance()
-                        if check(Lex.Colon) {
+                        if check(Colon) {
                             current = saved
                             val d = try_parse_single_ctor_adt()
                             if d != null {
@@ -820,7 +820,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
             current = saved
         }
         val target = parse_type()?
-        if check(Lex.Pipe) {
+        if check(Pipe) {
             report_error("each variant of a sum type must be prefixed with '|', including the first; for example `type Color = | Red | Green`")?
         }
         Ok(AliasD(target))
@@ -828,24 +828,24 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &try_parse_single_ctor_adt(): TypeD? {
         val name_tok = advance()
-        if !check(Lex.LParen) {
+        if !check(LParen) {
             return null
         }
         advance()
-        if check(Lex.RParen) {
+        if check(RParen) {
             advance()
             return AdtD([Cd(lexeme_of(name_tok), [], null)])
         }
-        val name_idx = if check(Lex.KwPub) { current + 1 } else { current }
+        val name_idx = if check(KwPub) { current + 1 } else { current }
         if name_idx + 1 < n()
-            && tok_at(name_idx).kind == Lex.Identifier
-            && tok_at(name_idx + 1).kind == Lex.Colon {
+            && tok_at(name_idx).kind == Identifier
+            && tok_at(name_idx + 1).kind == Colon {
             val fields = List.empty()
             match parse_constructor_field_list(fields) {
                 Ok(_) => {}
                 Error(_) => return null
             }
-            match expect(Lex.RParen, "expected ')'") {
+            match expect(RParen, "expected ')'") {
                 Ok(_) => {}
                 Error(_) => return null
             }
@@ -855,11 +855,11 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
             Ok(t) => t
             Error(_) => return null
         }
-        if check(Lex.Comma) {
+        if check(Comma) {
             val fields = List.empty()
             fields.push(Cfl(null, first_type, false))
-            while match_token(Lex.Comma) {
-                if check(Lex.RParen) {
+            while match_token(Comma) {
+                if check(RParen) {
                     break
                 }
                 val ty = match parse_type() {
@@ -868,13 +868,13 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
                 }
                 fields.push(Cfl(null, ty, false))
             }
-            match expect(Lex.RParen, "expected ')'") {
+            match expect(RParen, "expected ')'") {
                 Ok(_) => {}
                 Error(_) => return null
             }
             return AdtD([Cd(lexeme_of(name_tok), fields.as_array(), null)])
         }
-        match expect(Lex.RParen, "expected ')'") {
+        match expect(RParen, "expected ')'") {
             Ok(_) => {}
             Error(_) => return null
         }
@@ -883,8 +883,8 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &try_parse_record_type_def(): TypeD? {
         advance()
-        if check(Lex.RParen) {
-            val next_is_arrow = current + 1 < n() && tok_at(current + 1).kind == Lex.MinusGt
+        if check(RParen) {
+            val next_is_arrow = current + 1 < n() && tok_at(current + 1).kind == MinusGt
             if !next_is_arrow {
                 advance()
                 return RecordD([])
@@ -892,10 +892,10 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
             return null
         }
         val k = peek().kind
-        if k == Lex.Identifier || k == Lex.KwPub {
-            val is_pub0 = match_token(Lex.KwPub)
+        if k == Identifier || k == KwPub {
+            val is_pub0 = match_token(KwPub)
             val name = advance()
-            if check(Lex.Colon) {
+            if check(Colon) {
                 advance()
                 val ty = match parse_type() {
                     Ok(t) => t
@@ -903,23 +903,23 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
                 }
                 val fields = List.empty()
                 fields.push(Rft(lexeme_of(name), ty, is_pub0))
-                while match_token(Lex.Comma) {
-                    if check(Lex.RParen) {
+                while match_token(Comma) {
+                    if check(RParen) {
                         break
                     }
-                    val f_pub = match_token(Lex.KwPub)
-                    val field_name = match expect(Lex.Identifier, "expected field name") {
+                    val f_pub = match_token(KwPub)
+                    val field_name = match expect(Identifier, "expected field name") {
                         Ok(t) => t
                         Error(_) => return null
                     }
-                    expect(Lex.Colon, "expected ':'")?
+                    expect(Colon, "expected ':'")?
                     val field_ty = match parse_type() {
                         Ok(t) => t
                         Error(_) => return null
                     }
                     fields.push(Rft(lexeme_of(field_name), field_ty, f_pub))
                 }
-                expect(Lex.RParen, "expected ')'")?
+                expect(RParen, "expected ')'")?
                 return RecordD(fields.as_array())
             }
             return null
@@ -930,22 +930,22 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     fun &parse_adt_body(): Throw<TypeD, PErr> {
         val ctors = List.empty()
         ctors.push(parse_constructor_def()?)
-        while match_token(Lex.Pipe) {
+        while match_token(Pipe) {
             ctors.push(parse_constructor_def()?)
         }
         Ok(AdtD(ctors.as_array()))
     }
 
     fun &parse_constructor_def(): Throw<Cd, PErr> {
-        val name_tok = expect(Lex.Identifier, "expected constructor name")?
+        val name_tok = expect(Identifier, "expected constructor name")?
         val fields = List.empty()
-        if match_token(Lex.LParen) {
-            if !check(Lex.RParen) {
+        if match_token(LParen) {
+            if !check(RParen) {
                 parse_constructor_field_list(fields)?
             }
-            expect(Lex.RParen, "expected ')' to close constructor fields")?
+            expect(RParen, "expected ')' to close constructor fields")?
         }
-        val return_type = if match_token(Lex.Colon) {
+        val return_type = if match_token(Colon) {
             parse_type()?
         } else {
             null
@@ -955,8 +955,8 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_constructor_field_list(fields: List<Cfl>): Throw<void, PErr> {
         fields.push(parse_constructor_field()?)
-        while match_token(Lex.Comma) {
-            if check(Lex.RParen) {
+        while match_token(Comma) {
+            if check(RParen) {
                 break
             }
             fields.push(parse_constructor_field()?)
@@ -966,11 +966,11 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_constructor_field(): Throw<Cfl, PErr> {
         val k = peek().kind
-        if k == Lex.Identifier || k == Lex.KwPub {
+        if k == Identifier || k == KwPub {
             val saved = current
-            val is_pub = match_token(Lex.KwPub)
+            val is_pub = match_token(KwPub)
             val name = advance()
-            if match_token(Lex.Colon) {
+            if match_token(Colon) {
                 val ty = parse_type()?
                 return Ok(Cfl(lexeme_of(name), ty, is_pub))
             }
@@ -982,30 +982,30 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_trait_decl(visibility: Vis): Throw<Sd, PErr> {
         val trait_tok = advance()
-        val name_tok = expect(Lex.Identifier, "expected trait name")?
+        val name_tok = expect(Identifier, "expected trait name")?
         val type_params = List.empty()
         if match_token(Lex.Lt) {
             parse_type_param_list(type_params)?
             expect_close_angle("expected '>' to close type parameter list")?
         }
         val parents = List.empty()
-        if match_token(Lex.LParen) {
-            if !check(Lex.RParen) {
+        if match_token(LParen) {
+            if !check(RParen) {
                 parse_trait_bound_list_inner(parents)?
             }
-            expect(Lex.RParen, "expected ')' to close parent trait list")?
+            expect(RParen, "expected ')' to close parent trait list")?
         }
         val associated_types = List.empty()
         val methods = List.empty()
-        expect(Lex.LBrace, "expected '{{' to start trait body")?
-        while !check(Lex.RBrace) && !is_at_end() {
-            if check(Lex.KwType) {
+        expect(LBrace, "expected '{{' to start trait body")?
+        while !check(RBrace) && !is_at_end() {
+            if check(KwType) {
                 associated_types.push(parse_associated_type()?)
             } else {
                 methods.push(parse_method_decl()?)
             }
         }
-        expect(Lex.RBrace, "expected '}}' to close trait body")?
+        expect(RBrace, "expected '}}' to close trait body")?
         Ok(Sd(Span(trait_tok.line, trait_tok.column),
             TraitDeclD(visibility, lexeme_of(name_tok), type_params.as_array(),
                 parents.as_array(), associated_types.as_array(), methods.as_array())))
@@ -1013,8 +1013,8 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_associated_type(): Throw<At, PErr> {
         advance()
-        val name_tok = expect(Lex.Identifier, "expected associated type name")?
-        val kind = if match_token(Lex.Colon) {
+        val name_tok = expect(Identifier, "expected associated type name")?
+        val kind = if match_token(Colon) {
             parse_kind()?
         } else {
             null
@@ -1024,25 +1024,25 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_method_decl(): Throw<Md, PErr> {
         var visibility = Priv
-        if match_token(Lex.KwPub) {
+        if match_token(KwPub) {
             visibility = Pub
         }
-        val is_override = match_token(Lex.KwOverride)
-        val is_async = match_token(Lex.KwAsync)
-        expect(Lex.KwFun, "expected 'fun'")?
-        val is_ref_receiver = match_token(Lex.Ampersand)
-        val name_tok = expect(Lex.Identifier, "expected method name")?
+        val is_override = match_token(KwOverride)
+        val is_async = match_token(KwAsync)
+        expect(KwFun, "expected 'fun'")?
+        val is_ref_receiver = match_token(Ampersand)
+        val name_tok = expect(Identifier, "expected method name")?
         val type_params = List.empty()
         if match_token(Lex.Lt) {
             parse_type_param_list(type_params)?
             expect_close_angle("expected '>'")?
         }
         val params = List.empty()
-        expect(Lex.LParen, "expected '('")?
-        if !check(Lex.RParen) {
+        expect(LParen, "expected '('")?
+        if !check(RParen) {
             parse_param_list(params)?
         }
-        expect(Lex.RParen, "expected ')'")?
+        expect(RParen, "expected ')'")?
         val nspan = Span(name_tok.line, name_tok.column)
         val this_type = if is_ref_receiver {
             val this_ty = ast.alloc_type(nspan, TThis)
@@ -1052,21 +1052,21 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
         }
         // Rust 侧是 params.insert(0, this) —— this 参数在首位。
         val params_all: Prm[] = [Prm("this", this_type)] ++ params.as_array()
-        val return_type = if match_token(Lex.Colon) {
+        val return_type = if match_token(Colon) {
             parse_type()?
         } else {
             report_error("method declaration must explicitly annotate the return type (use ': void' for no return value)")?
             null
         }
         val delegate = if match_token(Lex.Eq) {
-            val trait_tok = expect(Lex.Identifier, "expected delegate trait name")?
-            expect(Lex.Dot, "expected '.'")?
-            val method_tok = expect(Lex.Identifier, "expected delegate method name")?
+            val trait_tok = expect(Identifier, "expected delegate trait name")?
+            expect(Dot, "expected '.'")?
+            val method_tok = expect(Identifier, "expected delegate method name")?
             Del(lexeme_of(trait_tok), lexeme_of(method_tok))
         } else {
             null
         }
-        val body = if check(Lex.LBrace) {
+        val body = if check(LBrace) {
             parse_expr()?
         } else {
             null
@@ -1077,34 +1077,34 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_use_decl(visibility: Vis): Throw<Sd, PErr> {
         val use_tok = advance()
-        val first = expect(Lex.Identifier, "expected module name")?
+        val first = expect(Identifier, "expected module name")?
         val module_path = List.empty()
         module_path.push(lexeme_of(first))
         var dot_before_brace = false
-        while match_token(Lex.Dot) {
-            if check(Lex.LBrace) {
+        while match_token(Dot) {
+            if check(LBrace) {
                 dot_before_brace = true
                 break
             }
-            val part = expect(Lex.Identifier, "expected module path segment")?
+            val part = expect(Identifier, "expected module path segment")?
             module_path.push(lexeme_of(part))
         }
-        val items = if check(Lex.LBrace) {
+        val items = if check(LBrace) {
             if !dot_before_brace {
                 report_error("selective import must use '.{{ }}' syntax; expected '.' before '{{'")?
             }
             advance()
             val item_list = List.empty()
-            if !check(Lex.RBrace) {
+            if !check(RBrace) {
                 item_list.push(parse_import_item()?)
-                while match_token(Lex.Comma) {
-                    if check(Lex.RBrace) {
+                while match_token(Comma) {
+                    if check(RBrace) {
                         break
                     }
                     item_list.push(parse_import_item()?)
                 }
             }
-            expect(Lex.RBrace, "expected '}}'")?
+            expect(RBrace, "expected '}}'")?
             Items(item_list.as_array())
         } else {
             NoItems
@@ -1114,9 +1114,9 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     }
 
     fun &parse_import_item(): Throw<Ii, PErr> {
-        val name = expect(Lex.Identifier, "expected import item name")?
-        val alias = if match_token(Lex.KwAs) {
-            val alias_tok = expect(Lex.Identifier, "expected alias")?
+        val name = expect(Identifier, "expected import item name")?
+        val alias = if match_token(KwAs) {
+            val alias_tok = expect(Identifier, "expected alias")?
             lexeme_of(alias_tok)
         } else {
             null
@@ -1126,7 +1126,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_pack_decl(visibility: Vis): Throw<Sd, PErr> {
         val pack_tok = advance()
-        val name_tok = expect(Lex.Identifier, "expected pack name")?
+        val name_tok = expect(Identifier, "expected pack name")?
         Ok(Sd(Span(pack_tok.line, pack_tok.column), PackDeclD(visibility, lexeme_of(name_tok))))
     }
 
@@ -1134,7 +1134,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_type_param_list(items: List<Tp>): Throw<void, PErr> {
         items.push(parse_type_param()?)
-        while match_token(Lex.Comma) {
+        while match_token(Comma) {
             if check_close_angle() {
                 break
             }
@@ -1144,27 +1144,27 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     }
 
     fun &parse_type_param(): Throw<Tp, PErr> {
-        val name_tok = expect(Lex.Identifier, "expected type parameter name")?
+        val name_tok = expect(Identifier, "expected type parameter name")?
         val bounds = List.empty()
-        val kind = if match_token(Lex.Colon) {
-            val has_paren = check(Lex.LParen)
-            if has_paren || check(Lex.Identifier) {
+        val kind = if match_token(Colon) {
+            val has_paren = check(LParen)
+            if has_paren || check(Identifier) {
                 if has_paren {
                     advance()
                 }
-                val trait_name_tok = expect(Lex.Identifier, "expected trait name")?
+                val trait_name_tok = expect(Identifier, "expected trait name")?
                 val trait_name = parse_name_path_tail(trait_name_tok, "expected trait name after '.'")?
                 bounds.push(Tb(trait_name, []))
                 if has_paren {
-                    while match_token(Lex.Comma) {
-                        if check(Lex.RParen) {
+                    while match_token(Comma) {
+                        if check(RParen) {
                             break
                         }
-                        val next_trait = expect(Lex.Identifier, "expected trait name")?
+                        val next_trait = expect(Identifier, "expected trait name")?
                         val next_name = parse_name_path_tail(next_trait, "expected trait name after '.'")?
                         bounds.push(Tb(next_name, []))
                     }
-                    expect(Lex.RParen, "expected ')' after trait list")?
+                    expect(RParen, "expected ')' after trait list")?
                 }
                 null
             } else {
@@ -1182,7 +1182,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_kind_arrow(): Throw<Kind, PErr> {
         val left = parse_kind_primary()?
-        if match_token(Lex.MinusGt) {
+        if match_token(MinusGt) {
             val right = parse_kind_arrow()?
             return Ok(KArrow(left, right))
         }
@@ -1190,13 +1190,13 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     }
 
     fun &parse_kind_primary(): Throw<Kind, PErr> {
-        if check(Lex.Star) {
+        if check(Star) {
             advance()
             return Ok(KStar)
         }
-        if match_token(Lex.LParen) {
+        if match_token(LParen) {
             val kind = parse_kind_arrow()?
-            expect(Lex.RParen, "expected ')'")?
+            expect(RParen, "expected ')'")?
             return Ok(kind)
         }
         report_error("expected kind (* or arrow kind)")?
@@ -1205,8 +1205,8 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_param_list(items: List<Prm>): Throw<void, PErr> {
         items.push(parse_param()?)
-        while match_token(Lex.Comma) {
-            if check(Lex.RParen) {
+        while match_token(Comma) {
+            if check(RParen) {
                 break
             }
             items.push(parse_param()?)
@@ -1215,8 +1215,8 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     }
 
     fun &parse_param(): Throw<Prm, PErr> {
-        val name_tok = expect(Lex.Identifier, "expected parameter name")?
-        val ta = if match_token(Lex.Colon) {
+        val name_tok = expect(Identifier, "expected parameter name")?
+        val ta = if match_token(Colon) {
             parse_type()?
         } else {
             null
@@ -1230,8 +1230,8 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_trait_bound_list_inner(bounds: List<Tb>): Throw<void, PErr> {
         bounds.push(parse_trait_bound()?)
-        while match_token(Lex.Comma) {
-            if check(Lex.RParen) {
+        while match_token(Comma) {
+            if check(RParen) {
                 break
             }
             bounds.push(parse_trait_bound()?)
@@ -1242,19 +1242,19 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     // 限定名路径:first 已消费,续吃 ('.' Ident)*;单段零拼接直接返回,
     // 多段拼成 "A.Point" 形(类型注解位/trait 名位/构造器模式)。
     fun &parse_name_path_tail(first: Tk, err_msg: str): Throw<str, PErr> {
-        if !check(Lex.Dot) {
+        if !check(Dot) {
             return Ok(lexeme_of(first))
         }
         var joined = lexeme_of(first)
-        while match_token(Lex.Dot) {
-            val seg = expect(Lex.Identifier, err_msg)?
+        while match_token(Dot) {
+            val seg = expect(Identifier, err_msg)?
             joined = joined + "." + lexeme_of(seg)
         }
         Ok(joined)
     }
 
     fun &parse_trait_bound(): Throw<Tb, PErr> {
-        val name_tok = expect(Lex.Identifier, "expected trait name")?
+        val name_tok = expect(Identifier, "expected trait name")?
         val name = parse_name_path_tail(name_tok, "expected trait name after '.'")?
         val type_args = List.empty()
         if match_token(Lex.Lt) {
@@ -1265,7 +1265,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     }
 
     fun &parse_method_block(methods: List<Md>): Throw<void, PErr> {
-        while !check(Lex.RBrace) && !is_at_end() {
+        while !check(RBrace) && !is_at_end() {
             methods.push(parse_method_decl()?)
         }
         Ok(void)
@@ -1273,7 +1273,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_type_arg_list(items: List<i64>): Throw<void, PErr> {
         items.push(parse_type()?)
-        while match_token(Lex.Comma) {
+        while match_token(Comma) {
             if check_close_angle() {
                 break
             }
@@ -1285,20 +1285,20 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     // ── 类型解析 ──
 
     fun &parse_type(): Throw<i64, PErr> {
-        if match_token(Lex.Ampersand) {
+        if match_token(Ampersand) {
             val prev = previous()
             val span = Span(prev.line, prev.column)
             val inner = parse_type()?
             return Ok(ast.alloc_type(span, TRef(inner)))
         }
-        if match_token(Lex.AmpAmp) {
+        if match_token(AmpAmp) {
             val prev = previous()
             val span = Span(prev.line, prev.column)
             val inner = parse_type()?
             val inner_ref = ast.alloc_type(span, TRef(inner))
             return Ok(ast.alloc_type(span, TRef(inner_ref)))
         }
-        if match_token(Lex.Star) {
+        if match_token(Star) {
             val prev = previous()
             val span = Span(prev.line, prev.column)
             val inner = parse_type()?
@@ -1308,27 +1308,27 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     }
 
     fun &parse_function_type(): Throw<i64, PErr> {
-        if check(Lex.LParen) && paren_group_followed_by_arrow() {
+        if check(LParen) && paren_group_followed_by_arrow() {
             val p = peek()
             val span = Span(p.line, p.column)
             advance()
             val params = List.empty()
-            if !check(Lex.RParen) {
+            if !check(RParen) {
                 params.push(parse_type()?)
-                while match_token(Lex.Comma) {
-                    if check(Lex.RParen) {
+                while match_token(Comma) {
+                    if check(RParen) {
                         break
                     }
                     params.push(parse_type()?)
                 }
             }
-            expect(Lex.RParen, "expected ')'")?
-            expect(Lex.MinusGt, "expected '->'")?
+            expect(RParen, "expected ')'")?
+            expect(MinusGt, "expected '->'")?
             val return_type = parse_type()?
             return Ok(ast.alloc_type(span, TFunction(params.as_array(), return_type)))
         }
         val left = parse_nullable_type()?
-        if match_token(Lex.MinusGt) {
+        if match_token(MinusGt) {
             val return_type = parse_type()?
             val left_span = ast.ty(left).span
             return Ok(ast.alloc_type(left_span, TFunction([left], return_type)))
@@ -1338,21 +1338,21 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun paren_group_followed_by_arrow(): bool {
         var i: i64 = current
-        if i >= n() || tok_at(i).kind != Lex.LParen {
+        if i >= n() || tok_at(i).kind != LParen {
             return false
         }
         var depth: i64 = 0
         while i < n() {
             val k = tok_at(i).kind
-            if k == Lex.LParen {
+            if k == LParen {
                 depth = depth + 1
-            } else if k == Lex.RParen {
+            } else if k == RParen {
                 depth = depth - 1
                 if depth == 0 {
                     val next = i + 1
-                    return next < n() && tok_at(next).kind == Lex.MinusGt
+                    return next < n() && tok_at(next).kind == MinusGt
                 }
-            } else if k == Lex.Eof {
+            } else if k == Eof {
                 return false
             }
             i = i + 1
@@ -1363,15 +1363,15 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     fun &parse_nullable_type(): Throw<i64, PErr> {
         var ty = parse_primary_type()?
         while true {
-            if match_token(Lex.Question) {
+            if match_token(Question) {
                 val span = ast.ty(ty).span
                 ty = ast.alloc_type(span, TNullable(ty))
-            } else if match_token(Lex.QuestionQuestion) {
+            } else if match_token(QuestionQuestion) {
                 var span = ast.ty(ty).span
                 ty = ast.alloc_type(span, TNullable(ty))
                 span = ast.ty(ty).span
                 ty = ast.alloc_type(span, TNullable(ty))
-            } else if check(Lex.LBracket) {
+            } else if check(LBracket) {
                 ty = parse_array_type_suffix(ty)?
             } else {
                 break
@@ -1383,19 +1383,19 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     fun &parse_array_type_suffix(ty: i64): Throw<i64, PErr> {
         val bracket = advance()
         var size: i64? = null
-        if !check(Lex.RBracket) {
-            val size_tok = expect(Lex.IntLiteral, "expected array size")?
+        if !check(RBracket) {
+            val size_tok = expect(IntLiteral, "expected array size")?
             size = parse_u64(lexeme_of(size_tok))
             if size == null {
                 report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")?
             }
         }
-        expect(Lex.RBracket, "expected ']'")?
+        expect(RBracket, "expected ']'")?
         Ok(ast.alloc_type(Span(bracket.line, bracket.column), TArray(ty, size)))
     }
 
     fun &parse_primary_type(): Throw<i64, PErr> {
-        if check(Lex.LParen) {
+        if check(LParen) {
             if is_paren_record_type() {
                 return parse_record_type()
             }
@@ -1403,49 +1403,49 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
             var span = Span(p.line, p.column)
             advance()
             val inner = parse_type()?
-            expect(Lex.RParen, "expected ')'")?
+            expect(RParen, "expected ')'")?
             var ty = inner
-            while match_token(Lex.LBracket) {
+            while match_token(LBracket) {
                 var size: i64? = null
-                if !check(Lex.RBracket) {
-                    val size_tok = expect(Lex.IntLiteral, "expected array size")?
+                if !check(RBracket) {
+                    val size_tok = expect(IntLiteral, "expected array size")?
                     size = parse_u64(lexeme_of(size_tok))
                     if size == null {
                         report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")?
                     }
                 }
-                expect(Lex.RBracket, "expected ']'")?
+                expect(RBracket, "expected ']'")?
                 ty = ast.alloc_type(span, TArray(ty, size))
             }
             return Ok(ty)
         }
-        val is_this_type_kw = check(Lex.KwThis)
-            || (check(Lex.Identifier) && lexeme_of(peek()) == "This")
+        val is_this_type_kw = check(KwThis)
+            || (check(Identifier) && lexeme_of(peek()) == "This")
         if is_this_type_kw {
             val tok = advance()
             val span = Span(tok.line, tok.column)
             var ty = ast.alloc_type(span, TThis)
-            while match_token(Lex.LBracket) {
+            while match_token(LBracket) {
                 var size: i64? = null
-                if !check(Lex.RBracket) {
-                    val size_tok = expect(Lex.IntLiteral, "expected array size")?
+                if !check(RBracket) {
+                    val size_tok = expect(IntLiteral, "expected array size")?
                     size = parse_u64(lexeme_of(size_tok))
                     if size == null {
                         report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")?
                     }
                 }
-                expect(Lex.RBracket, "expected ']'")?
+                expect(RBracket, "expected ']'")?
                 ty = ast.alloc_type(span, TArray(ty, size))
             }
             return Ok(ty)
         }
-        val name_tok = expect(Lex.Identifier, "expected type name")?
+        val name_tok = expect(Identifier, "expected type name")?
         val span = Span(name_tok.line, name_tok.column)
         val name = parse_name_path_tail(name_tok, "expected type name after '.'")?
         var ty = if match_token(Lex.Lt) {
             val args = List.empty()
             args.push(parse_type()?)
-            while match_token(Lex.Comma) {
+            while match_token(Comma) {
                 if check_close_angle() {
                     break
                 }
@@ -1456,16 +1456,16 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
         } else {
             ast.alloc_type(span, TNamed(name))
         }
-        while match_token(Lex.LBracket) {
+        while match_token(LBracket) {
             var size: i64? = null
-            if !check(Lex.RBracket) {
-                val size_tok = expect(Lex.IntLiteral, "expected array size")?
+            if !check(RBracket) {
+                val size_tok = expect(IntLiteral, "expected array size")?
                 size = parse_u64(lexeme_of(size_tok))
                 if size == null {
                     report_error_at(size_tok.line, size_tok.column, "array size must be a positive integer")?
                 }
             }
-            expect(Lex.RBracket, "expected ']'")?
+            expect(RBracket, "expected ']'")?
             ty = ast.alloc_type(span, TArray(ty, size))
         }
         Ok(ty)
@@ -1473,16 +1473,16 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun is_paren_record_type(): bool {
         var i: i64 = current
-        if i >= n() || tok_at(i).kind != Lex.LParen {
+        if i >= n() || tok_at(i).kind != LParen {
             return false
         }
         i = i + 1
-        if i >= n() || tok_at(i).kind == Lex.RParen {
+        if i >= n() || tok_at(i).kind == RParen {
             return false
         }
-        if tok_at(i).kind == Lex.Identifier {
+        if tok_at(i).kind == Identifier {
             val next = i + 1
-            if next < n() && tok_at(next).kind == Lex.Colon {
+            if next < n() && tok_at(next).kind == Colon {
                 return true
             }
         }
@@ -1493,24 +1493,24 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
         val lparen = advance()
         val span = Span(lparen.line, lparen.column)
         val fields = List.empty()
-        if !check(Lex.RParen) {
-            val f_pub0 = match_token(Lex.KwPub)
-            val name_tok = expect(Lex.Identifier, "expected field name")?
-            expect(Lex.Colon, "expected ':'")?
+        if !check(RParen) {
+            val f_pub0 = match_token(KwPub)
+            val name_tok = expect(Identifier, "expected field name")?
+            expect(Colon, "expected ':'")?
             val ty = parse_type()?
             fields.push(Rft(lexeme_of(name_tok), ty, f_pub0))
-            while match_token(Lex.Comma) {
-                if check(Lex.RParen) {
+            while match_token(Comma) {
+                if check(RParen) {
                     break
                 }
-                val f_pub = match_token(Lex.KwPub)
-                val field_name = expect(Lex.Identifier, "expected field name")?
-                expect(Lex.Colon, "expected ':'")?
+                val f_pub = match_token(KwPub)
+                val field_name = expect(Identifier, "expected field name")?
+                expect(Colon, "expected ':'")?
                 val field_ty = parse_type()?
                 fields.push(Rft(lexeme_of(field_name), field_ty, f_pub))
             }
         }
-        expect(Lex.RParen, "expected ')'")?
+        expect(RParen, "expected ')'")?
         if fields.len() == 0 {
             return Ok(ast.alloc_type(span, TNamed("void")))
         }
@@ -1534,7 +1534,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
             _ => false
         }
         val pk = peek().kind
-        if is_blocky && (pk == Lex.Minus || pk == Lex.Ampersand) {
+        if is_blocky && (pk == Minus || pk == Ampersand) {
             return Ok(left)
         }
         while true {
@@ -1551,7 +1551,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
                     break
                 }
             }
-            if (peek().kind == Lex.Minus || peek().kind == Lex.Ampersand)
+            if (peek().kind == Minus || peek().kind == Ampersand)
                 && postfix_opens_new_statement() {
                 break
             }
@@ -1569,7 +1569,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_as_cast(): Throw<i64, PErr> {
         var left = parse_unary()?
-        while match_token(Lex.KwAs) {
+        while match_token(KwAs) {
             val as_tok = previous()
             val target = parse_cast_type()?
             left = ast.alloc_expr(Span(as_tok.line, as_tok.column), AsCast(left, target))
@@ -1578,45 +1578,45 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     }
 
     fun &parse_cast_type(): Throw<i64, PErr> {
-        if match_token(Lex.Ampersand) {
+        if match_token(Ampersand) {
             val prev = previous()
             val span = Span(prev.line, prev.column)
             val inner = parse_cast_type()?
             return Ok(ast.alloc_type(span, TRef(inner)))
         }
-        if match_token(Lex.AmpAmp) {
+        if match_token(AmpAmp) {
             val prev = previous()
             val span = Span(prev.line, prev.column)
             val inner = parse_cast_type()?
             val inner_ref = ast.alloc_type(span, TRef(inner))
             return Ok(ast.alloc_type(span, TRef(inner_ref)))
         }
-        if match_token(Lex.Star) {
+        if match_token(Star) {
             val prev = previous()
             val span = Span(prev.line, prev.column)
             val inner = parse_cast_type()?
             return Ok(ast.alloc_type(span, TRawPtr(inner)))
         }
-        val is_this_type_kw = check(Lex.KwThis)
-            || (check(Lex.Identifier) && lexeme_of(peek()) == "This")
+        val is_this_type_kw = check(KwThis)
+            || (check(Identifier) && lexeme_of(peek()) == "This")
         var ty = if is_this_type_kw {
             val tok = advance()
             ast.alloc_type(Span(tok.line, tok.column), TThis)
         } else {
-            val name_tok = expect(Lex.Identifier, "expected type name after 'as'")?
+            val name_tok = expect(Identifier, "expected type name after 'as'")?
             val name = parse_name_path_tail(name_tok, "expected type name after '.'")?
             ast.alloc_type(Span(name_tok.line, name_tok.column), TNamed(name))
         }
         while true {
-            if match_token(Lex.Question) {
+            if match_token(Question) {
                 var span = ast.ty(ty).span
                 ty = ast.alloc_type(span, TNullable(ty))
-            } else if match_token(Lex.QuestionQuestion) {
+            } else if match_token(QuestionQuestion) {
                 var span = ast.ty(ty).span
                 ty = ast.alloc_type(span, TNullable(ty))
                 span = ast.ty(ty).span
                 ty = ast.alloc_type(span, TNullable(ty))
-            } else if check(Lex.LBracket) {
+            } else if check(LBracket) {
                 ty = parse_array_type_suffix(ty)?
             } else {
                 break
@@ -1626,39 +1626,39 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     }
 
     fun &parse_unary(): Throw<i64, PErr> {
-        if match_token(Lex.Bang) {
+        if match_token(Bang) {
             val op_tok = previous()
             val operand = parse_unary()?
             return Ok(ast.alloc_expr(Span(op_tok.line, op_tok.column), UnaryE(Not, operand)))
         }
-        if match_token(Lex.Tilde) {
+        if match_token(Tilde) {
             val op_tok = previous()
             val operand = parse_unary()?
             return Ok(ast.alloc_expr(Span(op_tok.line, op_tok.column), UnaryE(BitNot, operand)))
         }
-        if match_token(Lex.Ampersand) {
+        if match_token(Ampersand) {
             val op_tok = previous()
             val operand = parse_unary()?
             return Ok(ast.alloc_expr(Span(op_tok.line, op_tok.column), RefOfE(operand)))
         }
-        if match_token(Lex.AmpAmp) {
+        if match_token(AmpAmp) {
             val op_tok = previous()
             val operand = parse_unary()?
             val inner = ast.alloc_expr(Span(op_tok.line, op_tok.column), RefOfE(operand))
             return Ok(ast.alloc_expr(Span(op_tok.line, op_tok.column), RefOfE(inner)))
         }
-        if match_token(Lex.Star) {
+        if match_token(Star) {
             val op_tok = previous()
             val operand = parse_unary()?
             return Ok(ast.alloc_expr(Span(op_tok.line, op_tok.column), DerefE(operand)))
         }
-        if match_token(Lex.Minus) {
+        if match_token(Minus) {
             val op_tok = previous()
-            if check(Lex.IntLiteral) {
+            if check(IntLiteral) {
                 val lit_tok = advance()
                 return parse_negative_int_literal(lit_tok)
             }
-            if check(Lex.FloatLiteral) {
+            if check(FloatLiteral) {
                 val lit_tok = advance()
                 return parse_negative_float_literal(lit_tok)
             }
@@ -1682,16 +1682,16 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     fun &parse_postfix(): Throw<i64, PErr> {
         var expr = parse_primary()?
         while true {
-            if match_token(Lex.Question) {
+            if match_token(Question) {
                 val op_tok = previous()
                 expr = ast.alloc_expr(Span(op_tok.line, op_tok.column), PropagateE(expr))
-            } else if match_token(Lex.Bang) {
+            } else if match_token(Bang) {
                 val op_tok = previous()
                 expr = ast.alloc_expr(Span(op_tok.line, op_tok.column), NonNullAssertE(expr))
-            } else if match_token(Lex.QuestionDot) {
+            } else if match_token(QuestionDot) {
                 val op_tok = previous()
-                val field_tok = expect(Lex.Identifier, "expected field or method name")?
-                if check(Lex.LParen) {
+                val field_tok = expect(Identifier, "expected field or method name")?
+                if check(LParen) {
                     val r = parse_call_args()?
                     expr = ast.alloc_expr(Span(op_tok.line, op_tok.column),
                         SafeMethodCallE(expr, lexeme_of(field_tok), r.args, r.type_args))
@@ -1699,10 +1699,10 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
                     expr = ast.alloc_expr(Span(op_tok.line, op_tok.column),
                         SafeAccessE(expr, lexeme_of(field_tok)))
                 }
-            } else if match_token(Lex.Dot) {
+            } else if match_token(Dot) {
                 val op_tok = previous()
-                val field_tok = expect(Lex.Identifier, "expected field or method name")?
-                if check(Lex.LParen) || (check(Lex.Lt) && is_turbofish_call()) {
+                val field_tok = expect(Identifier, "expected field or method name")?
+                if check(LParen) || (check(Lex.Lt) && is_turbofish_call()) {
                     val r = parse_call_args()?
                     expr = ast.alloc_expr(Span(op_tok.line, op_tok.column),
                         MethodCallE(expr, lexeme_of(field_tok), r.args, r.type_args))
@@ -1710,7 +1710,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
                     expr = ast.alloc_expr(Span(op_tok.line, op_tok.column),
                         FieldAccessE(expr, lexeme_of(field_tok)))
                 }
-            } else if check(Lex.LParen) && !postfix_opens_new_statement() {
+            } else if check(LParen) && !postfix_opens_new_statement() {
                 if is_call_node(expr) {
                     report_error("chained call f(a)(b) is not allowed; use default currying: bind the partial result to a variable first")?
                 }
@@ -1727,31 +1727,31 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
                     report_error("chained call f(a)(b) is not allowed; use default currying: bind the partial result to a variable first")?
                 }
                 val call_tok = peek()
-                expect(Lex.LParen, "expected '('")?
+                expect(LParen, "expected '('")?
                 val args = List.empty()
-                if !check(Lex.RParen) {
+                if !check(RParen) {
                     args.push(parse_expr()?)
-                    while match_token(Lex.Comma) {
-                        if check(Lex.RParen) {
+                    while match_token(Comma) {
+                        if check(RParen) {
                             break
                         }
                         args.push(parse_expr()?)
                     }
                 }
-                expect(Lex.RParen, "expected ')'")?
+                expect(RParen, "expected ')'")?
                 expr = ast.alloc_expr(Span(call_tok.line, call_tok.column),
                     CallE(expr, args.as_array(), type_args.as_array()))
-            } else if check(Lex.LBracket) && !postfix_opens_new_statement() {
+            } else if check(LBracket) && !postfix_opens_new_statement() {
                 val bracket_tok = advance()
                 val start = parse_binary(ADDITION_PREC)?
-                if match_token(Lex.DotDotEq) || match_token(Lex.DotDot) {
-                    val inclusive = previous().kind == Lex.DotDotEq
+                if match_token(DotDotEq) || match_token(DotDot) {
+                    val inclusive = previous().kind == DotDotEq
                     val end = parse_binary(ADDITION_PREC)?
-                    expect(Lex.RBracket, "expected ']' after slice end")?
+                    expect(RBracket, "expected ']' after slice end")?
                     expr = ast.alloc_expr(Span(bracket_tok.line, bracket_tok.column),
                         SliceE(expr, start, end, inclusive))
                 } else {
-                    expect(Lex.RBracket, "expected ']'")?
+                    expect(RBracket, "expected ']'")?
                     expr = ast.alloc_expr(Span(bracket_tok.line, bracket_tok.column),
                         IndexE(expr, start))
                 }
@@ -1776,25 +1776,25 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
             } else if k == Lex.Gt {
                 depth = depth - 1
                 if depth == 0 {
-                    return i + 1 < n() && tok_at(i + 1).kind == Lex.LParen
+                    return i + 1 < n() && tok_at(i + 1).kind == LParen
                 }
-            } else if k == Lex.GtGt {
+            } else if k == GtGt {
                 // 虚拟拆分 >>:一个 token 两个闭合(嵌套泛型 A<B<C>>)。
                 depth = depth - 2
                 if depth <= 0 {
-                    return i + 1 < n() && tok_at(i + 1).kind == Lex.LParen
+                    return i + 1 < n() && tok_at(i + 1).kind == LParen
                 }
             } else if k == Lex.GtEq {
                 depth = depth - 1
                 if depth <= 0 {
                     return false
                 }
-            } else if k == Lex.GtGtEq {
+            } else if k == GtGtEq {
                 depth = depth - 2
                 if depth <= 0 {
                     return false
                 }
-            } else if k == Lex.LBrace || k == Lex.RBrace || k == Lex.Eq || k == Lex.EqGt || k == Lex.Eof {
+            } else if k == LBrace || k == RBrace || k == Lex.Eq || k == EqGt || k == Eof {
                 return false
             }
             i = i + 1
@@ -1808,124 +1808,124 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
             val ta = List.empty()
             parse_type_arg_list(ta)?
             if match_token(Lex.Gt) {
-                expect(Lex.LParen, "expected '('")?
+                expect(LParen, "expected '('")?
                 val args = List.empty()
-                if !check(Lex.RParen) {
+                if !check(RParen) {
                     args.push(parse_expr()?)
-                    while match_token(Lex.Comma) {
-                        if check(Lex.RParen) {
+                    while match_token(Comma) {
+                        if check(RParen) {
                             break
                         }
                         args.push(parse_expr()?)
                     }
                 }
-                expect(Lex.RParen, "expected ')'")?
+                expect(RParen, "expected ')'")?
                 return Ok(ArgsRes(args.as_array(), ta.as_array()))
             }
             current = current - (ta.len() as i64) - 1
         }
-        expect(Lex.LParen, "expected '('")?
+        expect(LParen, "expected '('")?
         val args = List.empty()
-        if !check(Lex.RParen) {
+        if !check(RParen) {
             args.push(parse_expr()?)
-            while match_token(Lex.Comma) {
-                if check(Lex.RParen) {
+            while match_token(Comma) {
+                if check(RParen) {
                     break
                 }
                 args.push(parse_expr()?)
             }
         }
-        expect(Lex.RParen, "expected ')'")?
+        expect(RParen, "expected ')'")?
         Ok(ArgsRes(args.as_array(), []))
     }
 
     // ── 主表达式 ──
 
     fun &parse_primary(): Throw<i64, PErr> {
-        if match_token(Lex.IntLiteral) {
+        if match_token(IntLiteral) {
             val tok = previous()
             return Ok(parse_int_literal(tok))
         }
-        if match_token(Lex.FloatLiteral) {
+        if match_token(FloatLiteral) {
             val tok = previous()
             return Ok(parse_float_literal(tok))
         }
-        if match_token(Lex.TrueLiteral) {
+        if match_token(TrueLiteral) {
             val tok = previous()
             return Ok(ast.alloc_expr(Span(tok.line, tok.column), BoolLit(true)))
         }
-        if match_token(Lex.FalseLiteral) {
+        if match_token(FalseLiteral) {
             val tok = previous()
             return Ok(ast.alloc_expr(Span(tok.line, tok.column), BoolLit(false)))
         }
-        if match_token(Lex.CharLiteral) {
+        if match_token(CharLiteral) {
             val tok = previous()
             return Ok(ast.alloc_expr(Span(tok.line, tok.column), CharLit(parse_char_value(lexeme_of(tok)))))
         }
-        if match_token(Lex.StringLiteral) {
+        if match_token(StringLiteral) {
             val tok = previous()
             return parse_string_literal(tok)
         }
-        if match_token(Lex.NullLiteral) {
+        if match_token(NullLiteral) {
             val tok = previous()
             return Ok(ast.alloc_expr(Span(tok.line, tok.column), NullLit))
         }
-        if check(Lex.KwFun) && n() > current + 1 && tok_at(current + 1).kind == Lex.LParen {
+        if check(KwFun) && n() > current + 1 && tok_at(current + 1).kind == LParen {
             return parse_lambda_fun(false)
         }
-        if check(Lex.KwAsync) && n() > current + 1 && tok_at(current + 1).kind == Lex.KwFun {
+        if check(KwAsync) && n() > current + 1 && tok_at(current + 1).kind == KwFun {
             advance()
             return parse_lambda_fun(true)
         }
-        if match_token(Lex.KwIf) {
+        if match_token(KwIf) {
             return parse_if_expr()
         }
-        if match_token(Lex.KwMatch) {
+        if match_token(KwMatch) {
             return parse_match_expr()
         }
-        if match_token(Lex.KwLazy) {
+        if match_token(KwLazy) {
             return parse_lazy_expr()
         }
-        if match_token(Lex.KwAtomic) {
+        if match_token(KwAtomic) {
             return parse_atomic_expr()
         }
-        if match_token(Lex.KwSelect) {
+        if match_token(KwSelect) {
             return parse_select_expr()
         }
-        if check(Lex.KwTrait) && n() > current + 1 && tok_at(current + 1).kind == Lex.LBrace {
+        if check(KwTrait) && n() > current + 1 && tok_at(current + 1).kind == LBrace {
             return parse_inline_trait_value()
         }
-        if match_token(Lex.LBracket) {
+        if match_token(LBracket) {
             return parse_array_literal()
         }
-        if check(Lex.LBrace) {
+        if check(LBrace) {
             return parse_block_expr()
         }
-        if match_token(Lex.LParen) {
+        if match_token(LParen) {
             return parse_paren_or_record_or_lambda()
         }
-        if check(Lex.KwType) && n() > current + 1 && tok_at(current + 1).kind == Lex.LParen {
+        if check(KwType) && n() > current + 1 && tok_at(current + 1).kind == LParen {
             val tok = advance()
             return Ok(ast.alloc_expr(Span(tok.line, tok.column), Ident(lexeme_of(tok))))
         }
-        if check(Lex.KwThis) {
+        if check(KwThis) {
             val tok = advance()
             return Ok(ast.alloc_expr(Span(tok.line, tok.column), Ident("this")))
         }
-        if check(Lex.KwSuper) {
+        if check(KwSuper) {
             val tok = advance()
             return Ok(ast.alloc_expr(Span(tok.line, tok.column), Ident("super")))
         }
         val k = peek().kind
-        if k == Lex.Identifier || k == Lex.KwChannel {
-            if check(Lex.Identifier) && lexeme_of(peek()) == "void" {
+        if k == Identifier || k == KwChannel {
+            if check(Identifier) && lexeme_of(peek()) == "void" {
                 val tok = advance()
                 return Ok(ast.alloc_expr(Span(tok.line, tok.column), VoidLit))
             }
             val tok = advance()
             return Ok(ast.alloc_expr(Span(tok.line, tok.column), Ident(lexeme_of(tok))))
         }
-        if check(Lex.Err) {
+        if check(Err) {
             val lex = lexeme_of(peek())
             var shown: str = ""
             val lb = lex.bytes()
@@ -1938,8 +1938,8 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
             }
             report_error("unexpected character '" + shown + "'")?
         }
-        if check(Lex.KwVal) || check(Lex.KwVar) {
-            val what = if check(Lex.KwVal) { "val" } else { "var" }
+        if check(KwVal) || check(KwVar) {
+            val what = if check(KwVal) { "val" } else { "var" }
             report_error("expected expression; '" + what + "' starts a declaration, wrap the body in {{ ... }}")?
         }
         report_error("expected expression")?
@@ -2103,7 +2103,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     }
 
     fun &parse_interpolation_expr(text: str): Throw<i64, PErr> {
-        val sub_toks = Lex.tokenize(text)
+        val sub_toks = tokenize(text)
         val sub_src = text.bytes()
 
         val saved_src = src
@@ -2256,12 +2256,12 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
         val fun_tok = advance()
         val span = Span(fun_tok.line, fun_tok.column)
         val params = List.empty()
-        expect(Lex.LParen, "expected '('")?
-        if !check(Lex.RParen) {
+        expect(LParen, "expected '('")?
+        if !check(RParen) {
             parse_param_list(params)?
         }
-        expect(Lex.RParen, "expected ')'")?
-        expect(Lex.Colon, "expected ':' followed by return type in lambda")?
+        expect(RParen, "expected ')'")?
+        expect(Colon, "expected ':' followed by return type in lambda")?
         val return_type = parse_type()?
         val body_expr = parse_expr()?
         Ok(ast.alloc_expr(span, LambdaE(params.as_array(), LBlock(body_expr), is_async, return_type)))
@@ -2270,38 +2270,38 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     fun &parse_paren_or_record_or_lambda(): Throw<i64, PErr> {
         val lparen_tok = previous()
         val span = Span(lparen_tok.line, lparen_tok.column)
-        if match_token(Lex.RParen) {
+        if match_token(RParen) {
             return Ok(ast.alloc_expr(span, VoidLit))
         }
         val saved = current
-        if peek().kind == Lex.Ellipsis {
+        if peek().kind == Ellipsis {
             advance()
             val base_expr = parse_expr()?
             val updates = List.empty()
-            while match_token(Lex.Comma) {
-                if check(Lex.RParen) {
+            while match_token(Comma) {
+                if check(RParen) {
                     break
                 }
-                val field_name = expect(Lex.Identifier, "expected field name")?
-                expect(Lex.Colon, "expected ':'")?
+                val field_name = expect(Identifier, "expected field name")?
+                expect(Colon, "expected ':'")?
                 val field_value = parse_expr()?
                 updates.push(Rfe(lexeme_of(field_name), field_value))
             }
-            expect(Lex.RParen, "expected ')'")?
+            expect(RParen, "expected ')'")?
             return Ok(ast.alloc_expr(span, RecordExtendE(base_expr, updates.as_array())))
         }
-        if peek().kind == Lex.Identifier {
+        if peek().kind == Identifier {
             val name_tok = advance()
-            if check(Lex.Colon) {
+            if check(Colon) {
                 advance()
                 val value = parse_expr()?
                 val fields = List.empty()
                 fields.push(Rfe(lexeme_of(name_tok), value))
-                while match_token(Lex.Comma) {
-                    if check(Lex.RParen) {
+                while match_token(Comma) {
+                    if check(RParen) {
                         break
                     }
-                    if check(Lex.Ellipsis) {
+                    if check(Ellipsis) {
                         advance()
                         val base_expr = parse_expr()?
                         val updates = List.empty()
@@ -2310,35 +2310,35 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
                             updates.push(fields.get(f as usize) ?? Rfe("", 0))
                             f = f + 1
                         }
-                        while match_token(Lex.Comma) {
-                            if check(Lex.RParen) {
+                        while match_token(Comma) {
+                            if check(RParen) {
                                 break
                             }
-                            val fname = expect(Lex.Identifier, "expected field name")?
-                            expect(Lex.Colon, "expected ':'")?
+                            val fname = expect(Identifier, "expected field name")?
+                            expect(Colon, "expected ':'")?
                             val fvalue = parse_expr()?
                             updates.push(Rfe(lexeme_of(fname), fvalue))
                         }
-                        expect(Lex.RParen, "expected ')'")?
+                        expect(RParen, "expected ')'")?
                         return Ok(ast.alloc_expr(span, RecordExtendE(base_expr, updates.as_array())))
                     }
-                    val field_name = expect(Lex.Identifier, "expected field name")?
-                    expect(Lex.Colon, "expected ':'")?
+                    val field_name = expect(Identifier, "expected field name")?
+                    expect(Colon, "expected ':'")?
                     val field_value = parse_expr()?
                     fields.push(Rfe(lexeme_of(field_name), field_value))
                 }
-                expect(Lex.RParen, "expected ')'")?
+                expect(RParen, "expected ')'")?
                 return Ok(ast.alloc_expr(span, RecordLitE(fields.as_array())))
             }
             current = saved
         }
         val first_expr = parse_expr()?
-        if match_token(Lex.Comma) {
+        if match_token(Comma) {
             report_error_at(lparen_tok.line, lparen_tok.column,
                 "anonymous tuples are not allowed; use named record fields like (name: value, ...)")?
             return Ok(ast.alloc_expr(Span(lparen_tok.line, lparen_tok.column), VoidLit))
         }
-        expect(Lex.RParen, "expected ')'")?
+        expect(RParen, "expected ')'")?
         Ok(first_expr)
     }
 
@@ -2348,7 +2348,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
         reject_paren_condition("if")?
         val cond = parse_expr()?
         val then_branch = parse_unary()?
-        val else_branch = if match_token(Lex.KwElse) {
+        val else_branch = if match_token(KwElse) {
             parse_unary()?
         } else {
             null
@@ -2361,39 +2361,39 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
         val span = Span(match_tok.line, match_tok.column)
         reject_paren_condition("match")?
         val scrutinee = parse_expr()?
-        expect(Lex.LBrace, "expected '{{'")?
+        expect(LBrace, "expected '{{'")?
         val arms = List.empty()
-        while !check(Lex.RBrace) && !is_at_end() {
+        while !check(RBrace) && !is_at_end() {
             val arm = match parse_match_arm() {
                 Ok(a) => a
                 Error(_) => {
-                    while !check(Lex.Comma) && !check(Lex.RBrace) && !is_at_end() {
+                    while !check(Comma) && !check(RBrace) && !is_at_end() {
                         advance()
                     }
-                    if match_token(Lex.Comma) {
+                    if match_token(Comma) {
                         continue
                     }
                     break
                 }
             }
             arms.push(arm)
-            match_token(Lex.Comma)
+            match_token(Comma)
         }
-        expect(Lex.RBrace, "expected '}}'")?
+        expect(RBrace, "expected '}}'")?
         Ok(ast.alloc_expr(span, MatchE(scrutinee, arms.as_array())))
     }
 
     fun &parse_match_arm(): Throw<Marm, PErr> {
         val pattern = parse_pattern()?
-        val guard = if match_token(Lex.KwIf) {
+        val guard = if match_token(KwIf) {
             reject_paren_condition("if guard")?
             parse_expr()?
         } else {
             null
         }
-        expect(Lex.EqGt, "expected '=>'")?
+        expect(EqGt, "expected '=>'")?
         val k = peek().kind
-        val body = if k == Lex.KwThrow || k == Lex.KwReturn || k == Lex.KwBreak || k == Lex.KwContinue {
+        val body = if k == KwThrow || k == KwReturn || k == KwBreak || k == KwContinue {
             val stmt_tok = peek()
             val stmt = parse_stmt()?
             val span = Span(stmt_tok.line, stmt_tok.column)
@@ -2419,29 +2419,29 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     fun &parse_select_expr(): Throw<i64, PErr> {
         val select_tok = previous()
         val span = Span(select_tok.line, select_tok.column)
-        expect(Lex.LBrace, "expected '{{'")?
+        expect(LBrace, "expected '{{'")?
         val arms = List.empty()
-        while !check(Lex.RBrace) && !is_at_end() {
+        while !check(RBrace) && !is_at_end() {
             arms.push(parse_select_arm()?)
-            match_token(Lex.Comma)
+            match_token(Comma)
         }
-        expect(Lex.RBrace, "expected '}}'")?
+        expect(RBrace, "expected '}}'")?
         Ok(ast.alloc_expr(span, SelectE(arms.as_array())))
     }
 
     fun &parse_select_arm(): Throw<SelArm, PErr> {
         if check_identifier("timeout") {
             advance()
-            expect(Lex.LParen, "expected '('")?
+            expect(LParen, "expected '('")?
             val duration = parse_expr()?
-            expect(Lex.RParen, "expected ')'")?
-            expect(Lex.EqGt, "expected '=>'")?
+            expect(RParen, "expected ')'")?
+            expect(EqGt, "expected '=>'")?
             val body = parse_expr()?
             return Ok(SelTimeout(duration, body))
         }
         val channel_expr = parse_expr()?
-        expect(Lex.EqGt, "expected '=>'")?
-        val binding = if check(Lex.Identifier) && current + 1 < n() && tok_at(current + 1).kind == Lex.EqGt {
+        expect(EqGt, "expected '=>'")?
+        val binding = if check(Identifier) && current + 1 < n() && tok_at(current + 1).kind == EqGt {
             val name_tok = advance()
             advance()
             lexeme_of(name_tok)
@@ -2455,12 +2455,12 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     fun &parse_inline_trait_value(): Throw<i64, PErr> {
         val trait_tok = advance()
         val span = Span(trait_tok.line, trait_tok.column)
-        expect(Lex.LBrace, "expected '{{'")?
+        expect(LBrace, "expected '{{'")?
         val methods = List.empty()
-        while !check(Lex.RBrace) && !is_at_end() {
+        while !check(RBrace) && !is_at_end() {
             methods.push(parse_method_decl()?)
         }
-        expect(Lex.RBrace, "expected '}}'")?
+        expect(RBrace, "expected '}}'")?
         Ok(ast.alloc_expr(span, InlineTraitE(methods.as_array())))
     }
 
@@ -2468,20 +2468,20 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
         val bracket_tok = previous()
         val span = Span(bracket_tok.line, bracket_tok.column)
         val elements = List.empty()
-        if !check(Lex.RBracket) {
+        if !check(RBracket) {
             elements.push(parse_expr()?)
-            if match_token(Lex.Comma) {
-                if match_token(Lex.DotDot) {
+            if match_token(Comma) {
+                if match_token(DotDot) {
                     val count = parse_expr()?
-                    expect(Lex.RBracket, "expected ']' after array fill count")?
+                    expect(RBracket, "expected ']' after array fill count")?
                     val value = elements.get(0 as usize) ?? 0
                     return Ok(ast.alloc_expr(span,
                         ArrayLitE(elements.as_array(), value, count, true)))
                 }
-                if !check(Lex.RBracket) {
+                if !check(RBracket) {
                     elements.push(parse_expr()?)
-                    while match_token(Lex.Comma) {
-                        if check(Lex.RBracket) {
+                    while match_token(Comma) {
+                        if check(RBracket) {
                             break
                         }
                         elements.push(parse_expr()?)
@@ -2489,7 +2489,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
                 }
             }
         }
-        expect(Lex.RBracket, "expected ']'")?
+        expect(RBracket, "expected ']'")?
         Ok(ast.alloc_expr(span, ArrayLitE(elements.as_array(), 0, 0, false)))
     }
 
@@ -2498,7 +2498,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
         val span = Span(brace_tok.line, brace_tok.column)
         val stmts = List.empty()
         var trailing: i64 = -1
-        while !check(Lex.RBrace) && !is_at_end() {
+        while !check(RBrace) && !is_at_end() {
             if is_stmt_start() {
                 val stmt = parse_stmt()?
                 var is_expr_stmt = false
@@ -2510,7 +2510,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
                     }
                     _ => {}
                 }
-                if is_expr_stmt && check(Lex.RBrace) {
+                if is_expr_stmt && check(RBrace) {
                     trailing = inner
                     break
                 }
@@ -2526,14 +2526,14 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
                     }
                     _ => {}
                 }
-                if is_expr_stmt && check(Lex.RBrace) {
+                if is_expr_stmt && check(RBrace) {
                     trailing = inner
                     break
                 }
                 stmts.push(stmt)
             }
         }
-        expect(Lex.RBrace, "expected '}}'")?
+        expect(RBrace, "expected '}}'")?
         if trailing >= 0 {
             Ok(ast.alloc_expr(span, BlockE(stmts.as_array(), trailing)))
         } else {
@@ -2545,54 +2545,54 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun is_stmt_start(): bool {
         val k = peek().kind
-        k == Lex.KwVal || k == Lex.KwVar || k == Lex.KwFun || k == Lex.KwType
-            || k == Lex.KwTrait || k == Lex.KwReturn || k == Lex.KwDefer || k == Lex.KwThrow
-            || k == Lex.KwBreak || k == Lex.KwContinue || k == Lex.KwFor || k == Lex.KwWhile
-            || k == Lex.KwLoop
+        k == KwVal || k == KwVar || k == KwFun || k == KwType
+            || k == KwTrait || k == KwReturn || k == KwDefer || k == KwThrow
+            || k == KwBreak || k == KwContinue || k == KwFor || k == KwWhile
+            || k == KwLoop
     }
 
     pub fun &parse_stmt(): Throw<i64, PErr> {
-        if match_token(Lex.KwVal) {
+        if match_token(KwVal) {
             return parse_val_decl()
         }
-        if match_token(Lex.KwVar) {
+        if match_token(KwVar) {
             return parse_var_decl()
         }
-        if match_token(Lex.KwFun) {
+        if match_token(KwFun) {
             return parse_fun_stmt()
         }
-        if check(Lex.KwType) {
+        if check(KwType) {
             val decl = parse_type_decl(Priv)?
             return Ok(ast.alloc_stmt(decl.span, LocalDeclS(decl.decl)))
         }
-        if check(Lex.KwTrait) {
+        if check(KwTrait) {
             val decl = parse_trait_decl(Priv)?
             return Ok(ast.alloc_stmt(decl.span, LocalDeclS(decl.decl)))
         }
-        if match_token(Lex.KwReturn) {
+        if match_token(KwReturn) {
             return parse_return_stmt()
         }
-        if match_token(Lex.KwDefer) {
+        if match_token(KwDefer) {
             return parse_defer_stmt()
         }
-        if match_token(Lex.KwThrow) {
+        if match_token(KwThrow) {
             return parse_throw_stmt()
         }
-        if match_token(Lex.KwBreak) {
+        if match_token(KwBreak) {
             val tok = previous()
             return Ok(ast.alloc_stmt(Span(tok.line, tok.column), BreakS))
         }
-        if match_token(Lex.KwContinue) {
+        if match_token(KwContinue) {
             val tok = previous()
             return Ok(ast.alloc_stmt(Span(tok.line, tok.column), ContinueS))
         }
-        if match_token(Lex.KwFor) {
+        if match_token(KwFor) {
             return parse_for_stmt()
         }
-        if match_token(Lex.KwWhile) {
+        if match_token(KwWhile) {
             return parse_while_stmt()
         }
-        if match_token(Lex.KwLoop) {
+        if match_token(KwLoop) {
             return parse_loop_stmt()
         }
         parse_expr_or_assignment_stmt()
@@ -2601,20 +2601,20 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     fun &parse_fun_stmt(): Throw<i64, PErr> {
         val fun_tok = previous()
         val span = Span(fun_tok.line, fun_tok.column)
-        if check(Lex.Identifier) && !check_identifier("in") {
-            val name_tok = expect(Lex.Identifier, "expected function name")?
+        if check(Identifier) && !check_identifier("in") {
+            val name_tok = expect(Identifier, "expected function name")?
             val type_params = List.empty()
             if match_token(Lex.Lt) {
                 parse_type_param_list(type_params)?
                 expect_close_angle("expected '>' to close type parameter list")?
             }
             val params = List.empty()
-            expect(Lex.LParen, "expected '('")?
-            if !check(Lex.RParen) {
+            expect(LParen, "expected '('")?
+            if !check(RParen) {
                 parse_param_list(params)?
             }
-            expect(Lex.RParen, "expected ')'")?
-            val return_type = if match_token(Lex.Colon) {
+            expect(RParen, "expected ')'")?
+            val return_type = if match_token(Colon) {
                 parse_type()?
             } else {
                 null
@@ -2625,12 +2625,12 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
             return Ok(ast.alloc_stmt(span, LocalDeclS(decl)))
         }
         val params = List.empty()
-        expect(Lex.LParen, "expected '('")?
-        if !check(Lex.RParen) {
+        expect(LParen, "expected '('")?
+        if !check(RParen) {
             parse_param_list(params)?
         }
-        expect(Lex.RParen, "expected ')'")?
-        expect(Lex.Colon, "expected ':' followed by return type in lambda")?
+        expect(RParen, "expected ')'")?
+        expect(Colon, "expected ':' followed by return type in lambda")?
         val return_type = parse_type()?
         val body_expr = parse_expr()?
         val lambda = ast.alloc_expr(span, LambdaE(params.as_array(), LBlock(body_expr), false, return_type))
@@ -2639,8 +2639,8 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_val_decl(): Throw<i64, PErr> {
         val val_tok = previous()
-        val name_tok = expect(Lex.Identifier, "expected variable name")?
-        val ta = if match_token(Lex.Colon) {
+        val name_tok = expect(Identifier, "expected variable name")?
+        val ta = if match_token(Colon) {
             parse_type()?
         } else {
             null
@@ -2653,8 +2653,8 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_var_decl(): Throw<i64, PErr> {
         val var_tok = previous()
-        val name_tok = expect(Lex.Identifier, "expected variable name")?
-        val ta = if match_token(Lex.Colon) {
+        val name_tok = expect(Identifier, "expected variable name")?
+        val ta = if match_token(Colon) {
             parse_type()?
         } else {
             null
@@ -2667,7 +2667,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_return_stmt(): Throw<i64, PErr> {
         val return_tok = previous()
-        val value = if !check(Lex.RBrace) && !is_stmt_start() && !is_at_end() {
+        val value = if !check(RBrace) && !is_stmt_start() && !is_at_end() {
             parse_expr()?
         } else {
             null
@@ -2697,8 +2697,8 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     fun &parse_for_stmt(): Throw<i64, PErr> {
         val for_tok = previous()
         val span = Span(for_tok.line, for_tok.column)
-        val name_tok = expect(Lex.Identifier, "expected iterator variable name")?
-        expect(Lex.KwIn, "expected 'in'")?
+        val name_tok = expect(Identifier, "expected iterator variable name")?
+        expect(KwIn, "expected 'in'")?
         reject_paren_condition("for")?
         val iterable = parse_expr()?
         val body = parse_unary()?
@@ -2754,16 +2754,16 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun peek_compound_assign(): COp? {
         val k = peek().kind
-        if k == Lex.PlusEq { return AddA }
-        if k == Lex.MinusEq { return SubA }
-        if k == Lex.StarEq { return MulA }
-        if k == Lex.SlashEq { return DivA }
-        if k == Lex.PercentEq { return ModA }
-        if k == Lex.AmpEq { return BitAndA }
-        if k == Lex.PipeEq { return BitOrA }
-        if k == Lex.CaretEq { return BitXorA }
-        if k == Lex.LtLtEq { return ShlA }
-        if k == Lex.GtGtEq { return ShrA }
+        if k == PlusEq { return AddA }
+        if k == MinusEq { return SubA }
+        if k == StarEq { return MulA }
+        if k == SlashEq { return DivA }
+        if k == PercentEq { return ModA }
+        if k == AmpEq { return BitAndA }
+        if k == PipeEq { return BitOrA }
+        if k == CaretEq { return BitXorA }
+        if k == LtLtEq { return ShlA }
+        if k == GtGtEq { return ShrA }
         null
     }
 
@@ -2775,7 +2775,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
 
     fun &parse_or_pattern(): Throw<i64, PErr> {
         var left = parse_primary_pattern()?
-        while match_token(Lex.Pipe) {
+        while match_token(Pipe) {
             val pipe_tok = previous()
             val right = parse_primary_pattern()?
             left = ast.alloc_pattern(Span(pipe_tok.line, pipe_tok.column), POr(left, right))
@@ -2784,63 +2784,63 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     }
 
     fun &parse_primary_pattern(): Throw<i64, PErr> {
-        if check(Lex.Identifier) && lexeme_of(peek()) == "_" {
+        if check(Identifier) && lexeme_of(peek()) == "_" {
             val tok = advance()
             return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PWild))
         }
-        if match_token(Lex.NullLiteral) {
+        if match_token(NullLiteral) {
             val tok = previous()
             return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PLit(PLNull)))
         }
-        if match_token(Lex.TrueLiteral) {
+        if match_token(TrueLiteral) {
             val tok = previous()
             return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PLit(PLBool(true))))
         }
-        if match_token(Lex.FalseLiteral) {
+        if match_token(FalseLiteral) {
             val tok = previous()
             return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PLit(PLBool(false))))
         }
-        if match_token(Lex.IntLiteral) {
+        if match_token(IntLiteral) {
             val tok = previous()
             return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PLit(PLInt(lexeme_of(tok)))))
         }
-        if match_token(Lex.FloatLiteral) {
+        if match_token(FloatLiteral) {
             val tok = previous()
             return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PLit(PLFloat(lexeme_of(tok)))))
         }
-        if match_token(Lex.CharLiteral) {
+        if match_token(CharLiteral) {
             val tok = previous()
             return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PLit(PLChar(parse_char_value(lexeme_of(tok))))))
         }
-        if match_token(Lex.StringLiteral) {
+        if match_token(StringLiteral) {
             val tok = previous()
             val lb = lexeme_of(tok).bytes()
             val value = (lb[1 as usize..(lb.len() - 1) as usize]) as str
             return Ok(ast.alloc_pattern(Span(tok.line, tok.column), PLit(PLStr(value))))
         }
-        if match_token(Lex.LParen) {
+        if match_token(LParen) {
             return parse_record_pattern()
         }
-        if check(Lex.KwVal) || check(Lex.KwVar) {
+        if check(KwVal) || check(KwVar) {
             val name_tok = advance()
-            if check(Lex.LParen) {
+            if check(LParen) {
                 return parse_constructor_pattern(name_tok)
             }
             return Ok(ast.alloc_pattern(Span(name_tok.line, name_tok.column), PVar(lexeme_of(name_tok))))
         }
-        if check(Lex.Identifier) {
+        if check(Identifier) {
             val name_tok = advance()
-            if check(Lex.Dot) {
+            if check(Dot) {
                 // 限定构造器路径 A.TEf(...):点分链只能是构造器(变量名无点)
                 // —— 带 '(' 为带参形态,否则空参形态。
                 val span = Span(name_tok.line, name_tok.column)
                 val name = parse_name_path_tail(name_tok, "expected pattern name after '.'")?
-                if check(Lex.LParen) {
+                if check(LParen) {
                     return parse_constructor_pattern_at(name, span)
                 }
                 return Ok(ast.alloc_pattern(span, PCtor(name, [])))
             }
-            if check(Lex.LParen) {
+            if check(LParen) {
                 return parse_constructor_pattern(name_tok)
             }
             return Ok(ast.alloc_pattern(Span(name_tok.line, name_tok.column), PVar(lexeme_of(name_tok))))
@@ -2856,16 +2856,16 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
     fun &parse_constructor_pattern_at(name: str, span: Span): Throw<i64, PErr> {
         advance()
         val patterns = List.empty()
-        if !check(Lex.RParen) {
+        if !check(RParen) {
             patterns.push(parse_pattern()?)
-            while match_token(Lex.Comma) {
-                if check(Lex.RParen) {
+            while match_token(Comma) {
+                if check(RParen) {
                     break
                 }
                 patterns.push(parse_pattern()?)
             }
         }
-        expect(Lex.RParen, "expected ')'")?
+        expect(RParen, "expected ')'")?
         Ok(ast.alloc_pattern(span, PCtor(name, patterns.as_array())))
     }
 
@@ -2873,24 +2873,24 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
         val lparen = previous()
         val span = Span(lparen.line, lparen.column)
         val fields = List.empty()
-        if !check(Lex.RParen) {
-            if peek().kind == Lex.Identifier {
+        if !check(RParen) {
+            if peek().kind == Identifier {
                 val saved = current
                 val name_tok = advance()
-                if check(Lex.Colon) {
+                if check(Colon) {
                     advance()
                     val pattern = parse_pattern()?
                     fields.push(Prf(lexeme_of(name_tok), pattern))
-                    while match_token(Lex.Comma) {
-                        if check(Lex.RParen) {
+                    while match_token(Comma) {
+                        if check(RParen) {
                             break
                         }
-                        val field_name = expect(Lex.Identifier, "expected field name")?
-                        expect(Lex.Colon, "expected ':'")?
+                        val field_name = expect(Identifier, "expected field name")?
+                        expect(Colon, "expected ':'")?
                         val field_pattern = parse_pattern()?
                         fields.push(Prf(lexeme_of(field_name), field_pattern))
                     }
-                    expect(Lex.RParen, "expected ')'")?
+                    expect(RParen, "expected ')'")?
                     return Ok(ast.alloc_pattern(span, PRecord(fields.as_array())))
                 }
                 current = saved
@@ -2898,8 +2898,8 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
             val first = parse_pattern()?
             fields.push(Prf(int_to_key(0), first))
             var idx: i64 = 1
-            while match_token(Lex.Comma) {
-                if check(Lex.RParen) {
+            while match_token(Comma) {
+                if check(RParen) {
                     break
                 }
                 val p = parse_pattern()?
@@ -2907,7 +2907,7 @@ pub type Parser = Parser(src: u8[], toks: Tk[], current: i64, ast: AstArena, err
                 idx = idx + 1
             }
         }
-        expect(Lex.RParen, "expected ')'")?
+        expect(RParen, "expected ')'")?
         Ok(ast.alloc_pattern(span, PRecord(fields.as_array())))
     }
 }
@@ -2937,7 +2937,7 @@ type ArgsRes = ArgsRes(args: i64[], type_args: i64[])
 
 // 入口:源文本 → 模块。
 pub fun parse_module_text(source: str, module_name: str): Throw<ModuleAst, PErr> {
-    val toks = Lex.tokenize(source)
+    val toks = tokenize(source)
     val p = Parser(source.bytes(), toks.as_array(), 0, Ast.new_arena(),
         List.empty(), false, false, false)
     p.parse_module(module_name)

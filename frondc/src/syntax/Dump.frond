@@ -5,9 +5,9 @@
 // diff_ast.sh。
 
 import std.core.types.Str
-import syntax.Lex
-import syntax.Ast
-import syntax.Parse
+import syntax.Lex.{lexeme, tokenize}
+import syntax.Ast.{print_module}
+import syntax.Parse.{parse_module_text}
 
 // {:>4} 的对位:右对齐补空格。
 fun pad_left(s: str, width: i64): str {
@@ -31,14 +31,14 @@ fun pad_right(s: str, width: i64): str {
 
 // 一行 token 输出:与 Rust debug_tokens 的 "{:>4}:{:<3} {:<20} {}" 对位。
 fun format_line(sb: u8[], t: Tk): str {
-    val lex = Lex.lexeme(sb, t)
+    val lex = lexeme(sb, t)
     pad_left("{t.line}", 4) + ":" + pad_right("{t.column}", 3) + " " +
         pad_right(t.kind.repr(), 20) + " " + lex
 }
 
 fun dump_tokens(text: str): void {
     val sb = text.bytes()
-    val toks = Lex.tokenize(text)
+    val toks = tokenize(text)
     var i: i64 = 0
     val count = toks.len() as i64
     while i < count {
@@ -51,8 +51,8 @@ fun dump_tokens(text: str): void {
 }
 
 fun dump_ast(text: str): void {
-    match Parse.parse_module_text(text, "stdin") {
-        Ok(m) => { print(Ast.print_module(m)) }
+    match parse_module_text(text, "stdin") {
+        Ok(m) => { print(print_module(m)) }
         Error(e) => { println("Parse error at {e.line}:{e.column}: {e.message}") }
     }
 }

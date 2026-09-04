@@ -15,7 +15,7 @@ import std.collections.Map
 import std.core.types.Str
 import syntax.Ast
 import sema.Data
-import sema.Envs
+import sema.Envs.{new_enva}
 
 pub type SemaRes = SemaRes(
     // ── 类型定义表 ──
@@ -92,7 +92,7 @@ pub fun new_semares(): SemaRes {
         Map.empty<str, List<i64>>(), Map.empty<str, i64>(),
         List.empty<WEnt>(), Map.empty<str, i64>(),
         "", Map.empty<str, str>(), List.empty<str>(), List.empty<str>(), List.empty<str>(),
-        Map.empty<str, u32>(), Envs.new_enva(), Map.empty<str, str>(),
+        Map.empty<str, u32>(), new_enva(), Map.empty<str, str>(),
         List.empty<Mono>(), List.empty<TDefI>(), List.empty<InhI>(),
         0,
         Map.empty<str, u32>(), Map.empty<str, bool>(),

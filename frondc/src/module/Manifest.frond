@@ -10,8 +10,8 @@ import std.os.Os
 import std.io.Fs
 import std.io.Path
 import std.core.types.Str
-import module.Loader
-import module.Toml
+import module.Loader.{join_path, read_text}
+import module.Toml.{manifest_from}
 
 fun norm_path(p: str): str { Str.replace(p, "\\", "/") }
 
@@ -32,7 +32,7 @@ async fun find_root_toml(entry: str): Async<str?> {
         if dir == "" {
             return null
         }
-        match Loader.read_text(Loader.join_path(dir, "Root.toml")).await() {
+        match read_text(join_path(dir, "Root.toml")).await() {
             null => {}
             content => { return content }
         }
@@ -55,7 +55,7 @@ async fun render_manifest(entry: str): Async<str> {
             match Toml.parse(content) {
                 Error(_) => { header + "root=bad\n" },
                 Ok(kvs) => {
-                    match Toml.manifest_from(kvs) {
+                    match manifest_from(kvs) {
                         null => { header + "root=bad\n" },
                         m => {
                             header + "root=yes name={m.name} entry={m.entry}"
@@ -88,9 +88,9 @@ async fun resolve_std_root(flag: str): Async<str?> {
                 if dir == "" {
                     return null
                 }
-                val probe = Loader.join_path(dir, "std/builtin/io/Raw.frond")
+                val probe = join_path(dir, "std/builtin/io/Raw.frond")
                 match Fs.exists(Path.from(probe)).await() {
-                    Ok(true) => { return Loader.join_path(dir, "std") }
+                    Ok(true) => { return join_path(dir, "std") }
                     _ => {}
                 }
                 val next = parent_dir_of(dir)

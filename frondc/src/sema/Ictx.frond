@@ -5,10 +5,10 @@
 import std.collections.List
 import std.collections.Map
 import syntax.Ast
-import types.Arena
+import types.Arena.{fresh_rigid_var, make_async, make_atomic, make_channel, make_foreign_fn, make_generic, make_lazy, make_receiver, make_sender, make_throw}
 import types.Ty
 
-import sema.Data
+import sema.Data.{new_flow, new_solver}
 
 pub type ICtx = ICtx(
     // 泛型作用域类型绑定栈(帧栈,内层优先)。
@@ -44,7 +44,7 @@ pub type ICtx = ICtx(
 
 pub fun new_ictx(): ICtx {
     ICtx(List.empty<Map<str, u32>>(), List.empty<u32>(), null, Map.empty<str, u32>(), null, null, "",
-        null, Data.new_solver(), Data.new_flow(), "", null, List.empty<DCall>(), Map.empty<str, bool>())
+        null, new_solver(), new_flow(), "", null, List.empty<DCall>(), Map.empty<str, bool>())
 }
 
 // reset_state(引擎 Core.rs:期望返回/绑定栈/solver/flow;env 不动)。
@@ -52,8 +52,8 @@ pub fun reset_state(ctx: ICtx): void {
     ctx.expected_return = null
     ctx.tb_frames = List.empty<Map<str, u32>>()
     ctx.this_stack = List.empty<u32>()
-    ctx.solver = Data.new_solver()
-    ctx.flow = Data.new_flow()
+    ctx.solver = new_solver()
+    ctx.flow = new_flow()
 }
 
 // ─── 绑定栈 ───────────────────────────────────────────────────────
@@ -64,7 +64,7 @@ pub fun push_type_bindings(ctx: ICtx, a: TypeArena, tps: Tp[]): void {
     var i: usize = 0
     while i < tps.len() {
         val tp = tps[i]
-        val var_h = Arena.fresh_rigid_var(a)
+        val var_h = fresh_rigid_var(a)
         insert_top(ctx, tp.name, var_h)
         i = i + 1
     }
@@ -143,23 +143,23 @@ pub fun is_builtin_generic_type(name: str): bool {
 // 构造专属变体;元数不符回退 Generic(容错)。
 pub fun make_builtin_generic(a: TypeArena, name: str, args: u32[]): u32 {
     if name == "Throw" && args.len() == 2 {
-        Arena.make_throw(a, args[0], args[1])
+        make_throw(a, args[0], args[1])
     } else if name == "Channel" && args.len() == 1 {
-        Arena.make_channel(a, args[0])
+        make_channel(a, args[0])
     } else if name == "Async" && args.len() == 1 {
-        Arena.make_async(a, args[0])
+        make_async(a, args[0])
     } else if name == "Lazy" && args.len() == 1 {
-        Arena.make_lazy(a, args[0])
+        make_lazy(a, args[0])
     } else if name == "Atomic" && args.len() == 1 {
-        Arena.make_atomic(a, args[0])
+        make_atomic(a, args[0])
     } else if name == "Sender" && args.len() == 1 {
-        Arena.make_sender(a, args[0])
+        make_sender(a, args[0])
     } else if name == "Receiver" && args.len() == 1 {
-        Arena.make_receiver(a, args[0])
+        make_receiver(a, args[0])
     } else if name == "ForeignFn" && args.len() == 1 {
-        Arena.make_foreign_fn(a, args[0])
+        make_foreign_fn(a, args[0])
     } else {
-        Arena.make_generic(a, name, args)
+        make_generic(a, name, args)
     }
 }
 

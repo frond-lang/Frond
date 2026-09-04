@@ -31,27 +31,27 @@ import std.collections.Map
 import std.core.types.Str
 import builtin.io.Console
 import syntax.Lex
-import syntax.Ast
-import syntax.Parse
-import syntax.Dump
-import syntax.AstCodec
-import module.Loader
-import module.Manifest
+import syntax.Ast.{print_module}
+import syntax.Parse.{parse_module_text}
+import syntax.Dump.{canonical_std_entry_name, dump_ast, dump_tokens}
+import syntax.AstCodec.{decode_module, encode_module}
+import module.Loader.{force_load_std, load_transitive_imports, new_loader, preload_builtins, read_text, render_graph}
+import module.Manifest.{norm_path, parent_dir_of, render_manifest, resolve_std_root}
 import module.Toml
 import module.StdPaths
-import module.AstDiskCache
+import module.AstDiskCache.{flush, warm}
 import types.Tyops
 import types.Arena
 import sema.Data
-import sema.Envs
-import sema.Semares
-import sema.Ictx
-import sema.Populate
-import sema.Modenv
-import sema.Check
-import sema.Sdump
-import backend.Back
-import backend.Toolchain
+import sema.Envs.{root}
+import sema.Semares.{SErr, find_last_sub, new_semares}
+import sema.Ictx.{new_ictx}
+import sema.Populate.{populate_module}
+import sema.Modenv.{predeclare_declarations, predeclare_declarations_with_origin, register_builtins, register_module_aliases}
+import sema.Check.{check_module_with_env}
+import sema.Sdump.{render}
+import backend.Back.{lower_entry}
+import backend.Toolchain.{link, toolchain_dir}
 import std.os.Info
 
 // 单入口的完整 load-dump v1(与 Rust dump_load 逐字节对齐)。
@@ -59,36 +59,36 @@ import std.os.Info
 async fun dump_load_entry(entry_raw: str, std_root: str?, std_cache: Map<str, ModuleAst>): void {
     // 全程用规范化路径(反斜杠 → /):manifest 爬链、读文件、parse。
     // entry_raw 只在 readfail 诊断行里原样保留。
-    val entry = Manifest.norm_path(entry_raw)
+    val entry = norm_path(entry_raw)
     println("load-dump v1")
-    print(Manifest.render_manifest(entry).await())
+    print(render_manifest(entry).await())
 
-    match Loader.read_text(entry).await() {
+    match read_text(entry).await() {
         null => {
             println("! fatal")
             println("readfail " + entry_raw)
         },
         text => {
-            match Parse.parse_module_text(text, entry) {
+            match parse_module_text(text, entry) {
                 Error(e) => {
                     println("! fatal")
                     println("parsefail {e.line}:{e.column}: {e.message}")
                 },
                 Ok(entry_module) => {
-                    val loader = Loader.new_loader(std_root, std_cache)
-                    Loader.preload_builtins(loader).await()
-                    loader.search.push(Manifest.parent_dir_of(entry))
+                    val loader = new_loader(std_root, std_cache)
+                    preload_builtins(loader).await()
+                    loader.search.push(parent_dir_of(entry))
                     // std-first:先全量载 std(终局反正要载),兄弟回退 5b
                     // 退化为缓存查询 — 消除 Rust"5b 试探解析 + force 重解
                     // 析"的双重浪费;依赖图后序不受影响(算法同,只是
                     // 步骤 3 全程缓存命中)。
-                    Loader.force_load_std(loader).await()
-                    val dep_keys = Loader.load_transitive_imports(loader, entry_module).await()
+                    force_load_std(loader).await()
+                    val dep_keys = load_transitive_imports(loader, entry_module).await()
                     // deps(后序)/modules(逻辑路径字节序)/errors(发生序):
                     // render_graph 与 Rust dump_load 逐字节对齐。sema 归
                     // check/checkmany(dump_sema_entry)——此处的 run_sema 试跑
                     // 是 M2 期误接,破坏 diff_load 字节契约,已摘除。
-                    print(Loader.render_graph(loader, dep_keys))
+                    print(render_graph(loader, dep_keys))
                 },
             }
         },
@@ -113,7 +113,7 @@ async fun cmd_load(cmd: str, args: str[]): void {
         println("usage: frondc {cmd} [--std <dir>] <entry>...")
         return
     }
-    match Manifest.resolve_std_root(std_flag).await() {
+    match resolve_std_root(std_flag).await() {
         null => {
             println("frondc: std root not found (pass --std <dir> or set FRONDC_STD_ROOT)")
         },
@@ -123,7 +123,7 @@ async fun cmd_load(cmd: str, args: str[]): void {
             // 逐编译全量重解析)。盘快照(AstDiskCache)在此之上再跨进程:
             // 预载有效快照 → 本轮只解析 miss 的 → 结束回写。
             val dcache = AstDiskCache.open().await()
-            val warmed = AstDiskCache.warm(dcache, root).await()
+            val warmed = warm(dcache, root).await()
             val std_cache = warmed.cache
             var j: usize = 0
             while j < entries.len() {
@@ -134,7 +134,7 @@ async fun cmd_load(cmd: str, args: str[]): void {
                 dump_load_entry(entry, root, std_cache).await()
                 j = j + 1
             }
-            AstDiskCache.flush(dcache, root, std_cache, warmed.from_disk).await()
+            flush(dcache, root, std_cache, warmed.from_disk).await()
         },
     }
 }
@@ -165,7 +165,7 @@ fun loader_module(loader: Loader, key: str): ModuleAst? {
 fun check_one(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAst,
     root_env: u32, std_env: u32, all_modules: List<ModuleAst>, use_std_env: bool): void {
     val env0 = if use_std_env { std_env } else { root_env }
-    Check.check_module_with_env(ctx, a, s, m, env0, all_modules)
+    check_module_with_env(ctx, a, s, m, env0, all_modules)
 }
 
 // 分段诊断(镜像 Rust run_sema_pipeline_or_exit 的 stderr 契约):每模块
@@ -176,14 +176,14 @@ fun print_diag_segment(s: SemaRes, err_base: usize, warn_base: usize,
     fallback: str, err_use_path: bool): void {
     var ei: usize = err_base
     while ei < s.errors.len() {
-        val e0 = s.errors.get(ei) ?? Semares.SErr("", 0, 0, null)
+        val e0 = s.errors.get(ei) ?? SErr("", 0, 0, null)
         val p = if err_use_path { (e0.file_path ?? fallback) } else { fallback }
         eprintln("{p}:{e0.line}:{e0.column}: {e0.message}")
         ei = ei + 1
     }
     var wi: usize = warn_base
     while wi < s.warnings.len() {
-        val w0 = s.warnings.get(wi) ?? Semares.SErr("", 0, 0, null)
+        val w0 = s.warnings.get(wi) ?? SErr("", 0, 0, null)
         val wp = w0.file_path ?? fallback
         eprintln("{wp}:{w0.line}:{w0.column}: warning: {w0.message}")
         wi = wi + 1
@@ -194,14 +194,14 @@ fun print_diag_segment(s: SemaRes, err_base: usize, warn_base: usize,
 type SemaOk = SemaOk(pub a: TypeArena, pub s: SemaRes)
 
 // 全 sema 管线(诊断即时 stderr;有错 = null)。check 与 native 共用;
-// check 再走 Sdump.render,native 走 backend.Back.lower_entry。
+// check 再走 render,native 走 backend.Back.lower_entry。
 fun run_sema_core(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
     entry_filename: str): SemaOk? {
     val a = types.Arena.new_arena()
-    val s = Semares.new_semares()
-    val ctx = Ictx.new_ictx()
-    val root_env = Envs.root(s.env)
-    Modenv.register_builtins(ctx, a, s, root_env)
+    val s = new_semares()
+    val ctx = new_ictx()
+    val root_env = root(s.env)
+    register_builtins(ctx, a, s, root_env)
     val std_env = Envs.child(s.env, root_env)
     s.module_envs.set("std.layer", std_env)
     val all_keys = loader.modules.keys()
@@ -211,7 +211,7 @@ fun run_sema_core(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
         logical_paths.push(key_to_logical(all_keys[i]))
         i = i + 1
     }
-    Modenv.register_module_aliases(ctx, a, s, root_env, std_env, logical_paths)
+    register_module_aliases(ctx, a, s, root_env, std_env, logical_paths)
     i = 0
     while i < logical_paths.len() {
         val p = logical_paths.get(i) ?? ""
@@ -225,7 +225,7 @@ fun run_sema_core(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
     while i < builtin_paths.len() {
         match loader_module(loader, builtin_paths[i]) {
             null => {}
-            m => { Modenv.predeclare_declarations(ctx, a, s, m, root_env) }
+            m => { predeclare_declarations(ctx, a, s, m, root_env) }
         }
         i = i + 1
     }
@@ -258,7 +258,7 @@ fun run_sema_core(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
     all_modules.push(entry_module)
     i = 0
     while i < all_modules.len() {
-        Populate.populate_module(a, s, all_modules.get(i) ?? entry_module, all_modules)
+        populate_module(a, s, all_modules.get(i) ?? entry_module, all_modules)
         i = i + 1
     }
     val std_paths2 = StdPaths.std_paths()
@@ -267,7 +267,7 @@ fun run_sema_core(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
         match loader_module(loader, std_paths2[i]) {
             null => {}
             m => {
-                Modenv.predeclare_declarations_with_origin(ctx, a, s, m, std_env, key_to_logical(std_paths2[i]))
+                predeclare_declarations_with_origin(ctx, a, s, m, std_env, key_to_logical(std_paths2[i]))
             },
         }
         i = i + 1
@@ -276,7 +276,7 @@ fun run_sema_core(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
     while i < dep_keys.len() {
         match loader_module(loader, dep_keys.get(i) ?? "") {
             null => {}
-            m => { Modenv.predeclare_declarations(ctx, a, s, m, root_env) }
+            m => { predeclare_declarations(ctx, a, s, m, root_env) }
         }
         i = i + 1
     }
@@ -289,7 +289,7 @@ fun run_sema_core(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
             m => {
                 val eb = s.errors.len()
                 val wb = s.warnings.len()
-                Check.check_module_with_env(ctx, a, s, m, root_env, all_modules)
+                check_module_with_env(ctx, a, s, m, root_env, all_modules)
                 print_diag_segment(s, eb, wb, builtin_paths[i], true)
             },
         }
@@ -302,7 +302,7 @@ fun run_sema_core(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
             m => {
                 val eb = s.errors.len()
                 val wb = s.warnings.len()
-                Check.check_module_with_env(ctx, a, s, m, std_env, all_modules)
+                check_module_with_env(ctx, a, s, m, std_env, all_modules)
                 print_diag_segment(s, eb, wb, std_paths2[i], false)
             },
         }
@@ -315,7 +315,7 @@ fun run_sema_core(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
             m => {
                 val eb = s.errors.len()
                 val wb = s.warnings.len()
-                Check.check_module_with_env(ctx, a, s, m, root_env, all_modules)
+                check_module_with_env(ctx, a, s, m, root_env, all_modules)
                 print_diag_segment(s, eb, wb, dep_keys.get(i) ?? "", false)
             },
         }
@@ -324,7 +324,7 @@ fun run_sema_core(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
     {
         val eb = s.errors.len()
         val wb = s.warnings.len()
-        Check.check_module_with_env(ctx, a, s, entry_module, root_env, all_modules)
+        check_module_with_env(ctx, a, s, entry_module, root_env, all_modules)
         print_diag_segment(s, eb, wb, entry_filename, false)
     }
     if s.errors.len() > 0 {
@@ -337,11 +337,11 @@ fun run_sema(loader: Loader, dep_keys: List<str>, entry_module: ModuleAst,
     entry_filename: str): str? {
     match run_sema_core(loader, dep_keys, entry_module, entry_filename) {
         null => { null }
-        ok => { Sdump.render(ok.a, ok.s) }
+        ok => { render(ok.a, ok.s) }
     }
 }
 
-// std 文件直入时按 std 键名归类(与引擎 Dump.canonical_std_entry_name 同规):
+// std 文件直入时按 std 键名归类(与引擎 canonical_std_entry_name 同规):
 // 入口位于 std 根下、且键在 StdPaths 清单内 → 用键名当模块名,让
 // @internal 等 std 专属属性保持合法;否则维持原路径(用户入口)。
 // (引擎侧另做内容核对——嵌入副本与磁盘一致性;镜像的 std 就是磁盘
@@ -368,24 +368,24 @@ fun std_entry_module_name(entry: str, std_root: str): str {
 }
 
 async fun dump_sema_entry(entry_raw: str, std_root: str, std_cache: Map<str, ModuleAst>): void {
-    val entry = Manifest.norm_path(entry_raw)
-    match Loader.read_text(entry).await() {
+    val entry = norm_path(entry_raw)
+    match read_text(entry).await() {
         null => {
             println("! fatal")
             println("readfail " + entry_raw)
         },
         text => {
-            match Parse.parse_module_text(text, std_entry_module_name(entry, std_root)) {
+            match parse_module_text(text, std_entry_module_name(entry, std_root)) {
                 Error(e) => {
                     println("! fatal")
                     println("parsefail {e.line}:{e.column}: {e.message}")
                 },
                 Ok(entry_module) => {
-                    val loader = Loader.new_loader(std_root, std_cache)
-                    Loader.preload_builtins(loader).await()
-                    loader.search.push(Manifest.parent_dir_of(entry))
-                    Loader.force_load_std(loader).await()
-                    val dep_keys = Loader.load_transitive_imports(loader, entry_module).await()
+                    val loader = new_loader(std_root, std_cache)
+                    preload_builtins(loader).await()
+                    loader.search.push(parent_dir_of(entry))
+                    force_load_std(loader).await()
+                    val dep_keys = load_transitive_imports(loader, entry_module).await()
                     match run_sema(loader, dep_keys, entry_module, entry) {
                         null => {},
                         dump => { print(dump) },
@@ -414,7 +414,7 @@ async fun cmd_check(cmd: str, args: str[]): void {
         println("usage: frondc {cmd} [--std <dir>] <entry>...")
         return
     }
-    match Manifest.resolve_std_root(std_flag).await() {
+    match resolve_std_root(std_flag).await() {
         null => {
             println("frondc: std root not found (pass --std <dir> or set FRONDC_STD_ROOT)")
         },
@@ -422,7 +422,7 @@ async fun cmd_check(cmd: str, args: str[]): void {
             // std 解析缓存三层:进程内共享(std_cache)+ 跨进程盘快照
             // (AstDiskCache 预载/回写,FRONDC_NO_AST_CACHE 可禁用)。
             val dcache = AstDiskCache.open().await()
-            val warmed = AstDiskCache.warm(dcache, root).await()
+            val warmed = warm(dcache, root).await()
             val std_cache = warmed.cache
             var j: usize = 0
             while j < entries.len() {
@@ -433,7 +433,7 @@ async fun cmd_check(cmd: str, args: str[]): void {
                 dump_sema_entry(entry, root, std_cache).await()
                 j = j + 1
             }
-            AstDiskCache.flush(dcache, root, std_cache, warmed.from_disk).await()
+            flush(dcache, root, std_cache, warmed.from_disk).await()
         },
     }
 }
@@ -443,7 +443,7 @@ async fun cmd_check(cmd: str, args: str[]): void {
 // 跑产物回显退出码(切片 0 验收口径:main 整型返回 = 进程退出码)。
 fun out_base(entry: str): str {
     var seg = entry
-    val pos = Semares.find_last_sub(entry, "/")
+    val pos = find_last_sub(entry, "/")
     if pos >= 0 {
         seg = Str.substring(entry, (pos + 1) as usize, entry.len())
     }
@@ -458,22 +458,22 @@ fun out_base(entry: str): str {
 
 async fun native_entry(entry_raw: str, std_root: str, do_run: bool,
     std_cache: Map<str, ModuleAst>): void {
-    val entry = Manifest.norm_path(entry_raw)
-    match Loader.read_text(entry).await() {
+    val entry = norm_path(entry_raw)
+    match read_text(entry).await() {
         null => {
             eprintln("frondc: native: readfail {entry_raw}")
         },
         text => {
-            match Parse.parse_module_text(text, std_entry_module_name(entry, std_root)) {
+            match parse_module_text(text, std_entry_module_name(entry, std_root)) {
                 Error(e) => {
                     eprintln("frondc: native: parsefail {e.line}:{e.column}: {e.message}")
                 },
                 Ok(entry_module) => {
-                    val loader = Loader.new_loader(std_root, std_cache)
-                    Loader.preload_builtins(loader).await()
-                    loader.search.push(Manifest.parent_dir_of(entry))
-                    Loader.force_load_std(loader).await()
-                    val dep_keys = Loader.load_transitive_imports(loader, entry_module).await()
+                    val loader = new_loader(std_root, std_cache)
+                    preload_builtins(loader).await()
+                    loader.search.push(parent_dir_of(entry))
+                    force_load_std(loader).await()
+                    val dep_keys = load_transitive_imports(loader, entry_module).await()
                     match run_sema_core(loader, dep_keys, entry_module, entry) {
                         null => {
                             eprintln("frondc: native: sema failed (diagnostics above)")
@@ -483,13 +483,13 @@ async fun native_entry(entry_raw: str, std_root: str, do_run: bool,
                             val os = Info.os_name()
                             val obj = base + ".o"
                             val exe = if os == "windows" { base + ".exe" } else { base }
-                            match Back.lower_entry(ok.a, ok.s, entry_module, obj) {
+                            match lower_entry(ok.a, ok.s, entry_module, obj) {
                                 Error(e) => {
                                     eprintln("frondc: native: lower/emit failed: {e}")
                                 },
                                 Ok(_) => {
                                     println("native: {obj} emitted")
-                                    match Toolchain.link(Toolchain.toolchain_dir(), os, Info.arch(), obj, exe) {
+                                    match link(toolchain_dir(), os, Info.arch(), obj, exe) {
                                         Error(e) => {
                                             eprintln("frondc: native: {e}")
                                         },
@@ -543,20 +543,20 @@ async fun cmd_native(args: str[]): void {
         println("usage: frondc native [--run] [--std <dir>] <entry>...")
         return
     }
-    match Manifest.resolve_std_root(std_flag).await() {
+    match resolve_std_root(std_flag).await() {
         null => {
             println("frondc: std root not found (pass --std <dir> or set FRONDC_STD_ROOT)")
         },
         root => {
             val dcache = AstDiskCache.open().await()
-            val warmed = AstDiskCache.warm(dcache, root).await()
+            val warmed = warm(dcache, root).await()
             val std_cache = warmed.cache
             var j: usize = 0
             while j < entries.len() {
                 native_entry(entries.get(j) ?? "", root, do_run, std_cache).await()
                 j = j + 1
             }
-            AstDiskCache.flush(dcache, root, std_cache, warmed.from_disk).await()
+            flush(dcache, root, std_cache, warmed.from_disk).await()
         },
     }
 }
@@ -599,9 +599,9 @@ async fun main(): void {
                 Ok(text) => {
                     println("@@FRONDC_SPLIT_9Q7Z@@ " + path)
                     if cmd == "lexmany" {
-                        Dump.dump_tokens(text)
+                        dump_tokens(text)
                     } else {
-                        Dump.dump_ast(text)
+                        dump_ast(text)
                     }
                 },
                 Error(e) => { println("@@FRONDC_SPLIT_9Q7Z@@ " + path + " @READFAIL@") },
@@ -614,19 +614,19 @@ async fun main(): void {
     match Fs.read_file(Path.from(path)).await() {
         Ok(text) => {
             if cmd == "lex" {
-                Dump.dump_tokens(text)
+                dump_tokens(text)
             } else if cmd == "astcheck" {
                 var fi: i64 = 1
                 while fi < args.len() as i64 {
                     val fpath = args[fi as usize]
                     match Fs.read_file(Path.from(fpath)).await() {
                         Ok(ftext) => {
-                            match Parse.parse_module_text(ftext, fpath) {
+                            match parse_module_text(ftext, fpath) {
                                 Ok(m) => {
-                                    val s1 = Ast.print_module(m)
-                                    val stream = AstCodec.encode_module(m)
-                                    val m2 = AstCodec.decode_module(stream)
-                                    val s2 = Ast.print_module(m2)
+                                    val s1 = print_module(m)
+                                    val stream = encode_module(m)
+                                    val m2 = decode_module(stream)
+                                    val s2 = print_module(m2)
                                     if s1 == s2 {
                                         println("ASTCHECK OK {fpath} exprs={m.arena.exprs.len()} stream={stream.len()}")
                                     } else {
@@ -641,7 +641,7 @@ async fun main(): void {
                     fi = fi + 1
                 }
             } else {
-                Dump.dump_ast(text)
+                dump_ast(text)
             }
         },
         Error(e) => { println("read error: {e}") },

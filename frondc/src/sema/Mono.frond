@@ -14,16 +14,16 @@ import std.collections.List
 import std.collections.Map
 import std.core.types.Str
 import syntax.Ast
-import types.Arena
+import types.Arena.{array_parts, display, fresh_type_var, make, make_adt, make_fn, make_generic, make_record, resolve}
 import types.Ty
 
-import sema.Data
-import sema.Envs
-import sema.Semares
-import sema.Ictx
-import sema.Populate
-import sema.Typeast
-import sema.Infer
+import sema.Data.{new_err_path, new_inst_ctx}
+import sema.Envs.{define, root}
+import sema.Semares.{get_expr, get_trait_def, get_type_def, list_has_str, list_remove_str, module_expr_key, module_logical_path, put_dispatch, put_expr, resolve_method_binding, resolve_trait_key, resolve_type_key, trait_def_idx, trait_effective_methods, trait_parent_closure}
+import sema.Ictx.{insert_top, new_ictx, push_type_bindings}
+import sema.Populate.{from_type_name_full, type_handle_name_matches, type_name_from_node}
+import sema.Typeast.{type_from_ast}
+import sema.Infer.{infer_expr}
 
 // ─── 类型节点展平解析(resolve_type_node_resolved 镜像)────────────
 // 注意:这是 monomorph 专用展平器,不是 type_from_ast/concretize ——
@@ -36,28 +36,28 @@ fun resolve_named_flat(a: TypeArena, s: SemaRes, name: str, type_args: u32[],
     // 1. type_args 名匹配(占位 Adt(形参名) 命中)。
     var i: usize = 0
     while i < type_args.len() {
-        if Populate.type_handle_name_matches(a, type_args[i], name) {
+        if type_handle_name_matches(a, type_args[i], name) {
             return type_args[i]
         }
         i = i + 1
     }
     // 2. 内建标量。
-    match Populate.from_type_name_full(name) {
+    match from_type_name_full(name) {
         null => {}
-        t => { return Arena.make(a, t) }
+        t => { return make(a, t) }
     }
     // 3. canonical + alias 链(visiting 环检测 + 深度保险丝 256)。
-    val canonical = Semares.resolve_type_key(s, name)
-    if Semares.list_has_str(visiting, canonical) {
-        return Arena.make_adt(a, canonical, [])
+    val canonical = resolve_type_key(s, name)
+    if list_has_str(visiting, canonical) {
+        return make_adt(a, canonical, [])
     }
     if visiting.len() >= 256 {
-        return Arena.make_adt(a, canonical, [])
+        return make_adt(a, canonical, [])
     }
     visiting.push(canonical)
     var target_ty: u32? = null
     var target_name: str? = null
-    match Semares.get_type_def(s, canonical) {
+    match get_type_def(s, canonical) {
         null => {}
         td => {
             target_ty = td.target_type
@@ -65,16 +65,16 @@ fun resolve_named_flat(a: TypeArena, s: SemaRes, name: str, type_args: u32[],
         },
     }
     if target_ty != null {
-        Semares.list_remove_str(visiting, canonical)
+        list_remove_str(visiting, canonical)
         return target_ty ?? 0
     }
     if target_name != null {
         val result = resolve_named_flat(a, s, target_name ?? "", type_args, visiting)
-        Semares.list_remove_str(visiting, canonical)
+        list_remove_str(visiting, canonical)
         return result
     }
-    Semares.list_remove_str(visiting, canonical)
-    Arena.make_adt(a, canonical, [])
+    list_remove_str(visiting, canonical)
+    make_adt(a, canonical, [])
 }
 
 pub fun resolve_tn_flat(a: TypeArena, s: SemaRes, type_ref: i64?, type_args: u32[],
@@ -96,44 +96,44 @@ pub fun resolve_tn_flat(a: TypeArena, s: SemaRes, type_ref: i64?, type_args: u32
                             inner => { return inner }
                         }
                     }
-                    Arena.make_generic(a, name, [])
+                    make_generic(a, name, [])
                 },
                 TNullable(inner) => {
                     resolve_tn_flat(a, s, inner, type_args, ast)
                 },
                 TRef(inner) => {
                     var iname = "ref"
-                    match Populate.type_name_from_node(ast, inner) {
+                    match type_name_from_node(ast, inner) {
                         null => {}
                         n => { iname = n }
                     }
-                    val canonical = Semares.resolve_type_key(s, iname)
-                    Arena.make_adt(a, canonical, [])
+                    val canonical = resolve_type_key(s, iname)
+                    make_adt(a, canonical, [])
                 },
                 TRawPtr(inner) => {
                     var iname = "ptr"
-                    match Populate.type_name_from_node(ast, inner) {
+                    match type_name_from_node(ast, inner) {
                         null => {}
                         n => { iname = n }
                     }
-                    val canonical = Semares.resolve_type_key(s, iname)
-                    Arena.make_adt(a, canonical, [])
+                    val canonical = resolve_type_key(s, iname)
+                    make_adt(a, canonical, [])
                 },
-                TRecord(_) => { Arena.make_record(a, [], null) },
+                TRecord(_) => { make_record(a, [], null) },
                 TFunction(_, _) => {
-                    val ret = Arena.make(a, TUnknown)
-                    Arena.make_fn(a, [], ret)
+                    val ret = make(a, TUnknown)
+                    make_fn(a, [], ret)
                 },
-                TArray(_, _) => { Arena.make_adt(a, "array", []) },
+                TArray(_, _) => { make_adt(a, "array", []) },
                 TThis => {
                     var i: usize = 0
                     while i < type_args.len() {
-                        if Populate.type_handle_name_matches(a, type_args[i], "This") {
+                        if type_handle_name_matches(a, type_args[i], "This") {
                             return type_args[i]
                         }
                         i = i + 1
                     }
-                    Arena.make_adt(a, "This", [])
+                    make_adt(a, "This", [])
                 },
                 TKindAnn(inner, _) => {
                     resolve_tn_flat(a, s, inner, type_args, ast)
@@ -290,7 +290,7 @@ pub fun mono_cache_key(a: TypeArena, module_name: str, func_name: str, type_args
     var key = "{module_name}\u{1}{func_name}"
     var i: usize = 0
     while i < type_args.len() {
-        key = key + "\u{1}" + Arena.display(a, type_args[i])
+        key = key + "\u{1}" + display(a, type_args[i])
         i = i + 1
     }
     key
@@ -323,7 +323,7 @@ pub fun infer_type_args(a: TypeArena, s: SemaRes, func_name: str, arguments: i64
                 null => {
                     Semares.add_error(s, new_err(
                         "failed to resolve type argument in {func_name}", 0, 0))
-                    args = args ++ [Arena.make(a, TUnknown)]
+                    args = args ++ [make(a, TUnknown)]
                 },
                 h => { args = args ++ [h ?? 0] },
             }
@@ -353,8 +353,8 @@ pub fun infer_type_args(a: TypeArena, s: SemaRes, func_name: str, arguments: i64
                 match fd_ast.ty(pt).node {
                     TNamed(pname) => {
                         if tp_has(type_params, pname) && !name_to_handle.has(pname) {
-                            val arg_key = Semares.module_expr_key(module_name, arguments[i])
-                            match Semares.get_expr(s, arg_key) {
+                            val arg_key = module_expr_key(module_name, arguments[i])
+                            match get_expr(s, arg_key) {
                                 null => {}
                                 info => { name_to_handle.set(pname, info ?? 0) }
                             }
@@ -378,17 +378,17 @@ pub fun infer_type_args(a: TypeArena, s: SemaRes, func_name: str, arguments: i64
                         match fd_ast.ty(elem).node {
                             TNamed(pname) => {
                                 if tp_has(type_params, pname) && !name_to_handle.has(pname) {
-                                    val arg_key = Semares.module_expr_key(module_name, arguments[i])
-                                    match Semares.get_expr(s, arg_key) {
+                                    val arg_key = module_expr_key(module_name, arguments[i])
+                                    match get_expr(s, arg_key) {
                                         null => {}
                                         info => {
-                                            val r = Arena.resolve(a, info ?? 0)
+                                            val r = resolve(a, info ?? 0)
                                             match Arena.get(a, r) {
                                                 TArray(_) => {
-                                                    name_to_handle.set(pname, Arena.array_parts(a, r).a)
+                                                    name_to_handle.set(pname, array_parts(a, r).a)
                                                 },
                                                 TStr => {
-                                                    name_to_handle.set(pname, Arena.make(a, TU8))
+                                                    name_to_handle.set(pname, make(a, TU8))
                                                 },
                                                 _ => {},
                                             }
@@ -479,7 +479,7 @@ pub fun infer_type_args(a: TypeArena, s: SemaRes, func_name: str, arguments: i64
     while ti < type_params.len() {
         match name_to_handle.get(type_params[ti]) {
             null => {
-                args = args ++ [Arena.make_adt(a, type_params[ti], [])]
+                args = args ++ [make_adt(a, type_params[ti], [])]
             },
             h => { args = args ++ [h ?? 0] },
         }
@@ -493,8 +493,8 @@ fun infer_lambda_return_type(a: TypeArena, s: SemaRes,
     body: LBody, ast: AstArena, module_name: str): u32? {
     match body {
         LExpr(body_expr) => {
-            val key = Semares.module_expr_key(module_name, body_expr)
-            Semares.get_expr(s, key)
+            val key = module_expr_key(module_name, body_expr)
+            get_expr(s, key)
         },
         LBlock(block_expr) => {
             match ast.expr(block_expr).node {
@@ -502,8 +502,8 @@ fun infer_lambda_return_type(a: TypeArena, s: SemaRes,
                     match trailing {
                         null => { null }
                         t => {
-                            val key = Semares.module_expr_key(module_name, t ?? 0)
-                            Semares.get_expr(s, key)
+                            val key = module_expr_key(module_name, t ?? 0)
+                            get_expr(s, key)
                         },
                     }
                 },
@@ -554,7 +554,7 @@ pub fun get_or_create_instance(a: TypeArena, s: SemaRes, func_name: str, type_ar
     }
     val instance_id = s.monomorph_instances.len() as i64
     // 返回类型(展平器 + type_args)。
-    var return_handle = Arena.make(a, TUnknown)
+    var return_handle = make(a, TUnknown)
     match resolve_tn_flat(a, s, rt, type_args, ast) {
         null => {
             Semares.add_error(s, new_err("failed to resolve return type of {func_name}", 0, 0))
@@ -581,7 +581,7 @@ fun resolve_instance_body_types(a: TypeArena, s: SemaRes, type_params: str[], pa
     in_progress: Map<str, i64>, module_name: str, instance_id: i64): i64 {
     // Step 1:临时 InferContext,rigid → 具体实参,重放 infer_expr。
     val saved_sema_module = s.current_module_name
-    val ictx2 = Ictx.new_ictx()
+    val ictx2 = new_ictx()
     ictx2.current_module_name = module_name
     s.current_module_name = module_name
     // 泛型绑定(先 rigid,后覆写为具体实参 = enter_instantiation_mode)。
@@ -592,18 +592,18 @@ fun resolve_instance_body_types(a: TypeArena, s: SemaRes, type_params: str[], pa
         k = k + 1
     }
     if tps.len() > 0 {
-        Ictx.push_type_bindings(ictx2, a, tps)
+        push_type_bindings(ictx2, a, tps)
     }
-    val instc = Data.new_inst_ctx(func_name, type_args, module_name, in_progress)
+    val instc = new_inst_ctx(func_name, type_args, module_name, in_progress)
     ictx2.inst = instc
     k = 0
     while k < type_params.len() && k < type_args.len() {
-        Ictx.insert_top(ictx2, type_params[k], type_args[k])
+        insert_top(ictx2, type_params[k], type_args[k])
         k = k + 1
     }
     // 声明模块 env 为父(裸名先解析本模块符号)。
-    var parent_env = Envs.root(s.env)
-    match Semares.module_logical_path(module_name) {
+    var parent_env = root(s.env)
+    match module_logical_path(module_name) {
         null => {}
         lp => {
             match s.module_envs.get(lp) {
@@ -615,26 +615,26 @@ fun resolve_instance_body_types(a: TypeArena, s: SemaRes, type_params: str[], pa
     val fn_env = Envs.child(s.env, parent_env)
     var pi: usize = 0
     while pi < params.len() {
-        var h = Arena.fresh_type_var(a)
+        var h = fresh_type_var(a)
         match params[pi].ta {
             null => {}
-            ta => { h = Typeast.type_from_ast(ictx2, a, s, ta, ast) }
+            ta => { h = type_from_ast(ictx2, a, s, ta, ast) }
         }
-        Envs.define(s.env, fn_env, params[pi].name, h)
+        define(s.env, fn_env, params[pi].name, h)
         pi = pi + 1
     }
-    var ret_ty = Arena.fresh_type_var(a)
+    var ret_ty = fresh_type_var(a)
     match rt {
         null => {}
-        r0 => { ret_ty = Typeast.type_from_ast(ictx2, a, s, r0, ast) }
+        r0 => { ret_ty = type_from_ast(ictx2, a, s, r0, ast) }
     }
     ictx2.expected_return = ret_ty
-    val _bt = Infer.infer_expr(ictx2, a, s, body, ast, fn_env, ictx2.expected_return)
+    val _bt = infer_expr(ictx2, a, s, body, ast, fn_env, ictx2.expected_return)
     // Step 1 收尾:局部表并入全局 expr_types(键集 = HM 已覆盖,计数不变)。
     var ki: usize = 0
     while ki < instc.local_expr_types.len() {
         val pair = instc.local_expr_types.get(ki) ?? ETMap(0, 0)
-        Semares.put_expr(s, Semares.module_expr_key(instc.module_name, pair.expr), pair.ty)
+        put_expr(s, module_expr_key(instc.module_name, pair.expr), pair.ty)
         ki = ki + 1
     }
     s.current_module_name = saved_sema_module
@@ -693,7 +693,7 @@ fun process_call(a: TypeArena, callee: i64, arguments: i64[], type_args_hint: i6
     if instance_id < 0 {
         return
     }
-    s.call_instantiations.set(Semares.module_expr_key(module_name, call_expr), instance_id)
+    s.call_instantiations.set(module_expr_key(module_name, call_expr), instance_id)
 }
 
 // 方法糖调用(recv.method(args)):纯路径接收者限定模块;值接收者占首参。
@@ -749,7 +749,7 @@ fun process_method_call(a: TypeArena, recv: i64, method: str, arguments: i64[],
     }
     val fd_ast = ftabs_arena(tables, owner2, method) ?? ast
     // 方法糖形参序:值接收者占首参(命名空间接收者除外)。
-    val recv_is_namespace = s.module_func_recv_exprs.has(Semares.module_expr_key(module_name, recv))
+    val recv_is_namespace = s.module_func_recv_exprs.has(module_expr_key(module_name, recv))
     var sugar_args: i64[] = []
     if !recv_is_namespace {
         sugar_args = sugar_args ++ [recv]
@@ -766,9 +766,9 @@ fun process_method_call(a: TypeArena, recv: i64, method: str, arguments: i64[],
     if instance_id < 0 {
         return
     }
-    s.call_instantiations.set(Semares.module_expr_key(module_name, call_expr), instance_id)
+    s.call_instantiations.set(module_expr_key(module_name, call_expr), instance_id)
     // v3 phase 1:方法糖分派元数据(与 call_instantiations 同键)。
-    Semares.put_dispatch(s, Semares.module_expr_key(module_name, call_expr))
+    put_dispatch(s, module_expr_key(module_name, call_expr))
 }
 
 // ─── AST 递归遍历 ────────────────────────────────────────────────
@@ -1027,7 +1027,7 @@ pub fun collect_monomorph_instances(a: TypeArena, s: SemaRes, m: ModuleAst,
             FunDeclD(_, name, tps, _, rt, body, is_async, _, _, _) => {
                 // 非泛型:空实参实例(泛型由调用点驱动,不建空实例)。
                 if tps.len() == 0 {
-                    var return_handle = Arena.make(a, TUnknown)
+                    var return_handle = make(a, TUnknown)
                     match resolve_tn_flat(a, s, rt, [], m.arena) {
                         null => {
                             Semares.add_error(s, new_err("failed to resolve return type of {name}", 0, 0))
@@ -1095,14 +1095,14 @@ pub fun validate_trait_method_bindings(a: TypeArena, s: SemaRes, m: ModuleAst): 
                 var ti: usize = 0
                 while ti < implemented_traits.len() {
                     val t = implemented_traits[ti].trait_name
-                    if !Semares.list_has_str(traits, t) {
+                    if !list_has_str(traits, t) {
                         traits.push(t)
                     }
-                    val closure = Semares.trait_parent_closure(s, t)
+                    val closure = trait_parent_closure(s, t)
                     var ci: usize = 0
                     while ci < closure.len() {
                         val pt = closure.get(ci) ?? ""
-                        if !Semares.list_has_str(traits, pt) {
+                        if !list_has_str(traits, pt) {
                             traits.push(pt)
                         }
                         ci = ci + 1
@@ -1113,12 +1113,12 @@ pub fun validate_trait_method_bindings(a: TypeArena, s: SemaRes, m: ModuleAst): 
                 val method_names = List.empty<str>()
                 ti = 0
                 while ti < traits.len() {
-                    match Semares.get_trait_def(s, traits.get(ti) ?? "") {
+                    match get_trait_def(s, traits.get(ti) ?? "") {
                         null => {}
                         td => {
                             var mi: usize = 0
                             while mi < td.methods.len() {
-                                if !Semares.list_has_str(method_names, td.methods[mi].name) {
+                                if !list_has_str(method_names, td.methods[mi].name) {
                                     method_names.push(td.methods[mi].name)
                                 }
                                 mi = mi + 1
@@ -1144,7 +1144,7 @@ pub fun validate_trait_method_bindings(a: TypeArena, s: SemaRes, m: ModuleAst): 
                     while ti < traits.len() {
                         val t = traits.get(ti) ?? ""
                         var has_default = false
-                        match Semares.get_trait_def(s, t) {
+                        match get_trait_def(s, t) {
                             null => {}
                             td => {
                                 var k: usize = 0
@@ -1176,7 +1176,7 @@ pub fun validate_trait_method_bindings(a: TypeArena, s: SemaRes, m: ModuleAst): 
                                     while k < providers.len() && all_covered {
                                         val o = providers.get(k) ?? ""
                                         if o != c {
-                                            if !Semares.list_has_str(Semares.trait_parent_closure(s, c), o) {
+                                            if !list_has_str(trait_parent_closure(s, c), o) {
                                                 all_covered = false
                                             }
                                         }
@@ -1208,7 +1208,7 @@ pub fun validate_trait_method_bindings(a: TypeArena, s: SemaRes, m: ModuleAst): 
                             match mm.delegate {
                                 null => {}
                                 d => {
-                                    if !Semares.list_has_str(traits, d.trait_name) {
+                                    if !list_has_str(traits, d.trait_name) {
                                         Semares.add_error(s, new_err(
                                             "type '{name}' does not implement trait '{d.trait_name}'; cannot delegate '{m_name}'",
                                             line, column))
@@ -1219,7 +1219,7 @@ pub fun validate_trait_method_bindings(a: TypeArena, s: SemaRes, m: ModuleAst): 
                                                 line, column))
                                         } else {
                                             var has_default2 = false
-                                            match Semares.get_trait_def(s, d.trait_name) {
+                                            match get_trait_def(s, d.trait_name) {
                                                 null => {}
                                                 td => {
                                                     var k: usize = 0
@@ -1289,7 +1289,7 @@ pub fun validate_trait_inheritance(a: TypeArena, s: SemaRes, m: ModuleAst): void
                     var pi: usize = 0
                     while pi < parents.len() {
                         val pname = parents[pi].trait_name
-                        val eff = Semares.trait_effective_methods(s, pname)
+                        val eff = trait_effective_methods(s, pname)
                         var ei: usize = 0
                         while ei < eff.len() {
                             val pair = eff.get(ei) ?? ET("", TMS("", 0, 0, false, false))
@@ -1312,7 +1312,7 @@ pub fun validate_trait_inheritance(a: TypeArena, s: SemaRes, m: ModuleAst): void
                     Modenv.str_list_sort(names)
                     // 子自身方法名集。
                     val own_has_body = Map.empty<str, bool>()
-                    match Semares.get_trait_def(s, name) {
+                    match get_trait_def(s, name) {
                         null => {}
                         td => {
                             var k: usize = 0
@@ -1329,7 +1329,7 @@ pub fun validate_trait_inheritance(a: TypeArena, s: SemaRes, m: ModuleAst): void
                         val dedup = List.empty<str>()
                         var k: usize = 0
                         while k < prov.len() {
-                            if !Semares.list_has_str(dedup, prov.get(k) ?? "") {
+                            if !list_has_str(dedup, prov.get(k) ?? "") {
                                 dedup.push(prov.get(k) ?? "")
                             }
                             k = k + 1
@@ -1344,13 +1344,13 @@ pub fun validate_trait_inheritance(a: TypeArena, s: SemaRes, m: ModuleAst): void
                             val joined = Semares.str_join(pnames, ", ")
                             match own_has_body.get(m_name) {
                                 null => {
-                                    Semares.add_error(s, Data.new_err_path(
+                                    Semares.add_error(s, new_err_path(
                                         "trait '{name}' inherits conflicting defaults for '{m_name}' from [{joined}]; declare its own '{m_name}' (with a body) in the trait to resolve",
                                         m.name, sd.span.line, sd.span.column))
                                 },
                                 hb => {
                                     if !(hb ?? false) {
-                                        Semares.add_error(s, Data.new_err_path(
+                                        Semares.add_error(s, new_err_path(
                                             "trait '{name}' re-declares '{m_name}' abstract while parents [{joined}] provide conflicting defaults; give '{m_name}' a default body in '{name}'",
                                             m.name, sd.span.line, sd.span.column))
                                     }
@@ -1376,13 +1376,13 @@ pub fun validate_trait_inheritance(a: TypeArena, s: SemaRes, m: ModuleAst): void
                     var ti: usize = 0
                     while ti < implemented_traits.len() {
                         val t = implemented_traits[ti].trait_name
-                        if !Semares.list_has_str(closure, t) {
+                        if !list_has_str(closure, t) {
                             closure.push(t)
                         }
-                        val pc = Semares.trait_parent_closure(s, t)
+                        val pc = trait_parent_closure(s, t)
                         var ci: usize = 0
                         while ci < pc.len() {
-                            if !Semares.list_has_str(closure, pc.get(ci) ?? "") {
+                            if !list_has_str(closure, pc.get(ci) ?? "") {
                                 closure.push(pc.get(ci) ?? "")
                             }
                             ci = ci + 1
@@ -1392,7 +1392,7 @@ pub fun validate_trait_inheritance(a: TypeArena, s: SemaRes, m: ModuleAst): void
                     ti = 0
                     while ti < closure.len() {
                         val t = closure.get(ti) ?? ""
-                        match Semares.get_trait_def(s, t) {
+                        match get_trait_def(s, t) {
                             null => {}
                             td => {
                                 var k: usize = 0
@@ -1411,7 +1411,7 @@ pub fun validate_trait_inheritance(a: TypeArena, s: SemaRes, m: ModuleAst): void
                                             var defaulted = false
                                             var ci: usize = 0
                                             while ci < closure.len() && !defaulted {
-                                                match Semares.get_trait_def(s, closure.get(ci) ?? "") {
+                                                match get_trait_def(s, closure.get(ci) ?? "") {
                                                     null => {}
                                                     ctd => {
                                                         var q: usize = 0
@@ -1426,7 +1426,7 @@ pub fun validate_trait_inheritance(a: TypeArena, s: SemaRes, m: ModuleAst): void
                                                 ci = ci + 1
                                             }
                                             if !defaulted {
-                                                Semares.add_error(s, Data.new_err_path(
+                                                Semares.add_error(s, new_err_path(
                                                     "type '{name}' does not implement trait method '{t}.{m_name}' (required directly or through trait inheritance)",
                                                     m.name, sd.span.line, sd.span.column))
                                             }
@@ -1453,8 +1453,8 @@ pub fun collect_trait_default_instances(a: TypeArena, s: SemaRes, m: ModuleAst):
         val sd = m.decls[di]
         match sd.decl {
             TraitDeclD(_, name, _, _, _, methods) => {
-                val canonical = Semares.resolve_trait_key(s, name)
-                match Semares.trait_def_idx(s, canonical) {
+                val canonical = resolve_trait_key(s, name)
+                match trait_def_idx(s, canonical) {
                     null => {}
                     trait_idx0 => {
                         val trait_idx = trait_idx0 ?? 0
@@ -1481,15 +1481,15 @@ pub fun collect_trait_default_instances(a: TypeArena, s: SemaRes, m: ModuleAst):
                             wi = wi + 1
                         }
                         // 父闭包:子/类型覆写了父默认 → 父默认也须特化(super)。
-                        val pc = Semares.trait_parent_closure(s, name)
+                        val pc = trait_parent_closure(s, name)
                         var ci: usize = 0
                         while ci < pc.len() {
                             val pt = pc.get(ci) ?? ""
-                            match Semares.trait_def_idx(s, pt) {
+                            match trait_def_idx(s, pt) {
                                 null => {}
                                 parent_idx0 => {
                                     val parent_idx = parent_idx0 ?? 0
-                                    match Semares.get_trait_def(s, pt) {
+                                    match get_trait_def(s, pt) {
                                         null => {}
                                         ptd => {
                                             var pm: usize = 0
@@ -1510,7 +1510,7 @@ pub fun collect_trait_default_instances(a: TypeArena, s: SemaRes, m: ModuleAst):
                                                         val tid = impl_ids.get(ii) ?? 0
                                                         val tname = impl_names.get("{tid}") ?? ""
                                                         var type_overrides = false
-                                                        match Semares.get_type_def(s, tname) {
+                                                        match get_type_def(s, tname) {
                                                             null => {}
                                                             td => {
                                                                 var q: usize = 0
@@ -1563,13 +1563,13 @@ pub fun collect_trait_default_instances(a: TypeArena, s: SemaRes, m: ModuleAst):
                                     while wi2 < s.witness_entries.len() {
                                         val e = s.witness_entries.get(wi2) ?? WEnt("", 0, Map.empty<str, i64>(), "")
                                         if e.type_id == tid {
-                                            if !Semares.list_has_str(traits2, e.trait_name) {
+                                            if !list_has_str(traits2, e.trait_name) {
                                                 traits2.push(e.trait_name)
                                             }
                                         }
                                         wi2 = wi2 + 1
                                     }
-                                    match Semares.resolve_method_binding(s, traits2, tname, method_name) {
+                                    match resolve_method_binding(s, traits2, tname, method_name) {
                                         MBBound(bt, overridden) => {
                                             if bt == canonical {
                                                 val super_key = "{tname}\u{0}{bt}\u{0}{method_name}"

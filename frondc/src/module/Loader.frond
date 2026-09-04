@@ -29,8 +29,8 @@ import std.io.Fs
 import std.io.Path
 import std.core.types.Str
 import syntax.Ast
-import syntax.Parse
-import module.StdPaths
+import syntax.Parse.{parse_module_text}
+import module.StdPaths.{builtin_paths, std_paths}
 
 pub type LErr =
     | NotFound(str)
@@ -206,7 +206,7 @@ pub fun collect_imports(m: ModuleAst): List<str[]> {
 }
 
 fun parse_and_collect(path_key: str, source: str): Throw<Loaded, PErr> {
-    match Parse.parse_module_text(source, path_key) {
+    match parse_module_text(source, path_key) {
         Ok(m) => Ok(Loaded(m, collect_exports(m)))
         Error(e) => throw e
     }
@@ -234,7 +234,7 @@ fun std_or_parse(loader: Loader, use_cache: bool, cache_key: str, err_path: str,
             hit => { return hit }
         }
     }
-    match Parse.parse_module_text(src, cache_key) {
+    match parse_module_text(src, cache_key) {
         Ok(m) => {
             if use_cache {
                 loader.std_cache.set(cache_key, m)
@@ -261,7 +261,7 @@ pub async fun preload_builtins(loader: Loader): void {
     match loader.std_root {
         null => {}
         root => {
-            val paths = StdPaths.builtin_paths()
+            val paths = builtin_paths()
             var i: usize = 0
             while i < paths.len() {
                 val path = paths[i]
@@ -416,7 +416,7 @@ pub async fun resolve_and_load(loader: Loader, segs: str[]): Async<Loaded?> {
             // std-first 编排下兄弟几乎总在缓存/已载 — 命中即零解析;
             // miss 分支为防御路径(对齐 Rust:未导出者不入 modules、
             // 解析失败静默跳过)。
-            val manifest_paths = StdPaths.builtin_paths() ++ StdPaths.std_paths()
+            val manifest_paths = builtin_paths() ++ std_paths()
             var s: usize = 0
             while s < manifest_paths.len() {
                 val sib = manifest_paths[s]
@@ -445,7 +445,7 @@ pub async fun resolve_and_load(loader: Loader, segs: str[]): Async<Loaded?> {
                                 match read_text(std_disk_path(root, sib)).await() {
                                     null => {}
                                     src => {
-                                        match Parse.parse_module_text(src, sib) {
+                                        match parse_module_text(src, sib) {
                                             Ok(m) => {
                                                 loader.std_cache.set(sib, m)
                                                 val exports = collect_exports(m)
@@ -575,7 +575,7 @@ pub async fun load_transitive_imports(loader: Loader, entry: ModuleAst): Async<L
 
 // 镜像 load_all_modules_or_exit 的 std 全量强制加载(不含其退出)。
 pub async fun force_load_std(loader: Loader): void {
-    val keys = StdPaths.std_paths()
+    val keys = std_paths()
     var i: usize = 0
     while i < keys.len() {
         val key = keys[i]

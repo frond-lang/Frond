@@ -7,49 +7,49 @@ import std.collections.List
 import std.collections.Map
 import std.core.types.Str
 import syntax.Ast
-import types.Arena
+import types.Arena.{fresh_rigid_var, fresh_type_var, make, make_adt, make_array, make_async, make_channel, make_fn, make_module_ref, make_nullable, make_ref, make_throw, resolve}
 import types.Ty
 
-import sema.Data
-import sema.Envs
-import sema.Semares
-import sema.Ictx
-import sema.Populate
-import sema.Typeast
+import sema.Data.{new_err}
+import sema.Envs.{define, lookup, lookup_local, redefine, snapshot_names}
+import sema.Semares.{dynamic_type_id, find_last_sub, get_trait_def, get_type_def, list_has_str, module_logical_path, record_module_import, resolve_trait_key, resolve_type_key, tail_seg, trait_parent_closure, type_def_idx, witness_register}
+import sema.Ictx.{is_builtin_generic_type, is_this_param, lookup_type_binding, make_builtin_generic, numeric_builtin_names, numeric_ty_of, pop_frame, push_type_bindings}
+import sema.Populate.{collect_module_trait_names, collect_module_type_names, from_type_name_full}
+import sema.Typeast.{type_from_ast}
 
 // ─── register_builtins ────────────────────────────────────────────
 
 pub fun register_builtins(ctx: ICtx, a: TypeArena, s: SemaRes, env: u32): void {
     // Panic: (str) -> void。
-    val str_ty = Arena.make(a, TStr)
-    val void_ty = Arena.make(a, TVoid)
-    val panic_fn = Arena.make_fn(a, [str_ty], void_ty)
-    Envs.define(s.env, env, "Panic", panic_fn)
+    val str_ty = make(a, TStr)
+    val void_ty = make(a, TVoid)
+    val panic_fn = make_fn(a, [str_ty], void_ty)
+    define(s.env, env, "Panic", panic_fn)
 
     // Ok: ∀T,E. (T) -> Throw<T, E>(rigid 形参;调用点实例化)。
-    val val_ty = Arena.fresh_rigid_var(a)
-    val err_ty = Arena.fresh_rigid_var(a)
-    val throw_ty = Arena.make_throw(a, val_ty, err_ty)
-    val ok_fn = Arena.make_fn(a, [val_ty], throw_ty)
-    Envs.define(s.env, env, "Ok", ok_fn)
+    val val_ty = fresh_rigid_var(a)
+    val err_ty = fresh_rigid_var(a)
+    val throw_ty = make_throw(a, val_ty, err_ty)
+    val ok_fn = make_fn(a, [val_ty], throw_ty)
+    define(s.env, env, "Ok", ok_fn)
 
     // 数值 ctor:i8..f64 族,∀T. (T) -> Self。
-    val names = Ictx.numeric_builtin_names()
+    val names = numeric_builtin_names()
     var i: usize = 0
     while i < names.len() {
-        val param = Arena.fresh_rigid_var(a)
-        val ret_ty = Arena.make(a, Ictx.numeric_ty_of(names[i]))
-        val fn_ty = Arena.make_fn(a, [param], ret_ty)
-        Envs.define(s.env, env, names[i], fn_ty)
+        val param = fresh_rigid_var(a)
+        val ret_ty = make(a, numeric_ty_of(names[i]))
+        val fn_ty = make_fn(a, [param], ret_ty)
+        define(s.env, env, names[i], fn_ty)
         i = i + 1
     }
 
     // channel<T>(capacity: usize) -> Channel<T>。
-    val usize_ty = Arena.make(a, TUsize)
-    val t_var3 = Arena.fresh_rigid_var(a)
-    val chan_ret = Arena.make_channel(a, t_var3)
-    val chan_fn = Arena.make_fn(a, [usize_ty], chan_ret)
-    Envs.define(s.env, env, "channel", chan_fn)
+    val usize_ty = make(a, TUsize)
+    val t_var3 = fresh_rigid_var(a)
+    val chan_ret = make_channel(a, t_var3)
+    val chan_fn = make_fn(a, [usize_ty], chan_ret)
+    define(s.env, env, "channel", chan_fn)
 }
 
 // ─── 模块 env 层级 ────────────────────────────────────────────────
@@ -78,8 +78,8 @@ pub fun ensure_module_env(ctx: ICtx, a: TypeArena, s: SemaRes, full_path: str, r
             },
             eid => { env_id = eid },
         }
-        val mod_ref_ty = Arena.make_module_ref(a, current_path, env_id)
-        Envs.define(s.env, parent_env, segments[i], mod_ref_ty)
+        val mod_ref_ty = make_module_ref(a, current_path, env_id)
+        define(s.env, parent_env, segments[i], mod_ref_ty)
         parent_env = env_id
         i = i + 1
     }
@@ -96,11 +96,11 @@ pub fun register_module_aliases(ctx: ICtx, a: TypeArena, s: SemaRes,
             val is_std = path == "std" || Str.starts_with(path, "std.")
             val anchor = if is_std { std_env } else { root_env }
             val module_env = ensure_module_env(ctx, a, s, path, anchor)
-            val last_seg = Semares.tail_seg(path)
+            val last_seg = tail_seg(path)
             if last_seg.len() > 0 && Str.contains(path, ".") {
-                if Envs.lookup(s.env, anchor, last_seg) == null {
-                    val mod_ref_ty = Arena.make_module_ref(a, path, module_env)
-                    Envs.define(s.env, anchor, last_seg, mod_ref_ty)
+                if lookup(s.env, anchor, last_seg) == null {
+                    val mod_ref_ty = make_module_ref(a, path, module_env)
+                    define(s.env, anchor, last_seg, mod_ref_ty)
                 }
             }
         }
@@ -112,7 +112,7 @@ pub fun register_module_aliases(ctx: ICtx, a: TypeArena, s: SemaRes,
 
 
 fun last_dot_index(s: str): i64 {
-    Semares.find_last_sub(s, ".")
+    find_last_sub(s, ".")
 }
 
 
@@ -194,7 +194,7 @@ fun origins_for_import(s: SemaRes, full_path: str, import_parent: str): List<str
                 var i: usize = 0
                 while i < l.len() {
                     val o = l.get(i) ?? ""
-                    if !Semares.list_has_str(origins, o) {
+                    if !list_has_str(origins, o) {
                         origins.push(o)
                     }
                     i = i + 1
@@ -208,7 +208,7 @@ fun origins_for_import(s: SemaRes, full_path: str, import_parent: str): List<str
 
 pub fun process_import_decls(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAst, env: u32): void {
     // 本模块路径前缀(env 链自引用解析)。
-    match Semares.module_logical_path(m.name) {
+    match module_logical_path(m.name) {
         null => {}
         logical_path => {
             ensure_module_env(ctx, a, s, logical_path, env)
@@ -223,7 +223,7 @@ pub fun process_import_decls(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAst, 
                     continue
                 }
                 val full_path = Semares.str_join(module_path, ".")
-                Semares.record_module_import(s, m.name, full_path)
+                record_module_import(s, m.name, full_path)
                 val module_env = ensure_module_env(ctx, a, s, full_path, env)
                 // ── std 层再输出(导入即显式可见性授予)──
                 val dot = last_dot_index(full_path)
@@ -244,9 +244,9 @@ pub fun process_import_decls(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAst, 
                 match s.module_envs.get(first) {
                     null => {}
                     first_env => {
-                        if Envs.lookup(s.env, env, first) == null {
-                            val mod_ref = Arena.make_module_ref(a, first, first_env)
-                            Envs.define(s.env, env, first, mod_ref)
+                        if lookup(s.env, env, first) == null {
+                            val mod_ref = make_module_ref(a, first, first_env)
+                            define(s.env, env, first, mod_ref)
                         }
                     },
                 }
@@ -257,22 +257,22 @@ pub fun process_import_decls(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAst, 
                         null => {}
                         origin_env => {
                             // origin 模块 env 的全部绑定再输出(函数/ctor)。
-                            val names = Envs.snapshot_names(s.env, origin_env)
+                            val names = snapshot_names(s.env, origin_env)
                             str_list_sort(names)
                             var ni: usize = 0
                             while ni < names.len() {
                                 val name = names.get(ni) ?? ""
-                                match Envs.lookup_local(s.env, origin_env, name) {
+                                match lookup_local(s.env, origin_env, name) {
                                     null => {}
-                                    sym_ty => { Envs.define(s.env, env, name, sym_ty) }
+                                    sym_ty => { define(s.env, env, name, sym_ty) }
                                 }
                                 ni = ni + 1
                             }
                             // 尾短名 ModuleRef(限定短形态)。
-                            val short = Semares.tail_seg(origin)
-                            if Envs.lookup(s.env, env, short) == null {
-                                val mod_ref_ty = Arena.make_module_ref(a, origin, origin_env)
-                                Envs.define(s.env, env, short, mod_ref_ty)
+                            val short = tail_seg(origin)
+                            if lookup(s.env, env, short) == null {
+                                val mod_ref_ty = make_module_ref(a, origin, origin_env)
+                                define(s.env, env, short, mod_ref_ty)
                             }
                         },
                     }
@@ -286,7 +286,7 @@ pub fun process_import_decls(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAst, 
                         var ki: usize = 0
                         while ki < iis.len() {
                             val item = iis[ki]
-                            match Envs.lookup_local(s.env, module_env, item.name) {
+                            match lookup_local(s.env, module_env, item.name) {
                                 null => {}
                                 sym_ty => {
                                     var local = item.name
@@ -294,7 +294,7 @@ pub fun process_import_decls(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAst, 
                                         null => {}
                                         al => { local = al }
                                     }
-                                    Envs.define(s.env, env, local, sym_ty)
+                                    define(s.env, env, local, sym_ty)
                                     // import_aliases 登记在 M1 无 IR 消费者,
                                     // 二义检查属推断切片;先跳过。
                                 },
@@ -347,7 +347,7 @@ pub fun predeclare_declarations_with_origin(ctx: ICtx, a: TypeArena, s: SemaRes,
         null => {}
         lp => {
             module_env = ensure_module_env(ctx, a, s, lp, root_env)
-            before = Envs.snapshot_names(s.env, module_env)
+            before = snapshot_names(s.env, module_env)
             has_origin = true
         },
     }
@@ -356,11 +356,11 @@ pub fun predeclare_declarations_with_origin(ctx: ICtx, a: TypeArena, s: SemaRes,
         match origin_prefix {
             null => {}
             lp => {
-                val after = Envs.snapshot_names(s.env, module_env)
+                val after = snapshot_names(s.env, module_env)
                 var i: usize = 0
                 while i < after.len() {
                     val name = after.get(i) ?? ""
-                    if !Semares.list_has_str(before, name) {
+                    if !list_has_str(before, name) {
                         match s.std_binding_origins.get(name) {
                             null => { s.std_binding_origins.set(name, lp) }
                             prev => {
@@ -380,21 +380,21 @@ pub fun predeclare_declarations_with_origin(ctx: ICtx, a: TypeArena, s: SemaRes,
 pub fun predeclare_declarations(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAst, root_env: u32): void {
     // 模块上下文(镜像 populate_module:canonical 化需要)。
     s.current_module_name = m.name
-    s.pending_own_types = Populate.collect_module_type_names(m)
-    s.pending_own_traits = Populate.collect_module_trait_names(m)
+    s.pending_own_types = collect_module_type_names(m)
+    s.pending_own_traits = collect_module_trait_names(m)
     var di: usize = 0
     while di < m.decls.len() {
         match m.decls[di].decl {
             ImportDeclD(path, _, _) => {
                 if path.len() > 0 {
-                    Semares.record_module_import(s, m.name, Semares.str_join(path, "."))
+                    record_module_import(s, m.name, Semares.str_join(path, "."))
                 }
             },
             _ => {}
         }
         di = di + 1
     }
-    val module_path = Semares.module_logical_path(m.name)
+    val module_path = module_logical_path(m.name)
     val module_env = match module_path {
         null => { root_env }
         mp => { ensure_module_env(ctx, a, s, mp, root_env) }
@@ -407,66 +407,66 @@ pub fun predeclare_declarations(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAs
         val sd = m.decls[di]
         match sd.decl {
             FunDeclD(_, name, tps, params, rt, _, is_async, _, _, _) => {
-                if Semares.list_has_str(seen_fns, name) {
-                    Semares.add_error(s, Data.new_err(
+                if list_has_str(seen_fns, name) {
+                    Semares.add_error(s, new_err(
                         "duplicate definition of function '{name}' in this module", sd.span.line, sd.span.column))
                 }
                 seen_fns.push(name)
                 // 顶层函数禁 this 参数(ThisType 注解判定)。
-                if params.len() > 0 && Ictx.is_this_param(params[0].ta, m.arena) {
-                    Semares.add_error(s, Data.new_err(
+                if params.len() > 0 && is_this_param(params[0].ta, m.arena) {
+                    Semares.add_error(s, new_err(
                         "this parameter is not allowed in top-level function", sd.span.line, sd.span.column))
                 }
                 // 泛型函数:压绑定栈(type_from_ast 解析形参为 rigid)。
                 if tps.len() > 0 {
-                    Ictx.push_type_bindings(ctx, a, tps)
+                    push_type_bindings(ctx, a, tps)
                 }
                 var param_types: u32[] = []
                 var pi: usize = 0
                 while pi < params.len() {
                     match params[pi].ta {
-                        null => { param_types = param_types ++ [Arena.fresh_type_var(a)] }
-                        ta => { param_types = param_types ++ [Typeast.type_from_ast(ctx, a, s, ta, m.arena)] }
+                        null => { param_types = param_types ++ [fresh_type_var(a)] }
+                        ta => { param_types = param_types ++ [type_from_ast(ctx, a, s, ta, m.arena)] }
                     }
                     pi = pi + 1
                 }
                 val ret_ty_raw = match rt {
-                    null => { Arena.fresh_type_var(a) }
-                    r0 => { Typeast.type_from_ast(ctx, a, s, r0, m.arena) }
+                    null => { fresh_type_var(a) }
+                    r0 => { type_from_ast(ctx, a, s, r0, m.arena) }
                 }
                 val ret_ty = wrap_async_return(a, ret_ty_raw, is_async)
-                val fn_ty = Arena.make_fn(a, param_types, ret_ty)
-                Envs.define(s.env, module_env, name, fn_ty)
-                Envs.define(s.env, root_env, name, fn_ty)
+                val fn_ty = make_fn(a, param_types, ret_ty)
+                define(s.env, module_env, name, fn_ty)
+                define(s.env, root_env, name, fn_ty)
                 if tps.len() > 0 {
-                    Ictx.pop_frame(ctx)
+                    pop_frame(ctx)
                 }
             },
             TypeDeclD(_, name, tps, base_types, _, def, _) => {
                 // 类型 ctor 预绑定(canonical 名;泛型绑定形参)。
-                val canonical = Semares.resolve_type_key(s, name)
+                val canonical = resolve_type_key(s, name)
                 if tps.len() > 0 {
-                    Ictx.push_type_bindings(ctx, a, tps)
+                    push_type_bindings(ctx, a, tps)
                 }
                 var self_ty: u32 = 0
                 if tps.len() == 0 {
-                    self_ty = Arena.make_adt(a, canonical, [])
+                    self_ty = make_adt(a, canonical, [])
                 } else {
                     var type_args: u32[] = []
                     var ti: usize = 0
                     while ti < tps.len() {
-                        match Ictx.lookup_type_binding(ctx, tps[ti].name) {
-                            null => { type_args = type_args ++ [Arena.fresh_rigid_var(a)] }
+                        match lookup_type_binding(ctx, tps[ti].name) {
+                            null => { type_args = type_args ++ [fresh_rigid_var(a)] }
                             h => { type_args = type_args ++ [h] }
                         }
                         ti = ti + 1
                     }
-                    self_ty = Arena.make_adt(a, canonical, type_args)
+                    self_ty = make_adt(a, canonical, type_args)
                 }
                 // 继承:env 绑定用 sema 合并视图(base 字段 + own)。
                 var merged_reprs: List<TR> = List.empty<TR>()
                 if base_types.len() > 0 {
-                    match Semares.get_type_def(s, name) {
+                    match get_type_def(s, name) {
                         null => {}
                         d => {
                             if d.constructors.len() > 0 {
@@ -489,7 +489,7 @@ pub fun predeclare_declarations(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAs
                             var ctor_fn_ty: u32 = 0
                             if merged_reprs.len() > 0 {
                                 // 合并视图:(继承 + own 字段) -> Child(裸 Adt)。
-                                val child_adt = Arena.make_adt(a, canonical, [])
+                                val child_adt = make_adt(a, canonical, [])
                                 var param_types: u32[] = []
                                 var ri: usize = 0
                                 while ri < merged_reprs.len() {
@@ -499,46 +499,46 @@ pub fun predeclare_declarations(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAs
                                 if param_types.len() == 0 {
                                     ctor_fn_ty = child_adt
                                 } else {
-                                    ctor_fn_ty = Arena.make_fn(a, param_types, child_adt)
+                                    ctor_fn_ty = make_fn(a, param_types, child_adt)
                                 }
                             } else {
                                 var param_types: u32[] = []
                                 var fi: usize = 0
                                 while fi < ctor.fields.len() {
-                                    param_types = param_types ++ [Typeast.type_from_ast(ctx, a, s, ctor.fields[fi].ty, m.arena)]
+                                    param_types = param_types ++ [type_from_ast(ctx, a, s, ctor.fields[fi].ty, m.arena)]
                                     fi = fi + 1
                                 }
                                 if param_types.len() == 0 {
                                     ctor_fn_ty = self_ty
                                 } else {
-                                    ctor_fn_ty = Arena.make_fn(a, param_types, self_ty)
+                                    ctor_fn_ty = make_fn(a, param_types, self_ty)
                                 }
                             }
                             if is_stdlib_mod {
-                                Envs.redefine(s.env, root_env, ctor.name, ctor_fn_ty)
+                                redefine(s.env, root_env, ctor.name, ctor_fn_ty)
                             } else {
-                                Envs.define(s.env, module_env, ctor.name, ctor_fn_ty)
-                                Envs.define(s.env, root_env, ctor.name, ctor_fn_ty)
+                                define(s.env, module_env, ctor.name, ctor_fn_ty)
+                                define(s.env, root_env, ctor.name, ctor_fn_ty)
                             }
                             ctx.ctor_module_envs.set(ctor.name, module_env)
                             ci = ci + 1
                         }
                     },
                     NewtypeD(ctor_name, inner) => {
-                        val inner_ty = Typeast.type_from_ast(ctx, a, s, inner, m.arena)
-                        val ctor_fn_ty = Arena.make_fn(a, [inner_ty], self_ty)
+                        val inner_ty = type_from_ast(ctx, a, s, inner, m.arena)
+                        val ctor_fn_ty = make_fn(a, [inner_ty], self_ty)
                         if is_stdlib_mod {
-                            Envs.redefine(s.env, root_env, ctor_name, ctor_fn_ty)
+                            redefine(s.env, root_env, ctor_name, ctor_fn_ty)
                         } else {
-                            Envs.define(s.env, module_env, ctor_name, ctor_fn_ty)
-                            Envs.define(s.env, root_env, ctor_name, ctor_fn_ty)
+                            define(s.env, module_env, ctor_name, ctor_fn_ty)
+                            define(s.env, root_env, ctor_name, ctor_fn_ty)
                         }
                         ctx.ctor_module_envs.set(ctor_name, module_env)
                     },
                     _ => {}
                 }
                 if tps.len() > 0 {
-                    Ictx.pop_frame(ctx)
+                    pop_frame(ctx)
                 }
             },
             _ => {}
@@ -553,7 +553,7 @@ pub fun wrap_async_return(a: TypeArena, ret_ty: u32, is_async: bool): u32 {
     if !is_async {
         return ret_ty
     }
-    val resolved = Arena.resolve(a, ret_ty)
+    val resolved = resolve(a, ret_ty)
     var already = false
     match Arena.get(a, resolved) {
         TAsync(_) => { already = true }
@@ -562,7 +562,7 @@ pub fun wrap_async_return(a: TypeArena, ret_ty: u32, is_async: bool): u32 {
     if already {
         ret_ty
     } else {
-        Arena.make_async(a, ret_ty)
+        make_async(a, ret_ty)
     }
 }
 
@@ -571,12 +571,12 @@ pub fun wrap_async_return(a: TypeArena, ret_ty: u32, is_async: bool): u32 {
 pub fun type_repr_to_handle(a: TypeArena, s: SemaRes, r: TR): u32 {
     match r {
         TRNamed(n) => {
-            match Populate.from_type_name_full(n) {
-                null => { Arena.make_adt(a, Semares.resolve_type_key(s, n), []) }
-                t => { Arena.make(a, t) }
+            match from_type_name_full(n) {
+                null => { make_adt(a, resolve_type_key(s, n), []) }
+                t => { make(a, t) }
             }
         },
-        TRThis => { Arena.make_adt(a, "This", []) }
+        TRThis => { make_adt(a, "This", []) }
         TRGeneric(n, args) => {
             var hs: u32[] = []
             var i: usize = 0
@@ -584,15 +584,15 @@ pub fun type_repr_to_handle(a: TypeArena, s: SemaRes, r: TR): u32 {
                 hs = hs ++ [type_repr_to_handle(a, s, args[i])]
                 i = i + 1
             }
-            if Ictx.is_builtin_generic_type(n) {
-                Ictx.make_builtin_generic(a, n, hs)
+            if is_builtin_generic_type(n) {
+                make_builtin_generic(a, n, hs)
             } else {
-                Arena.make_adt(a, Semares.resolve_type_key(s, n), hs)
+                make_adt(a, resolve_type_key(s, n), hs)
             }
         },
-        TRNullable(i0) => { Arena.make_nullable(a, type_repr_to_handle(a, s, i0)) }
-        TRRef(i0) => { Arena.make_ref(a, type_repr_to_handle(a, s, i0), false) }
-        TRRaw(i0) => { Arena.make_ref(a, type_repr_to_handle(a, s, i0), true) }
+        TRNullable(i0) => { make_nullable(a, type_repr_to_handle(a, s, i0)) }
+        TRRef(i0) => { make_ref(a, type_repr_to_handle(a, s, i0), false) }
+        TRRaw(i0) => { make_ref(a, type_repr_to_handle(a, s, i0), true) }
         TRFun(ps, r0) => {
             var hs: u32[] = []
             var i: usize = 0
@@ -600,9 +600,9 @@ pub fun type_repr_to_handle(a: TypeArena, s: SemaRes, r: TR): u32 {
             hs = hs ++ [type_repr_to_handle(a, s, ps[i])]
                 i = i + 1
             }
-            Arena.make_fn(a, hs, type_repr_to_handle(a, s, r0))
+            make_fn(a, hs, type_repr_to_handle(a, s, r0))
         },
-        TRArray(e, sz) => { Arena.make_array(a, type_repr_to_handle(a, s, e), sz) }
+        TRArray(e, sz) => { make_array(a, type_repr_to_handle(a, s, e), sz) }
     }
 }
 
@@ -614,17 +614,17 @@ pub fun populate_witness_table(ctx: ICtx, s: SemaRes, m: ModuleAst): void {
         val sd = m.decls[di]
         match sd.decl {
             TypeDeclD(_, name, _, _, traits, _, methods) => {
-                val canonical = Semares.resolve_type_key(s, name)
-                match Semares.type_def_idx(s, canonical) {
+                val canonical = resolve_type_key(s, name)
+                match type_def_idx(s, canonical) {
                     null => {}
                     idx => {
-                        val type_id = Semares.dynamic_type_id(idx)
+                        val type_id = dynamic_type_id(idx)
                         var ti: usize = 0
                         while ti < traits.len() {
                             val impl_trait = traits[ti]
-                            val trait_name = Semares.resolve_trait_key(s, impl_trait.trait_name)
-                            if Semares.get_trait_def(s, trait_name) == null {
-                                Semares.add_error(s, Data.new_err(
+                            val trait_name = resolve_trait_key(s, impl_trait.trait_name)
+                            if get_trait_def(s, trait_name) == null {
+                                Semares.add_error(s, new_err(
                                     "type '{name}' implements unknown trait '{trait_name}' (declared before use? traits must exist)",
                                     sd.span.line, sd.span.column))
                                 ti = ti + 1
@@ -636,13 +636,13 @@ pub fun populate_witness_table(ctx: ICtx, s: SemaRes, m: ModuleAst): void {
                                 slots.set(methods[mi].name, mi as i64)
                                 mi = mi + 1
                             }
-                            Semares.witness_register(s, trait_name, type_id, canonical, slots)
+                            witness_register(s, trait_name, type_id, canonical, slots)
                             // 传递性:实现子 trait 同时是全部传递父的见证。
-                            val closure = Semares.trait_parent_closure(s, trait_name)
+                            val closure = trait_parent_closure(s, trait_name)
                             var ci: usize = 0
                             while ci < closure.len() {
                                 val pt = closure.get(ci) ?? ""
-                                Semares.witness_register(s, pt, type_id, canonical, slots)
+                                witness_register(s, pt, type_id, canonical, slots)
                                 ci = ci + 1
                             }
                             ti = ti + 1

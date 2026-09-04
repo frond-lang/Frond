@@ -4,15 +4,15 @@
 import std.collections.List
 import std.collections.Map
 import std.core.types.Str
-import types.Arena
+import types.Arena.{display}
 
 import module.Loader
 import sema.Data
-import sema.Semares
-import sema.Modenv
+import sema.Semares.{trait_def_idx, type_def_idx}
+import sema.Modenv.{str_bytes_lt, str_list_sort}
 
 fun ty_str(a: TypeArena, h: u32): str {
-    Arena.display(a, h)
+    display(a, h)
 }
 
 fun bool_str(b: bool): str {
@@ -67,7 +67,7 @@ fun diag_lt(x: SErr, y: SErr): bool {
     val xf = err_file(x)
     val yf = err_file(y)
     if xf != yf {
-        return Modenv.str_bytes_lt(xf, yf)
+        return str_bytes_lt(xf, yf)
     }
     if x.line != y.line {
         return x.line < y.line
@@ -75,7 +75,7 @@ fun diag_lt(x: SErr, y: SErr): bool {
     if x.column != y.column {
         return x.column < y.column
     }
-    return Modenv.str_bytes_lt(x.message, y.message)
+    return str_bytes_lt(x.message, y.message)
 }
 
 fun sort_errors(errs: List<SErr>): void {
@@ -109,7 +109,7 @@ pub fun render(ar: TypeArena, s: SemaRes): str {
         mods.push(s.user_module_paths.get(i) ?? "")
         i = i + 1
     }
-    Modenv.str_list_sort(mods)
+    str_list_sort(mods)
     outl.push("! modules {mods.len()}\n")
     i = 0
     while i < mods.len() {
@@ -125,12 +125,12 @@ pub fun render(ar: TypeArena, s: SemaRes): str {
         type_names.push(keys[i])
         i = i + 1
     }
-    Modenv.str_list_sort(type_names)
+    str_list_sort(type_names)
     outl.push("! types {type_names.len()}\n")
     i = 0
     while i < type_names.len() {
         val name = type_names.get(i) ?? ""
-        val idx = Semares.type_def_idx(s, name) ?? 0
+        val idx = type_def_idx(s, name) ?? 0
         val td = s.type_defs.get(idx as usize) ?? TDef("", TAlias, [], [], null, null, [], [])
         val params = Semares.str_join(td.type_params, ",")
         val bases = Semares.str_join(td.bases, ",")
@@ -200,12 +200,12 @@ pub fun render(ar: TypeArena, s: SemaRes): str {
         trait_names.push(tkeys[i])
         i = i + 1
     }
-    Modenv.str_list_sort(trait_names)
+    str_list_sort(trait_names)
     outl.push("! traits {trait_names.len()}\n")
     i = 0
     while i < trait_names.len() {
         val name = trait_names.get(i) ?? ""
-        val idx = Semares.trait_def_idx(s, name) ?? 0
+        val idx = trait_def_idx(s, name) ?? 0
         val td = s.trait_defs.get(idx as usize) ?? TTDef("", [], [])
         outl.push("trait {name} parents=[{Semares.str_join(td.parents, ",")}]\n")
         var mi: usize = 0
@@ -225,7 +225,7 @@ pub fun render(ar: TypeArena, s: SemaRes): str {
         func_keys.push(fkeys[i])
         i = i + 1
     }
-    Modenv.str_list_sort(func_keys)
+    str_list_sort(func_keys)
     outl.push("! funcs {func_keys.len()}\n")
     i = 0
     while i < func_keys.len() {
@@ -306,7 +306,7 @@ pub fun render(ar: TypeArena, s: SemaRes): str {
             slot_keys.push(mk[si])
             si = si + 1
         }
-        Modenv.str_list_sort(slot_keys)
+        str_list_sort(slot_keys)
         var slots_str = ""
         si = 0
         while si < slot_keys.len() {
@@ -329,7 +329,7 @@ pub fun render(ar: TypeArena, s: SemaRes): str {
         fids.push(fid_keys[i])
         i = i + 1
     }
-    Modenv.str_list_sort(fids)
+    str_list_sort(fids)
     outl.push("! field-ids {fids.len()}\n")
     i = 0
     while i < fids.len() {
@@ -378,9 +378,9 @@ fun sort_tdefis(items: List<TDefI>): void {
             val cur = items.get(j as usize) ?? TDefI(0, "", 0, "", 0)
             var lt = false
             if key.type_name != cur.type_name {
-                lt = Modenv.str_bytes_lt(key.type_name, cur.type_name)
+                lt = str_bytes_lt(key.type_name, cur.type_name)
             } else if key.trait_name != cur.trait_name {
-                lt = Modenv.str_bytes_lt(key.trait_name, cur.trait_name)
+                lt = str_bytes_lt(key.trait_name, cur.trait_name)
             } else {
                 lt = key.method_idx < cur.method_idx
             }
@@ -407,7 +407,7 @@ fun sort_inhis(items: List<InhI>): void {
             val cur = items.get(j as usize) ?? InhI(0, "", 0, "", "", 0)
             var lt = false
             if key.type_name != cur.type_name {
-                lt = Modenv.str_bytes_lt(key.type_name, cur.type_name)
+                lt = str_bytes_lt(key.type_name, cur.type_name)
             } else {
                 lt = key.method_idx < cur.method_idx
             }
@@ -434,9 +434,9 @@ fun sort_wits(items: List<WEnt>): void {
             val cur = items.get(j as usize) ?? WEnt("", 0, Map.empty<str, i64>(), "")
             var lt = false
             if key.trait_name != cur.trait_name {
-                lt = Modenv.str_bytes_lt(key.trait_name, cur.trait_name)
+                lt = str_bytes_lt(key.trait_name, cur.trait_name)
             } else {
-                lt = Modenv.str_bytes_lt(key.type_name, cur.type_name)
+                lt = str_bytes_lt(key.type_name, cur.type_name)
             }
             if lt {
                 items.set((j + 1) as usize, cur)
