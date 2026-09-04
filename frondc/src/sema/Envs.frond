@@ -75,6 +75,33 @@ pub fun lookup_local(e: EnvA, env: u32, name: str): u32? {
     node_of(e, env).bindings.get(name)
 }
 
+// 沿父链查找,仅当命中落在 ROOT 层(std 预declare/全局层)才返回;
+// 更深层命中(局部变量/本模块定义/选择性导入条目)是刻意绑定,静默
+// 胜出,返回 null。裸名自由函数多主零静默检查用(S2c,引擎
+// Env::lookup_at_root 同步)。
+pub fun lookup_at_root(e: EnvA, env: u32, name: str): u32? {
+    var cur = env
+    var guard: i64 = 0
+    while guard < 1000000 {
+        val node = node_of(e, cur)
+        match node.bindings.get(name) {
+            null => {}
+            ty => {
+                match node.parent {
+                    null => { return ty }
+                    _ => { return null }
+                }
+            },
+        }
+        match node.parent {
+            null => { return null }
+            p => { cur = p }
+        }
+        guard = guard + 1
+    }
+    null
+}
+
 // 本层已定义的名字集合(快照;predeclare origin 清单用)。
 pub fun snapshot_names(e: EnvA, env: u32): List<str> {
     val out = List.empty<str>()

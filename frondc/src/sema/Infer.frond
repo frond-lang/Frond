@@ -4687,6 +4687,36 @@ fun infer_call_expr(ctx: ICtx, a: TypeArena, s: SemaRes, expr: i64, ast: AstAren
                             },
                         }
                         if !handled {
+                            // S2c 镜像(引擎 CallInfer 同步):裸名自由调用经
+                            // root 层解析且全局多主 → 调用点歧义错(消息与
+                            // 引擎逐字节一致);本模块自有定义与显式选择性
+                            // 条目豁免(优先级格:显式 > std 预declare 层)。
+                            match Envs.lookup_at_root(s.env, env, name) {
+                                null => {}
+                                _ => {
+                                    match s.func_sig_owners.get(name) {
+                                        null => {}
+                                        owners_csv => {
+                                            val oc = owners_csv ?? ""
+                                            val oparts = Str.split(oc, ",")
+                                            var own = false
+                                            var oi: usize = 0
+                                            while oi < oparts.len() {
+                                                if oparts[oi] == ctx.current_module_name {
+                                                    own = true
+                                                }
+                                                oi = oi + 1
+                                            }
+                                            val alias_key = ctx.current_module_name + "\u{0}" + name
+                                            if oparts.len() >= 2 && !own && !s.import_alias_owners.has(alias_key) {
+                                                add_error_at(s,
+                                                    "ambiguous call '" + name + "': [" + oc + "] — qualify the call or bind it with a selective import",
+                                                    e.span.line, e.span.column)
+                                            }
+                                        },
+                                    }
+                                },
+                            }
                             callee_ty = infer_expr(ctx, a, s, callee, ast, env, null)
                             resolved_directly = true
                         }

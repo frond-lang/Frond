@@ -78,6 +78,9 @@ pub type SemaRes = SemaRes(
     pub origin_index_built: bool,
     // alias/dup 检查水位(增量化:每模块只扫新增 type_defs)。
     pub checks_scan_base: usize,
+    // ── S2c:选择性导入条目归属(键 = module + NUL + 本地名 → true;
+    // 裸名多主零静默的显式豁免面;不进 dump/stats)──
+    pub import_alias_owners: Map<str, bool>,
     // ── 诊断 ──
     pub errors: List<SErr>,
     pub warnings: List<SErr>,
@@ -100,6 +103,7 @@ pub fun new_semares(): SemaRes {
         Map.empty<str, bool>(), Map.empty<str, bool>(),
         Map.empty<str, List<str>>(), Map.empty<str, List<str>>(), false,
         0,
+        Map.empty<str, bool>(),
         List.empty<SErr>(), List.empty<SErr>(), false,
     )
 }

@@ -335,7 +335,16 @@ impl<'a> InferContext<'a> {
                                     let prev_desc = match &prev {
                                         crate::sema::Sema::AliasTarget::Symbol(m) => {
                                             if m.as_ref() == target_mangled {
-                                                continue; // same target re-imported: idempotent
+                                                // Same target re-imported: idempotent for
+                                                // the GLOBAL alias map, but ownership must
+                                                // still be recorded for THIS module (the
+                                                // bare-call zero-silence exemption consults
+                                                // per-module alias_keys).
+                                                self.sema_result.module_ownership.alias_keys
+                                                    .entry(module.name.to_string())
+                                                    .or_default()
+                                                    .insert(local.to_string());
+                                                continue;
                                             }
                                             format!("'{}'", m)
                                         }

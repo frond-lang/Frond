@@ -294,9 +294,15 @@ pub fun process_import_decls(ctx: ICtx, a: TypeArena, s: SemaRes, m: ModuleAst, 
                                         null => {}
                                         al => { local = al }
                                     }
-                                    define(s.env, env, local, sym_ty)
-                                    // import_aliases 登记在 M1 无 IR 消费者,
-                                    // 二义检查属推断切片;先跳过。
+                                    // S2c 优先级格(env 层):显式条目 define
+                                    // 失败(std 预declare 同层首胜)时 redefine
+                                    // 覆盖 —— 显式 > 环境层任意既有绑定。
+                                    if !define(s.env, env, local, sym_ty) {
+                                        redefine(s.env, env, local, sym_ty)
+                                    }
+                                    // S2c:显式条目归属登记(裸名多主零静默
+                                    // 的豁免面;引擎 alias_keys 同步语义)。
+                                    s.import_alias_owners.set(s.current_module_name + "\u{0}" + local, true)
                                 },
                             }
                             ki = ki + 1
