@@ -2516,9 +2516,7 @@ impl RecordRef {
         }
         // Records always hold Value edges → always potentially-cyclic.
         // (乙①: intrusive list thread replaces the hash-set insert.)
-        if super::Registry::record_registration_enabled() {
-            record_list_thread(ptr);
-        }
+        record_list_thread(ptr);
         RecordRef(std::ptr::NonNull::new(ptr).unwrap())
     }
 
@@ -2601,9 +2599,7 @@ impl RecordRef {
                 }
             }
         }
-        if super::Registry::record_registration_enabled() {
-            record_list_thread(ptr);
-        }
+        record_list_thread(ptr);
         RecordRef(std::ptr::NonNull::new(ptr).unwrap())
     }
 
@@ -2815,9 +2811,7 @@ impl Drop for RecordRef {
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
             // (乙①: unthread BEFORE freeing so the registry never holds a
             // dangling pointer.)
-            if super::Registry::record_registration_enabled() {
-                record_list_unthread(self.0.as_ptr());
-            }
+            record_list_unthread(self.0.as_ptr());
             unsafe { self.drop_slow() }
         }
     }

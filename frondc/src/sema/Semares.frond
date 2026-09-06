@@ -14,7 +14,7 @@ import std.collections.List
 import std.collections.Map
 import std.core.types.Str
 import syntax.Ast
-import sema.Data.{new_err_path}
+import sema.Data
 import sema.Envs.{new_enva}
 
 pub type SemaRes = SemaRes(
@@ -566,6 +566,63 @@ pub fun get_ctor_def(s: SemaRes, name: str): Ctor? {
         i = i + 1
     }
     null
+}
+
+// ─── record 形状查询(切片 2 后端消费)─────────────────────────────
+
+// 名义 record 字段类型序列(声明序):null = 非单构造器非泛型聚合
+// (多 ctor ADT/alias/newtype/泛型/未知)。构造器调用推断产
+// TAdt(detail),detail 只挂名——字段序列必须经 type_defs 名义解析
+// (kind Record 单 ctor;Adt 单 ctor 同形收编)。字段序 = 声明序
+// (field_types 与 field_names 对齐)。返回 u32[](非 record 形 =
+// null,零字段 record = 空数组)——后端免 import Data(TDK 与 Ty
+// 变体撞名)。
+pub fun record_shape(s: SemaRes, name: str): u32[]? {
+    match get_type_def(s, name) {
+        null => null
+        def => {
+            val d = def ?? TDef("", TAlias, [], [], null, null, [], [])
+            if d.type_params.len() > 0 || d.constructors.len() != 1 {
+                return null
+            }
+            if d.kind == Data.TRecord || d.kind == Data.TAdt {
+                d.constructors[0].field_types
+            } else {
+                null
+            }
+        },
+    }
+}
+
+// 名义 record 字段名 → 声明序下标(0 基,即字段在构造器里的位置;
+// -1 = 无此字段/类型未知)。按 field_names 位置直接消歧——与
+// lookup_field_id 的 kind 基数口径(Record 0 基、Adt 1 基)等价,
+// 免去后端翻译;跨 ctor 不可能(单 ctor 消费面)。
+pub fun record_field_idx(s: SemaRes, type_name: str, field: str): i64 {
+    match get_type_def(s, type_name) {
+        null => -1
+        def => {
+            val d = def ?? TDef("", TAlias, [], [], null, null, [], [])
+            var ci: usize = 0
+            while ci < d.constructors.len() {
+                val c = d.constructors[ci]
+                var fi: usize = 0
+                while fi < c.field_names.len() {
+                    match c.field_names[fi] {
+                        null => {}
+                        nm => {
+                            if (nm ?? "") == field {
+                                return fi as i64
+                            }
+                        },
+                    }
+                    fi = fi + 1
+                }
+                ci = ci + 1
+            }
+            -1
+        },
+    }
 }
 
 // ─── 名称消歧(模块作用域单点)──────────────────────────────────────

@@ -25,7 +25,7 @@
 |---|---|---|
 | **Stage 0** | Rust 编译器+引擎(现状) | ✓ 存在 |
 | **Stage 1** | frondc 跑在 Rust 引擎上:词法+语法+全套 sema(含 monomorph)。**不碰 LLVM**——验证"Frond 语言表达力足以承载自己的语义系统" | ✓ **完成(2026-08-31:全节差分绿 + 终局验收三级)** |
-| **Stage 2** | frondc 的后端模块用 std.llvm(Frond 代码调 LLVM-C)lower AST→.obj,内嵌 lld 解出后 spawn 链接(零宿主工具链,见 四) | **切片 0 落地(2026-09-04):Back lowering 字面量/算术/main + `native` 子命令端到端,退出码验收 4/4**;探针绿(2026-08-31 macOS 实证 + CI) |
+| **Stage 2** | frondc 的后端模块用 std.llvm(Frond 代码调 LLVM-C)lower AST→.obj,内嵌 lld 解出后 spawn 链接(零宿主工具链,见 四) | **切片 0/1/2 落地(2026-09-04~07):Back lowering 字面量/算术/main + 控制流 + 聚合(record/数组/str,bump arena);`native` 子命令端到端,退出码验收 16/16**;探针绿(2026-08-31 macOS 实证 + CI) |
 | **Stage 3** | 引擎里跑 frondc.frond 编译它自己 → 原生 fronc.exe。**此刻闭环达成** | 未开始 |
 | **Stage 4** | (可选)Rust 引擎退役,fronc 为唯一编译器 | 未开始 |
 
@@ -600,8 +600,90 @@ status 8 位截断,保 CI 可移植)。checkmany 引擎侧 sema 先行验证 0 �
 每块必恰一条终结指令,孤儿块同罪);块按形态懒创建。
 
 **下一片 = 切片 2**:聚合(record 构造/字段)+ 数组 + str 字面量 →
-frond_rt C 层起步(v0 Value 盒);跨模块函数与 monomorph 实例 lower
-随自举临近再排。
+bump arena 纯 IR(**2026-09-07 落地**,见 附八落地记录);
+跨模块函数与 monomorph 实例 lower 随自举临近再排。
+
+## 附八:Stage 2 切片 2 计划与落地记录(2026-09-06 计划,2026-09-07 落地)
+
+**范围**:单构造器 record(构造/字段读/FieldAssignS 写/作参数返回)、
+数组(ArrayLitE 含 fill 循环/IndexE 读写/复合写/越界 trap)、str 字面量
+(全局常量块/len 内在/== != 内联字节循环)、聚合嵌套组合(record 数组/
+record 内数组/str 字段)。多 ctor ADT/match、nullable 族、str 拼接索引
+切片、`++` 拼接与 push 族、引用、RecordLitE/RecordExtendE、深相等、
+跨模块与 monomorph——全部响亮报错,后续切片。
+
+**值表示(镜像引擎 oracle,Value.rs 已核实)**:record = Arc 单块共享
+(**引用语义**——赋值拷指针,`b.x=10` 经 `a` 可见;引擎 Record(RecordRef)
+同款);str = 单分配 UTF-8 不可变;数组 = len + 可变元素堆块。原生 v0:
+record/str/数组全 `ptr`(标量维持切片 0/1 SSA/栈槽不动)——
+record=`{f0,...}` 字面 struct(字段序=ctor 声明序)、str=`{i64 len,
+[N x i8]}` 弹性尾、数组=`{i64 len, elem...}` 弹性尾;无 rc 头无 tag
+(静态特化);`llty_key`:str=`pstr`/数组=`parr:<elem>`(递归)/
+record=`prec:<模块>::<类型名>`。FieldAssignS/arr[i]=x 经指针原地
+store,共享语义自动与引擎一致。
+
+**§2 分配策略(裁决变更:原计划"frond_rt C 层起步"→ bump arena)**:
+甲(extern malloc)破 macOS 零库链接;乙(frond_rt.c 现在起步)把五
+triple C 交叉编译管道拖进本切片且真消费者(rc/panic/argv/UTF-16 桥/
+dlopen)全在后续切片;**丙 = Back 每模块 emit `@frond_heap`(1GiB
+.bss 零页)+ `@frond_heap_top`(i64 前沿)+ 辅助函数 `frond_alloc(size)
+-> ptr`(load top → 16 对齐 → icmp 越界 → store → ret 旧顶;越界
+`llvm.trap`)**。零外部符号(macOS 零库链接不破)、零新资产(五 triple
+CI 零改动)、泄漏 = 4e 已接受(v0 可泄漏)。frond_rt 真进场时
+`frond_alloc` 换 C 实现即可,调用点不动。多 .obj 各带 arena,块跨模块
+传递安全(分配归属不区分);arena 收敛单点分配器随 frond_rt 一起做。
+1GiB 虚拟段 Windows PE 表现 = lld 实测,异常降 256MB。
+
+**绑定新增**:struct_type/build_struct_gep/build_gep/add_global/
+const 家族(const_struct/const_array)——LLVM 21 API 位次先探针后
+进主线(谓词位次教训,附二雷 1)。trap intrinsic 复用 declare 通道。
+
+**实施序**(每步全量门禁绿再进):绑定+布局地基 → str → record →
+数组 → fixtures/driver/CI。
+
+**验收**:`tests/fixtures/native_slice2/cases/`(11-16:record 构造+深
+访问/**共享语义锚**(var 别名字段写可见)+translate 链/宽 record 10
+字段+混合标量/数组字面量+fill+原地写+len 迭代/record 数组+Matrix
+嵌套/str 相等+len+作字段读回),退出码锁 0..255;driver =
+`tests/scripts/native_slice2.sh`(拷 slice1 模板),CI 五平台矩阵挂
+负套件后;每 fixture 先过引擎 checkmany 0 错;门禁 = native 0/1/2 +
+functional + negative + diff_sema/load/tyops 全绿。
+
+**风险**:新 LLVM API 位次雷(独立探针先行);record 共享语义 fixture
+写完先引擎跑确认 oracle;fill/元素求值序以引擎 dump_ir 为准;1GiB
+.bss PE 实测;多 ctor 误入构造分支(严格 constructors.len()==1 &&
+ctor 名==类型名,否则报 "multi-ctor ADT arrives with match (slice 3)")。
+
+**落地记录(2026-09-07)**:
+
+**验收**:`tests/fixtures/native_slice2/cases/`(11-16)退出码全中
+57/112/110/176/96/87——record 深链构造+共享语义(translate 链)+
+宽 record 10 字段混合标量/数组字面量+fill+原地写+复合写+越界 trap/
+record 数组 Matrix 嵌套深链写/str 相等+!= +len UTF-8 字符数+作字段
+读回;driver = `tests/scripts/native_slice2.sh`,CI 五平台矩阵已挂
+(ci.yml:100,负套件后)。门禁全绿:native 0/1/2(5+5+6)+ functional 98
+(llvm_probe 补跑)+ negative 69 + diff_lex 489 + diff_ast 479+10skip +
+diff_load 12 + diff_tyops IDENTICAL + diff_sema 6 = **1167 用例零回归**。
+
+**关键修复(实施期定位)**:
+1. **GEP i8 基型单索引**:字节步进 `[头, off]` 双索引报 "Invalid
+   indices for GEP pointer type";修 = 先 `build_add` 加总成单索引
+   `boff = 8 + i` 再 `gep i8, ptr, [boff]`(i8 无嵌套层可索引)。
+2. **str_len_chars 谓词反转**:续字节判定 `(b & 0xC0) == 0x80` 用
+   `icmp ne`(33u32)→ iscont 真 = 续字节却跳过计数,数的是续字节
+   非 0 的("héllo"=5 字符数成 3);改 `icmp eq`(32u32)→ iscont
+   真 = 续字节,跳过;首字节才 inc。diag16 退出码 71040016→87 实证。
+3. **ty_same 数组忽略 size**:`[T; N]` 宽化到 `T[]`(引擎允许,值
+   形态同为 ptr);不忽略 size 时 conv_value 报 mismatched aggregate。
+4. **record 构造器 TAdt 名义引用**:CallE 推断为 TAdt(detail id
+   每次新分配不可靠),布局按类型名解析;conv_value 的 (7,7) 分支
+   按 `record_name_of` 同名判等。
+
+**顺带修复**:run_functional.sh / negative/run.sh 的 FROND 路径
+解析 bug——`cd "$(dirname "$0")"` 后再拼同相对串会解析到错误位置
+(从仓库根调用时 FROND 误判 not found → exit 2 零输出);CI 显式
+设 FROND env 一直掩盖,本地裸跑必中招;改纯相对路径 `../../Frond/
+core/target/release`(与 native_slice*/diff_* 同款)。
 
 ## 附五:S2c 导入优先级格 + 裸名多主零静默(2026-09-04,用户裁决"地基要稳")
 

@@ -1577,8 +1577,6 @@ pub fn optimize_with_analysis(
     // hoisted_owners tracking + rebuild grouped reordering ensures body nodes are correctly
     // included in the caller's range.
 
-    let bt = std::env::var("FROND_BUILD_TIME").is_ok();
-    let mut bt_prev = std::time::Instant::now();
     // ── Pre-pass: entry-reachability prune (physical) ──────────────────────
     // The std dependency closure is compiled wholesale (fib imports one
     // Instant call and the graph carries 927 functions, 31 reachable). Kill
@@ -1620,18 +1618,6 @@ pub fn optimize_with_analysis(
         });
         // On failure `run_guarded` already restored the pre-phase1 graph;
         // phase 2 still runs on the (unoptimized) consistent graph.
-    }
-    if bt {
-        let now = std::time::Instant::now();
-        eprintln!("[opt-time] phase1: {} us", now.duration_since(bt_prev).as_micros());
-        bt_prev = now;
-    }
-
-
-    if bt {
-        let now = std::time::Instant::now();
-        eprintln!("[opt-time] prepass: {} us", now.duration_since(bt_prev).as_micros());
-        bt_prev = now;
     }
     // ── Phase 2: fixpoint iteration (Inline + traditional optimization, level >= 1) ──
     // Termination guard (replaces the former fixed 48/198-round cap): the loop stops
@@ -1688,11 +1674,6 @@ pub fn optimize_with_analysis(
             stalled = 0;
         } else {
             stalled += 1;
-        }
-        if bt {
-            let now = std::time::Instant::now();
-            eprintln!("[opt-time] phase2(rounds={}): {} us", round, now.duration_since(bt_prev).as_micros());
-            bt_prev = now;
         }
         if stalled >= stall_window {
             eprintln!(

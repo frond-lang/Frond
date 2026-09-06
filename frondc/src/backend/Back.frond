@@ -1,28 +1,36 @@
-// backend/Back.frond — Stage 2 Back lowering 切片 0+1(BOOTSTRAP_PLAN 八):
+// backend/Back.frond — Stage 2 Back lowering 切片 0+1+2(BOOTSTRAP_PLAN 八/附八):
 // 切片 0:字面量/一元负/算术/比较/位运算/AsCast/局部 val/var + return;
 // 切片 1:IfE 值表达式(槽位+merge)/块作用域(副本式)/while/loop/
 // break/continue/&&-|| 短路/入口模块多函数(原型先行互递归)+ CallE,
 // 经 sema(已单态化、类型完备)直接 lower 成 LLVM IR 的 SSA → verify
 // → default<O2>(mem2reg 吃掉 naive alloca)→ TargetMachine emit .obj。
+// 切片 2:record/数组/str 三聚合(附八)——值 = opaque ptr(引用语义,
+// 镜像引擎 Arc 单块共享),分配走 bump arena(§2 策略丙:@frond_heap
+// 1GiB .bss + @frond_heap_top + frond_alloc,零外部符号)。
 //
-// 值表示(切片 0):标量全程寄存器/栈槽,无堆值——聚合/str/引用随
-// v0 Value 盒(需 frond_rt)在后续切片进入;本文件的类型映射与表达式
-// 遍历骨架与表示无关。
+// 值表示(切片 2,附八裁决):record = ptr → 字面 struct {f0,...}
+// (字段序 = ctor 声明序);str = ptr → {i64 len, [N x i8] bytes}
+// (字面量 = 私有全局常量块);数组 = ptr → {i64 len, elem...} 弹性尾
+// (ArrayLitE 经 frond_alloc 运行时构造,原地写语义)。标量维持切片 0/1
+// SSA/栈槽不动。布局键:str 值 = "ptr"(opaque 单例)/record 布局 =
+// "prec:{detail_id}"/str 块 = "strblk:{N}"。
 //
 // 工程约束(handleprobe 实证 2026-09-04):LLVM u64 句柄经局部值/函数
 // 参数/函数返回/数组/List/Map/nullable/模块 var 读回后 FFI marshal 全部
 // 安全;**record 字段读回是软类型值,call 收 0**(引擎已知洞)——本文件
 // 一切状态(Map 槽表/类型缓存/计数器)不得使用含 u64 字段的 record。
 //
-// 错误通道:统一 Throw<_, FfiError>;切片 0 边界(不支持的节点/类型/
+// 错误通道:统一 Throw<_, FfiError>;切片边界(不支持的节点/类型/
 // 转型)以 FfiError(Other, "...") 报出,消息带节点 id 与模块名。
 //
 // 语义记账(切片 0 有界差异,均待 frond_rt/后续切片收编):
 // - 整型溢出 = 环绕(无 nsw/nuw);除零/移位越界 = LLVM UB(C 语义);
-// - &&/|| 非短路(切片 0 无副作用表达式,等价);
 // - f128 字面量经 LLVMConstRealOfString 全精度,不经 double 中转;
 // - usize/isize 与 char 按位宽并入整型族(char = i32 无符号码点;
-//   usize/isize = host 词长,交叉目标未开)。
+//   usize/isize = host 词长,交叉目标未开);
+// - 切片 2:arena 不回收(4e 已接受,v0 可泄漏);str 拼接/索引/切片、
+//   数组 ++/push、多 ctor ADT/match、nullable 族、引用、RecordLitE/
+//   RecordExtendE、深相等、跨模块与 monomorph——响亮报错,后续切片。
 import backend.Llvm
 import backend.Toolchain
 import syntax.Ast
@@ -32,12 +40,14 @@ import types.Arena
 import types.Ty
 import std.collections.List
 import std.collections.Map
+import std.os.Env
 
 // ── 类型分类(纯函数)──────────────────────────────────────────────
 
-// 类型分类标签(0=int 1=float 2=bool 3=char 4=void -1=其他)。不返回
-// ADT:frondc 模块规模下 match 臂返回裸零参变体会被静默吞成 null(引擎
-// 洞,handleprobe 小规模复刻不触发,2026-09-04 实证);整数字面量臂稳定。
+// 类型分类标签(0=int 1=float 2=bool 3=char 4=void 5=str 6=array
+// 7=record -1=其他)。不返回 ADT:frondc 模块规模下 match 臂返回裸零参
+// 变体会被静默吞成 null(引擎洞,handleprobe 小规模复刻不触发,
+// 2026-09-04 实证);整数字面量臂稳定。
 pub fun ty_kind(t: Ty): i64 {
     match t {
         TBool => 2
@@ -47,6 +57,9 @@ pub fun ty_kind(t: Ty): i64 {
         TIsize | TUsize => 0
         TF16 | TF32 | TF64 | TF128 => 1
         TVoid => 4
+        TStr => 5
+        TArray(_) => 6
+        TRecord(_) => 7
         _ => -1
     }
 }
@@ -134,6 +147,126 @@ pub fun llty_for(lib: Lib, ctx: u64, cache: Map<str, u64>, t: Ty): Throw<u64, Ff
     Ok(built)
 }
 
+// ── 聚合类型映射(切片 2,附八)───────────────────────────────────
+
+// 聚合值形态 = opaque ptr(str/数组/record 三形态统一;opaque ptr 在
+// context 内单例,缓存键 "ptr" 共享)。
+fun is_agg_kind(k: i64): bool {
+    k == 5 || k == 6 || k == 7
+}
+
+fun opaque_ptr(lib: Lib, ctx: u64, cache: Map<str, u64>): Throw<u64, FfiError> {
+    match cache.get("ptr") {
+        null => {
+            val p = Llvm.ptr_type(lib, ctx)?
+            cache.set("ptr", p)
+            Ok(p)
+        }
+        h => Ok(h ?? 0)
+    }
+}
+
+// 句柄聚合分类(切片 2):ty_kind 的名义扩展——TAdt 且类型名为单 ctor
+// 非泛型聚合(record_shape 命中)→ 7。其余 TAdt(多 ctor/泛型/别名/
+// newtype/未知名)→ -1,lowering 触点响亮报错。TRecord(detail)保持
+// ty_kind 直判(结构 record,本切片构造面不走此形态)。
+pub fun agg_kind(a: TypeArena, s: SemaRes, h: u32): i64 {
+    val rh = Arena.resolve(a, h)
+    val raw = Arena.get(a, rh)
+    val k = ty_kind(raw)
+    if k >= 0 {
+        return k
+    }
+    match raw {
+        TAdt(_) => {
+            val parts = Arena.adt_parts(a, rh)
+            if parts.b.len() > 0 {
+                return -1
+            }
+            match Semares.record_shape(s, parts.a) {
+                null => -1
+                _ => 7
+            }
+        },
+        _ => -1
+    }
+}
+
+// 句柄形态的类型映射(聚合 → opaque ptr;标量回落 llty_for)。TArray
+// 元素未定长(size=null)在此不炸——值形态只看 ptr;元素访问另有校验。
+pub fun llty_for_h(lib: Lib, ctx: u64, cache: Map<str, u64>, a: TypeArena, s: SemaRes, h: u32): Throw<u64, FfiError> {
+    if is_agg_kind(agg_kind(a, s, h)) {
+        return opaque_ptr(lib, ctx, cache)
+    }
+    llty_for(lib, ctx, cache, Arena.get(a, Arena.resolve(a, h)))
+}
+
+// record 名义类型句柄的 ADT 名(record 布局/字段访问的公用入口):
+// TAdt → detail 名(泛型实例 null——本切片非泛型面);TRecord(结构
+// record,RecordLitE 族)无名义,null——本切片构造面不走此形态。
+pub fun record_name_of(a: TypeArena, h: u32): str? {
+    val rh = Arena.resolve(a, h)
+    match Arena.get(a, rh) {
+        TAdt(_) => {
+            val parts = Arena.adt_parts(a, rh)
+            if parts.b.len() > 0 {
+                null
+            } else {
+                parts.a
+            }
+        },
+        _ => null,
+    }
+}
+
+// record 布局 {f0,...}(字段序 = ctor 声明序 = record_field_idx 口径;
+// 字段值形态:标量 = 本体,聚合 = ptr)。名义键 prec:{name}——构造器
+// 调用推断产 TAdt(detail 只挂名,detail id 每次推断新分配,不可作键);
+// 同名即同型(切片 2 非泛型约束),跨模块同构各自成键无害。
+pub fun record_layout(lib: Lib, ctx: u64, cache: Map<str, u64>, a: TypeArena, s: SemaRes, name: str): Throw<u64, FfiError> {
+    val key = "prec:{name}"
+    match cache.get(key) {
+        null => {}
+        h => { return Ok(h ?? 0) }
+    }
+    match Semares.record_shape(s, name) {
+        null => throw FfiError(Other, "slice 2: '{name}' is not a single-constructor non-generic record")
+        fts0 => {
+            val fts = fts0 ?? []
+            if fts.len() == 0 {
+                val lt = Llvm.struct_type0(lib, ctx)?
+                cache.set(key, lt)
+                return Ok(lt)
+            }
+            var ftys: u64[] = []
+            var i: usize = 0
+            while i < fts.len() {
+                ftys = ftys ++ [llty_for_h(lib, ctx, cache, a, s, fts[i])?]
+                i = i + 1
+            }
+            val lt = Llvm.struct_type(lib, ctx, ftys)?
+            cache.set(key, lt)
+            Ok(lt)
+        },
+    }
+}
+
+// str 块布局 {i64, [N x i8]}(字面量全局常量与堆拷贝共用的头部形态;
+// len 在 offset 0,字节在 offset 8)。
+pub fun str_layout(lib: Lib, ctx: u64, cache: Map<str, u64>, n: usize): Throw<u64, FfiError> {
+    val key = "strblk:{n}"
+    match cache.get(key) {
+        null => {}
+        h => { return Ok(h ?? 0) }
+    }
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    val i8ty = llty_for(lib, ctx, cache, TI8)?
+    val bytes = Llvm.array_type2(lib, i8ty, n as u64)?
+    val lt = Llvm.struct_type(lib, ctx, [i64ty, bytes])?
+    cache.set(key, lt)
+    Ok(lt)
+}
+
 // ── 字面量文本(LLVMConstIntOfString 的 radix/数字段分离)──────────
 
 // 前缀识别:0x/0X=16,0o/0O=8,0b/0B=2,其余 10。
@@ -195,19 +328,117 @@ pub fun expr_ty(a: TypeArena, s: SemaRes, mname: str, eid: i64): Throw<u32, FfiE
     }
 }
 
+// ── 结构同型判定(切片 2)─────────────────────────────────────────
+// conv_value 聚合恒等的公用:detail id 每次推断新分配,裸句柄比较不可
+// 靠(TAdt/TArray 双份句柄同型不同 id)。str 恒同;数组 = size 相等 +
+// elem 递归;record = TAdt 同名(零类型参)或 TRecord 同 detail;标量
+// = 同 LLVM 表示键;其余(-1 族)= false。
+fun ty_same(a: TypeArena, s: SemaRes, h1: u32, h2: u32): bool {
+    if h1 == h2 {
+        return true
+    }
+    val r1 = Arena.resolve(a, h1)
+    val r2 = Arena.resolve(a, h2)
+    if r1 == r2 {
+        return true
+    }
+    val k1 = agg_kind(a, s, r1)
+    val k2 = agg_kind(a, s, r2)
+    if k1 != k2 {
+        return false
+    }
+    if k1 == 5 {
+        return true
+    }
+    if k1 == 6 {
+        // size 不参与:引擎允许 [T; N] 宽化到 T[](数组 = 堆引用,
+        // len 运行时),值形态同为 ptr。
+        val q1 = Arena.array_parts(a, r1)
+        val q2 = Arena.array_parts(a, r2)
+        return ty_same(a, s, q1.a, q2.a)
+    }
+    if k1 == 7 {
+        val n1 = record_name_of(a, r1)
+        val n2 = record_name_of(a, r2)
+        if n1 != null || n2 != null {
+            return n1 != null && n2 != null && (n1 ?? "") == (n2 ?? "")
+        }
+        match Arena.get(a, r1) {
+            TRecord(d1) => {
+                match Arena.get(a, r2) {
+                    TRecord(d2) => { d1 == d2 }
+                    _ => false
+                }
+            },
+            _ => false
+        }
+    } else {
+        if k1 < 0 {
+            return false
+        }
+        llty_key(Arena.get(a, r1)) == llty_key(Arena.get(a, r2))
+    }
+}
+
 // ── 值转型 ─────────────────────────────────────────────────────────
 
 // v: from → to(两类型句柄)。同类宽窄/符号化、int↔float、bool↔X;
 // 位宽相同 = 恒等(char↔i32 走此短路,免非法 same-size trunc)。
 pub fun conv_value(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>,
-    a: TypeArena, v: u64, from_h: u32, to_h: u32, name: str): Throw<u64, FfiError> {
+    a: TypeArena, s: SemaRes, v: u64, from_h: u32, to_h: u32, name: str): Throw<u64, FfiError> {
     if from_h == to_h {
         return Ok(v)
     }
-    val from = Arena.get(a, from_h)
-    val to = Arena.get(a, to_h)
-    val fk = ty_kind(from)
-    val tk = ty_kind(to)
+    val from = Arena.get(a, Arena.resolve(a, from_h))
+    val to = Arena.get(a, Arena.resolve(a, to_h))
+    val fk = agg_kind(a, s, from_h)
+    val tk = agg_kind(a, s, to_h)
+    // 聚合族(切片 2):值 = opaque ptr,同型即恒等(str↔str;数组须
+    // elem 同型;record 须同名义类型——TAdt 同名或 TRecord 同 detail)。
+    // 跨形态/异型 = 响亮报错。
+    if is_agg_kind(fk) || is_agg_kind(tk) {
+        if !is_agg_kind(fk) || !is_agg_kind(tk) {
+            throw FfiError(Other, "slice 2: aggregate/scalar conversion '{name}' is not supported")
+        }
+        if fk == 5 && tk == 5 {
+            return Ok(v)
+        }
+        if fk == 6 && tk == 6 {
+            if ty_same(a, s, from_h, to_h) {
+                return Ok(v)
+            }
+        }
+        if fk == 7 && tk == 7 {
+            match from {
+                TAdt(_) => {
+                    match to {
+                        TAdt(_) => {
+                            // 名义恒等:detail id 每次推断新分配,不可靠;
+                            // 非泛型面同名即同型。
+                            val fname = record_name_of(a, from_h) ?? ""
+                            val tname = record_name_of(a, to_h) ?? ""
+                            if fname.len() > 0 && fname == tname {
+                                return Ok(v)
+                            }
+                        },
+                        _ => {}
+                    }
+                },
+                TRecord(fid) => {
+                    match to {
+                        TRecord(tid) => {
+                            if fid == tid {
+                                return Ok(v)
+                            }
+                        },
+                        _ => {}
+                    }
+                },
+                _ => {}
+            }
+        }
+        throw FfiError(Other, "slice 2: mismatched aggregate conversion '{name}'")
+    }
     if (fk == 0 || fk == 3) && (tk == 0 || tk == 3) {
         val fb = ty_bits(from)
         val tb = ty_bits(to)
@@ -276,11 +507,493 @@ fun tmp(): str {
     "t{tmpn}"
 }
 
-// ── 切片 1 状态(模块 var 通道;gvar 探针实证 List/Map 初始化安全)──
-// flow_stopped:当前线性路径已终止(return/break/continue)。不变式:
-// stopped=true 时该路径必已发出终结指令,组合器一律跳过后续 build
-// (null 句柄进 FFI = 段错误)。
+// ── bump arena(切片 2,附八 §2 策略丙)────────────────────────────
+// @frond_heap = 1GiB [i8] 零页(.bss);@frond_heap_top = ptr 前沿
+// (初值 = heap 基址);frond_alloc(size) -> ptr:load top →
+// (top+size+15) & -16 → ule heap基址+1GiB(越界 llvm.trap)→
+// store 新顶 → ret 旧顶。零外部符号(macOS 零库链接不破,零新资产);
+// arena 不回收 = 4e 已接受(v0 可泄漏);frond_rt 真进场时 frond_alloc
+// 换 C 实现即可,调用点不动。
+
+var arena_fn: u64 = 0
+var arena_ft: u64 = 0
+var cur_td: u64 = 0
+// 切片 2 模块级通道:cur_module(str 常量全局挂载点)/trap(越界内联)/
+// str_consts(字面量内容去重)/place_ptr-place_ty(lower_place 出参,
+// 调用点即读,禁止跨嵌套持有——u64 record 字段读回是软类型洞,禁用)。
+var cur_module: u64 = 0
+var trap_fn: u64 = 0
+var trap_ft: u64 = 0
+var str_consts: Map<str, u64> = Map.empty<str, u64>()
+var strn: i64 = 0
+var place_ptr: u64 = 0
+var place_ty: u32 = 0
+// flow_stopped 提前声明(切片 2 部件在切片 1 状态区之前引用;
+// var 顺序敏感,函数前向引用不受限)。语义不变:当前线性路径已终止
+// (return/break/continue),stopped=true 时该路径必已发出终结指令,
+// 组合器一律跳过后续 build(null 句柄进 FFI = 段错误)。
 var flow_stopped: bool = false
+
+pub fun emit_arena(lib: Lib, ctx: u64, module: u64, cache: Map<str, u64>): Throw<void, FfiError> {
+    val i8ty = llty_for(lib, ctx, cache, TI8)?
+    val heap_ty = Llvm.array_type2(lib, i8ty, 1073741824u64)?
+    val heap_g = Llvm.add_global(lib, module, heap_ty, "frond_heap")?
+    Llvm.set_initializer(lib, heap_g, Llvm.const_null(lib, heap_ty)?)?
+    val ptrty = opaque_ptr(lib, ctx, cache)?
+    val top_g = Llvm.add_global(lib, module, ptrty, "frond_heap_top")?
+    // 初值 = @frond_heap 的地址(全局变量句柄即 ptr 值,合法 initializer)。
+    Llvm.set_initializer(lib, top_g, heap_g)?
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    arena_ft = Llvm.function_type(lib, ptrty, [i64ty], false)?
+    arena_fn = Llvm.add_function(lib, module, "frond_alloc", arena_ft)?
+    // llvm.trap:intrinsic 走 declare 通道(直接按名 add_function)。
+    val voidty = Llvm.void_type(lib, ctx)?
+    trap_ft = Llvm.function_type0(lib, voidty, false)?
+    trap_fn = Llvm.add_function(lib, module, "llvm.trap", trap_ft)?
+    cur_module = module
+    // entry:top0 = load top;new = (top0 + size + 15) & -16;
+    // ok = new <= heap_base + 1GiB。
+    val builder = Llvm.create_builder(lib, ctx)?
+    val entry_blk = Llvm.append_block(lib, ctx, arena_fn, "entry")?
+    val ok_blk = Llvm.append_block(lib, ctx, arena_fn, "ok")?
+    val oom_blk = Llvm.append_block(lib, ctx, arena_fn, "oom")?
+    Llvm.position_builder_at_end(lib, builder, entry_blk)?
+    val top0 = Llvm.build_load(lib, builder, ptrty, top_g, "top0")?
+    val top0i = Llvm.build_ptrtoint(lib, builder, top0, i64ty, "top0i")?
+    val size = Llvm.get_param(lib, arena_fn, 0u32)?
+    val sum = Llvm.build_add(lib, builder, top0i, size, "sum")?
+    val fifteen = Llvm.const_int(lib, i64ty, 15u64, false)?
+    val padded = Llvm.build_add(lib, builder, sum, fifteen, "padded")?
+    val m16 = Llvm.const_int(lib, i64ty, 18446744073709551600u64, false)?
+    val alni = Llvm.build_and(lib, builder, padded, m16, "alni")?
+    val newp = Llvm.build_inttoptr(lib, builder, alni, ptrty, "newp")?
+    val base = Llvm.build_ptrtoint(lib, builder, heap_g, i64ty, "base")?
+    val gi = Llvm.const_int(lib, i64ty, 1073741824u64, false)?
+    val lim = Llvm.build_add(lib, builder, base, gi, "lim")?
+    val ok = Llvm.build_icmp(lib, builder, alni, lim, 37u32, "inbounds")?
+    Llvm.build_cond_br(lib, builder, ok, ok_blk, oom_blk)?
+    // ok:store 新顶,ret 旧顶(返回对齐前的原 top——分配区间
+    // [top0, new),头部自身不含对齐间隙)。
+    Llvm.position_builder_at_end(lib, builder, ok_blk)?
+    Llvm.build_store(lib, builder, newp, top_g)?
+    Llvm.build_ret(lib, builder, top0)?
+    // oom:trap + unreachable。
+    Llvm.position_builder_at_end(lib, builder, oom_blk)?
+    val trapcall = Llvm.build_call2_0(lib, builder, trap_ft, trap_fn, "")?
+    Llvm.build_unreachable(lib, builder)?
+    Llvm.dispose_builder(lib, builder)
+    Ok(void)
+}
+
+// 分配调用(大小为编译期常量;16 对齐由 frond_alloc 内部完成)。
+fun call_alloc(lib: Lib, ctx: u64, cache: Map<str, u64>, builder: u64, size: u64): Throw<u64, FfiError> {
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    val sz = Llvm.const_int(lib, i64ty, size, false)?
+    Llvm.build_call2(lib, builder, arena_ft, arena_fn, [sz], tmp())
+}
+
+// ── 切片 2 聚合部件(附八 §3-§5)─────────────────────────────────
+
+// 无符号整数字面量解析(fill count 编译期取值;int_digits 已剥前缀/'_')。
+fun parse_u64(digits: str, radix: u8): u64 {
+    val b = digits.bytes()
+    var v: u64 = 0u64
+    var i: usize = 0
+    while i < b.len() {
+        val c = b[i]
+        var d: u64 = 0u64
+        if c >= 48 && c <= 57 {
+            d = (c - 48) as u64
+        } else if c >= 97 && c <= 122 {
+            d = (c - 97 + 10) as u64
+        } else if c >= 65 && c <= 90 {
+            d = (c - 65 + 10) as u64
+        }
+        v = v * (radix as u64) + d
+        i = i + 1
+    }
+    v
+}
+
+// 值形态字节宽:聚合 = ptr(8);标量 = ABI size(TargetData)。
+fun agg_size(lib: Lib, ctx: u64, cache: Map<str, u64>, a: TypeArena, s: SemaRes,
+    h: u32): Throw<u64, FfiError> {
+    if is_agg_kind(agg_kind(a, s, h)) {
+        return Ok(8u64)
+    }
+    val lt = llty_for(lib, ctx, cache, Arena.get(a, h))?
+    Llvm.abi_size_of_type(lib, cur_td, lt)
+}
+
+// str 字面量 → 私有全局常量块 {i64 字节数, [N x i8]}(内容去重);
+// 返回块地址句柄(= str 值)。空串走 const_null [0 x i8] 兜底。
+fun str_lit_global(lib: Lib, ctx: u64, cache: Map<str, u64>, text: str): Throw<u64, FfiError> {
+    val key = "strlit:{text}"
+    match str_consts.get(key) {
+        null => {}
+        g => { return Ok(g ?? 0) }
+    }
+    val n = text.bytes().len()
+    val blk_ty = str_layout(lib, ctx, cache, n)?
+    strn = strn + 1
+    val g = Llvm.add_global(lib, cur_module, blk_ty, ".str{strn}")?
+    Llvm.set_linkage_private(lib, g)?
+    Llvm.set_global_constant(lib, g, true)?
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    val i8ty = llty_for(lib, ctx, cache, TI8)?
+    val nconst = Llvm.const_int(lib, i64ty, n as u64, false)?
+    val bytesv = if n == 0 {
+        Llvm.const_null(lib, Llvm.array_type2(lib, i8ty, 0u64)?)?
+    } else {
+        Llvm.const_string2(lib, ctx, text, n)?
+    }
+    Llvm.set_initializer(lib, g, Llvm.const_struct(lib, ctx, [nconst, bytesv])?)?
+    str_consts.set(key, g)
+    Ok(g)
+}
+
+// str.len():UTF-8 码点数(引擎语义 = 字符数,非字节数)。内联循环:
+// (b & 0xC0) != 0x80 → 新码点。循环状态走 alloca 槽(mem2reg 吃掉,
+// 引擎无 phi 构造器)。返回 i64 位宽值(usize 同宽,后续 conv 恒等)。
+fun str_len_chars(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>,
+    fref: u64, sp: u64): Throw<u64, FfiError> {
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    val i8ty = llty_for(lib, ctx, cache, TI8)?
+    val nbytes = Llvm.build_load(lib, builder, i64ty, sp, "slen")?
+    val islot = Llvm.build_alloca(lib, builder, i64ty, "si")?
+    val cslot = Llvm.build_alloca(lib, builder, i64ty, "sc")?
+    val zero = Llvm.const_int(lib, i64ty, 0u64, false)?
+    val one = Llvm.const_int(lib, i64ty, 1u64, false)?
+    Llvm.build_store(lib, builder, zero, islot)?
+    Llvm.build_store(lib, builder, zero, cslot)?
+    val loop_blk = Llvm.append_block(lib, ctx, fref, "slen.loop")?
+    val body_blk = Llvm.append_block(lib, ctx, fref, "slen.body")?
+    val inc_blk = Llvm.append_block(lib, ctx, fref, "slen.inc")?
+    val step_blk = Llvm.append_block(lib, ctx, fref, "slen.step")?
+    val end_blk = Llvm.append_block(lib, ctx, fref, "slen.end")?
+    // 字节区 offset 8(str 块 {i64, [N x i8]} 头 8 字节)。
+    val c8 = Llvm.const_int(lib, i64ty, 8u64, false)?
+    Llvm.build_br(lib, builder, loop_blk)?
+    Llvm.position_builder_at_end(lib, builder, loop_blk)?
+    val iv = Llvm.build_load(lib, builder, i64ty, islot, "i")?
+    val more = Llvm.build_icmp(lib, builder, iv, nbytes, 36u32, "more")?
+    Llvm.build_cond_br(lib, builder, more, body_blk, end_blk)?
+    Llvm.position_builder_at_end(lib, builder, body_blk)?
+    // i8 基型仅容单索引:头 8 + i 先加总再 gep。
+    val boff = Llvm.build_add(lib, builder, c8, iv, "boff")?
+    val baddr = Llvm.build_inbounds_gep2(lib, builder, i8ty, sp, [boff], "bp")?
+    val bv = Llvm.build_load(lib, builder, i8ty, baddr, "b")?
+    val mask = Llvm.const_int(lib, i8ty, 192u64, false)?
+    val contb = Llvm.const_int(lib, i8ty, 128u64, false)?
+    val masked = Llvm.build_and(lib, builder, bv, mask, "m")?
+    // 续字节判定 (b & 0xC0) == 0x80:EQ——iscont 真 = 续字节,跳过计数;
+    // 首字节才 inc(此前误用 NE,语义反转成数续字节,诊断 71040016 实证)。
+    val iscont = Llvm.build_icmp(lib, builder, masked, contb, 32u32, "iscont")?
+    Llvm.build_cond_br(lib, builder, iscont, step_blk, inc_blk)?
+    Llvm.position_builder_at_end(lib, builder, inc_blk)?
+    val c0 = Llvm.build_load(lib, builder, i64ty, cslot, "c")?
+    val c1 = Llvm.build_add(lib, builder, c0, one, "c1")?
+    Llvm.build_store(lib, builder, c1, cslot)?
+    Llvm.build_br(lib, builder, step_blk)?
+    Llvm.position_builder_at_end(lib, builder, step_blk)?
+    val i2 = Llvm.build_load(lib, builder, i64ty, islot, "i")?
+    val i3 = Llvm.build_add(lib, builder, i2, one, "i3")?
+    Llvm.build_store(lib, builder, i3, islot)?
+    Llvm.build_br(lib, builder, loop_blk)?
+    Llvm.position_builder_at_end(lib, builder, end_blk)?
+    Llvm.build_load(lib, builder, i64ty, cslot, "nchars")
+}
+
+// str ==(内联):len 不等 → false;等长逐字节循环,首异即短路 false;
+// 全同 → true。结果走 alloca i1 槽。Neq = xor true。
+fun str_eq_inline(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>,
+    fref: u64, ap: u64, bp: u64): Throw<u64, FfiError> {
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    val i8ty = llty_for(lib, ctx, cache, TI8)?
+    val i1ty = llty_for(lib, ctx, cache, TBool)?
+    val la = Llvm.build_load(lib, builder, i64ty, ap, "la")?
+    val lb = Llvm.build_load(lib, builder, i64ty, bp, "lb")?
+    val lendiff = Llvm.build_icmp(lib, builder, la, lb, 33u32, "lendiff")?
+    val res_slot = Llvm.build_alloca(lib, builder, i1ty, "seqr")?
+    val t = Llvm.const_int(lib, i1ty, 1u64, false)?
+    val f = Llvm.const_int(lib, i1ty, 0u64, false)?
+    Llvm.build_store(lib, builder, t, res_slot)?
+    val ne_blk = Llvm.append_block(lib, ctx, fref, "seq.ne")?
+    val pre_blk = Llvm.append_block(lib, ctx, fref, "seq.pre")?
+    val loop_blk = Llvm.append_block(lib, ctx, fref, "seq.loop")?
+    val byte_blk = Llvm.append_block(lib, ctx, fref, "seq.byte")?
+    val diff_blk = Llvm.append_block(lib, ctx, fref, "seq.diff")?
+    val step_blk = Llvm.append_block(lib, ctx, fref, "seq.step")?
+    val end_blk = Llvm.append_block(lib, ctx, fref, "seq.end")?
+    Llvm.build_cond_br(lib, builder, lendiff, ne_blk, pre_blk)?
+    Llvm.position_builder_at_end(lib, builder, ne_blk)?
+    Llvm.build_store(lib, builder, f, res_slot)?
+    Llvm.build_br(lib, builder, end_blk)?
+    Llvm.position_builder_at_end(lib, builder, pre_blk)?
+    val islot = Llvm.build_alloca(lib, builder, i64ty, "seqi")?
+    val zero = Llvm.const_int(lib, i64ty, 0u64, false)?
+    val one = Llvm.const_int(lib, i64ty, 1u64, false)?
+    val c8 = Llvm.const_int(lib, i64ty, 8u64, false)?
+    Llvm.build_store(lib, builder, zero, islot)?
+    Llvm.build_br(lib, builder, loop_blk)?
+    Llvm.position_builder_at_end(lib, builder, loop_blk)?
+    val iv = Llvm.build_load(lib, builder, i64ty, islot, "i")?
+    val more = Llvm.build_icmp(lib, builder, iv, la, 36u32, "more")?
+    Llvm.build_cond_br(lib, builder, more, byte_blk, end_blk)?
+    Llvm.position_builder_at_end(lib, builder, byte_blk)?
+    // i8 基型仅容单索引:头 8 + i 先加总再 gep(两操作数共用)。
+    val boff = Llvm.build_add(lib, builder, c8, iv, "boff")?
+    val ab = Llvm.build_load(lib, builder, i8ty,
+        Llvm.build_inbounds_gep2(lib, builder, i8ty, ap, [boff], "abp")?, "ab")?
+    val bb = Llvm.build_load(lib, builder, i8ty,
+        Llvm.build_inbounds_gep2(lib, builder, i8ty, bp, [boff], "bbp")?, "bb")?
+    val same = Llvm.build_icmp(lib, builder, ab, bb, 32u32, "same")?
+    Llvm.build_cond_br(lib, builder, same, step_blk, diff_blk)?
+    Llvm.position_builder_at_end(lib, builder, diff_blk)?
+    Llvm.build_store(lib, builder, f, res_slot)?
+    Llvm.build_br(lib, builder, end_blk)?
+    Llvm.position_builder_at_end(lib, builder, step_blk)?
+    val i2 = Llvm.build_load(lib, builder, i64ty, islot, "i")?
+    val i3 = Llvm.build_add(lib, builder, i2, one, "i3")?
+    Llvm.build_store(lib, builder, i3, islot)?
+    Llvm.build_br(lib, builder, loop_blk)?
+    Llvm.position_builder_at_end(lib, builder, end_blk)?
+    Llvm.build_load(lib, builder, i1ty, res_slot, "eqr")
+}
+
+// 数组元素地址(读/写共用):idx conv i64 → 越界(uge len)llvm.trap →
+// 字节 gep(头 16 = i64 len + 8 pad,elem 16 对齐保 f128;步进 =
+// idx*esz)。返回元素地址;elem 类型由调用方 array_parts 取。
+fun arr_elem_addr(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>, fref: u64,
+    a: TypeArena, s: SemaRes, arr_ptr: u64, arr_h: u32,
+    idx_v: u64, idx_h: u32, eid: i64): Throw<u64, FfiError> {
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    val i8ty = llty_for(lib, ctx, cache, TI8)?
+    val i64_h = Arena.from_scalar_name(a, "i64")
+    val idx = conv_value(lib, ctx, builder, cache, a, s, idx_v, idx_h, i64_h, tmp())?
+    val len = Llvm.build_load(lib, builder, i64ty, arr_ptr, "alen")?
+    val oob = Llvm.build_icmp(lib, builder, idx, len, 35u32, "oob")?
+    val ok_blk = Llvm.append_block(lib, ctx, fref, "idx.ok")?
+    val trap_blk = Llvm.append_block(lib, ctx, fref, "idx.oob")?
+    Llvm.build_cond_br(lib, builder, oob, trap_blk, ok_blk)?
+    Llvm.position_builder_at_end(lib, builder, trap_blk)?
+    Llvm.build_call2_0(lib, builder, trap_ft, trap_fn, "")?
+    Llvm.build_unreachable(lib, builder)?
+    Llvm.position_builder_at_end(lib, builder, ok_blk)?
+    val elem_h = (Arena.array_parts(a, arr_h)).a
+    val esz = agg_size(lib, ctx, cache, a, s, elem_h)?
+    val off = Llvm.build_mul(lib, builder, idx,
+        Llvm.const_int(lib, i64ty, esz, false)?, "off")?
+    val c16 = Llvm.const_int(lib, i64ty, 16u64, false)?
+    // i8 基型仅容单索引:头 16 + off 先加总再 gep。
+    val eoff = Llvm.build_add(lib, builder, c16, off, "eoff")?
+    Llvm.build_inbounds_gep2(lib, builder, i8ty, arr_ptr, [eoff], "ep")
+}
+
+// 地址装载(读路径收尾):标量 load 本体;聚合 load ptr(槽/字段/
+// 元素里存的是块地址)。llty_for_h 统一二形。
+fun load_at(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>,
+    a: TypeArena, s: SemaRes, addr: u64, ty_h: u32): Throw<u64, FfiError> {
+    val lt = llty_for_h(lib, ctx, cache, a, s, ty_h)?
+    Llvm.build_load(lib, builder, lt, addr, tmp())
+}
+
+// record 字段定位(读/写/FieldAssignS 共用):rec_ptr + rec_h + 字段名
+// → place_ptr(字段地址)/place_ty(字段类型)。field_id 0 基
+// (record_field_idx 口径)。非名义 record / 无此字段 = 响亮报错。
+fun rec_field_place(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>,
+    a: TypeArena, s: SemaRes, rec_ptr: u64, rec_h: u32,
+    field: str, nid: i64): Throw<void, FfiError> {
+    match record_name_of(a, rec_h) {
+        null => throw FfiError(Other, "slice 2: field access on non-nominal record (node {nid})")
+        rn => {
+            val name = rn ?? ""
+            val fid = Semares.record_field_idx(s, name, field)
+            if fid < 0 {
+                throw FfiError(Other, "slice 2: record '{name}' has no field '{field}' (node {nid})")
+            }
+            place_ty = (Semares.record_shape(s, name) ?? [])[(fid as usize)]
+            val lt = record_layout(lib, ctx, cache, a, s, name)?
+            place_ptr = Llvm.build_struct_gep(lib, builder, lt, rec_ptr, fid as u32, tmp())?
+            Ok(void)
+        },
+    }
+}
+
+// 写目标定位(赋值/复合赋值共用):target 表达式 → place_ptr(存储
+// 地址)/place_ty(类型)。Ident → 栈槽;FieldAccessE → record 字段
+// 地址(聚合字段 = 存 ptr 的槽位);IndexE → 数组元素地址(越界 trap)。
+// 出参即读即用;嵌套赋值表达式会覆盖,调用方须先拷贝局部。
+fun lower_place(lib: Lib, ctx: u64, builder: u64, fref: u64,
+    a: TypeArena, s: SemaRes, mname: str, ast: AstArena,
+    slots: Map<str, u64>, tyslots: Map<str, u32>, cache: Map<str, u64>,
+    eid: i64): Throw<void, FfiError> {
+    match ast.expr(eid).node {
+        Ident(name) => {
+            match slots.get(name) {
+                null => throw FfiError(Other, "slice 2: assignment to non-local '{name}' (expr {eid})")
+                slot => {
+                    place_ptr = slot ?? 0
+                    place_ty = tyslots.get(name) ?? (expr_ty(a, s, mname, eid)?)
+                    Ok(void)
+                },
+            }
+        },
+        FieldAccessE(recv, field) => {
+            val recv_h = expr_ty(a, s, mname, recv)?
+            if agg_kind(a, s, recv_h) != 7 {
+                throw FfiError(Other, "slice 2: field write on non-record (expr {eid})")
+            }
+            val rec_ptr = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, recv)?
+            if flow_stopped {
+                return Ok(void)
+            }
+            rec_field_place(lib, ctx, builder, cache, a, s, rec_ptr, recv_h, field, eid)?
+            Ok(void)
+        },
+        IndexE(arr, idx) => {
+            val arr_h = expr_ty(a, s, mname, arr)?
+            if agg_kind(a, s, arr_h) != 6 {
+                throw FfiError(Other, "slice 2: index write on non-array (expr {eid})")
+            }
+            val arr_ptr = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, arr)?
+            if flow_stopped {
+                return Ok(void)
+            }
+            val idx_h = expr_ty(a, s, mname, idx)?
+            val idx_v = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, idx)?
+            if flow_stopped {
+                return Ok(void)
+            }
+            place_ptr = arr_elem_addr(lib, ctx, builder, cache, fref, a, s, arr_ptr, arr_h, idx_v, idx_h, eid)?
+            place_ty = (Arena.array_parts(a, arr_h)).a
+            Ok(void)
+        },
+        _ => throw FfiError(Other, "slice 2: invalid assignment target (expr {eid})"),
+    }
+}
+
+// 复合赋值算术(镜像 lower_binary 的 COp 族;ty_raw 已 resolve)。
+fun cop_apply(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>, op: COp,
+    old: u64, rv: u64, ty_raw: Ty, name: str): Throw<u64, FfiError> {
+    val k = ty_kind(ty_raw)
+    match op {
+        AddA => {
+            if k == 1 { Llvm.build_fadd(lib, builder, old, rv, name) }
+            else { Llvm.build_add(lib, builder, old, rv, name) }
+        },
+        SubA => {
+            if k == 1 { Llvm.build_fsub(lib, builder, old, rv, name) }
+            else { Llvm.build_sub(lib, builder, old, rv, name) }
+        },
+        MulA => {
+            if k == 1 { Llvm.build_fmul(lib, builder, old, rv, name) }
+            else { Llvm.build_mul(lib, builder, old, rv, name) }
+        },
+        DivA => {
+            if k == 1 { Llvm.build_fdiv(lib, builder, old, rv, name) }
+            else if ty_signed(ty_raw) { Llvm.build_sdiv(lib, builder, old, rv, name) }
+            else { Llvm.build_udiv(lib, builder, old, rv, name) }
+        },
+        ModA => {
+            if k == 1 { Llvm.build_frem(lib, builder, old, rv, name) }
+            else if ty_signed(ty_raw) { Llvm.build_srem(lib, builder, old, rv, name) }
+            else { Llvm.build_urem(lib, builder, old, rv, name) }
+        },
+        BitAndA => Llvm.build_and(lib, builder, old, rv, name),
+        BitOrA => Llvm.build_or(lib, builder, old, rv, name),
+        BitXorA => Llvm.build_xor(lib, builder, old, rv, name),
+        ShlA => Llvm.build_shl(lib, builder, old, rv, name),
+        ShrA => {
+            if ty_signed(ty_raw) { Llvm.build_ashr(lib, builder, old, rv, name) }
+            else { Llvm.build_lshr(lib, builder, old, rv, name) }
+        },
+    }
+}
+
+// 复合赋值核心(语句/表达式位共用):place 定位 → load 旧值 → op →
+// store;返回新值句柄。聚合 place = 响亮报错。
+fun lower_comp_place(lib: Lib, ctx: u64, builder: u64, fref: u64,
+    a: TypeArena, s: SemaRes, mname: str, ast: AstArena,
+    slots: Map<str, u64>, tyslots: Map<str, u32>, cache: Map<str, u64>,
+    nid: i64, op: COp, target: i64, value: i64): Throw<u64, FfiError> {
+    lower_place(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, target)?
+    if flow_stopped {
+        return Ok(0u64)
+    }
+    val addr = place_ptr
+    val ty_h = place_ty
+    if is_agg_kind(agg_kind(a, s, ty_h)) {
+        throw FfiError(Other, "slice 2: compound assignment on aggregate (node {nid})")
+    }
+    val old = load_at(lib, ctx, builder, cache, a, s, addr, ty_h)?
+    val val_h = expr_ty(a, s, mname, value)?
+    val v = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, value)?
+    if flow_stopped {
+        return Ok(0u64)
+    }
+    val rvc = conv_value(lib, ctx, builder, cache, a, s, v, val_h, ty_h, tmp())?
+    val nv = cop_apply(lib, ctx, builder, cache, op, old, rvc,
+        Arena.get(a, Arena.resolve(a, ty_h)), tmp())?
+    Llvm.build_store(lib, builder, nv, addr)?
+    Ok(nv)
+}
+
+// 数组字面量(含 fill):frond_alloc(16 + n*esz) → store len 头 →
+// 逐元素 store(标量本体/聚合 ptr;fill = 展开拷贝)。fill count 编译期
+// 取值(IntLit;非字面量响亮报错)。返回块地址(= 数组值)。
+fun lower_array_lit(lib: Lib, ctx: u64, builder: u64, fref: u64,
+    a: TypeArena, s: SemaRes, mname: str, ast: AstArena,
+    slots: Map<str, u64>, tyslots: Map<str, u32>, cache: Map<str, u64>,
+    eid: i64, my_h: u32, elements: i64[], fv: i64, fc: i64,
+    has_fill: bool): Throw<u64, FfiError> {
+    val elem_h = (Arena.array_parts(a, my_h)).a
+    val esz = agg_size(lib, ctx, cache, a, s, elem_h)?
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    val i8ty = llty_for(lib, ctx, cache, TI8)?
+    var n: u64 = 0u64
+    var vals: u64[] = []
+    if has_fill {
+        match ast.expr(fc).node {
+            IntLit(txt, _) => {
+                n = parse_u64(int_digits(txt), int_radix(txt))
+                val fv_h = expr_ty(a, s, mname, fv)?
+                val v = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, fv)?
+                if flow_stopped {
+                    return Ok(0u64)
+                }
+                vals = vals ++ [conv_value(lib, ctx, builder, cache, a, s, v, fv_h, elem_h, tmp())?]
+            },
+            _ => throw FfiError(Other, "slice 2: array fill count must be an integer literal (expr {eid})"),
+        }
+    } else {
+        n = elements.len() as u64
+        var i: usize = 0
+        while i < elements.len() {
+            val eh = expr_ty(a, s, mname, elements[i])?
+            val v = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, elements[i])?
+            if flow_stopped {
+                return Ok(0u64)
+            }
+            vals = vals ++ [conv_value(lib, ctx, builder, cache, a, s, v, eh, elem_h, tmp())?]
+            i = i + 1
+        }
+    }
+    val p = call_alloc(lib, ctx, cache, builder, 16u64 + n * esz)?
+    Llvm.build_store(lib, builder, Llvm.const_int(lib, i64ty, n, false)?, p)?
+    var j: u64 = 0u64
+    while j < n {
+        // i8 基型仅容单索引:头 16 + j*esz 编译期加总成单常量偏移。
+        val eaddr = Llvm.build_inbounds_gep2(lib, builder, i8ty, p,
+            [Llvm.const_int(lib, i64ty, 16u64 + j * esz, false)?], tmp())?
+        Llvm.build_store(lib, builder, vals[if has_fill { 0u64 } else { j } as usize], eaddr)?
+        j = j + 1u64
+    }
+    Ok(p)
+}
+
+// ── 切片 1 状态(模块 var 通道;gvar 探针实证 List/Map 初始化安全)──
+// flow_stopped 已提前至切片 2 通道区声明(var 顺序敏感)。
 var cur_ret_h: u32 = 0
 var cur_is_main: bool = false
 
@@ -353,11 +1066,16 @@ pub fun lower_expr(lib: Lib, ctx: u64, builder: u64, fref: u64,
             val lt = llty_for(lib, ctx, cache, TChar)?
             Llvm.const_int(lib, lt, cp as u64, false)
         },
+        StrLit(text) => {
+            // 切片 2:str 字面量 = 私有全局常量块地址(值 = ptr)。
+            str_lit_global(lib, ctx, cache, text)
+        },
         Ident(name) => {
             match slots.get(name) {
                 null => throw FfiError(Other, "slice 0: identifier '{name}' is not a local (params/globals arrive in later slices)")
                 slot => {
-                    val lt = llty_for(lib, ctx, cache, Arena.get(a, my_ty))?
+                    // 切片 2:聚合变量槽存 ptr(llty_for_h 统一二形)。
+                    val lt = llty_for_h(lib, ctx, cache, a, s, my_ty)?
                     Llvm.build_load(lib, builder, lt, slot ?? 0, name)
                 },
             }
@@ -412,7 +1130,7 @@ pub fun lower_expr(lib: Lib, ctx: u64, builder: u64, fref: u64,
                 return Ok(0u64)
             }
             val from_h = expr_ty(a, s, mname, sub)?
-            conv_value(lib, ctx, builder, cache, a, v, from_h, my_ty, tmp())
+            conv_value(lib, ctx, builder, cache, a, s,v, from_h, my_ty, tmp())
         },
         IfE(cond, then_e, else_e) => {
             lower_if(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, eid, cond, then_e, else_e)
@@ -422,6 +1140,61 @@ pub fun lower_expr(lib: Lib, ctx: u64, builder: u64, fref: u64,
         },
         CallE(callee, args, _) => {
             lower_call(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, eid, callee, args)
+        },
+        MethodCallE(recv, method, args, _) => {
+            // 切片 2:str/数组 len 内在(其余方法后续切片)。
+            val recv_h = expr_ty(a, s, mname, recv)?
+            val rk = agg_kind(a, s, recv_h)
+            if method == "len" && args.len() == 0 && (rk == 5 || rk == 6) {
+                val sp = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, recv)?
+                if flow_stopped {
+                    return Ok(0u64)
+                }
+                if rk == 5 {
+                    str_len_chars(lib, ctx, builder, cache, fref, sp)?
+                } else {
+                    val i64ty = llty_for(lib, ctx, cache, TI64)?
+                    Llvm.build_load(lib, builder, i64ty, sp, tmp())
+                }
+            } else {
+                throw FfiError(Other, "slice 2: unsupported method call '.{method}()' (expr {eid})")
+            }
+        },
+        FieldAccessE(recv, field) => {
+            // 切片 2:record 字段读(标量 load 本体/聚合 load ptr)。
+            val recv_h = expr_ty(a, s, mname, recv)?
+            if agg_kind(a, s, recv_h) != 7 {
+                throw FfiError(Other, "slice 2: field read on non-record (expr {eid})")
+            }
+            val rec_ptr = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, recv)?
+            if flow_stopped {
+                return Ok(0u64)
+            }
+            rec_field_place(lib, ctx, builder, cache, a, s, rec_ptr, recv_h, field, eid)?
+            load_at(lib, ctx, builder, cache, a, s, place_ptr, place_ty)
+        },
+        IndexE(arr, idx) => {
+            // 切片 2:数组元素读(越界 trap;标量/聚合按元素类型装载)。
+            val arr_h = expr_ty(a, s, mname, arr)?
+            if agg_kind(a, s, arr_h) != 6 {
+                throw FfiError(Other, "slice 2: index read on non-array (expr {eid})")
+            }
+            val arr_ptr = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, arr)?
+            if flow_stopped {
+                return Ok(0u64)
+            }
+            val idx_h = expr_ty(a, s, mname, idx)?
+            val idx_v = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, idx)?
+            if flow_stopped {
+                return Ok(0u64)
+            }
+            val eaddr = arr_elem_addr(lib, ctx, builder, cache, fref, a, s, arr_ptr, arr_h, idx_v, idx_h, eid)?
+            val elem_h = (Arena.array_parts(a, arr_h)).a
+            load_at(lib, ctx, builder, cache, a, s, eaddr, elem_h)
+        },
+        ArrayLitE(elements, fv, fc, has_fill) => {
+            lower_array_lit(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache,
+                eid, my_ty, elements, fv, fc, has_fill)
         },
         AssignE(target, value) => {
             // 表达式位赋值(免花括号循环体形态):store 后返回被存值。
@@ -436,7 +1209,7 @@ pub fun lower_expr(lib: Lib, ctx: u64, builder: u64, fref: u64,
                                 return Ok(0u64)
                             }
                             val slot_h = tyslots.get(tn) ?? val_h
-                            val vc = conv_value(lib, ctx, builder, cache, a, v, val_h, slot_h, tmp())?
+                            val vc = conv_value(lib, ctx, builder, cache, a, s,v, val_h, slot_h, tmp())?
                             match Llvm.build_store(lib, builder, vc, slot ?? 0) {
                                 Ok(_) => {}
                                 Error(e) => throw e
@@ -445,8 +1218,30 @@ pub fun lower_expr(lib: Lib, ctx: u64, builder: u64, fref: u64,
                         },
                     }
                 },
-                _ => throw FfiError(Other, "slice 1: assignment target must be a local identifier (expr {eid})"),
+                _ => {
+                    // 切片 2:place 赋值(IndexE/FieldAccessE 深链;其余
+                    // lower_place 报错)。
+                    lower_place(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, target)?
+                    if flow_stopped {
+                        return Ok(0u64)
+                    }
+                    val addr = place_ptr
+                    val ty_h = place_ty
+                    val val_h = expr_ty(a, s, mname, value)?
+                    val v = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, value)?
+                    if flow_stopped {
+                        return Ok(0u64)
+                    }
+                    val vc = conv_value(lib, ctx, builder, cache, a, s, v, val_h, ty_h, tmp())?
+                    Llvm.build_store(lib, builder, vc, addr)?
+                    Ok(vc)
+                },
             }
+        },
+        CompAssignE(op, target, value) => {
+            // 切片 2:表达式位复合赋值(load-op-store;值 = 新值)。
+            lower_comp_place(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache,
+                eid, op, target, value)
         },
         _ => throw FfiError(Other, "slice 1: unsupported expression form (expr {eid} in module '{mname}')"),
     }
@@ -485,7 +1280,7 @@ pub fun lower_if(lib: Lib, ctx: u64, builder: u64, fref: u64,
     }
     var slot = 0u64
     if !is_void {
-        val st = llty_for(lib, ctx, cache, Arena.get(a, my_h))?
+        val st = llty_for_h(lib, ctx, cache, a, s,my_h)?
         slot = Llvm.build_alloca(lib, builder, st, "if.res")?
     }
     // 块按形态创建:无 else 不建 else 块(then 臂终止时空块无终结
@@ -505,7 +1300,7 @@ pub fun lower_if(lib: Lib, ctx: u64, builder: u64, fref: u64,
     val tv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, then_e)?
     if !flow_stopped && !is_void {
         val th = expr_ty(a, s, mname, then_e)?
-        val tvc = conv_value(lib, ctx, builder, cache, a, tv, th, my_h, tmp())?
+        val tvc = conv_value(lib, ctx, builder, cache, a, s, tv, th, my_h, tmp())?
         match Llvm.build_store(lib, builder, tvc, slot) {
             Ok(_) => {}
             Error(e) => throw e
@@ -524,7 +1319,7 @@ pub fun lower_if(lib: Lib, ctx: u64, builder: u64, fref: u64,
             val ev = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, ee ?? 0)?
             if !flow_stopped && !is_void {
                 val eh = expr_ty(a, s, mname, ee ?? 0)?
-                val evc = conv_value(lib, ctx, builder, cache, a, ev, eh, my_h, tmp())?
+                val evc = conv_value(lib, ctx, builder, cache, a, s,ev, eh, my_h, tmp())?
                 match Llvm.build_store(lib, builder, evc, slot) {
                     Ok(_) => {}
                     Error(e) => throw e
@@ -547,7 +1342,7 @@ pub fun lower_if(lib: Lib, ctx: u64, builder: u64, fref: u64,
     if is_void {
         return Ok(0u64)
     }
-    val lt = llty_for(lib, ctx, cache, Arena.get(a, my_h))?
+    val lt = llty_for_h(lib, ctx, cache, a, s,my_h)?
     Llvm.build_load(lib, builder, lt, slot, tmp())
 }
 
@@ -583,7 +1378,41 @@ pub fun lower_call(lib: Lib, ctx: u64, builder: u64, fref: u64,
     match ast.expr(callee).node {
         Ident(name) => {
             match fn_index.get(name) {
-                null => throw FfiError(Other, "slice 1: callee '{name}' not slice-1 function (generic/async/throwing/std/cross-module arrive in later slices)")
+                null => {
+                    // 切片 2:record 构造器(单 ctor 非泛型聚合;args 逐个
+                    // conv 到字段类型 → frond_alloc → 逐字段 store;值 =
+                    // 块地址)。非函数非 record = 响亮报错。
+                    match Semares.record_shape(s, name) {
+                        null => throw FfiError(Other, "slice 1: callee '{name}' not slice-1 function (generic/async/throwing/std/cross-module arrive in later slices)")
+                        fts0 => {
+                            val fts = fts0 ?? []
+                            if fts.len() != args.len() {
+                                throw FfiError(Other, "slice 2: arity mismatch constructing '{name}' (expr {eid})")
+                            }
+                            var vals: u64[] = []
+                            var ai: usize = 0
+                            while ai < args.len() {
+                                val av = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, args[ai])?
+                                if flow_stopped {
+                                    return Ok(0u64)
+                                }
+                                val ah = expr_ty(a, s, mname, args[ai])?
+                                vals = vals ++ [conv_value(lib, ctx, builder, cache, a, s, av, ah, fts[ai], tmp())?]
+                                ai = ai + 1
+                            }
+                            val lt = record_layout(lib, ctx, cache, a, s, name)?
+                            val sz = Llvm.abi_size_of_type(lib, cur_td, lt)?
+                            val p = call_alloc(lib, ctx, cache, builder, sz)?
+                            var fi: usize = 0
+                            while fi < fts.len() {
+                                val faddr = Llvm.build_struct_gep(lib, builder, lt, p, fi as u32, tmp())?
+                                Llvm.build_store(lib, builder, vals[fi], faddr)?
+                                fi = fi + 1
+                            }
+                            Ok(p)
+                        },
+                    }
+                },
                 row => {
                     val ri = (row ?? 0) as usize
                     val ph = fn_params.get(ri) ?? []
@@ -598,7 +1427,7 @@ pub fun lower_call(lib: Lib, ctx: u64, builder: u64, fref: u64,
                             return Ok(0u64)
                         }
                         val ah = expr_ty(a, s, mname, args[ai])?
-                        vals = vals ++ [conv_value(lib, ctx, builder, cache, a, av, ah, ph[ai], tmp())?]
+                        vals = vals ++ [conv_value(lib, ctx, builder, cache, a, s,av, ah, ph[ai], tmp())?]
                         ai = ai + 1
                     }
                     val ft = fn_lty.get(ri) ?? 0
@@ -640,14 +1469,31 @@ pub fun lower_binary(lib: Lib, ctx: u64, builder: u64, fref: u64,
         return Ok(0u64)
     }
     val lhs_h = expr_ty(a, s, mname, lhs)?
-    val lvc = conv_value(lib, ctx, builder, cache, a, lv, lhs_h, operand_h, tmp())?
+    val lvc = conv_value(lib, ctx, builder, cache, a, s, lv, lhs_h, operand_h, tmp())?
     val rv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, rhs)?
     if flow_stopped {
         return Ok(0u64)
     }
     val rhs_h = expr_ty(a, s, mname, rhs)?
-    val rvc = conv_value(lib, ctx, builder, cache, a, rv, rhs_h, operand_h, tmp())?
+    val rvc = conv_value(lib, ctx, builder, cache, a, s,rv, rhs_h, operand_h, tmp())?
     val opk = ty_kind(operand_raw)
+    // 切片 2:str 相等族:== / != 内联字节循环(引擎 Arc<str> 语义 =
+    // 内容相等);RefEq/RefNeq = ptr 比较(引用同一块)。其余 str 操作
+    //(拼接/索引/切片/排序)= 响亮报错,后续切片。
+    if opk == 5 {
+        match op {
+            Eq => { return str_eq_inline(lib, ctx, builder, cache, fref, lvc, rvc) }
+            Neq => {
+                val eq = str_eq_inline(lib, ctx, builder, cache, fref, lvc, rvc)?
+                val i1ty = llty_for(lib, ctx, cache, TBool)?
+                val t = Llvm.const_int(lib, i1ty, 1u64, false)?
+                return Llvm.build_xor(lib, builder, eq, t, tmp())
+            }
+            RefEq => { return Llvm.build_icmp(lib, builder, lvc, rvc, 32u32, tmp()) }
+            RefNeq => { return Llvm.build_icmp(lib, builder, lvc, rvc, 33u32, tmp()) }
+            _ => throw FfiError(Other, "slice 2: unsupported str operator (expr {eid})"),
+        }
+    }
     match op {
         Add => {
             if opk == 1 {
@@ -813,7 +1659,8 @@ pub fun lower_stmt(lib: Lib, ctx: u64, builder: u64, fref: u64,
             if flow_stopped {
                 return Ok(true)
             }
-            val slot_ty = llty_for(lib, ctx, cache, Arena.get(a, init_h))?
+            // 切片 2:聚合初值 = ptr(llty_for_h 统一;标量回落 llty_for)。
+            val slot_ty = llty_for_h(lib, ctx, cache, a, s, init_h)?
             val slot = Llvm.build_alloca(lib, builder, slot_ty, name)?
             match Llvm.build_store(lib, builder, v, slot) {
                 Ok(_) => {}
@@ -835,7 +1682,7 @@ pub fun lower_stmt(lib: Lib, ctx: u64, builder: u64, fref: u64,
                                 return Ok(true)
                             }
                             val slot_h = tyslots.get(name) ?? val_h
-                            val vc = conv_value(lib, ctx, builder, cache, a, v, val_h, slot_h, tmp())?
+                            val vc = conv_value(lib, ctx, builder, cache, a, s,v, val_h, slot_h, tmp())?
                             match Llvm.build_store(lib, builder, vc, slot ?? 0) {
                                 Ok(_) => {}
                                 Error(e) => throw e
@@ -844,8 +1691,56 @@ pub fun lower_stmt(lib: Lib, ctx: u64, builder: u64, fref: u64,
                         },
                     }
                 },
-                _ => throw FfiError(Other, "slice 0: assignment target must be a local identifier (stmt {sid})"),
+                _ => {
+                    // 切片 2:place 赋值(IndexE/FieldAccessE 深链写)。
+                    lower_place(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, target)?
+                    if flow_stopped {
+                        return Ok(true)
+                    }
+                    val addr = place_ptr
+                    val ty_h = place_ty
+                    val val_h = expr_ty(a, s, mname, value)?
+                    val v = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, value)?
+                    if flow_stopped {
+                        return Ok(true)
+                    }
+                    val vc = conv_value(lib, ctx, builder, cache, a, s, v, val_h, ty_h, tmp())?
+                    Llvm.build_store(lib, builder, vc, addr)?
+                    Ok(false)
+                },
             }
+        },
+        FieldAssignS(object, field, value) => {
+            // 切片 2:record 字段写(object 任意表达式 → record ptr →
+            // 字段地址 store)。place 出参即读即拷。
+            val obj_h = expr_ty(a, s, mname, object)?
+            if agg_kind(a, s, obj_h) != 7 {
+                throw FfiError(Other, "slice 2: field write on non-record (stmt {sid})")
+            }
+            val rec_ptr = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, object)?
+            if flow_stopped {
+                return Ok(true)
+            }
+            rec_field_place(lib, ctx, builder, cache, a, s, rec_ptr, obj_h, field, sid)?
+            val addr = place_ptr
+            val ty_h = place_ty
+            val val_h = expr_ty(a, s, mname, value)?
+            val v = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, value)?
+            if flow_stopped {
+                return Ok(true)
+            }
+            val vc = conv_value(lib, ctx, builder, cache, a, s, v, val_h, ty_h, tmp())?
+            Llvm.build_store(lib, builder, vc, addr)?
+            Ok(false)
+        },
+        CompAssignS(target, op, value) => {
+            // 切片 2:复合赋值(place 定位 → load-op-store)。
+            match lower_comp_place(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache,
+                sid, op, target, value) {
+                Ok(_) => {}
+                Error(e) => throw e
+            }
+            Ok(false)
         },
         ExprS(e) => {
             match lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, e) {
@@ -885,7 +1780,7 @@ pub fun lower_stmt(lib: Lib, ctx: u64, builder: u64, fref: u64,
                         val v = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, ve ?? 0)?
                         if !flow_stopped {
                             val v_h = expr_ty(a, s, mname, ve ?? 0)?
-                            val vc = conv_value(lib, ctx, builder, cache, a, v, v_h, cur_ret_h, tmp())?
+                            val vc = conv_value(lib, ctx, builder, cache, a, s,v, v_h, cur_ret_h, tmp())?
                             match Llvm.build_ret(lib, builder, vc) {
                                 Ok(_) => {}
                                 Error(e) => throw e
@@ -1022,14 +1917,14 @@ fun register_fn(lib: Lib, ctx: u64, module: u64, a: TypeArena, s: SemaRes,
                 var ptys: u64[] = []
                 var j: usize = 0
                 while j < ph.len() {
-                    ptys = ptys ++ [llty_for(lib, ctx, cache, Arena.get(a, Arena.resolve(a, ph[j])))?]
+                    ptys = ptys ++ [llty_for_h(lib, ctx, cache, a, s,ph[j])?]
                     j = j + 1
                 }
                 val ret_res = Arena.resolve(a, ret_h)
                 val ret_llvm = if ty_kind(Arena.get(a, ret_res)) == 4 {
                     Llvm.void_type(lib, ctx)?
                 } else {
-                    llty_for(lib, ctx, cache, Arena.get(a, ret_res))?
+                    llty_for_h(lib, ctx, cache, a, s,ret_res)?
                 }
                 if ptys.len() == 0 {
                     fnty = Llvm.function_type0(lib, ret_llvm, false)?
@@ -1051,7 +1946,7 @@ fun register_fn(lib: Lib, ctx: u64, module: u64, a: TypeArena, s: SemaRes,
 
 // 隐式返回(main → i32 0;void → ret void;值类型 → 零值兜底)。
 fun emit_implicit_ret(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>,
-    a: TypeArena, ret_h: u32, is_main: bool): Throw<void, FfiError> {
+    a: TypeArena, s: SemaRes, ret_h: u32, is_main: bool): Throw<void, FfiError> {
     if is_main {
         val i32ty = llty_for(lib, ctx, cache, TI32)?
         val z = Llvm.const_int_str(lib, i32ty, "0", 10u8)?
@@ -1067,6 +1962,17 @@ fun emit_implicit_ret(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>,
         return Ok(void)
     }
     val raw = Arena.get(a, rt)
+    // 聚合隐式返回 = null ptr 兜底(切片 2:控制流完整性优先,语义
+    // 上"漏 return 的聚合值"本就是残缺程序)。
+    if is_agg_kind(agg_kind(a, s, rt)) {
+        val lt = opaque_ptr(lib, ctx, cache)?
+        val z = Llvm.const_null(lib, lt)?
+        match Llvm.build_ret(lib, builder, z) {
+            Ok(_) => {}
+            Error(e) => throw e
+        }
+        return Ok(void)
+    }
     val lt = llty_for(lib, ctx, cache, raw)?
     val z = if ty_kind(raw) == 1 {
         Llvm.const_real_str(lib, lt, "0")?
@@ -1131,6 +2037,13 @@ pub fun lower_entry(a: TypeArena, s: SemaRes, entry: ModuleAst, obj_path: str,
     Llvm.init_host_target(lib)?
     val ctx = Llvm.create_context(lib)?
     val module = Llvm.create_module(lib, "frondc_out", ctx)?
+    // tm/td 提前(切片 2:聚合大小经 TargetData;布局规则与 emit 一致)。
+    val triple = Llvm.host_triple()
+    val target = Llvm.get_target(lib, triple)?
+    val tm = Llvm.create_target_machine(lib, target, triple, "generic", "", 2u32, 0u32, 0u32)?
+    cur_td = Llvm.create_target_data_layout(lib, tm)?
+    str_consts = Map.empty<str, u64>()
+    strn = 0
     tmpn = 0
     clear_u64_list(fn_llvm)
     clear_u64_list(fn_lty)
@@ -1164,6 +2077,10 @@ pub fun lower_entry(a: TypeArena, s: SemaRes, entry: ModuleAst, obj_path: str,
         fn_bodies.push(bodies.get(i) ?? 0)
         i = i + 1
     }
+    // 切片 2:bump arena(每模块无条件 emit;纯标量程序 frond_alloc
+    // 无调用者,O2 死码删除,仅 .bss 零页残留——1GiB 虚拟段 Windows PE
+    // 表现见附八风险注记)。
+    emit_arena(lib, ctx, module, cache)?
     // 3) 函数体:参数入槽(alloca+store),体后无终止则隐式返回。
     var r: usize = 0
     while r < fn_names.len() {
@@ -1179,7 +2096,7 @@ pub fun lower_entry(a: TypeArena, s: SemaRes, entry: ModuleAst, obj_path: str,
         while pi < ph.len() {
             val pname = apron[pi].name
             val pv = Llvm.get_param(lib, fref, pi as u32)?
-            val plt = llty_for(lib, ctx, cache, Arena.get(a, Arena.resolve(a, ph[pi])))?
+            val plt = llty_for_h(lib, ctx, cache, a, s, ph[pi])?
             val pslot = Llvm.build_alloca(lib, builder, plt, pname)?
             match Llvm.build_store(lib, builder, pv, pslot) {
                 Ok(_) => {}
@@ -1208,7 +2125,7 @@ pub fun lower_entry(a: TypeArena, s: SemaRes, entry: ModuleAst, obj_path: str,
                 }
                 if !flow_stopped {
                     match tail {
-                        null => { emit_implicit_ret(lib, ctx, builder, cache, a, cur_ret_h, cur_is_main)? }
+                        null => { emit_implicit_ret(lib, ctx, builder, cache, a, s, cur_ret_h, cur_is_main)? }
                         te => {
                             val v = lower_expr(lib, ctx, builder, fref, a, s, entry.name, entry.arena,
                                 slots, tyslots, cache, te ?? 0)?
@@ -1219,7 +2136,7 @@ pub fun lower_entry(a: TypeArena, s: SemaRes, entry: ModuleAst, obj_path: str,
                                     Llvm.build_ret(lib, builder, vc)?
                                 } else {
                                     val v_h = expr_ty(a, s, entry.name, te ?? 0)?
-                                    val vc = conv_value(lib, ctx, builder, cache, a, v, v_h, cur_ret_h, tmp())?
+                                    val vc = conv_value(lib, ctx, builder, cache, a, s,v, v_h, cur_ret_h, tmp())?
                                     Llvm.build_ret(lib, builder, vc)?
                                 }
                                 flow_stopped = true
@@ -1238,7 +2155,7 @@ pub fun lower_entry(a: TypeArena, s: SemaRes, entry: ModuleAst, obj_path: str,
                         Llvm.build_ret(lib, builder, vc)?
                     } else {
                         val v_h = expr_ty(a, s, entry.name, body)?
-                        val vc = conv_value(lib, ctx, builder, cache, a, v, v_h, cur_ret_h, tmp())?
+                        val vc = conv_value(lib, ctx, builder, cache, a, s,v, v_h, cur_ret_h, tmp())?
                         Llvm.build_ret(lib, builder, vc)?
                     }
                     flow_stopped = true
@@ -1246,7 +2163,7 @@ pub fun lower_entry(a: TypeArena, s: SemaRes, entry: ModuleAst, obj_path: str,
             },
         }
         if !flow_stopped {
-            emit_implicit_ret(lib, ctx, builder, cache, a, cur_ret_h, cur_is_main)?
+            emit_implicit_ret(lib, ctx, builder, cache, a, s, cur_ret_h, cur_is_main)?
         }
         Llvm.dispose_builder(lib, builder)
         r = r + 1
@@ -1259,9 +2176,14 @@ pub fun lower_entry(a: TypeArena, s: SemaRes, entry: ModuleAst, obj_path: str,
         }
         throw FfiError(Other, "slice 0: emitted module failed LLVM verification")
     }
-    val triple = Llvm.host_triple()
-    val target = Llvm.get_target(lib, triple)?
-    val tm = Llvm.create_target_machine(lib, target, triple, "generic", "", 2u32, 0u32, 0u32)?
+    // 调试门(FROND_NATIVE_DUMP_IR=1):verify 后、O2 前导出模块 IR 文本
+    // 到 stderr(native 语义对拍定位用;不影响产物)。
+    if Env.get("FROND_NATIVE_DUMP_IR") == "1" {
+        match Llvm.print_module_ir(lib, module) {
+            Ok(text) => { eprintln(text) }
+            Error(_) => {}
+        }
+    }
     Llvm.run_passes(lib, module, "default<O2>", tm)?
     Llvm.emit_to_file(lib, tm, module, obj_path, true)?
     Llvm.dispose_target_machine(lib, tm)

@@ -541,6 +541,150 @@ pub fun build_call2_0(lib: Lib, builder: u64, fn_ty: u64, fn_ref: u64, name: str
     f.call(builder, fn_ty, fn_ref, 0u64, 0u32, name)
 }
 
+// ── 聚合/全局(Stage 2 切片 2)────────────────────────────────────
+// 签名逐条对照仓库内 llvm-c/Core.h(LLVM 21 源码,行号注记)——谓词
+// 位次教训(附二雷 1)的落地纪律:不看旧文献,只看本地头文件。
+
+// opaque ptr(context-scoped;record/str/数组三形态的统一值表示)。
+// Core.h L1682:LLVMPointerTypeInContext(C, AddressSpace)。
+pub fun ptr_type(lib: Lib, ctx: u64): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMPointerTypeInContext", "u64, u32")?
+    f.call(ctx, 0u32)
+}
+
+// 字面 struct 类型(record 指针指向的布局)。Core.h L1493:
+// LLVMStructTypeInContext(C, ElementTypes, ElementCount, Packed)。
+pub fun struct_type(lib: Lib, ctx: u64, elem_types: u64[]): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMStructTypeInContext", "u64, cbuf, u32, u32")?
+    f.call(ctx, elem_types, elem_types.len() as u32, 0u32)
+}
+
+// 零字段变体(空 record 的 {} 布局;空 u64[] 不能按 cbuf 编组,params 位
+// 传 NULL,同 function_type0 口径)。
+pub fun struct_type0(lib: Lib, ctx: u64): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMStructTypeInContext", "u64, u64, u32, u32")?
+    f.call(ctx, 0u64, 0u32, 0u32)
+}
+
+// 定长数组类型。Core.h L1634:LLVMArrayType2(ElementType, uint64 Count)
+// (LLVMArrayType 的 u32 计数版已弃用)。
+pub fun array_type2(lib: Lib, elem_ty: u64, count: u64): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMArrayType2", "u64, u64")?
+    f.call(elem_ty, count)
+}
+
+// 匿名 struct 常量(str 全局常量的 {i64, [N x i8]} 初始化;与具名
+// struct 类型结构同一即合法)。Core.h L2425。
+pub fun const_struct(lib: Lib, ctx: u64, vals: u64[]): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMConstStructInContext", "u64, cbuf, u32, u32")?
+    f.call(ctx, vals, vals.len() as u32, 0u32)
+}
+
+// 字节常量 [N x i8]。Core.h L2378 ConstStringInContext2:size_t 显式
+// 长度(内嵌 NUL 安全);DontNullTerminate=1 不追加 NUL。空串由调用方
+// 走 const_null 兜底(空常量的 null 返回歧义)。
+pub fun const_string2(lib: Lib, ctx: u64, s: str, byte_len: usize): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMConstStringInContext2", "u64, cstr, usize, u32")?
+    val v = f.call(ctx, s, byte_len, 1u32)?
+    if v == 0u64 {
+        throw FfiError(Other, "LLVMConstStringInContext2 failed (len {byte_len})")
+    }
+    Ok(v)
+}
+
+// 零Initializer(zeroinitializer/@frond_heap 零页;也作 ptr null 兜底)。
+// Core.h L2201。
+pub fun const_null(lib: Lib, ty: u64): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMConstNull", "u64")?
+    f.call(ty)
+}
+
+// 模块全局变量(返回值即 ptr 形句柄,可直接 load/store/传参)。
+// Core.h L2753:LLVMAddGlobal(M, Ty, Name)。
+pub fun add_global(lib: Lib, module: u64, ty: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMAddGlobal", "u64, u64, cstr")?
+    f.call(module, ty, name)
+}
+
+// Core.h L2769(LLVMSetInitializer, void API):初始值可以是常量,
+// 也可以是另一个全局变量句柄(@frond_heap_top = global ptr @frond_heap)。
+pub fun set_initializer(lib: Lib, global: u64, v: u64): Throw<void, FfiError> {
+    val f: ForeignFn<void> = lib.lookup("LLVMSetInitializer", "u64, u64")?
+    f.call(global, v)
+}
+
+// Core.h L2775(LLVMSetGlobalConstant, void):str 字面量全局只读。
+pub fun set_global_constant(lib: Lib, global: u64, is_const: bool): Throw<void, FfiError> {
+    val flag = if is_const { 1u32 } else { 0u32 }
+    val f: ForeignFn<void> = lib.lookup("LLVMSetGlobalConstant", "u64, u32")?
+    f.call(global, flag)
+}
+
+// Core.h L2631(LLVMSetLinkage, void):Private=9(枚举序:External=0
+// …Appending=7, Internal=8, Private=9),str 字面量私有防链接撞名。
+pub fun set_linkage_private(lib: Lib, global: u64): Throw<void, FfiError> {
+    val f: ForeignFn<void> = lib.lookup("LLVMSetLinkage", "u64, u32")?
+    f.call(global, 9u32)
+}
+
+// 字段地址。Core.h L4716 StructGEP2:opaque pointers 须显式给 struct
+// 类型(builder, ty, ptr, idx, name)。
+pub fun build_struct_gep(lib: Lib, builder: u64, struct_ty: u64, ptr: u64, idx: u32,
+    name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildStructGEP2", "u64, u64, u64, u32, cstr")?
+    f.call(builder, struct_ty, ptr, idx, name)
+}
+
+// 逐索引元素地址(inbounds)。Core.h L4701 InBoundsGEP2:(builder, ty,
+// ptr, indices, count, name);indices 形如 [i64 0, i32 1, i64 i]
+// (struct 头弹性尾)。注意:i8 基型仅容单索引——字节步进须先把偏移
+// 加总成单索引(i8 无嵌套层可索引,双索引会被 LLVM 以
+// "Invalid indices for GEP pointer type" 拒绝)。
+pub fun build_inbounds_gep2(lib: Lib, builder: u64, ty: u64, ptr: u64, indices: u64[],
+    name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildInBoundsGEP2", "u64, u64, u64, cbuf, u32, cstr")?
+    f.call(builder, ty, ptr, indices, indices.len() as u32, name)
+}
+
+// Core.h L4758/4760:ptr ↔ 整型(bump arena 的 top 前沿整数算术)。
+pub fun build_ptrtoint(lib: Lib, builder: u64, v: u64, dest_ty: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildPtrToInt", "u64, u64, u64, cstr")?
+    f.call(builder, v, dest_ty, name)
+}
+
+pub fun build_inttoptr(lib: Lib, builder: u64, v: u64, dest_ty: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildIntToPtr", "u64, u64, u64, cstr")?
+    f.call(builder, v, dest_ty, name)
+}
+
+// ── TargetData(聚合大小;Stage 2 切片 2)─────────────────────────
+
+// TargetMachine.h:LLVMCreateTargetDataLayout(TM) — 从目标机导出
+// DataLayout(布局规则与 emit 的 .obj 一致)。
+pub fun create_target_data_layout(lib: Lib, tm: u64): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMCreateTargetDataLayout", "u64")?
+    val td = f.call(tm)?
+    if td == 0u64 {
+        throw FfiError(Other, "LLVMCreateTargetDataLayout returned null")
+    }
+    Ok(td)
+}
+
+// Target.h L263:LLVMABISizeOfType(TD, Ty) — 含 padding 的分配尺寸
+// (frond_alloc 的大小参数;unsigned long long = u64)。
+pub fun abi_size_of_type(lib: Lib, td: u64, ty: u64): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMABISizeOfType", "u64, u64")?
+    f.call(td, ty)
+}
+
+// Target.h L294:LLVMOffsetOfElement(TD, StructTy, Element) — struct 字段
+// 字节偏移(数组块 {i64 len, elem...} 的元素基址 = 8;record 字段 GEP
+// 按位次已由 StructGEP2 覆盖,此查询用于 i8 步进 GEP 路径)。
+pub fun offset_of_element(lib: Lib, td: u64, struct_ty: u64, element: u32): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMOffsetOfElement", "u64, u64, u32")?
+    f.call(td, struct_ty, element)
+}
+
 // ── TargetMachine ──────────────────────────────────────────────────
 
 pub fun get_target(lib: Lib, triple: str): Throw<u64, FfiError> {

@@ -236,18 +236,6 @@ fn classify_same_frame_callees(graph: &mut DataFlowGraph) {
             .iter()
             .all(|&c| visit(graph, &children_idx, &own_bad, &mut memo, s, c));
     }
-    if std::env::var_os("FROND_L3PP_DEBUG").is_some() {
-        let eligible: Vec<String> = (0..sg_count)
-            .filter(|&i| ok[i])
-            .map(|i| format!("{}#{}", graph.sg_names.get(i).map(|s| s.as_str()).unwrap_or("?"), i))
-            .collect();
-        if let Some(idx) = std::env::var("FROND_L3PP_SG").ok().and_then(|v| v.parse::<usize>().ok()) {
-            let (ns, ne) = graph.subgraphs[idx].node_range;
-            for gid in ns.0..ne.0 {
-                let n = graph.node(gid as usize);
-            }
-        }
-    }
     graph.sg_callee_same_frame = ok;
 }
 

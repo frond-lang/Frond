@@ -36,6 +36,4 @@ pub fn run() {
         Commands::Lint { path, format, deny, stdin } => Lint::cmd_lint(path, format, deny, stdin),
         Commands::Lsp => Lsp::cmd_lsp(),
     }
-    // TEMP-PROBE (mem baseline): allocation/registry report at exit.
-    crate::value::Registry::probe::report();
 }

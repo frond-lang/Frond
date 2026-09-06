@@ -1,0 +1,26 @@
+// 临时探针:跨包带参变体 match 模式(用毕即删)。
+import types.Ty
+import types.Ty.{ty_source_name}
+
+// A:整模块 import 下具名绑定。
+fun tkA(t: Ty): i64 {
+    match t {
+        TArray(id) => id as i64
+        _ => 0
+    }
+}
+
+// B:全限定拼写。
+fun tkB(t: Ty): i64 {
+    match t {
+        Ty.TArray(id) => id as i64
+        _ => 0
+    }
+}
+
+// C:同包形态对照(Populate 先例 = 选择性导入成员)。
+fun tkC(t: Ty): str {
+    ty_source_name(t)
+}
+
+fun main(): i64 { tkC(TUnknown) as i64 }

@@ -13,20 +13,11 @@
 //! normal drops. Soundness rests on ROOT COMPLETENESS (see Schedule.rs call
 //! site) and on the quiescent stop-the-world point.
 
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rustc_hash::FxHashSet;
 
 use crate::value::{HeapObj, Value};
-
-// Cycle collection is fully bypassed under FROND_NO_CYCLES: allocation-side
-// registration is skipped as well.
-static CYCLES_DISABLED: OnceLock<bool> = OnceLock::new();
-
-fn cycles_disabled() -> bool {
-    *CYCLES_DISABLED.get_or_init(|| std::env::var("FROND_NO_CYCLES").is_ok())
-}
 
 /// A HeapObj can only join a cycle if it holds `Value` edges. Childless kinds
 /// skip registration entirely. (Records register unconditionally through
@@ -55,28 +46,7 @@ pub const RECORD_TAG: usize = 1;
 /// Called at every Arc<HeapObj> allocation site (Value::ref_val /
 /// register_arc funnels; the funnels gate on `can_cycle`).
 pub fn register(ptr: usize) {
-    // TEMP-PROBE (mem baseline)
-    if probe::enabled() {
-        let n = probe::REGISTER_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
-        let live = n - probe::DEREGISTER_CALLS.load(Ordering::Relaxed);
-        probe::track_live(live);
-    }
-    if cycles_disabled() {
-        return;
-    }
     registry().lock().unwrap().insert(ptr);
-}
-
-/// Whether record blocks should thread into the intrusive registry list
-/// (乙①: the list lives in Value.rs; FROND_NO_CYCLES skips the threading).
-pub fn record_registration_enabled() -> bool {
-    // TEMP-PROBE (mem baseline)
-    if probe::enabled() {
-        let n = probe::REGISTER_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
-        let live = n - probe::DEREGISTER_CALLS.load(Ordering::Relaxed);
-        probe::track_live(live);
-    }
-    !cycles_disabled()
 }
 
 /// Record-block registration is intrusive (Value.rs list); kept for API
@@ -87,13 +57,6 @@ pub fn register_record(ptr: usize) {
 
 /// Called from HeapObj::drop (absent pointers are a no-op miss).
 pub fn deregister(ptr: usize) {
-    // TEMP-PROBE (mem baseline)
-    if probe::enabled() {
-        probe::DEREGISTER_CALLS.fetch_add(1, Ordering::Relaxed);
-    }
-    if cycles_disabled() {
-        return;
-    }
     registry().lock().unwrap().remove(&ptr);
 }
 
@@ -104,10 +67,6 @@ pub fn deregister_record(ptr: usize) {
 
 /// Number of currently unreclaimed heap objects (alive or leaked-cyclic).
 pub fn registered_count() -> usize {
-    // TEMP-PROBE (mem baseline): the pressure valve calls this per frame completion.
-    if probe::enabled() {
-        probe::COUNT_CHECKS.fetch_add(1, Ordering::Relaxed);
-    }
     registry().lock().unwrap().len() + crate::value::record_list_count()
 }
 
@@ -183,10 +142,7 @@ fn push_value_edges(v: &Value, work: &mut Vec<usize>) {
 /// Collects cyclic garbage. `roots` must enumerate every live Value.
 /// Returns the number of objects whose reclamation was initiated.
 pub fn collect_cycles(roots: &[Value]) -> usize {
-    if std::env::var("FROND_NO_CYCLES").is_ok() {
-        return 0;
-    }
-    let mut reg = registry().lock().unwrap();
+    let reg = registry().lock().unwrap();
     let record_total = crate::value::record_list_count();
     if reg.is_empty() && record_total == 0 {
         return 0;
@@ -225,22 +181,6 @@ pub fn collect_cycles(roots: &[Value]) -> usize {
     }
     let reg_clear: Vec<usize> = dead.iter().copied().filter(|p| p & RECORD_TAG == 0).collect();
     { let mut reg = registry().lock().unwrap(); for p in &reg_clear { reg.remove(p); } }
-    let trace = std::env::var("FROND_TRACE_CYCLES").is_ok();
-    if trace {
-        eprintln!(
-            "[cycles] roots={} registered={} marked={} dead={}",
-            roots.len(),
-            registry().lock().unwrap().len() + record_total,
-            marked.len(),
-            dead.len()
-        );
-    }
-    // TEMP-PROBE (mem baseline)
-    if probe::enabled() {
-        probe::COLLECT_FIRES.fetch_add(1, Ordering::Relaxed);
-        probe::COLLECT_ROOTS.fetch_add(roots.len() as u64, Ordering::Relaxed);
-        probe::COLLECT_RECLAIMED.fetch_add(dead.len() as u64, Ordering::Relaxed);
-    }
     // Phase 1: cushion EVERY dead source (+1) — record blocks get a borrowed
     // RecordRef, HeapObj sources get their outgoing edges cloned. This
     // guarantees no cascade free can happen while releases below are running
@@ -282,153 +222,5 @@ pub fn collect_cycles(roots: &[Value]) -> usize {
     // cycle members fall to zero through normal drops.
     drop(held);
     drop(held_records);
-    if trace {
-        eprintln!("[cycles] release done");
-    }
     dead.len()
-}
-
-// TEMP-PROBE (mem baseline) — env-gated allocation/registry counters.
-// Enabled by FROND_MEM_PROBE=1; report printed via `probe::report()` at CLI exit.
-pub mod probe {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-    static ENABLED: AtomicBool = AtomicBool::new(false);
-    static INIT: AtomicBool = AtomicBool::new(false);
-
-    pub static REGISTER_CALLS: AtomicU64 = AtomicU64::new(0);
-    pub static DEREGISTER_CALLS: AtomicU64 = AtomicU64::new(0);
-    pub static COUNT_CHECKS: AtomicU64 = AtomicU64::new(0);
-    pub static COLLECT_FIRES: AtomicU64 = AtomicU64::new(0);
-    pub static COLLECT_ROOTS: AtomicU64 = AtomicU64::new(0);
-    pub static COLLECT_RECLAIMED: AtomicU64 = AtomicU64::new(0);
-    pub static PEAK_REGISTERED: AtomicU64 = AtomicU64::new(0);
-
-    pub const KIND_NAMES: [&str; 22] = [
-        "Array", "Cell", "Range", "Closure", "Partial",
-        "Builtin", "TraitVal", "LazyVal", "ErrorVal", "ThrowVal", "ArrayElemRef",
-        "RecordFieldRef", "GlobalSlotRef", "AtomicVal", "AsyncVal", "ChannelVal", "SenderVal",
-        "ReceiverVal", "CoroutineFrame", "OpaquePtr", "LibVal", "ForeignFnVal",
-    ];
-    pub static KIND_ALLOC_COUNTS: [AtomicU64; 22] = {
-        #[allow(clippy::declare_interior_mutable_const)]
-        const ZERO: AtomicU64 = AtomicU64::new(0);
-        [ZERO; 22]
-    };
-
-    #[inline]
-    pub fn enabled() -> bool {
-        if !INIT.load(Ordering::Relaxed) {
-            ENABLED.store(std::env::var("FROND_MEM_PROBE").is_ok(), Ordering::Relaxed);
-            INIT.store(true, Ordering::Relaxed);
-        }
-        ENABLED.load(Ordering::Relaxed)
-    }
-
-    pub fn count_kind(kind: usize) {
-        if enabled() {
-            if kind < 22 {
-                KIND_ALLOC_COUNTS[kind].fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    pub fn track_live(live: u64) {
-        if enabled() {
-            PEAK_REGISTERED.fetch_max(live, Ordering::Relaxed);
-        }
-    }
-
-    pub fn report() {
-        if !enabled() {
-            return;
-        }
-        eprintln!("== MEM-PROBE ==");
-        eprintln!(
-            "process: peak_working_set={:.1} MB commit={:.1} MB",
-            peak_working_set() as f64 / (1024.0 * 1024.0),
-            peak_commit() as f64 / (1024.0 * 1024.0),
-        );
-        eprintln!(
-            "registry: register={} deregister={} peak_live={} count_checks={} fires={} roots_total={} reclaimed_total={}",
-            REGISTER_CALLS.load(Ordering::Relaxed),
-            DEREGISTER_CALLS.load(Ordering::Relaxed),
-            PEAK_REGISTERED.load(Ordering::Relaxed),
-            COUNT_CHECKS.load(Ordering::Relaxed),
-            COLLECT_FIRES.load(Ordering::Relaxed),
-            COLLECT_ROOTS.load(Ordering::Relaxed),
-            COLLECT_RECLAIMED.load(Ordering::Relaxed),
-        );
-        let total: u64 = KIND_ALLOC_COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
-        eprintln!("heap allocs by kind (total {}):", total);
-        let mut idx: Vec<usize> = (0..22).collect();
-        idx.sort_by_key(|&i| std::cmp::Reverse(KIND_ALLOC_COUNTS[i].load(Ordering::Relaxed)));
-        for i in idx {
-            let c = KIND_ALLOC_COUNTS[i].load(Ordering::Relaxed);
-            if c > 0 {
-                let pct = (c as f64 / total as f64 * 1000.0).round() / 10.0;
-                eprintln!("  {:<16} {:>12}  {:>5}%", KIND_NAMES[i], c, pct);
-            }
-        }
-    }
-
-    // TEMP-PROBE (mem baseline): OS-recorded process memory high-water marks.
-    #[cfg(windows)]
-    mod winmem {
-        #[repr(C)]
-        struct ProcessMemoryCounters {
-            cb: u32,
-            page_fault_count: u32,
-            peak_working_set_size: usize,
-            working_set_size: usize,
-            quota_peak_paged_pool_usage: usize,
-            quota_paged_pool_usage: usize,
-            quota_peak_non_paged_pool_usage: usize,
-            quota_non_paged_pool_usage: usize,
-            pagefile_usage: usize,
-            peak_pagefile_usage: usize,
-        }
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn GetCurrentProcess() -> isize;
-        }
-        #[link(name = "psapi")]
-        extern "system" {
-            fn GetProcessMemoryInfo(
-                process: isize,
-                ppmemcounters: *mut ProcessMemoryCounters,
-                cb: u32,
-            ) -> i32;
-        }
-        fn with_counters<R>(f: impl FnOnce(&ProcessMemoryCounters) -> R) -> Option<R> {
-            let mut pmc = ProcessMemoryCounters {
-                cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
-                page_fault_count: 0,
-                peak_working_set_size: 0,
-                working_set_size: 0,
-                quota_peak_paged_pool_usage: 0,
-                quota_paged_pool_usage: 0,
-                quota_peak_non_paged_pool_usage: 0,
-                quota_non_paged_pool_usage: 0,
-                pagefile_usage: 0,
-                peak_pagefile_usage: 0,
-            };
-            let ok = unsafe {
-                GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb)
-            };
-            if ok == 0 { None } else { Some(f(&pmc)) }
-        }
-        pub fn peak_working_set() -> usize {
-            with_counters(|p| p.peak_working_set_size).unwrap_or(0)
-        }
-        pub fn peak_commit() -> usize {
-            with_counters(|p| p.peak_pagefile_usage).unwrap_or(0)
-        }
-    }
-    #[cfg(windows)]
-    pub use winmem::{peak_commit, peak_working_set};
-    #[cfg(not(windows))]
-    pub fn peak_working_set() -> usize { 0 }
-    #[cfg(not(windows))]
-    pub fn peak_commit() -> usize { 0 }
 }

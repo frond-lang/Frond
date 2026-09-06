@@ -59,17 +59,6 @@ pub fn compile_graph(entry_path: &str, opt_level: crate::pass::Optimizer::OptLev
 }
 
 fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptLevel, debug: bool) -> crate::ir::Ir::DataFlowGraph {
-    // Diagnostic stage timing (FROND_BUILD_TIME=1): per-stage wall time to
-    // stderr; same env-gated diagnostic pattern as FROND_TRACE_CYCLES.
-    let bt = std::env::var("FROND_BUILD_TIME").is_ok();
-    let mut bt_prev = std::time::Instant::now();
-    fn bt_mark(name: &str, bt: bool, prev: &mut std::time::Instant) {
-        if bt {
-            let now = std::time::Instant::now();
-            eprintln!("[build-time] {name}: {} us", now.duration_since(*prev).as_micros());
-            *prev = now;
-        }
-    }
     let source = read_source(entry_path);
 
     if debug {
@@ -80,7 +69,6 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
     // 1. Parse
     let arena = bumpalo::Bump::new();
     let entry_module = Pipeline::parse_entry_module_or_exit(&arena, &source, entry_path);
-    bt_mark("parse_entry", bt, &mut bt_prev);
 
     if debug {
         eprintln!("  AST: {} declarations", entry_module.declarations.len());
@@ -98,7 +86,6 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
     // module CHECKS populate method/resolution tables that user code and
     // sibling std modules consume, and std modules reference each other
     // without imports, so neither sema nor ir-build can be import-scoped.)
-    bt_mark("load_modules", bt, &mut bt_prev);
 
     if debug {
         let builtin_count = loader.builtin_modules().count();
@@ -110,7 +97,6 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
     // 3. Sema check (shared pipeline; any module type error is printed and exits)
     let (type_arena, sema_result) =
         Pipeline::run_sema_pipeline_or_exit(&loader, &std_keys, &dep_keys, &entry_module, entry_path);
-    bt_mark("sema", bt, &mut bt_prev);
 
     if debug {
         eprintln!("  Sema: OK (no type errors)");
@@ -120,7 +106,6 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
     // 4. Static analysis (after Sema, before IR): dead code/dead vars/dead functions + memoization strategy.
     //    Runs analysis on the entry module; prints a report summary in debug mode.
     let mut analysis_report = Analyzer::analyze(&entry_module, &entry_module.arena, &sema_result);
-    bt_mark("analyze_entry", bt, &mut bt_prev);
     if debug {
         eprintln!("  Analyzer: dead_code={} dead_var={} dead_func={} memo_candidates={} dead_param={} inline={} stack_alloc={} non_exhaustive={} unreachable_arms={}",
             analysis_report.dead_code.dead_stmts.len(),
@@ -186,7 +171,6 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
             .with_builtin_analyses(builtin_analyses)
             .build()
     };
-    bt_mark("ir_build", bt, &mut bt_prev);
 
     // Check for IR compilation errors (unimplemented feature fallbacks, missing functions, etc.).
     if !graph.ir_errors.is_empty() {
@@ -209,7 +193,6 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
 
     // Loop analysis (after IR): identify invariants + unrollable loops, populating analysis_report.loop_analysis.
     analysis_report.loop_analysis = crate::pass::Analyzer::analyze_loops(&graph);
-    bt_mark("loop_analysis", bt, &mut bt_prev);
     if debug {
         eprintln!("  LoopAnalysis: invariants={} unrollable={}",
             analysis_report.loop_analysis.invariants.len(),
@@ -227,8 +210,6 @@ fn compile_graph_inner(entry_path: &str, opt_level: crate::pass::Optimizer::OptL
     // condition-tree reset plans — recompute them on the final graph so the
     // engine applies the mechanical fast path.
     graph.precompute_reset_plans();
-    bt_mark("optimize", bt, &mut bt_prev);
-
 
     if debug {
         eprintln!("  IR (after opt):  {} nodes, {} subgraphs, {} compute_fns",
