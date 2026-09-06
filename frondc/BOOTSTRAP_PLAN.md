@@ -760,6 +760,45 @@ parse 已跨入口共享(std_cache/AST 盘缓存),sema 检查环仍逐入口重�
 3. **环境白名单收缩(方案 B,进行中)**:root 预declare 的 330 名
    隐式 glob 收缩为原语白名单,见附七。
 
+**清账结论(2026-09-06,未决 bug 清账会话,案 1/案 2 双销案)**:
+
+- **案 1(async 裸调用 null)——销案,真凶更深**:复现剖析 = 沙箱
+  混态树(旧 b3d6717 引擎 + 新树 CallInfer)的 **arity mismatch**:
+  裸调用 `read_text(path, loader, null, false)` 4 实参喂 5 形参
+  函数,尾部形参静默绑 null 流入 match → [ctor-match-null]。
+  自洽树验证原 bug 引擎已治好;但暴露真缺陷 = **跨模块函数调用
+  arity 校验缺失**:本地调用有校验,ModuleRef 调用路径对实/形参
+  数量不匹配零静默放行。根修(CallInfer):arity_error 覆盖
+  ModuleRef 路径 + 构造器超参报错(保留构造器少参默认构造语义;
+  本地非构造器少参仍为合法部分应用)。负例三件落 negative:
+  arity_module_call / arity_module_over / arity_local_over。
+- **案 2(type_name 方法糖)——复测已愈,销案**:typename_probe
+  沙箱双形态(零导入 / 选择性导入 `Str.{starts_with}`)验证
+  i32/str/f64 的 `type_name()` 全部正常——方法解析走 trait
+  witness 表,与 import 形态无关;上表 1 的"方法糖回落带偏"症状
+  当前引擎不复现。
+- **门禁硬化(同会话落地):ctor-match-null 警告升三态门**
+  (引擎 Builder/ControlFlow + Compute,自举侧 Back 不涉):
+  - scrutinee 静态**非空**(expr_type_handle → handle_nullability,
+    resolve 后非 TypeVar/Unknown):挂 nonnull_assert 为 ctor_match
+    的 inputs[1] 调度依赖(and_bool inputs[2] 同模式)——运行时
+    null 即 "non-null assertion failed" panic 硬失败,不再静默
+    判 false;
+  - 静态**可空**(T?):挂 is_null 探针为 inputs[1]——Compute 侧
+    见 input_count>1 即安静 fall-through(合法 null 的警告噪音
+    清零);**零新元数据、零序列化改动**:input_count 天然随 .fndo
+    Inputs section 持久化,规避 bool_flag 家族的 SectionKind 端
+    成本;非空位则依赖调度序(assert 先于 ctor_match 执行)在
+    序列化前后同构;
+  - **unknown**(typevar/嵌套 record field):单输入,保留警告兜底。
+  嵌套 ctor 子模式 nullability 由父 ctor_def.field_types 逐位推导;
+  守护套件 pattern_nullable_gate(Tree? 上 null/Node/Leaf 判别 +
+  嵌套 ctor 子模式 + 纯 null/变量混合,15 check)零警告全绿;panic
+  路径以临时 paranoid 探针(强制非空判定)端到端复现后移除。
+  **回归门**:functional 97(llvm_probe 缺 llvm.dll 资产,环境性,
+  native slice0/1 门同因留 CI)+ negative 69 + lex 483 + ast 473
+  + load 12 + sema 6 + tyops 77 全绿。
+
 ## 附七:方案 B 环境白名单收缩落地(2026-09-05,@export 制)
 
 **裁决演进**:命名模式白名单(println 族+`__` 前缀)→ 用户改判

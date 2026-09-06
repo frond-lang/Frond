@@ -3,6 +3,28 @@
 use super::*;
 
 impl<'a> InferContext<'a> {
+    /// Arity-mismatch diagnostic (Bug #160): call sites used to silently skip
+    /// (`==` guards) or min()-truncate their argument unification, so
+    /// wrong-arity calls compiled and the runtime garbage-filled the missing
+    /// parameter slots (the "async bare-call null" family). `desc` is a
+    /// preformatted callee description, e.g. "function 'two'".
+    fn arity_error(&mut self, desc: &str, expected: usize, got: usize, line: u32, column: u32) {
+        self.add_error_at(
+            &format!("{desc} expects {expected} argument(s) but got {got}"),
+            line,
+            column,
+        );
+    }
+
+    /// Diagnostic description for a call callee: bare identifiers name the
+    /// function; anything else stays anonymous.
+    fn call_callee_desc(&self, callee: ExprId, ast: &AstArena<'_>) -> String {
+        match &ast.expr(callee).node {
+            Expr::Ident(name) => format!("function '{name}'"),
+            _ => "function".to_string(),
+        }
+    }
+
     /// Infer an `Expr::Call` expression (extracted from `infer_expr_inner`).
     pub(super) fn infer_call_expr(
         &mut self,
@@ -391,12 +413,26 @@ impl<'a> InferContext<'a> {
                     // ModuleRef call: look up the function signature from the module env.
                     if let Type::ModuleRef(_) = self.arena.get(resolved_callee) {
                         let (path, module_env) = self.arena.module_ref_parts(resolved_callee);
+                        // Own the diagnostic name up front (see the normal-stage site).
+                        let fn_desc = format!("function '{path}'");
                         if let Some(func_name) = path.rsplit('.').next() {
                             if let Some(fn_ty) = self.sema_result.env.lookup_local(module_env, func_name) {
                                 let inst_fn = self.instantiate_fn_type(fn_ty);
                                 if let Type::Fn(_) = self.arena.get(inst_fn) {
                                     let (params, return_type) = self.arena.fn_parts(inst_fn);
                                     let params: Vec<TypeHandle> = params.to_vec();
+                                    if params.len() != args.len() {
+                                        // Mirror of the normal-stage guard (Bug #160):
+                                        // module-qualified calls never partially apply.
+                                        let sp = ast.expr(expr).span;
+                                        self.arity_error(
+                                            &fn_desc,
+                                            params.len(),
+                                            args.len(),
+                                            sp.line,
+                                            sp.column,
+                                        );
+                                    }
                                     for (&param_ty, &arg) in params.iter().zip(args.iter()) {
                                         let _ = self.infer_expr(arg, ast, env, Some(param_ty));
                                     }
@@ -410,6 +446,40 @@ impl<'a> InferContext<'a> {
                     if let Type::Fn(_) = self.arena.get(inst_callee) {
                         let (params, return_type) = self.arena.fn_parts(inst_callee);
                         let params: Vec<TypeHandle> = params.to_vec();
+                        // Constructor callee: under-arity is legacy default
+                        // construction (see the normal-stage site) — never a
+                        // partial application.
+                        let callee_is_ctor = match &ast.expr(*callee).node {
+                            Expr::Ident(name) => {
+                                self.sema_result.ctor_def_has(name)
+                                    && matches!(
+                                        self.arena.get(self.arena.resolve(return_type)),
+                                        Type::Adt(_)
+                                    )
+                            }
+                            _ => false,
+                        };
+                        if args.len() < params.len() && !callee_is_ctor {
+                            // Default currying (Bug #160): mirror the normal stage —
+                            // under-arity local calls are partial applications typed
+                            // Fn(remaining) -> ret, keeping the two stages consistent.
+                            for (&param_ty, &arg) in params.iter().zip(args.iter()) {
+                                let _ = self.infer_expr(arg, ast, env, Some(param_ty));
+                            }
+                            let partial = self.arena.make_fn(
+                                params[args.len()..].to_vec().into_boxed_slice(),
+                                return_type,
+                            );
+                            if let Some(exp) = expected {
+                                self.unify_or_constrain(partial, exp);
+                            }
+                            return partial;
+                        }
+                        if params.len() != args.len() && !callee_is_ctor {
+                            let sp = ast.expr(expr).span;
+                            let desc = self.call_callee_desc(*callee, ast);
+                            self.arity_error(&desc, params.len(), args.len(), sp.line, sp.column);
+                        }
                         for (&param_ty, &arg) in params.iter().zip(args.iter()) {
                             let _ = self.infer_expr(arg, ast, env, Some(param_ty));
                         }
@@ -437,6 +507,8 @@ impl<'a> InferContext<'a> {
                 // look up the function signature by its trailing bare name directly in the module env carried by the ModuleRef (no parent-env traversal).
                 if let Type::ModuleRef(_) = self.arena.get(resolved_callee) {
                     let (path, module_env) = self.arena.module_ref_parts(resolved_callee);
+                    // Own the diagnostic name up front (see the instantiation-mode site).
+                    let fn_desc = format!("function '{path}'");
                     // The trailing segment is the function name (e.g. "std.reflect.Reflect.format" → "format").
                     if let Some(func_name) = path.rsplit('.').next() {
                         if let Some(fn_ty) = self.sema_result.env.lookup_local(module_env, func_name) {
@@ -445,24 +517,40 @@ impl<'a> InferContext<'a> {
                             if let Type::Fn(_) = self.arena.get(inst_fn) {
                                 let (params, return_type) = self.arena.fn_parts(inst_fn);
                                 let params: Vec<TypeHandle> = params.to_vec();
-                                if params.len() == args.len() {
+                                if params.len() != args.len() {
+                                    // Module-qualified calls have no partial-application
+                                    // semantics (Bug #160): wrong arity is a hard error, never
+                                    // a silent fallthrough that garbage-fills the missing
+                                    // parameter slots at runtime.
+                                    let sp = ast.expr(expr).span;
+                                    self.arity_error(
+                                        &fn_desc,
+                                        params.len(),
+                                        args.len(),
+                                        sp.line,
+                                        sp.column,
+                                    );
                                     for (&param_ty, &arg) in params.iter().zip(args.iter()) {
-                                        let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
-                                        if let Some(kind) = self
-                                            .unwrap_leak_kind(param_ty, arg_ty)
-                                            .filter(|_| !matches!(&ast.expr(arg).node, crate::ast::Ast::Expr::NullLit))
-                                        {
-                                            self.add_error(&format!(
-                                                "argument type incompatible with parameter type: cannot pass a {} value where '{}' is expected — unwrap explicitly ('?? default', '!', '?', or an '!= null' narrowed branch)",
-                                                kind,
-                                                self.arena.display(self.arena.resolve(param_ty))
-                                            ));
-                                        } else if let Err(e) = self.try_widen_unify(param_ty, arg_ty) {
-                                            self.add_error(&format!("argument type incompatible with parameter type: {}", e));
-                                        }
+                                        let _ = self.infer_expr(arg, ast, env, Some(param_ty));
                                     }
                                     return return_type;
                                 }
+                                for (&param_ty, &arg) in params.iter().zip(args.iter()) {
+                                    let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
+                                    if let Some(kind) = self
+                                        .unwrap_leak_kind(param_ty, arg_ty)
+                                        .filter(|_| !matches!(&ast.expr(arg).node, crate::ast::Ast::Expr::NullLit))
+                                    {
+                                        self.add_error(&format!(
+                                            "argument type incompatible with parameter type: cannot pass a {} value where '{}' is expected — unwrap explicitly ('?? default', '!', '?', or an '!= null' narrowed branch)",
+                                            kind,
+                                            self.arena.display(self.arena.resolve(param_ty))
+                                        ));
+                                    } else if let Err(e) = self.try_widen_unify(param_ty, arg_ty) {
+                                        self.add_error(&format!("argument type incompatible with parameter type: {}", e));
+                                    }
+                                }
+                                return return_type;
                             }
                         }
                     }
@@ -482,14 +570,61 @@ impl<'a> InferContext<'a> {
                 if let Type::Fn(_) = self.arena.get(inst_callee) {
                     let (params, return_type) = self.arena.fn_parts(inst_callee);
                     let params: Vec<TypeHandle> = params.to_vec();
-                    if params.len() == args.len() {
+                    // Constructor callee (bare `Ctor(..)` form): under-arity is
+                    // legacy default construction — IR zero-fills the missing
+                    // fields (edge_traits: `MutCheck()` for MutCheck(dummy: i32)).
+                    // Constructors never partially apply; Bug #160 currying is
+                    // for plain functions only.
+                    let callee_is_ctor = match &ast.expr(*callee).node {
+                        Expr::Ident(name) => {
+                            self.sema_result.ctor_def_has(name)
+                                && matches!(
+                                    self.arena.get(self.arena.resolve(return_type)),
+                                    Type::Adt(_)
+                                )
+                        }
+                        _ => false,
+                    };
+                    if args.len() < params.len() && !callee_is_ctor {
+                        // Default currying (Bug #160): a local under-arity call is a
+                        // partial application. Type it Fn(remaining) -> ret — the old
+                        // declared-return-type lie crashed IR ("missing ExprInfo") on
+                        // any later use of the result.
                         for (&param_ty, &arg) in params.iter().zip(args.iter()) {
                             let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
-                            // Hard-concrete mismatch fails now; TypeVars keep the
-                            // constraint path (see unify_call_arg).
                             let sp = ast.expr(arg).span;
                             self.unify_call_arg(param_ty, arg_ty, sp.line, sp.column, matches!(&ast.expr(arg).node, crate::ast::Ast::Expr::NullLit));
                         }
+                        let partial = self.arena.make_fn(
+                            params[args.len()..].to_vec().into_boxed_slice(),
+                            return_type,
+                        );
+                        if let Some(exp) = expected {
+                            self.unify_or_constrain(partial, exp);
+                        }
+                        return partial;
+                    }
+                    if params.len() != args.len() && !callee_is_ctor {
+                        // Over-arity (Bug #160): hard error; still infer every argument
+                        // (prefix with parameter hints) to keep diagnostics informative.
+                        let sp = ast.expr(expr).span;
+                        let desc = self.call_callee_desc(*callee, ast);
+                        self.arity_error(&desc, params.len(), args.len(), sp.line, sp.column);
+                        for (i, &arg) in args.iter().enumerate() {
+                            let hint = params.get(i).copied();
+                            let _ = self.infer_expr(arg, ast, env, hint);
+                        }
+                        if let Some(exp) = expected {
+                            self.unify_or_constrain(return_type, exp);
+                        }
+                        return return_type;
+                    }
+                    for (&param_ty, &arg) in params.iter().zip(args.iter()) {
+                        let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
+                        // Hard-concrete mismatch fails now; TypeVars keep the
+                        // constraint path (see unify_call_arg).
+                        let sp = ast.expr(arg).span;
+                        self.unify_call_arg(param_ty, arg_ty, sp.line, sp.column, matches!(&ast.expr(arg).node, crate::ast::Ast::Expr::NullLit));
                     }
                     // Always return the declared return type, to avoid cascading type loss from argument mismatches.
                     // If there is an expected type, unify the return type with it to solve pending TypeVars in the return type
@@ -587,6 +722,8 @@ impl<'a> InferContext<'a> {
                                 .iter()
                                 .map(|r| self.type_repr_to_handle(r))
                                 .collect();
+                            // Capture the diagnostic name before `make_adt` moves it.
+                            let ctor_desc = format!("constructor '{method}' of type '{ctor_type_name}'");
                             let ret_ty = self.arena.make_adt(ctor_type_name, Box::new([]));
                             let fn_ty = self.arena.make_fn(
                                 param_types.into_boxed_slice(),
@@ -594,11 +731,23 @@ impl<'a> InferContext<'a> {
                             );
                             let (params, return_type) = self.arena.fn_parts(fn_ty);
                             let params: Vec<TypeHandle> = params.to_vec();
-                            if params.len() == args.len() {
-                                for (&param_ty, &arg) in params.iter().zip(args.iter()) {
-                                    let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
-                                    self.unify_or_constrain(param_ty, arg_ty);
-                                }
+                            if args.len() > params.len() {
+                                // Constructors never partially apply (Bug #160): over-
+                                // arity is a hard error — the extra arguments would be
+                                // silently dropped. Under-arity stays legacy default
+                                // construction (IR zero-fills the missing fields).
+                                let sp = ast.expr(expr).span;
+                                self.arity_error(
+                                    &ctor_desc,
+                                    params.len(),
+                                    args.len(),
+                                    sp.line,
+                                    sp.column,
+                                );
+                            }
+                            for (&param_ty, &arg) in params.iter().zip(args.iter()) {
+                                let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
+                                self.unify_or_constrain(param_ty, arg_ty);
                             }
                             if let Some(exp) = expected {
                                 self.unify_or_constrain(return_type, exp);
@@ -668,6 +817,20 @@ impl<'a> InferContext<'a> {
                         if let Type::Fn(_) = self.arena.get(inst_fn) {
                             let (params, return_type) = self.arena.fn_parts(inst_fn);
                             let params: Vec<TypeHandle> = params.to_vec();
+                            if params.len() != args.len() {
+                                // Module-qualified calls have no partial-application
+                                // semantics (Bug #160): wrong arity is a hard error, never
+                                // a min()-truncated launch that garbage-fills the missing
+                                // parameter slots at runtime (the "async bare-call null").
+                                let sp = ast.expr(expr).span;
+                                    self.arity_error(
+                                        &format!("function '{mod_path_owned}.{method}'"),
+                                        params.len(),
+                                        args.len(),
+                                        sp.line,
+                                        sp.column,
+                                    );
+                            }
                             let n = params.len().min(args.len());
                             for i in 0..n {
                                 let arg_ty = self.infer_expr(args[i], ast, env, Some(params[i]));

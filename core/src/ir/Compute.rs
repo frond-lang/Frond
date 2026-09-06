@@ -2119,9 +2119,18 @@ pub fn compute_pattern_ctor_match(frame: &mut Frame, node: NodeId, ctx: &EvalCon
     let ctor_name = graph.pattern_ctor_name(node.0 as usize)
         .expect("pattern ctor match node has no ctor name");
     if val.is_null() {
-        let tn = graph.pattern_type_name(node.0 as usize);
-        eprintln!("[ctor-match-null] node={:?} local={:?} ctor={} type={:?}",
-            node, node.0 - frame.node_offset, ctor_name, tn);
+        // Null gate (Builder attaches inputs[1] when the scrutinee's static
+        // nullability is known): a statically NON-NULL scrutinee never reaches
+        // here — its nonnull_assert scheduling input panics first; a NULLABLE
+        // (T?) scrutinee discriminates Null to false quietly via the is_null
+        // probe marker. input_count == 1 means unknown nullability (soft
+        // typevar / untyped field) — keep the warning as fallback diagnostics.
+        if n.input_count < 2 {
+            let tn = graph.pattern_type_name(node.0 as usize);
+            eprintln!("[ctor-match-null] node={:?} local={:?} ctor={} type={:?}",
+                node, node.0 - frame.node_offset, ctor_name, tn);
+        }
+        return Value::bool_val(false);
     }
     let type_name = graph.pattern_type_name(node.0 as usize);
     let matched = match val.as_record() {

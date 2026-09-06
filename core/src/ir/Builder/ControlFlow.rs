@@ -370,10 +370,14 @@ impl<'a> IrBuilder<'a> {
 
             // Compile the pattern: produce the discriminant node + bind variables to field-extraction nodes.
             // The scrutinee's static type drives literal-pattern equality routing
-            // (see pattern_scrutinee_ty / int_pattern_eq_fn).
+            // (see pattern_scrutinee_ty / int_pattern_eq_fn) and the ctor-match
+            // null gate (pattern_scrutinee_nullable / handle_nullability).
             self.pattern_scrutinee_ty = self.expr_type_name(scrutinee).map(Box::from);
+            self.pattern_scrutinee_nullable =
+                self.expr_type_handle(scrutinee).and_then(|h| self.handle_nullability(h));
             let pattern_node = self.compile_pattern_match(scrutinee_in_frame, arm.pattern);
             self.pattern_scrutinee_ty = None;
+            self.pattern_scrutinee_nullable = None;
 
             // Guard condition: pattern_match && guard
             let cond_node = if let Some(guard) = arm.guard {
@@ -685,14 +689,59 @@ impl<'a> IrBuilder<'a> {
         patterns: &[crate::ast::Ast::PatternRef],
         type_name: Option<&str>,
     ) -> NodeId {
+        // Ctor-match null gate (three-way, driven by pattern_scrutinee_nullable):
+        //   Some(false) — statically non-null: a runtime Null is an upstream
+        //     binding/eval bug symptom (the historical ctor-match-null class).
+        //     Attach a nonnull_assert as an extra scheduling input (compute
+        //     reads only inputs[0]; inputs[1] guarantees the assert runs first
+        //     — same pattern as and_bool's inputs[2]): Null panics with the
+        //     `expr!` semantics instead of silently discriminating to false.
+        //   Some(true) — statically nullable (T?): Null legitimately
+        //     discriminates to false. Attach an is_null probe as inputs[1]:
+        //     its presence tells Compute to stay quiet (vs. the unknown class
+        //     below, which keeps the warning). No metadata field needed —
+        //     input_count round-trips through .fndo serialization natively.
+        //   None — unknown (soft typevar / untyped field): conservative
+        //     pass-through, single input; the Compute-side warning stays.
+        let null_gate_node = match self.pattern_scrutinee_nullable {
+            Some(false) => {
+                let off = self.graph.inputs_pool.push(&[scrutinee_node]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::UnOp,
+                    input_count: 1,
+                    inputs_offset: off,
+                    compute_fn: CF_NON_NULL_ASSERT,
+                })
+            }
+            Some(true) => {
+                let off = self.graph.inputs_pool.push(&[scrutinee_node]);
+                self.graph.add_node(Node {
+                    kind: NodeKind::BinOp,
+                    input_count: 1,
+                    inputs_offset: off,
+                    compute_fn: CF_IS_NULL,
+                })
+            }
+            None => scrutinee_node,
+        };
         // Constructor-name discriminant node
-        let ctor_match_off = self.graph.inputs_pool.push(&[scrutinee_node]);
-        let ctor_match_node = self.graph.add_node(Node {
-            kind: NodeKind::BinOp,
-            input_count: 1,
-            inputs_offset: ctor_match_off,
-            compute_fn: CF_PATTERN_CTOR_MATCH, // pattern_ctor_match
-        });
+        let ctor_match_node = if self.pattern_scrutinee_nullable.is_some() {
+            let ctor_match_off = self.graph.inputs_pool.push(&[scrutinee_node, null_gate_node]);
+            self.graph.add_node(Node {
+                kind: NodeKind::BinOp,
+                input_count: 2,
+                inputs_offset: ctor_match_off,
+                compute_fn: CF_PATTERN_CTOR_MATCH, // pattern_ctor_match
+            })
+        } else {
+            let ctor_match_off = self.graph.inputs_pool.push(&[scrutinee_node]);
+            self.graph.add_node(Node {
+                kind: NodeKind::BinOp,
+                input_count: 1,
+                inputs_offset: ctor_match_off,
+                compute_fn: CF_PATTERN_CTOR_MATCH, // pattern_ctor_match
+            })
+        };
         // Qualified pattern spellings (`A.TEf`) store the bare constructor
         // name: runtime AdtValue constructor names are bare — the module
         // prefix only disambiguated the sema lookup.
@@ -706,6 +755,24 @@ impl<'a> IrBuilder<'a> {
         } else if let Some(ctor_def) = self.sema.get_ctor_def(name) {
             self.graph.set_pattern_type_name(ctor_match_node, ctor_def.type_name.to_string());
         }
+
+        // Nested sub-pattern scrutinee nullability: pre-copy this ctor's
+        // per-field nullability (the borrow must end before the &mut self
+        // recursion). Disambiguate same-named ctors by the sema-resolved
+        // owning type when available; when no def is reachable the field
+        // stays None (conservative pass-through).
+        let ctor_defs = self.sema.get_ctor_defs(name);
+        let field_nullability: Vec<Option<bool>> = {
+            let def = if let Some(tn) = type_name {
+                ctor_defs.into_iter().find(|d| &*d.type_name == tn)
+            } else {
+                ctor_defs.into_iter().next()
+            };
+            def.map(|d| {
+                d.field_types.iter().map(|&h| self.handle_nullability(h)).collect()
+            })
+            .unwrap_or_default()
+        };
 
         // Recursively process sub-patterns: extract fields + discriminate
         let mut result = ctor_match_node;
@@ -722,10 +789,14 @@ impl<'a> IrBuilder<'a> {
 
             // Recursively compile the sub-pattern (may bind variables). The
             // outer scrutinee's type does not describe this FIELD: drop it so
-            // nested literal patterns keep their legacy literal-based routing.
+            // nested literal patterns keep their legacy literal-based routing
+            // (nullability switches to the i-th FIELD's own type).
             let outer_scrutinee_ty = self.pattern_scrutinee_ty.take();
+            let outer_nullable = self.pattern_scrutinee_nullable.take();
+            self.pattern_scrutinee_nullable = field_nullability.get(i).copied().flatten();
             let sub_match = self.compile_pattern_match(field_get_node, sub_pattern_id);
             self.pattern_scrutinee_ty = outer_scrutinee_ty;
+            self.pattern_scrutinee_nullable = outer_nullable;
 
             // result = result && sub_match
             // field_get_node is an extra dependency input: ensures the variable-bound field-extraction node
@@ -763,10 +834,14 @@ impl<'a> IrBuilder<'a> {
 
             // Recursively compile the sub-pattern. The outer scrutinee's type
             // does not describe this FIELD: drop it so nested literal patterns
-            // keep their legacy literal-based routing.
+            // keep their legacy literal-based routing. Record-field types are
+            // not tracked here — the field's nullability stays None
+            // (conservative pass-through for the ctor-match null gate).
             let outer_scrutinee_ty = self.pattern_scrutinee_ty.take();
+            let outer_nullable = self.pattern_scrutinee_nullable.take();
             let sub_match = self.compile_pattern_match(field_get_node, field.pattern);
             self.pattern_scrutinee_ty = outer_scrutinee_ty;
+            self.pattern_scrutinee_nullable = outer_nullable;
 
             // field_get_node is an extra dependency input (same as compile_pattern_constructor)
             let and_off = self.graph.inputs_pool.push(&[result, sub_match, field_get_node]);

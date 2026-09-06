@@ -223,6 +223,14 @@ pub struct IrBuilder<'a> {
     /// recover the scrutinee's width, and the eq_i32 default truncated both
     /// sides (i64 4294967296 falsely matched pattern 0).
     pub pattern_scrutinee_ty: Option<Box<str>>,
+    /// Statically-known nullability of the pattern scrutinee (ctor-match gate):
+    /// `Some(true)` = `T?` — runtime Null is legal, ctor discrimination falls
+    /// through quietly; `Some(false)` = statically non-null — runtime Null is
+    /// an upstream binding/eval bug, hardened by attaching a nonnull_assert
+    /// scheduling input to the ctor-match node; `None` = unknown (soft
+    /// typevar or field without type info) — conservative pass-through with
+    /// the Compute-side `[ctor-match-null]` warning as fallback diagnostics.
+    pub pattern_scrutinee_nullable: Option<bool>,
     /// Compile-time error list (unimplemented features, missing functions, etc.; inspectable
     /// after compilation).
     pub errors: Vec<String>,
@@ -432,6 +440,7 @@ impl<'a> IrBuilder<'a> {
             current_instance_id: None,
             current_method_type: None,
             pattern_scrutinee_ty: None,
+            pattern_scrutinee_nullable: None,
             errors: Vec::new(),
             global_var_slots: rustc_hash::FxHashMap::default(),
             top_level_var_decls: Vec::new(),
@@ -1285,6 +1294,27 @@ impl<'a> IrBuilder<'a> {
             }
         }
         false
+    }
+
+    /// Statically decide nullability from a type handle (ctor-match gate).
+    /// Resolves the var chain first; `None` = soft (unconstrained typevar /
+    /// unknown / out-of-range placeholder): cannot prove non-null, so the
+    /// caller stays conservative. `Some(false)` covers every concrete type —
+    /// a Null reaching a non-null scrutinee's ctor discrimination is an
+    /// engine bug symptom, not a legal program state.
+    pub(super) fn handle_nullability(&self, t0: crate::sema::Sema::TypeHandle) -> Option<bool> {
+        if (t0.0 as usize) >= self.type_arena.len() {
+            return None;
+        }
+        let t = self.type_arena.resolve(t0);
+        if (t.0 as usize) >= self.type_arena.len() {
+            return None;
+        }
+        match self.type_arena.get(t) {
+            crate::sema::Sema::Type::Nullable(_) => Some(true),
+            crate::sema::Sema::Type::TypeVar(_) | crate::sema::Sema::Type::Unknown => None,
+            _ => Some(false),
+        }
     }
 
     pub(super) fn expr_key_module(&self) -> &'a str {
