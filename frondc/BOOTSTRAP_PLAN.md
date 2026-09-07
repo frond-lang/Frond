@@ -471,9 +471,18 @@ assets/toolchain`(套件/便携形态)。探针已按此实现(Env 哨兵 = 空�
   v1 标量 unbox(i64/f64 进寄存器,聚合保持盒式)。
 - **运行时库**:frond_rt C 库(~50-100 函数,清单见 4b);
   **cycle collector 明确后置**(v0 可泄漏)。
-- **async/defer**:v1 后端 sync-only(frndc 自身写成纯 sync);
-  async→状态机是自举之后的大件。
-- **Throw**:先 setjmp/longjmp,后迁零成本 unwinding。
+- **async/defer**:~~v1 后端 sync-only(frndc 自身写成纯 sync)~~
+  (**2026-09-07 修正**:实测 frondc 有 22 个 async fun + 62 处
+  `.await()`,并非纯 sync——但 std/frondc 的 async fun 全是
+  "签名 async、函数体同步原语直调"(std/io/File.frond:11 注释自证);
+  原生 = **直通降级**:普通函数直调 + await 恒等,零状态机,见附九);
+  defer 2 处低频(切片 5/6 顺手);async→状态机仍是自举之后的大件。
+- ~~**Throw**:先 setjmp/longjmp,后迁零成本 unwinding~~(**2026-09-07
+  改判,见附九**:两态值直落,零运行时。引擎实证——`throw` = 构造
+  `ThrowVal(Err)` + **仅当前函数早退**(Compute.rs compute_throw_wrap_
+  err);调用返回的 Throw 是**数据,不隐式穿透**(Bug #65 明确修掉);
+  `?` = 调用点显式传播(compute_propagate)。setjmp/longjmp 是隐式
+  跨层 unwind = 引擎已移除的语义,不是简化是错译,废弃)。
 
 ## 五、差分基础设施(验收方法论)
 
@@ -522,8 +531,8 @@ libc_nonshared.a(__libc_csu_init/fini 的家);② 目录名排序选目录必
 CI 并行负载放宽(意图不变);tls13 留 NOCI 待引擎修。
 **下一步 = Stage 2 后端本体**:~~frondc/src/backend 已立(Toolchain
 资产解析序 + Llvm 绑定副本),下一片 = Back lowering(切片 0:
-字面量/算术/main)→ `native` 子命令端到端 → AST 全量~~
-(**2026-09-04 切片 0 落地**,见 附二;下一片 = 切片 1 控制流)。
+字面量/算术/main)→ `native` 子命令端到端 → AST 全量~~(切片 0/1/2/3
+已落地,见 附二/附四/附八/附九;**下一步 = 切片 4+(见 附九)**)。
 
 ## 附二:Stage 2 切片 0 记录(2026-09-04)
 
@@ -684,6 +693,156 @@ diff_load 12 + diff_tyops IDENTICAL + diff_sema 6 = **1167 用例零回归**。
 (从仓库根调用时 FROND 误判 not found → exit 2 零输出);CI 显式
 设 FROND env 一直掩盖,本地裸跑必中招;改纯相对路径 `../../Frond/
 core/target/release`(与 native_slice*/diff_* 同款)。
+
+**切片 3(和类型一刀切)已落地(2026-09-07)**,规划与落地记录见 附九。
+
+## 附九:Stage 2 切片 3+ 规划(2026-09-07,自举终点倒排)
+
+**现状盘点**(frondc 源码实测:33 文件 / 28044 行 / 902 fun /
+208 import;由 Stage 3 终局倒排优先级):
+
+| 特性 | frondc 内使用 | 承重度 |
+|---|---|---|
+| match(多 ctor ADT) | 1052 | 极高——最大单缺口 |
+| `??` / nullable | 448 | 高 |
+| `.push()` | 395(多数 List 接收者) | 高(→ 跨模块) |
+| `++` 拼接(数组为主) | 180 | 高 |
+| throw / Ok-Error 消费 | 92 / 385 | 高 |
+| async fun / `.await()` | 22 / 62 | 高(直通降级,见 4e 修正) |
+| or-pattern | ~200 | 中 |
+| 引用 `&` | **0** | 移出关键路径 |
+| defer / RecordLitE / RecordExtendE | 2 / 7 / 8 | 顺手件 |
+
+std 依赖闭包(切片 6 面向):collections.List/Map(全员)+
+io.Path/Fs/File/Dir + os.Proc/Os/Env/Info + math + time ≈ 20 文件,
+底层 C 原语(`#{ }#`/@extern)→ 预编译 .obj 资产链接。
+
+**三裁决(2026-09-07 用户拍板)**:
+1. **切片 3 和类型一刀切**:多 ctor ADT + match 全模式族 + nullable
+   合并一片,统一 `{i64 tag, payload}` tagged-union 表示。T? 本质 =
+   2-ctor 特例(tag 0 = null,tag 1 = 值;nullable 无 Some 包装,
+   镜像引擎 T?? 塌缩语义);分开做会重复设计表示层。
+2. **throw 两态值直落,废弃 setjmp/longjmp**(4e 已改判):引擎实证
+   ——`throw` = 构造 ThrowVal(Err) + 仅当前函数早退;调用返回 Throw
+   是数据不隐式穿透(Bug #65);`?` = 调用点显式传播(Throw 的
+   Ok 解包/Err 早退与 nullable 的 null 早退/非空直通同一通道,
+   compute_propagate)。原生:throw 语句 = 构造 `{1, payload}` +
+   `ret`;`?` = 内联 tag 检查双臂;match Ok/Error = 普通 2 臂;
+   零运行时、零 C 层、零新资产、零 ABI 差异,IR 膨胀仅在显式 `?`
+   点(frndc 几乎不用 `?`,主流是 match 消费 + `??`)。
+3. **async 直通降级**(4e 已修正):async fun lower = 普通函数,
+   `.await(e)` = e 恒等;无需状态机。
+
+**切片序列**:
+- **切片 3(和类型)**:ADT 布局 + match 编译 + nullable(细则下);
+- **切片 4(Throw + async 直通)**:throw/`?`/Ok-Err 构造 lowering +
+  async 签名直通 + await 恒等——两态值直落后全部零资产小件;
+- **切片 5(动态聚合)**:数组 `++` 拼接、str 拼接、str/数组索引、
+  `[a..b]` 切片、record/数组深相等(`==`/`!=`);纯 IR 走
+  frond_alloc(切片 2 既有),零新资产;defer 顺手;
+- **切片 6(跨模块 + monomorph + std)**:mangled 多模块 lower、
+  call_instantiations 实例重放、方法分派/witness、std 依赖闭包 +
+  C 原语 @extern → declare + C 层 .obj 链接输入 + frond_rt 最小
+  内核(dlopen/LoadLibrary/argv/UTF-16 桥/spawn;进场时
+  `frond_alloc` 换 C 实现,调用点不动——§2 策略丙预留);RecordLitE/
+  RecordExtendE 顺手;
+- **Stage 3(自举闭环)**:引擎跑 `frondc native` 编 frondc 自身 →
+  原生 fronc.exe;fronc 再编 frondc 平方验证 + 产物 diff + 三平台。
+
+**切片 3 细则**:
+- ADT 块 = `{i64 tag, payload 区}`:tag = ctor 声明序;payload 布局
+  两案(最大公共 payload vs per-ctor 偏移表)以 IR 体积/GEP 次数
+  实测裁决,独立探针先行(附二雷 1 教训:LLVM 21 API 位次先探后进);
+  字段访问 = 8 字节头 + 字节偏移 GEP(**切片 2 的 i8 基型单索引
+  铁律复用**:偏移先 build_add 加总成单索引);零参 ctor payload 空
+  (引擎 ctors 表判定,严格 `constructors.len()`,勿依赖 detail id)。
+- 布局键 `padt:<模块>::<类型名>`;值形态 = opaque ptr(与其他聚合
+  一致,ty_same 按 record_name_of 同名判等的既有口径推广)。
+- match 编译:scrutinee 单次求值入槽 → load tag → switch(小 ctor
+  数用 icmp 链);模式族 = 字面量/绑定/ctor 嵌套(递归子模式)/
+  or-pattern(同块多比较)/guard(谓词假 fall-through 下一臂)/
+  通配;臂体 = 子块 + 结果槽(镜像 IfE 切片 1 槽位法);穷尽性
+  sema 已保证(Maranget),不可达尾兜底 `unreachable`;绑定回填在
+  臂内先于谓词/臂体。
+- nullable `T?`:标量 payload 直接内联(块 = `{tag, 标量}`),
+  聚合 payload = ptr;`??` Elvis = tag 检查 + 双臂选择;赋值不放宽
+  语义照镜像(附二/三既有写法约束)。
+- **语义锚**:每 fixture 先引擎跑 oracle(checkmany 0 错;求值序以
+  引擎 dump_ir 为准)。
+- **验收**:`tests/fixtures/native_slice3/cases/`(枚举判别+嵌套
+  ctor 模式/or-pattern/guard/nullable `??` 链/深嵌套 match 值);
+  退出码锁 0..255;driver = `tests/scripts/native_slice3.sh`(拷
+  slice2 模板);CI 五平台矩阵挂负套件后;门禁 = native 0/1/2/3 +
+  functional + negative + 差分五套全绿(串行)。
+
+**风险与记账**:
+- payload 布局抉择影响后续所有 ADT 代码的 IR 质量,探针先行;
+- match 深嵌套模式的状态机式回退(绑定污染/臂间泄漏)——副本式
+  slots(切片 1 块作用域法)天然隔离,验收 fixture 覆盖;
+- 引擎 ctor-match-null 洞(附二雷 3)原生侧不存在(静态特化),
+  但 Back 自身规避形态(整数字面量臂)保持不变;
+- 跨模块同名 ADT 布局键带模块名,不撞;
+- Stage 3 端到端时长:引擎解释执行 frondc 编 frondc(28k 行 + std
+  闭包),Map 热表 ~200µs/op(§7)可能放大——IntMap 化或提前到
+  切片 6 前,实测裁决;
+- 引用 0 使用,正式移出自举关键路径(Stage 3 后按需再议)。
+
+**落地记录(2026-09-07)**:
+
+**验收**:`tests/fixtures/native_slice3/cases/`(21-26)退出码全中
+31/44/60/102/155/81——多 ctor 枚举判别/带字段 ctor 嵌套模式/
+nullable 构造装箱+Elvis 链+Ident 窄化/match guard+or-pattern+字面量
+模式/nullable 聚合(数组元素 nullable+record 装 nullable)/递归
+ADT(Cons 链 sum/len)+record 装多 ctor ADT 字段访问+PRecord 按名
+按位+match 返回 str;driver = `tests/scripts/native_slice3.sh`
+(slice2 模板,CI 五平台矩阵待挂)。门禁全绿(2026-09-07 实测):
+native 0/1/2/3(5+5+6+6,slice3 同源先批)+ functional 98 +
+negative 69 + diff_lex 495 + diff_ast 485+10skip + diff_load 12 +
+diff_tyops IDENTICAL + diff_sema 6 = **1187 用例零回归**。
+
+**布局裁决(细则两案 → per-ctor struct 胜出)**:探针实测弃"统一
+{i64 tag, 最大公共 payload}+8 字节头字节偏移 GEP"案——**每 ctor
+独立 LLVM struct `{i64, fields...}`**(键 `adtc:<类型名>:<ctor索引>`,
+字段序 = ctor 声明序,复用切片 2 record 全链);tag 判别 = 首字段
+i64 `icmp eq`(32u32),字段访问 = `struct_gep`(免 i8 单索引加总),
+内存 = per-ctor 尺寸;T? = 同款 2-ctor 特例 `{i64, T}`(键
+`nulv:<inner>`,tag0=null 零参/tag1=Some;标量 payload 内联,聚合
+payload = ptr);null 字面量 = 每 nullable 类型一个 zeroinit 私有
+全局(`nulcst:`)。值形态全 opaque ptr,ty_same 按类型名判等
+(切片 2 record_name_of 口径推广到 8/9 两类)。
+
+**关键修复(实施期定位)**:
+1. **ValDeclS 绑定类型**:IR 定位槽位误用初值类型 + 初值未按绑定
+   类型 conv(`val x: i64? = 整数` 槽位成标量非 2 字块,后继
+   `??`/match 全炸);修 = 绑定类型三处落地(Semares 新
+   local_decl_types 表 + Infer.check_local_decl 存 +
+   Back.ValDeclS 取),槽位按绑定类型分配,初值 conv 装箱后入槽。
+2. **PRecord 模式推断**:Infer.infer_pattern 的 PRecord 分支原用
+   fresh_type_var(镜像引擎同款——引擎动态执行无碍,native 需具体
+   类型,26_match_deep 炸 "unresolved type for expr");修 = 按期望
+   record(TAdt 名义)的 record_shape 实际字段类型绑定子模式,fid
+   口径镜像 Back.pat_bind(按位 Prf.name = 十进制键 int_to_key 形态,
+   按名 record_field_idx;sema 层 dec_idx_local 本地副本免跨层
+   import)。期望非名义/字段未命中 → fresh_type_var 旧径保守回退。
+3. **字面量模式 scrutinee 谓词**:标量 scrutinee 的字面量模式被
+   `k >= 0` 误拒(标量 kind 全 >= 0);改 `k >= 5`(仅 str/聚合
+   不可作字面量匹配面)。
+4. **nullable arm 窄化**:null arm 之后的绑定 arm 已知非 null(镜像
+   引擎 Match.rs 窄化),arm_h 窄化到 inner + conv unbox;
+   Ident 引用 nullable 局部同理(conv_value 9→inner 直落)。
+5. **Elvis/比较/断言族**:`??` 短路双臂(tag 判别+取值/右值);
+   T? == T? 三臂分发(双 null 真/单 null 假/双值 inner 递归);
+   `!!` 非空断言 null 臂 `llvm.trap`;Eq/Neq 与 sema Data 枚举
+   撞名 → `Ast.Eq`/`Ast.Neq` 显式消歧。
+6. **conv_value 标量→T? 装箱**:inner 类型与标量源不同宽时先转
+   inner 再装箱(i32 字面量 → i64? 槽)。
+
+**Frond 语言顺带发现**:赋值不放宽 `str` → `str?`(nullable 变量
+赋非空值须 `if true { x } else { null }` idiom);本切片统一改用
+非空哨兵(空串)变量 + nullable 数组承载,规避之。
+
+**下一片 = 切片 4(Throw 两态值直落 + async 直通降级)**,零资产
+小件,规划见上。
 
 ## 附五:S2c 导入优先级格 + 裸名多主零静默(2026-09-04,用户裁决"地基要稳")
 

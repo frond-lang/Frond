@@ -2114,9 +2114,41 @@ fun infer_pattern(ctx: ICtx, a: TypeArena, s: SemaRes, pat: i64, ast: AstArena,
             }
         },
         PRecord(fields) => {
+            // 切片 3:PRecord 子模式按期望 record 的实际字段类型绑定
+            // (native 后端需具体类型;fid 口径镜像 Back.frond pat_bind——
+            // 按位 Prf.name = 十进制键,按名走 record_field_idx)。期望非
+            // 名义 record(TAdt)/字段未命中 → fresh_type_var 旧径(引擎
+            // 同款保守回退)。
+            var rn: str = ""
+            var fts: u32[]? = null
+            val prec_resolved = resolve(a, expected_ty)
+            match Arena.get(a, prec_resolved) {
+                TAdt(_) => {
+                    val p = adt_parts(a, prec_resolved)
+                    if p.b.len() == 0 {
+                        rn = p.a
+                        fts = Semares.record_shape(s, p.a)
+                    }
+                },
+                _ => {},
+            }
             var i: usize = 0
             while i < fields.len() {
-                val field_ty = fresh_type_var(a)
+                var field_ty = fresh_type_var(a)
+                match fts {
+                    null => {}
+                    fts0 => {
+                        val ftsv = fts0 ?? []
+                        val f = fields[i]
+                        val fid = match dec_idx_local(f.name) {
+                            null => Semares.record_field_idx(s, rn, f.name)
+                            d => d ?? 0,
+                        }
+                        if fid >= 0 && (fid as usize) < ftsv.len() {
+                            field_ty = ftsv[fid as usize]
+                        }
+                    },
+                }
                 infer_pattern(ctx, a, s, fields[i].pattern, ast, field_ty, env)
                 i = i + 1
             }
@@ -2140,6 +2172,27 @@ fun is_upper_name(name: str): bool {
         return false
     }
     b[0] >= 65 && b[0] <= 90
+}
+
+// 十进制下标解析(PRecord 按位模式的 Prf.name = int_to_key 形态;
+// 非全数字 → null)。Back.frond parse_dec_idx 的 sema 层本地副本
+// (免跨层 import)。
+fun dec_idx_local(name: str): i64? {
+    val b = name.bytes()
+    if b.len() == 0 {
+        return null
+    }
+    var v: i64 = 0
+    var i: usize = 0
+    while i < b.len() {
+        val c = b[i]
+        if c < 48 || c > 57 {
+            return null
+        }
+        v = v * 10 + ((c - 48) as i64)
+        i = i + 1
+    }
+    v
 }
 
 // ── 穷尽性(Maranget 有用性矩阵)──
@@ -3042,6 +3095,9 @@ fun check_local_decl(ctx: ICtx, a: TypeArena, s: SemaRes, name: str, type_annota
             bind_ty = annot_ty
         },
     }
+    // 切片 3:绑定类型落地(键 = module + stmt;native 后端 ValDeclS
+    // 槽位分配/初值 conv 消费——注解优先于初值表达式类型)。
+    Semares.put_local_decl(s, Semares.local_decl_key(ctx.current_module_name, stmt), bind_ty)
     // Bug#76:可变性变更遮蔽检测。
     val key = "{env}\u{0}{name}"
     match ctx.local_mutability.get(key) {

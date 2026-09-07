@@ -36,6 +36,8 @@ import backend.Toolchain
 import syntax.Ast
 import sema.Semares
 import sema.Envs
+import sema.Ictx
+import sema.Typeast
 import types.Arena
 import types.Ty
 import std.collections.List
@@ -141,18 +143,51 @@ pub fun llty_for(lib: Lib, ctx: u64, cache: Map<str, u64>, t: Ty): Throw<u64, Ff
             Llvm.fp128_type(lib, ctx)?
         }
     } else {
-        throw FfiError(Other, "slice 0: unsupported type for LLVM lowering")
+        throw FfiError(Other, "slice 0: unsupported type for LLVM lowering: {ty_variant_name(t)}")
     }
     cache.set(key, built)
     Ok(built)
 }
 
+// 类型变体名(诊断专用:llty_for 兜底报错定位非标量类型形态)。
+fun ty_variant_name(t: Ty): str {
+    match t {
+        TVoid => "TVoid"
+        TStr => "TStr"
+        TNull => "TNull"
+        TLib => "TLib"
+        TThrow(_) => "TThrow"
+        TChannel(_) => "TChannel"
+        TAsync(_) => "TAsync"
+        TLazy(_) => "TLazy"
+        TAtomic(_) => "TAtomic"
+        TSender(_) => "TSender"
+        TReceiver(_) => "TReceiver"
+        TForeignFn(_) => "TForeignFn"
+        TTimer(_) => "TTimer"
+        TArray(_) => "TArray"
+        TRef(_) => "TRef"
+        TFn(_) => "TFn"
+        TNullable(_) => "TNullable"
+        TAdt(_) => "TAdt"
+        TRecord(_) => "TRecord"
+        TTrait(_) => "TTrait"
+        TTraitObject(_) => "TTraitObject"
+        TModuleRef(_) => "TModuleRef"
+        TGeneric(_) => "TGeneric"
+        TNever => "TNever"
+        TTypeVar(_) => "TTypeVar"
+        TUnknown => "TUnknown"
+        _ => "?"
+    }
+}
+
 // ── 聚合类型映射(切片 2,附八)───────────────────────────────────
 
-// 聚合值形态 = opaque ptr(str/数组/record 三形态统一;opaque ptr 在
-// context 内单例,缓存键 "ptr" 共享)。
+// 聚合值形态 = opaque ptr(str/数组/record/多 ctor ADT/nullable 五形态
+// 统一;opaque ptr 在 context 内单例,缓存键 "ptr" 共享)。
 fun is_agg_kind(k: i64): bool {
-    k == 5 || k == 6 || k == 7
+    k == 5 || k == 6 || k == 7 || k == 8 || k == 9
 }
 
 fun opaque_ptr(lib: Lib, ctx: u64, cache: Map<str, u64>): Throw<u64, FfiError> {
@@ -166,10 +201,13 @@ fun opaque_ptr(lib: Lib, ctx: u64, cache: Map<str, u64>): Throw<u64, FfiError> {
     }
 }
 
-// 句柄聚合分类(切片 2):ty_kind 的名义扩展——TAdt 且类型名为单 ctor
-// 非泛型聚合(record_shape 命中)→ 7。其余 TAdt(多 ctor/泛型/别名/
-// newtype/未知名)→ -1,lowering 触点响亮报错。TRecord(detail)保持
-// ty_kind 直判(结构 record,本切片构造面不走此形态)。
+// 句柄聚合分类(切片 2/3):ty_kind 的名义扩展——TAdt 且类型名为单 ctor
+// 非泛型聚合(record_shape 命中)→ 7;多 ctor 非泛型 TAdt(kind==TAdt 且
+// constructors.len()>1)→ 8(切片 3:per-ctor struct {i64 tag, ...});
+// TNullable → 9(切片 3:2-ctor 特例 {i64 tag, payload},tag0=null)。
+// 其余 TAdt(泛型实例/别名/newtype/未知名)→ -1,lowering 触点响亮
+// 报错。TRecord(detail)保持 ty_kind 直判(结构 record,本切片构造面
+// 不走此形态)。
 pub fun agg_kind(a: TypeArena, s: SemaRes, h: u32): i64 {
     val rh = Arena.resolve(a, h)
     val raw = Arena.get(a, rh)
@@ -178,13 +216,20 @@ pub fun agg_kind(a: TypeArena, s: SemaRes, h: u32): i64 {
         return k
     }
     match raw {
+        TNullable(_) => 9
         TAdt(_) => {
             val parts = Arena.adt_parts(a, rh)
             if parts.b.len() > 0 {
                 return -1
             }
             match Semares.record_shape(s, parts.a) {
-                null => -1
+                null => {
+                    if Semares.type_def_is_multi_ctor_adt(s, parts.a) {
+                        8
+                    } else {
+                        -1
+                    }
+                }
                 _ => 7
             }
         },
@@ -265,6 +310,204 @@ pub fun str_layout(lib: Lib, ctx: u64, cache: Map<str, u64>, n: usize): Throw<u6
     val lt = Llvm.struct_type(lib, ctx, [i64ty, bytes])?
     cache.set(key, lt)
     Ok(lt)
+}
+
+// ── 聚合类型映射(切片 3,附九)───────────────────────────────────
+// 多 ctor ADT = ptr → per-ctor struct {i64 tag, f0, f1, ...}(B 案,
+// 探针实测裁决:复用 record struct 全链 + per-ctor 精确尺寸;tag@0 =
+// 构造器在 TDef.constructors 里的 0 基索引,payload 字段从 1 起)。
+// T? = ptr → {i64 tag, T payload}(2-ctor 特例:tag0=null,tag1=值);
+// null = 每类型一个私有 zeroinit 全局常量块(零 arena 消耗)。
+
+// 类型结构键(nullable 布局/null 常量的缓存键:句柄 id 不稳定——
+// TAdt/TNullable 每次推断新分配,双份句柄同型不同 id)。
+fun ty_key(a: TypeArena, s: SemaRes, h: u32): str {
+    val rh = Arena.resolve(a, h)
+    val k = agg_kind(a, s, rh)
+    if k == 5 {
+        return "s"
+    }
+    if k == 6 {
+        return "a" + ty_key(a, s, (Arena.array_parts(a, rh)).a)
+    }
+    if k == 7 {
+        match Arena.get(a, rh) {
+            TRecord(d) => { return "r{d}" }
+            _ => { return "rn" + (record_name_of(a, rh) ?? "?") }
+        }
+    }
+    if k == 8 {
+        return "d" + (record_name_of(a, rh) ?? "?")
+    }
+    if k == 9 {
+        return "o" + ty_key(a, s, Arena.nullable_inner(a, rh))
+    }
+    llty_key(Arena.get(a, rh))
+}
+
+// per-ctor struct 布局 {i64, fields...}(多 ctor ADT;键含类型名与
+// ctor 索引,同型同键共享)。
+fun adt_ctor_layout(lib: Lib, ctx: u64, cache: Map<str, u64>, a: TypeArena, s: SemaRes,
+    type_name: str, ctor_idx: i64): Throw<u64, FfiError> {
+    val key = "adtc:{type_name}:{ctor_idx}"
+    match cache.get(key) {
+        null => {}
+        h => { return Ok(h ?? 0) }
+    }
+    match Semares.adt_ctor_fields(s, type_name, ctor_idx) {
+        null => throw FfiError(Other, "slice 3: no constructor #{ctor_idx} on '{type_name}'")
+        fts0 => {
+            val fts = fts0 ?? []
+            val i64ty = llty_for(lib, ctx, cache, TI64)?
+            var ftys: u64[] = [i64ty]
+            var i: usize = 0
+            while i < fts.len() {
+                ftys = ftys ++ [llty_for_h(lib, ctx, cache, a, s, fts[i])?]
+                i = i + 1
+            }
+            val lt = Llvm.struct_type(lib, ctx, ftys)?
+            cache.set(key, lt)
+            Ok(lt)
+        },
+    }
+}
+
+// nullable 块布局 {i64, T}(tag@0:0=null,1=Some;payload@1)。
+fun nullable_layout(lib: Lib, ctx: u64, cache: Map<str, u64>, a: TypeArena, s: SemaRes,
+    inner_h: u32): Throw<u64, FfiError> {
+    val key = "nulv:" + ty_key(a, s, inner_h)
+    match cache.get(key) {
+        null => {}
+        h => { return Ok(h ?? 0) }
+    }
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    val pt = llty_for_h(lib, ctx, cache, a, s, inner_h)?
+    val lt = Llvm.struct_type(lib, ctx, [i64ty, pt])?
+    cache.set(key, lt)
+    Ok(lt)
+}
+
+// null 全局常量块(每 nullable 类型一个:私有 zeroinit {i64, T};
+// tag@0=0 即 null,payload 零值永不被读——判 null 后短路)。
+// cur_td/cur_module 提前声明(切片 3 布局族在切片 2 状态区之前引用;
+// var 顺序敏感,函数前向引用不受限)。
+var cur_td: u64 = 0
+var cur_module: u64 = 0
+var nuln: i64 = 0
+
+fun nullable_null_global(lib: Lib, ctx: u64, cache: Map<str, u64>, a: TypeArena, s: SemaRes,
+    inner_h: u32): Throw<u64, FfiError> {
+    val key = "nulcst:" + ty_key(a, s, inner_h)
+    match cache.get(key) {
+        null => {}
+        g => { return Ok(g ?? 0) }
+    }
+    val blk_ty = nullable_layout(lib, ctx, cache, a, s, inner_h)?
+    nuln = nuln + 1
+    val g = Llvm.add_global(lib, cur_module, blk_ty, ".nul{nuln}")?
+    Llvm.set_linkage_private(lib, g)?
+    Llvm.set_global_constant(lib, g, true)?
+    Llvm.set_initializer(lib, g, Llvm.const_null(lib, blk_ty)?)?
+    cache.set(key, g)
+    Ok(g)
+}
+
+// nullable tag 读取(i64 在 offset 0,ptr 直 load 免 gep)。
+fun nullable_tag(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>, p: u64): Throw<u64, FfiError> {
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    Llvm.build_load(lib, builder, i64ty, p, "ntag")
+}
+
+// Some 包装:frond_alloc {i64, T} → store tag=1 → store payload;返回
+// 块地址(= nullable 值)。v 已是 inner 类型值(调用方 conv 保证)。
+fun nullable_box_val(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>,
+    a: TypeArena, s: SemaRes, v: u64, inner_h: u32): Throw<u64, FfiError> {
+    val lt = nullable_layout(lib, ctx, cache, a, s, inner_h)?
+    val sz = Llvm.abi_size_of_type(lib, cur_td, lt)?
+    val p = call_alloc(lib, ctx, cache, builder, sz)?
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    val one = Llvm.const_int(lib, i64ty, 1u64, false)?
+    val tag_at = Llvm.build_struct_gep(lib, builder, lt, p, 0u32, tmp())?
+    Llvm.build_store(lib, builder, one, tag_at)?
+    val f_at = Llvm.build_struct_gep(lib, builder, lt, p, 1u32, tmp())?
+    Llvm.build_store(lib, builder, v, f_at)?
+    Ok(p)
+}
+
+// unbox:payload@1 装载(inner 类型;窄化路径调用方保证非 null)。
+fun nullable_unbox_val(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>,
+    a: TypeArena, s: SemaRes, p: u64, inner_h: u32): Throw<u64, FfiError> {
+    val lt = nullable_layout(lib, ctx, cache, a, s, inner_h)?
+    val f_at = Llvm.build_struct_gep(lib, builder, lt, p, 1u32, tmp())?
+    load_at(lib, ctx, builder, cache, a, s, f_at, inner_h)
+}
+
+// 多 ctor ADT 构造:frond_alloc per-ctor struct → store tag@0=ctor_idx →
+// 逐字段 store@1..(vals 已 conv 到字段类型;聚合字段存 ptr);返回块
+// 地址(= ADT 值)。B 案:复用 record 构造全链,仅多 tag 写入。
+fun adt_ctor_build(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>,
+    a: TypeArena, s: SemaRes, type_name: str, ctor_idx: i64, vals: u64[]): Throw<u64, FfiError> {
+    val lt = adt_ctor_layout(lib, ctx, cache, a, s, type_name, ctor_idx)?
+    val sz = Llvm.abi_size_of_type(lib, cur_td, lt)?
+    val p = call_alloc(lib, ctx, cache, builder, sz)?
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    val tagv = Llvm.const_int(lib, i64ty, ctor_idx as u64, false)?
+    val tag_at = Llvm.build_struct_gep(lib, builder, lt, p, 0u32, tmp())?
+    Llvm.build_store(lib, builder, tagv, tag_at)?
+    var fi: usize = 0
+    while fi < vals.len() {
+        val faddr = Llvm.build_struct_gep(lib, builder, lt, p, (fi + 1) as u32, tmp())?
+        Llvm.build_store(lib, builder, vals[fi], faddr)?
+        fi = fi + 1
+    }
+    Ok(p)
+}
+
+// 开放类型变量(悬空 TypeVar/Unknown):NullLit 的 nullable inner 形态。
+fun is_open_var(a: TypeArena, h: u32): bool {
+    match Arena.get(a, Arena.resolve(a, h)) {
+        TTypeVar(_) | TUnknown => true
+        _ => false
+    }
+}
+
+// 裸 null 规范全局(NullLit 专属):zeroinit {i64, i64}(tag=0;
+// payload 为 i64 哑型——判空短路保证永不读,与具体 nullable 布局差异
+// 不可观察)。所有裸 null 共享一块,零 arena 消耗。
+fun null_global_canon(lib: Lib, ctx: u64, cache: Map<str, u64>): Throw<u64, FfiError> {
+    match cache.get("nulcst:?") {
+        null => {}
+        g => { return Ok(g ?? 0) }
+    }
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    val blk_ty = Llvm.struct_type(lib, ctx, [i64ty, i64ty])?
+    nuln = nuln + 1
+    val g = Llvm.add_global(lib, cur_module, blk_ty, ".nul{nuln}")?
+    Llvm.set_linkage_private(lib, g)?
+    Llvm.set_global_constant(lib, g, true)?
+    Llvm.set_initializer(lib, g, Llvm.const_null(lib, blk_ty)?)?
+    cache.set("nulcst:?", g)
+    Ok(g)
+}
+
+// 十进制下标解析(PRecord 按位模式的 Prf.name = int_to_key 形态;
+// 非全数字 → null)。
+fun parse_dec_idx(name: str): i64? {
+    val b = name.bytes()
+    if b.len() == 0 {
+        return null
+    }
+    var v: i64 = 0
+    var i: usize = 0
+    while i < b.len() {
+        val c = b[i]
+        if c < 48 || c > 57 {
+            return null
+        }
+        v = v * 10 + ((c - 48) as i64)
+        i = i + 1
+    }
+    v
 }
 
 // ── 字面量文本(LLVMConstIntOfString 的 radix/数字段分离)──────────
@@ -372,12 +615,21 @@ fun ty_same(a: TypeArena, s: SemaRes, h1: u32, h2: u32): bool {
             },
             _ => false
         }
-    } else {
-        if k1 < 0 {
-            return false
-        }
-        llty_key(Arena.get(a, r1)) == llty_key(Arena.get(a, r2))
     }
+    if k1 == 8 {
+        // 多 ctor ADT:非泛型面同名即同型(tag/字段布局由 TDef 决定)。
+        val n1 = record_name_of(a, r1)
+        val n2 = record_name_of(a, r2)
+        return n1 != null && n2 != null && (n1 ?? "") == (n2 ?? "")
+    }
+    if k1 == 9 {
+        // nullable:inner 递归(T?[] 的元素形态与 T 一致,折叠嵌套同键)。
+        return ty_same(a, s, Arena.nullable_inner(a, r1), Arena.nullable_inner(a, r2))
+    }
+    if k1 < 0 {
+        return false
+    }
+    llty_key(Arena.get(a, r1)) == llty_key(Arena.get(a, r2))
 }
 
 // ── 值转型 ─────────────────────────────────────────────────────────
@@ -393,12 +645,37 @@ pub fun conv_value(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>,
     val to = Arena.get(a, Arena.resolve(a, to_h))
     val fk = agg_kind(a, s, from_h)
     val tk = agg_kind(a, s, to_h)
-    // 聚合族(切片 2):值 = opaque ptr,同型即恒等(str↔str;数组须
-    // elem 同型;record 须同名义类型——TAdt 同名或 TRecord 同 detail)。
-    // 跨形态/异型 = 响亮报错。
+    // 聚合族(切片 2/3):值 = opaque ptr,同型即恒等(str↔str;数组须
+    // elem 同型;record 须同名义类型——TAdt 同名或 TRecord 同 detail;
+    // 多 ctor ADT 同名;nullable inner 同型)。切片 3 新通道:T → T?
+    // = Some 包装(box:frond_alloc 块);T? → T = payload 装载(unbox:
+    // 流窄化路径,sema 已保证非 null)。跨形态/异型 = 响亮报错。
     if is_agg_kind(fk) || is_agg_kind(tk) {
-        if !is_agg_kind(fk) || !is_agg_kind(tk) {
-            throw FfiError(Other, "slice 2: aggregate/scalar conversion '{name}' is not supported")
+        // 切片 3:T → T? = Some 包装(box:标量/聚合统一——聚合值本就是
+        // ptr,store payload 即可);T? → T = payload 装载(unbox:流窄化
+        // 路径,sema 已保证非 null)。
+        if fk != 9 && tk == 9 {
+            // T → T? = Some 包装。inner 同型直 box;标量族先 conv 到
+            // inner 再 box(字面量 arm 体/初值形态:i32 → i64?);聚合
+            // 须同型(str → str?)。
+            val inner = Arena.nullable_inner(a, Arena.resolve(a, to_h))
+            if ty_same(a, s, from_h, inner) {
+                return nullable_box_val(lib, ctx, builder, cache, a, s, v, inner)
+            }
+            if fk >= 0 && fk < 5 {
+                val wv = conv_value(lib, ctx, builder, cache, a, s, v, from_h, inner, name + "w")?
+                return nullable_box_val(lib, ctx, builder, cache, a, s, wv, inner)
+            }
+        }
+        if fk == 9 && tk != 9 {
+            // T? → T = payload 装载后 conv 到目标(流窄化路径,sema 已
+            // 保证非 null;inner → 目标走常规 conv:i64? → i32 截窄等)。
+            val inner = Arena.nullable_inner(a, Arena.resolve(a, from_h))
+            val uv = nullable_unbox_val(lib, ctx, builder, cache, a, s, v, inner)?
+            return conv_value(lib, ctx, builder, cache, a, s, uv, inner, to_h, name)
+        }
+        if (fk < 5 || tk < 5) && fk != tk {
+            throw FfiError(Other, "slice 3: aggregate/scalar conversion '{name}' ({fk}->{tk}, {ty_key(a, s, from_h)}~{ty_key(a, s, to_h)}) is not supported")
         }
         if fk == 5 && tk == 5 {
             return Ok(v)
@@ -435,6 +712,30 @@ pub fun conv_value(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>,
                     }
                 },
                 _ => {}
+            }
+        }
+        if fk == 8 && tk == 8 {
+            // 多 ctor ADT:非泛型面同名即同型。
+            val fname = record_name_of(a, from_h) ?? ""
+            val tname = record_name_of(a, to_h) ?? ""
+            if fname.len() > 0 && fname == tname {
+                return Ok(v)
+            }
+        }
+        if fk == 9 && tk == 9 {
+            // nullable:inner 递归同型即恒等(块布局同键)。
+            // 裸 null 直通:NullLit 的 sema 类型 = TNullable(fresh var),
+            // 任一侧 inner 是开放类型变量即视为 null 块传递(payload 永不
+            // 读——判空后短路,块布局差异不可观察)。
+            val ifr = Arena.resolve(a, from_h)
+            val itr = Arena.resolve(a, to_h)
+            val fi = Arena.nullable_inner(a, ifr)
+            val ti = Arena.nullable_inner(a, itr)
+            if is_open_var(a, fi) || is_open_var(a, ti) {
+                return Ok(v)
+            }
+            if ty_same(a, s, from_h, to_h) {
+                return Ok(v)
             }
         }
         throw FfiError(Other, "slice 2: mismatched aggregate conversion '{name}'")
@@ -517,11 +818,9 @@ fun tmp(): str {
 
 var arena_fn: u64 = 0
 var arena_ft: u64 = 0
-var cur_td: u64 = 0
 // 切片 2 模块级通道:cur_module(str 常量全局挂载点)/trap(越界内联)/
 // str_consts(字面量内容去重)/place_ptr-place_ty(lower_place 出参,
 // 调用点即读,禁止跨嵌套持有——u64 record 字段读回是软类型洞,禁用)。
-var cur_module: u64 = 0
 var trap_fn: u64 = 0
 var trap_ft: u64 = 0
 var str_consts: Map<str, u64> = Map.empty<str, u64>()
@@ -1070,11 +1369,50 @@ pub fun lower_expr(lib: Lib, ctx: u64, builder: u64, fref: u64,
             // 切片 2:str 字面量 = 私有全局常量块地址(值 = ptr)。
             str_lit_global(lib, ctx, cache, text)
         },
+        NullLit => {
+            // 切片 3:裸 null = 规范全局常量块地址({i64,i64} zeroinit,
+            // tag@0=0;判空短路保证 payload 永不读,哑型差异不可观察)。
+            null_global_canon(lib, ctx, cache)
+        },
         Ident(name) => {
             match slots.get(name) {
-                null => throw FfiError(Other, "slice 0: identifier '{name}' is not a local (params/globals arrive in later slices)")
+                null => {
+                    // 切片 3:零参 ADT 构造器(parser 裸名形态,如 Nil/Red;
+                    // 局部绑定优先,ctor 次之——同名遮蔽由 sema 保证)。
+                    match Semares.get_ctor_def(s, name) {
+                        null => throw FfiError(Other, "slice 0: identifier '{name}' is not a local (params/globals arrive in later slices)")
+                        cd => {
+                            val tn = (cd ?? Ctor("", "", [], [], [], false, null, null, [], Span(0, 0), "")).type_name
+                            if !Semares.type_def_is_multi_ctor_adt(s, tn) {
+                                throw FfiError(Other, "slice 0: identifier '{name}' is not a local (params/globals arrive in later slices)")
+                            }
+                            val cidx = Semares.adt_ctor_index(s, tn, name)
+                            if cidx < 0 {
+                                throw FfiError(Other, "slice 3: ctor '{name}' not found on '{tn}' (expr {eid})")
+                            }
+                            val fts = Semares.adt_ctor_fields(s, tn, cidx) ?? []
+                            if fts.len() != 0 {
+                                throw FfiError(Other, "slice 3: ctor '{name}' takes {fts.len()} args — use '{name}(...)' (expr {eid})")
+                            }
+                            adt_ctor_build(lib, ctx, builder, cache, a, s, tn, cidx, [])
+                        },
+                    }
+                },
                 slot => {
-                    // 切片 2:聚合变量槽存 ptr(llty_for_h 统一二形)。
+                    // 切片 3:流窄化读取——声明槽 T? 而使用点 T(sema 经
+                    // != null / match null-arm 窄化):槽装 nullable ptr,
+                    // load ptr → unbox(inner)。其余按使用类型装载(聚合
+                    // 变量槽存 ptr,llty_for_h 统一二形)。
+                    val decl_h = tyslots.get(name) ?? my_ty
+                    val dk = agg_kind(a, s, decl_h)
+                    if dk == 9 && agg_kind(a, s, my_ty) != 9 {
+                        val inner = Arena.nullable_inner(a, Arena.resolve(a, decl_h))
+                        if ty_same(a, s, inner, my_ty) {
+                            val pt = llty_for_h(lib, ctx, cache, a, s, decl_h)?
+                            val p = Llvm.build_load(lib, builder, pt, slot ?? 0, name)?
+                            return nullable_unbox_val(lib, ctx, builder, cache, a, s, p, inner)
+                        }
+                    }
                     val lt = llty_for_h(lib, ctx, cache, a, s, my_ty)?
                     Llvm.build_load(lib, builder, lt, slot ?? 0, name)
                 },
@@ -1134,6 +1472,10 @@ pub fun lower_expr(lib: Lib, ctx: u64, builder: u64, fref: u64,
         },
         IfE(cond, then_e, else_e) => {
             lower_if(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, eid, cond, then_e, else_e)
+        },
+        MatchE(scrut, arms) => {
+            // 切片 3:match 值表达式(全模式族 + guard)。
+            lower_match(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, eid, scrut, arms)
         },
         BlockE(stmts, tail) => {
             lower_block(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, stmts, tail)
@@ -1243,6 +1585,31 @@ pub fun lower_expr(lib: Lib, ctx: u64, builder: u64, fref: u64,
             lower_comp_place(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache,
                 eid, op, target, value)
         },
+        NonNullAssertE(sub) => {
+            // 切片 3:e! —— 非 null 断言:tag==0 → llvm.trap;否则
+            // unbox(inner = 表达式类型)。
+            val sh = expr_ty(a, s, mname, sub)?
+            if agg_kind(a, s, sh) != 9 {
+                throw FfiError(Other, "slice 3: '!' assertion on non-nullable (expr {eid})")
+            }
+            val inner = Arena.nullable_inner(a, Arena.resolve(a, sh))
+            val v = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, sub)?
+            if flow_stopped {
+                return Ok(0u64)
+            }
+            val i64ty = llty_for(lib, ctx, cache, TI64)?
+            val t = nullable_tag(lib, ctx, builder, cache, v)?
+            val z = Llvm.const_int(lib, i64ty, 0u64, false)?
+            val b = Llvm.build_icmp(lib, builder, t, z, 32u32, "nna.n")?
+            val ok_blk = Llvm.append_block(lib, ctx, fref, "nna.ok")?
+            val trap_blk = Llvm.append_block(lib, ctx, fref, "nna.trap")?
+            Llvm.build_cond_br(lib, builder, b, trap_blk, ok_blk)?
+            Llvm.position_builder_at_end(lib, builder, trap_blk)?
+            Llvm.build_call2_0(lib, builder, trap_ft, trap_fn, "")?
+            Llvm.build_unreachable(lib, builder)?
+            Llvm.position_builder_at_end(lib, builder, ok_blk)?
+            nullable_unbox_val(lib, ctx, builder, cache, a, s, v, inner)
+        },
         _ => throw FfiError(Other, "slice 1: unsupported expression form (expr {eid} in module '{mname}')"),
     }
 }
@@ -1346,6 +1713,438 @@ pub fun lower_if(lib: Lib, ctx: u64, builder: u64, fref: u64,
     Llvm.build_load(lib, builder, lt, slot, tmp())
 }
 
+// ── 切片 3 match 编译(附九)───────────────────────────────────────
+// 镜像引擎 ControlFlow::compile_match:scrutinee 一次求值 → arm 链
+// (模式判别 + 可选 guard → body);非穷尽 = 引擎 panic → native
+// unreachable(切片 3 面全穷尽,响亮注释)。模式测试用 CPS 双续体
+// (成功 br ok_blk / 失败 br fail_blk,完成后 builder 位于 ok_blk):
+// ctor 层短路(tag 确认后才 load 字段,防 per-ctor 布局越界读)。
+// 绑定 = alloca 槽 + store(值形态同 ValDecl:标量本体/聚合 ptr);
+// 槽类型 = 绑定位置原生形态,使用处 Ident 按 sema 类型 conv 窄化
+// (nullable 槽 + inner 使用 = unbox,镜像 sema 的 nullable arm
+// narrowing:null arm 后的绑定 arm 窄化到 inner)。
+
+// 模式变量绑定:槽类型 = 绑定位置类型(scrut/ctor 字段/record 字段)。
+fun pat_bind(lib: Lib, ctx: u64, builder: u64, cache: Map<str, u64>,
+    a: TypeArena, s: SemaRes, name: str, v: u64, v_h: u32,
+    aslots: Map<str, u64>, atys: Map<str, u32>): Throw<void, FfiError> {
+    val st = llty_for_h(lib, ctx, cache, a, s, v_h)?
+    val p = Llvm.build_alloca(lib, builder, st, "pb.{name}")?
+    Llvm.build_store(lib, builder, v, p)?
+    aslots.set(name, p)
+    atys.set(name, v_h)
+    Ok(void)
+}
+
+// ctor 字段链(ADT per-ctor 与单 ctor record 共用):逐字段 gep+load →
+// 子模式递归;第 i 字段成功续体 = 第 i+1 字段测试起点块,末字段 = ok_blk。
+// base_idx:ADT per-ctor 字段从 1(tag@0);record 从 0。零字段 = 恒真。
+fun field_chain(lib: Lib, ctx: u64, builder: u64, fref: u64,
+    a: TypeArena, s: SemaRes, mname: str, ast: AstArena,
+    aslots: Map<str, u64>, atys: Map<str, u32>, cache: Map<str, u64>,
+    subpats: i64[], fts: u32[], lt: u64, base_idx: u32, base: u64,
+    ok_blk: u64, fail_blk: u64): Throw<void, FfiError> {
+    if fts.len() == 0 {
+        Llvm.build_br(lib, builder, ok_blk)?
+        Llvm.position_builder_at_end(lib, builder, ok_blk)?
+        return Ok(void)
+    }
+    var i: usize = 0
+    while i < fts.len() {
+        val oknext = if i + 1 < fts.len() {
+            Llvm.append_block(lib, ctx, fref, "fc.n{i}")?
+        } else {
+            ok_blk
+        }
+        val addr = Llvm.build_struct_gep(lib, builder, lt, base, base_idx + (i as u32), tmp())?
+        val fv = load_at(lib, ctx, builder, cache, a, s, addr, fts[i])?
+        pat_test(lib, ctx, builder, fref, a, s, mname, ast, aslots, atys, cache,
+            subpats[i], fv, fts[i], oknext, fail_blk)?
+        i = i + 1
+    }
+    Ok(void)
+}
+
+// 构造器模式:scrut 三形态——k8 ADT(tag 判别 + per-ctor 字段链)、
+// k9 nullable(tag==1 → unbox → inner k8/k7 递归)、k7 record(ctor 名
+// = 类型名,无 tag 直链)。PVar 形态的零参 ctor 由 pat_test 转入。
+fun ctor_test(lib: Lib, ctx: u64, builder: u64, fref: u64,
+    a: TypeArena, s: SemaRes, mname: str, ast: AstArena,
+    aslots: Map<str, u64>, atys: Map<str, u32>, cache: Map<str, u64>,
+    cname: str, subpats: i64[], sv: u64, sh: u32,
+    ok_blk: u64, fail_blk: u64): Throw<void, FfiError> {
+    val k = agg_kind(a, s, sh)
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    if k == 8 {
+        val tn = record_name_of(a, sh) ?? "?"
+        match Semares.get_ctor_def(s, cname) {
+            null => throw FfiError(Other, "slice 3: unknown constructor '{cname}' in pattern (type '{tn}')")
+            cd => {
+                val ctn = (cd ?? Ctor("", "", [], [], [], false, null, null, [], Span(0, 0), "")).type_name
+                if ctn != tn {
+                    throw FfiError(Other, "slice 3: constructor '{cname}' belongs to '{ctn}', scrutinee is '{tn}'")
+                }
+            },
+        }
+        val cidx = Semares.adt_ctor_index(s, tn, cname)
+        if cidx < 0 {
+            throw FfiError(Other, "slice 3: constructor '{cname}' not found on '{tn}'")
+        }
+        val fts = Semares.adt_ctor_fields(s, tn, cidx) ?? []
+        if fts.len() != subpats.len() {
+            throw FfiError(Other, "slice 3: pattern '{cname}' expects {fts.len()} sub-patterns, got {subpats.len()}")
+        }
+        val t = nullable_tag(lib, ctx, builder, cache, sv)?
+        val c = Llvm.const_int(lib, i64ty, cidx as u64, false)?
+        val b = Llvm.build_icmp(lib, builder, t, c, 32u32, "ctag")?
+        val tok = Llvm.append_block(lib, ctx, fref, "ct.ok")?
+        Llvm.build_cond_br(lib, builder, b, tok, fail_blk)?
+        Llvm.position_builder_at_end(lib, builder, tok)?
+        val lt = adt_ctor_layout(lib, ctx, cache, a, s, tn, cidx)?
+        field_chain(lib, ctx, builder, fref, a, s, mname, ast, aslots, atys, cache,
+            subpats, fts, lt, 1u32, sv, ok_blk, fail_blk)
+    } else if k == 9 {
+        // nullable 上的 ctor 模式:tag==1 后解 inner 递归(sema 剥壳 unify 同口径)。
+        val inner_h = Arena.nullable_inner(a, Arena.resolve(a, sh))
+        val t = nullable_tag(lib, ctx, builder, cache, sv)?
+        val one = Llvm.const_int(lib, i64ty, 1u64, false)?
+        val b = Llvm.build_icmp(lib, builder, t, one, 32u32, "ntag")?
+        val tok = Llvm.append_block(lib, ctx, fref, "nt.ok")?
+        Llvm.build_cond_br(lib, builder, b, tok, fail_blk)?
+        Llvm.position_builder_at_end(lib, builder, tok)?
+        val pv = nullable_unbox_val(lib, ctx, builder, cache, a, s, sv, inner_h)?
+        val ik = agg_kind(a, s, inner_h)
+        if ik == 8 || ik == 7 {
+            ctor_test(lib, ctx, builder, fref, a, s, mname, ast, aslots, atys, cache,
+                cname, subpats, pv, inner_h, ok_blk, fail_blk)
+        } else {
+            throw FfiError(Other, "slice 3: constructor pattern on non-aggregate nullable inner ('{cname}')")
+        }
+    } else if k == 7 {
+        // 单 ctor record:ctor 名即类型名,无 tag。
+        val rn = record_name_of(a, sh) ?? "?"
+        match Semares.get_ctor_def(s, cname) {
+            null => throw FfiError(Other, "slice 3: unknown constructor '{cname}' in pattern (record '{rn}')")
+            cd => {
+                val ctn = (cd ?? Ctor("", "", [], [], [], false, null, null, [], Span(0, 0), "")).type_name
+                if ctn != rn {
+                    throw FfiError(Other, "slice 3: constructor '{cname}' belongs to '{ctn}', scrutinee is '{rn}'")
+                }
+            },
+        }
+        val fts = Semares.record_shape(s, rn) ?? []
+        if fts.len() != subpats.len() {
+            throw FfiError(Other, "slice 3: pattern '{cname}' expects {fts.len()} sub-patterns, got {subpats.len()}")
+        }
+        val lt = record_layout(lib, ctx, cache, a, s, rn)?
+        field_chain(lib, ctx, builder, fref, a, s, mname, ast, aslots, atys, cache,
+            subpats, fts, lt, 0u32, sv, ok_blk, fail_blk)
+    } else {
+        throw FfiError(Other, "slice 3: constructor pattern '{cname}' on non-ADT scrutinee")
+    }
+}
+
+// 模式测试(CPS 双续体):全模式族——通配/绑定(含零参 ctor 转发)/
+// 字面量(int/float/bool/char/str/null)/ctor/record(按名+按位)/
+// or/guard。成功路径汇聚 br ok_blk,失败 br fail_blk;完成后 builder
+// 位于 ok_blk(body/guard 在此续编)。
+fun pat_test(lib: Lib, ctx: u64, builder: u64, fref: u64,
+    a: TypeArena, s: SemaRes, mname: str, ast: AstArena,
+    aslots: Map<str, u64>, atys: Map<str, u32>, cache: Map<str, u64>,
+    pid: i64, sv: u64, sh: u32, ok_blk: u64, fail_blk: u64): Throw<void, FfiError> {
+    match ast.pat(pid).node {
+        PWild => {
+            Llvm.build_br(lib, builder, ok_blk)?
+            Llvm.position_builder_at_end(lib, builder, ok_blk)?
+            Ok(void)
+        },
+        PVar(name) => {
+            // ctor 名消歧(镜像引擎 Variable 分支:ctor_def 命中即 ctor 模式)。
+            match Semares.get_ctor_def(s, name) {
+                null => {
+                    pat_bind(lib, ctx, builder, cache, a, s, name, sv, sh, aslots, atys)?
+                    Llvm.build_br(lib, builder, ok_blk)?
+                    Llvm.position_builder_at_end(lib, builder, ok_blk)?
+                    Ok(void)
+                },
+                cd => {
+                    if !Semares.type_def_is_multi_ctor_adt(s,
+                        (cd ?? Ctor("", "", [], [], [], false, null, null, [], Span(0, 0), "")).type_name) {
+                        throw FfiError(Other, "slice 3: single-ctor record name '{name}' needs explicit field patterns")
+                    }
+                    ctor_test(lib, ctx, builder, fref, a, s, mname, ast, aslots, atys, cache,
+                        name, [], sv, sh, ok_blk, fail_blk)
+                },
+            }
+        },
+        PLit(pl) => {
+            val k = agg_kind(a, s, sh)
+            match pl {
+                PLNull => {
+                    if k != 9 {
+                        throw FfiError(Other, "slice 3: null pattern on non-nullable scrutinee")
+                    }
+                    val t = nullable_tag(lib, ctx, builder, cache, sv)?
+                    val i64ty = llty_for(lib, ctx, cache, TI64)?
+                    val z = Llvm.const_int(lib, i64ty, 0u64, false)?
+                    val b = Llvm.build_icmp(lib, builder, t, z, 32u32, "isnull")?
+                    Llvm.build_cond_br(lib, builder, b, ok_blk, fail_blk)?
+                    Llvm.position_builder_at_end(lib, builder, ok_blk)?
+                    Ok(void)
+                },
+                PLStr(txt) => {
+                    if k != 5 {
+                        throw FfiError(Other, "slice 3: string pattern on non-str scrutinee")
+                    }
+                    val sp = str_lit_global(lib, ctx, cache, txt)?
+                    val b = str_eq_inline(lib, ctx, builder, cache, fref, sv, sp)?
+                    Llvm.build_cond_br(lib, builder, b, ok_blk, fail_blk)?
+                    Llvm.position_builder_at_end(lib, builder, ok_blk)?
+                    Ok(void)
+                },
+                PLInt(txt) => {
+                    if k >= 5 {
+                        throw FfiError(Other, "slice 3: int pattern on aggregate/nullable scrutinee (unsupported narrowing)")
+                    }
+                    val lt = llty_for_h(lib, ctx, cache, a, s, sh)?
+                    val c = Llvm.const_int_str(lib, lt, int_digits(txt), int_radix(txt))?
+                    val b = Llvm.build_icmp(lib, builder, sv, c, 32u32, tmp())?
+                    Llvm.build_cond_br(lib, builder, b, ok_blk, fail_blk)?
+                    Llvm.position_builder_at_end(lib, builder, ok_blk)?
+                    Ok(void)
+                },
+                PLFloat(txt) => {
+                    if k >= 5 {
+                        throw FfiError(Other, "slice 3: float pattern on aggregate/nullable scrutinee (unsupported narrowing)")
+                    }
+                    val lt = llty_for_h(lib, ctx, cache, a, s, sh)?
+                    val c = Llvm.const_real_str(lib, lt, txt)?
+                    val b = Llvm.build_fcmp(lib, builder, sv, c, 2u32, tmp())?
+                    Llvm.build_cond_br(lib, builder, b, ok_blk, fail_blk)?
+                    Llvm.position_builder_at_end(lib, builder, ok_blk)?
+                    Ok(void)
+                },
+                PLBool(bv) => {
+                    if k >= 5 {
+                        throw FfiError(Other, "slice 3: bool pattern on aggregate/nullable scrutinee (unsupported narrowing)")
+                    }
+                    val lt = llty_for(lib, ctx, cache, TBool)?
+                    val bits = if bv { 1u64 } else { 0u64 }
+                    val c = Llvm.const_int(lib, lt, bits, false)?
+                    val b = Llvm.build_icmp(lib, builder, sv, c, 32u32, tmp())?
+                    Llvm.build_cond_br(lib, builder, b, ok_blk, fail_blk)?
+                    Llvm.position_builder_at_end(lib, builder, ok_blk)?
+                    Ok(void)
+                },
+                PLChar(cp) => {
+                    if k >= 5 {
+                        throw FfiError(Other, "slice 3: char pattern on aggregate/nullable scrutinee (unsupported narrowing)")
+                    }
+                    val lt = llty_for(lib, ctx, cache, TChar)?
+                    val c = Llvm.const_int(lib, lt, cp as u64, false)?
+                    val b = Llvm.build_icmp(lib, builder, sv, c, 32u32, tmp())?
+                    Llvm.build_cond_br(lib, builder, b, ok_blk, fail_blk)?
+                    Llvm.position_builder_at_end(lib, builder, ok_blk)?
+                    Ok(void)
+                },
+            }
+        },
+        PCtor(name, subpats) => {
+            ctor_test(lib, ctx, builder, fref, a, s, mname, ast, aslots, atys, cache,
+                name, subpats, sv, sh, ok_blk, fail_blk)
+        },
+        PRecord(fields) => {
+            val k = agg_kind(a, s, sh)
+            if k != 7 {
+                throw FfiError(Other, "slice 3: record pattern on non-record scrutinee")
+            }
+            val rn = record_name_of(a, sh) ?? "?"
+            val fts = Semares.record_shape(s, rn) ?? []
+            val lt = record_layout(lib, ctx, cache, a, s, rn)?
+            if fields.len() == 0 {
+                Llvm.build_br(lib, builder, ok_blk)?
+                Llvm.position_builder_at_end(lib, builder, ok_blk)?
+                return Ok(void)
+            }
+            var fi: usize = 0
+            while fi < fields.len() {
+                val f = fields[fi]
+                val fid = match parse_dec_idx(f.name) {
+                    null => Semares.record_field_idx(s, rn, f.name)
+                    d => d ?? 0,
+                }
+                if fid < 0 || (fid as usize) >= fts.len() {
+                    throw FfiError(Other, "slice 3: record '{rn}' has no field '{f.name}' in pattern")
+                }
+                val fidx = fid as usize
+                val oknext = if fi + 1 < fields.len() {
+                    Llvm.append_block(lib, ctx, fref, "rc.n{fi}")?
+                } else {
+                    ok_blk
+                }
+                val addr = Llvm.build_struct_gep(lib, builder, lt, sv, fidx as u32, tmp())?
+                val fv = load_at(lib, ctx, builder, cache, a, s, addr, fts[fidx])?
+                pat_test(lib, ctx, builder, fref, a, s, mname, ast, aslots, atys, cache,
+                    f.pattern, fv, fts[fidx], oknext, fail_blk)?
+                fi = fi + 1
+            }
+            Ok(void)
+        },
+        POr(l, r) => {
+            // 左右各自完整测试;成功同汇 or_true → br ok。绑定按序累积
+            // (镜像引擎 bind_var 两侧都执行)。
+            val or_true = Llvm.append_block(lib, ctx, fref, "or.t")?
+            val r_start = Llvm.append_block(lib, ctx, fref, "or.r")?
+            pat_test(lib, ctx, builder, fref, a, s, mname, ast, aslots, atys, cache,
+                l, sv, sh, or_true, r_start)?
+            Llvm.position_builder_at_end(lib, builder, r_start)?
+            pat_test(lib, ctx, builder, fref, a, s, mname, ast, aslots, atys, cache,
+                r, sv, sh, or_true, fail_blk)?
+            Llvm.build_br(lib, builder, ok_blk)?
+            Llvm.position_builder_at_end(lib, builder, ok_blk)?
+            Ok(void)
+        },
+        PGuard(p, cond) => {
+            val gok = Llvm.append_block(lib, ctx, fref, "pg.ok")?
+            pat_test(lib, ctx, builder, fref, a, s, mname, ast, aslots, atys, cache,
+                p, sv, sh, gok, fail_blk)?
+            val gv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, aslots, atys, cache, cond)?
+            if flow_stopped {
+                // guard 内终止(罕见):补 br ok 保 verifier;stopped 传播。
+                Llvm.build_br(lib, builder, ok_blk)?
+                Llvm.position_builder_at_end(lib, builder, ok_blk)?
+                return Ok(void)
+            }
+            val gh = expr_ty(a, s, mname, cond)?
+            val gb = conv_to_bool(lib, ctx, builder, cache, a, gv, gh, tmp())?
+            Llvm.build_cond_br(lib, builder, gb, ok_blk, fail_blk)?
+            Llvm.position_builder_at_end(lib, builder, ok_blk)?
+            Ok(void)
+        },
+    }
+}
+
+// match 值表达式:scrutinee 一次求值 → arm 链(模式测试 + guard →
+// body,失败 → 下一 arm);结果槽 + merge(同 lower_if);全 arm 终止
+// → merge 无前驱补 unreachable;非穷尽 = m.dead 块 unreachable
+// (引擎 panic 语义,切片 3 面全穷尽)。
+pub fun lower_match(lib: Lib, ctx: u64, builder: u64, fref: u64,
+    a: TypeArena, s: SemaRes, mname: str, ast: AstArena,
+    slots: Map<str, u64>, tyslots: Map<str, u32>, cache: Map<str, u64>,
+    eid: i64, scrut: i64, arms: Marm[]): Throw<u64, FfiError> {
+    val scrut_v = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, scrut)?
+    if flow_stopped {
+        return Ok(0u64)
+    }
+    val scrut_h = expr_ty(a, s, mname, scrut)?
+    // 结果形态:缺表项或 TVoid → void(同 lower_if)。
+    var is_void = true
+    var my_h = cur_ret_h
+    match Semares.get_expr(s, Semares.module_expr_key(mname, eid)) {
+        null => {}
+        h => {
+            val rh = Arena.resolve(a, h ?? 0)
+            if ty_kind(Arena.get(a, rh)) != 4 {
+                is_void = false
+                my_h = rh
+            }
+        },
+    }
+    var slot = 0u64
+    if !is_void {
+        val st = llty_for_h(lib, ctx, cache, a, s, my_h)?
+        slot = Llvm.build_alloca(lib, builder, st, "m.res")?
+    }
+    val merge_blk = Llvm.append_block(lib, ctx, fref, "m.end")?
+    // 切片 3:nullable arm 窄化(镜像引擎 Match.rs:null arm 之后的非
+    // null arm 已知非 null——PVar 绑定/ctor 解构/字面量模式统一按
+    // inner 型处理;scrut 值 conv unbox 一次入 arm)。
+    val scrut_k = agg_kind(a, s, scrut_h)
+    val scrut_inner = if scrut_k == 9 {
+        Arena.nullable_inner(a, Arena.resolve(a, scrut_h))
+    } else {
+        scrut_h
+    }
+    var null_arm_seen = false
+    var all_stopped = true
+    var i: usize = 0
+    while i < arms.len() {
+        val arm = arms[i]
+        // 本 arm 失败目标:下一 arm 测试起点(末 arm = m.dead)。
+        val next_blk = if i + 1 < arms.len() {
+            Llvm.append_block(lib, ctx, fref, "m.arm{i + 1}")?
+        } else {
+            Llvm.append_block(lib, ctx, fref, "m.dead")?
+        }
+        val aslots = copy_slots(slots)
+        val atys = copy_tys(tyslots)
+        val body_blk = Llvm.append_block(lib, ctx, fref, "m.ok{i}")?
+        val is_null_arm = match ast.pat(arm.pattern).node {
+            PLit(pl) => {
+                match pl {
+                    PLNull => true
+                    _ => false
+                }
+            },
+            _ => false,
+        }
+        var arm_h = scrut_h
+        var arm_v = scrut_v
+        if scrut_k == 9 && null_arm_seen && !is_null_arm && !is_open_var(a, scrut_inner) {
+            arm_h = scrut_inner
+            arm_v = conv_value(lib, ctx, builder, cache, a, s, scrut_v, scrut_h, arm_h, tmp())?
+        }
+        null_arm_seen = null_arm_seen || is_null_arm
+        flow_stopped = false
+        pat_test(lib, ctx, builder, fref, a, s, mname, ast, aslots, atys, cache,
+            arm.pattern, arm_v, arm_h, body_blk, next_blk)?
+        match arm.guard {
+            null => {}
+            g => {
+                val gv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, aslots, atys, cache, g ?? 0)?
+                if !flow_stopped {
+                    val gh = expr_ty(a, s, mname, g ?? 0)?
+                    val gb = conv_to_bool(lib, ctx, builder, cache, a, gv, gh, tmp())?
+                    val gok = Llvm.append_block(lib, ctx, fref, "m.grd{i}")?
+                    Llvm.build_cond_br(lib, builder, gb, gok, next_blk)?
+                    Llvm.position_builder_at_end(lib, builder, gok)?
+                }
+            },
+        }
+        if !flow_stopped {
+            val bv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, aslots, atys, cache, arm.body)?
+            if !flow_stopped && !is_void {
+                val bh = expr_ty(a, s, mname, arm.body)?
+                val bvc = conv_value(lib, ctx, builder, cache, a, s, bv, bh, my_h, tmp())?
+                match Llvm.build_store(lib, builder, bvc, slot) {
+                    Ok(_) => {}
+                    Error(e) => throw e
+                }
+            }
+            if !flow_stopped {
+                Llvm.build_br(lib, builder, merge_blk)?
+            }
+        }
+        all_stopped = all_stopped && flow_stopped
+        Llvm.position_builder_at_end(lib, builder, next_blk)?
+        i = i + 1
+    }
+    // m.dead:全 arm 不匹配(引擎 panic;切片 3 面全穷尽,不可达)。
+    Llvm.build_unreachable(lib, builder)?
+    Llvm.position_builder_at_end(lib, builder, merge_blk)?
+    if all_stopped {
+        Llvm.build_unreachable(lib, builder)?
+        flow_stopped = true
+        return Ok(0u64)
+    }
+    flow_stopped = false
+    if is_void {
+        return Ok(0u64)
+    }
+    val lt = llty_for_h(lib, ctx, cache, a, s, my_h)?
+    Llvm.build_load(lib, builder, lt, slot, tmp())
+}
+
 // 块表达式(表达式位):作用域副本 + 语句列 + 尾表达式即块值。
 pub fun lower_block(lib: Lib, ctx: u64, builder: u64, fref: u64,
     a: TypeArena, s: SemaRes, mname: str, ast: AstArena,
@@ -1383,7 +2182,40 @@ pub fun lower_call(lib: Lib, ctx: u64, builder: u64, fref: u64,
                     // conv 到字段类型 → frond_alloc → 逐字段 store;值 =
                     // 块地址)。非函数非 record = 响亮报错。
                     match Semares.record_shape(s, name) {
-                        null => throw FfiError(Other, "slice 1: callee '{name}' not slice-1 function (generic/async/throwing/std/cross-module arrive in later slices)")
+                        null => {
+                            // 切片 3:多 ctor ADT 构造器(callee 名 = ctor 名;
+                            // per-ctor struct {i64 tag, fields...},tag = ctor 在
+                            // TDef.constructors 的 0 基索引)。
+                            match Semares.get_ctor_def(s, name) {
+                                null => throw FfiError(Other, "slice 1: callee '{name}' not slice-1 function (generic/async/throwing/std/cross-module arrive in later slices)")
+                                cd => {
+                                    val tn = (cd ?? Ctor("", "", [], [], [], false, null, null, [], Span(0, 0), "")).type_name
+                                    if !Semares.type_def_is_multi_ctor_adt(s, tn) {
+                                        throw FfiError(Other, "slice 3: ctor '{name}' on non-slice-3 shape (generic/newtype ctors arrive in later slices)")
+                                    }
+                                    val cidx = Semares.adt_ctor_index(s, tn, name)
+                                    if cidx < 0 {
+                                        throw FfiError(Other, "slice 3: ctor '{name}' not found on '{tn}' (expr {eid})")
+                                    }
+                                    val fts = Semares.adt_ctor_fields(s, tn, cidx) ?? []
+                                    if fts.len() != args.len() {
+                                        throw FfiError(Other, "slice 3: arity mismatch constructing '{name}' (expr {eid})")
+                                    }
+                                    var vals: u64[] = []
+                                    var ai: usize = 0
+                                    while ai < args.len() {
+                                        val av = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, args[ai])?
+                                        if flow_stopped {
+                                            return Ok(0u64)
+                                        }
+                                        val ah = expr_ty(a, s, mname, args[ai])?
+                                        vals = vals ++ [conv_value(lib, ctx, builder, cache, a, s, av, ah, fts[ai], tmp())?]
+                                        ai = ai + 1
+                                    }
+                                    adt_ctor_build(lib, ctx, builder, cache, a, s, tn, cidx, vals)
+                                },
+                            }
+                        },
                         fts0 => {
                             val fts = fts0 ?? []
                             if fts.len() != args.len() {
@@ -1444,6 +2276,155 @@ pub fun lower_call(lib: Lib, ctx: u64, builder: u64, fref: u64,
     }
 }
 
+// Elvis(??,切片 3):lhs ?? rhs——lhs 非 null → unbox(inner = 表达式
+// 类型);null → rhs(短路:rhs 仅 null 分支求值)。lhs 形:nullable 块
+// (或裸 null 规范块——tag@0=0 恒 null)。结果槽 + cond_br 双臂
+// store,merge load(同 short_circuit 骨架)。
+pub fun elvis_build(lib: Lib, ctx: u64, builder: u64, fref: u64,
+    a: TypeArena, s: SemaRes, mname: str, ast: AstArena,
+    slots: Map<str, u64>, tyslots: Map<str, u32>, cache: Map<str, u64>,
+    eid: i64, lhs: i64, rhs: i64, my_h: u32): Throw<u64, FfiError> {
+    val lh = expr_ty(a, s, mname, lhs)?
+    val lk = agg_kind(a, s, lh)
+    if lk != 9 && !is_open_var(a, lh) {
+        throw FfiError(Other, "slice 3: '??' lhs must be nullable (expr {eid}, got kind {lk})")
+    }
+    val lv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, lhs)?
+    if flow_stopped {
+        return Ok(0u64)
+    }
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    val t = nullable_tag(lib, ctx, builder, cache, lv)?
+    val z = Llvm.const_int(lib, i64ty, 0u64, false)?
+    val isnull = Llvm.build_icmp(lib, builder, t, z, 32u32, "elv.n")?
+    val st = llty_for_h(lib, ctx, cache, a, s, my_h)?
+    val slot = Llvm.build_alloca(lib, builder, st, "elv.res")?
+    val some_blk = Llvm.append_block(lib, ctx, fref, "elv.some")?
+    val null_blk = Llvm.append_block(lib, ctx, fref, "elv.null")?
+    val merge_blk = Llvm.append_block(lib, ctx, fref, "elv.end")?
+    Llvm.build_cond_br(lib, builder, isnull, null_blk, some_blk)?
+    // some:unbox(窄化路径 null 不可达;inner = 表达式类型)。
+    Llvm.position_builder_at_end(lib, builder, some_blk)?
+    val uv = nullable_unbox_val(lib, ctx, builder, cache, a, s, lv, my_h)?
+    Llvm.build_store(lib, builder, uv, slot)?
+    Llvm.build_br(lib, builder, merge_blk)?
+    // null:rhs(短路求值)→ conv 入槽。
+    Llvm.position_builder_at_end(lib, builder, null_blk)?
+    flow_stopped = false
+    val rv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, rhs)?
+    if !flow_stopped {
+        val rh = expr_ty(a, s, mname, rhs)?
+        val rvc = conv_value(lib, ctx, builder, cache, a, s, rv, rh, my_h, tmp())?
+        Llvm.build_store(lib, builder, rvc, slot)?
+        Llvm.build_br(lib, builder, merge_blk)?
+    }
+    Llvm.position_builder_at_end(lib, builder, merge_blk)?
+    Llvm.build_load(lib, builder, st, slot, tmp())
+}
+
+// nullable 相等族(切片 3):Eq/Neq 任一侧 nullable。三形态——
+// ①一侧 null 形(inner 开放变量,即 NullLit):判对侧 tag;
+// ②双 nullable:tag 相等 && (null 或 payload 相等)——纯数据流公式,
+//   payload 零值安全(null 块 zeroinit,标量 icmp/聚合 ptr eq 不解引用);
+// ③nullable vs 标量:peel unbox 后常规比较(镜像引擎 ExprInfer 剥壳)。
+pub fun nullable_eq_dispatch(lib: Lib, ctx: u64, builder: u64, fref: u64,
+    a: TypeArena, s: SemaRes, mname: str, ast: AstArena,
+    slots: Map<str, u64>, tyslots: Map<str, u32>, cache: Map<str, u64>,
+    eid: i64, op: BOp, lhs: i64, rhs: i64,
+    lh: u32, rh: u32, lk: i64, rk: i64): Throw<u64, FfiError> {
+    val i64ty = llty_for(lib, ctx, cache, TI64)?
+    val i1ty = llty_for(lib, ctx, cache, TBool)?
+    val tru = Llvm.const_int(lib, i1ty, 1u64, false)?
+    val z = Llvm.const_int(lib, i64ty, 0u64, false)?
+    val lnull_lit = lk == 9 && is_open_var(a, Arena.nullable_inner(a, Arena.resolve(a, lh)))
+    val rnull_lit = rk == 9 && is_open_var(a, Arena.nullable_inner(a, Arena.resolve(a, rh)))
+    // Neq = eq 取反(xor true)。
+    fun finish_impl(b: u64): Throw<u64, FfiError> {
+        if op == Ast.Neq {
+            Llvm.build_xor(lib, builder, b, tru, tmp())
+        } else {
+            Ok(b)
+        }
+    }
+    if rnull_lit && lk == 9 {
+        // e == null:判 e 的 tag。
+        val lv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, lhs)?
+        if flow_stopped {
+            return Ok(0u64)
+        }
+        val t = nullable_tag(lib, ctx, builder, cache, lv)?
+        val b = Llvm.build_icmp(lib, builder, t, z, 32u32, "nq.z")?
+        finish_impl(b)
+    } else if lnull_lit && rk == 9 {
+        // null == e:判 e 的 tag。
+        val rv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, rhs)?
+        if flow_stopped {
+            return Ok(0u64)
+        }
+        val t = nullable_tag(lib, ctx, builder, cache, rv)?
+        val b = Llvm.build_icmp(lib, builder, t, z, 32u32, "nq.z")?
+        finish_impl(b)
+    } else if lk == 9 && rk == 9 {
+        // 双 nullable:tag+payload 公式。
+        val lv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, lhs)?
+        if flow_stopped {
+            return Ok(0u64)
+        }
+        val rv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, rhs)?
+        if flow_stopped {
+            return Ok(0u64)
+        }
+        val pi = Arena.nullable_inner(a, Arena.resolve(a, lh))
+        val ltag = nullable_tag(lib, ctx, builder, cache, lv)?
+        val rtag = nullable_tag(lib, ctx, builder, cache, rv)?
+        val tags_eq = Llvm.build_icmp(lib, builder, ltag, rtag, 32u32, "nq.te")?
+        val lnull = Llvm.build_icmp(lib, builder, ltag, z, 32u32, "nq.ln")?
+        val lp = nullable_unbox_val(lib, ctx, builder, cache, a, s, lv, pi)?
+        val rp = nullable_unbox_val(lib, ctx, builder, cache, a, s, rv, pi)?
+        // payload 相等:标量 icmp/fcmp;聚合/str ptr eq(引用近似;null
+        // 侧 payload 零值,不解引用安全)。
+        val peq = if agg_kind(a, s, pi) == 1 {
+            Llvm.build_fcmp(lib, builder, lp, rp, 2u32, tmp())?
+        } else {
+            Llvm.build_icmp(lib, builder, lp, rp, 32u32, tmp())?
+        }
+        val orv = Llvm.build_or(lib, builder, lnull, peq, tmp())?
+        val eq = Llvm.build_and(lib, builder, tags_eq, orv, "nq.eq")?
+        finish_impl(eq)
+    } else if lk == 9 && rk >= 0 && rk < 5 {
+        // nullable vs 标量:peel unbox(窄化调用方保证)。
+        val lv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, lhs)?
+        if flow_stopped {
+            return Ok(0u64)
+        }
+        val rv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, rhs)?
+        if flow_stopped {
+            return Ok(0u64)
+        }
+        val pi = Arena.nullable_inner(a, Arena.resolve(a, lh))
+        val lp = nullable_unbox_val(lib, ctx, builder, cache, a, s, lv, pi)?
+        val lpc = conv_value(lib, ctx, builder, cache, a, s, lp, pi, rh, tmp())?
+        val rvc = conv_value(lib, ctx, builder, cache, a, s, rv, rh, rh, tmp())?
+        finish_impl(cmp_build(lib, builder, Arena.get(a, Arena.resolve(a, rh)), lpc, rvc, 32u32, 2u32)?)
+    } else if rk == 9 && lk >= 0 && lk < 5 {
+        val lv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, lhs)?
+        if flow_stopped {
+            return Ok(0u64)
+        }
+        val rv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, rhs)?
+        if flow_stopped {
+            return Ok(0u64)
+        }
+        val pi = Arena.nullable_inner(a, Arena.resolve(a, rh))
+        val rp = nullable_unbox_val(lib, ctx, builder, cache, a, s, rv, pi)?
+        val rpc = conv_value(lib, ctx, builder, cache, a, s, rp, pi, lh, tmp())?
+        val lvc = conv_value(lib, ctx, builder, cache, a, s, lv, lh, lh, tmp())?
+        finish_impl(cmp_build(lib, builder, Arena.get(a, Arena.resolve(a, lh)), lvc, rpc, 32u32, 2u32)?)
+    } else {
+        throw FfiError(Other, "slice 3: unsupported nullable comparison kinds {lk} vs {rk} (expr {eid})")
+    }
+}
+
 pub fun lower_binary(lib: Lib, ctx: u64, builder: u64, fref: u64,
     a: TypeArena, s: SemaRes, mname: str, ast: AstArena,
     slots: Map<str, u64>, tyslots: Map<str, u32>, cache: Map<str, u64>,
@@ -1453,9 +2434,26 @@ pub fun lower_binary(lib: Lib, ctx: u64, builder: u64, fref: u64,
     match op {
         And => { return short_circuit(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, lhs, rhs, true) }
         Or => { return short_circuit(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, lhs, rhs, false) }
+        ElvisOp => {
+            // 切片 3:?? 短路(nullable 专用通道,不走通用操作数路径)。
+            return elvis_build(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache,
+                eid, lhs, rhs, expr_ty(a, s, mname, eid)?)
+        }
         _ => {}
     }
     val my_ty = expr_ty(a, s, mname, eid)?
+    // 切片 3:nullable 相等族任一侧 nullable → 独立分派(null 形判
+    // tag/双 nullable tag+payload;不 peel)。
+    if op == Ast.Eq || op == Ast.Neq {
+        val lh0 = expr_ty(a, s, mname, lhs)?
+        val rh0 = expr_ty(a, s, mname, rhs)?
+        val lk0 = agg_kind(a, s, lh0)
+        val rk0 = agg_kind(a, s, rh0)
+        if lk0 == 9 || rk0 == 9 {
+            return nullable_eq_dispatch(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache,
+                eid, op, lhs, rhs, lh0, rh0, lk0, rk0)
+        }
+    }
     // 比较族:操作数统一到 LHS 类型(sema peer 合一),产出 i1;
     // 其余:操作数统一到表达式类型。
     val is_cmp = match op {
@@ -1463,19 +2461,25 @@ pub fun lower_binary(lib: Lib, ctx: u64, builder: u64, fref: u64,
         _ => false
     }
     val operand_h = if is_cmp { expr_ty(a, s, mname, lhs)? } else { my_ty }
-    val operand_raw = Arena.get(a, operand_h)
+    // 切片 3:nullable 操作数剥壳(镜像引擎 ExprInfer:算术/比较族 peel
+    // 到 inner numeric;conv (T?→T) unbox 通道)。
+    var op_h = operand_h
+    if agg_kind(a, s, op_h) == 9 {
+        op_h = Arena.nullable_inner(a, Arena.resolve(a, op_h))
+    }
+    val operand_raw = Arena.get(a, op_h)
     val lv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, lhs)?
     if flow_stopped {
         return Ok(0u64)
     }
     val lhs_h = expr_ty(a, s, mname, lhs)?
-    val lvc = conv_value(lib, ctx, builder, cache, a, s, lv, lhs_h, operand_h, tmp())?
+    val lvc = conv_value(lib, ctx, builder, cache, a, s, lv, lhs_h, op_h, tmp())?
     val rv = lower_expr(lib, ctx, builder, fref, a, s, mname, ast, slots, tyslots, cache, rhs)?
     if flow_stopped {
         return Ok(0u64)
     }
     val rhs_h = expr_ty(a, s, mname, rhs)?
-    val rvc = conv_value(lib, ctx, builder, cache, a, s,rv, rhs_h, operand_h, tmp())?
+    val rvc = conv_value(lib, ctx, builder, cache, a, s,rv, rhs_h, op_h, tmp())?
     val opk = ty_kind(operand_raw)
     // 切片 2:str 相等族:== / != 内联字节循环(引擎 Arc<str> 语义 =
     // 内容相等);RefEq/RefNeq = ptr 比较(引用同一块)。其余 str 操作
@@ -1659,15 +2663,19 @@ pub fun lower_stmt(lib: Lib, ctx: u64, builder: u64, fref: u64,
             if flow_stopped {
                 return Ok(true)
             }
-            // 切片 2:聚合初值 = ptr(llty_for_h 统一;标量回落 llty_for)。
-            val slot_ty = llty_for_h(lib, ctx, cache, a, s, init_h)?
+            // 切片 3:绑定类型 = sema bind_ty(注解优先,键 = module+stmt;
+            // 无注解 = 初值类型)。槽位按绑定类型分配;初值 conv 到绑定
+            // 类型后入槽(T → T? = Some 包装 box;整型族同走拓窄)。
+            val bind_h = Semares.get_local_decl(s, Semares.local_decl_key(mname, sid)) ?? init_h
+            val vc = conv_value(lib, ctx, builder, cache, a, s, v, init_h, bind_h, tmp())?
+            val slot_ty = llty_for_h(lib, ctx, cache, a, s, bind_h)?
             val slot = Llvm.build_alloca(lib, builder, slot_ty, name)?
-            match Llvm.build_store(lib, builder, v, slot) {
+            match Llvm.build_store(lib, builder, vc, slot) {
                 Ok(_) => {}
                 Error(e) => throw e
             }
             slots.set(name, slot)
-            tyslots.set(name, init_h)
+            tyslots.set(name, bind_h)
             Ok(false)
         },
         AssignS(target, value) => {

@@ -81,6 +81,10 @@ pub type SemaRes = SemaRes(
     // ── S2c:选择性导入条目归属(键 = module + NUL + 本地名 → true;
     // 裸名多主零静默的显式豁免面;不进 dump/stats)──
     pub import_alias_owners: Map<str, bool>,
+    // ── 切片 3:局部声明绑定类型(键 = module + NUL + "v" + stmt_id;
+    // 值 = check_local_decl 的 bind_ty——注解优先,无注解 = 初值类型;
+    // native 后端 ValDeclS 槽位/conv 消费)──
+    pub local_decl_types: Map<str, u32>,
     // ── 诊断 ──
     pub errors: List<SErr>,
     pub warnings: List<SErr>,
@@ -104,6 +108,7 @@ pub fun new_semares(): SemaRes {
         Map.empty<str, List<str>>(), Map.empty<str, List<str>>(), false,
         0,
         Map.empty<str, bool>(),
+        Map.empty<str, u32>(),
         List.empty<SErr>(), List.empty<SErr>(), false,
     )
 }
@@ -594,6 +599,54 @@ pub fun record_shape(s: SemaRes, name: str): u32[]? {
     }
 }
 
+// 多 ctor 非泛型 TAdt 判定(切片 3 后端消费):类型存在、kind==TAdt、
+// 构造器 > 1。Back.frond 免 import Data(TDK 与 Ty 变体撞名),经此
+// 纯布尔接口取分类信息。
+pub fun type_def_is_multi_ctor_adt(s: SemaRes, name: str): bool {
+    match get_type_def(s, name) {
+        null => false
+        d => {
+            val dd = d ?? TDef("", TAlias, [], [], null, null, [], [])
+            dd.kind == Data.TAdt && dd.constructors.len() > 1
+        }
+    }
+}
+
+// 构造器名 → 在类型 constructors 里的 0 基索引(切片 3 后端 tag 口径;
+// -1 = 类型未知/无此构造器)。
+pub fun adt_ctor_index(s: SemaRes, type_name: str, ctor_name: str): i64 {
+    match get_type_def(s, type_name) {
+        null => -1
+        d => {
+            val dd = d ?? TDef("", TAlias, [], [], null, null, [], [])
+            var i: usize = 0
+            while i < dd.constructors.len() {
+                if dd.constructors[i].name == ctor_name {
+                    return i as i64
+                }
+                i = i + 1
+            }
+            -1
+        },
+    }
+}
+
+// 构造器字段类型序列(声明序;null = 类型未知/索引越界)。无字段
+// 构造器返回空数组。
+pub fun adt_ctor_fields(s: SemaRes, type_name: str, ctor_idx: i64): u32[]? {
+    match get_type_def(s, type_name) {
+        null => null
+        d => {
+            val dd = d ?? TDef("", TAlias, [], [], null, null, [], [])
+            if ctor_idx < 0 || (ctor_idx as usize) >= dd.constructors.len() {
+                null
+            } else {
+                dd.constructors[ctor_idx as usize].field_types
+            }
+        },
+    }
+}
+
 // 名义 record 字段名 → 声明序下标(0 基,即字段在构造器里的位置;
 // -1 = 无此字段/类型未知)。按 field_names 位置直接消歧——与
 // lookup_field_id 的 kind 基数口径(Record 0 基、Adt 1 基)等价,
@@ -858,6 +911,20 @@ pub fun put_expr(s: SemaRes, key: str, ty: u32): void {
 
 pub fun get_expr(s: SemaRes, key: str): u32? {
     s.expr_types.get(key)
+}
+
+// 局部声明绑定类型键(切片 3:module + NUL + "v" + stmt_id;"v" 前缀
+// 与纯数字 expr 键区分;独立表,无碰撞面)。
+pub fun local_decl_key(module_name: str, stmt_id: i64): str {
+    "{module_name}\u{0}v{stmt_id}"
+}
+
+pub fun put_local_decl(s: SemaRes, key: str, ty: u32): void {
+    s.local_decl_types.set(key, ty)
+}
+
+pub fun get_local_decl(s: SemaRes, key: str): u32? {
+    s.local_decl_types.get(key)
 }
 
 // 方法分派标记(intrinsic await/recv;计数进 stats)。
