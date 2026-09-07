@@ -3046,9 +3046,13 @@ pub fun lower_entry(a: TypeArena, s: SemaRes, entry: ModuleAst, obj_path: str,
     val ctx = Llvm.create_context(lib)?
     val module = Llvm.create_module(lib, "frondc_out", ctx)?
     // tm/td 提前(切片 2:聚合大小经 TargetData;布局规则与 emit 一致)。
+    // reloc=LLVMRelocPIC(2):x86-64 ELF 默认 Static 用绝对 32 位寻址
+    // (R_X86_64_32S),glibc PIE 链接直接拒(lld "recompile with -fPIC",
+    // CI linux-x64 slice2 16_str_fields 实证);PIC 走 RIP 相对,全平台
+    // 安全(COFF→REL32,Mach-O/arm64 本就 PC 相对)。
     val triple = Llvm.host_triple()
     val target = Llvm.get_target(lib, triple)?
-    val tm = Llvm.create_target_machine(lib, target, triple, "generic", "", 2u32, 0u32, 0u32)?
+    val tm = Llvm.create_target_machine(lib, target, triple, "generic", "", 2u32, 2u32, 0u32)?
     cur_td = Llvm.create_target_data_layout(lib, tm)?
     str_consts = Map.empty<str, u64>()
     strn = 0

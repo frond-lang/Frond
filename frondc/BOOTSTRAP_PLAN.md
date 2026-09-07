@@ -836,6 +836,13 @@ payload = ptr);null 字面量 = 每 nullable 类型一个 zeroinit 私有
    撞名 → `Ast.Eq`/`Ast.Neq` 显式消歧。
 6. **conv_value 标量→T? 装箱**:inner 类型与标量源不同宽时先转
    inner 再装箱(i32 字面量 → i64? 槽)。
+7. **CI linux-x64 PIE 链接(切片 3 推送后显形,病根在切片 2)**:
+   str 字面量私有全局常量 + 默认 RelocDefault(x86-64 ELF → Static
+   绝对 32 位寻址 R_X86_64_32S),glibc 默认 PIE 的 lld 直接拒
+   ("recompile with -fPIC",仅 linux-x64 挂,arm64/musl/macos/
+   windows 非 PIE 或本就 PC 相对);修 = TargetMachine reloc 参数
+   0→2(LLVMRelocPIC,RIP 相对)——本地 .o 实证:修复前 ADDR32,
+   修复后 .text 全 REL32(ELF 对应 R_X86_64_PC32),exit 87 不变。
 
 **Frond 语言顺带发现**:赋值不放宽 `str` → `str?`(nullable 变量
 赋非空值须 `if true { x } else { null }` idiom);本切片统一改用
