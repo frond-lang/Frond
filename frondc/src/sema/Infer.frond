@@ -4929,6 +4929,13 @@ fun infer_call_expr(ctx: ICtx, a: TypeArena, s: SemaRes, expr: i64, ast: AstAren
                                 match Arena.get(a, inst_fn0) {
                                     TFn(_) => {
                                         val f0 = fn_parts(a, inst_fn0)
+                                        // 元数守卫(引擎 CallInfer Bug#160 同步):
+                                        // 模块限定调用无部分应用语义,双向硬错。
+                                        if f0.ps.len() != args.len() {
+                                            add_error_at(s,
+                                                "function '{p.a}' expects {f0.ps.len()} argument(s) but got {args.len()}",
+                                                e.span.line, e.span.column)
+                                        }
                                         var k0: usize = 0
                                         while k0 < f0.ps.len() && k0 < args.len() {
                                             val _t0 = infer_expr(ctx, a, s, args[k0], ast, env, f0.ps[k0])
@@ -4947,6 +4954,34 @@ fun infer_call_expr(ctx: ICtx, a: TypeArena, s: SemaRes, expr: i64, ast: AstAren
                 match Arena.get(a, inst_callee0) {
                     TFn(_) => {
                         val f0 = fn_parts(a, inst_callee0)
+                        // 构造器豁免(引擎同步):少参=默认构造零填充,不报元数。
+                        var ctor0 = false
+                        match ast.expr(callee).node {
+                            Ident(n0) => {
+                                if ctor_defs_of(s, n0).len() > 0 {
+                                    match Arena.get(a, resolve(a, f0.ret)) {
+                                        TAdt(_) => { ctor0 = true }
+                                        _ => {}
+                                    }
+                                }
+                            },
+                            _ => {},
+                        }
+                        // 元数守卫(引擎 Bug#160 rev.2 同步):少参旧路径是
+                        // "默认柯里化"定型,但任何层都未实现部分应用——
+                        // 跨模块裸调在表达式位产生 Partial 值、本地急切
+                        // 调用缺参垃圾补槽("async 裸调用 null"家族)。
+                        // 双向硬错,与模块限定/超参口径一致。
+                        if f0.ps.len() != args.len() && !ctor0 {
+                            var desc0 = "function"
+                            match ast.expr(callee).node {
+                                Ident(n0) => { desc0 = "function '" + n0 + "'" }
+                                _ => {}
+                            }
+                            add_error_at(s,
+                                "{desc0} expects {f0.ps.len()} argument(s) but got {args.len()}",
+                                e.span.line, e.span.column)
+                        }
                         var k0: usize = 0
                         while k0 < f0.ps.len() && k0 < args.len() {
                             val _t0 = infer_expr(ctx, a, s, args[k0], ast, env, f0.ps[k0])
@@ -4978,34 +5013,46 @@ fun infer_call_expr(ctx: ICtx, a: TypeArena, s: SemaRes, expr: i64, ast: AstAren
                             match Arena.get(a, inst_fn) {
                                 TFn(_) => {
                                     val f = fn_parts(a, inst_fn)
-                                    if f.ps.len() == args.len() {
-                                        var k: usize = 0
-                                        while k < f.ps.len() {
-                                            val arg_ty = infer_expr(ctx, a, s, args[k], ast, env, f.ps[k])
-                                            match unwrap_leak_kind(a, f.ps[k], arg_ty) {
-                                                null => {}
-                                                kind => {
-                                                    var is_null_lit = false
-                                                    match ast.expr(args[k]).node {
-                                                        NullLit => { is_null_lit = true }
-                                                        _ => {},
-                                                    }
-                                                    if !is_null_lit {
-                                                        add_error(s,
-                                                            "argument type incompatible with parameter type: cannot pass a {kind} value where '{display(a, resolve(a, f.ps[k]))}' is expected — unwrap explicitly ('?? default', '!', '?', or an '!= null' narrowed branch)")
-                                                    }
-                                                },
-                                            }
-                                            match try_widen_unify(ctx, a, f.ps[k], arg_ty) {
-                                                TWOk(_) => {}
-                                                TWErr(msg) => {
-                                                    add_error(s, "argument type incompatible with parameter type: {msg}")
-                                                }
-                                            }
-                                            k = k + 1
+                                    if f.ps.len() != args.len() {
+                                        // 元数守卫(引擎 Bug#160 同步):模块限定
+                                        // 调用无部分应用语义,双向硬错——旧路静默
+                                        // 落空,缺槽运行期垃圾填充。
+                                        add_error_at(s,
+                                            "function '{p.a}' expects {f.ps.len()} argument(s) but got {args.len()}",
+                                            e.span.line, e.span.column)
+                                        var km: usize = 0
+                                        while km < f.ps.len() && km < args.len() {
+                                            val _t = infer_expr(ctx, a, s, args[km], ast, env, f.ps[km])
+                                            km = km + 1
                                         }
                                         return f.ret
                                     }
+                                    var k: usize = 0
+                                    while k < f.ps.len() {
+                                        val arg_ty = infer_expr(ctx, a, s, args[k], ast, env, f.ps[k])
+                                        match unwrap_leak_kind(a, f.ps[k], arg_ty) {
+                                            null => {}
+                                            kind => {
+                                                var is_null_lit = false
+                                                match ast.expr(args[k]).node {
+                                                    NullLit => { is_null_lit = true }
+                                                    _ => {},
+                                                }
+                                                if !is_null_lit {
+                                                    add_error(s,
+                                                        "argument type incompatible with parameter type: cannot pass a {kind} value where '{display(a, resolve(a, f.ps[k]))}' is expected — unwrap explicitly ('?? default', '!', '?', or an '!= null' narrowed branch)")
+                                                }
+                                            },
+                                        }
+                                        match try_widen_unify(ctx, a, f.ps[k], arg_ty) {
+                                            TWOk(_) => {}
+                                            TWErr(msg) => {
+                                                add_error(s, "argument type incompatible with parameter type: {msg}")
+                                            }
+                                        }
+                                        k = k + 1
+                                    }
+                                    return f.ret
                                 },
                                 _ => {},
                             }
@@ -5019,6 +5066,40 @@ fun infer_call_expr(ctx: ICtx, a: TypeArena, s: SemaRes, expr: i64, ast: AstAren
             match Arena.get(a, inst_callee) {
                 TFn(_) => {
                     val f = fn_parts(a, inst_callee)
+                    // 构造器豁免(引擎同步):少参=默认构造零填充。
+                    var callee_is_ctor = false
+                    match ast.expr(callee).node {
+                        Ident(n1) => {
+                            if ctor_defs_of(s, n1).len() > 0 {
+                                match Arena.get(a, resolve(a, f.ret)) {
+                                    TAdt(_) => { callee_is_ctor = true }
+                                    _ => {}
+                                }
+                            }
+                        },
+                        _ => {},
+                    }
+                    if f.ps.len() != args.len() && !callee_is_ctor {
+                        // 元数守卫(引擎 Bug#160 rev.2 同步):少参旧路径 =
+                        // "默认柯里化"部分应用定型,但 IR 从未实现部分应用
+                        // ——本地急切调用缺参垃圾补槽、跨模块裸调产 Partial
+                        // 值死于 match scrutinee("async 裸调用 null"家族)。
+                        // 双向硬错;构造器保零填充默认构造。
+                        var desc1 = "function"
+                        match ast.expr(callee).node {
+                            Ident(n1) => { desc1 = "function '" + n1 + "'" }
+                            _ => {}
+                        }
+                        add_error_at(s,
+                            "{desc1} expects {f.ps.len()} argument(s) but got {args.len()}",
+                            e.span.line, e.span.column)
+                        var kq: usize = 0
+                        while kq < args.len() {
+                            val hint: u32? = if kq < f.ps.len() { f.ps[kq] } else { null }
+                            val _t = infer_expr(ctx, a, s, args[kq], ast, env, hint)
+                            kq = kq + 1
+                        }
+                    }
                     if f.ps.len() == args.len() {
                         var k: usize = 0
                         while k < f.ps.len() {
@@ -5040,6 +5121,42 @@ fun infer_call_expr(ctx: ICtx, a: TypeArena, s: SemaRes, expr: i64, ast: AstAren
                     return f.ret
                 },
                 _ => {},
+            }
+            // 具体非 Fn callee(数组/record/str 等值在调用位,引擎同步):
+            // 回退只向 fresh Fn 约束、具体错配静默——调用值曾编译通过后
+            // 运行期 panic("input is not callable")。硬错;未解 var /
+            // Never / ModuleRef 保留回退(泛型高阶、死代码路径、裸尾段
+            // 匹配构造器 callee 由 IR 构造器表真派发)。Adt 型 Ident
+            // callee = Bug#69 家族豁免:零参 ctor 注册为值(Adt 型非 Fn),
+            // 函数局部类型不进全局构造器表——Marker()/Leaf() 须与裸值等价。
+            var adt_ident_callee = false
+            match ast.expr(callee).node {
+                Ident(_) => {
+                    match Arena.get(a, resolved_callee) {
+                        TAdt(_) => { adt_ident_callee = true }
+                        _ => {}
+                    }
+                },
+                _ => {},
+            }
+            match Arena.get(a, resolved_callee) {
+                TTypeVar(_) => {}
+                TUnknown => {}
+                TNever => {}
+                TModuleRef(_) => {}
+                _ => {
+                    if !adt_ident_callee {
+                        add_error_at(s,
+                            "cannot call non-function value of type '{display(a, resolved_callee)}'",
+                            e.span.line, e.span.column)
+                        var zn: usize = 0
+                        while zn < args.len() {
+                            val _t = infer_expr(ctx, a, s, args[zn], ast, env, null)
+                            zn = zn + 1
+                        }
+                        return make(a, TUnknown)
+                    }
+                },
             }
             // 回退:推断实参 + 与 (args -> ret) 约束。
             val ret_ty = fresh_type_var(a)

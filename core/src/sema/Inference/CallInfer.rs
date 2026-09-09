@@ -459,23 +459,16 @@ impl<'a> InferContext<'a> {
                             }
                             _ => false,
                         };
-                        if args.len() < params.len() && !callee_is_ctor {
-                            // Default currying (Bug #160): mirror the normal stage —
-                            // under-arity local calls are partial applications typed
-                            // Fn(remaining) -> ret, keeping the two stages consistent.
-                            for (&param_ty, &arg) in params.iter().zip(args.iter()) {
-                                let _ = self.infer_expr(arg, ast, env, Some(param_ty));
-                            }
-                            let partial = self.arena.make_fn(
-                                params[args.len()..].to_vec().into_boxed_slice(),
-                                return_type,
-                            );
-                            if let Some(exp) = expected {
-                                self.unify_or_constrain(partial, exp);
-                            }
-                            return partial;
-                        }
                         if params.len() != args.len() && !callee_is_ctor {
+                            // Arity mismatch, both directions (Bug #160 rev.2):
+                            // under-arity used to take a "default currying"
+                            // partial-application typing here, but no layer ever
+                            // implemented partials — cross-module bare calls
+                            // produced a Partial value in expression position
+                            // and locals eager-called with garbage-filled slots
+                            // (the "async bare-call null" family). Hard error,
+                            // matching module-qualified semantics; constructors
+                            // keep the legacy zero-fill default construction.
                             let sp = ast.expr(expr).span;
                             let desc = self.call_callee_desc(*callee, ast);
                             self.arity_error(&desc, params.len(), args.len(), sp.line, sp.column);
@@ -487,13 +480,9 @@ impl<'a> InferContext<'a> {
                     }
                     // Non-Fn callee: report an error and return Unknown.
                     let span = ast.expr(expr).span;
-                    let callee_name = self
-                        .arena
-                        .type_name(resolved_callee)
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("{:?}", self.arena.get(resolved_callee)));
+                    let callee_name = self.arena.display(resolved_callee);
                     self.add_error_at(
-                        &format!("cannot call non-function value of type '{}'", callee_name),
+                        &format!("cannot call non-function value of type '{callee_name}'"),
                         span.line,
                         span.column,
                     );
@@ -585,28 +574,15 @@ impl<'a> InferContext<'a> {
                         }
                         _ => false,
                     };
-                    if args.len() < params.len() && !callee_is_ctor {
-                        // Default currying (Bug #160): a local under-arity call is a
-                        // partial application. Type it Fn(remaining) -> ret — the old
-                        // declared-return-type lie crashed IR ("missing ExprInfo") on
-                        // any later use of the result.
-                        for (&param_ty, &arg) in params.iter().zip(args.iter()) {
-                            let arg_ty = self.infer_expr(arg, ast, env, Some(param_ty));
-                            let sp = ast.expr(arg).span;
-                            self.unify_call_arg(param_ty, arg_ty, sp.line, sp.column, matches!(&ast.expr(arg).node, crate::ast::Ast::Expr::NullLit));
-                        }
-                        let partial = self.arena.make_fn(
-                            params[args.len()..].to_vec().into_boxed_slice(),
-                            return_type,
-                        );
-                        if let Some(exp) = expected {
-                            self.unify_or_constrain(partial, exp);
-                        }
-                        return partial;
-                    }
                     if params.len() != args.len() && !callee_is_ctor {
-                        // Over-arity (Bug #160): hard error; still infer every argument
-                        // (prefix with parameter hints) to keep diagnostics informative.
+                        // Arity mismatch, both directions (Bug #160 rev.2):
+                        // under-arity used to be typed as a "default currying"
+                        // partial application Fn(remaining) -> ret — a promise no
+                        // layer kept: IR eager-calls locals with garbage-filled
+                        // slots and hands cross-module bare calls a Partial value
+                        // that dies in match scrutinees (the "async bare-call
+                        // null" family). Hard error now, same as module-qualified
+                        // and over-arity; constructors keep zero-fill defaults.
                         let sp = ast.expr(expr).span;
                         let desc = self.call_callee_desc(*callee, ast);
                         self.arity_error(&desc, params.len(), args.len(), sp.line, sp.column);
@@ -633,6 +609,46 @@ impl<'a> InferContext<'a> {
                         self.unify_or_constrain(return_type, exp);
                     }
                     return return_type;
+                }
+                // Concrete non-Fn callee (array/record/str/… value in call
+                // position): the generic fallback below only *constrains*
+                // callee_ty toward a fresh Fn and stays silent on concrete
+                // mismatches, so calling a value used to compile and panic at
+                // runtime ("input is not callable"). Mirror the
+                // instantiation-mode site: hard error. Exemptions: unresolved
+                // var / Never keep the constraint fallback (generic
+                // higher-order calls, dead-code paths); ModuleRef keeps it too
+                // — the module-qualified branch above owns that case, and a
+                // bare tail-matched ctor callee resolves here (Sdump's
+                // `Mono(...)` shape) with IR-side ctor tables doing the real
+                // dispatch. Adt-typed Ident callees are the Bug #69 family:
+                // zero-field ctors are registered as VALUES (Adt-typed, not
+                // Fn), and function-local types never reach the global ctor
+                // table — `Marker()`/`Leaf()` must stay equivalent to the
+                // bare value.
+                let callee_is_adt_ident = match &ast.expr(*callee).node {
+                    Expr::Ident(_) => {
+                        matches!(self.arena.get(resolved_callee), Type::Adt(_))
+                    }
+                    _ => false,
+                };
+                if !callee_is_adt_ident
+                    && !matches!(
+                        self.arena.get(resolved_callee),
+                        Type::TypeVar(_) | Type::Unknown | Type::Never | Type::ModuleRef(_)
+                    )
+                {
+                    let span = ast.expr(expr).span;
+                    let callee_name = self.arena.display(resolved_callee);
+                    self.add_error_at(
+                        &format!("cannot call non-function value of type '{callee_name}'"),
+                        span.line,
+                        span.column,
+                    );
+                    for &a in args.iter() {
+                        let _ = self.infer_expr(a, ast, env, None);
+                    }
+                    return self.arena.make(Type::Unknown);
                 }
                 // Fallback: infer all arguments and unify the callee with (args -> ret).
                 // (Scalar-name constructors are rejected at the top of this arm.)

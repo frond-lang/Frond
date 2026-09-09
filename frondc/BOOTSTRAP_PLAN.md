@@ -1047,6 +1047,42 @@ parse 已跨入口共享(std_cache/AST 盘缓存),sema 检查环仍逐入口重�
   native slice0/1 门同因留 CI)+ negative 69 + lex 483 + ast 473
   + load 12 + sema 6 + tyops 77 全绿。
 
+**清账复审(2026-09-07,案 1 rev.2 = 09-06 销案补完)**:
+
+- **复审发现 09-06 修复有洞**:N4 最小复现(选择性导入 5 参函数喂
+  3 实参、进 match scrutinee)在含 4862f74 修复的引擎上**仍崩**
+  (non-exhaustive match,与 frondc native_entry 崩溃同签名);根因
+  = bare import-entry 调用经 `infer_expr(callee)` 落入通用段的
+  **"默认柯里化"**(Bug #160 裁决)——少参被静默定型为部分应用
+  `Fn(余参)->ret`,但**任何层都未实现部分应用**:IR 对本地急切调用
+  缺参垃圾补槽(N1 侥幸值)、对跨模块裸调产 Partial 值死于 match
+  scrutinee(N4/b3d6717)、真用"部分应用"则 panic "input is not
+  callable"(N2)。原立案的 async 是红鲱鱼(b3d6717 的 native_entry
+  恰好 async;真凶 = lower_entry 在 b638666 4→5 参演进)。
+- **裁决 rev.2:默认柯里化废止**——under-arity 双向硬错误,与
+  ModuleRef/超参口径统一(全库零依赖隐式柯里化,`fun &` 仅接口
+  方法标记);构造器少参零填充默认构造语义保留(`!callee_is_ctor`
+  豁免,正常+实例化两段)。
+- **N5 同族洞**:调用非函数局部值(如 `arr(1)`)正常段静默落回退
+  → 运行期 panic。补"cannot call non-function value of type '{}'"
+  硬错(镜像实例化段已有,正常段新增);**豁免名单** = TypeVar/
+  Unknown/Never(泛型高阶/死代码)、ModuleRef(裸尾段匹配构造器
+  callee,Sdump 的 `Mono(...)` 形态由 IR 构造器表真派发)、
+  **Adt 型 Ident callee**(Bug#69 家族:零参 ctor 注册为值、函数
+  局部类型不进全局构造器表——`Marker()`/`Leaf()` 须与裸值等价,
+  edge_adt 回归实证后定豁免)。
+- **镜像同步**:Infer.frond 五处(实例化 ModuleRef/通用 + 正常
+  ModuleRef/通用 + 回退前非 Fn),诊断文案与引擎逐字节一致
+  (三新负例双引擎同串实证);旧镜像零元数诊断(合法语料差分
+  不暴露的错误路径 parity 缺口)就此补齐。
+- **负例三件**:arity_bare_import_under / arity_local_under /
+  call_nonfn_value(negative 69→72)。
+- **门禁(2026-09-07 实测)**:functional 98(llvm_probe 环境性)
+  + negative 72 + native slice0/1(5+5)+ battery x3 + diff_lex 498
+  + diff_ast 488+10skip + diff_load 12 + diff_tyops IDENTICAL
+  + diff_sema 6/6 全量逐字节 + b3d6717 怪胎 Main 复验 =
+  `lower_entry expects 5 argument(s) but got 4` 编译期诊断。
+
 ## 附七:方案 B 环境白名单收缩落地(2026-09-05,@export 制)
 
 **裁决演进**:命名模式白名单(println 族+`__` 前缀)→ 用户改判
