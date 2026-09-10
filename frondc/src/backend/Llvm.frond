@@ -655,6 +655,11 @@ pub fun build_inbounds_gep2(lib: Lib, builder: u64, ty: u64, ptr: u64, indices: 
 }
 
 // Core.h L4758/4760:ptr ↔ 整型(bump arena 的 top 前沿整数算术)。
+pub fun build_select(lib: Lib, builder: u64, cond: u64, then_v: u64, else_v: u64, name: str): Throw<u64, FfiError> {
+    val f: ForeignFn<u64> = lib.lookup("LLVMBuildSelect", "u64, u64, u64, u64, cstr")?
+    f.call(builder, cond, then_v, else_v, name)
+}
+
 pub fun build_ptrtoint(lib: Lib, builder: u64, v: u64, dest_ty: u64, name: str): Throw<u64, FfiError> {
     val f: ForeignFn<u64> = lib.lookup("LLVMBuildPtrToInt", "u64, u64, u64, cstr")?
     f.call(builder, v, dest_ty, name)

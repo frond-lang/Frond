@@ -20,7 +20,7 @@ import types.Ty
 import sema.Data.{new_err_path, new_inst_ctx}
 import sema.Envs.{define, root}
 import sema.Semares.{get_expr, get_trait_def, get_type_def, list_has_str, list_remove_str, module_expr_key, module_logical_path, put_dispatch, put_expr, resolve_method_binding, resolve_trait_key, resolve_type_key, trait_def_idx, trait_effective_methods, trait_parent_closure}
-import sema.Ictx.{insert_top, new_ictx, push_type_bindings}
+import sema.Ictx.{insert_top, new_ictx, pop_this_type, push_this_type, push_type_bindings}
 import sema.Populate.{from_type_name_full, type_handle_name_matches, type_name_from_node}
 import sema.Typeast.{type_from_ast}
 import sema.Infer.{infer_expr}
@@ -208,7 +208,9 @@ fun ftabs_resolve_owner(t: FTabs, name: str, from: str): str? {
 }
 
 // 限定接收者路径段 → 后缀唯一匹配的模块名。
-fun ftabs_module_by_path(t: FTabs, segs: str[]): str? {
+// 切片 6e:Back 消费面——命名空间接收者路径段 → 归属模块名(与
+// fn_mods 同源路径形)。多主竞争 = null(调用方响亮报错)。
+pub fun ftabs_module_by_path(t: FTabs, segs: str[]): str? {
     var hit: str? = null
     var mi: usize = 0
     while mi < t.modules.len() {
@@ -642,6 +644,76 @@ fun resolve_instance_body_types(a: TypeArena, s: SemaRes, type_params: str[], pa
     walk_expr_m(a, body, ast, tables, in_progress, s, module_name)
     instc.local_expr_types.len() as i64
 }
+
+// 切片 6e:Back 消费面——泛型类型方法体的实例化重放。check 期只为
+// 自由函数建实例(类型方法走共享 subgraph 的软值路径),Back 的逐
+// 实例静态布局需要代换后的体类型:与 resolve_instance_body_types
+// 同骨架,外加 push_this_type(实例化接收者型 —— TThis 首参与裸
+// 字段名都经 this 绑定解析)。重放产出并入全局 expr_types(键 =
+// 声明模块 + expr id),Back 按"重放→立即 lower"窗口消费。
+pub fun replay_method_body(a: TypeArena, s: SemaRes, type_params: str[], params: Prm[],
+    rt: i64?, body: i64, func_name: str, type_args: u32[], this_h: u32,
+    ast: AstArena, tables: FTabs, in_progress: Map<str, i64>, module_name: str): void {
+    val saved_sema_module = s.current_module_name
+    val ictx2 = new_ictx()
+    ictx2.current_module_name = module_name
+    s.current_module_name = module_name
+    var tps: Tp[] = []
+    var k: usize = 0
+    while k < type_params.len() {
+        tps = tps ++ [Tp(type_params[k], null, [])]
+        k = k + 1
+    }
+    if tps.len() > 0 {
+        push_type_bindings(ictx2, a, tps)
+    }
+    push_this_type(ictx2, this_h)
+    val instc = new_inst_ctx(func_name, type_args, module_name, in_progress)
+    ictx2.inst = instc
+    k = 0
+    while k < type_params.len() && k < type_args.len() {
+        insert_top(ictx2, type_params[k], type_args[k])
+        k = k + 1
+    }
+    var parent_env = root(s.env)
+    match module_logical_path(module_name) {
+        null => {}
+        lp => {
+            match s.module_envs.get(lp) {
+                null => {}
+                me => { parent_env = me ?? 0 }
+            }
+        },
+    }
+    val fn_env = Envs.child(s.env, parent_env)
+    var pi: usize = 0
+    while pi < params.len() {
+        var h = fresh_type_var(a)
+        match params[pi].ta {
+            null => {}
+            ta => { h = type_from_ast(ictx2, a, s, ta, ast) }
+        }
+        define(s.env, fn_env, params[pi].name, h)
+        pi = pi + 1
+    }
+    var ret_ty = fresh_type_var(a)
+    match rt {
+        null => {}
+        r0 => { ret_ty = type_from_ast(ictx2, a, s, r0, ast) }
+    }
+    ictx2.expected_return = ret_ty
+    val _bt = infer_expr(ictx2, a, s, body, ast, fn_env, ictx2.expected_return)
+    var ki: usize = 0
+    while ki < instc.local_expr_types.len() {
+        val pair = instc.local_expr_types.get(ki) ?? ETMap(0, 0)
+        put_expr(s, module_expr_key(instc.module_name, pair.expr), pair.ty)
+        ki = ki + 1
+    }
+    pop_this_type(ictx2)
+    s.current_module_name = saved_sema_module
+    walk_expr_m(a, body, ast, tables, in_progress, s, module_name)
+}
+
 
 // 切片 6b:Back 侧实例类型重放入口——泛型多实例共享全局 expr_types
 // 体键(check 期重放末者胜),Back 按 instance_id 序"重放→立即 lower"

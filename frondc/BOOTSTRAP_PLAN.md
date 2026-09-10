@@ -1019,8 +1019,88 @@ RecordExtendE 顺手。
 - **验收**:42_mono_nested(泛型调泛型 both→wrap / sum_len→both,
   T[] 数组形参双实例)退出码 7;n1/n2/n3/m4 探针链全程实证。
 - **门禁(2026-09-10 实测)**:functional 98(llvm_probe 本地环境性)
-  + negative 72 + native slice0-6(5+5+6+6+5+6+5)+ battery x3 + 差分
-  五套(收尾记录)——零回归。
+  + negative 72 + native slice0-6(5+5+6+6+5+6+5)+ battery x3 + diff_lex
+  520 + diff_ast 510+10skip + diff_load 12 + diff_tyops IDENTICAL
+  + diff_sema 6/6 全量逐字节——零回归。6b monomorph 全部收官。
+
+**6c 方法分派落地(2026-09-10 同日)**:静态已知接收者型的直接分派。
+
+- **机制**:方法以独立函数发射(`frond_m_<Type>_<method>`,trait
+  默认 `_d` 后缀;canonical 名注册 `method_rows`);**parser 已注入
+  `this:TThis` 首参**(Md.params[0])——TThis 解析为接收者型
+  (make_adt canonical),调用 = [recv] + args。trait 默认经 TDefI
+  实例注册,默认体从声明 trait 的模块 TraitDeclD 取(TTDef/TMS 无
+  body 持久化);自有覆写优先(method_rows 键已占即跳过)。隐式
+  this 两路:expr_types 的 `this` 记录型是占位 Adt("This") →
+  expr_ty 查询位以行 this 型(cur_this_h)替换;方法体内裸字段
+  (x → this.x,槽装载后字段定位)与裸方法调用(sum() → this.sum())
+  回落。InhI 继承方法 = 6d 面(布局前缀未建模)。
+- **排雷三颗**:①默认行 fn_mods/fn_asts 误推 entry——默认体在
+  声明 trait 模块的 arena,错 arena = 乱解释(主症状:main 的
+  'identifier not a local' 假象 + 默认值乱);②this 槽是 alloca,
+  字段定位/隐式调用前须 load;③TMS/TTDef 的 get 是数组索引非
+  List.get;④Md 兜底 ctor 的 body 字面量须 0i64(i64? 参数)。
+- **验收**:43_methods_basic(自有方法:record/ADT、带参、this
+  match、方法调方法、链式、跨模块)= 52;44_trait_default(TDD:
+  默认体经 this 虚派到覆写 name,默认调默认)= 132。
+- **门禁(2026-09-10 实测)**:functional 98(llvm_probe 本地环境性)
+  + negative 72 + native slice0-6(5+5+6+6+5+6+7)+ battery x3 + diff_lex
+  524 + diff_ast 514+10skip + diff_load 12 + diff_tyops IDENTICAL
+  + diff_sema 6/6 全量逐字节——零回归。
+
+**6d 第一段落地(2026-09-10 同日,rt-as-IR + @extern 直调)**:
+- **rt-as-IR 裁决(替代 C 文件 + clang 编译)**:工具链资产 bin/ 仅
+  lld 无 clang——rt 以 IR 由 Back 直接发射,CRT/kernel32 走 declare
+  (链接视图已含),**零新资产、零新子进程、五平台天然**。
+- **frond_alloc 换 malloc(策略丙)**:调用点不动;bump 1GiB 段退役;
+  OOM → trap。现有全部语料(重分配 concat/methods)免改通过。
+- **rt 写原语**:`__stdout/__stderr_write_raw(ptr, i64) -> i32`
+  (C ABI = str 的 data+len 双参形态);Windows = kernel32
+  GetStdHandle(-11/-12) + WriteFile(已链接),Unix = write(fd)。
+  控制台 ANSI 渲染为 v0 已知近似,管道/重定向精确。
+- **@extern 调用链**:extern_llvm/fts/params 三表;调用点先于跨模块
+  解析(builtin 拥有者不在收集面);str 参数 ABI 编组 = 块地址拆
+  (data@8 gep + len@0 load)。镜像 sema 放行 builtin extern 直调
+  (@internal 拦截是引擎 IR 层规则;native 面合法)。
+- **验收**:45_rt_print——两行 stdout 原生打印 + exit 40(rt rc
+  语义 0+0+40);**首个带 I/O 的原生程序**。
+- **门禁(2026-09-10 实测)**:functional 98(llvm_probe 本地环境性)
+  + negative 72 + native slice0-6(5+5+6+6+5+6+8)+ battery x3 + diff_lex
+  525 + diff_ast 515+10skip + diff_load 12 + diff_tyops IDENTICAL
+  + diff_sema 6/6 全量逐字节——零回归。
+- **6d 余段**:可达性驱动发射(worklist——builtin 全量收集的前置;
+  ~230 个 __ 包装含不支持构造,须只编可达)+ Console 模块函数收集
+  → println 全链(泛型 6b + Throw 4 + extern 6d)+ repr() intrinsic
+  (str 恒等 / 整型 itoa rt 函数)+ InhI 继承(布局前缀建模)+
+  RecordLitE/RecordExtendE。
+
+**6d 第二段落地(2026-09-10 同日,println 全链)**:
+- **worklist 可达性发射**:mark_reachable(调用/方法分派位标记)+
+  游标队列;builtin 全量原型注册(~230 个 __ 包装含不支持构造——
+  容错注册跳过,不触即不编)。
+- **排雷三颗(全为链路型)**:①用户 fn 收集循环**双份 push**(容错
+  match 内 + 旧无条件 push 残留)= 列错位 8 行 → 参数/体张冠李戴
+  (症状:alloca 名 %s 而非 %x + load ptr from i32 槽);②Throw 的
+  TGeneric("Throw",[V,E]) 在 inst_param_ty 须双参递归(resolve_tn_flat
+  丢实参 → 裸 TGeneric 不可 lower);③itoa 谓词位次:slt=40(误 48)、
+  循环 ugt=34(误 uge=35 = 无符号恒真 → 死循环)。
+- **println 全链六件合璧**:泛型实例(6b)→ x.repr() intrinsic
+  (6d:名字即分派;str 恒等 / i64 itoa rt 函数)→ __stdout_write
+  (跨模块 builtin 6a+6d)→ Throw 直落(4)→ @extern rt(6d 一)→
+  WriteFile(kernel32)。VoidLit/Ok(void)→ i64 哑 box;Throw→Throw
+  conv 恒等(V 位 void/open 哑差不改 ptr)。
+- **验收**:46_println = "hello native println"/"42"/"-12345" 三行
+  原生输出 + exit 41。
+- **6d 排雷续(29 号回归修复)**:void/open 容错的 open 判定误用
+  `ty_kind == -1` — **TAdt(record)也是 -1** → 所有 record 载荷的
+  Ok(P(...)) 走了 i64 哑box 路径(症状:字段全 0 + 无 throw 包装;
+  named+packed 组合死循环 = 乱 IR 级联)。修 = `TTypeVar(_) |
+  TUnknown` 显式 match(非 -1);三处同步(Ok 特判 / throw_arm_
+  layout / PropagateE)。★Frond 无 matches! 宏——Rust 语法直接
+  编译错,须展开为 match 表达式。二分链 p2→p9→pa 定位:p9
+  (packed 单独)= 16(应为 30)即破案点。
+- **6d 余段(收窄)**:InhI 继承(布局前缀建模)+ RecordLitE/
+  RecordExtendE + eprint/stdin + std 泛型(List/Map 族)。
 
 ## 附五:S2c 导入优先级格 + 裸名多主零静默(2026-09-04,用户裁决"地基要稳")
 
@@ -1324,3 +1404,84 @@ std.core.hash.Hash.{fnv1a}) or use the qualified form`;真未定义名维持
 原文案;方法糖位(模块短名 recv)提示待补。负向 EXPECT 同步更新,
 66/66 + sema 差分绿。
 
+
+## 附十四:Stage 2 切片 6e 落地(2026-09-11,std 泛型 List/Map)
+
+**范围(附九 6d 余段的最大一片)**:std 泛型聚合(List<T>/Map<K,V> 族)
+进 native 收集面,frondc 自身 395 处 `.push()` 的静态特化基础全链打通。
+
+**七层接线**:
+1. **std 进收集面**(Main.frond native_entry):builtin.* 之外加 std.*
+   (全量原型注册,可达性发射只编被调者);
+2. **命名空间接收者路由**(Back MethodCallE 前置):sema 的
+   module_func_recv_exprs 标记 + call_instantiations 实例分派,非泛型
+   经 ftabs 路径后缀定归属(recv 不进实参);
+3. **inst_param_ty TGeneric 泛型族**:Throw/Channel/Async/Lazy/Atomic/
+   Sender/Receiver/ForeignFn 结构变体 + 用户泛型聚合 →
+   make_adt(canonical, 代换实参)(镜像 Typeast 口径);
+4. **泛型聚合代换**:agg_kind 7/8 收编带实参 TAdt;ty_key 实参感知
+   (rg/dg 前缀);record_layout_h(声明字段 subst_ty 名字键代换——
+   探针实证声明位 T = TAdt("T") 名字占位);rec_field_place 字段型
+   代换;
+5. **泛型构造器实参反推**(lower_call):声明字段 vs 实参类型结构对位
+   (infer_ctor_args/match_param_arg)→ 代换布局 → 产物型入
+   ty_overlay(expr_ty 先读 overlay);
+6. **泛型类型方法实例**:meth_inst_rows(键 = canonical+method+ty_key)+
+   调用点动态注册 + Mono.replay_method_body(this 绑定重放,TThis/裸
+   字段经 this 解析;check 期只为自由函数建实例,类型方法共享软值
+   subgraph);隐式 this 字段读写(AssignS/Ident 双侧);
+7. **rt 原语 + intrinsic**:emit_rt_mem_copy(18 元素型,memmove 方向
+   语义)/__hash_key_str(FNV-1a+"-0"归一)/__fnv1a_bytes;type_name()
+   静态折叠 display;bytes() str→u8[] 块拷;StrInterp(str/整型);
+   动态数组 fill([v, ..n] 运行期计数);void→void 恒等 + void 值槽
+   i8 哑位 + 数组↔str/数组→数组 as 直通(type_name 分派死分支)。
+
+**毒型家族(本片最大敌情)**:check 期方法糖调用的共享刚性槽末者胜
+——泛型类型声明的 rigid T 被覆写(TVoid 实证:List 构造调用点全局型
+= List<void>),引擎软值不可见,native 静态布局受害。对策三件:
+实例分派行返回型 overlay(lower_call_row/lower_method_call)+
+ValDeclS 先 lower 后取型 + 毒型回落绑定槽型(expr_ty_sl;ty_generic_
+poisoned 深度上限 8)。**实参归一**(sanitize_arg,出口在 expr_ty/
+conv_value 双侧):sema 局部声明/实参位的嵌套泛型聚合是 arena
+TGeneric 句柄,消费面统一 TAdt。幻影实例门(args_resolvable):泛型
+体内嵌套调用的 check 期实例(实参 = 未解类型参)不注册。
+
+**验收**:native_slice6e(47-52)6/6——List 全方法面(i32/str/嵌套/
+增长翻倍)+ Map<str,i64>(set/get/has/remove/len,hash str 快路)。
+
+**留洞(下一片 6f 面)**:Map keys()/values()——泛型体内
+`List.empty()` 的 T 需 HM 回流绑定(check 期实例实参 = 未解 K,重放
+一次性推断不跑 solver);i64 键走非 str 哈希路径(itoa+bytes 链已
+lower,待语料);entries() = HashIterator builtin。InhI/RecordLitE/
+stdin 维持 6d 余段原位。
+
+## 附十五:Stage 2 切片 6f 落地(2026-09-11,keys/values 使用驱动绑定)
+
+**范围(附十四留洞的收口)**:Map keys()/values() + i64 键(非 str
+哈希路径)native 全通。零引擎/零 check 改动(纯 Back 层)。
+
+**机制:幽灵实例的使用驱动派生**(derive_ghost_instance 双路):
+泛型体内零参工厂(`List.empty()`)的 check 期实例实参 = 未解占位
+(TAdt("T")——**工厂自身参名**,非外层类型的 K;真值由 check 期
+solver 回流绑定,Back 的一次性重放不跑 solver)。两路:
+- A 名字代换:占位名 ∈ 当前发射行类型参(K/V 形)→ subst_ty;
+- B 使用驱动:扫当前函数体(scan_stmt_uses/scan_expr_uses 递归
+  BlockE/If/While/Match/表达式树)找绑定名(init == 调用 eid 的
+  Val)上的首个带参方法调用(out.push(x))→ 方法声明参型占位
+  (inst_param_ty 空 tps/args)与实参类型 match_param_arg 对位闭包
+  接收者开放槽 → 工厂 rt 模式对位(match_rt_pattern,声明 rt AST
+  vs 闭包后句柄)→ 工厂类型参绑定 → 虚拟实例(追加进
+  monomorph_instances,id = 追加索引,register_instance_fn + 行簿记
+  + worklist 重放机制全复用)。
+
+**配套**:发射行类型参绑定上下文(cur_gtps/cur_gargs,自由函数
+实例行 + 方法实例行 -2 置位)+ 体上下文(cur_body_eid/cur_farena)。
+标量→str as 死分支哑值(conv_value:**原值直通会令下游 str 拆参
+gep 到标量,LLVM verifier 拒——必须 null ptr 类型正确哑值**)。
+
+**验收**:native_slice6e 扩至 8 案(53_map_iteration/54_map_i64_keys)
+全绿;探针 t0-t6 13/13;i64 键全链 = "{"{k}"}" itoa 插值 +
+normalize_zero + bytes + fnv1a_bytes rt。
+
+**余洞**:entries() = HashIterator builtin(迭代器协议未入 native);
+InhI/RecordLitE/stdin 维持原位。

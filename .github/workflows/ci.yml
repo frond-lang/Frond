@@ -125,6 +125,15 @@ jobs:
         env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
         run: bash tests/scripts/native_slice6.sh
 
+      # 切片 6e:std 泛型(List/Map)——std 进收集面 + 命名空间实例
+      # 分派 + 泛型聚合代换/构造反推 + 方法实例(this 重放)+ rt 原语
+      # (mem_copy 族/hash_key_str/fnv1a_bytes)+ type_name/bytes/
+      # StrInterp + 动态 fill。keys()/values() 留洞(HM 回流绑定)。
+      - name: Stage 2 native slice6e
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/native_slice6e.sh
+
       # 调度稳定性哨兵:历史上 Multi 模式挂死/抖动的专项电池。
       - name: await_loop stability battery (x30)
         shell: bash

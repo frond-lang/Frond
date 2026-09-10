@@ -488,14 +488,30 @@ async fun native_entry(entry_raw: str, std_root: str, do_run: bool,
                             val obj = base + ".o"
                             val exe = if os == "windows" { base + ".exe" } else { base }
                             eprintln("M5 pre-lower")
-                            // 切片 6a:用户依赖模块序(user_module_paths 序;
-                            // std/builtin 天然排除,入口去重)。loader 键 =
-                            // 文件路径,key_to_logical 对齐逻辑名。
+                            // 切片 6a/6e:用户依赖模块序(user_module_paths
+                            // 序)+ builtin 模块 + std 模块(全量原型注册,
+                            // 可达性发射只编被调者;std 泛型 List/Map 族由
+                            // 此进收集面)。loader 键 = 文件路径,key_to_logical
+                            // 对齐逻辑名。
                             val dep_mods = List.empty<ModuleAst>()
                             val allk = loader.modules.keys()
                             var ui: usize = 0
-                            while ui < ok.s.user_module_paths.len() {
-                                val lp = ok.s.user_module_paths.get(ui) ?? ""
+                            while ui < ok.s.user_module_paths.len() + allk.len() {
+                                val lp = if ui < ok.s.user_module_paths.len() {
+                                    ok.s.user_module_paths.get(ui) ?? ""
+                                } else {
+                                    val k2 = allk[ui - ok.s.user_module_paths.len() as usize]
+                                    val l2 = key_to_logical(k2)
+                                    if Str.starts_with(l2, "builtin.") || Str.starts_with(l2, "std.") {
+                                        l2
+                                    } else {
+                                        ""
+                                    }
+                                }
+                                if lp == "" {
+                                    ui = ui + 1
+                                    continue
+                                }
                                 var ki: usize = 0
                                 while ki < allk.len() {
                                     val k = allk[ki]
