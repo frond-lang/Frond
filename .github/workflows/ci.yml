@@ -99,6 +99,32 @@ jobs:
         env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
         run: bash tests/scripts/native_slice2.sh
 
+      # 切片 3:和类型一刀切(多 ctor ADT tagged-union + match 全模式族 +
+      # nullable;附九)。
+      - name: Stage 2 native slice3
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/native_slice3.sh
+
+      # 切片 4:Throw 两态值直落 + async 直通降级(附十)。
+      - name: Stage 2 native slice4
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/native_slice4.sh
+
+      # 切片 5:动态聚合(拼接/码点索引/切片/深相等/defer;附十一)。
+      - name: Stage 2 native slice5
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/native_slice5.sh
+
+      # 切片 6a:跨模块(多模块 mangled 收集/裸名解析/跨模块类型;
+      # 附十二)。用例 = 目录项目形态(driver 兼容单文件)。
+      - name: Stage 2 native slice6
+        shell: bash
+        env: { FROND: '${{ steps.setup.outputs.frond-bin }}' }
+        run: bash tests/scripts/native_slice6.sh
+
       # 调度稳定性哨兵:历史上 Multi 模式挂死/抖动的专项电池。
       - name: await_loop stability battery (x30)
         shell: bash

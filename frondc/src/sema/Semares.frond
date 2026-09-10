@@ -614,6 +614,13 @@ pub fun type_def_is_multi_ctor_adt(s: SemaRes, name: str): bool {
 
 // 构造器名 → 在类型 constructors 里的 0 基索引(切片 3 后端 tag 口径;
 // -1 = 类型未知/无此构造器)。
+pub fun adt_ctor_count(s: SemaRes, type_name: str): i64 {
+    match get_type_def(s, type_name) {
+        null => -1
+        d => (d ?? TDef("", TAlias, [], [], null, null, [], [])).constructors.len() as i64
+    }
+}
+
 pub fun adt_ctor_index(s: SemaRes, type_name: str, ctor_name: str): i64 {
     match get_type_def(s, type_name) {
         null => -1

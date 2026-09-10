@@ -627,6 +627,14 @@ pub fun set_linkage_private(lib: Lib, global: u64): Throw<void, FfiError> {
     f.call(global, 9u32)
 }
 
+// 清指令名(切片 5):void 调用不得命名——带名 call 的 void 值过不了
+// verifier;空串 cstr 在引擎编组产出 NULL(Twine(nullptr) UB)。
+// LLVMSetValueName2(Val, 非空指针, 0)= StringRef(ptr,0) 安全清名。
+pub fun clear_value_name(lib: Lib, v: u64): Throw<void, FfiError> {
+    val f: ForeignFn<void> = lib.lookup("LLVMSetValueName2", "u64, cstr, u64")?
+    f.call(v, "x", 0u64)
+}
+
 // 字段地址。Core.h L4716 StructGEP2:opaque pointers 须显式给 struct
 // 类型(builder, ty, ptr, idx, name)。
 pub fun build_struct_gep(lib: Lib, builder: u64, struct_ty: u64, ptr: u64, idx: u32,

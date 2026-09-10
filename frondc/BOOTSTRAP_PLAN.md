@@ -848,8 +848,179 @@ payload = ptr);null 字面量 = 每 nullable 类型一个 zeroinit 私有
 赋非空值须 `if true { x } else { null }` idiom);本切片统一改用
 非空哨兵(空串)变量 + nullable 数组承载,规避之。
 
-**下一片 = 切片 4(Throw 两态值直落 + async 直通降级)**,零资产
-小件,规划见上。
+## 附十:Stage 2 切片 4 落地(2026-09-08,Throw 两态值直落 + async 直通)
+
+**范围(附九三裁决 2/3 的实现)**:throw 语句 / `?` 传播 / Ok 构造 /
+match Ok-Error 消费 / async fun 直通 / `.await()` 恒等——全部零运行
+时、零 C 层、零新资产、零 ABI 差异。
+
+**表示**:Throw 值 = per-臂块 `{i64 tag, payload}`(tag 0=Ok / 1=Err;
+V、E 各自 payload 型,聚合载荷 = ptr——同 nullable 纪律),值 = 块
+地址(opaque ptr);`agg_kind` 新码 10,tag@0 读取复用 nullable_tag。
+Err-Throw 构造仅经 throw 语句(引擎无 Error 构造器 builtin,只有 Ok
+——镜像 Modenv 同口径)。
+
+**接线七处**(Back.frond):①`throw_arm_layout/box/unbox` 三 helper
+(键 `thr:{o|e}:{payload-key}`);②`Ok(v)` 特判(fn_index miss 后、
+record 构造器前;按调用点 sema 型 TThrow 的 V 部装箱);③`ThrowS`
+语句(载荷 conv 到 E 部 → box tag=1 → ret 早退;cur_ret_h 非 TThrow
+响亮报错);④`PropagateE`(tag 检查双臂:Err → conv 后 ret 回传
+Throw 本值;Ok → unbox V 续行);⑤ctor_test k==10 臂(Ok=tag 0 /
+Error|Err=tag 1;单子模式按 payload 型递归 pat_test——镜像 Infer
+refine_constructor_pattern 同口径);⑥MethodCallE `.await()` 恒等
+(async fun 已按内型注册,调用产物即 payload);⑦收集门放宽
+(is_throwing/is_async 入列;签名返 TAsync → register_fn 按内型 T
+注册)。ty_same/conv_value 补 Throw 双部递归同型。
+
+**验收**:`tests/fixtures/native_slice4/cases/`(27-31)退出码全中
+46/77/25/37/19——显式 Ok + throw 早退 + match Error/Ok 消费 / `?`
+传播链(Ok 直通 + Err 早退回传)/ str+record 聚合载荷 / async 直通
++ 串 await 链 / Async<Throw<V,E>> 组合(frondc 自身形态);driver =
+`tests/scripts/native_slice4.sh`(slice3 模板);CI 补挂 slice3+
+slice4 步(五平台矩阵,负套件后)。语料先行纪律:五件先过引擎
+oracle(打印形态数值验证,顺带修正两处 EXPECT 算术 46/37),再进
+Back——首跑五件全中,零雷。
+
+**门禁(2026-09-08 实测)**:functional 98(llvm_probe 本地环境性)
++ negative 72 + native slice0/1/2/3/4(5+5+6+6+5)+ battery x3
++ diff_lex 503 + diff_ast 493+10skip + diff_load 12 + diff_tyops
+IDENTICAL + diff_sema 6/6 全量逐字节——零回归。
+
+**下一片 = 切片 5(动态聚合)**:数组 `++` 拼接、str 拼接、str/数组
+索引、`[a..b]` 切片、record/数组深相等;纯 IR 走 frond_alloc,零新
+资产;defer 顺手。(**2026-09-08 切片 5 落地**,见 附十一)
+
+## 附十一:Stage 2 切片 5 落地(2026-09-08,动态聚合)
+
+**范围(附九序列第 5 片)**:str `+` 拼接 / 数组 `++` 拼接 / str 码点
+索引 / `[a..b]`+`[a..=b]` 切片(str 码点·数组元素)/ record+数组深相等
+(`==`/`!=`,引擎内容相等语义;此前非 str 聚合 == 是**静默 ptr 比较 =
+引用相等,语义错**)/ defer(函数级 LIFO 链)。全部纯 IR 走 frond_alloc
+(动态尺寸新 `call_alloc_dyn`),零新资产。
+
+**实现**:六件 helper(str_concat / str_index_char 含 1-4 字节 UTF-8
+解码四路链 / str_slice 单趟码点偏移 / arr_concat / arr_slice /
+deep_eq 双类型递归——**双侧各按己型装载 + 叶级 conv 统一**,peer 型
+数组 i32[] vs i64[] 引擎语义相等)+ 接线五处(lower_binary 的 Add-on-str
+/ ConcatList / 深相等分派;IndexE str 臂;SliceE 新臂;DeferS 臂 +
+ReturnS/ThrowS/`?`-err/函数尾四处出口统一发射)。
+
+**排雷六颗(全为潜伏雷首踩,自举价值高)**:
+1. **谓词位次**:UTF-8 解码 is1 用 33(NEQ)应 36(ULT)——多字节
+   引码全进 1 字节路返回首字节原值(195/228 探针实证);
+2. **循环块结构**:str_concat B 循环 br 自身清零块(k 每轮归零死循环,
+   300s 超时 143 假象)+ 双 concat 的 B 循环条件反转(more→done);
+3. **深相等 peer 型**:单类型装载把 i32 存储当 i64 读——垃圾比较;
+4. **elem TypeVar**:++ 表达式 sema 型 elem 是 unify 绑定的 var,
+   `array_parts().a` 裸取不 resolve → llty_for(TTypeVar) 炸——
+   `arr_elem_of`(resolve 到底)统一四点;
+5. **void 函数双终结符(切片 1 起潜伏)**:tail-null 路径
+   emit_implicit_ret 后 flow_stopped 未置位 → 外层兜底再补一发
+   `ret void` ×2(Broken module;verify AbortProcess 模式下 IR 不可见,
+   verify 前临时 dump 实证);
+6. **void 调用三重坑**:带名 call 的 void 值 verifier 拒 / 空串 cstr
+   引擎编组 NULL = Twine(nullptr) UB / 名位传 u64-0 = setName(NULL)
+   段错误——正解 = **建后清名**(LLVMSetValueName2(v, 非空指针, 0),
+   StringRef(ptr,0) 安全);另裸 `0u64` 尾值强转 null Throw,调用方
+   match 即崩——必须 `Ok(0u64)` 包裹。
+
+**验收**:`tests/fixtures/native_slice5/cases/`(32-37)退出码全中
+41/79/52/54/70/58——str+/arr++(链式)/ASCII+多字节码点(é=233/
+中=20013)/str+数组切片含闭区间/深相等(record+数组+嵌套数组 in
+record+peer 型)/str 数组拼接后码点访问/defer 函数级链;driver =
+`tests/scripts/native_slice5.sh`;CI 挂 slice5 步(slice3/4 上一批已
+挂)。语料先行:六件引擎打印 oracle 验值(修正 EXPECT 算术 54/70/58,
+37 号模块级 var 改数组盒形态——Back 未支持模块 var)。
+
+**defer 语义近似**:函数级链(块级作用域/循环体内 defer 为函数出口
+统一触发,非每迭代);frondc 自身两处均为函数级清理,自举面无伤。
+
+**门禁(2026-09-08 实测)**:functional 98(llvm_probe 本地环境性)
++ negative 72 + native slice0-5(5+5+6+6+5+6)+ battery x3 + diff_lex
+509 + diff_ast 499+10skip + diff_load 12 + diff_tyops IDENTICAL
++ diff_sema 6/6 全量逐字节——零回归。
+
+**下一片 = 切片 6(跨模块 + monomorph + std)**:mangled 多模块
+lower、call_instantiations 实例重放、方法分派/witness、std 依赖闭包
++C 原语 @extern → declare + C 层 .obj 链接输入 + frond_rt 最小内核
+(dlopen/LoadLibrary/argv/UTF-16 桥/spawn);RecordLitE/RecordExtendE
+顺手——自举前最后一片大件。(**6a 跨模块 2026-09-10 落地**,见 附十二)
+
+## 附十二:Stage 2 切片 6a 落地(2026-09-10,跨模块)
+
+**范围(附九切片 6 的第一子片)**:非泛型多模块 lowering——依赖用户
+模块的函数收集、跨模块裸名解析、跨模块 record/ADT/ctor/match、
+ADT 深相等补齐。monomorph(6b)/方法分派(6c)/std+frond_rt(6d)
+续后。
+
+**实现(七处)**:①`lower_entry` 加 `dep_mods: List<ModuleAst>`
+(Main 侧按 `user_module_paths` 序组装,loader 键=文件路径经
+key_to_logical 对齐,入口去重;std/builtin 天然排除);②收集循环扩
+多模块(fn_mods/fn_asts 两列:体用己 arena、sema 表键同源);
+③`register_fn` 加 `llvm_name` 参数(入口模块保旧 `frond_<名>` ABI,
+依赖模块 `frond_u_<路径清洗>_<名>`,'/'/'.'→'_');④`fn_index` 键改
+`mod\0name`(模块隔离);⑤per-module 签名 env(`env_of_module`:
+module_envs 按逻辑路径,兜底 root);⑥`lower_call` 本地键先行,miss
+→ `resolve_cross_module`(func_sig_owners 的唯一 USER 拥有者,
+std./builtin. 前缀排除;多主放弃→调用点响亮报错);发射体抽
+`lower_call_row` 两路共用;⑦deep_eq 补 k==8(tag 相等 + per-ctor
+icmp 链逐字段递归;`Semares.adt_ctor_count` 新增)+ 分派条件放行
+kind 8——**修掉 ADT == 静默 ptr 比较(引用相等)的语义错**。
+
+**验收**:`tests/fixtures/native_slice6/cases/`(38-40,目录项目
+形态)退出码全中 81/63/144——选择性导入裸调用 + 跨模块 record
+构造/字段读 + 跨模块 ADT ctor/match / 三模块链 Main→Mid→Base
+(依赖模块内再跨模块调用)/ 跨模块 ADT 带字段 ctor 嵌套模式 +
+深相等 + 跨模块 Throw。driver = `tests/scripts/native_slice6.sh`
+(slice5 模板 + 目录用例支持:`cases/*/src/Main.frond` 与单文件
+并存);CI 挂 slice6 步。语料先行:引擎 oracle 验值(修正 EXPECT
+算术 63/144;嵌套 `_` 子模式引擎不支持→绑定变量;多行括号臂体
+需花括号)。
+
+**门禁(2026-09-10 实测)**:functional 98(llvm_probe 本地环境性)
++ negative 72 + native slice0-6(5+5+6+6+5+6+3)+ battery x3 + diff_lex
+516 + diff_ast 506+10skip + diff_load 12 + diff_tyops IDENTICAL
++ diff_sema 6/6 全量逐字节——零回归。
+
+**余片**:6b monomorph(call_instantiations 实例重放 + 类型代换
+expr_ty 查询)、6c 方法分派/witness、6d std 闭包 + C 原语 declare +
+frond_rt 最小内核(dlopen/argv/UTF-16 桥/spawn)+ RecordLitE/
+RecordExtendE 顺手。
+
+**6b 部分落地(2026-09-10 同日,单层泛型)**:
+- **机制**:Mono.return_type 对直接类型参数是**未解占位 Adt("T")**
+  (镜像 dump 自留口径,diff 实证)——参数/返回专用解析器
+  `inst_param_ty`(声明 type_params 按名位置映射 type_args;T[]/T?
+  递归;非参数名回落 resolve_tn_flat 空实参;TGeneric=6d)。实例注册
+  `register_instance_fn`(LLVM 名 `frond_g<id>_<fn>`);发射期逐实例
+  **重放→立即 lower**(`Mono.replay_instance_types` 新 pub 包装——
+  多实例共享全局 expr_types 体键,镜像 check 期重放末者胜,按
+  instance_id 序回放与 check 终态一致);重放内嵌套实例化经
+  `register_pending_instances` 动态拾取;调用点路由
+  call_instantiations(键=调用表达式 id)优先于常规解析,空实参
+  实例不进行表(与常规收集重复,未命中自然回落)。
+- **排雷三颗**:①register_instance_fn 与收集循环**双份 push 列**
+  = 行错位 → 路由到错误实例参数(int→str conv 假象);②泛型调用
+  点的数组字面量型 elem 是 unify 绑定 var,`array_parts().a` 裸取
+  不 resolve 即炸(lower_array_lit 补 arr_elem_of);③赋值不放宽
+  ModuleAst→ModuleAst?(if-else idiom)。
+- **验收**:41_mono_basic(同泛型函数双实例 idt<i32>+idt<str>+
+  pick+ksize)退出码 73;n1/n3/n4 系列单实例探针全中。
+- **6b 嵌套泛型收官(2026-09-10 同日,42 号回归)**:镜像 inst 模式
+  重放**跳过 unify**,内层泛型调用点/其派生表达式的记录型是**悬空
+  fresh var**(非绑定,deep_resolve 无效)。四处物化/直通:
+  ①`expr_ty` 查询位——记录型 open(悬空 var 或壳内 open elem)且
+  call_instantiations 路由到泛型实例 → `instance_call_ret` 用声明返回
+  AST + type_args 经 inst_param_ty 重建(cur_ftab 模块 var 供查询);
+  ②lower_binary——操作数基准型 open 的非调用表达式(如 ++)以 LHS
+  物化型为基准;③数组字面量 elem open → 从首元素物化型派生;
+  ④conv_value——单侧 open 的同形聚合转换直通(open 侧是悬空记录型
+  无布局信息,值本体已按具体派生构造)。
+- **验收**:42_mono_nested(泛型调泛型 both→wrap / sum_len→both,
+  T[] 数组形参双实例)退出码 7;n1/n2/n3/m4 探针链全程实证。
+- **门禁(2026-09-10 实测)**:functional 98(llvm_probe 本地环境性)
+  + negative 72 + native slice0-6(5+5+6+6+5+6+5)+ battery x3 + 差分
+  五套(收尾记录)——零回归。
 
 ## 附五:S2c 导入优先级格 + 裸名多主零静默(2026-09-04,用户裁决"地基要稳")
 

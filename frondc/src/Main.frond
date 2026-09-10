@@ -488,7 +488,41 @@ async fun native_entry(entry_raw: str, std_root: str, do_run: bool,
                             val obj = base + ".o"
                             val exe = if os == "windows" { base + ".exe" } else { base }
                             eprintln("M5 pre-lower")
-                            match Back.lower_entry(ok.a, ok.s, entry_module, obj, ok.root_env) {
+                            // 切片 6a:用户依赖模块序(user_module_paths 序;
+                            // std/builtin 天然排除,入口去重)。loader 键 =
+                            // 文件路径,key_to_logical 对齐逻辑名。
+                            val dep_mods = List.empty<ModuleAst>()
+                            val allk = loader.modules.keys()
+                            var ui: usize = 0
+                            while ui < ok.s.user_module_paths.len() {
+                                val lp = ok.s.user_module_paths.get(ui) ?? ""
+                                var ki: usize = 0
+                                while ki < allk.len() {
+                                    val k = allk[ki]
+                                    if key_to_logical(k) == lp {
+                                        match loader.modules.get(k) {
+                                            null => {}
+                                            ld => {
+                                                val dm = (ld ?? Loaded(entry_module, List.empty<str>())).module
+                                                var dup = dm.name == entry_module.name
+                                                var dj: usize = 0
+                                                while dj < dep_mods.len() {
+                                                    if (dep_mods.get(dj) ?? entry_module).name == dm.name {
+                                                        dup = true
+                                                    }
+                                                    dj = dj + 1
+                                                }
+                                                if !dup {
+                                                    dep_mods.push(dm)
+                                                }
+                                            },
+                                        }
+                                    }
+                                    ki = ki + 1
+                                }
+                                ui = ui + 1
+                            }
+                            match Back.lower_entry(ok.a, ok.s, entry_module, dep_mods, obj, ok.root_env) {
                                 Error(e) => {
                                     eprintln("frondc: native: lower/emit failed: {e}")
                                 },

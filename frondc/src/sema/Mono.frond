@@ -14,7 +14,7 @@ import std.collections.List
 import std.collections.Map
 import std.core.types.Str
 import syntax.Ast
-import types.Arena.{array_parts, display, fresh_type_var, make, make_adt, make_fn, make_generic, make_record, resolve}
+import types.Arena.{array_parts, display, fresh_type_var, make, make_adt, make_fn, make_generic, make_record, new_arena, resolve}
 import types.Ty
 
 import sema.Data.{new_err_path, new_inst_ctx}
@@ -643,8 +643,48 @@ fun resolve_instance_body_types(a: TypeArena, s: SemaRes, type_params: str[], pa
     instc.local_expr_types.len() as i64
 }
 
+// 切片 6b:Back 侧实例类型重放入口——泛型多实例共享全局 expr_types
+// 体键(check 期重放末者胜),Back 按 instance_id 序"重放→立即 lower"
+// 逐实例取正确类型;序与 check 期一致,收尾终态不变。嵌套实例化在
+// 重放内经 walk_expr_m 追加,调用方循环动态拾取。
+pub fun replay_instance_types(a: TypeArena, s: SemaRes, inst: Mono,
+    tables: FTabs, in_progress: Map<str, i64>): void {
+    val key = "{inst.module_name}\u{0}{inst.func_name}"
+    match tables.decls.get(key) {
+        null => {}
+        sd0 => {
+            val sd = sd0 ?? m_decls_dummy()
+            var type_params: str[] = []
+            var params: Prm[] = []
+            var rt: i64? = null
+            var body: i64 = 0
+            match sd.decl {
+                FunDeclD(_, _, tps, ps, r0, b, _, _, _, _) => {
+                    var k: usize = 0
+                    while k < tps.len() {
+                        type_params = type_params ++ [tps[k].name]
+                        k = k + 1
+                    }
+                    params = ps
+                    rt = r0
+                    body = b
+                },
+                _ => { return },
+            }
+            match tables.arenas.get(key) {
+                null => {}
+                ast0 => {
+                    val _ = resolve_instance_body_types(a, s, type_params, params, rt, body,
+                        inst.func_name, inst.type_args, ast0 ?? new_arena(), tables, in_progress,
+                        inst.module_name, inst.instance_id)
+                },
+            }
+        },
+    }
+}
+
 // 空 Sd 兜底(类型层面的非空;路径上已被 null 门拦)。
-fun m_decls_dummy(): Sd {
+pub fun m_decls_dummy(): Sd {
     Sd(Span(0, 0), FunDeclD(Priv, "", [], [], null, 0, false, false, [], null))
 }
 
