@@ -178,7 +178,22 @@ pub fun ftabs_register(t: FTabs, m: ModuleAst): void {
                         bucket.push(m.name)
                         t.owners.set(name, bucket)
                     },
-                    l => { l.push(m.name) },
+                    l => {
+                        // 切片 6g:同名去重 —— 模块可双重装载(builtin
+                        // 全量 + 显式 import 走 dep 键),重复入桶令唯一
+                        // 性判定(len==1)误判多主,裸名 print 的实例化被吞。
+                        var dup = false
+                        var dk: usize = 0
+                        while dk < (l ?? List.empty<str>()).len() {
+                            if ((l ?? List.empty<str>()).get(dk) ?? "") == m.name {
+                                dup = true
+                            }
+                            dk = dk + 1
+                        }
+                        if !dup {
+                            (l ?? List.empty<str>()).push(m.name)
+                        }
+                    },
                 }
             },
             _ => {},

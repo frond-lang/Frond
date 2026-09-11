@@ -3316,7 +3316,9 @@ fun infer_expr(ctx: ICtx, a: TypeArena, s: SemaRes, expr: i64, ast: AstArena,
     ty
 }
 
-// 整数字面量范围检查(简化:i64 域解析;溢出按目标位宽裁决)。
+// 整数字面量范围检查(引擎 Helpers.check_int_literal_range 镜像:
+// i128 域解析 + 按后缀限域;u64/usize 全域合法 —— i64 域旧简化在
+// u64 后缀大常量上误拒,rt 常量族(FNV 基数/掩码)首踩)。
 fun check_int_literal_range(raw: str, suffix: str): str? {
     val b = raw.bytes()
     // 去 '_'。
@@ -3350,7 +3352,9 @@ fun check_int_literal_range(raw: str, suffix: str): str? {
         neg = true
         digits_b = arr_drop(digits_b, 1)
     }
-    var value: i64 = 0
+    // i128 累积(引擎口径:u128/i128 仅语法错可能,这里 i128 域。
+    // 溢出 i128 = 病态字面量,按 i64 限域报错兜底)。
+    var value: i128 = 0
     var overflow = false
     i = 0
     while i < digits_b.len() {
@@ -3370,34 +3374,32 @@ fun check_int_literal_range(raw: str, suffix: str): str? {
         if d < 0 || d >= radix {
             return "invalid integer literal '{raw}'"
         }
-        if value > (9223372036854775807 as i64 - d) / radix {
-            overflow = true
-        }
         if !overflow {
-            value = value * radix + d
+            value = value * (radix as i128) + (d as i128)
+            if value < 0 {
+                overflow = true
+            }
         }
         i = i + 1
     }
     if overflow {
-        if suffix == "i128" || suffix == "u128" {
-            return null
-        }
         return "integer literal '{raw}' is out of range for {suffix}"
     }
     if neg {
         value = -value
     }
-    var limits_ok = match suffix {
+    // 后缀限域(引擎同表;i128/u128 全域)。
+    val limits_ok = match suffix {
         "i8" => { value >= -128 && value <= 127 }
         "i16" => { value >= -32768 && value <= 32767 }
         "i32" => { value >= -2147483648 && value <= 2147483647 }
-        "i64" => { true }
+        "i64" => { value >= -9223372036854775808i128 && value <= 9223372036854775807 }
         "u8" => { value >= 0 && value <= 255 }
         "u16" => { value >= 0 && value <= 65535 }
         "u32" => { value >= 0 && value <= 4294967295 }
-        "u64" => { value >= 0 }
-        "isize" => { true }
-        "usize" => { value >= 0 }
+        "u64" => { value >= 0 && value <= 18446744073709551615i128 }
+        "isize" => { value >= -9223372036854775808i128 && value <= 9223372036854775807 }
+        "usize" => { value >= 0 && value <= 18446744073709551615i128 }
         _ => { true }
     }
     if !limits_ok {

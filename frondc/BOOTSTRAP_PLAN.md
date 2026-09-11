@@ -1485,3 +1485,85 @@ normalize_zero + bytes + fnv1a_bytes rt。
 
 **余洞**:entries() = HashIterator builtin(迭代器协议未入 native);
 InhI/RecordLitE/stdin 维持原位。
+
+## 附十六:Stage 3 前哨第一段(2026-09-11,frondc 自编链开凿)
+
+**范围重估**:RecordLitE 在 frondc 实为零用例(此前"7/8 处"计数把
+parser/codec 对该节点的处理代码误当用例)——不阻塞;println/eprintln
+已通(slice 6d rt 链)。前哨转入:**native 直接编译 frondc 自身**。
+
+**已落(六件)**:
+1. async main 放行 + **main(argc, argv) ABI**(入口序存私有全局
+   frond_rt_argc/argv;private + zeroinit——无初始化器的 add_global 被
+   当外部声明,lld 拒);
+2. **rt argv**:`__os_arg_count`(= argc-1,引擎口径不含程序名;谓词
+   陷阱:sgt/slt 写反令正数被钳 0)/`__os_arg_get_into`(Raw 合同:
+   越界 -1/超 buf 容量 -2/拷贝返 n;argv char** 的 i8 基型 gep 须 ×8
+   字节偏移)——Proc.args 全链 native 实测通(参数回显+长度和);
+3. **活的 u8[]↔str 真转换**(conv_value:块头 16↔8 重排拷贝;6e 的
+   直通只对死分支合法——活路径把 cap 当数据读);
+4. ★**引擎级根修(六系列首件 Rust 改动)**:reflect 顶层拦截
+   (Call.rs 安全网)对裸 Ident callee 同名即劫持——frondc 自身
+   `Relate.type_name(a,h)` 的递归自调用被降成 CF_REFLECT_TYPE_NAME,
+   返回首参(a = TypeArena 值)的反射类型名 "TypeArena"。修 = 拦截前
+   加 global_bare_index/func_subgraphs 真函数守卫(与旁边
+   BUILTIN_CTORS 同款)。诊断法:同体克隆(新名)对、原名错 →
+   引擎派送层;引擎侧 functional 99/99 绿;
+5. 镜像字面量域检查 i64→**i128 域**(引擎对齐;u64 后缀大常量
+   FNV 基数 14695981039346656037/掩码 u64::MAX 误拒);
+6. 镜像 ftabs owners **同名去重**(模块双重装载:builtin 全量 +
+   显式 import 走 dep 键 → "print" 桶重复 → 唯一性(len==1)误判
+   多主 → 裸名实例化被吞)+ Back resolve_cross_module 放开 std/
+   builtin(点斜互换 + .frond)+ void→Throw 哑盒(Ok(void) 形)+
+   extern 零参 _0 分支。
+
+**里程碑**:frondc 全项目镜像自检通过(引擎 dump 131437 表达式型,
+零诊断);native 自编深入 lowering(main + 大量函数发射后遇雷)。
+
+**余雷清单(6g 续)**:
+- `ref` 参数 lowering(Parser 的 `&parse_*` 方法族 / sema 内部 & 参
+  ——ref = 槽位 ptr,place 机械可复用);
+- 裸 `List` 注解(TAdt("List") 无实参——未参化泛型注解或解析回落);
+- builtin 泛型签名位(Channel/Receiver/Lib 等,注册吞错后调用点炸)。
+
+## 附十七:6g 续篇(2026-09-11 同日,TGeneric 双拼法 + 自编墙再推)
+
+**三修**(自编墙从"注册期 TGeneric"推到"record 插值"):
+1. **gen_method_mods 双键**:模块名与类型同名(std.collections.List 装
+   List)时 canonical 解析步 2 拼出 "std.collections.List.List" 错键 →
+   步 3 glob 落裸名 "List" —— TAdt 细节名以裸形存储(引擎同形,非分
+   歧)。方法归属表 canonical + 裸尾段双键(首键优先);
+2. **字段型 sanitize**:rec_field_place / record_layout_h 的声明位字段
+   型过 sanitize_arg(List<Se> 可被存成 TGeneric——Typeast 回落,
+   has_params 因同上错键误判 false);
+3. **TGeneric(用户泛型)≡ TAdt**:agg_kind/record_name_of 收编
+   TGeneric 拼法(单 ctor → 7/多 ctor → 8;值形态同为 ptr;名字经
+   glob/双键可查)—— 双拼法全下游自动兼容。
+
+**新壁(6g 再续清单)**:record/ADT/数组的 repr 插值(frondc 诊断
+字符串 "{record}" 形——repr 扩面从质量项升格为自举硬前置);
+ref 参数(×142 吞错,Parser & 方法族);std.llvm Lib 型参数签名
+(×167 吞错,Llvm.* 调用点到达即炸)。
+
+## 附十八:6g 再续(2026-09-11 同日,repr 全面 + 模块 var + async main 收尾)
+
+**三件**:
+1. **repr_value_ir 递归发射器**(引擎 Reflect.format_value 对齐):
+   record = Name(f: v, ...)/ADT = Ctor(f: v, ...)(tag 运行期分派)/
+   数组 = [v, ...](循环拼接,槽位前置于循环块)/nullable = null|内层/
+   Throw = Ok(v)|Err(e)(tag@0:0=Ok)/bool = true|false(select)/void/
+   深度 > 5 = "..."。接线:StrInterp 复合面 + repr() intrinsic。
+   ★坑:①sep 拼接勿丢累积(select 误用);②Ctor[] 是数组没有
+   .get;③循环体递归 alloca = per-迭代栈增长(诊断面可接受);
+2. **模块级 var/val 全局槽**(引擎 Core.rs 0b 口径):模块 var 在
+   decls = ExprDeclD(expr, stmt) 包裹的 VarDeclS;LLVM private 全局
+   + main 入口序初始化(收集序;模块上下文切换);键 = 模块\0名(主)
+   + 裸名(首胜);类型 = 注解优先(init 求值补录)。读/写/place
+   三接线(slots miss → 全局槽 → 隐式 this);
+3. **async void main 收尾**:尾/return 的 void|Throw 值 → ret 0
+   (main_tail_nonint 谓词;★ty_kind(TThrow) = -1 非 10 —— 变体判)。
+
+**自编墙推进**:main + 模块 var 初始化序编译通过,现卡
+`lib.add_function(...)`(**Lib 方法糖** —— std.llvm 全 FFI 面,
+注册吞错 ×167 家族:recv = TLib 值 + 方法名 → 糖调用 = 自由函数 +
+recv 作首参)。

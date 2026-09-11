@@ -206,19 +206,35 @@ impl<'a> IrBuilder<'a> {
         // wrapper is reintroduced, it lowers directly to CF_REFLECT_* without going
         // through FFI dispatch. Today it is effectively dead code (no such functions
         // are declared, so Sema rejects bare `format(x)` before reaching here).
+        //
+        // Real-function guard (Stage-3 rehearsal find, 2026-09-11): a USER function
+        // may legitimately be named like a reflect primitive (frondc's own
+        // `sema/Relate.frond` declares `type_name(a, h)`). Sema resolves the bare
+        // self-recursive call to that function fine — intercepting here hijacks it
+        // to CF_REFLECT_TYPE_NAME on the first argument (observed: returned
+        // "TypeArena" — the reflect name of the TypeArena value). Only fall through
+        // to the reflect lowering when the bare name resolves to no known function
+        // (same contract the BUILTIN_CTORS branch below enforces via func_subgraphs;
+        // global_bare_index is the bare-name table, std mangled keys never register
+        // bare).
         if let crate::ast::Ast::Expr::Ident(name) = &callee_expr.node {
-            if let Some(cf) = reflect_top_level_cf(name) {
-                let mut inputs = Vec::with_capacity(args.len());
-                for &arg in args {
-                    inputs.push(self.compile_subexpr(arg));
+            let name_str: &str = name;
+            if !self.global_bare_index.contains_key(name_str)
+                && !self.func_subgraphs.contains_key(name_str)
+            {
+                if let Some(cf) = reflect_top_level_cf(name) {
+                    let mut inputs = Vec::with_capacity(args.len());
+                    for &arg in args {
+                        inputs.push(self.compile_subexpr(arg));
+                    }
+                    let inputs_offset = self.graph.inputs_pool.push(&inputs);
+                    return self.graph.add_node(Node {
+                        kind: NodeKind::Call,
+                        input_count: inputs.len() as u8,
+                        inputs_offset,
+                        compute_fn: cf,
+                    });
                 }
-                let inputs_offset = self.graph.inputs_pool.push(&inputs);
-                return self.graph.add_node(Node {
-                    kind: NodeKind::Call,
-                    input_count: inputs.len() as u8,
-                    inputs_offset,
-                    compute_fn: cf,
-                });
             }
         }
 
